@@ -20,13 +20,17 @@ class LinearBase(nn.Module):
         self,
         input_size: int,
         output_size: int,
+        tp_dim: int | None = None,
         bias: bool = False,
         params_dtype = dtypes.bf16,
-        quant_type = Optional.No,
+        quant_type = None,
     ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
+        self.tp_dim = tp_dim
+        self.tp_rank = dist.get_rank()
+        self.tp_size = dist.get_world_size()
         self.weight = nn.Parameter(torch.empty((self.output_size, self.input_size), dtype=params_dtype))
         if bias:
             self.bias = nn.Parameter(torch.empty(self.output_size, dtype=params_dtype))
@@ -34,7 +38,7 @@ class LinearBase(nn.Module):
         else:
             self.register_parameter("bias", None)
         self.quant_type = quant_type
-        if quant_type != Optional.No:
+        if quant_type is not None:
             if quant_type == QuantType.per_Tensor:
                 self.weight.weight_loader_process = functools_partial(self.weight_loader_process, post_process_func=shuffle_weight(16, 16))
                 self.weight_scale = nn.Parameter(torch.empty(1, dtype=dtypes.fp32))
@@ -57,7 +61,7 @@ class LinearBase(nn.Module):
         param.data.copy_(post_process_func(loaded_weight))
 
     def forward(self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16) -> torch.Tensor:
-        if self.quant_type == Optional.No:
+        if self.quant_type is None:
             return tgemm.mm(x, self.weight, self.bias)
         else:
             assert x_scale is not None
@@ -103,14 +107,23 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
         params_dtype = dtypes.bf16,
-        quant_type = Optional.No,
+        quant_type = None,
     ):
         self.tp_dim = 0
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
-        super().__init__(input_size, self.output_size_per_partition, bias, params_dtype, quant_type)
+        super().__init__(input_size, output_size, self.tp_dim, bias, params_dtype, quant_type)
+
+        self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, self.input_size_per_partition))
+        self.weight.weight_loader = self.weight_loader
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.output_size_per_partition))
+            self.bias.weight_loader = self.weight_loader
+        else:
+            self.register_parameter("bias", None)
+
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -186,7 +199,7 @@ class RowParallelLinear(LinearBase):
         bias: bool = False,
     ):
         super().__init__(input_size, output_size, 1)
-        self.input_size_per_partition = divide(input_size, self.tp_size)
+        self.input_size_per_partition = divide(input_size, 1)
         self.output_size_per_partition = output_size
 
         self.weight = nn.Parameter(torch.empty(self.output_size, self.input_size_per_partition))
@@ -199,7 +212,7 @@ class RowParallelLinear(LinearBase):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        shard_size = param_data.size(self.tp_dim)
+        shard_size = param_data.size(1)
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
