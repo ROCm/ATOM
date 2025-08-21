@@ -3,7 +3,7 @@ from glob import glob
 import torch
 from torch import nn
 from safetensors import safe_open
-from .weight_utils import download_weights_from_hf
+from atom.model_loader.weight_utils import download_weights_from_hf
 from tqdm import tqdm
 
 
@@ -17,7 +17,9 @@ def load_model(model: nn.Module, model_name_or_path: str):
     path = (
         model_name_or_path
         if is_path
-        else download_weights_from_hf(model_name_or_path, None, ["*.safetensors"])
+        else download_weights_from_hf(
+            model_name_or_path, None, ["*.safetensors"], ignore_patterns=["original/*"]
+        )
     )
     for file in tqdm(glob(os.path.join(path, "*.safetensors"))):
         print(f"Loading weights from {file}")

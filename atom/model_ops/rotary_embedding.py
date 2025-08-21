@@ -73,8 +73,6 @@ class RotaryEmbedding(nn.Module):
         sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
         return cos, sin
 
-
-    @torch.compile()
     def forward(
         self,
         positions: torch.Tensor,

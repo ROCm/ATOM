@@ -4,7 +4,6 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from aiter import dtypes
-
 from atom.config import Config
 from atom.model_engine.sequence import Sequence
 from atom.model_ops.sampler import Sampler
@@ -32,6 +31,7 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config, config.kv_cache_dtype)
+        # self.model = torch.compile(self.model, fullgraph=True)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -128,7 +128,7 @@ class ModelRunner:
             int(total * config.gpu_memory_utilization - used - peak + current)
             // block_bytes
         )
-        assert config.num_kvcache_blocks > 0
+        assert config.num_kvcache_blocks > 0, f"need at least {block_bytes} KV cache"
         self.kv_cache = torch.zeros(
             2,
             hf_config.num_hidden_layers,
@@ -136,8 +136,8 @@ class ModelRunner:
             self.block_size,
             num_kv_heads,
             hf_config.head_dim,
-            dtype=dtypes.fp8 if config.kv_cache_dtype == "fp8" else dtypes.bf16,
-            device="cuda"
+            dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+            device="cuda",
         )
 
         self.kv_scale = torch.zeros(
@@ -147,7 +147,7 @@ class ModelRunner:
             self.block_size,
             num_kv_heads,
             dtype=dtypes.fp32,
-            device="cuda"
+            device="cuda",
         )
 
         layer_id = 0
@@ -173,7 +173,6 @@ class ModelRunner:
                     module.v_scale = self.kv_scale[1, layer_id]
 
                 layer_id += 1
-
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -373,7 +372,12 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(
+                False,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+            )
 
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
