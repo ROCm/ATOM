@@ -1,7 +1,6 @@
 import torch
 from functools import cache, lru_cache
 from typing import Optional
-from atom.model_ops.utils import direct_register_custom_op
 
 
 def is_rocm_aiter_fusion_shared_expert_enabled():
@@ -314,38 +313,13 @@ def rocm_aiter_grouped_topk_fake(
     return topk_weights, topk_ids
 
 
-direct_register_custom_op(
-    op_name="rocm_aiter_topk_softmax",
-    op_func=rocm_aiter_topk_softmax_impl,
-    mutates_args=[],
-    fake_impl=rocm_aiter_topk_softmax_fake,
-    dispatch_key="CUDA",
-)
-
-direct_register_custom_op(
-    op_name="rocm_aiter_biased_grouped_topk",
-    op_func=rocm_aiter_biased_grouped_topk_impl,
-    mutates_args=[],
-    fake_impl=rocm_aiter_biased_grouped_topk_fake,
-    dispatch_key="CUDA",
-)
-
-direct_register_custom_op(
-    op_name="rocm_aiter_grouped_topk",
-    op_func=rocm_aiter_grouped_topk_impl,
-    mutates_args=[],
-    fake_impl=rocm_aiter_grouped_topk_fake,
-    dispatch_key="CUDA",
-)
-
-
 def rocm_aiter_topk_softmax(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
     num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, ...]:
-    return torch.ops.aiter.rocm_aiter_topk_softmax(
+    return rocm_aiter_topk_softmax_impl(
         gating_output, topk, renormalize, num_fused_shared_experts
     )
 
@@ -363,7 +337,7 @@ def rocm_aiter_grouped_topk(
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if e_score_correction_bias is not None:
-        return torch.ops.aiter.rocm_aiter_biased_grouped_topk(
+        return rocm_aiter_biased_grouped_topk_impl(
             gating_output,
             e_score_correction_bias,
             num_expert_group,
@@ -375,7 +349,7 @@ def rocm_aiter_grouped_topk(
         )
     else:
         assert scoring_func == "softmax" or scoring_func == "sigmoid"
-        return torch.ops.aiter.rocm_aiter_grouped_topk(
+        return rocm_aiter_grouped_topk_impl(
             gating_output,
             num_expert_group,
             topk_group,
