@@ -19,8 +19,8 @@ from atom.model_engine.sequence import Sequence
 from atom.model_loader.loader import load_model
 from atom.model_ops.sampler import Sampler
 from atom.models.llama import LlamaForCausalLM
-from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
+from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.utils.context import get_context, reset_context, set_context
 
 logger = logging.getLogger("atom")
@@ -66,6 +66,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+        self.allocate_decode_vars()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -174,6 +175,21 @@ class ModelRunner:
         dummy_batch = ScheduledBatchs(seqs, True, False)
         self.run(dummy_batch)
         torch.cuda.empty_cache()
+
+    def allocate_decode_vars(self):
+        config = self.config
+        hidden_size = config.hf_config.hidden_size
+        hidden_type = config.hf_config.torch_dtype
+        max_bs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        self.decode_vars = {
+            "input_ids": torch.zeros(max_bs, dtype=torch.int64),
+            "positions": torch.zeros(max_bs, dtype=torch.int64),
+            "slot_mapping": torch.zeros(max_bs, dtype=torch.int64),
+            "context_lens": torch.zeros(max_bs, dtype=torch.int32),
+            "block_tables": torch.zeros(max_bs, max_num_blocks, dtype=torch.int32),
+            "outputs": torch.empty(max_bs, hidden_size, dtype=hidden_type),
+        }
 
     def allocate_kv_cache(self):
         config = self.config
@@ -316,7 +332,9 @@ class ModelRunner:
 
     def prepare_decode(self, scheduled_batchs: ScheduledBatchs):
         bs = len(scheduled_batchs.seqs)
-        graph_bs = next(x for x in self.graph_bs if x >= bs)
+        graph_bs = (
+            bs if self.enforce_eager else next(x for x in self.graph_bs if x >= bs)
+        )
         assert graph_bs >= bs, f"current decode {bs=} > max graph_bs{graph_bs}"
         input_ids = []
         positions = []
@@ -350,13 +368,13 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
 
-        graph_vars = self.graph_vars
-        graph_vars["slot_mapping"][bs:graph_bs] = -1
-        graph_vars["slot_mapping"][:bs].copy_(slot_mapping, non_blocking=True)
-        graph_vars["input_ids"][:bs].copy_(input_ids, non_blocking=True)
-        graph_vars["positions"][:bs].copy_(positions, non_blocking=True)
-        graph_vars["context_lens"][:bs].copy_(context_lens, non_blocking=True)
-        graph_vars["block_tables"][:bs, : block_tables.size(1)].copy_(
+        decode_vars = self.decode_vars
+        decode_vars["slot_mapping"][bs : graph_bs + 1] = -1
+        decode_vars["slot_mapping"][:bs].copy_(slot_mapping, non_blocking=True)
+        decode_vars["input_ids"][:bs].copy_(input_ids, non_blocking=True)
+        decode_vars["positions"][:bs].copy_(positions, non_blocking=True)
+        decode_vars["context_lens"][:bs].copy_(context_lens, non_blocking=True)
+        decode_vars["block_tables"][:bs, : block_tables.size(1)].copy_(
             block_tables, non_blocking=True
         )
         set_context(
@@ -368,13 +386,13 @@ class ModelRunner:
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             min_seqlen_q=min_seqlen_q,
-            slot_mapping=graph_vars["slot_mapping"][:bs],
-            context_lens=graph_vars["context_lens"][:bs],
-            block_tables=graph_vars["block_tables"][:bs, : block_tables.size(1)],
+            slot_mapping=decode_vars["slot_mapping"][:bs],
+            context_lens=decode_vars["context_lens"][:bs],
+            block_tables=decode_vars["block_tables"][:bs, : block_tables.size(1)],
             dropout_p=dropout_p,
         )
 
-        return graph_vars["input_ids"][:bs], graph_vars["positions"][:bs]
+        return decode_vars["input_ids"][:bs], decode_vars["positions"][:bs]
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
@@ -406,7 +424,7 @@ class ModelRunner:
         else:
             graph_bs = ctx.graph_bs
             self.graphs[graph_bs].replay()
-            return self.model.compute_logits(self.graph_vars["outputs"][:bs])
+            return self.model.compute_logits(self.decode_vars["outputs"][:bs])
 
     def run(self, scheduled_batchs: ScheduledBatchs) -> list[int]:
         input_ids, positions, temperatures = self.prepare_model(scheduled_batchs)
@@ -419,16 +437,12 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        config = self.config
-        hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int64)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        input_ids = self.decode_vars["input_ids"]
+        positions = self.decode_vars["positions"]
+        slot_mapping = self.decode_vars["slot_mapping"]
+        context_lens = self.decode_vars["context_lens"]
+        block_tables = self.decode_vars["block_tables"]
+        outputs = self.decode_vars["outputs"]
 
         # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:
@@ -474,12 +488,3 @@ class ModelRunner:
                 torch.cuda.synchronize()
                 reset_context()
         self.graph_bs.sort(reverse=False)
-
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )
