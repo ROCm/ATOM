@@ -1,15 +1,17 @@
-import atexit
+import logging
+import time
 from dataclasses import fields
-from time import perf_counter
+
+import torch.multiprocessing as mp
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
-import torch.multiprocessing as mp
 
 from atom.config import Config
-from atom.sampling_params import SamplingParams
+from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.model_runner import ModelRunner
+from atom.sampling_params import SamplingParams
+
+logger = logging.getLogger("atom")
 
 
 class LLMEngine:
@@ -18,76 +20,115 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        self.ps = []
-        self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
+        config.eos_token_id = self.tokenizer.eos_token_id
 
-    def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
-        for p in self.ps:
-            p.join()
+        self.rquest_ids = set()
+        self.io_processor = InputOutputProcessor(
+            self.tokenizer, config.kvcache_block_size
+        )
+        self.core_mgr = CoreManager(config)
+        logger.info("LLMEngine init")
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
+    def add_request(
+        self, prompt_or_tokens: str | list[int], sampling_params: SamplingParams
+    ):
+        # 1. convet prompt to request
+        req = self.io_processor.preprocess(prompt_or_tokens, sampling_params)
+
+        # 2. add req to scheduler
+        self.core_mgr.add_request(req)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+        # seqs, is_prefill = self.scheduler.schedule()
+        # token_ids = self.model_runner.call("run", seqs, is_prefill)
+        # self.scheduler.postprocess(seqs, token_ids)
+        # outputs = [
+        #     (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
+        # ]
+        # num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        # return outputs, num_tokens
+
+        seq = self.core_mgr.get_output()
+        return seq
 
     def is_finished(self):
-        return self.scheduler.is_finished()
+        return not self.io_processor.has_pending_requests()
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        # prompts: list[str] | list[list[int]],
+        prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
-        use_tqdm: bool = True,
+        enable_profiling: bool = False,
     ) -> list[str]:
-        if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+        # # Start profiling for all ranks if enabled
+        # if enable_profiling:
+        #     self.model_runner.call("start_profiler")
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
-        prefill_throughput = decode_throughput = 0.
-        while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                if use_tqdm:
-                    pbar.update(1)
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seq = self.step()
+            out = self.io_processor.postprocess(seq)
+            outputs[seq.id] = out
+        # # Stop profiling for all ranks if enabled
+        # if enable_profiling:
+        #     self.model_runner.call("stop_profiler")
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        if use_tqdm:
-            pbar.close()
         return outputs
+
+
+class InputOutputProcessor:
+
+    def __init__(self, tokenizer, block_size):
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.requests = {}
+
+    def preprocess(
+        self, prompt_or_tokens: str | list[int], sampling_params: SamplingParams
+    ):
+        """responsible for:
+        1) Tokenize
+        2) Create Sequence object"""
+        tokens = (
+            self.tokenizer.encode(prompt_or_tokens)
+            if isinstance(prompt_or_tokens, str)
+            else prompt_or_tokens
+        )
+        seq = Sequence(tokens, self.block_size, sampling_params)
+        seq.arrive_time = time.time()
+        self.requests[seq.id] = seq
+        print(
+            f"Request {seq.id} arrived, input tokens: {len(tokens)}, pending requests: {len(self.requests)}"
+        )
+        return seq
+
+    def postprocess(self, req: Sequence):
+        """responsible for:
+        1) Compute stats for logging
+        2) Detokenize"""
+        self.requests.pop(req.id)
+        output_str = self.tokenizer.decode(req.completion_token_ids)
+        req.leave_time = time.time()
+        print(
+            f"Request {req.id} finished with reason {req.leave_reason}. "
+            f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
+            f"latency: {req.leave_time - req.arrive_time:.2f}s"
+        )
+        return {
+            "text": output_str,
+            "token_ids": req.completion_token_ids,
+            "latency": req.leave_time - req.arrive_time,
+            "finish_reason": req.leave_reason,
+            "num_tokens_input": req.num_prompt_tokens,
+            "num_tokens_output": req.num_completion_tokens,
+        }
+
+    def has_pending_requests(self):
+        return len(self.requests) > 0

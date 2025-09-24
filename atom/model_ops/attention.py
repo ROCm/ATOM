@@ -1,50 +1,13 @@
+import aiter
 import torch
-from torch import nn
 import triton
 import triton.language as tl
+from aiter.paged_attn import PagedAttention
+from torch import nn
 
-import aiter
 from atom.utils.context import get_context
 
-
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr,
-):
-    idx = tl.program_id(0)
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    slot = tl.load(slot_mapping_ptr + idx)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
-
-
-def store_kvcache(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-):
-    N, num_heads, head_dim = key.shape
-    D = num_heads * head_dim
-    assert key.stride(-1) == 1 and value.stride(-1) == 1
-    assert key.stride(1) == head_dim and value.stride(1) == head_dim
-    assert k_cache.stride(1) == D and v_cache.stride(1) == D
-    assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](
-        key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D
-    )
+# from flash_attn import flash_attn_with_kvcache
 
 
 class Attention(nn.Module):
@@ -55,6 +18,8 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        kv_cache_dtype="bf16",
+        **kwargs,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -62,6 +27,9 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.kv_cache_dtype = kv_cache_dtype
+        self.max_model_len = 0
+        self.k_scale = self.v_scale = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         o: torch.Tensor
@@ -70,24 +38,76 @@ class Attention(nn.Module):
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if k_cache.numel() and v_cache.numel() and context.slot_mapping is not None:
+            if self.kv_cache_dtype == "fp8":
+                aiter.reshape_and_cache_with_pertoken_quant(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    self.k_scale,
+                    self.v_scale,
+                    context.slot_mapping,
+                    asm_layout=True,
+                )
+            else:
+                aiter.reshape_and_cache(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    context.slot_mapping,
+                    kv_cache_dtype="auto",
+                    k_scale=None,
+                    v_scale=None,
+                    asm_layout=True,
+                )
+
         if context.is_prefill:
-            if context.block_tables is not None:  # prefix cache
-                k, v = k_cache, v_cache
+            # if context.block_tables is not None:  # prefix cache
+            #     k, v = k_cache, v_cache
             o = aiter.flash_attn_varlen_func(
                 q,
                 k,
                 v,
-                max_seqlen_q=context.max_seqlen_q,
                 cu_seqlens_q=context.cu_seqlens_q,
-                max_seqlen_k=context.max_seqlen_k,
                 cu_seqlens_k=context.cu_seqlens_k,
+                max_seqlen_q=context.max_seqlen_q,
+                max_seqlen_k=context.max_seqlen_k,
+                min_seqlen_q=context.min_seqlen_q,
+                dropout_p=context.dropout_p,
                 softmax_scale=self.scale,
                 causal=True,
             )
         else:  # decode
-            o = torch.empty_like(q, dtype=q.dtype, device=q.device)
+            o = aiter.pa_fwd_asm(
+                q,
+                k_cache,
+                v_cache,
+                context.block_tables,
+                context.context_lens,
+                context.block_tables.stride(0),
+                K_QScale=self.k_scale,
+                V_QScale=self.v_scale,
+                out_=None,
+                high_precision=0,
+            )
+
+            # o = PagedAttention.forward_decode(
+            #     q,
+            #     k_cache,
+            #     v_cache,
+            #     context.block_tables,
+            #     context.context_lens,
+            #     max_seq_len=self.max_model_len,
+            #     kv_cache_dtype="auto",
+            #     num_kv_heads=self.num_kv_heads,
+            #     scale=self.scale,
+            #     alibi_slopes=None,
+            #     k_scale=self.k_scale,
+            #     v_scale=self.v_scale,
+            # )
+
             # o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
             #                             cache_seqlens=context.context_lens, block_table=context.block_tables,
             #                             softmax_scale=self.scale, causal=True)

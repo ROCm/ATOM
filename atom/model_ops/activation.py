@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from aiter import silu_and_mul
 
 
 class SiluAndMul(nn.Module):
@@ -8,7 +9,12 @@ class SiluAndMul(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.compile
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         x, y = x.chunk(2, -1)
         return F.silu(x) * y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty([*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype)
+        silu_and_mul(out, x)
+        return out
+

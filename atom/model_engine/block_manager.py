@@ -1,7 +1,9 @@
 from collections import deque
-import xxhash
-import numpy as np
 
+import numpy as np
+import xxhash
+
+from atom.config import Config
 from atom.model_engine.sequence import Sequence
 
 
@@ -25,13 +27,16 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, config: Config):
+        block_size = config.kvcache_block_size
+        num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.enable_prefix_caching = config.enable_prefix_caching
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -63,8 +68,14 @@ class BlockManager:
         cache_miss = False
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
+            h = (
+                self.compute_hash(token_ids, h)
+                if len(token_ids) == self.block_size
+                else -1
+            )
+            block_id = (
+                self.hash_to_block_id.get(h, -1) if self.enable_prefix_caching else -1
+            )
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
             if cache_miss:
@@ -104,7 +115,7 @@ class BlockManager:
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
             assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
+            token_ids = seq.block(seq.num_blocks - 1)
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
