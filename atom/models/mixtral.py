@@ -226,6 +226,7 @@ class MixtralDecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            layer_num=layer_num,
         )
         self.block_sparse_moe = MixtralMoE(
             config=config,
