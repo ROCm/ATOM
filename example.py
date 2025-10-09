@@ -43,7 +43,7 @@ parser.add_argument(
     "--cudagraph-capture-sizes", type=str, default="[1,2,4,8,16]", help="Sizes to capture cudagraph."
 )
 
-parser.add_argument("--level", type=int, default=0, help="The level of compilation")
+parser.add_argument("--level", type=int, default=3, help="The level of compilation")
 
 parser.add_argument(
     "--torch-profiler-dir", type=str, default=None, help="Directory to save torch profiler traces"
