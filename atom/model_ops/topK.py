@@ -4,8 +4,10 @@ from typing import Optional
 
 
 def is_rocm_aiter_fusion_shared_expert_enabled():
-    return False
+    return True
 
+def is_rocm_aiter_fuse_routed_scaling_factor():
+    return False
 
 aiter_topK_meta_data = None
 

@@ -19,6 +19,10 @@ class Context:
     block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
+    max_q_len: Optional[int] = None
+    kv_indptr: Optional[torch.Tensor] = None
+    kv_indices: Optional[torch.Tensor] = None
+    kv_last_page_lens: Optional[torch.Tensor] = None
 
 _CONTEXT = Context()
 
@@ -40,6 +44,10 @@ def set_context(
     context_lens=None,
     block_tables=None,
     dropout_p=0.0,
+    max_q_len=None,
+    kv_indptr=None,
+    kv_indices=None,
+    kv_last_page_lens=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -55,6 +63,10 @@ def set_context(
         context_lens,
         block_tables,
         dropout_p,
+        max_q_len,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
     )
 
 

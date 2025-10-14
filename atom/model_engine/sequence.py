@@ -56,7 +56,7 @@ class Sequence:
     def num_tokens(self, value):
         self._num_tokens = value
         self.num_blocks = (value + self.block_size - 1) // self.block_size
-        self.last_block_num_tokens = value % self.block_size
+        self.last_block_num_tokens = self._num_tokens - (self.num_blocks - 1) * self.block_size
 
     @property
     def is_finished(self):

@@ -49,6 +49,18 @@ parser.add_argument(
     "--torch-profiler-dir", type=str, default=None, help="Directory to save torch profiler traces"
 )
 
+parser.add_argument(
+    "--enable-expert-parallel", action="store_true", help="Enable expert parallel(EP MoE)."
+)
+
+parser.add_argument(
+    "--block-size", type=int, default=16, help="KV cache block size."
+)
+
+parser.add_argument(
+    "--load_dummy", action="store_true", help="Skip loading model weights."
+)
+
 def parse_size_list(size_str: str) -> List[int]:
     import ast
     try:
@@ -66,7 +78,10 @@ def main():
         enforce_eager=args.enforce_eager,
         tensor_parallel_size=args.tensor_parallel_size,
         kv_cache_dtype=args.kv_cache_dtype,
+        kv_cache_block_size=args.block_size,
         port=args.port,
+        load_dummy=args.load_dummy,
+        enable_expert_parallel=args.enable_expert_parallel,
         torch_profiler_dir=args.torch_profiler_dir,
         compilation_config=CompilationConfig(
             level = args.level,

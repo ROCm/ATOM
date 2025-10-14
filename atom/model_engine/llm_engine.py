@@ -28,7 +28,7 @@ class LLMEngine:
 
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
-            self.tokenizer, config.kvcache_block_size
+            self.tokenizer, config.kv_cache_block_size
         )
         self.core_mgr = CoreManager(config)
         logger.info("LLMEngine init")

@@ -117,23 +117,23 @@ class CompilationConfig:
     FULL mode: Capture full cudagraph for all batches. Can be good for small
     models or workloads with small prompts; not supported by many backends.
     Generally for performance FULL_AND_PIECEWISE is better.
-    
+
     FULL_DECODE_ONLY mode: Capture full cudagraph for decode batches only.
     Mixed prefill-decode batches are run without cudagraphs. Can be good for
     decode instances in a P/D setup where prefill is not as important so we
     can save some memory.
-    
+
     FULL_AND_PIECEWISE mode: Capture full cudagraph for decode batches and
     piecewise cudagraph for prefill and mixed prefill-decode batches.
     This is like the most performant mode for most models.
 
     Currently, the cudagraph mode is only used for the v1 engine.
-    Note that the cudagraph logic is generally orthogonal to the 
-    compilation logic. While piecewise cudagraphs require piecewise 
+    Note that the cudagraph logic is generally orthogonal to the
+    compilation logic. While piecewise cudagraphs require piecewise
     compilation (level=PIECEWISE and non-empty splitting_ops), full
     cudagraphs are supported with and without compilation.
-    
-    Warning: This flag is new and subject to change in addition 
+
+    Warning: This flag is new and subject to change in addition
     more modes may be added.
     """
 
@@ -150,7 +150,7 @@ class CompilationConfig:
     cudagraph. If the caller can guarantee that the same input buffers
     are always used, it can set this to False. Otherwise, it should
     set this to True, and the compiler will copy the input to an
-    internally managed buffer. Default is False. 
+    internally managed buffer. Default is False.
     Note that this flag is only effective when cudagraph_mode is PIECEWISE.
     """
 
@@ -346,7 +346,7 @@ class Config:
     hf_config: PretrainedConfig = field(init=False)
     bos_token_id: int = -1
     eos_token_id: int = -1
-    kvcache_block_size: int = 16
+    kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     enable_prefix_caching: bool = False
@@ -357,6 +357,8 @@ class Config:
         default_factory=lambda: QuantizationConfig()
     )
     asyncio_mode: bool = False
+    load_dummy: bool = False
+    enable_expert_parallel: bool = False
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
 
@@ -374,7 +376,9 @@ class Config:
 
     def __post_init__(self):
         # assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 16 == 0
+        assert (self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1), (
+            f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
+        )
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.quant_config = get_quant_config(self.hf_config)
@@ -419,3 +423,16 @@ class Config:
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
+
+
+_current_atom_config: Optional[Config] = None
+
+
+def set_current_atom_config(atom_config: Config):
+    global _current_atom_config
+    _current_atom_config = atom_config
+
+
+def get_current_atom_config() -> Config:
+    assert _current_atom_config is not None, "Current atom config is not set"
+    return _current_atom_config

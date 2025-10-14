@@ -25,7 +25,7 @@ from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_m
 
 
 def divide(numerator, denominator):
-    assert numerator % denominator == 0
+    assert numerator % denominator == 0, f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
 
 
@@ -38,12 +38,14 @@ class LinearBase(nn.Module):
         tp_dim: int | None = None,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = False,
     ):
         if quant_config is None:
             quant_config = QuantizationConfig()
         quant_type = quant_config["quant_type"]
         params_dtype = quant_config["quant_dtype"]
         super().__init__()
+        self.reduce_results = reduce_results
         self.input_size = input_size
         self.output_size = (
             output_size if isinstance(output_size, int) else sum(output_size)
@@ -97,7 +99,7 @@ class LinearBase(nn.Module):
             elif quant_type == QuantType.per_1x128:
                 self.weight_scale = nn.Parameter(
                     torch.empty(
-                        divide(self.output_size, 128),
+                        (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
                         dtype=dtypes.fp32,
                     ),
@@ -232,7 +234,7 @@ class LinearBase(nn.Module):
                     self.bias,
                     dtype=otype,
                 )
-        if self.tp_dim == 1 and self.tp_size > 1:
+        if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 
@@ -400,6 +402,7 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank
@@ -409,6 +412,7 @@ class RowParallelLinear(LinearBase):
             tp_dim=1,
             bias=bias if self.tp_rank == 0 else False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):

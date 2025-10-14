@@ -1,10 +1,8 @@
 from typing import Tuple, Optional, List, Union
 import torch
-from torch.library import Library
-from typing import Callable, Optional, Tuple
-from aiter import per_tensor_quant, dtypes
+from aiter import per_tensor_quant, dtypes, QuantType
 from aiter.ops.shuffle import shuffle_weight
-from aiter.ops.quant import per_tensor_quant
+from torch import nn
 
 def per_tensor_dequantize(
     tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
@@ -81,15 +79,15 @@ def shuffle_weights(
     *tensors: torch.Tensor, layout: tuple[int, int] = (16, 16)
 ) -> tuple[torch.Tensor, ...]:
     """
-    Applies shuffle_weight function from AITER to each 
+    Applies shuffle_weight function from AITER to each
     input tensor and returns them.
-    
+
     Rearranges (shuffles) the input tensor/s
     into a specified block layout for optimized computation.
 
     Args:
         *tensors: Variable number of torch.Tensor objects.
-        layout: A pair of integers specifying the 
+        layout: A pair of integers specifying the
         block sizes used to divide the tensors during shuffling.
         Default is (16, 16).
 
@@ -110,3 +108,18 @@ def per_tensor_dequantize(
     fake_qweight = tensor.to(torch.float16)
     dq_weight = fake_qweight * inv_scale
     return dq_weight
+
+
+def get_and_maybe_dequant_weights(layer: nn.Module) -> torch.Tensor:
+    if layer.quant_type != QuantType.No:
+        # NOTE: This should only be used offline, since it's O(N^3)
+        eye = torch.eye(
+            layer.input_size,
+            dtype=torch.bfloat16,
+            device=layer.weight.device,
+        )
+        dequant_weights = layer(eye)
+        del eye
+        # standardize to (output, input)
+        return dequant_weights.T
+    return layer.weight
