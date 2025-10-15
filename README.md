@@ -39,20 +39,15 @@ docker run -it --network=host \
   rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
 ```
 
-### 3. Install Dependencies
-
-```bash
-pip install transformers zmq ninja xxhash
-```
-
-### 4. Clone and Setup
+### 3. Clone and Setup
 
 ```bash
 git clone https://github.com/valarLip/atom.git
 git clone --recursive https://github.com/ROCm/aiter.git
 cd aiter
 python3 setup.py develop
-cd ..
+cd ../atom
+pip install .
 ```
 
 ## 💡 Usage
@@ -62,7 +57,7 @@ cd ..
 The default optimization level is 3 (running with torch compile). Supported models include **Qwen**, **Llama**, and **Mixtral**.
 
 ```bash
-python example.py --model meta-llama/Meta-Llama-3-8B
+python -m atom.bench.example.py --model meta-llama/Meta-Llama-3-8B
 ```
 
 > **Note:** First-time execution may take approximately 10 minutes for model compilation.
@@ -72,7 +67,7 @@ python example.py --model meta-llama/Meta-Llama-3-8B
 Run performance tests to compare ATOM against vLLM:
 
 ```bash
-python bench_test.py --model Qwen/Qwen3-0.6B
+python -m atom.bench.one_batch.py --model Qwen/Qwen3-0.6B
 ```
 
 ## 📊 Performance Comparison

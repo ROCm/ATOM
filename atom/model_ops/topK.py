@@ -1,13 +1,14 @@
-import torch
 from functools import cache, lru_cache
 from typing import Optional
+
+import torch
 
 
 def is_rocm_aiter_fusion_shared_expert_enabled():
     return True
 
 def is_rocm_aiter_fuse_routed_scaling_factor():
-    return False
+    return True
 
 aiter_topK_meta_data = None
 

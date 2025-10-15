@@ -1,6 +1,4 @@
 import argparse
-import os
-import pstats
 import time
 from random import randint, seed
 
@@ -38,6 +36,8 @@ def main():
     llm = LLMEngine(
         path,
         enforce_eager=False,
+        tensor_parallel_size=1,
+        kv_cache_block_size=16,
         max_model_len=4096,
         port=12345,
         torch_profiler_dir="./log",
@@ -46,7 +46,6 @@ def main():
         ),
     )
 
-
     sampling_params = [
         SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=16)
         for _ in range(num_seqs)
@@ -54,7 +53,7 @@ def main():
 
     print("------start generating------")
 
-    #warm up
+    # warm up
     outputs_ = llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()
     outputs = llm.generate(LONG_PROMPT, sampling_params)

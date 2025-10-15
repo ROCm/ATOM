@@ -1,21 +1,26 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools_scm[toml]>=6.2"]
 
 [project]
 name = "atom"
-version = "0.1.0"
 authors = [{ name = "ValarLip" }]
 license = "MIT"
 readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
-dependencies = [
-]
+dynamic = ["version"]
+dependencies = ["transformers", "zmq", "xxhash"]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage = "https://github.com/valarLip/atom"
+Repository = "https://github.com/valarLip/atom"
+Issues = "https://github.com/valarLip/atom/issues"
+
+[tool.setuptools_scm]
+write_to = "atom/_version.py"
+write_to_template = "__version__ = '{version}'\n"
+fallback_version = "0.1.0"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["python*"]
+include = ["atom*"]

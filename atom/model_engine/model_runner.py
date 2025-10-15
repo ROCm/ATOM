@@ -138,7 +138,6 @@ class ModelRunner:
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
 
-
     def exit(self):
         if not self.still_running:
             return
@@ -203,13 +202,23 @@ class ModelRunner:
             "block_tables": CpuGpuBuffer(
                 max_bs, max_num_blocks, dtype=torch.int32, device=self.device
             ),
-            "cu_seqlens_q": CpuGpuBuffer(max_bs + 1, dtype=torch.int32, device=self.device),
-            "kv_indptr": CpuGpuBuffer(max_bs + 1, dtype=torch.int32, device=self.device),
-            "kv_indices": CpuGpuBuffer(max_bs * max_num_blocks, dtype=torch.int32, device=self.device),
-            "kv_last_page_lens": CpuGpuBuffer(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": CpuGpuBuffer(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "kv_indptr": CpuGpuBuffer(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "kv_indices": CpuGpuBuffer(
+                max_bs * max_num_blocks, dtype=torch.int32, device=self.device
+            ),
+            "kv_last_page_lens": CpuGpuBuffer(
+                max_bs, dtype=torch.int32, device=self.device
+            ),
             "outputs": torch.empty(max_bs, hidden_size, dtype=hidden_type),
         }
-        self.decode_vars["cu_seqlens_q"].cpu.copy_(torch.arange(0, max_bs + 1, step=1, dtype=torch.int32))
+        self.decode_vars["cu_seqlens_q"].cpu.copy_(
+            torch.arange(0, max_bs + 1, step=1, dtype=torch.int32)
+        )
         self.decode_vars["cu_seqlens_q"].copy_to_gpu()
 
         self.decode_vars["kv_last_page_lens"].cpu.fill_(1)
@@ -397,8 +406,8 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
-        cu_seqlens_q = [0]
         dropout_p = 0.0
+        max_q_len = 1
         self.total_blocks = 0
 
         context_lens = [seq.num_tokens for seq in scheduled_batchs.seqs]
@@ -418,10 +427,13 @@ class ModelRunner:
             self.kv_indices: list[int] = []
             self.kv_indptr: list[int] = [0]
             self.kv_last_page_lens: list[int] = []
+            qlens = [1 for seq in scheduled_batchs.seqs]  # TODO support mtp
+            num_scheduled_tokens = np.array(qlens, dtype=np.int32)
+            max_q_len = max(qlens)
+            cu_seqlens_q = np.cumsum(num_scheduled_tokens, dtype=np.int32)
 
             for seq in scheduled_batchs.seqs:
                 current_seq_len = len(seq)
-                cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
                 self._update_paged_kv_tensors(seq.block_table, current_seq_len)
 
         block_tables = self.prepare_block_tables(scheduled_batchs.seqs)
@@ -436,11 +448,15 @@ class ModelRunner:
         if isinstance(self.model, DeepseekV2ForCausalLM) and len(self.kv_indptr) > 0:
             # extend to the maximum number of blocks as returned by the scheduler
             self.kv_indices.extend([0] * (self.total_blocks - len(self.kv_indices)))
-            var["kv_indices"].np[: self.total_blocks] = np.array(self.kv_indices, dtype=np.int64)
+            var["kv_indices"].np[: self.total_blocks] = np.array(
+                self.kv_indices, dtype=np.int64
+            )
             var["kv_indptr"].np[: bs + 1] = np.array(self.kv_indptr, dtype=np.int64)
             var["kv_indptr"].np[bs + 1 : graph_bs + 1] = var["kv_indptr"].np[bs]
-            var["kv_last_page_lens"].np[:bs] = np.array(self.kv_last_page_lens, dtype=np.int64)
-            var["cu_seqlens_q"].np[:bs + 1] = np.array(cu_seqlens_q,  dtype=np.int64)
+            var["kv_last_page_lens"].np[:bs] = np.array(
+                self.kv_last_page_lens, dtype=np.int64
+            )
+            var["cu_seqlens_q"].np[1 : bs + 1] = np.array(cu_seqlens_q, dtype=np.int64)
 
         for el in [
             "slot_mapping",
@@ -451,19 +467,19 @@ class ModelRunner:
             "cu_seqlens_q",
             "kv_indices",
             "kv_indptr",
-            "kv_last_page_lens"
+            "kv_last_page_lens",
         ]:
             var[el].copy_to_gpu()
         set_context(
             False,
             batch_size=bs,
             graph_bs=graph_bs,
-            cu_seqlens_q=var["cu_seqlens_q"].gpu[:bs + 1],
+            cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs, : block_tables.shape[1]],
             dropout_p=dropout_p,
-            max_q_len=1,
+            max_q_len=max_q_len,
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
             kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],

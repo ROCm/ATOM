@@ -1,5 +1,5 @@
-# aiter version
-aiter/_version.py
+# atom version
+atom/_version.py
 
 # Prerequisites
 *.d
