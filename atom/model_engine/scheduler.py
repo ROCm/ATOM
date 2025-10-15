@@ -211,41 +211,60 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], prev_token_ids: list[int], prev_seqs: list[Sequence]):
         # # placeholder for the each decode step
-        token_ids = [self.eos_token_id] * len(seqs)
-        for seq, token_id in zip(seqs, prev_token_ids):
-            seq.append_token(token_id)
+        # token_ids = [self.eos_token_id] * len(seqs)
+        # for seq, token_id in zip(seqs, prev_token_ids):
+        #     seq.append_token(token_id)
+
+        # print('--------------------')
+        # for i, seq in enumerate(prev_seqs): 
+        #     print("prev_seqs", seq.id)
+        #     print(seq.token_ids)
+        # for i, seq in enumerate(seqs): 
+        #     print("seqs", seq.id)
+        #     print(seq.token_ids)
+        # print("prev_token_ids", prev_token_ids)
 
         if not prev_token_ids or not prev_seqs:
             return
         
-        # seq_id_to_index = {seq.id: i for i, seq in enumerate(prev_seqs)}
-        
         # self.unfinished_req = []
-        # for i, seq in enumerate(seqs):
-        #     if seq.id in seq_id_to_index:
-        #         token_idx = seq_id_to_index[seq.id]
-        #         token_id = prev_token_ids[token_idx]
-                
-        #         seq.append_token(token_id)
-                
-        #         leave_reason = None
-        #         if not seq.ignore_eos and token_id == self.eos_token_id:
-        #             leave_reason = "eos"
-        #         elif seq.num_completion_tokens == seq.max_tokens:
-        #             leave_reason = "max_tokens"
-                    
-        #         if leave_reason is not None:
-        #             seq.leave_reason = leave_reason
-        #             seq.status = SequenceStatus.FINISHED
-        #             self.block_manager.deallocate(seq)
-        #             self.running.remove(seq)
-        #         else:
-        #             self.unfinished_req.append(i)
-        #     else:
-        #         print(f"New sequence {seq.id} found in current batch")
+        # processed_seqs = set()
+        
+        # for i, prev_seq in enumerate(prev_seqs):
+        #     token_id = prev_token_ids[i]
+            
+        #     current_seq = None
+        #     for seq in seqs:
+        #         if seq.id == prev_seq.id:
+        #             current_seq = seq
+            
+        #             if current_seq and current_seq.id not in processed_seqs:
+        #                 processed_seqs.add(current_seq.id)
+                        
+        #                 # Check if this token has been used before (to avoid outputting a word repeatedly)
+        #                 if (len(current_seq.token_ids) > prev_seq.num_tokens and
+        #                     current_seq.token_ids[-1] == token_id):
+        #                     print(f"Token {token_id} already applied to sequence {current_seq.id}")
+        #                     continue
+                            
+        #                 current_seq.append_token(token_id)
+        #                 print(f"Applied token {token_id} to sequence {current_seq.id}")
+                        
+        #                 leave_reason = None
+        #                 if not current_seq.ignore_eos and token_id == self.eos_token_id:
+        #                     leave_reason = "eos"
+        #                 elif current_seq.num_completion_tokens == current_seq.max_tokens:
+        #                     leave_reason = "max_tokens"
+                            
+        #                 if leave_reason is not None:
+        #                     current_seq.leave_reason = leave_reason
+        #                     current_seq.status = SequenceStatus.FINISHED
+        #                     self.block_manager.deallocate(current_seq)
+        #                     self.running.remove(current_seq)
+        #                 else:
+        #                     self.unfinished_req.append(i)
 
-
-        # update token_ids with the actual sampled token ids
+        seq_id_to_index = {seq.id: i for i, seq in enumerate(prev_seqs)}
         self.unfinished_req = []
         # prev_token_ids = out.get_output()
         # worker_response_mq.dequeue(

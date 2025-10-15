@@ -28,7 +28,6 @@ from atom.utils.context import get_context, reset_context, set_context
 
 logger = logging.getLogger("atom")
 from atom.utils.forward_context import AttentionMetadata, set_forward_context
-from atom.model_engine.outputs import ModelRunnerOutput, AsyncModelRunnerOutput
 
 suppot_model_arch_dict = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
@@ -36,55 +35,6 @@ suppot_model_arch_dict = {
     "MixtralForCausalLM": MixtralForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
-
-# Wrapper for ModelRunnerOutput to support overlapped execution.
-class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
-
-    def __init__(
-        self,
-        # model_runner_output: ModelRunnerOutput,
-        sampled_token_ids: torch.Tensor,
-        # invalid_req_indices: list[int],
-        async_output_copy_stream: torch.cuda.Stream,
-    ):
-        # self._model_runner_output = model_runner_output
-        # self._invalid_req_indices = invalid_req_indices
-
-        # Event on the copy stream so we can synchronize the non-blocking copy.
-        # self._async_copy_ready_event = torch.cuda.Event()
-
-        # Keep a reference to the device tensor to avoid it being
-        # deallocated until we finish copying it to the host.
-        self._sampled_token_ids = sampled_token_ids
-
-        # Initiate the copy on a separate stream, but do not synchronize it.
-        default_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(async_output_copy_stream):
-            async_output_copy_stream.wait_stream(default_stream)
-            self._sampled_token_ids_cpu = self._sampled_token_ids.to(
-                'cpu', non_blocking=True)
-            # self._async_copy_ready_event.record()
-
-    def get_output(self) -> ModelRunnerOutput:
-        """Copy the device tensors to the host and return a ModelRunnerOutput.
-        
-        This function blocks until the copy is finished.
-        """
-        # self._async_copy_ready_event.synchronize()
-
-        # Release the device tensor once the copy has completed
-        del self._sampled_token_ids
-
-        valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
-        # for i in self._invalid_req_indices:
-        #     valid_sampled_token_ids[i].clear()
-
-        return valid_sampled_token_ids
-        # output = self._model_runner_output
-        # output.sampled_token_ids = valid_sampled_token_ids
-        # return output
-
-
 
 class OutputProcessor:
 
@@ -152,15 +102,20 @@ class OutputProcessor:
             else:
                 self.deferred_request_id.append(req.id)
 
-        if returned_reqIDs:
-            for ids in self.token_ids_cpu[:-1]:
-                ids_list = ids.tolist()
-                for req_id in returned_reqIDs:
-                    self.deferred_request_id.remove(req_id)
-                    req_index = batch.unfinished_prev_req.index(req_id)
-                    batch.unfinished_prev_req.remove(req_id)
-                    req = batch.seqs[req_index]
-                    req.append_token(prev_token_ids[req_index])
+        # prev_seqs = []
+        # if returned_reqIDs:
+        #     # for ids in self.token_ids_cpu[:-1]:
+        #     #     ids_list = ids.tolist()
+        #         for req_id in returned_reqIDs:
+        #             self.deferred_request_id.remove(req_id)
+        #         for i, seq in enumerate(batch.seqs):
+        #             if seq.id in returned_reqIDs:
+        #                 # batch.unfinished_prev_req.remove(i)
+        #                 prev_seqs.append(seq)
+        #             # req_index = batch.unfinished_prev_req.index(req_id)
+        #             # batch.unfinished_prev_req.remove(req_id)
+        #             # req = batch.seqs[req_index]
+        #             # req.append_token(prev_token_ids[req_index])
         return prev_token_ids, prev_seqs
         # self.async_copy_event.synchronize()
 
@@ -712,26 +667,6 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return temperatures
 
-    # def _get_cumsum_and_arange(
-    #     self,
-    #     num_tokens: np.ndarray,
-    #     cumsum_dtype: Optional[np.dtype] = None,
-    # ) -> tuple[np.ndarray, np.ndarray]:
-    #     """Get the cumulative sum and batched arange of the given array.
-    #     # E.g., [2, 5, 3] -> ([2, 7, 10], [0, 1, 0, 1, 2, 3, 4, 0, 1, 2])
-    #     # Equivalent to but faster than:
-    #     # np.concatenate([np.arange(n) for n in num_tokens])
-    #     """
-    #     # Step 1. [2, 5, 3] -> [2, 7, 10]
-    #     cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
-    #     total_num_tokens = cu_num_tokens[-1]
-    #     # Step 2. [2, 7, 10] -> [0, 0, 2, 2, 2, 2, 2, 7, 7, 7]
-    #     cumsums_offsets = np.repeat(cu_num_tokens - num_tokens, num_tokens)
-    #     # Step 3. [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-    #     arange = self.arange_np[:total_num_tokens] - cumsums_offsets
-
-    #     return cu_num_tokens, arange
-
 
     def prepare_model(self, scheduled_batchs: ScheduledBatchs):
         self._update_states(scheduled_batchs)
@@ -742,8 +677,6 @@ class ModelRunner:
         _req_ids = self.input_batch.req_ids
         req_ids = [req_id for req_id in _req_ids if req_id is not None]
 
-        # print("scheduled_batchs.num_scheduled_tokens", scheduled_batchs.num_scheduled_tokens)
-        # print("req_ids", req_ids)
         tokens = [scheduled_batchs.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
@@ -818,9 +751,6 @@ class ModelRunner:
                 batch,
                 sampled_tokens,
             )
-            print("sampled_token_ids", sampled_token_ids)
-            print("prev_token_ids", output)
-            print('----------')
         else:
             output = None
             prev_seqs = None
