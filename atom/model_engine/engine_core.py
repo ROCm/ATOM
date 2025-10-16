@@ -138,9 +138,9 @@ class EngineCore:
 
     def _process_engine_step(self):
         scheduled_batchs = self.scheduler.schedule()
-        out, prev_seqs = self.runner_mgr.call_func("forward", scheduled_batchs, wait_out=True)
+        out = self.runner_mgr.call_func("forward", scheduled_batchs, wait_out=True)
         # scheduled_batchs.prev_seqs = prev_seqs
-        self.scheduler.postprocess(scheduled_batchs.seqs, out, prev_seqs)
+        self.scheduler.postprocess(scheduled_batchs.seqs, out)
         self.output_queue.put_nowait(
             [seq for seq in scheduled_batchs.seqs if seq.is_finished]
         )
