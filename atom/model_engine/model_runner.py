@@ -567,11 +567,12 @@ class ModelRunner:
         num_scheduled_tokens = scheduled_batchs.total_num_scheduled_tokens
         num_input_tokens = num_scheduled_tokens
         prev_input_ids_ = self.input_ids.gpu[:num_input_tokens]
-        prev_positions_ = self.input_batch.prev_position_ids
+        # prev_positions_ = self.input_batch.prev_position_ids
 
         var = self.decode_vars
         var["slot_mapping"].np[:graph_bs] = slot_mapping
-        var["input_ids"].np[:bs] = prev_input_ids_[:bs].cpu()
+        # var["input_ids"].np[:bs] = prev_input_ids_[:bs]
+        var["input_ids"].gpu[:bs] = prev_input_ids_[:bs]
         var["positions"].np[:bs] = positions
         # var["input_ids"].np[:bs] = input_ids
         # var["positions"].np[:bs] = positions
@@ -594,7 +595,7 @@ class ModelRunner:
 
         for el in [
             "slot_mapping",
-            "input_ids",
+            # "input_ids",
             "positions",
             "context_lens",
             "block_tables",
@@ -704,11 +705,6 @@ class ModelRunner:
                 # Cache the sampled tokens on the GPU and avoid CPU sync.
                 # These will be copied into input_ids in the next step
                 # when preparing inputs.
-                # if self.input_batch.prev_sampled_token_ids is None:
-                #     output = None
-                # else:
-                #     output = self.input_batch.prev_sampled_token_ids
-
                 self.input_batch.prev_sampled_token_ids = \
                     sampled_token_ids
                 self.input_batch.prev_req_id_to_index = {
@@ -716,20 +712,10 @@ class ModelRunner:
                     for i, req_id in enumerate(self.input_batch.req_ids)
                 }
                 # plus 1 to fit next iter seq len
-                context_lens = [seq.num_tokens + 1 for seq in batch.seqs]
+                # context_lens = [seq.num_tokens + 1 for seq in batch.seqs]
                 # positions = np.array(context_lens, dtype=np.int64)
 
-                self.input_batch.prev_position_ids = np.array(context_lens, dtype=np.int64)
-
-
-            # output  = AsyncGPUModelRunnerOutput(
-            #     sampled_token_ids=sampled_token_ids,
-            #     # invalid_req_indices=invalid_req_indices,
-            #     async_output_copy_stream=self.async_output_copy_stream,
-            # )
-
-            # .get_output()
-            # self.handle_output(output)
+                # self.input_batch.prev_position_ids = np.array(context_lens, dtype=np.int64)
 
             # token_ids = sampled_tokens.tolist()
             output = self.out_processor.update_and_ret(
