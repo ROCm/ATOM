@@ -220,5 +220,5 @@ class EngineCore:
     def stop_profiler(self):
         if self.profile_enbaled:
             print("Stopping profiler...")
-            self.runner_mgr.call_func("stop_profiler")
+            self.runner_mgr.call_func("stop_profiler", wait_out=True)
             print("Profiler stopped.")

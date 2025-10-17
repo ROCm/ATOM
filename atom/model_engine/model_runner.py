@@ -213,6 +213,7 @@ class ModelRunner:
         if self.profiler is not None:
             self.profiler.__exit__(None, None, None)
             self.profiler = None
+        return True
 
     def warmup_model(self):
         torch.cuda.empty_cache()
