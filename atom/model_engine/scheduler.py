@@ -23,10 +23,6 @@ class ScheduledBatchs:
     # Total number of tokens scheduled for all requests.
     # Equal to sum(num_scheduled_tokens.values())
     total_num_scheduled_tokens: int
-        # Cached reference to the GPU tensor of previously sampled tokens
-    # prev_sampled_token_ids: Optional[torch.Tensor] = None
-    # prev_sampled_token_ids_invalid_indices: Optional[set[int]] = None
-    # prev_req_id_to_index: Optional[dict[str, int]] = None
 
 
 class PrevScheduledBatchs:
@@ -94,7 +90,6 @@ class PrevScheduledBatchs:
         # self.req_id_to_index[req_id] = new_req_index
 
         # self._req_ids.append(req_id)
-        # print("req_id:", req_id)
 
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense().
@@ -224,12 +219,9 @@ class Scheduler:
 
         # update token_ids with the actual sampled token ids
         self.unfinished_req = []
-        # prev_token_ids = out.get_output()
-        # worker_response_mq.dequeue(
         token_ids = prev_token_ids
         for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
-            # if seq.id in prev_seqs:
-            #     seq.append_token(token_id)
+            # seq.append_token(token_id)
             seq.token_ids[-2] = token_id
             leave_reason = None
             

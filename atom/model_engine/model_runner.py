@@ -59,7 +59,6 @@ class OutputProcessor:
             self.async_copy_stream.wait_stream(default_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             self.async_copy_event.record(self.async_copy_stream)
-        # self.token_ids_gpu.append(gpu_tensor)
         self.token_ids_cpu.append(cpu_tensor)
         self.pending_outputs.append((cpu_tensor, batch.seqs))
 
@@ -89,7 +88,6 @@ class OutputProcessor:
         self, batch: ScheduledBatchs, sampled_token_ids: torch.Tensor
     ) -> list[int]:
         token_ids = self.recv_async_output()
-        # prev_token_ids, prev_seqs = self.revc_async_output_tuple()
         self.send_to_cpu_async(batch, sampled_token_ids)
 
         return token_ids
@@ -129,7 +127,7 @@ class ModelRunner:
         self.out_processor = OutputProcessor()
         self.sampler = Sampler()
 
-        self.input_batch = PrevScheduledBatchs(
+        self.prev_input_batch = PrevScheduledBatchs(
             max_num_reqs=self.config.max_num_seqs,
             max_model_len=self.config.max_model_len)
 
@@ -236,7 +234,6 @@ class ModelRunner:
             num_scheduled_tokens[seq.id] = 1
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        # print("total_num_scheduled_tokens dummy_batch", total_num_scheduled_tokens)
         dummy_batch = ScheduledBatchs(seqs, True, False, seqs, num_scheduled_tokens, total_num_scheduled_tokens)
         self.forward(dummy_batch)
         self.out_processor.clean_token()
@@ -406,7 +403,7 @@ class ModelRunner:
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
 
-        if self.input_batch.prev_sampled_token_ids is None:
+        if self.prev_input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
             return
@@ -414,13 +411,13 @@ class ModelRunner:
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
         # on the GPU from prev_sampled_token_ids.
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        prev_req_id_to_index = self.prev_input_batch.prev_req_id_to_index
         assert prev_req_id_to_index is not None
         flattened_indices = []
         prev_common_req_indices = []
         indices_match = True
         max_flattened_index = -1
-        for req_id, cur_index in self.input_batch.req_id_to_index.items():
+        for req_id, cur_index in self.prev_input_batch.req_id_to_index.items():
             if (prev_index := prev_req_id_to_index.get(req_id)) is not None:
                 prev_common_req_indices.append(prev_index)
                 # We need to compute the flattened input_ids index of the
@@ -445,7 +442,7 @@ class ModelRunner:
             # The indices are both the same permutation of 0..N-1 so
             # we can copy directly using a single slice.
             self.input_ids.gpu[:num_commmon_tokens].copy_(
-                self.input_batch.prev_sampled_token_ids[:num_commmon_tokens],
+                self.prev_input_batch.prev_sampled_token_ids[:num_commmon_tokens],
                 non_blocking=True)
             return
         # Upload the index tensors asynchronously
@@ -460,7 +457,7 @@ class ModelRunner:
         self.input_ids.gpu.scatter_(
             dim=0,
             index=self.input_ids_index_tensor.gpu[:num_commmon_tokens],
-            src=self.input_batch.prev_sampled_token_ids[
+            src=self.prev_input_batch.prev_sampled_token_ids[
             self.prev_common_req_indices_tensor.gpu[:num_commmon_tokens]])
         #         prev_common_req_indices_tensor, 0])
 
@@ -525,7 +522,7 @@ class ModelRunner:
         )
         assert graph_bs >= bs, f"current decode {bs=} > max graph_bs{graph_bs}"
         input_ids = []
-        # positions = []
+        positions = []
         slot_mapping = []
         context_lens = []
         dropout_p = 0.0
@@ -564,15 +561,11 @@ class ModelRunner:
         num_scheduled_tokens = scheduled_batchs.total_num_scheduled_tokens
         num_input_tokens = num_scheduled_tokens
         prev_input_ids_ = self.input_ids.gpu[:num_input_tokens]
-        # prev_positions_ = self.input_batch.prev_position_ids
 
         var = self.decode_vars
         var["slot_mapping"].np[:graph_bs] = slot_mapping
-        # var["input_ids"].np[:bs] = prev_input_ids_[:bs]
         var["input_ids"].gpu[:bs] = prev_input_ids_[:bs]
         var["positions"].np[:bs] = positions
-        # var["input_ids"].np[:bs] = input_ids
-        # var["positions"].np[:bs] = positions
 
         var["context_lens"].np[:bs] = context_lens
         var["block_tables"].np[:bs, : block_tables.shape[1]] = block_tables
@@ -673,7 +666,7 @@ class ModelRunner:
         total_num_scheduled_tokens = scheduled_batchs.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
 
-        _req_ids = self.input_batch.req_ids
+        _req_ids = self.prev_input_batch.req_ids
         req_ids = [req_id for req_id in _req_ids if req_id is not None]
 
         tokens = [scheduled_batchs.num_scheduled_tokens[i] for i in req_ids]
@@ -723,18 +716,16 @@ class ModelRunner:
                 # These will be copied into input_ids in the next step
                 # when preparing inputs.
                 invalid_req_indices_set = [None]
-                self.input_batch.prev_sampled_token_ids = \
+                self.prev_input_batch.prev_sampled_token_ids = \
                     sampled_token_ids
-                self.input_batch.prev_req_id_to_index = {
+                self.prev_input_batch.prev_req_id_to_index = {
                     req_id: i
-                    for i, req_id in enumerate(self.input_batch.req_ids)
+                    for i, req_id in enumerate(self.prev_input_batch.req_ids)
                     if req_id not in invalid_req_indices_set
                 }
                 # plus 1 to fit next iter seq len
                 # context_lens = [seq.num_tokens + 1 for seq in batch.seqs]
                 # positions = np.array(context_lens, dtype=np.int64)
-
-                # self.input_batch.prev_position_ids = np.array(context_lens, dtype=np.int64)
 
             # token_ids = sampled_tokens.tolist()
             output = self.out_processor.update_and_ret(
@@ -743,20 +734,19 @@ class ModelRunner:
             )
         else:
             output = None
-        # self.worker_response_mq.enqueue(result)
         return output
 
     def _update_states(self, batch: ScheduledBatchs):
-        for req_id in self.input_batch.finished_req_ids:
-            self.input_batch.remove_request(req_id)
+        for req_id in self.prev_input_batch.finished_req_ids:
+            self.prev_input_batch.remove_request(req_id)
 
         for request in batch.seqs:
-            self.input_batch.add_request(request)
+            self.prev_input_batch.add_request(request)
     
     def finish_req(self, batch: ScheduledBatchs):
-        request_id = self.input_batch.req_ids
+        request_id = self.prev_input_batch.req_ids
         for id in request_id:
-            self.input_batch.finished_req_ids.add(id)
+            self.prev_input_batch.finished_req_ids.add(id)
 
 
     @torch.inference_mode()
@@ -766,8 +756,6 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, batch.is_prefill)
         reset_context()
         self.finish_req(batch)
-        # self.postprocess(batch, logits, temperatures)
-        # return self.async_get_output()
         return self.postprocess(batch, logits, temperatures)
 
     @torch.inference_mode()
