@@ -604,16 +604,17 @@ class ModelRunner:
                 self.kv_indptr, dtype=np.int64
             )
             var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = var["kv_indptr"].np[bs]
-            var["kv_last_page_lens"].np[:bs] = np.array(
+            var["kv_last_page_lens"].np[:scheduled_bs] = np.array(
                 self.kv_last_page_lens, dtype=np.int64
             )
+            var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
             vars_used = [
                 ("slot_mapping", bs),  # TODO: MTP support
                 ("context_lens", bs),
                 ("block_tables", bs),
                 ("cu_seqlens_q", bs + 1),
-                ("kv_indices", bs),
-                ("kv_indptr", bs),
+                ("kv_indices", sum(context_lens)),
+                ("kv_indptr", bs + 1),
                 ("kv_last_page_lens", bs),
             ]
 
@@ -716,17 +717,6 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         start_time = time.time()
-        input_ids = self.forward_vars["input_ids"].gpu
-        positions = self.forward_vars["positions"].gpu
-        slot_mapping = self.forward_vars["slot_mapping"].gpu
-        context_lens = self.forward_vars["context_lens"].gpu
-        block_tables = self.forward_vars["block_tables"].gpu
-        cu_seqlens_q = self.forward_vars["cu_seqlens_q"].gpu
-        kv_indptr = self.forward_vars["kv_indptr"].gpu
-        kv_indices = self.forward_vars["kv_indices"].gpu
-        kv_last_page_lens = self.forward_vars["kv_last_page_lens"].gpu
-        outputs = self.forward_vars["outputs"]
-
         # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.config.compilation_config.cudagraph_capture_sizes
@@ -739,6 +729,21 @@ class ModelRunner:
             elif len(cuda_graph_sizes) > 1:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
+
+        self.forward_vars["cu_seqlens_q"].np[: self.graph_bs[0] + 1] = np.arange(
+            0, self.graph_bs[0] + 1
+        )
+        self.forward_vars["cu_seqlens_q"].copy_to_gpu(self.graph_bs[0] + 1)
+        input_ids = self.forward_vars["input_ids"].gpu
+        positions = self.forward_vars["positions"].gpu
+        slot_mapping = self.forward_vars["slot_mapping"].gpu
+        context_lens = self.forward_vars["context_lens"].gpu
+        block_tables = self.forward_vars["block_tables"].gpu
+        cu_seqlens_q = self.forward_vars["cu_seqlens_q"].gpu
+        kv_indptr = self.forward_vars["kv_indptr"].gpu
+        kv_indices = self.forward_vars["kv_indices"].gpu
+        kv_last_page_lens = self.forward_vars["kv_last_page_lens"].gpu
+        outputs = self.forward_vars["outputs"]
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = dict()
         self.graph_pool = None
