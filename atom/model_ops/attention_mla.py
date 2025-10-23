@@ -343,7 +343,7 @@ def _forward_linear_fp8_no_bias(x: torch.Tensor, weight: torch.Tensor, weight_sc
     quant_func = get_hip_quant(quant_type)
     x, x_scale = quant_func(
         x,
-        quant_dtype=torch.float8_e4m3fnuz,
+        quant_dtype=dtypes.fp8,
         scale=None,
     )
     y = gemm_a8w8_blockscale(
