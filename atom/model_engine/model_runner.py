@@ -230,8 +230,11 @@ class ModelRunner:
         )
         self.async_output_copy_stream = torch.cuda.Stream()
         self.model = suppot_model_arch_dict[hf_config.architectures[0]](config)
+        self.use_kv_indptr = False
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        if isinstance(self.model, DeepseekV2ForCausalLM):
+            self.use_kv_indptr = True
         torch.set_default_device("cuda")
         self.allocate_forward_vars()
         self.warmup_model()
@@ -573,7 +576,7 @@ class ModelRunner:
         ]
         slot_mapping.extend([-1] * (bs - scheduled_bs))
 
-        if isinstance(self.model, DeepseekV2ForCausalLM):
+        if self.use_kv_indptr:
             assert self.block_size == 1, "AITER MLA requires only block size 1."
             self.kv_indices: list[int] = []
             self.kv_indptr: list[int] = [0]
@@ -596,7 +599,7 @@ class ModelRunner:
             ("block_tables", bs),
         ]
 
-        if isinstance(self.model, DeepseekV2ForCausalLM) and len(self.kv_indptr) > 0:
+        if self.use_kv_indptr and len(self.kv_indptr) > 0:
             # extend to the maximum number of blocks as returned by the scheduler
             self.kv_indices.extend([0] * (self.total_blocks - len(self.kv_indices)))
             var["kv_indices"].np[: self.total_blocks] = np.array(
