@@ -24,6 +24,7 @@ from atom.model_ops.utils import (
     per_tensor_dequantize,
     shuffle_weights,
 )
+from atom.utils.custom_register import direct_register_custom_op
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
@@ -169,6 +170,56 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         )
 
 
+def rocm_aiter_fused_moe_impl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe
+
+    activation_ = ActivationType(activation)
+    quant_type_ = QuantType(quant_type)
+
+    return fused_moe(hidden_states, w1, w2, topk_weight, topk_ids, expert_mask,
+                     activation_, quant_type_, doweight_stage1, w1_scale,
+                     w2_scale, a1_scale, a2_scale)
+
+
+def rocm_aiter_fused_moe_fake(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+direct_register_custom_op(
+    op_name="rocm_aiter_fused_moe",
+    op_func=rocm_aiter_fused_moe_impl,
+    mutates_args=[],
+    fake_impl=rocm_aiter_fused_moe_fake,
+)
+
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -302,9 +353,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # If loading fp8 checkpoint, pass the weight loaders.
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
-        if self.quant_config["quant_dtype"] == torch.float8_e4m3fnuz:
-            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # INPUT_SCALES
         if not self.quant_config["is_dynamic"]:
@@ -477,24 +527,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        return fused_moe(
+        
+        return torch.ops.aiter.rocm_aiter_fused_moe(
             x,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weight=topk_weights,
-            topk_ids=topk_ids,
+            topk_weights,
+            topk_ids,
             expert_mask=expert_map,
-            activation=activation,
-            quant_type=self.quant_type,
-            w1_scale=(
-                layer.w13_weight_scale if self.block_quant else layer.w13_weight_scale
-            ),
-            w2_scale=(
-                layer.w2_weight_scale if self.block_quant else layer.w2_weight_scale
-            ),
+            activation=activation.value,
+            quant_type=self.quant_type.value,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-        )
+            doweight_stage1=apply_router_weight_on_input)
+
 
 
 def determine_expert_map(

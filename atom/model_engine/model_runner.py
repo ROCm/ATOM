@@ -9,7 +9,6 @@ import torch.profiler as torch_profiler
 import tqdm
 from aiter import destroy_dist_env, dtypes, init_dist_env
 from aiter.dist.parallel_state import graph_capture
-
 from atom.config import Config, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence
@@ -31,12 +30,16 @@ suppot_model_arch_dict = {
     "MixtralForCausalLM": MixtralForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
+# seed=1
+# np.random.seed(seed)
+# torch.cuda.manual_seed_all(seed)
 
 
 class tokenIDProcessor:
 
     def __init__(self, max_num_batched_tokens: int, device: torch.device):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
+        # self.is_deferred_out = False
         self.is_deferred_out = True
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens, dtype=torch.int32, device=device
@@ -77,7 +80,9 @@ class tokenIDProcessor:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             seq_ids = batch.seqs.keys()
-            return {seq_id: token_id for seq_id, token_id in zip(seq_ids, token_ids)}
+            ret = {seq_id: token_id for seq_id, token_id in zip(seq_ids, token_ids)}
+            ret[-1] = 0
+            return ret
         token_ids = self.recv_async_output()
         self.send_to_cpu_async(sampled_token_ids)
 
@@ -92,6 +97,7 @@ class tokenIDProcessor:
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
+        token_ids[-1] = 1
         return token_ids
 
     def get_prev_alive_locations(self, batch: ScheduledBatch) -> tuple[list[int], bool]:
@@ -180,7 +186,6 @@ class tokenIDProcessor:
         else:
             # TODO: new requests' input_ids need to be filled in
             assert False, "TODO new requests' input_ids need to be filled in"
-        # print(f"{self.input_ids.gpu[:total_tokens]=}")
         return self.input_ids.gpu[:total_tokens]
 
 
@@ -230,8 +235,11 @@ class ModelRunner:
         )
         self.async_output_copy_stream = torch.cuda.Stream()
         self.model = suppot_model_arch_dict[hf_config.architectures[0]](config)
+        self.use_kv_indptr = False
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        if isinstance(self.model, DeepseekV2ForCausalLM):
+            self.use_kv_indptr = True
         torch.set_default_device("cuda")
         self.allocate_forward_vars()
         self.warmup_model()
@@ -477,7 +485,16 @@ class ModelRunner:
                     576,
                 )
                 module.max_model_len = self.config.max_model_len
+                attention_metadata = AttentionMetadata(
+                    k_cache=module.kv_cache,
+                    v_cache=None,
+                    k_scale=None,
+                    v_scale=None,
+                )
+                set_forward_context(module.layer_num, attention_metadata)
                 layer_id += 1
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         return True
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -564,7 +581,7 @@ class ModelRunner:
         ]
         slot_mapping.extend([-1] * (bs - scheduled_bs))
 
-        if isinstance(self.model, DeepseekV2ForCausalLM):
+        if self.use_kv_indptr:
             assert self.block_size == 1, "AITER MLA requires only block size 1."
             self.kv_indices: list[int] = []
             self.kv_indptr: list[int] = [0]
@@ -587,7 +604,7 @@ class ModelRunner:
             ("block_tables", bs),
         ]
 
-        if isinstance(self.model, DeepseekV2ForCausalLM) and len(self.kv_indptr) > 0:
+        if self.use_kv_indptr and len(self.kv_indptr) > 0:
             # extend to the maximum number of blocks as returned by the scheduler
             self.kv_indices.extend([0] * (self.total_blocks - len(self.kv_indices)))
             var["kv_indices"].np[: self.total_blocks] = np.array(
@@ -596,7 +613,9 @@ class ModelRunner:
             var["kv_indptr"].np[: scheduled_bs + 1] = np.array(
                 self.kv_indptr, dtype=np.int64
             )
-            var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = var["kv_indptr"].np[bs]
+            var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = var["kv_indptr"].np[
+                scheduled_bs
+            ]
             var["kv_last_page_lens"].np[:scheduled_bs] = np.array(
                 self.kv_last_page_lens, dtype=np.int64
             )
@@ -664,6 +683,7 @@ class ModelRunner:
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
 
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
+        # print(f"{input_ids=}")
 
         is_prefill = batch.total_tokens_num_prefill > 0
         prepare_func = self.prepare_prefill if is_prefill else self.prepare_decode
@@ -694,6 +714,8 @@ class ModelRunner:
         temperatures: torch.Tensor,
     ) -> dict[int, int]:
         sampled_tokens = self.sampler(logits, temperatures)
+        # print(f"{logits=}")
+        # print(f"{sampled_tokens=}")
         token_ids = self.tokenID_processor.prepare_sampled_ids(
             batch,
             sampled_tokens,

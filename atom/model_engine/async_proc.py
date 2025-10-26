@@ -6,14 +6,12 @@ import signal
 import threading
 import weakref
 from contextlib import ExitStack
-from multiprocessing.shared_memory import SharedMemory
-from multiprocessing.synchronize import Event
 from threading import Thread
 from typing import List
 
 import zmq
 import zmq.asyncio
-
+from aiter.dist.shm_broadcast import MessageQueue
 from atom.utils import (
     get_mp_context,
     get_open_zmq_ipc_path,
@@ -31,26 +29,21 @@ class AsyncIOProc:
     def __init__(
         self,
         label: str,
-        label_shm: str,
         io_addrs: tuple[str, str],
-        sync_event: Event,
+        input_shm_handle: int,
         # runner class and its args
         runner_qualname: str,  # atom.model_engine.model_runner.ModelRunner
+        rank: int,
         *args,
         **kwargs,
     ):
         self.label = f"AsyncIOProc({label})"
-        self.sync_event = sync_event
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads = []
-        self.shm = SharedMemory(name=f"atom_{label_shm}_shm")
-        init_exit_handler(self)
-
+        self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
         # make sure exit handler is set before runner is created
-        runner_class = resolve_obj_by_qualname(runner_qualname)  # type: ignore
-        self.runners = []
-        self.runners.append(runner_class(*args, **kwargs))
+        init_exit_handler(self)
         for addr, q, func in zip(
             self.io_addrs,
             self.io_queues,
@@ -61,6 +54,10 @@ class AsyncIOProc:
             t = threading.Thread(target=func, args=(addr, q), daemon=True)
             t.start()
             self.io_threads.append(t)
+
+        runner_class = resolve_obj_by_qualname(runner_qualname)  # type: ignore
+        self.runners = []
+        self.runners.append(runner_class(rank, *args, **kwargs))
         self.busy_loop()
 
     def exit(self):
@@ -70,7 +67,6 @@ class AsyncIOProc:
         logger.debug(f"{self.label}: Shutting down runner...")
         for el in self.runners:
             el.exit()
-        self.shm.close()
         for t in self.io_threads:
             t.join(timeout=0.5)
 
@@ -120,10 +116,7 @@ class AsyncIOProc:
         logger.debug(f"{self.label}: exit busy_loop...")
 
     def get_func(self):
-        self.sync_event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4 : n + 4])
-        self.sync_event.clear()
+        method_name, *args = self.rpc_broadcast_mq.dequeue()
         return method_name, args
 
 
@@ -133,28 +126,35 @@ class AsyncIOProcManager:
         self.parent_finalizer = finalizer
         io_addrs = [get_open_zmq_ipc_path(), get_open_zmq_ipc_path()]
         self.procs = []
-        self.sync_events = []
         ctx = get_mp_context()
         self.mp_ctx = ctx
         self.runner_label = runner.split(".")[-1]
         self.label = f"AsyncIOProcManager({self.runner_label})"
-        self.create_shared_memory()
+        self.rpc_broadcast_mq = MessageQueue(
+            proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024
+        )
+        scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         self.still_running = True
         init_exit_handler(self)
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
             addrs = (
-                io_addrs if i == 0 else [io_addrs[0], None]
+                [None, io_addrs[1]] if i == 0 else [None, None]
             )  # only get output from rank 0
-            sync_event = ctx.Event()
             process = ctx.Process(
                 target=AsyncIOProc,
                 name=label,
-                args=(label, self.runner_label, addrs, sync_event, runner, i, *args),
+                args=(
+                    label,
+                    addrs,
+                    scheduler_output_handle,
+                    runner,
+                    i,
+                    *args,
+                ),
             )
             process.start()
             self.procs.append(process)
-            self.sync_events.append(sync_event)
 
         self.zmq_ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue()
@@ -167,16 +167,6 @@ class AsyncIOProcManager:
         self.output_thread.start()
         self.monitor_procs()
 
-    def create_shared_memory(self):
-        name = f"atom_{self.runner_label}_shm"
-        try:
-            self.shm = SharedMemory(name=name, create=True, size=2**20)
-        except FileExistsError:
-            existing_shm = SharedMemory(name=name)
-            existing_shm.close()
-            existing_shm.unlink()
-            self.shm = SharedMemory(name=name, create=True, size=2**20)
-
     def exit(self):
         if not self.still_running:
             return
@@ -184,7 +174,6 @@ class AsyncIOProcManager:
         # 1. kill all runners
         logger.info(f"{self.label}: shutdown all runners...")
         shutdown_all_processes(self.procs, allowed_seconds=1)
-        self.shm.unlink()
         self.procs = []
         self.output_thread.join()
         logger.info(f"{self.label}: All runners are shutdown.")
@@ -213,11 +202,8 @@ class AsyncIOProcManager:
 
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         logger.debug(f"{self.label}: call_func {func_name} {args}")
-        n = pickle.dumps((func_name, *args))
-        self.shm.buf[0:4] = len(n).to_bytes(4, "little")
-        self.shm.buf[4 : len(n) + 4] = n
-        for ev in self.sync_events:
-            ev.set()
+        msg = (func_name, *args)
+        self.rpc_broadcast_mq.enqueue(msg)
         if wait_out:
             ret = self.outputs_queue.get()
             if isinstance(ret, SystemExit):

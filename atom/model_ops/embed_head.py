@@ -40,7 +40,8 @@ class VocabParallelEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor):
         if self.tp_size > 1:
-            mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
+            mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
+            # mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:

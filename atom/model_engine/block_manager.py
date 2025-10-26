@@ -2,7 +2,6 @@ from collections import deque
 
 import numpy as np
 import xxhash
-
 from atom.config import Config
 from atom.model_engine.sequence import Sequence
 
@@ -54,10 +53,11 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
 
-    def _deallocate_block(self, block_id: int) -> Block:
+    def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
+        # self.free_block_ids.appendleft(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= seq.num_blocks
@@ -115,7 +115,9 @@ class BlockManager:
             block_table.append(block_id)
             if self.block_size == 1:
                 token_ids = [seq[-1]]
-                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                prefix = (
+                    self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                )
                 h = self.compute_hash(token_ids, prefix)
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id

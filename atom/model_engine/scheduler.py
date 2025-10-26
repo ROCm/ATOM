@@ -5,7 +5,6 @@ from typing import Any, Optional, cast
 
 import numpy as np
 import torch
-
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -150,7 +149,7 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], prev_token_ids: dict[int, int]):
-        is_deferred_out = True
+        is_deferred_out = prev_token_ids[-1]
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         for seq in self.running:
