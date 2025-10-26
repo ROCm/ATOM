@@ -9,7 +9,6 @@ import torch.profiler as torch_profiler
 import tqdm
 from aiter import destroy_dist_env, dtypes, init_dist_env
 from aiter.dist.parallel_state import graph_capture
-
 from atom.config import Config, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence
@@ -31,12 +30,16 @@ suppot_model_arch_dict = {
     "MixtralForCausalLM": MixtralForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
 }
+# seed=1
+# np.random.seed(seed)
+# torch.cuda.manual_seed_all(seed)
 
 
 class tokenIDProcessor:
 
     def __init__(self, max_num_batched_tokens: int, device: torch.device):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
+        # self.is_deferred_out = False
         self.is_deferred_out = True
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens, dtype=torch.int32, device=device
@@ -77,7 +80,9 @@ class tokenIDProcessor:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             seq_ids = batch.seqs.keys()
-            return {seq_id: token_id for seq_id, token_id in zip(seq_ids, token_ids)}
+            ret = {seq_id: token_id for seq_id, token_id in zip(seq_ids, token_ids)}
+            ret[-1] = 0
+            return ret
         token_ids = self.recv_async_output()
         self.send_to_cpu_async(sampled_token_ids)
 
@@ -92,6 +97,7 @@ class tokenIDProcessor:
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
+        token_ids[-1] = 1
         return token_ids
 
     def get_prev_alive_locations(self, batch: ScheduledBatch) -> tuple[list[int], bool]:
@@ -180,7 +186,6 @@ class tokenIDProcessor:
         else:
             # TODO: new requests' input_ids need to be filled in
             assert False, "TODO new requests' input_ids need to be filled in"
-        # print(f"{self.input_ids.gpu[:total_tokens]=}")
         return self.input_ids.gpu[:total_tokens]
 
 
@@ -678,6 +683,7 @@ class ModelRunner:
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
 
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
+        # print(f"{input_ids=}")
 
         is_prefill = batch.total_tokens_num_prefill > 0
         prepare_func = self.prepare_prefill if is_prefill else self.prepare_decode
@@ -708,6 +714,8 @@ class ModelRunner:
         temperatures: torch.Tensor,
     ) -> dict[int, int]:
         sampled_tokens = self.sampler(logits, temperatures)
+        # print(f"{logits=}")
+        # print(f"{sampled_tokens=}")
         token_ids = self.tokenID_processor.prepare_sampled_ids(
             batch,
             sampled_tokens,
