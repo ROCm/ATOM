@@ -427,3 +427,47 @@ class RowParallelLinear(LinearBase):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
+
+
+class MergedReplicatedLinear(ReplicatedLinear):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: list[int],
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        **kwargs,
+    ):
+        self.output_sizes = output_size
+        super().__init__(
+            input_size,
+            sum(output_size),  # ？
+            bias=bias,
+            quant_config=quant_config,
+        )
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: Optional[int] = None,
+    ):  # ？
+        param_data = param.data
+        assert loaded_shard_id is not None
+        assert loaded_shard_id < len(self.output_sizes)
+        if param is getattr(self, "weight_scale", None) or param is getattr(
+            self, "input_scale", None
+        ):
+            if self.quant_type == QuantType.per_1x128:
+                shard_offset = (
+                    sum(self.output_sizes[:loaded_shard_id]) + 128 - 1
+                ) // 128
+                shard_size = (self.output_sizes[loaded_shard_id] + 128 - 1) // 128
+            elif self.quant_type == QuantType.per_Tensor:
+                shard_offset = loaded_shard_id
+                shard_size = 1
+        else:
+            shard_offset = sum(self.output_sizes[:loaded_shard_id])
+            shard_size = self.output_sizes[loaded_shard_id]
+        param_data = param_data.narrow(0, shard_offset, shard_size)
+        param.weight_loader_process(param_data, loaded_weight)

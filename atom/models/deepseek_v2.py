@@ -63,6 +63,7 @@ from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    MergedReplicatedLinear
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
@@ -496,11 +497,16 @@ class DeepseekV2MLAAttention(nn.Module):
         self.layer_num = layer_num
 
         if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(self.hidden_size,
-                                             self.q_lora_rank,
-                                             bias=False,
-                                             quant_config=quant_config,
-                                             prefix=f"{prefix}.q_a_proj")
+            # self.q_a_proj = ReplicatedLinear(self.hidden_size,
+            #                                  self.q_lora_rank,
+            #                                  bias=False,
+            #                                  quant_config=quant_config,
+            #                                  prefix=f"{prefix}.q_a_proj")
+            self.fused_qkv_a_proj = MergedReplicatedLinear(
+                self.hidden_size,
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                bias=False,
+                quant_config=quant_config)
             self.q_a_layernorm = RMSNorm(self.q_lora_rank,
                                          eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(q_lora_rank,
@@ -517,12 +523,12 @@ class DeepseekV2MLAAttention(nn.Module):
                                                quant_config=quant_config,
                                                prefix=f"{prefix}.q_proj")
 
-        self.kv_a_proj_with_mqa = ReplicatedLinear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_a_proj_with_mqa")
+            self.kv_a_proj_with_mqa = ReplicatedLinear(
+                self.hidden_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.kv_a_proj_with_mqa")
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
                                       eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -551,7 +557,6 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        
         self.is_v32 = hasattr(config, "index_topk")
 
         if self.is_v32:
@@ -607,12 +612,18 @@ class DeepseekV2MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         if self.q_lora_rank is not None:
-            ckq = self.q_a_proj(hidden_states)
-            hidden_states_or_q_c = self.q_a_layernorm(ckq)
+            qkv_lora = self.fused_qkv_a_proj(hidden_states)
+            # ckq = self.q_a_proj(hidden_states)
+            q_c, kv_c, k_pe = torch.split(
+                qkv_lora,
+                [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
+                dim=-1,
+            )
+            hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
             hidden_states_or_q_c = hidden_states
-        kv_c, k_pe = torch.split(self.kv_a_proj_with_mqa(hidden_states),
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            kv_c, k_pe = torch.split(self.kv_a_proj_with_mqa(hidden_states),
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
         if self.is_v32 and self.indexer is not None:
             _topk_indices = self.indexer(hidden_states, hidden_states_or_q_c, positions, self.rotary_emb)
@@ -833,13 +844,12 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+    # packed_modules_mapping = {
+    #     "q_a_proj" : ("fused_qkv_a_proj", 0),
+    #     "kv_a_proj_with_mqa":  ("fused_qkv_a_proj", 1),
+    #     "gate_proj": ("gate_up_proj", 0),
+    #     "up_proj": ("gate_up_proj", 1),
+    # }
 
     def __init__(
             self,
@@ -852,6 +862,20 @@ class DeepseekV2ForCausalLM(nn.Module):
         quant_config = atom_config.quant_config
         self.config = config
         self.quant_config = quant_config
+
+        if hasattr(config, 'q_lora_rank') and config.q_lora_rank is not None:
+            self.packed_modules_mapping = {
+                "q_a_proj": ("fused_qkv_a_proj", 0),
+                "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
+                "gate_proj": ("gate_up_proj", 0),
+                "up_proj": ("gate_up_proj", 1),
+            }
+        else:
+            self.packed_modules_mapping = {
+                "gate_proj": ("gate_up_proj", 0),
+                "up_proj": ("gate_up_proj", 1),
+            }
+
         self.model = DeepseekV2Model(atom_config=atom_config,
                                      prefix=maybe_prefix(prefix, "model"),
                                      layer_type = layer_type)
