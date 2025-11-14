@@ -156,11 +156,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
         if self.is_sparse:
-            block_tables = var["block_tables"].np
-            for i, seq in enumerate(seqs):
-                block_tables[i] = 0
-                if len(seq.block_table) > 0:
-                    block_tables[i, : seq.num_blocks] = seq.block_table
+            self.prepare_block_tables(seqs)
+            attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
             var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
                 np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
             )
@@ -190,8 +187,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ]
 
         var = self.model_runner.forward_vars
-        self.prepare_block_tables(seqs)
-
         sum_scheduled_tokens = batch.total_tokens_num_decode
         var["slot_mapping"].np[:scheduled_bs] = slot_mapping
         var["slot_mapping"].np[scheduled_bs:bs] = -1
@@ -214,13 +209,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         vars_used = [
             ("slot_mapping", bs),  # TODO: MTP support
             ("context_lens", bs),
-            ("block_tables", bs),
             ("cu_seqlens_q", bs + 1),
             ("kv_indptr", bs + 1),
             ("kv_indices", sum_blocks),
             ("kv_last_page_lens", bs),
         ]
         if self.is_sparse:
+            self.prepare_block_tables(seqs)
+            vars_used.append(("block_tables", bs))
             index_topk = self.index_topk
             sparse_context_lens = np.clip(var["context_lens"].np[:bs], None, index_topk)
             var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(

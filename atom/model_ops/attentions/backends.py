@@ -121,7 +121,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         block_tables = var["block_tables"].np
         for i, seq in enumerate(seqs):
             block_tables[i] = 0
-            block_tables[i, : seq.num_blocks] = seq.block_table
+            if len(seq.block_table) > 0:
+                block_tables[i, : seq.num_blocks] = seq.block_table
 
     def prepare_prefill(self, batch: ScheduledBatch):
         bs = batch.total_seqs_num_prefill
@@ -160,7 +161,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         min_seqlen_q = 0
         dropout_p = 0.0
         vars_used = [
-            ("block_tables", bs),
             ("cu_seqlens_q", bs + 1),
             ("slot_mapping", len(slot_mapping)),
         ]
