@@ -237,10 +237,6 @@ class ModelRunner:
             self.block_size,
             use_mla=self.use_mla,
         )
-        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
-            self.block_size,
-            self.device,
-        )
         self.tokenID_processor = tokenIDProcessor(
             self.config.max_num_batched_tokens, self.device
         )
@@ -262,6 +258,7 @@ class ModelRunner:
             self.use_kv_indptr = True
         torch.set_default_device("cuda")
         self.allocate_forward_vars()
+        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
         torch.set_default_device("cpu")
@@ -391,9 +388,8 @@ class ModelRunner:
         config = self.config
         hidden_size = config.hf_config.hidden_size
         hidden_type = config.hf_config.torch_dtype
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_bs = min(self.config.max_num_seqs, 512)
+        self.max_num_batched_tokens = config.max_num_batched_tokens
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         f32_kwargs = {"dtype": torch.float, "device": self.device}
@@ -401,34 +397,10 @@ class ModelRunner:
         # TODO: remove it in forward_context
         self.forward_vars = {
             "input_ids": self.tokenID_processor.input_ids,
-            "positions": CpuGpuBuffer(max_num_batched_tokens, **i64_kwargs),
-            "slot_mapping": CpuGpuBuffer(max_num_batched_tokens, **i64_kwargs),
-            "context_lens": CpuGpuBuffer(max_bs, **i32_kwargs),
-            "block_tables": CpuGpuBuffer(max_bs, max_num_blocks, **i32_kwargs),
-            "temperatures": CpuGpuBuffer(max_bs, **f32_kwargs),
-            "cu_seqlens_q": CpuGpuBuffer(max_bs + 1, **i32_kwargs),
-            "kv_indptr": CpuGpuBuffer(max_bs + 1, **i32_kwargs),
-            "kv_indices": CpuGpuBuffer(max_bs * max_num_blocks, **i32_kwargs),
-            "kv_last_page_lens": CpuGpuBuffer(max_bs, **i32_kwargs),
-            "outputs": torch.empty(max_bs, hidden_size, dtype=hidden_type),
+            "positions": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
+            "temperatures": CpuGpuBuffer(self.max_bs, **f32_kwargs),
+            "outputs": torch.empty(self.max_bs, hidden_size, dtype=hidden_type),
         }
-        if self.is_deepseek_v32:
-            self.forward_vars["cu_seqlen_ke"] = CpuGpuBuffer(
-                max_num_batched_tokens, **i32_kwargs
-            )
-            self.forward_vars["cu_seqlen_ks"] = CpuGpuBuffer(
-                max_num_batched_tokens, **i32_kwargs
-            )
-            self.forward_vars["sparse_kv_indptr"] = CpuGpuBuffer(
-                max_bs + 1, **i32_kwargs
-            )
-        self.forward_vars["cu_seqlens_q"].cpu.copy_(
-            torch.arange(0, max_bs + 1, step=1, dtype=torch.int32)
-        )
-        self.forward_vars["cu_seqlens_q"].copy_to_gpu()
-
-        self.forward_vars["kv_last_page_lens"].cpu.fill_(1)
-        self.forward_vars["kv_last_page_lens"].copy_to_gpu()
 
     def get_num_blocks(self):
         torch.set_default_device("cuda")
@@ -611,15 +583,6 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        block_tables = self.forward_vars["block_tables"].np
-        for i, seq in enumerate(seqs):
-            block_tables[i] = 0
-            block_tables[i, : seq.num_blocks] = seq.block_table
-
-    def prepare_prefill(self, batch: ScheduledBatch):
-        return self.attn_metadata_builder.prepare_prefill(batch, self.forward_vars)
-
     def prepare_intputs(self, batch: ScheduledBatch):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
@@ -643,9 +606,7 @@ class ModelRunner:
             self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
                 self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
             )
-        attn_metadata, positions = self.attn_metadata_builder.build(
-            batch, self.forward_vars, bs
-        )
+        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
         context_bs = (
             batch.total_seqs_num_prefill if is_prefill else batch.total_seqs_num_decode
         )
@@ -755,9 +716,7 @@ class ModelRunner:
                 graph = torch.cuda.CUDAGraph()
 
                 attn_metadata, context = (
-                    self.attn_metadata_builder.build_for_cudagraph_capture(
-                        forward_vars=self.forward_vars, bs=bs
-                    )
+                    self.attn_metadata_builder.build_for_cudagraph_capture(bs)
                 )
                 set_forward_context(
                     attn_metadata=attn_metadata,

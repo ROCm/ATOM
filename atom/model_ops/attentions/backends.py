@@ -5,6 +5,8 @@ from atom.model_ops.attention_mla import MLAModules
 import numpy as np
 
 from atom.utils.forward_context import AttentionMetaData
+from atom.utils import CpuGpuBuffer
+from atom.model_engine.sequence import Sequence
 import torch
 from torch import nn
 
@@ -67,34 +69,64 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_decode(self, batch: ScheduledBatch, bs: int, forward_vars):
+    def prepare_decode(self, batch: ScheduledBatch, bs: int):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_prefill(self, batch: ScheduledBatch, forward_vars):
+    def prepare_prefill(self, batch: ScheduledBatch):
         raise NotImplementedError
 
     @abstractmethod
-    def build(self,
-              batch: ScheduledBatch,
-              forward_vars,
-              bs: int):
+    def build(self, batch: ScheduledBatch, bs: int):
         raise NotImplementedError
-    
+
     @abstractmethod
-    def build_for_cudagraph_capture(self, forward_vars, bs: int) -> AttentionMetaData:
+    def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         raise NotImplementedError
 
 
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
-    def __init__(self, block_size: int, device: torch.device):
-        self.block_size = block_size
-        self.device = device
+    def __init__(self, model_runner):
+        self.model_runner = model_runner
+        self.block_size = model_runner.block_size
+        self.device = model_runner.device
+        config = model_runner.config
+        self.max_num_batched_tokens = model_runner.max_num_batched_tokens
+        self.max_bs = model_runner.max_bs
+        self.max_num_blocks_per_seq = (
+            config.max_model_len + self.block_size - 1
+        ) // self.block_size
 
-    def prepare_prefill(self, batch: ScheduledBatch, forward_vars):
+        i64_kwargs = {"dtype": torch.int64, "device": self.device}
+        i32_kwargs = {"dtype": torch.int32, "device": self.device}
+
+        attn_metadata = {
+            "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
+            "context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "block_tables": CpuGpuBuffer(
+                self.max_bs, self.max_num_blocks_per_seq, **i32_kwargs
+            ),
+            "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+        }
+
+        attn_metadata["cu_seqlens_q"].cpu.copy_(
+            torch.arange(0, self.max_bs + 1, step=1, dtype=torch.int32)
+        )
+        attn_metadata["cu_seqlens_q"].copy_to_gpu()
+        self.model_runner.forward_vars.update(attn_metadata)
+
+    def prepare_block_tables(self, seqs: list[Sequence]):
+        var = self.model_runner.forward_vars
+        block_tables = var["block_tables"].np
+        for i, seq in enumerate(seqs):
+            block_tables[i] = 0
+            block_tables[i, : seq.num_blocks] = seq.block_table
+
+    def prepare_prefill(self, batch: ScheduledBatch):
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
-        var = forward_vars
+        var = self.model_runner.forward_vars
         positions = []
         cu_seqlens_k = [0]
         max_seqlen_q = 0
@@ -132,21 +164,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ("cu_seqlens_q", bs + 1),
             ("slot_mapping", len(slot_mapping)),
         ]
-        if "cu_seqlen_ke" in var and "cu_seqlen_ks" in var:
-            block_tables = forward_vars["block_tables"].np
-            for i, seq in enumerate(seqs):
-                block_tables[i] = 0
-                if len(seq.block_table) > 0:
-                    block_tables[i, : seq.num_blocks] = seq.block_table
-            var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
-                np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
-            )
-            counts = var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
-            var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
-                var["cu_seqlens_q"].np[:bs], counts
-            )
-            vars_used.append(("cu_seqlen_ke", sum_scheduled_tokens))
-            vars_used.append(("cu_seqlen_ks", sum_scheduled_tokens))
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
@@ -156,19 +173,16 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             dropout_p=dropout_p,
             **ctx,
         )
-        positions=var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
         return attn_metadata, positions
         # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
-    def build(self,
-              batch: ScheduledBatch,
-              forward_vars,
-              bs: int):
+    def build(self, batch: ScheduledBatch, bs: int):
         if batch.total_tokens_num_prefill > 0:
-            return self.prepare_prefill(batch, forward_vars)
+            return self.prepare_prefill(batch)
         else:
-            return self.prepare_decode(batch, bs, forward_vars)
+            return self.prepare_decode(batch, bs)
 
 
 class AttentionImpl(nn.Module):
@@ -181,7 +195,7 @@ class AttentionImpl(nn.Module):
         num_kv_heads: Optional[int] = None,
         kv_cache_dtype: str = "auto",
         layer_num: int = 0,
-        mla_modules: MLAModules=None,
+        mla_modules: MLAModules = None,
     ) -> None:
         raise NotImplementedError
 
@@ -191,6 +205,6 @@ class AttentionImpl(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        position: torch.Tensor=None,
+        position: torch.Tensor = None,
     ) -> torch.Tensor:
         raise NotImplementedError
