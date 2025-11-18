@@ -13,7 +13,7 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 from .attention_mla import MLAModules
-
+from aiter.ops.triton.unified_attention import unified_attention
 
 class Attention(nn.Module):
 
@@ -26,6 +26,8 @@ class Attention(nn.Module):
         kv_cache_dtype="bf16",
         layer_num=0,
         mla_modules: MLAModules=None,
+        sinks: nn.Parameter=None,
+        sliding_window: int=None,
         **kwargs,
     ):
         super().__init__()
@@ -38,6 +40,8 @@ class Attention(nn.Module):
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
         self.layer_num = layer_num
+        self.sinks = sinks
+        self.sliding_window = sliding_window
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position: torch.Tensor=None):
         o: torch.Tensor
@@ -89,8 +93,33 @@ class Attention(nn.Module):
                     asm_layout=True,
                 )
 
-
-        if context.is_prefill:
+        if self.sinks is not None:
+            out = torch.empty_like(q)
+            descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
+            o = unified_attention(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                q,
+                k,
+                v,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                seqused_k=attn_metadata.context_lens,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=None,
+                window_size=self.sliding_window,
+                block_table= attn_metadata.block_tables,
+                softcap=None,
+                q_descale=None,
+                k_descale=self.k_scale.expand(descale_shape),
+                v_descale=self.v_scale.expand(descale_shape),
+                sinks=self.sinks
+            )
+        elif context.is_prefill:
             # if context.block_tables is not None:  # prefix cache
             #     k, v = k_cache, v_cache
             o = aiter.flash_attn_varlen_func(

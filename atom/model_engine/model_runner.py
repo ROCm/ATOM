@@ -14,6 +14,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence
 from atom.model_loader.loader import load_model
 from atom.model_ops.sampler import Sampler
+from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.deepseek_v2 import DeepseekV2ForCausalLM
 from atom.models.llama import LlamaForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
@@ -37,6 +38,7 @@ suppot_model_arch_dict = {
     "MixtralForCausalLM": MixtralForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
     "DeepseekV32ForCausalLM": DeepseekV2ForCausalLM,
+    "GptOssForCausalLM": GptOssForCausalLM,
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -230,8 +232,9 @@ class ModelRunner:
         os.environ["MASTER_PORT"] = str(self.config.port)
         init_dist_env(self.world_size, rankID=rank)
         init_exit_handler(self)
-        default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        default_dtype = hf_config.torch_dtype if getattr(hf_config, "torch_dtype", None) is not None else "bfloat16"
+        default_dtype = getattr(torch, default_dtype, torch.bfloat16)
+        torch.set_default_dtype(default_dtype)
         torch.set_default_device("cuda")
         self.attn_backend = get_attn_backend(
             self.block_size,

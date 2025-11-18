@@ -300,8 +300,10 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
     RE_QUANT_DTYPE = r"\'(?:d?type|weight_dtype|quant_method)\'\:\s*\'(\w+)\'"
     quant_dtype = None
     m = re.search(RE_QUANT_DTYPE, orig_quant_config_str)
-    if m and m.group(1).lower() in ["fp8", "fp4", "int8", "int4", "fp8_e4m3"]:
+    if m and m.group(1).lower() in ["fp8", "fp4", "int8", "int4", "fp8_e4m3", "mxfp4"]:
         dtype = m.group(1).lower().split("_")[0]
+        if dtype == "mxfp4":
+            dtype = "fp4"
         if dtype.endswith("4"):
             dtype += "x2"
         quant_dtype = d_dtypes[dtype]

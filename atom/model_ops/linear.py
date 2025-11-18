@@ -25,7 +25,9 @@ from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_m
 
 
 def divide(numerator, denominator):
-    assert numerator % denominator == 0, f"numerator {numerator} denominator {denominator}"
+    assert (
+        numerator % denominator == 0
+    ), f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
 
 
@@ -63,8 +65,13 @@ class LinearBase(nn.Module):
             self.output_partition_sizes = [
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
+        weight_size = (
+            (self.output_size, self.input_size)
+            if params_dtype not in [dtypes.fp4x2, dtypes.i4x2]
+            else (self.output_size, self.input_size // 2)
+        )
         self.weight = nn.Parameter(
-            torch.empty((self.output_size, self.input_size), dtype=params_dtype),
+            torch.empty(weight_size, dtype=params_dtype),
             requires_grad=False,
         )
         if bias:
@@ -174,6 +181,7 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
+        need_reduce = self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(x, self.weight, self.bias)
         else:
@@ -190,7 +198,7 @@ class LinearBase(nn.Module):
                 y = tgemm.mm(
                     x,
                     self.weight,
-                    self.bias,
+                    self.bias if not need_reduce else None,
                     otype=otype,
                     scale_a=x_scale,
                     scale_b=self.weight_scale,
@@ -202,7 +210,7 @@ class LinearBase(nn.Module):
                         self.weight,
                         x_scale,
                         self.weight_scale,
-                        self.bias,
+                        self.bias if not need_reduce else None,
                         dtype=otype,
                     )
                 else:
@@ -211,15 +219,16 @@ class LinearBase(nn.Module):
                         self.weight,
                         x_scale,
                         self.weight_scale,
-                        self.bias,
                         dtype=otype,
                     )
+                    if self.bias is not None and not need_reduce:
+                        y += self.bias.view_as(y)
             elif self.quant_type.value == QuantType.per_1x128.value:
                 y = gemm_a8w8_blockscale_bpreshuffle(
                     x, self.weight, x_scale, self.weight_scale, dtype=otype
                 )
-                if self.bias is not None:
-                    y += self.bias
+                if self.bias is not None and not need_reduce:
+                    y += self.bias.view_as(y)
             elif self.quant_type.value == QuantType.per_1x32.value:
                 m = x.view(-1, x.size(-1)).shape[0]
                 y = torch.empty(
@@ -233,11 +242,15 @@ class LinearBase(nn.Module):
                     x_scale,
                     self.weight_scale,
                     y,
-                    self.bias,
                     dtype=otype,
                 )
-        if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
+                y = y[:m, ...]
+                if self.bias is not None and not need_reduce:
+                    y += self.bias.view_as(y)
+        if need_reduce:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
+            if self.bias is not None:
+                y += self.bias.view_as(y)
         return y
 
 

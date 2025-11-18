@@ -66,6 +66,7 @@ def load_model(
     load_dummy: bool = False,
 ):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
@@ -74,8 +75,12 @@ def load_model(
                 continue
             if name.endswith("kv_scale"):
                 continue
+            name_suffix = name.split(".")[-1]
+            if name_suffix in weights_mapping.keys():
+                name = name.replace(name_suffix, weights_mapping[name_suffix])
             if "weight_scale_inv" in name:
                 name = name.replace("weight_scale_inv", "weight_scale")
+
             layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
             layerId = int(layerId_.group(1)) if layerId_ else 0
             if hf_config.num_hidden_layers and layerId >= hf_config.num_hidden_layers:

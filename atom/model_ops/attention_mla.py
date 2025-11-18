@@ -69,6 +69,7 @@ class MLAAttention(nn.Module):
         kv_cache_dtype: str,
         layer_num: int = 0,
         mla_modules: MLAModules = None,
+        **kwargs,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
