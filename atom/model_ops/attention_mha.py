@@ -41,7 +41,7 @@ class Attention(nn.Module):
         self.k_scale = self.v_scale = None
         self.layer_num = layer_num
         self.sinks = sinks
-        self.sliding_window = sliding_window
+        self.sliding_window = (sliding_window - 1, 0) if sliding_window is not None else None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position: torch.Tensor=None):
         o: torch.Tensor
@@ -93,32 +93,30 @@ class Attention(nn.Module):
                     asm_layout=True,
                 )
 
-        if self.sinks is not None:
-            out = torch.empty_like(q)
+        if self.sliding_window is not None:
+            o = torch.empty_like(q)
             descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
-            o = unified_attention(
-                q,
-                k_cache,
-                v_cache,
-                out,
-                q,
-                k,
-                v,
-                cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                seqused_k=attn_metadata.context_lens,
-                max_seqlen_q=attn_metadata.max_seqlen_q,
-                max_seqlen_k=attn_metadata.max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=None,
-                window_size=self.sliding_window,
-                block_table= attn_metadata.block_tables,
-                softcap=None,
-                q_descale=None,
-                k_descale=self.k_scale.expand(descale_shape),
-                v_descale=self.v_scale.expand(descale_shape),
-                sinks=self.sinks
-            )
+            if k_cache.numel() and v_cache.numel():
+                unified_attention(
+                    q,
+                    k_cache,
+                    v_cache,
+                    o,
+                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                    seqused_k=attn_metadata.context_lens,
+                    max_seqlen_q=attn_metadata.max_seqlen_q,
+                    max_seqlen_k=attn_metadata.max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=None,
+                    window_size=self.sliding_window,
+                    block_table= attn_metadata.block_tables,
+                    softcap=0,
+                    q_descale=None,
+                    k_descale=k_scale.expand(descale_shape) if k_scale is not None else None,
+                    v_descale=v_scale.expand(descale_shape) if v_scale is not None else None,
+                    sinks=self.sinks
+                )
         elif context.is_prefill:
             # if context.block_tables is not None:  # prefix cache
             #     k, v = k_cache, v_cache

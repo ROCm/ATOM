@@ -432,13 +432,14 @@ class RowParallelLinear(LinearBase):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        shard_size = param_data.size(self.tp_dim)
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.view(1, 1)
-        if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
-            loaded_weight = loaded_weight.repeat(1, self.tp_size)
-        start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        if param is not getattr(self, "bias", None):
+            shard_size = param_data.size(self.tp_dim)
+            if len(loaded_weight.shape) == 0:
+                loaded_weight = loaded_weight.view(1, 1)
+            if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
+                loaded_weight = loaded_weight.repeat(1, self.tp_size)
+            start_idx = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
 
 

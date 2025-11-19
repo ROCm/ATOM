@@ -91,6 +91,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.block_size = model_runner.block_size
         self.device = model_runner.device
         config = model_runner.config
+        hf_config = config.hf_config
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (
@@ -115,6 +116,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         )
         attn_metadata["cu_seqlens_q"].copy_to_gpu()
         self.model_runner.forward_vars.update(attn_metadata)
+        self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         var = self.model_runner.forward_vars
@@ -164,6 +166,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ("cu_seqlens_q", bs + 1),
             ("slot_mapping", len(slot_mapping)),
         ]
+        if self.has_sliding_window:
+            var["context_lens"].np[: bs] = [seq.num_tokens for seq in seqs]
+            vars_used.append(("context_lens", bs))
+            self.prepare_block_tables(seqs)
+            vars_used.append(("block_tables", bs))
+
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),

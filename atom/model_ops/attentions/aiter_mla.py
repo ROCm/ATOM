@@ -156,8 +156,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
         if self.is_sparse:
-            self.prepare_block_tables(seqs)
-            attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+            if attn_metadata.block_tables is None:
+                self.prepare_block_tables(seqs)
+                attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
             var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
                 np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
             )
