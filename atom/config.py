@@ -1,14 +1,22 @@
+import logging
 import enum
 import hashlib
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Optional, Union
+from atom.utils import envs
+from torch.distributed import ProcessGroup, ReduceOp
 
+from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 import torch
 from aiter import QuantType
 from aiter.utility.dtypes import d_dtypes
 from transformers import AutoConfig, PretrainedConfig
+from aiter.dist.parallel_state import get_dp_group
+
+
+logger = logging.getLogger("atom")
 
 @dataclass
 class KVCacheTensor:
@@ -360,6 +368,112 @@ def get_hf_config(model: str) -> PretrainedConfig:
 
 
 @dataclass
+class ParallelConfig:
+    data_parallel_size: int = 1
+    """Number of data parallel groups. MoE layers will be sharded according to
+    the product of the tensor parallel size and data parallel size."""
+    data_parallel_size_local: int = 1
+    """Number of local data parallel groups."""
+    data_parallel_rank: int = 0
+    """Rank of the data parallel group."""
+    data_parallel_rank_local: Optional[int] = None
+    """Local rank of the data parallel group,
+    set only in SPMD mode."""
+    world_size: int = field(init=False)
+    """world_size is TPxPP, it affects the number of workers we create."""
+    data_parallel_master_port: int = 29500
+    """Port of the data parallel master."""
+
+    data_parallel_base_port: int = 29400
+
+    data_parallel_master_ip: str = "127.0.0.1"
+
+
+    @property
+    def world_size_across_dp(self) -> int:
+        """world_size_across_dp is TPxPPxDP, it is the size of the world
+        including data parallelism."""
+        return self.world_size * self.data_parallel_size
+
+    def get_next_dp_init_port(self) -> int:
+        """
+        We might need to initialize process groups in multiple
+        processes that is related to data parallelism,
+        e.g. both in the worker and in the engine, which
+        can live in different processes. To avoid port conflicts, we
+        pop a new port from the prepared port list each time we need to
+        initialize a new process group related to data parallelism.
+        """
+        answer = self.data_parallel_master_port
+        self.data_parallel_master_port += self.data_parallel_rank
+
+        return answer
+
+    def stateless_init_dp_group(self):
+        # NOTE: In high-concurrency scenarios multiple processes
+        # can pick the same (currently free) port through a race
+        # condition when calling `get_open_port()`. When the first
+        # process binds the port the others will subsequently fail
+        # with `torch.distributed.DistNetworkError: EADDRINUSE`.
+        # To make the initialization more robust we retry a few times
+        # with a fresh port whenever this specific error is observed.
+        dp_group = stateless_init_torch_distributed_process_group(
+            self.data_parallel_master_ip,
+            self.get_next_dp_init_port(),
+            self.data_parallel_rank,
+            self.data_parallel_size,
+            backend="gloo")
+        return dp_group
+
+
+    @staticmethod
+    def has_unfinished_dp(dp_group: ProcessGroup,
+                          has_unfinished: bool) -> bool:
+        tensor = torch.tensor([has_unfinished],
+                              dtype=torch.int32,
+                              device="cpu")
+        # dp rank 0: has_unfinished_seqs=True
+        # dp rank 1: has_unfinished_seqs=False
+        # aggregated: has_unfinished_seqs=True
+        # so this is an OR operation, i.e. MAX in integers
+        # torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
+        # from aiter.dist.parallel_state import get_dp_group
+        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
+        aggregated_has_unfinished = bool(tensor.item())
+        return aggregated_has_unfinished
+
+    def compute_hash(self):
+        """
+        Provide a hash that uniquely identifies all the configs
+        that affect the structure of the computation
+        graph from input ids/embeddings to the final hidden states,
+        excluding anything before input ids/embeddings and after
+        the final hidden states.
+        """
+        factors: list[Any] = []
+        factors.append(self.data_parallel_size)
+        factors.append(self.data_parallel_rank)
+        factors.append(self.data_parallel_rank_local)
+        factors.append(self.data_parallel_master_ip)
+        factors.append(self.data_parallel_master_port)
+        return hashlib.sha256(str(factors).encode()).hexdigest()
+
+    def __post_init__(self) -> None:
+        # Only override with env vars if not already set to non-default values
+        # This allows programmatic configuration to take precedence
+        import os
+        if os.getenv("ATOM_DP_SIZE") is not None:
+            self.data_parallel_size = envs.ATOM_DP_SIZE
+        if os.getenv("ATOM_DP_RANK") is not None:
+            self.data_parallel_rank = envs.ATOM_DP_RANK
+        if os.getenv("ATOM_DP_RANK_LOCAL") is not None:
+            self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
+        # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
+        # self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
+
+
+
+@dataclass
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
@@ -369,6 +483,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
+    parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
     bos_token_id: int = -1
     eos_token_id: int = -1
     kv_cache_block_size: int = 16
@@ -386,6 +501,7 @@ class Config:
     enable_expert_parallel: bool = False
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
+    enable_dp_attention: bool = False
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -443,9 +559,13 @@ class Config:
 
         if self.compilation_config:
             vllm_factors.append(self.compilation_config.compute_hash())
+        
+        if self.parallel_config:
+            vllm_factors.append(self.parallel_config.compute_hash())
 
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
+        factors.append(self.enable_dp_attention)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
@@ -459,6 +579,9 @@ _current_atom_config: Optional[Config] = None
 def set_current_atom_config(atom_config: Config):
     global _current_atom_config
     _current_atom_config = atom_config
+    # for MoE to check
+    import os
+    os.environ["ATOM_ENFORCE_EAGER"] = "1" if atom_config.enforce_eager else "0"
 
 
 def get_current_atom_config() -> Config:

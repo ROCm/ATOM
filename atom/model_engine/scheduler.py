@@ -72,7 +72,8 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
 
         if not self.running and not self.waiting:
-            self.block_manager.reset()
+            # self.block_manager.reset()
+            return None
 
         while self.waiting and num_seqs_prefill < self.max_num_seqs:
             seq = self.waiting[0]

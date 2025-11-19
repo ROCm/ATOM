@@ -558,7 +558,7 @@ class VllmBackend:
         # when dynamo calls the backend, it means the bytecode
         # transform and analysis are done
         compilation_counter.num_graphs_seen += 1
-        from atom.utils import torch_compile_start_time
+        from atom.utils.decorators import torch_compile_start_time
         dynamo_time = time.time() - torch_compile_start_time
         logger.info("Dynamo bytecode transform time: %.2f s", dynamo_time)
         self.compilation_config.compilation_time += dynamo_time

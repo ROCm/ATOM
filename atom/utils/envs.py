@@ -1,0 +1,18 @@
+import os
+from typing import Callable, Any
+# Data parallel environment variables
+
+environment_variables: dict[str, Callable[[], Any]] = {
+    "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
+    "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
+    "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
+    "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
+    "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    "ATOM_ENFORCE_EAGER": lambda: os.getenv("ATOM_ENFORCE_EAGER", "0") == "1",
+}
+
+def __getattr__(name: str):
+    # lazy evaluation of environment variables
+    if name in environment_variables:
+        return environment_variables[name]()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

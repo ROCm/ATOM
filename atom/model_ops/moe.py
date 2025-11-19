@@ -2,14 +2,17 @@ from abc import abstractmethod
 from functools import lru_cache
 from typing import Callable, List, Optional, Tuple
 
+from dataclasses import dataclass
+
+from atom.utils.forward_context import ForwardContext, get_forward_context
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_tp_group, get_dp_group
 from aiter.fused_moe import fused_moe
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import QuantizationConfig, get_current_atom_config
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.topK import (
@@ -25,6 +28,134 @@ from atom.model_ops.utils import (
     shuffle_weights,
 )
 from atom.utils.custom_register import direct_register_custom_op
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from atom.utils import envs
+
+
+@dataclass
+class FusedMoEParallelConfig:
+    tp_size: int
+    dp_size: int
+    ep_size: int
+    tp_rank: int
+    dp_rank: int
+    ep_rank: int
+
+    use_ep: bool  # whether to use EP or not
+    @property
+    def use_all2all_kernels(self):
+        return self.dp_size > 1 and self.use_ep
+
+    @staticmethod
+    def make(tp_size_: int, dp_size_: int,
+             parallel_config: Config) -> "FusedMoEParallelConfig":
+        def flatten_tp_across_dp(dp_rank: int):
+            tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
+            # There are actually dp_size_ * tp_size_ devices. Update tp_size
+            # and tp_rank so we shard across all devices.
+            tp_size = dp_size_ * tp_size_
+            tp_rank = dp_rank * tp_size_ + tp_rank
+            return tp_size, tp_rank
+
+        use_ep = (dp_size_ * tp_size_ > 1
+                  and parallel_config.enable_expert_parallel)
+
+        dp_size = dp_size_
+        dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+        tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
+
+        if not use_ep:
+            return FusedMoEParallelConfig(tp_size=tp_size,
+                                          tp_rank=tp_rank,
+                                          dp_size=dp_size,
+                                          dp_rank=dp_rank,
+                                          ep_size=1,
+                                          ep_rank=0,
+                                          use_ep=False)
+        # DP + EP / TP + EP / DP + TP + EP
+        assert use_ep
+        # In EP, each device owns a set of experts fully. There is no tensor
+        # parallel update tp_size, tp_rank, ep_size and ep_rank to reflect that.
+        ep_size = tp_size
+        ep_rank = tp_rank
+        return FusedMoEParallelConfig(tp_size=1,
+                                      tp_rank=0,
+                                      dp_size=dp_size,
+                                      dp_rank=dp_rank,
+                                      ep_size=ep_size,
+                                      ep_rank=ep_rank,
+                                      use_ep=True)
+
+
+def naive_multicast_fake(x: torch.Tensor,
+                    cu_tokens_across_dp_cpu: torch.Tensor)->torch.Tensor:
+    assert (len(x.shape) == 2)
+    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
+    buffer = torch.empty((cu_tokens_across_dp_cpu[-1], x.size(1)),
+                            device=x.device,
+                            dtype=x.dtype)
+    return buffer
+
+
+
+@torch_compile_guard()
+def naive_multicast(x: torch.Tensor,
+                    cu_tokens_across_dp_cpu: torch.Tensor)->torch.Tensor:
+    dp_rank = get_dp_group().rank_in_group
+    assert (len(x.shape) == 2)
+    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
+    buffer = torch.empty((cu_tokens_across_dp_cpu[-1], x.size(1)),
+                            device=x.device,
+                            dtype=x.dtype)
+
+    start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[
+        dp_rank - 1]
+    end = cu_tokens_across_dp_cpu[dp_rank]
+    buffer[start:end, :].copy_(x)
+    for idx in range(get_dp_group().world_size):
+        start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
+        end = cu_tokens_across_dp_cpu[idx]
+        get_dp_group().broadcast(buffer[start:end, :], idx)
+    return buffer
+
+
+def all_gather_with_padding(x: torch.Tensor):
+    max_batch_size = 512
+    dim = 0
+    original_batch_size = x.shape[dim]
+    padded_x = x
+    if original_batch_size < max_batch_size:
+        padding_size = max_batch_size - original_batch_size
+
+        padding_shape = list(x.shape)
+        padding_shape[dim] = padding_size
+
+        padding = torch.empty(
+            padding_shape, dtype=x.dtype, device=x.device
+        )
+        padding.zero_()
+        padded_x = torch.cat([x, padding], dim=dim)
+
+    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=dim)
+    return gathered_hidden_states, original_batch_size
+
+def reduce_scatter_with_unpadding(x: torch.Tensor, original_batch_size: int)->torch.Tensor:
+    dim = 0
+    dp_group = get_dp_group()
+    
+    scattered_output = dp_group.reduce_scatter(x, dim=dim)
+    
+    if scattered_output.shape[dim] > original_batch_size:
+        slices = [slice(None)] * scattered_output.ndim
+        slices[dim] = slice(0, original_batch_size)
+        scattered_output = scattered_output[slices]
+    
+    return scattered_output
+
+
+@torch_compile_guard()
+def get_max_tokens_across_dispatchers(input: torch.Tensor) -> int:
+    return input.item()
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
@@ -591,6 +722,32 @@ def determine_expert_map(
     return (local_num_experts, expert_map)
 
 
+def moe_forward(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    return self.forward_impl(hidden_states, router_logits)
+
+
+def moe_forward_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+direct_register_custom_op(
+    op_name="moe_forward",
+    op_func=moe_forward,
+    mutates_args=["hidden_states"],
+    fake_impl=moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order, ),
+)
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -644,31 +801,21 @@ class FusedMoE(torch.nn.Module):
         self.quant_config = quant_config
         # Note: here we guard against accessing the TP and DP groups when
         # uninitialized (this happens when testing)
-        self.tp_size = tp_size if tp_size is not None else get_tp_group().world_size
-        tp_rank = 0 if self.tp_size == 1 else get_tp_group().rank_in_group
-        self.global_num_experts = num_experts
+        # self.tp_size = 1
+        tp_size = tp_size if tp_size is not None else get_tp_group().world_size
+        dp_size = dp_size if dp_size is not None else get_dp_group().world_size
 
         atom_config = get_current_atom_config()
-        use_ep = self.tp_size > 1 and atom_config.enable_expert_parallel
-
-        if use_ep:
-            # Set TP size to 1 to adjust for EP and adjust EP size and rank
-            self.ep_rank = tp_rank
-            self.tp_rank = 0
-            self.ep_size = self.tp_size
-            self.tp_size = 1
-
+        self.moe_parallel_config = FusedMoEParallelConfig.make(tp_size, dp_size, atom_config)
+        tp_rank = 0 if self.tp_size == 1 else get_tp_group().rank_in_group
+        self.global_num_experts = num_experts
+        if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
                 global_num_experts=self.global_num_experts,
             )
         else:
-            # Adjust TP size for DP attention
-            self.tp_rank = tp_rank
-            self.ep_rank = 0
-            self.tp_size = self.tp_size
-            self.ep_size = 1
             self.local_num_experts = self.global_num_experts
             self.expert_map = None
         self.top_k = top_k
@@ -687,7 +834,7 @@ class FusedMoE(torch.nn.Module):
             else 1.0
         )
         self.expert_mask = None
-        if use_ep:
+        if self.use_ep:
             expert_mask = torch.ones(
                 (self.global_num_experts + self.num_fused_shared_experts + 1,),
                 dtype=torch.int32,
@@ -716,19 +863,18 @@ class FusedMoE(torch.nn.Module):
                 n_routed_experts=self.global_num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
                 top_k=self.top_k,
-                tp_rank=self.ep_rank if use_ep else tp_rank,
-                tp_size=self.ep_size if use_ep else tp_size,
+                tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
+                tp_size=self.ep_size if self.use_ep else self.tp_size,
                 shared_experts_score=(
                     1.0
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
                 max_num_tokens=16384,  # Default max tokens
-                is_EP=use_ep,
+                is_EP=self.use_ep,
             )
         if is_rocm_aiter_fusion_shared_expert_enabled():
             self.local_num_experts += self.num_fused_shared_experts
-
         assert intermediate_size % self.tp_size == 0
         self.hidden_size = hidden_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
@@ -743,6 +889,24 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
+
+        self.use_chunked = (get_dp_group().world_size > 1) and (not envs.ATOM_ENFORCE_EAGER)
+        self.batched_hidden_states: Optional[torch.Tensor] = None
+        self.batched_router_logits: Optional[torch.Tensor] = None
+
+        if self.use_chunked:
+            self.vllm_moe_dp_chunk_size = 256
+            self.batched_hidden_states = torch.zeros(
+                (self.vllm_moe_dp_chunk_size, self.hidden_size),
+                dtype=torch.bfloat16,
+                device=torch.cuda.current_device())
+
+            # Note here we use `num_experts` which is logical expert count
+            self.batched_router_logits = torch.zeros(
+                (self.vllm_moe_dp_chunk_size, num_experts),
+                dtype=torch.bfloat16,
+                device=torch.cuda.current_device())
+
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError(
@@ -774,6 +938,42 @@ class FusedMoE(torch.nn.Module):
             "weight_loader": self.weight_loader,
         }
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        compilation_config = atom_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError("Duplicate layer name: {}".format(prefix))
+        compilation_config.static_forward_context[prefix] = self
+        self.layer_name = prefix
+
+
+
+    @property
+    def tp_size(self):
+        return self.moe_parallel_config.tp_size
+
+    @property
+    def dp_size(self):
+        return self.moe_parallel_config.dp_size
+
+    @property
+    def ep_size(self):
+        return self.moe_parallel_config.ep_size
+
+    @property
+    def tp_rank(self):
+        return self.moe_parallel_config.tp_rank
+
+    @property
+    def dp_rank(self):
+        return self.moe_parallel_config.dp_rank
+
+    @property
+    def ep_rank(self):
+        return self.moe_parallel_config.ep_rank
+
+    @property
+    def use_ep(self):
+        return self.moe_parallel_config.use_ep
+
 
     def _load_per_tensor_weight_scale(
         self,
@@ -1102,10 +1302,93 @@ class FusedMoE(torch.nn.Module):
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        return self.forward_impl(hidden_states, router_logits)
+        return torch.ops.aiter.moe_forward(hidden_states, router_logits, self.layer_name)
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        assert self.quant_method is not None
+    def forward_impl_chunked(self, full_hidden_states: torch.Tensor, full_router_logits: torch.Tensor):
+        """Chunked forward for DP to support CUDA Graph."""
+
+        from atom.utils.forward_context import get_forward_context
+        assert self.batched_hidden_states is not None
+        assert self.batched_router_logits is not None
+        assert self.batched_hidden_states.dtype == full_hidden_states.dtype
+        assert self.batched_router_logits.dtype == full_router_logits.dtype
+        # Check size compatibility.
+        assert (
+            self.batched_hidden_states.size(-1) == full_hidden_states.size(-1))
+        assert (
+            self.batched_router_logits.size(-1) == full_router_logits.size(-1))
+
+        full_fused_final_hidden_states = torch.empty_like(full_hidden_states)
+
+
+        def process_chunk(chunk_start, chunk_end, skip_result_store=False):
+            chunk_size = chunk_end - chunk_start
+            hidden_states = full_hidden_states[chunk_start:chunk_end, :]
+            router_logits = full_router_logits[chunk_start:chunk_end, :]
+
+            assert (self.batched_hidden_states.size(0)  # type: ignore
+                    >= chunk_size)
+            assert (self.batched_router_logits.size(0)  # type: ignore
+                    >= chunk_size)
+            staged_hidden_states = self.batched_hidden_states[:
+                                                              chunk_size, :]  # type: ignore
+            staged_router_logits = self.batched_router_logits[:
+                                                              chunk_size, :]  # type: ignore
+            staged_hidden_states.copy_(hidden_states, non_blocking=True)
+            staged_router_logits.copy_(router_logits, non_blocking=True)
+
+            # Matrix multiply.
+            final_hidden_states = self.quant_method.apply(
+                layer=self,
+                x=staged_hidden_states,
+                router_logits=staged_router_logits,
+                top_k=self.top_k,
+                renormalize=self.renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                global_num_experts=self.global_num_experts,
+                expert_map=self.expert_mask,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                custom_routing_function=self.custom_routing_function,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias,
+                activation=self.activation,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+            )
+
+            if not skip_result_store:
+                full_fused_final_hidden_states[
+                    chunk_start:chunk_end, :].copy_(final_hidden_states,
+                                                    non_blocking=True)
+
+        ctx = get_forward_context()
+        max_tokens_across_dispatchers = ctx.dp_metadata.max_tokens_across_dp_cpu
+        moe_dp_chunk_size_per_rank = self.vllm_moe_dp_chunk_size
+
+        num_tokens = full_hidden_states.size(0)
+        for chunk_idx, chunk_start_ in enumerate(
+                range(0, get_max_tokens_across_dispatchers(max_tokens_across_dispatchers),
+                      moe_dp_chunk_size_per_rank)):
+            chunk_start = chunk_start_
+            chunk_end = min(chunk_start + moe_dp_chunk_size_per_rank,
+                            max_tokens_across_dispatchers)
+            # clamp start and end
+            chunk_start = min(chunk_start, num_tokens - 1)
+            chunk_end = min(chunk_end, num_tokens)
+            with ctx.dp_metadata.chunked_sizes(moe_dp_chunk_size_per_rank,
+                                               chunk_idx):
+                process_chunk(chunk_start,
+                              chunk_end,
+                              skip_result_store=chunk_start_ >= num_tokens)
+
+
+        return full_fused_final_hidden_states
+    
+    def forward_impl_graph(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        dp_group = get_dp_group()
+        if dp_group.world_size > 1:
+            hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
+            router_logits, _ = all_gather_with_padding(router_logits)    
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -1125,6 +1408,67 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
+        
+        dp_group = get_dp_group()
+        if dp_group.world_size > 1:
+            final_hidden_states = reduce_scatter_with_unpadding(final_hidden_states, original_hidden_size)
+
+
+        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+            # Default set to False. (May have to add shared expert outputs.)
+            final_hidden_states = get_tp_group().all_reduce(
+                final_hidden_states, ca_fp8_quant=False
+            )
+
+        return final_hidden_states
+
+
+
+
+    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        assert self.quant_method is not None
+        # cuda graph not supported forward with combine and dispatch
+        is_prefill = get_forward_context().context.is_prefill
+        if self.use_chunked:
+            return self.forward_impl_graph(hidden_states, router_logits)
+            # return self.forward_impl_chunked(hidden_states, router_logits)
+
+        dp_group = get_dp_group()
+        if dp_group.world_size > 1:
+            cu_tokens_across_dp_cpu = get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
+
+            hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
+            router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)    
+
+        # Matrix multiply.
+        final_hidden_states = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            renormalize=self.renormalize,
+            use_grouped_topk=self.use_grouped_topk,
+            global_num_experts=self.global_num_experts,
+            expert_map=self.expert_mask,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            custom_routing_function=self.custom_routing_function,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.e_score_correction_bias,
+            activation=self.activation,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+        )
+        
+        dp_group = get_dp_group()
+        if dp_group.world_size > 1:
+            dp_rank = dp_group.rank_in_group
+            start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[
+                dp_rank - 1]
+            end = cu_tokens_across_dp_cpu[dp_rank]
+
+            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
+            final_hidden_states = all_hidden_states[start:end, :]
+
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

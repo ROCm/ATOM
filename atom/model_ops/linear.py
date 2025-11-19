@@ -51,7 +51,7 @@ class LinearBase(nn.Module):
             output_size if isinstance(output_size, int) else sum(output_size)
         )
         self.tp_dim = tp_dim
-        self.tp_rank = get_tp_group().rank
+        self.tp_rank = get_tp_group().rank_in_group
         self.tp_size = get_tp_group().world_size
         self.output_partition_sizes = (
             output_size if isinstance(output_size, list) else [output_size]
@@ -407,7 +407,7 @@ class RowParallelLinear(LinearBase):
         reduce_results: bool = True,
         **kwargs,
     ):
-        self.tp_rank = get_tp_group().rank
+        self.tp_rank = get_tp_group().rank_in_group
         super().__init__(
             input_size,
             output_size,

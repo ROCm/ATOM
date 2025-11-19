@@ -24,6 +24,7 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+from aiter.dist.parallel_state import get_dp_group
 
 torch.set_printoptions(threshold=10_000)
 
@@ -259,6 +260,27 @@ class MLAAttention(nn.Module):
         if self.kv_cache_dtype.startswith("fp8"):
             q = q.to(dtypes.fp8)
             q_scale = kv_scale = self.one_scale
+
+        dp_size = get_dp_group().world_size
+        is_fp8 = self.kv_cache_dtype.startswith("fp8")
+        use_persistent_mode = not (dp_size == 8 and not is_fp8)
+
+        if not use_persistent_mode:
+            # DP + bf16: disable persistent mode to avoid overflow
+            work_meta_data = None
+            work_indptr = None
+            work_info_set = None
+            reduce_indptr = None
+            reduce_final_map = None
+            reduce_partial_map = None
+        else:
+            work_meta_data = attn_metadata.work_meta_data
+            work_indptr = attn_metadata.work_indptr
+            work_info_set = attn_metadata.work_info_set
+            reduce_indptr = attn_metadata.reduce_indptr
+            reduce_final_map = attn_metadata.reduce_final_map
+            reduce_partial_map = attn_metadata.reduce_partial_map
+
         mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
@@ -272,12 +294,12 @@ class MLAAttention(nn.Module):
             0.0,
             None,
             None,
-            attn_metadata.work_meta_data,
-            attn_metadata.work_indptr,
-            attn_metadata.work_info_set,
-            attn_metadata.reduce_indptr,
-            attn_metadata.reduce_final_map,
-            attn_metadata.reduce_partial_map,
+            work_meta_data,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
             q_scale,
             kv_scale,
         )

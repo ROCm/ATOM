@@ -20,6 +20,7 @@ from atom.utils import (
     get_open_zmq_inproc_path,
     get_open_zmq_ipc_path,
     make_zmq_socket,
+    set_device_control_env_var,
     shutdown_all_processes,
 )
 
@@ -29,34 +30,113 @@ logger = logging.getLogger("atom")
 class CoreManager:
     def __init__(self, config: Config):
         self.label = "Engine Core Mgr"
+        self._closed = False  # Track whether already closed
+        if config.enable_dp_attention:
+            self.local_engine_count = config.tensor_parallel_size * config.parallel_config.data_parallel_size
+            logger.info(f"Enable dp attention, using {self.local_engine_count} data parallel ranks")
+            config.parallel_config.data_parallel_size = self.local_engine_count
+            config.tensor_parallel_size = 1
+        else:
+            self.local_engine_count = config.parallel_config.data_parallel_size
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[List[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
         self._seq_id_to_callback = {}
-        engine_core_process, addresses = launch_engine_core(config)
-        self.engine_core_process = engine_core_process
+        self.engine_core_processes = []
+        self.input_sockets = []
+        self.output_sockets = []
+        self.engine_core_identities = []
+        self.shutdown_paths = []
+        self.output_threads = []
 
-        input_address = addresses["input_address"]
-        output_address = addresses["output_address"]
-        self.input_socket = make_zmq_socket(
-            self.ctx, input_address, zmq.ROUTER, bind=True
-        )
-        identity, _ = self.input_socket.recv_multipart()
-        self.engine_core_identity = identity
-        self.output_socket = make_zmq_socket(self.ctx, output_address, zmq.PULL)
+        import torch
+        if torch.multiprocessing.get_start_method(allow_none=True) is None:
+            torch.multiprocessing.set_start_method("spawn", force=False)
 
-        shutdown_path = get_open_zmq_inproc_path()
-        self.shutdown_path = shutdown_path
+        processes_info = []
+        local_dp_ranks = []
 
+        try:
+            for dp_rank in range(self.local_engine_count):
+                logger.info(f"{self.label}: Creating EngineCore for DP rank {dp_rank}/{self.local_engine_count}")
+
+                # Create config for this DP rank
+                import copy
+                rank_config = copy.deepcopy(config)
+                rank_config.parallel_config.data_parallel_rank = dp_rank
+
+                engine_core_process, addresses, local_dp_rank = launch_engine_core(rank_config, dp_rank)
+
+                processes_info.append({
+                    'process': engine_core_process,
+                    'addresses': addresses,
+                    'dp_rank': dp_rank,
+                    'config': rank_config
+                })
+                local_dp_ranks.append(local_dp_rank)
+
+            data_parallel = config.parallel_config.data_parallel_size > 1
+            try:
+                for info, local_dp_rank in zip(processes_info, local_dp_ranks):
+                    dp_rank = info['dp_rank']
+                    logger.info(f"{self.label}: Starting EngineCore for DP rank {dp_rank}/{self.local_engine_count}")
+
+                    if data_parallel:
+                        with set_device_control_env_var(info['config'], local_dp_rank):
+                            info['process'].start()
+                    else:
+                        info['process'].start()
+
+                    self.engine_core_processes.append(info['process'])
+
+                    input_address = info['addresses']["input_address"]
+                    input_socket = make_zmq_socket(
+                        self.ctx, input_address, zmq.ROUTER, bind=True
+                    )
+                    identity, _ = input_socket.recv_multipart()
+                    self.input_sockets.append(input_socket)
+                    self.engine_core_identities.append(identity)
+
+                    output_address = info['addresses']["output_address"]
+                    output_socket = make_zmq_socket(self.ctx, output_address, zmq.PULL)
+                    self.output_sockets.append(output_socket)
+
+                    shutdown_path = get_open_zmq_inproc_path()
+                    self.shutdown_paths.append(shutdown_path)
+
+                    output_thread = self._create_output_thread(dp_rank, output_socket, shutdown_path)
+                    output_thread.start()
+                    self.output_threads.append(output_thread)
+
+                    logger.info(f"{self.label}: DP rank {dp_rank} initialized successfully")
+            finally:
+                if self.finished_procs():
+                    logger.error(f"{self.label}: Some processes failed to start, shutting down all")
+                    self.close()
+                    raise RuntimeError("Failed to start all EngineCore processes")
+
+        except Exception as e:
+            logger.error(f"{self.label}: Failed to initialize all EngineCores, cleaning up: {e}")
+            self.close()
+            raise
+
+        logger.info(f"{self.label}: All {self.local_engine_count} EngineCores initialized")
+        self._finalizer = weakref.finalize(self, self.close)
+        self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
+        self._output_handler_task = None
+        self._asyncio_mode = config.asyncio_mode
+
+
+    def _create_output_thread(self, dp_rank: int, output_socket: zmq.Socket, shutdown_path: str) -> Thread:
         def process_outputs_socket():
-            assert isinstance(self.output_socket, zmq.Socket)
+            assert isinstance(output_socket, zmq.Socket)
             shutdown_socket = self.ctx.socket(zmq.PAIR)
             try:
                 shutdown_socket.bind(shutdown_path)
                 poller = zmq.Poller()
                 poller.register(shutdown_socket, zmq.POLLIN)
-                poller.register(self.output_socket, zmq.POLLIN)
-                logger.debug(f"{self.label}: output thread started")
+                poller.register(output_socket, zmq.POLLIN)
+                logger.debug(f"{self.label} (DP {dp_rank}): output thread started")
                 while True:
                     socks = poller.poll()
                     if not socks:
@@ -64,20 +144,17 @@ class CoreManager:
                     if len(socks) == 2 or socks[0][0] == shutdown_socket:
                         # shutdown signal, exit thread.
                         logger.debug(
-                            f"{self.label}: output thread receive shutdown signal"
+                            f"{self.label} (DP {dp_rank}): output thread receive shutdown signal"
                         )
                         break
 
-                    obj = self.output_socket.recv(copy=False)
+                    obj = output_socket.recv(copy=False)
                     request_type, data = pickle.loads(obj)
                     if request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(
-                            f"{self.label}: output thread receive SHUTDOWN request"
+                            f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
                         )
-                        self._shutdown_engine_core()
-                        self.outputs_queue.put_nowait(
-                            SystemExit(f"{self.label}: shutdown")
-                        )
+                        self._shutdown_engine_core_rank(dp_rank)
                         break
                     elif request_type == EngineCoreRequestType.STREAM:
                         stream_outputs = data  # List of (seq_id, RequestOutput) tuples
@@ -103,18 +180,15 @@ class CoreManager:
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
-                self.output_socket.close(linger=0)
+                output_socket.close(linger=0)
 
-        self.output_queue_thread = Thread(
+
+        return Thread(
             target=process_outputs_socket,
-            name="EngineCoreOutputQueueThread",
+            name=f"EngineCoreOutputThread-DP{dp_rank}",
             daemon=True,
         )
-        self.output_queue_thread.start()
-        self._finalizer = weakref.finalize(self, self.close)
-        self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
-        self._output_handler_task = None
-        self._asyncio_mode = config.asyncio_mode
+
     
     def _ensure_output_handler_task(self):
         if self._asyncio_mode and self._output_handler_task is None:
@@ -152,14 +226,34 @@ class CoreManager:
         return seqs
 
     def close(self):
-        self._shutdown_engine_core()
-        self.input_socket.close()
-        if self.shutdown_path and self.output_queue_thread:
-            with self.ctx.socket(zmq.PAIR) as shutdown_sender:
-                shutdown_sender.connect(self.shutdown_path)
-                # Send shutdown signal.
-                shutdown_sender.send(b"")
-        self.output_queue_thread.join()
+        if self._closed:
+            return
+        self._closed = True
+
+        logger.info(f"{self.label}: Shutting down all {self.local_engine_count} EngineCores")
+
+        for dp_rank in range(self.local_engine_count):
+            self._shutdown_engine_core_rank(dp_rank)
+
+        for input_socket in self.input_sockets:
+            if not input_socket.closed:
+                input_socket.close()
+
+        for shutdown_path in self.shutdown_paths:
+            if shutdown_path:
+                try:
+                    with self.ctx.socket(zmq.PAIR) as shutdown_sender:
+                        shutdown_sender.connect(shutdown_path)
+                        shutdown_sender.send(b"")
+                except Exception as e:
+                    logger.debug(f"{self.label}: Error sending shutdown signal: {e}")
+
+        for thread in self.output_threads:
+            if thread and thread.is_alive():
+                thread.join(timeout=5.0)
+
+        logger.info(f"{self.label}: All EngineCores shut down")
+
 
     def add_request(self, seqs: List[Sequence]):
         logger.debug(f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}")
@@ -168,10 +262,28 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        self.input_socket.send_multipart(
-            [self.engine_core_identity, pickle.dumps((EngineCoreRequestType.ADD, seqs))],
-            copy=False,
-        )
+        if self.local_engine_count == 1:
+            # Single DP rank, send all requests
+            logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
+            self.input_sockets[0].send_multipart(
+                [self.engine_core_identities[0], pickle.dumps((EngineCoreRequestType.ADD, seqs))],
+                copy=False,
+            )
+        else:
+            # DP ranks, round-robin
+            dp_seqs = [[] for _ in range(self.local_engine_count)]
+            for i, seq in enumerate(seqs):
+                dp_rank = i % self.local_engine_count
+                dp_seqs[dp_rank].append(seq)
+
+            for dp_rank, rank_seqs in enumerate(dp_seqs):
+                if rank_seqs:
+                    logger.debug(f"{self.label}: Add {len(rank_seqs)} requests to DP rank {dp_rank}")
+                    self.input_sockets[dp_rank].send_multipart(
+                        [self.engine_core_identities[dp_rank], 
+                         pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))],
+                        copy=False,
+                    )
     
     def get_stream_outputs(self):
         try:
@@ -179,22 +291,33 @@ class CoreManager:
         except queue.Empty:
             return None
     
-    def send_utility_command(self, cmd: str):
-        logger.debug(f"{self.label}: Send utility command: {cmd}")
-        self.input_socket.send_multipart(
-            [self.engine_core_identity, pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))],
+    def send_utility_command(self, cmd: str, dp_rank: int = 0):
+        logger.debug(f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}")
+        self.input_sockets[dp_rank].send_multipart(
+            [self.engine_core_identities[dp_rank], 
+             pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))],
             copy=False,
         )
 
-    def _shutdown_engine_core(self):
-        if self.engine_core_process is not None and self.engine_core_process.is_alive():
-            self.input_socket.send_multipart(
-                [
-                    self.engine_core_identity,
-                    pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)),
-                ],
-                copy=False,
-            )
+    def _shutdown_engine_core_rank(self, dp_rank: int):
+        if dp_rank >= len(self.engine_core_processes):
+            return
+
+        process = self.engine_core_processes[dp_rank]
+        if process is not None and process.is_alive():
+            try:
+                input_socket = self.input_sockets[dp_rank]
+                if not input_socket.closed:
+                    input_socket.send_multipart(
+                        [
+                            self.engine_core_identities[dp_rank],
+                            pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)),
+                        ],
+                        copy=False,
+                    )
+                    logger.debug(f"{self.label}: Sent shutdown to DP rank {dp_rank}")
+            except Exception as e:
+                logger.debug(f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}")
 
     def get_output(self) -> List[Sequence]:
         seqs = self.outputs_queue.get()
@@ -206,23 +329,33 @@ class CoreManager:
         return not self.outputs_queue.empty()
 
     def is_alive(self):
-        return self.engine_core_process is not None
+        return any(proc is not None and proc.is_alive() 
+                  for proc in self.engine_core_processes)
 
+    def finished_procs(self):
+        return any(proc is not None and not proc.is_alive()
+                  for proc in self.engine_core_processes)
 
-def launch_engine_core(config: Config):
+def launch_engine_core(config: Config, dp_rank: int = 0):
     input_address = get_open_zmq_ipc_path()
     output_address = get_open_zmq_ipc_path()
     import torch
     if torch.multiprocessing.get_start_method(allow_none=True) is None:
         torch.multiprocessing.set_start_method("spawn", force=False)
+
+    config.parallel_config.data_parallel_rank = dp_rank
+    config.parallel_config.data_parallel_rank_local = dp_rank
+
+    logger.info(f"Creating EngineCore process: DP rank {dp_rank}, will use GPUs {dp_rank * config.tensor_parallel_size} to {(dp_rank + 1) * config.tensor_parallel_size - 1}")
+
     process = multiprocessing.Process(
         target=EngineCore.run_engine,
-        name=f"EngineCore",
+        name=f"EngineCore-DP{dp_rank}",
         kwargs={
             "config": config,
             "input_address": input_address,
             "output_address": output_address,
         },
     )
-    process.start()
-    return process, {"input_address": input_address, "output_address": output_address}
+
+    return process, {"input_address": input_address, "output_address": output_address}, dp_rank

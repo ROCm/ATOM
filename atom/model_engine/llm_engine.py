@@ -23,11 +23,14 @@ class LLMEngine:
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+        data_parallel_size = kwargs.get('data_parallel_size', 1)
         config = Config(model, **config_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.bos_token_id = self.tokenizer.bos_token_id
         config.eos_token_id = self.tokenizer.eos_token_id
-
+        # Set data parallel size in config
+        config.parallel_config.data_parallel_size = data_parallel_size
+        self.data_parallel_size = data_parallel_size
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             self.tokenizer, config.kv_cache_block_size
@@ -35,7 +38,7 @@ class LLMEngine:
         self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
-        logger.info("LLMEngine init")
+        logger.info(f"LLMEngine init with {self.data_parallel_size} data parallel ranks")
 
     def add_request(
         self, 
