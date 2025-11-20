@@ -95,8 +95,8 @@ class Attention(nn.Module):
             kv_cache_dtype,
             layer_num,
             mla_modules,
-            sinks,
-            per_layer_sliding_window,
+            sinks=sinks,
+            sliding_window=per_layer_sliding_window,
         )
 
         compilation_config = atom_config.compilation_config

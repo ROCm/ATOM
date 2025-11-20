@@ -369,8 +369,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             shuffled_w13, shuffled_w2 = shuffle_weights(
                 layer.w13_weight, layer.w2_weight
             )
-            shuffled_w13_scale = fp4_utils.e8m0_shuffle(layer.w13_weight_scale)
-            shuffled_w2_scale = fp4_utils.e8m0_shuffle(layer.w2_weight_scale)
+            shuffled_w13_scale = fp4_utils.e8m0_shuffle(
+                layer.w13_weight_scale.view(self.num_experts, -1)
+            )
+            shuffled_w2_scale = fp4_utils.e8m0_shuffle(
+                layer.w2_weight_scale.view(self.num_experts, -1)
+            )
 
         layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
@@ -939,7 +943,7 @@ class FusedMoE(torch.nn.Module):
                     else 1 / self.routed_scaling_factor
                 ),
                 max_num_tokens=16384,  # Default max tokens
-                is_EP=use_ep,
+                is_EP=self.use_ep,
             )
         if is_rocm_aiter_fusion_shared_expert_enabled():
             self.local_num_experts += self.num_fused_shared_experts
@@ -1087,7 +1091,10 @@ class FusedMoE(torch.nn.Module):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-        expert_data.copy_(loaded_weight)
+        if expert_data.dtype != dtypes.fp4x2:
+            expert_data.copy_(loaded_weight)
+        else:
+            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
 
     def _load_w2(
         self,
@@ -1107,7 +1114,10 @@ class FusedMoE(torch.nn.Module):
                 shard_dim, shard_size * tp_rank, shard_size
             )
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        if expert_data.dtype != dtypes.fp4x2:
+            expert_data.copy_(loaded_weight)
+        else:
+            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int

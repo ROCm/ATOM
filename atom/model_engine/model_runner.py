@@ -232,8 +232,16 @@ class ModelRunner:
         os.environ["MASTER_PORT"] = str(self.config.port)
         init_dist_env(self.world_size, rankID=rank)
         init_exit_handler(self)
-        default_dtype = hf_config.torch_dtype if getattr(hf_config, "torch_dtype", None) is not None else "bfloat16"
-        default_dtype = getattr(torch, default_dtype, torch.bfloat16)
+        default_dtype = (
+            hf_config.torch_dtype
+            if getattr(hf_config, "torch_dtype", None) is not None
+            else "bfloat16"
+        )
+        default_dtype = (
+            getattr(torch, default_dtype, torch.bfloat16)
+            if type(default_dtype) is not torch.dtype
+            else default_dtype
+        )
         torch.set_default_dtype(default_dtype)
         torch.set_default_device("cuda")
         self.attn_backend = get_attn_backend(

@@ -242,7 +242,6 @@ class LinearBase(nn.Module):
                     x_scale,
                     self.weight_scale,
                     y,
-                    dtype=otype,
                 )
                 y = y[:m, ...]
                 if self.bias is not None and not need_reduce:
