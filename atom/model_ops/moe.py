@@ -260,8 +260,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
 
         mxfp4_block = 32
+        pad_align = 256
 
-        intermediate_size_per_partition_after_pad = intermediate_size_per_partition
+        intermediate_size_per_partition_after_pad = (
+            (intermediate_size_per_partition + pad_align - 1) // pad_align * pad_align
+        )
+        hidden_size = (hidden_size + pad_align - 1) // pad_align * pad_align
         self.intermediate_size = intermediate_size_per_partition_after_pad
         self.hidden_size = hidden_size
         # Fused gate_up_proj (column parallel)
@@ -351,11 +355,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.activation == ActivationType.Swiglu:
             shuffled_w13 = shuffle_weight_a16w4(layer.w13_weight, 16, True)
             shuffled_w13_scale = shuffle_scale_a16w4(
-                layer.w13_weight_scale, layer.local_num_experts, True
+                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                self.num_experts,
+                True,
             )
             shuffled_w2 = shuffle_weight_a16w4(layer.w2_weight, 16, False)
             shuffled_w2_scale = shuffle_scale_a16w4(
-                layer.w2_weight_scale, layer.local_num_experts, False
+                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                self.num_experts,
+                False,
             )
         else:
             shuffled_w13, shuffled_w2 = shuffle_weights(
@@ -413,15 +421,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             topk_weights,
             topk_ids,
             expert_mask=expert_map,
-            activation=activation.value,
-            quant_type=self.quant_type.value,
+            activation=activation,
+            quant_type=self.quant_type,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
             doweight_stage1=apply_router_weight_on_input,
             hidden_pad=self.hidden_size,
-            intermediate_pad=self.intermediate_size_per_partition_after_pad,
+            intermediate_pad=self.intermediate_size,
             bias1=layer.w13_bias,
             bias2=layer.w2_bias,
         )
@@ -858,9 +864,9 @@ class FusedMoE(torch.nn.Module):
         self.global_num_experts = num_experts
 
         atom_config = get_current_atom_config()
-        use_ep = self.tp_size > 1 and atom_config.enable_expert_parallel
+        self.use_ep = self.tp_size > 1 and atom_config.enable_expert_parallel
 
-        if use_ep:
+        if self.use_ep:
             # Set TP size to 1 to adjust for EP and adjust EP size and rank
             self.ep_rank = tp_rank
             self.tp_rank = 0
@@ -896,7 +902,7 @@ class FusedMoE(torch.nn.Module):
             else 1.0
         )
         self.expert_mask = None
-        if use_ep:
+        if self.use_ep:
             expert_mask = torch.ones(
                 (self.global_num_experts + self.num_fused_shared_experts + 1,),
                 dtype=torch.int32,
@@ -925,8 +931,8 @@ class FusedMoE(torch.nn.Module):
                 n_routed_experts=self.global_num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
                 top_k=self.top_k,
-                tp_rank=self.ep_rank if use_ep else tp_rank,
-                tp_size=self.ep_size if use_ep else tp_size,
+                tp_rank=self.ep_rank if self.use_ep else tp_rank,
+                tp_size=self.ep_size if self.use_ep else tp_size,
                 shared_experts_score=(
                     1.0
                     if is_rocm_aiter_fuse_routed_scaling_factor()
@@ -1136,14 +1142,88 @@ class FusedMoE(torch.nn.Module):
             return expert_id
         return self.expert_map[expert_id].item()
 
+    def mxf4_merged_weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ):
+        # (FIXME) for gpt-oss all experts are combined
+        mxfp4_block = 32
+        ep_rank_start = self.ep_rank * self.local_num_experts
+        ep_rank_end = ep_rank_start + self.local_num_experts
+        tp_rank_start = self.tp_rank * self.intermediate_size_per_partition
+        tp_rank_end = tp_rank_start + self.intermediate_size_per_partition
+        # print(
+        #     f"{param.shape=} {ep_rank_start=} {ep_rank_end=} {tp_rank_start=} {tp_rank_end=}"
+        # )
+        if param is getattr(self, "w13_bias", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
+            dim1 = narrow_weight.shape[1]
+            param[:, :dim1].copy_(narrow_weight)
+        elif param is getattr(self, "w2_bias", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight
+            dim1 = narrow_weight.shape[1]
+            param[:, :dim1].copy_(narrow_weight)
+        elif param is getattr(self, "w13_weight", None):
+            loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[
+                    :, 2 * tp_rank_start : 2 * tp_rank_end, ...
+                ]
+            dim1, dim2 = narrow_weight.shape[1:]
+            param.view(torch.uint8)[:, :dim1, :dim2].copy_(
+                narrow_weight.view(torch.uint8)
+            )
+        elif param is getattr(self, "w2_weight", None):
+            loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[
+                    ..., tp_rank_start // 2 : tp_rank_end // 2
+                ]
+            dim1, dim2 = narrow_weight.shape[1:]
+            param.view(torch.uint8)[:, :dim1, :dim2].copy_(
+                narrow_weight.view(torch.uint8)
+            )
+        elif param is getattr(self, "w13_weight_scale", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[
+                    :, 2 * tp_rank_start : 2 * tp_rank_end, ...
+                ]
+            dim1, dim2 = narrow_weight.shape[1:]
+            param[:, :dim1, :dim2].copy_(narrow_weight)
+        elif param is getattr(self, "w2_weight_scale", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[
+                    ..., tp_rank_start // mxfp4_block : tp_rank_end // mxfp4_block
+                ]
+            dim1, dim2 = narrow_weight.shape[1:]
+            param[:, :dim1, :dim2].copy_(narrow_weight)
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
+        weight_name: str = "",
+        shard_id: str = "",
+        expert_id: int = 0,
     ) -> None:
+        if self.quant_config["quant_dtype"] == dtypes.fp4x2 and weight_name == "":
+            self.mxf4_merged_weight_loader(param, loaded_weight)
+            return
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
@@ -1364,12 +1444,11 @@ class FusedMoE(torch.nn.Module):
                 expert_id,
                 shard_id,
             )
-            for suffix in (["", "_bias"] if has_bias else [""])
             for expert_id in range(num_experts)
             for shard_id, weight_name in [
-                ("w1", ckpt_gate_proj_name + suffix),
-                ("w2", ckpt_down_proj_name + suffix),
-                ("w3", ckpt_up_proj_name + suffix),
+                ("w1", ckpt_gate_proj_name),
+                ("w2", ckpt_down_proj_name),
+                ("w3", ckpt_up_proj_name),
             ]
         ]
 

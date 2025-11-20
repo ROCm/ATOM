@@ -313,16 +313,16 @@ class GptOssForCausalLM(nn.Module):
     }
     weights_mapping = {
         # MoE MXFP4 weights
-        ".gate_up_proj_blocks": ".w13_weight",
-        ".down_proj_blocks": ".w2_weight",
-        ".gate_up_proj_scales": ".w13_weight_scale",
-        ".down_proj_scales": ".w2_weight_scale",
+        "gate_up_proj_blocks": "w13_weight",
+        "down_proj_blocks": "w2_weight",
+        "gate_up_proj_scales": "w13_weight_scale",
+        "down_proj_scales": "w2_weight_scale",
         # MoE other weights
-        ".gate_up_proj": ".w13_weight",
-        ".down_proj": ".w2_weight",
+        "gate_up_proj": "w13_weight",
+        "down_proj": "w2_weight",
         # MoE Bias
-        ".gate_up_proj_bias": ".w13_bias",
-        ".down_proj_bias": ".w2_bias",
+        "gate_up_proj_bias": "w13_bias",
+        "down_proj_bias": "w2_bias",
     }
 
     def __init__(
@@ -379,5 +379,4 @@ class GptOssForCausalLM(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_local_experts,
-            has_bias=True,
         )

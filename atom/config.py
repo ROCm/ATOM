@@ -324,6 +324,8 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
     assert (
         quant_dtype is not None
     ), f"Cannot parse quant dtype from {orig_quant_config_str}"
+    if quant_dtype == d_dtypes["fp4x2"]:
+        quant_type = QuantType.per_1x32
 
     RE_STATIC_QUANT = r"\'(?:activation_scheme)\'\:\s*\'(static)\'"
     if re.search(RE_STATIC_QUANT, orig_quant_config_str):
