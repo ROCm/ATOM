@@ -17,10 +17,17 @@ from atom.model_loader.weight_utils import (
 )
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.moe import is_rocm_aiter_fusion_shared_expert_enabled
+from aiter.dist.parallel_state import get_tp_group
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
-    param.data.copy_(loaded_weight)
+    if loaded_weight.numel() == param.data.numel():
+        param.data.copy_(loaded_weight)
+    elif loaded_weight.numel() // get_tp_group().world_size == param.data.numel():
+        loaded_weight_per_rank = loaded_weight.numel() // get_tp_group().world_size
+        tp_rank_start = loaded_weight_per_rank * get_tp_group().rank
+        tp_rank_end = tp_rank_start + loaded_weight_per_rank
+        param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
 
 
 def safetensors_weights_iterator(

@@ -222,13 +222,13 @@ class LinearBase(nn.Module):
                         dtype=otype,
                     )
                     if self.bias is not None and not need_reduce:
-                        y += self.bias.view_as(y)
+                        y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
                 y = gemm_a8w8_blockscale_bpreshuffle(
                     x, self.weight, x_scale, self.weight_scale, dtype=otype
                 )
                 if self.bias is not None and not need_reduce:
-                    y += self.bias.view_as(y)
+                    y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
                 m = x.view(-1, x.size(-1)).shape[0]
                 y = torch.empty(
@@ -246,11 +246,11 @@ class LinearBase(nn.Module):
                 )
                 y = y[:m, ...]
                 if self.bias is not None and not need_reduce:
-                    y += self.bias.view_as(y)
+                    y += self.bias
         if need_reduce:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
             if self.bias is not None:
-                y += self.bias.view_as(y)
+                y += self.bias
         return y
 
 
@@ -425,7 +425,7 @@ class RowParallelLinear(LinearBase):
             input_size,
             output_size,
             tp_dim=1,
-            bias=bias if self.tp_rank == 0 else False,
+            bias=bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
         )
