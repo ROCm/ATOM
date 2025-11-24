@@ -1,4 +1,4 @@
-<div align="center" id="sglangtop">
+<div align="center" id="logo">
 <img src="docs/atom_logo.png" alt="logo" width="400" margin="10px"></img>
 </div>
 
