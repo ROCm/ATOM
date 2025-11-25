@@ -181,7 +181,6 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
-        need_reduce = self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(x, self.weight, self.bias)
         else:
@@ -198,7 +197,7 @@ class LinearBase(nn.Module):
                 y = tgemm.mm(
                     x,
                     self.weight,
-                    self.bias if not need_reduce else None,
+                    self.bias,
                     otype=otype,
                     scale_a=x_scale,
                     scale_b=self.weight_scale,
@@ -210,7 +209,7 @@ class LinearBase(nn.Module):
                         self.weight,
                         x_scale,
                         self.weight_scale,
-                        self.bias if not need_reduce else None,
+                        self.bias,
                         dtype=otype,
                     )
                 else:
@@ -221,13 +220,13 @@ class LinearBase(nn.Module):
                         self.weight_scale,
                         dtype=otype,
                     )
-                    if self.bias is not None and not need_reduce:
+                    if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
                 y = gemm_a8w8_blockscale_bpreshuffle(
                     x, self.weight, x_scale, self.weight_scale, dtype=otype
                 )
-                if self.bias is not None and not need_reduce:
+                if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
                 m = x.view(-1, x.size(-1)).shape[0]
@@ -244,12 +243,10 @@ class LinearBase(nn.Module):
                     y,
                 )
                 y = y[:m, ...]
-                if self.bias is not None and not need_reduce:
+                if self.bias is not None:
                     y += self.bias
-        if need_reduce:
+        if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
-            if self.bias is not None:
-                y += self.bias
         return y
 
 
@@ -439,6 +436,9 @@ class RowParallelLinear(LinearBase):
                 loaded_weight = loaded_weight.repeat(1, self.tp_size)
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        else:
+            if self.tp_size > 0 and self.tp_rank != 0:
+                loaded_weight.zero_()
         param.weight_loader_process(param_data, loaded_weight)
 
 

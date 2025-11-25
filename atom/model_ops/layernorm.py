@@ -8,6 +8,7 @@ from aiter import (
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
 )
+from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
@@ -38,11 +39,13 @@ class RMSNorm(nn.Module):
         self,
         dim: int,
         eps: float = 1e-6,
+        x_pad_to_multiple: int = 0,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self.x_pad_to_multiple = x_pad_to_multiple
 
     # def rms_forward(
     #     self,
@@ -73,6 +76,10 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.x_pad_to_multiple > 0:
+            return fused_add_rmsnorm_pad(
+                x, self.weight, self.eps, residual, self.x_pad_to_multiple
+            )
         if residual is None:
             # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
             return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)

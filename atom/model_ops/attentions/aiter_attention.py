@@ -36,8 +36,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self.total_blocks = 0
         dropout_p = 0.0
         max_q_len = 1
+        min_seqlen_q = 0
 
         context_lens = [seq.num_tokens for seq in seqs]
+        max_seqlen_k = max(context_lens)
         positions = context_lens
         slot_mapping = [
             seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
@@ -60,11 +62,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ("context_lens", bs),
             ("block_tables", bs),
         ]
-
+        if self.block_size:
+            vars_used.append(("cu_seqlens_q", bs + 1))
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_q_len=max_q_len,
+            max_seqlen_q=max_q_len,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
             **ctx,
         )
 

@@ -12,6 +12,7 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 from torch import nn
+import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from atom.config import QuantizationConfig, get_current_atom_config
@@ -268,6 +269,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         hidden_size = (hidden_size + pad_align - 1) // pad_align * pad_align
         self.intermediate_size = intermediate_size_per_partition_after_pad
         self.hidden_size = hidden_size
+        self.hidden_pad = self.hidden_size - layer.hidden_size
+        self.intermediate_pad = (
+            self.intermediate_size - layer.intermediate_size_per_partition
+        )
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -282,7 +287,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w13_weight_scale = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 2 * intermediate_size_per_partition_after_pad,
                 hidden_size // mxfp4_block,
@@ -321,7 +326,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition_after_pad // mxfp4_block,
@@ -352,7 +357,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
-        if layer.activation == ActivationType.Swiglu:
+        if layer.activation == ActivationType.Swiglu and layer.w13_bias is not None:
+            e, n, k = layer.w13_weight.shape
+            layer.w13_weight.view(torch.uint8).copy_(
+                layer.w13_weight.data.view(torch.uint8)
+                .view(e, n // 2, 2, k)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(e, n, k)
+            )
+            layer.w13_weight_scale.data = (
+                layer.w13_weight_scale.data.view(e, n // 2, 2, -1)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(e, n, -1)
+            )
             shuffled_w13 = shuffle_weight_a16w4(layer.w13_weight, 16, True)
             shuffled_w13_scale = shuffle_scale_a16w4(
                 layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
@@ -364,6 +383,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
                 self.num_experts,
                 False,
+            )
+            layer.w13_bias.data = (
+                layer.w13_bias.data.view(-1, n // 2, 2)
+                .permute(0, 2, 1)
+                .contiguous()
+                .view(-1, n)
             )
         else:
             shuffled_w13, shuffled_w2 = shuffle_weights(
@@ -430,8 +455,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             doweight_stage1=apply_router_weight_on_input,
-            hidden_pad=self.hidden_size,
-            intermediate_pad=self.intermediate_size,
+            hidden_pad=0,  # self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
             bias1=layer.w13_bias,
             bias2=layer.w2_bias,
         )
@@ -1163,9 +1188,6 @@ class FusedMoE(torch.nn.Module):
         ep_rank_end = ep_rank_start + self.local_num_experts
         tp_rank_start = self.tp_rank * self.intermediate_size_per_partition
         tp_rank_end = tp_rank_start + self.intermediate_size_per_partition
-        # print(
-        #     f"{param.shape=} {ep_rank_start=} {ep_rank_end=} {tp_rank_start=} {tp_rank_end=}"
-        # )
         if param is getattr(self, "w13_bias", None):
             if self.use_ep:
                 narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
@@ -1178,6 +1200,8 @@ class FusedMoE(torch.nn.Module):
                 narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight
+                if self.tp_rank != 0:
+                    narrow_weight.zero_()
             dim1 = narrow_weight.shape[1]
             param[:, :dim1].copy_(narrow_weight)
         elif param is getattr(self, "w13_weight", None):
@@ -1430,7 +1454,7 @@ class FusedMoE(torch.nn.Module):
                 final_hidden_states, ca_fp8_quant=False
             )
 
-        return final_hidden_states
+        return final_hidden_states[:, : self.hidden_size]
 
     @classmethod
     def make_expert_params_mapping(
