@@ -670,7 +670,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
-            quant_config=quant_config,
+            # TODO use ignore layer for mxfp4 attention
+            quant_config=quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None,
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
             topk_indices_buffer=topk_indices_buffer,

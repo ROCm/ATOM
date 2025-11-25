@@ -18,6 +18,7 @@ from aiter import (
 from aiter.dist.parallel_state import get_tp_group
 from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
+from aiter.utility import fp4_utils
 from torch import nn
 
 from atom.config import QuantizationConfig
@@ -53,7 +54,7 @@ class LinearBase(nn.Module):
             output_size if isinstance(output_size, int) else sum(output_size)
         )
         self.tp_dim = tp_dim
-        self.tp_rank = get_tp_group().rank_in_group
+        self.tp_rank = get_tp_group().rank
         self.tp_size = get_tp_group().world_size
         self.output_partition_sizes = (
             output_size if isinstance(output_size, list) else [output_size]
@@ -192,6 +193,7 @@ class LinearBase(nn.Module):
                     x,
                     quant_dtype=self.params_dtype,
                     scale=getattr(self, "input_scale", None),
+                    shuffle=True if self.quant_type.value == QuantType.per_1x32.value else False
                 )
             if self.quant_type.value == QuantType.per_Tensor.value:
                 y = tgemm.mm(
@@ -235,11 +237,12 @@ class LinearBase(nn.Module):
                     dtype=otype,
                     device=x.device,
                 )
+                w_scale = fp4_utils.e8m0_shuffle(self.weight_scale.data)
                 y = gemm_a4w4(
                     x,
                     self.weight,
                     x_scale,
-                    self.weight_scale,
+                    w_scale,
                     y,
                 )
                 y = y[:m, ...]

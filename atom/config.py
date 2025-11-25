@@ -249,12 +249,14 @@ class QuantizationConfig(dict):
         quant_dtype=torch.bfloat16,
         is_dynamic=True,
         quant_name="",
+        quant_method=None,
     ):
         super().__init__()
         self["quant_type"] = quant_type if quant_type is not None else QuantType.No
         self["quant_dtype"] = quant_dtype if quant_dtype is not None else torch.bfloat16
         self["quant_name"] = quant_name
         self["is_dynamic"] = is_dynamic
+        self["quant_method"] = quant_method
 
     def get_name(self):
         return self["quant_name"]
@@ -276,6 +278,7 @@ class QuantizationConfig(dict):
         factors.append(self["quant_dtype"])
         factors.append(self["quant_name"])
         factors.append(self["is_dynamic"])
+        factors.append(self["quant_method"])
         str_factors = str(factors)
         # assert_hashable(str_factors)
         return hashlib.sha256(str(factors).encode()).hexdigest()
@@ -340,7 +343,7 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
         is_dynamic = False
     else:
         is_dynamic = True
-    return QuantizationConfig(quant_type, quant_dtype, is_dynamic)
+    return QuantizationConfig(quant_type, quant_dtype, is_dynamic, quant_method=quant_method)
 
 
 _CONFIG_REGISTRY: dict[str, str] = {
