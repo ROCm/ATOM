@@ -102,7 +102,7 @@ python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --cudagraph-cap
 ```
 run benchmark
 ```bash
-python -m atom.bench.benchmark_throughput -n 128 -r 128 -c 64 -i 1020 -o 1024
+python -m atom.bench.benchmark_throughput --model Qwen/Qwen3-0.6B -n 128 -r 128 -c 64 -i 1020 -o 1024
 ```
 
 
