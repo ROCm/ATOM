@@ -1,7 +1,7 @@
 import argparse
 from typing import List
 
-from atom import LLMEngine, AsyncLLMEngine
+from atom import AsyncLLMEngine, LLMEngine
 from atom.config import CompilationConfig
 
 
@@ -106,7 +106,7 @@ class EngineArgs:
         parser.add_argument(
             "--cudagraph-capture-sizes",
             type=str,
-            default=None,
+            default="[1,2,4,8,16,32,48,64,128,256]",
             help="Sizes to capture cudagraph. Example: [1,2,4,8,16]",
         )
 
@@ -188,7 +188,7 @@ class EngineArgs:
             data_parallel_size=self.data_parallel_size,
             enable_dp_attention=self.enable_dp_attention,
         )
-    
+
     def create_async_engine(self) -> AsyncLLMEngine:
         """Create and return an AsyncLLMEngine instance with the configured parameters."""
         return AsyncLLMEngine(
@@ -210,4 +210,3 @@ class EngineArgs:
             data_parallel_size=self.data_parallel_size,
             enable_dp_attention=self.enable_dp_attention,
         )
-

@@ -99,6 +99,7 @@ Run online throughput benchmark:
 start the server
 ```bash
 python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --cudagraph-capture-sizes [1,2,4,8,16,32,64,128]
+python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 -tp 8 --block-size 1
 ```
 run benchmark
 ```bash
