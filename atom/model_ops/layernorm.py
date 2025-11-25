@@ -33,7 +33,19 @@ def rmsnorm2d_fwd_with_add_(
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 
-@torch_compile_guard()
+def fused_rmsnorm_pad_fake_tensors(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    x_pad_to_multiple: int = 0,
+) -> torch.Tensor:
+    M, N = x.shape
+    N_out = (N + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
+    out = torch.empty((M, N_out), dtype=x.dtype, device=x.device)
+    return out
+
+
+@torch_compile_guard(gen_fake=fused_rmsnorm_pad_fake_tensors)
 def fused_rmsnorm_pad_(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -43,7 +55,21 @@ def fused_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, None, x_pad_to_multiple)
 
 
-@torch_compile_guard()
+def fused_add_rmsnorm_pad_fake_tensors(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    res: torch.Tensor,
+    x_pad_to_multiple: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    N_out = (N + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
+    out = torch.empty((M, N_out), dtype=x.dtype, device=x.device)
+    res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
+    return out, res_out
+
+
+@torch_compile_guard(gen_fake=fused_add_rmsnorm_pad_fake_tensors)
 def fused_add_rmsnorm_pad_(
     x: torch.Tensor,
     weight: torch.Tensor,
