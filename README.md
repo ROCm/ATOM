@@ -48,7 +48,7 @@ docker run -it --network=host \
 ```bash
 pip install aiter -i https://mkmartifactory.amd.com/artifactory/api/pypi/hw-orc3pypi-prod-local/simple
 git clone https://github.com/ROCm/ATOM.git
-cd ./atom
+cd ./ATOM
 pip install .
 ```
 
