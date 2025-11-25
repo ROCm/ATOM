@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 from aiter.paged_attn import PagedAttention
 from torch import nn
+from typing import Optional
 
 from atom.utils.forward_context import (
     ForwardContext,
@@ -14,6 +15,7 @@ from atom.utils.forward_context import (
 )
 from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
+
 
 class Attention(nn.Module):
 
@@ -25,9 +27,9 @@ class Attention(nn.Module):
         num_kv_heads,
         kv_cache_dtype="bf16",
         layer_num=0,
-        mla_modules: MLAModules=None,
-        sinks: nn.Parameter=None,
-        sliding_window: int=None,
+        mla_modules: Optional[MLAModules] = None,
+        sinks: Optional[nn.Parameter] = None,
+        sliding_window: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -42,17 +44,27 @@ class Attention(nn.Module):
         self.layer_num = layer_num
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self.sinks = sinks
-        self.sliding_window = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+        self.sliding_window = (
+            (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+        )
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position: torch.Tensor=None):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position: torch.Tensor = None,
+    ):
         o: torch.Tensor
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        
-        use_triton_unified_attention = self.sliding_window != (-1, -1) or self.head_dim != 128
 
-        # o = torch.ops.aiter.unified_attention_with_output(q, k, v, 
+        use_triton_unified_attention = (
+            self.sliding_window != (-1, -1) or self.head_dim != 128
+        )
+
+        # o = torch.ops.aiter.unified_attention_with_output(q, k, v,
         #             self.scale, self.kv_cache_dtype, self.layer_num)
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -75,10 +87,18 @@ class Attention(nn.Module):
                 aiter.reshape_and_cache_flash(
                     k,
                     v,
-                    k_cache.view(k_cache.shape[0], -1, self.num_kv_heads, self.head_dim),
-                    v_cache.view(v_cache.shape[0], -1, self.num_kv_heads, self.head_dim),
+                    k_cache.view(
+                        k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                    ),
+                    v_cache.view(
+                        v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                    ),
                     attn_metadata.slot_mapping,
-                    self.kv_cache_dtype if self.kv_cache_dtype.startswith("fp8") else "auto",
+                    (
+                        self.kv_cache_dtype
+                        if self.kv_cache_dtype.startswith("fp8")
+                        else "auto"
+                    ),
                     self.one_scale,
                     self.one_scale,
                 )
@@ -113,8 +133,12 @@ class Attention(nn.Module):
             if k_cache.numel() and v_cache.numel():
                 unified_attention(
                     q,
-                    k_cache.view(k_cache.shape[0], -1, self.num_kv_heads, self.head_dim),
-                    v_cache.view(v_cache.shape[0], -1, self.num_kv_heads, self.head_dim),
+                    k_cache.view(
+                        k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                    ),
+                    v_cache.view(
+                        v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                    ),
                     o,
                     cu_seqlens_q=attn_metadata.cu_seqlens_q,
                     seqused_k=attn_metadata.context_lens,
@@ -124,12 +148,12 @@ class Attention(nn.Module):
                     causal=True,
                     alibi_slopes=None,
                     window_size=self.sliding_window,
-                    block_table= attn_metadata.block_tables,
+                    block_table=attn_metadata.block_tables,
                     softcap=0,
                     q_descale=None,
                     k_descale=self.one_scale.expand(descale_shape),
                     v_descale=self.one_scale.expand(descale_shape),
-                    sinks=self.sinks
+                    sinks=self.sinks,
                 )
         elif context.is_prefill:
             # if context.block_tables is not None:  # prefix cache

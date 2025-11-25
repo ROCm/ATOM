@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import nn
+from typing import Optional
 
 
 from atom.utils import mark_spliting_op
@@ -58,9 +59,9 @@ class Attention(nn.Module):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: MLAModules = None,
-        sinks: nn.Parameter = None,
-        per_layer_sliding_window: int = None,
+        mla_modules: Optional[MLAModules] = None,
+        sinks: Optional[nn.Parameter] = None,
+        per_layer_sliding_window: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
