@@ -202,6 +202,7 @@ class TransformerBlock(torch.nn.Module):
         cache_config = atom_config.kv_cache_dtype
 
         self.layer_idx = layer_num
+        self.hidden_size = atom_config.hf_config.hidden_size
         self.self_attn = OAIAttention(
             config,
             prefix=f"{prefix}.self_attn",
@@ -229,7 +230,7 @@ class TransformerBlock(torch.nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        output = self.mlp(hidden_states)
+        output = self.mlp(hidden_states)[:, : self.hidden_size]
         return output, residual
 
 

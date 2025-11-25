@@ -33,6 +33,27 @@ def rmsnorm2d_fwd_with_add_(
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 
+@torch_compile_guard()
+def fused_rmsnorm_pad_(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    x_pad_to_multiple: int = 0,
+) -> torch.Tensor:
+    return fused_add_rmsnorm_pad(x, weight, epsilon, None, x_pad_to_multiple)
+
+
+@torch_compile_guard()
+def fused_add_rmsnorm_pad_(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    res: torch.Tensor,
+    x_pad_to_multiple: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
+
+
 class RMSNorm(nn.Module):
 
     def __init__(
@@ -77,10 +98,15 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
-            return fused_add_rmsnorm_pad(
-                x, self.weight, self.eps, residual, self.x_pad_to_multiple
-            )
-        if residual is None:
+            if residual is None:
+                return fused_rmsnorm_pad_(
+                    x, self.weight, self.eps, self.x_pad_to_multiple
+                )
+            else:
+                return fused_add_rmsnorm_pad_(
+                    x, self.weight, self.eps, residual, self.x_pad_to_multiple
+                )
+        elif residual is None:
             # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
             return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
         else:

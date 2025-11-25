@@ -1,16 +1,24 @@
 import argparse
 import asyncio
+import json
 import time
-from typing import List, Optional, Dict, Any, Union
+import queue
+from typing import List, Optional, Dict, Any, AsyncGenerator
 import uuid
+from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 from transformers import AutoTokenizer
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.request import RequestOutput
+import logging
+
+logger = logging.getLogger("atom")
 
 
 class ChatMessage(BaseModel):
@@ -26,16 +34,18 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = 256
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
+    stream: Optional[bool] = False
 
 
 class CompletionRequest(BaseModel):
     model: str
-    prompt: Union[str, List[str]]
+    prompt: str
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     max_tokens: Optional[int] = 256
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
+    stream: Optional[bool] = False
 
 
 class ChatCompletionResponse(BaseModel):
@@ -56,79 +66,256 @@ class CompletionResponse(BaseModel):
     usage: Dict[str, Any]
 
 
-# Global engine
 engine = None
 tokenizer: Optional[AutoTokenizer] = None
 model_name: str = ""
+_stream_queues: Dict[str, queue.Queue] = {}
+_seq_id_to_request_id: Dict[int, str] = {}
 
 
-async def generate_async(prompt: str, sampling_params: SamplingParams) -> Dict[str, Any]:
-    """Async wrapper for engine generation."""
-    global engine
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str = "",
+    finish_reason: Optional[str] = None,
+    usage: Optional[Dict] = None
+) -> str:
+    chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": content} if content else {}, "finish_reason": finish_reason, "logprobs": None}],
+    }
+    if usage is not None:
+        chunk["usage"] = usage
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def create_chat_usage_chunk(
+    request_id: str,
+    model: str,
+    usage: Dict
+) -> str:
+    """Create a chunk containing only usage information for chat completions (no choices)."""
+    chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "usage": usage,
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def create_completion_chunk(
+    request_id: str,
+    model: str,
+    text: str,
+    finish_reason: Optional[str] = None,
+    usage: Optional[Dict] = None
+) -> str:
+    chunk = {
+        "id": request_id,
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "text": text, "finish_reason": finish_reason, "logprobs": None}],
+    }
+    if usage is not None:
+        chunk["usage"] = usage
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def create_usage_chunk(
+    request_id: str,
+    model: str,
+    usage: Dict
+) -> str:
+    """Create a chunk containing only usage information (no choices)."""
+    chunk = {
+        "id": request_id,
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model,
+        "usage": usage,
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def send_stream_chunk(request_output: RequestOutput):
+    global tokenizer, _stream_queues, _seq_id_to_request_id
     
-    async for output in engine.generate_async(prompt, sampling_params):
-        return output
+    # Get request_id from sequence ID
+    request_id = _seq_id_to_request_id.get(request_output.request_id)
+    if request_id is None:
+        logger.warning(f"send_stream_chunk: No request_id found for sequence {request_output.request_id}")
+        return
+    
+    # Decode the new tokens
+    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+    logger.debug(f"send_stream_chunk: seq_id={request_output.request_id}, request_id={request_id}, tokens={request_output.output_tokens}, text='{new_text}'")
+    
+    # Get the queue for this request
+    stream_queue = _stream_queues.get(request_id)
+    if stream_queue is None:
+        logger.warning(f"send_stream_chunk: No queue found for request_id {request_id}")
+        return
+    
+    # Prepare chunk data
+    chunk_data = {
+        "text": new_text,
+        "token_ids": request_output.output_tokens,
+        "finished": request_output.finished,
+        "finish_reason": request_output.finish_reason,
+    }
+
+    try:
+        stream_queue.put_nowait(chunk_data)
+        logger.debug(f"send_stream_chunk: Successfully put chunk data into queue for request_id {request_id}")
+    except queue.Full:
+        logger.warning(f"send_stream_chunk: Queue full for request_id {request_id}, skipping chunk")
+        pass
+
+
+async def generate_async(
+    prompt: str,
+    sampling_params: SamplingParams,
+    request_id: str
+) -> AsyncGenerator[Dict[str, Any], None]:
+    global engine, tokenizer
+    async for output in engine.generate_async(prompt, sampling_params, request_id):
+        yield {
+            "text": output["text"],
+            "token_ids": output["token_ids"],
+            "finish_reason": output.get("finish_reason"),
+            "num_tokens_input": len(tokenizer.encode(prompt)),
+            "num_tokens_output": len(output["token_ids"]),
+            "ttft": output.get("ttft", 0.0),
+            "tpot": output.get("tpot", 0.0),
+            "latency": output.get("latency", 0.0),
+        }
 
 
 app = FastAPI(title="Atom OpenAI API Server")
 
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+@app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """Handle chat completion requests."""
     global engine, tokenizer, model_name
-    
     try:
         prompt = tokenizer.apply_chat_template(
             [{"role": msg.role, "content": msg.content} for msg in request.messages],
             tokenize=False,
             add_generation_prompt=True,
         )
-        
+
         sampling_params = SamplingParams(
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
         )
-        
-        output = await generate_async(prompt, sampling_params)
-        
-        response = ChatCompletionResponse(
-            id=f"chatcmpl-{uuid.uuid4().hex}",
-            created=int(time.time()),
+
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        if request.stream:
+            async def generate_stream():
+                stream_queue = queue.Queue()
+                _stream_queues[request_id] = stream_queue
+
+                def stream_callback(request_output: RequestOutput):
+                    send_stream_chunk(request_output)
+
+                seq = engine.io_processor.preprocess(prompt, sampling_params, stream_callback=stream_callback)
+                seq_id = seq.id
+                _seq_id_to_request_id[seq_id] = request_id
+                logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}")
+                engine.core_mgr.add_request([seq])
+                logger.info(f"API: Added request to engine, callback registered: {seq.stream_callback is not None}")
+                
+                prev_text = ""
+                num_tokens_input = len(tokenizer.encode(prompt))
+                num_tokens_output = 0
+                yield create_chat_completion_chunk(request_id, request.model, "")
+                
+                # Consume chunks from queue using executor to avoid blocking
+                finished = False
+                loop = asyncio.get_event_loop()
+                while not finished:
+                    try:
+                        chunk_data = await asyncio.wait_for(
+                            loop.run_in_executor(None, stream_queue.get),
+                            timeout=30.0
+                        )
+                        new_text = chunk_data["text"]
+                        current_text = prev_text + new_text
+                        new_content = new_text
+                        prev_text = current_text
+
+                        chunk_token_ids = chunk_data.get("token_ids", [])
+                        num_tokens_output += len(chunk_token_ids)
+                        
+                        yield create_chat_completion_chunk(
+                            request_id, 
+                            request.model, 
+                            new_content,
+                            finish_reason=chunk_data.get("finish_reason")
+                        )
+                        
+                        if chunk_data.get("finished", False):
+                            finished = True
+                    except asyncio.TimeoutError:
+                        break
+                
+                _stream_queues.pop(request_id, None)
+                _seq_id_to_request_id.pop(seq_id, None)
+                
+                yield create_chat_completion_chunk(request_id, request.model, "", "stop")
+                usage = {
+                    "prompt_tokens": num_tokens_input,
+                    "completion_tokens": num_tokens_output,
+                    "total_tokens": num_tokens_input + num_tokens_output,
+                }
+                yield create_chat_usage_chunk(request_id, request.model, usage)
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+        # non-streaming
+        final_output = None
+        async for output in generate_async(prompt, sampling_params, request_id):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError("No output generated")
+
+        return ChatCompletionResponse(
+            id=request_id,
+            created=created,
             model=request.model,
             choices=[
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": output["text"],
-                    },
-                    "finish_reason": output["finish_reason"],
+                    "message": {"role": "assistant", "content": final_output["text"]},
+                    "finish_reason": final_output["finish_reason"],
                 }
             ],
             usage={
-                "prompt_tokens": output["num_tokens_input"],
-                "completion_tokens": output["num_tokens_output"],
-                "total_tokens": output["num_tokens_input"] + output["num_tokens_output"],
-                "ttft_s": output.get("ttft", 0.0),
-                "tpot_s": output.get("tpot", 0.0),
-                "latency_s": output.get("latency", 0.0),
+                "prompt_tokens": final_output["num_tokens_input"],
+                "completion_tokens": final_output["num_tokens_output"],
+                "total_tokens": final_output["num_tokens_input"] + final_output["num_tokens_output"],
+                "ttft_s": round(final_output.get("ttft", 0.0), 4),
+                "tpot_s": round(final_output.get("tpot", 0.0), 4),
+                "latency_s": round(final_output.get("latency", 0.0), 4),
             },
         )
-        
-        return response
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/v1/completions", response_model=CompletionResponse)
+@app.post("/v1/completions")
 async def completions(request: CompletionRequest):
-    """Handle text completion requests."""
-    global engine, model_name
-    
+    global engine, tokenizer, model_name
     try:
         sampling_params = SamplingParams(
             temperature=request.temperature,
@@ -136,69 +323,103 @@ async def completions(request: CompletionRequest):
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
         )
-        
-        if isinstance(request.prompt, str):
-            output = await generate_async(request.prompt, sampling_params)
-            choices = [
-                {
-                    "index": 0,
-                    "text": output["text"],
-                    "finish_reason": output["finish_reason"],
+
+        if request.stream:
+            request_id = f"cmpl-{uuid.uuid4().hex}"
+
+            async def generate_stream():
+                stream_queue = queue.Queue()
+                _stream_queues[request_id] = stream_queue
+                
+                def stream_callback(request_output: RequestOutput):
+                    send_stream_chunk(request_output)
+                
+                seq = engine.io_processor.preprocess(request.prompt, sampling_params, stream_callback=stream_callback)
+                seq_id = seq.id
+                _seq_id_to_request_id[seq_id] = request_id
+                engine.core_mgr.add_request([seq])
+                
+                prev_text = ""
+                num_tokens_input = len(tokenizer.encode(request.prompt))
+                num_tokens_output = 0
+                
+                finished = False
+                loop = asyncio.get_event_loop()
+                while not finished:
+                    try:
+                        chunk_data = await asyncio.wait_for(
+                            loop.run_in_executor(None, stream_queue.get),
+                            timeout=30.0
+                        )
+                        new_text = chunk_data["text"]
+                        current_text = prev_text + new_text
+                        new_content = new_text
+                        prev_text = current_text
+                        
+                        chunk_token_ids = chunk_data.get("token_ids", [])
+                        num_tokens_output += len(chunk_token_ids)
+                        
+                        yield create_completion_chunk(
+                            request_id,
+                            request.model,
+                            new_content,
+                            finish_reason=chunk_data.get("finish_reason")
+                        )
+                        
+                        if chunk_data.get("finished", False):
+                            finished = True
+                    except asyncio.TimeoutError:
+                        break
+                
+                # Cleanup
+                _stream_queues.pop(request_id, None)
+                _seq_id_to_request_id.pop(seq_id, None)
+                
+                yield create_completion_chunk(request_id, request.model, "", "stop")
+                usage = {
+                    "prompt_tokens": num_tokens_input,
+                    "completion_tokens": num_tokens_output,
+                    "total_tokens": num_tokens_input + num_tokens_output,
                 }
-            ]
-            total_prompt_tokens = output["num_tokens_input"]
-            total_completion_tokens = output["num_tokens_output"]
-        else:
-            tasks = [
-                generate_async(prompt, sampling_params)
-                for prompt in request.prompt
-            ]
-            outputs = await asyncio.gather(*tasks)
-            
-            choices = [
-                {
-                    "index": i,
-                    "text": output["text"],
-                    "finish_reason": output["finish_reason"],
-                }
-                for i, output in enumerate(outputs)
-            ]
-            total_prompt_tokens = sum(output["num_tokens_input"] for output in outputs)
-            total_completion_tokens = sum(output["num_tokens_output"] for output in outputs)
-        
-        if isinstance(request.prompt, str):
-            ttft = output.get("ttft", 0.0)
-            tpot = output.get("tpot", 0.0)
-            latency = output.get("latency", 0.0)
-        else:
-            ttft = sum(output.get("ttft", 0.0) for output in outputs) / len(outputs) if outputs else 0.0
-            tpot = sum(output.get("tpot", 0.0) for output in outputs) / len(outputs) if outputs else 0.0
-            latency = sum(output.get("latency", 0.0) for output in outputs) / len(outputs) if outputs else 0.0
-        
-        response = CompletionResponse(
-            id=f"cmpl-{uuid.uuid4().hex}",
+                yield create_usage_chunk(request_id, request.model, usage)
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+        # non-streaming
+        request_id = f"cmpl-{uuid.uuid4().hex}"
+        final_output = None
+        async for output in generate_async(request.prompt, sampling_params, request_id):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError("No output generated")
+
+        return CompletionResponse(
+            id=request_id,
             created=int(time.time()),
             model=request.model,
-            choices=choices,
+            choices=[
+                {
+                    "index": 0,
+                    "text": final_output["text"],
+                    "finish_reason": final_output["finish_reason"],
+                }
+            ],
             usage={
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": total_prompt_tokens + total_completion_tokens,
-                "ttft_s": ttft,
-                "tpot_s": tpot,
-                "latency_s": latency,
+                "prompt_tokens": final_output["num_tokens_input"],
+                "completion_tokens": final_output["num_tokens_output"],
+                "total_tokens": final_output["num_tokens_input"] + final_output["num_tokens_output"],
+                "ttft_s": round(final_output.get("ttft", 0.0), 4),
+                "tpot_s": round(final_output.get("tpot", 0.0), 4),
+                "latency_s": round(final_output.get("latency", 0.0), 4),
             },
         )
-        
-        return response
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/v1/models")
 async def list_models():
-    """List available models."""
     global model_name
     return {
         "object": "list",
@@ -215,13 +436,11 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
     return {"status": "ok"}
 
 
 @app.post("/start_profile")
 async def start_profile():
-    """Start profiling."""
     global engine
     try:
         engine.start_profile()
@@ -232,7 +451,6 @@ async def start_profile():
 
 @app.post("/stop_profile")
 async def stop_profile():
-    """Stop profiling and generate trace files."""
     global engine
     try:
         engine.stop_profile()
@@ -243,27 +461,23 @@ async def stop_profile():
 
 def main():
     global engine, tokenizer, model_name
-    
     parser = argparse.ArgumentParser(description="Atom OpenAI API Server")
-    
     EngineArgs.add_cli_args(parser)
-    
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument(
-        "--server-port", type=int, default=8000, 
+        "--server-port", type=int, default=8000,
         help="Server port (note: --port is used for internal engine communication)"
     )
-    
     args = parser.parse_args()
 
     print(f"Loading tokenizer from {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model_name = args.model
-    
-    print(f"Initializing engine with model {args.model}...")
+
+    print(f"Initializing async engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
-    engine = engine_args.create_engine()
-    
+    engine = engine_args.create_async_engine()
+
     print(f"Starting server on {args.host}:{args.server_port}...")
     uvicorn.run(app, host=args.host, port=args.server_port)
 

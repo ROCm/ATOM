@@ -2,8 +2,9 @@ import asyncio
 import itertools
 import logging
 import time
+import asyncio
 from dataclasses import fields
-from typing import List, Union
+from typing import List, Union, AsyncGenerator, Dict, Optional
 
 import torch.multiprocessing as mp
 from tqdm.auto import tqdm
@@ -22,11 +23,14 @@ class LLMEngine:
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+        data_parallel_size = kwargs.get('data_parallel_size', 1)
         config = Config(model, **config_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.bos_token_id = self.tokenizer.bos_token_id
         config.eos_token_id = self.tokenizer.eos_token_id
-
+        # Set data parallel size in config
+        config.parallel_config.data_parallel_size = data_parallel_size
+        self.data_parallel_size = data_parallel_size
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             self.tokenizer, config.kv_cache_block_size
@@ -34,12 +38,13 @@ class LLMEngine:
         self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
-        logger.info("LLMEngine init")
+        logger.info(f"LLMEngine init with {self.data_parallel_size} data parallel ranks")
 
     def add_request(
         self, 
         prompt_or_tokens_list: List[Union[str, List[int]]], 
-        sampling_params_list: SamplingParams | List[SamplingParams]
+        sampling_params_list: SamplingParams | List[SamplingParams],
+        stream_callback=None
     ):
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
@@ -53,9 +58,22 @@ class LLMEngine:
                 )
             sampling_params_iter = sampling_params_list
         
+        # Handle stream_callback
+        if stream_callback is not None and not isinstance(stream_callback, list):
+            stream_callback_iter = itertools.repeat(stream_callback)
+        elif isinstance(stream_callback, list):
+            if len(stream_callback) != len(prompt_or_tokens_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and stream_callback is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(stream_callback)=}"
+                )
+            stream_callback_iter = stream_callback
+        else:
+            stream_callback_iter = itertools.repeat(None)
+        
         reqs = []
-        for prompt, sampling_param in zip(prompt_or_tokens_list, sampling_params_iter):
-            req = self.io_processor.preprocess(prompt, sampling_param)
+        for prompt, sampling_param, callback in zip(prompt_or_tokens_list, sampling_params_iter, stream_callback_iter):
+            req = self.io_processor.preprocess(prompt, sampling_param, stream_callback=callback)
             reqs.append(req)
         self.core_mgr.add_request(reqs)
 
@@ -84,49 +102,6 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         return outputs
 
-    async def generate_async(
-        self,
-        prompt: str,
-        sampling_params: SamplingParams,
-    ):
-        # Initialize lock on first use
-        if self._step_lock is None:
-            self._step_lock = asyncio.Lock()
-        
-        # Add the request and get its sequence ID
-        req = self.io_processor.preprocess(prompt, sampling_params)
-        seq_id = req.id
-        self.core_mgr.add_request([req])
-        
-        while True:
-            # Check if result is already available
-            if seq_id in self._pending_results:
-                result = self._pending_results.pop(seq_id)
-                yield result
-                return
-            
-            if seq_id not in self.io_processor.requests:
-                break
-            
-            if not (self.core_mgr.is_alive() or self.core_mgr.is_rest()):
-                break
-            
-            # Coordinate step() calls across all concurrent requests
-            async with self._step_lock:
-                seqs = self.step()
-                outs = self.io_processor.postprocess(seqs)
-                
-                # Store all results so other waiting tasks can find them
-                self._pending_results.update(outs)
-            
-            if seq_id in self._pending_results:
-                result = self._pending_results.pop(seq_id)
-                yield result
-                return
-            
-            # Let other tasks run before trying again
-            await asyncio.sleep(0)
-    
     def start_profile(self):
         self.core_mgr.send_utility_command("start_profile")
         logger.info("Profiling started")
@@ -144,7 +119,7 @@ class InputOutputProcessor:
         self.requests = {}
 
     def preprocess(
-        self, prompt_or_tokens: str | list[int], sampling_params: SamplingParams
+        self, prompt_or_tokens: str | list[int], sampling_params: SamplingParams, stream_callback=None
     ):
         """responsible for:
         1) Tokenize
@@ -164,7 +139,7 @@ class InputOutputProcessor:
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
         
-        seq = Sequence(tokens, self.block_size, sampling_params, stop_token_sequences)
+        seq = Sequence(tokens, self.block_size, sampling_params, stop_token_sequences, stream_callback=stream_callback)
         seq.arrive_time = time.time()
         self.requests[seq.id] = seq
         print(
@@ -211,3 +186,160 @@ class InputOutputProcessor:
 
     def has_pending_requests(self):
         return len(self.requests) > 0
+
+
+class AsyncLLMEngine(LLMEngine):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._request_queues: Dict[str, asyncio.Queue] = {}
+        self._seq_id_to_request_id: Dict[int, str] = {}
+        self._running = True
+        self._output_task = None
+    
+    def _ensure_output_task(self):
+        if self._output_task is None:
+            try:
+                loop = asyncio.get_running_loop()
+                self._output_task = loop.create_task(self._process_outputs_loop())
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    self._output_task = loop.create_task(self._process_outputs_loop())
+                else:
+                    raise RuntimeError("AsyncLLMEngine requires a running event loop")
+    
+    async def _process_outputs_loop(self):
+        while self._running:
+            try:
+                try:
+                    seqs = await asyncio.wait_for(
+                        self.core_mgr.get_output_async(), 
+                        timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                
+                for seq in seqs:
+                    request_id = self._seq_id_to_request_id.get(seq.id)
+                    if request_id and request_id in self._request_queues:
+                        try:
+                            self._request_queues[request_id].put_nowait(seq)
+                        except asyncio.QueueFull:
+                            try:
+                                old_seq = self._request_queues[request_id].get_nowait()
+                                logger.debug(f"Request {request_id} queue full, dropping old result and adding new one")
+                            except asyncio.QueueEmpty:
+                                pass
+                            try:
+                                self._request_queues[request_id].put_nowait(seq)
+                            except asyncio.QueueFull:
+                                logger.warning(f"Request {request_id} queue still full, result lost")
+                    else:
+                        logger.debug(f"Sequence {seq.id} request queue does not exist (request_id={request_id}), ignoring result")
+                
+            except Exception as e:
+                logger.error(f"Error in output processing loop: {e}", exc_info=True)
+                await asyncio.sleep(0.1)
+    
+    async def generate_async(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+        request_id: str
+    ) -> AsyncGenerator[Dict, None]:
+        self._ensure_output_task()
+        
+        output_queue = asyncio.Queue(maxsize=1)
+        self._request_queues[request_id] = output_queue
+        
+        seq = None
+        seq_id = None
+        try:
+            req = self.io_processor.preprocess(prompt, sampling_params)
+            seq_id = req.id
+            if seq_id in self._seq_id_to_request_id:
+                logger.warning(f"Sequence ID {seq_id} already exists in mapping, overwriting old mapping")
+            self._seq_id_to_request_id[seq_id] = request_id
+            self.core_mgr.add_request([req])
+            
+            while True:
+                seq = await output_queue.get()
+                
+                if seq.id != seq_id:
+                    logger.error(f"Received wrong sequence ID: expected {seq_id}, got {seq.id}, request_id={request_id}")
+                    continue
+                
+                result = self._postprocess_sequence(seq)
+                
+                if seq.is_finished:
+                    yield result
+                    break
+                
+                yield result
+                
+        finally:
+            self._request_queues.pop(request_id, None)
+            if seq_id is not None:
+                self._seq_id_to_request_id.pop(seq_id, None)
+                # Clean up pending request if sequence didn't finish normally
+                if seq is None or not seq.is_finished:
+                    self.io_processor.requests.pop(seq_id, None)
+    
+    #TODO add tokenizer process to handle tokens combination for utf8 decoding
+    def _postprocess_sequence(self, seq: Sequence) -> Dict:
+        # Set leave_time when sequence is finished
+        if seq.is_finished and seq.leave_time == 0.0:
+            seq.leave_time = time.time()
+        
+        # Remove from pending requests when sequence is finished
+        if seq.is_finished:
+            self.io_processor.requests.pop(seq.id, None)
+
+        ttft = 0.0
+        tpot = 0.0
+        latency = 0.0
+        
+        if seq.first_token_time > 0:
+            ttft = seq.first_token_time - seq.arrive_time
+            if seq.num_completion_tokens > 1:
+                leave_time = seq.leave_time if seq.leave_time > 0 else time.time()
+                tpot = (leave_time - seq.first_token_time) / (seq.num_completion_tokens - 1)
+        
+        # Calculate latency if sequence is finished
+        if seq.is_finished and seq.leave_time > 0:
+            latency = seq.leave_time - seq.arrive_time
+        
+        return {
+            "text": self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=True),
+            "token_ids": seq.completion_token_ids.copy(), 
+            "finished": seq.is_finished,
+            "finish_reason": getattr(seq, "leave_reason", None),
+            "ttft": ttft,
+            "tpot": tpot,
+            "latency": latency,
+        }
+
+    #TODO enable abort request
+    # def abort_request(self, request_id: str):
+    #     if request_id in self._request_queues:
+    #         # Find seq_id from request_id mapping
+    #         seq_id = None
+    #         for sid, rid in self._seq_id_to_request_id.items():
+    #             if rid == request_id:
+    #                 seq_id = sid
+    #                 break
+    #         # Remove from pending requests using seq_id
+    #         if seq_id is not None:
+    #             self.io_processor.requests.pop(seq_id, None)
+    #         self._request_queues.pop(request_id, None)
+    #         logger.info(f"Request {request_id} aborted")
+    
+    async def close(self):
+        self._running = False
+        if self._output_task is not None:
+            self._output_task.cancel()
+            try:
+                await self._output_task
+            except asyncio.CancelledError:
+                pass
+        self.core_mgr.close()

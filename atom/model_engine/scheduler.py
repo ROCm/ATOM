@@ -2,13 +2,14 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Optional, cast
+from typing import Any, Optional, cast, List
 
 import numpy as np
 import torch
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.request import RequestOutput
 
 logger = logging.getLogger("atom")
 
@@ -71,7 +72,8 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
 
         if not self.running and not self.waiting:
-            self.block_manager.reset()
+            # self.block_manager.reset()
+            return None
 
         while self.waiting and num_seqs_prefill < self.max_num_seqs:
             seq = self.waiting[0]
@@ -149,18 +151,29 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], prev_token_ids: dict[int, int]):
-        is_deferred_out = prev_token_ids[-1]
+    def postprocess(self, seqs: list[Sequence], prev_token_ids: dict[int, int], stream_output_queue=None) -> list[Sequence]:
+        is_deferred_out = prev_token_ids.get(-1, False)
         # update token_ids with the actual sampled token ids
         finished_seqs = []
+        stream_outputs = []
+        
         for seq in self.running:
             if seq.id not in prev_token_ids:
                 continue
             token_id = prev_token_ids[seq.id]
+            new_tokens = []
             if is_deferred_out:
                 seq.token_ids[-1] = token_id
+
+                if seq.output_tokens:
+                    seq.output_tokens[-1] = token_id
+                    new_tokens = [token_id]
+                else:
+                    seq.output_tokens.append(token_id)
+                    new_tokens = [token_id]
             else:
                 seq.append_token(token_id)
+                new_tokens = [token_id]
 
             if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
@@ -177,10 +190,26 @@ class Scheduler:
                     leave_reason = "eos"
                 elif seq.num_completion_tokens == seq.max_tokens:
                     leave_reason = "max_tokens"
+            # Prepare stream output
+            if stream_output_queue is not None and new_tokens:
+                request_output = RequestOutput(
+                    request_id=seq.id,
+                    output_tokens=new_tokens.copy(),
+                    finished=(leave_reason is not None),
+                    finish_reason=leave_reason
+                )
+                # Store sequence ID instead of sequence object to avoid pickling issues
+                stream_outputs.append((seq.id, request_output))
+                logger.debug(f"Scheduler: Created stream output for seq_id={seq.id}, tokens={new_tokens}, finished={leave_reason is not None}")
+            
             if leave_reason is not None:
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
                 finished_seqs.append(seq)
+
+        if stream_output_queue is not None and stream_outputs:
+            stream_output_queue.put_nowait(stream_outputs)
+        
         if is_deferred_out:
             # placeholder for the each decode step
             for seq in seqs:
@@ -189,3 +218,4 @@ class Scheduler:
         for seq in finished_seqs:
             self.block_manager.deallocate(seq)
             self.running.remove(seq)
+        return finished_seqs

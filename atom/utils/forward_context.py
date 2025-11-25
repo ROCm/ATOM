@@ -5,7 +5,106 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Set, Dict, Union
 from atom.config import Config, KVCacheTensor
 import torch
 from abc import ABC, abstractmethod
+from atom.config import Config, ParallelConfig
 
+def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
+                                      max_num_tokens: int,
+                                      chunk_idx: int) -> list[int]:
+    dp_size = len(num_tokens_across_dp_cpu)
+
+    local_size = [-1] * dp_size
+    for i in range(dp_size):
+        dp_tokens = num_tokens_across_dp_cpu[i]
+        local_size[i] = min(max_num_tokens,
+                            dp_tokens - (max_num_tokens * chunk_idx))
+        if local_size[i] <= 0:
+            local_size[i] = 1  # ensure lockstep even if done
+    return local_size
+
+
+@dataclass
+class DPMetadata:
+    max_tokens_across_dp_cpu: torch.Tensor
+    cu_tokens_across_dp_cpu: torch.Tensor
+    local_sizes: Optional[list[int]] = None
+
+    @staticmethod
+    def num_tokens_across_dp(num_tokens: int, dp_size: int,
+                             dp_rank: int) -> torch.Tensor:
+        """
+        Gather the num_tokens across all DP ranks and return results in a
+        CPU tensor of size dp_size.
+        """
+        num_tokens_across_dp = [0] * dp_size
+        num_tokens_across_dp[dp_rank] = num_tokens
+        num_tokens_tensor = torch.tensor(num_tokens_across_dp,
+                                         device="cpu",
+                                         dtype=torch.int32)
+        from aiter.dist.parallel_state import get_dp_group
+        import torch.distributed as dist
+        dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
+        return num_tokens_tensor
+
+    @staticmethod
+    def make(
+            parallel_config: ParallelConfig,
+            # attn_metadata: Any,
+            num_tokens: int,
+            num_tokens_across_dp: Optional[torch.Tensor] = None
+    ) -> "DPMetadata":
+
+        assert parallel_config.data_parallel_size > 1
+        dp_size = parallel_config.data_parallel_size
+        dp_rank = parallel_config.data_parallel_rank
+        batchsize = num_tokens
+
+        # If num_tokens_across_dp is None, it will be computed by all_reduce
+        # Otherwise, num_tokens_across_dp[dp_rank] should be equal to batchsize
+        assert (num_tokens_across_dp is None
+                or num_tokens_across_dp[dp_rank] == batchsize)
+        if num_tokens_across_dp is None:
+            num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
+                batchsize, dp_size, dp_rank)
+        max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp)
+        cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_across_dp, dim=0)
+        return DPMetadata(max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu)
+
+    @contextmanager
+    def chunked_sizes(self, max_chunk_size_per_rank: int, chunk_idx: int):
+        """
+        Context manager to compute and temporarily set the per-rank local token
+        sizes for a specific chunk during chunked forward execution.
+        This is necessary to ensure each DP (data parallel) rank processes its
+        designated portion of tokens in lockstep with others, even when the
+        token counts are uneven or some ranks have completed their input early.
+        For chunked execution, we break up the total tokens on each rank into
+        multiple chunks (of at most `max_chunk_size_per_rank`), and for a given
+        `chunk_idx`, this context manager sets `self.local_sizes` to the number
+        of tokens to process in that chunk on each rank.
+        It uses cumulative sizes (`cu_tokens_across_dp_cpu`) to derive the
+        number of tokens per rank, and calls `_compute_chunked_local_num_tokens`
+        to determine the chunk-wise split.
+        `self.local_sizes` is only valid inside the context.
+        Args:
+            max_chunk_size_per_rank: The max number of tokens each rank is 
+                                     allowed to process in this chunk.
+            chunk_idx: The index of the chunk to compute sizes for.
+        """
+        cu_sizes = self.cu_tokens_across_dp_cpu
+        num_tokens_across_dp_cpu = [
+            (cu_sizes[i] -
+             cu_sizes[i - 1]).item() if i > 0 else cu_sizes[0].item()
+            for i in range(len(cu_sizes))
+        ]
+        self.local_sizes = _compute_chunked_local_num_tokens(
+            num_tokens_across_dp_cpu, max_chunk_size_per_rank, chunk_idx)
+        try:
+            yield self.local_sizes
+        finally:
+            self.local_sizes = None
+
+    def get_chunk_sizes_across_dp_rank(self) -> Optional[list[int]]:
+        return self.local_sizes
 
 @dataclass
 class Context:
@@ -131,6 +230,8 @@ class ForwardContext:
 
     context: Optional[Context] = None
 
+    dp_metadata: Optional[DPMetadata] = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -152,17 +253,25 @@ def get_forward_context() -> ForwardContext:
 
 
 def set_forward_context(
-    attn_metadata: AttentionMetaData, atom_config: Config, context: Context
+    attn_metadata: AttentionMetaData, atom_config: Config, context: Context,
+    num_tokens: Optional[int] = None,
+    num_tokens_across_dp: Optional[torch.Tensor] = None,
 ) -> None:
-
     global _forward_context
+    dp_metadata: Optional[DPMetadata] = None
+    if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
+        dp_metadata = DPMetadata.make(atom_config.parallel_config,
+                                      # attn_metadata,
+                                      num_tokens or 0,
+                                      num_tokens_across_dp)
+
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,
         no_compile_layers=atom_config.compilation_config.static_forward_context,
         kv_cache_data=_forward_kv_cache_context.kv_cache_data,
         context=context,
-    )
-    # _forward_context.attn_metadata = attn_metadata
+        dp_metadata=dp_metadata,
+    )    # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
 

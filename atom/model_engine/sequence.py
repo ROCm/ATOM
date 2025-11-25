@@ -1,6 +1,7 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from typing import Optional, Callable, Any
 
 from atom.sampling_params import SamplingParams
 
@@ -28,7 +29,12 @@ class Sequence:
     counter = count()
 
     def __init__(
-        self, token_ids: list[int], block_size: int, sampling_params=SamplingParams(), stop_token_sequences: list[list[int]] = None
+        self, 
+        token_ids: list[int], 
+        block_size: int, 
+        sampling_params=SamplingParams(), 
+        stop_token_sequences: list[list[int]] = None, 
+        stream_callback: Optional[Callable[[Any], None]] = None
     ):
         self.block_size = block_size
         self.id = next(Sequence.counter)
@@ -45,6 +51,10 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
+
+        # stream callback
+        self.stream_callback = stream_callback
+        self.output_tokens = [] # cache for newly generate tokens
 
         # statistics fields
         self.arrive_time = 0.0
@@ -104,6 +114,7 @@ class Sequence:
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
+        self.output_tokens.append(token_id)
         self.num_tokens += 1
 
     # def __getstate__(self):

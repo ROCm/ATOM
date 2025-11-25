@@ -1,7 +1,7 @@
 import argparse
 from typing import List
 
-from atom import LLMEngine
+from atom import LLMEngine, AsyncLLMEngine
 from atom.config import CompilationConfig
 
 
@@ -22,6 +22,7 @@ class EngineArgs:
         self,
         model: str = "Qwen/Qwen3-0.6B",
         tensor_parallel_size: int = 1,
+        data_parallel_size: int = 1,
         enforce_eager: bool = False,
         enable_prefix_caching: bool = False,
         port: int = 8006,
@@ -33,6 +34,7 @@ class EngineArgs:
         load_dummy: bool = False,
         enable_expert_parallel: bool = False,
         torch_profiler_dir: str = None,
+        enable_dp_attention: bool = False,
     ):
         self.model = model
         self.tensor_parallel_size = tensor_parallel_size
@@ -47,6 +49,8 @@ class EngineArgs:
         self.load_dummy = load_dummy
         self.enable_expert_parallel = enable_expert_parallel
         self.torch_profiler_dir = torch_profiler_dir
+        self.enable_dp_attention = enable_dp_attention
+        self.data_parallel_size = data_parallel_size
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -128,6 +132,19 @@ class EngineArgs:
             help="Directory to save torch profiler traces",
         )
 
+        parser.add_argument(
+            "--data-parallel-size",
+            "-dp",
+            type=int,
+            default=1,
+            help="Data parallel size.",
+        )
+
+        parser.add_argument(
+            "--enable-dp-attention",
+            action="store_true",
+            help="Enable DP attention.",
+        )
         return parser
 
     @classmethod
@@ -136,6 +153,7 @@ class EngineArgs:
         return cls(
             model=args.model,
             tensor_parallel_size=args.tensor_parallel_size,
+            data_parallel_size=getattr(args, "data_parallel_size", 1),
             enforce_eager=args.enforce_eager,
             enable_prefix_caching=args.enable_prefix_caching,
             port=args.port,
@@ -147,6 +165,7 @@ class EngineArgs:
             load_dummy=args.load_dummy,
             enable_expert_parallel=args.enable_expert_parallel,
             torch_profiler_dir=args.torch_profiler_dir,
+            enable_dp_attention=args.enable_dp_attention,
         )
 
     def create_engine(self) -> LLMEngine:
@@ -166,5 +185,29 @@ class EngineArgs:
                 level=self.level,
                 cudagraph_capture_sizes=parse_size_list(self.cudagraph_capture_sizes) if self.cudagraph_capture_sizes else None,
             ),
+            data_parallel_size=self.data_parallel_size,
+            enable_dp_attention=self.enable_dp_attention,
+        )
+    
+    def create_async_engine(self) -> AsyncLLMEngine:
+        """Create and return an AsyncLLMEngine instance with the configured parameters."""
+        return AsyncLLMEngine(
+            self.model,
+            enforce_eager=self.enforce_eager,
+            tensor_parallel_size=self.tensor_parallel_size,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_block_size=self.block_size,
+            max_model_len=self.max_model_len,
+            port=self.port,
+            load_dummy=self.load_dummy,
+            enable_expert_parallel=self.enable_expert_parallel,
+            torch_profiler_dir=self.torch_profiler_dir,
+            asyncio_mode=True,
+            compilation_config=CompilationConfig(
+                level=self.level,
+                cudagraph_capture_sizes=parse_size_list(self.cudagraph_capture_sizes),
+            ),
+            data_parallel_size=self.data_parallel_size,
+            enable_dp_attention=self.enable_dp_attention,
         )
 

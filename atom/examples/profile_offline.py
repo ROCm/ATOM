@@ -25,6 +25,12 @@ parser.add_argument(
     help="Output generation length in tokens",
 )
 parser.add_argument(
+    "--bs",
+    type=int,
+    default=1,
+    help="Batch size (number of requests to process in parallel)",
+)
+parser.add_argument(
     "--random-input",
     action="store_true",
     help="Use random repeated words as input. Otherwise use a predefined meaningful text.",
@@ -74,7 +80,11 @@ def main():
     
     llm.start_profile()
 
-    outputs = llm.generate([prompt], sampling_params)
+    # Create batch of prompts based on batch size
+    prompts = [prompt] * args.bs
+    print(f"Processing batch of {args.bs} requests...")
+    
+    outputs = llm.generate(prompts, sampling_params)
     
     llm.stop_profile()
     
@@ -85,9 +95,12 @@ def main():
     
     if not args.random_input:
         print("Generated Output:")
-        for output in outputs:
+        for i, output in enumerate(outputs):
             generated_text = output['text']
-            print(f"Output: {generated_text}\n")
+            if args.bs > 1:
+                print(f"Output [{i+1}/{args.bs}]: {generated_text}\n")
+            else:
+                print(f"Output: {generated_text}\n")
     
 
 if __name__ == "__main__":

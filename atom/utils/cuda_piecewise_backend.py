@@ -8,7 +8,7 @@ import torch.fx as fx
 
 # import vllm.envs as envs
 from atom.utils.backends import VllmBackend
-from atom.utils import end_monitoring_torch_compile
+from atom.utils.decorators import end_monitoring_torch_compile
 from atom.config import Config
 from aiter import logger
 

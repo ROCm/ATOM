@@ -5,9 +5,11 @@ import queue
 import signal
 import threading
 import weakref
+import time
 from contextlib import ExitStack
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, List, Optional
+import torch
 
 import zmq
 import zmq.asyncio
@@ -26,6 +28,8 @@ from atom.utils import (
     shutdown_all_processes,
     zmq_socket_ctx,
 )
+from atom.utils.distributed.utils import stateless_destroy_torch_distributed_process_group
+from atom.config import Config, ParallelConfig
 
 logger = logging.getLogger("atom")
 
@@ -44,6 +48,8 @@ class EngineCoreRequestType(enum.Enum):
     EXECUTOR_FAILED = b"\x04"
     # Sentinel used within EngineCore.
     SHUTDOWN = b"\x05"
+    # Stream output for callbacks
+    STREAM = b"\x06"
 
 
 class EngineCore:
@@ -51,6 +57,7 @@ class EngineCore:
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[List[Sequence]]()
+        self.stream_output_queue = queue.Queue()  # Queue for streaming intermediate outputs
         self.input_address = input_address
         self.output_address = output_address
         self.input_thread = threading.Thread(
@@ -64,6 +71,7 @@ class EngineCore:
 
         self.profile_enbaled = config.torch_profiler_dir is not None
         init_exit_handler(self)
+        self._init_data_parallel(config)
 
         # Initialize model runner processes
         try:
@@ -98,6 +106,9 @@ class EngineCore:
 
         self.scheduler = Scheduler(config)
 
+    def _init_data_parallel(self, config: Config):
+        pass
+
     def exit(self):
         if not self.still_running:
             return
@@ -116,7 +127,10 @@ class EngineCore:
     def run_engine(config: Config, input_address: str, output_address: str):
         engine: EngineCore = None
         try:
-            engine = EngineCore(config, input_address, output_address)
+            if config.parallel_config.data_parallel_size > 1:
+                engine = DPEngineCoreProc(config, input_address, output_address)
+            else:   
+                engine = EngineCore(config, input_address, output_address)            
             engine.busy_loop()
         except Exception as e:
             logger.error(f"run_engine: exception: {e}", exc_info=True)
@@ -136,10 +150,26 @@ class EngineCore:
 
     def _process_engine_step(self):
         scheduled_batch = self.scheduler.schedule()
+        if scheduled_batch is None:
+            logger.debug(f"{self.label}: No sequences to schedule, skipping forward")
+            return False
         out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         seqs = scheduled_batch.seqs.values()
-        self.scheduler.postprocess(seqs, out)
-        self.output_queue.put_nowait([seq for seq in seqs if seq.is_finished])
+        # Pass stream_output_queue to postprocess for streaming callbacks
+        finished_seqs = self.scheduler.postprocess(seqs, out, stream_output_queue=self.stream_output_queue)
+        
+        # Send stream outputs to main process via output_queue
+        try:
+            while not self.stream_output_queue.empty():
+                stream_outputs = self.stream_output_queue.get_nowait()
+                # Send stream outputs as intermediate results
+                self.output_queue.put_nowait(("STREAM", stream_outputs))
+        except queue.Empty:
+            pass
+        
+        if finished_seqs:
+            self.output_queue.put_nowait(finished_seqs)
+        return True
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
@@ -203,7 +233,16 @@ class EngineCore:
             logger.debug(f"{self.label}: output socket connected")
 
             while True:
-                seqs = self.output_queue.get()
+                item = self.output_queue.get()
+                if isinstance(item, tuple) and item[0] == "STREAM":
+                    # Send stream outputs
+                    stream_outputs = item[1]
+                    serialized_obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
+                    socket.send(serialized_obj)
+                    continue
+                
+                # Regular finished sequences
+                seqs = item
                 valid_seqs = [
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
@@ -228,3 +267,91 @@ class EngineCore:
             print("Stopping profiler...")
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
             print("Profiler stopped.")
+
+
+class DPEngineCoreProc(EngineCore):
+    def __init__(self, config: Config, input_address: str, output_address: str):
+        # self.dp_group = config.parallel_config.dp_group
+        self.dp_rank = config.parallel_config.data_parallel_rank
+        # self.dp_group = config.parallel_config.stateless_init_dp_group()
+        super().__init__(config, input_address, output_address)
+        # Initialize to True so first iteration reaches all_reduce
+        self.engines_running = True
+        self._shutting_down = False
+
+    def _init_data_parallel(self, config: Config):
+        dp_rank = config.parallel_config.data_parallel_rank
+        dp_size = config.parallel_config.data_parallel_size
+        local_dp_rank = config.parallel_config.data_parallel_rank_local
+
+        assert dp_size > 1
+        assert local_dp_rank is not None
+        assert 0 <= local_dp_rank <= dp_rank < dp_size
+
+        self.dp_rank = dp_rank
+        self.dp_group = config.parallel_config.stateless_init_dp_group()
+
+    def exit(self):
+        super().exit()
+        if dp_group := getattr(self, "dp_group", None):
+            stateless_destroy_torch_distributed_process_group(dp_group)
+
+    def busy_loop(self):
+        shutdown = False
+        while True:
+            local_is_unfinished = not self.scheduler.is_finished()
+
+            # Synchronize shutdown state across all DP ranks
+            # This ensures all ranks know when any rank wants to shutdown
+            if not self._shutting_down:
+                global_should_shutdown = self._sync_shutdown_state(shutdown and not local_is_unfinished)
+                if global_should_shutdown:
+                    self._shutting_down = True
+                    logger.debug(f"{self.label}: Entering shutdown phase (synchronized across DP)")
+
+            self.engines_running = self._has_global_unfinished_reqs(local_is_unfinished)
+            logger.debug(f"{self.label}: [Sync] engines_running={self.engines_running}")
+
+            if not self.engines_running:
+                logger.debug(f"{self.label}: All DP ranks finished")
+                if shutdown:
+                    break
+                shutdown = shutdown or self.pull_and_process_input_queue()
+                continue
+
+            shutdown = shutdown or self.pull_and_process_input_queue()
+
+            executed = self._process_engine_step()
+
+            if not executed:
+                logger.debug(f"{self.label}: Executing dummy batch for DP sync")
+                # we must have dummy execution to avoid deadlock in other ranks
+                self._execute_dummy_batch()
+
+    def _execute_dummy_batch(self):
+        return self.runner_mgr.call_func("dummy_execution", wait_out=True)
+
+    def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
+        try:
+            tensor = torch.tensor([local_should_shutdown],
+                                dtype=torch.int32,
+                                device="cpu")
+            torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group)
+            global_should_shutdown = bool(tensor.item())
+            return global_should_shutdown
+        except RuntimeError as e:
+            # If all_reduce fails, it means other ranks are shutting down
+            logger.warning(f"{self.label}: Shutdown sync failed, assuming shutdown: {e}")
+            return True
+
+    def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+        if self._shutting_down:
+            logger.info(f"{self.label}: Skipping DP sync during shutdown")
+            return local_unfinished
+        try:
+            return ParallelConfig.has_unfinished_dp(self.dp_group,
+                                                    local_unfinished)
+        except RuntimeError as e:
+            # Handle case where other ranks have already shut down
+            logger.warning(f"{self.label}: DP sync failed during shutdown: {e}")
+            return local_unfinished

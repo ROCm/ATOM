@@ -2,6 +2,7 @@ import requests
 import time
 import argparse
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoTokenizer
 
 
@@ -75,7 +76,7 @@ def main():
         help="Input prompt length in tokens (used with --random-input)",
     )
     parser.add_argument(
-        "--output-len",
+        "--output-length",
         type=int,
         default=32,
         help="Number of output tokens to generate (max_tokens) (default: 32)"
@@ -101,6 +102,12 @@ def main():
         "--model",
         type=str,
         help="Model name or path for tokenizer (required when using --random-input)",
+    )
+    parser.add_argument(
+        "--bs",
+        type=int,
+        default=1,
+        help="Batch size (number of concurrent requests to send)",
     )
     
     args = parser.parse_args()
@@ -131,9 +138,34 @@ def main():
 
     time.sleep(2)
     
-    result = send_completion_request(base_url, input_prompt, args.output_len)
-    if result is None:
-        print("Warning: Request failed or returned no result")
+    # Send concurrent requests based on batch size
+    print(f"\nSending {args.bs} concurrent request(s)...")
+    results = []
+    
+    if args.bs == 1:
+        # Single request
+        result = send_completion_request(base_url, input_prompt, args.output_length)
+        if result is None:
+            print("Warning: Request failed or returned no result")
+        results = [result]
+    else:
+        # Concurrent requests using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=args.bs) as executor:
+            # Submit all requests and track their indices
+            future_to_index = {
+                executor.submit(send_completion_request, base_url, input_prompt, args.output_length): i + 1
+                for i in range(args.bs)
+            }
+            
+            # Process results as they complete
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                result = future.result()
+                if result is None:
+                    print(f"Warning: Request {index}/{args.bs} failed or returned no result")
+                else:
+                    print(f"Request {index}/{args.bs} completed")
+                results.append(result)
     
     time.sleep(2)
     
@@ -144,13 +176,17 @@ def main():
         return
     
     # Print output results for non-random input
-    if not args.random_input and result:
+    if not args.random_input and results:
         print("\n" + "=" * 60)
         print("Generated Output:")
         print("=" * 60)
-        if "choices" in result and len(result["choices"]) > 0:
-            generated_text = result["choices"][0]["text"]
-            print(f"Output: {generated_text}\n")
+        for i, result in enumerate(results):
+            if result and "choices" in result and len(result["choices"]) > 0:
+                generated_text = result["choices"][0]["text"]
+                if args.bs > 1:
+                    print(f"Output [{i+1}/{args.bs}]: {generated_text}\n")
+                else:
+                    print(f"Output: {generated_text}\n")
         print("=" * 60)
 
 

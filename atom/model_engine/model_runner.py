@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
+from aiter.dist.utils import get_distributed_init_method
 from aiter import destroy_dist_env, dtypes, init_dist_env
 from aiter.dist.parallel_state import graph_capture, get_tp_group
 from atom.config import Config, set_current_atom_config, KVCacheTensor
@@ -21,6 +22,9 @@ from atom.models.mixtral import MixtralForCausalLM
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.utils import CpuGpuBuffer, init_exit_handler, get_hf_text_config
 from atom.utils.selector import get_attn_backend
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.utils import CpuGpuBuffer, envs, init_exit_handler, get_hf_text_config
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
@@ -30,6 +34,7 @@ from atom.utils.forward_context import (
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
+    DPMetadata,
 )
 
 suppot_model_arch_dict = {
@@ -209,14 +214,31 @@ class ModelRunner:
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
-        self.device = torch.device(f"cuda:{rank}")
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
         self.use_mla = self.is_deepseek_mla()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
+        # Calculate local device rank considering both TP and DP
+        # When data parallelism is enabled on the same node, different DP ranks
+        # need to use different sets of GPUs
+        dp_rank_local = config.parallel_config.data_parallel_rank_local
+        if dp_rank_local is None:
+            dp_rank_local = 0
+        local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+        num_gpus = torch.cuda.device_count()
+        if local_device_rank >= num_gpus:
+            raise ValueError(
+                f"Calculated local_device_rank={local_device_rank} exceeds available GPUs ({num_gpus}). "
+            )
 
+        device = torch.device(f"cuda:{local_device_rank}")
+        print(
+            f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, local_device_rank={local_device_rank}, device={device}"
+        )
+        self.device = device
+        
         # Initialize profiler for this rank
         self.profiler = None
         self.profiler_dir = None
@@ -230,17 +252,23 @@ class ModelRunner:
         torch.cuda.set_device(self.device)
         os.environ["MASTER_ADDR"] = self.config.master_addr
         os.environ["MASTER_PORT"] = str(self.config.port)
-        init_dist_env(self.world_size, rankID=rank)
+        distributed_init_method = get_distributed_init_method(
+            config.parallel_config.data_parallel_master_ip,
+            config.parallel_config.data_parallel_base_port,
+        )
+        init_dist_env(
+            config.tensor_parallel_size,
+            rankID=rank,
+            backend="nccl",
+            distributed_init_method=distributed_init_method,
+            data_parallel_size=config.parallel_config.data_parallel_size,
+            data_parallel_rank=config.parallel_config.data_parallel_rank,
+        )
         init_exit_handler(self)
         default_dtype = (
             hf_config.torch_dtype
             if getattr(hf_config, "torch_dtype", None) is not None
-            else "bfloat16"
-        )
-        default_dtype = (
-            getattr(torch, default_dtype, torch.bfloat16)
-            if type(default_dtype) is not torch.dtype
-            else default_dtype
+            else torch.bfloat16
         )
         torch.set_default_dtype(default_dtype)
         torch.set_default_device("cuda")
@@ -267,7 +295,7 @@ class ModelRunner:
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
         if isinstance(self.model, DeepseekV2ForCausalLM):
             self.use_kv_indptr = True
-        torch.set_default_device("cuda")
+        torch.set_default_device(self.device)
         self.allocate_forward_vars()
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
         self.warmup_model()
@@ -360,6 +388,56 @@ class ModelRunner:
             self.profiler = None
         return True
 
+    def dummy_execution(self):
+        """Execute dummy decode batch for DP synchronization. """
+        num_tokens_original = 1
+
+        seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.DECODE
+        seq.block_table = [0]
+        bs = 1
+
+        dummy_batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32), 
+            total_tokens_num=num_tokens_original,  # original value
+            total_tokens_num_decode=num_tokens_original,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+        )
+
+        attn_metadata, positions = self.attn_metadata_builder.build(dummy_batch, bs)
+        context_bs = dummy_batch.total_seqs_num_decode
+
+        num_input_tokens, num_tokens_across_dp = self._preprocess(dummy_batch)
+
+        context = Context(
+            positions=positions,
+            is_prefill=False,
+            batch_size=context_bs,
+            graph_bs=bs,
+        )
+
+        actual_num_tokens = dummy_batch.total_tokens_num
+        set_forward_context(
+            attn_metadata=attn_metadata,
+            atom_config=self.config,
+            context=context,
+            num_tokens=actual_num_tokens,  # original value, not with padding
+            num_tokens_across_dp=num_tokens_across_dp,
+        )
+
+        self.tokenID_processor.input_ids.np[:num_input_tokens] = [0] * num_input_tokens
+        self.tokenID_processor.input_ids.copy_to_gpu(num_input_tokens)
+        input_ids = self.tokenID_processor.input_ids.gpu[:num_input_tokens]
+
+        logits = self.run_model(input_ids)
+
+        reset_forward_context()
+        logger.debug(f"{self.label}: dummy batch executed with {num_input_tokens} tokens")
+        return True
+
     def warmup_model(self):
         start_time = time.time()
         torch.cuda.empty_cache()
@@ -368,16 +446,32 @@ class ModelRunner:
             self.config.max_num_batched_tokens,
             self.config.max_model_len,
         )
+        dp_size = get_dp_group().world_size
+        warmup_max_tokens = max_num_batched_tokens // dp_size
+        
         num_seqs = min(
-            max_num_batched_tokens // max_model_len, self.config.max_num_seqs
+            warmup_max_tokens // max_model_len, self.config.max_num_seqs
         )
+        
+        if num_seqs == 0:
+            num_seqs = 1
+            seq_len = min(warmup_max_tokens, max_model_len)
+            if seq_len == 0:
+                seq_len = 1
+            logger.warning(
+                f"{self.label}: DP size={dp_size} too large, warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
+                f"Using {num_seqs} seq with length {seq_len} for warmup."
+            )
+        else:
+            seq_len = max_model_len
+
         seqs = [
-            Sequence([0] * max_model_len, block_size=self.block_size)
+            Sequence([0] * seq_len, block_size=self.block_size)
             for _ in range(num_seqs)
         ]
         seqs = {seq.id: seq for seq in seqs}
 
-        num_scheduled_tokens = np.array([max_model_len] * num_seqs, dtype=np.int32)
+        num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
         total_tokens_num = num_scheduled_tokens.sum()
 
         dummy_batch = ScheduledBatch(
@@ -414,7 +508,7 @@ class ModelRunner:
         }
 
     def get_num_blocks(self):
-        torch.set_default_device("cuda")
+        torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
         if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
@@ -594,6 +688,33 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
+    def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
+        dp_size = self.config.parallel_config.data_parallel_size
+        dp_rank = self.config.parallel_config.data_parallel_rank
+
+        # For DP: Don't pad when setting enforce_eager.
+        # This lets us set enforce_eager on the prefiller in a P/D setup and
+        # still use CUDA graphs (enabled by this padding) on the decoder.
+        #
+        # TODO(tms) : There are many cases where padding is enabled for
+        # prefills, causing unnecessary and excessive padding of activations.
+
+        if dp_size == 1 or self.enforce_eager:
+            # Early exit.
+            return 0, None
+        num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
+            num_tokens, dp_size, dp_rank
+        )
+        max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp).item()
+
+        return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
+
+    def _preprocess(self, batch: ScheduledBatch):
+        num_input_tokens = batch.total_tokens_num
+        num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
+        num_input_tokens += num_pad
+        return num_input_tokens, num_tokens_across_dp
+
     def prepare_intputs(self, batch: ScheduledBatch):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
@@ -628,9 +749,16 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=bs,
         )
+        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)        
+        actual_num_tokens = batch.total_tokens_num
         set_forward_context(
-            attn_metadata=attn_metadata, atom_config=self.config, context=context
+            attn_metadata=attn_metadata,
+            atom_config=self.config,
+            context=context,
+            num_tokens=actual_num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
         )
+        return num_input_tokens
 
     def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
         temperatures = [seq.temperature for seq in batch.seqs.values()]
@@ -729,10 +857,15 @@ class ModelRunner:
                 attn_metadata, context = (
                     self.attn_metadata_builder.build_for_cudagraph_capture(bs)
                 )
+                num_tokens = bs
+                num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
+                num_tokens += num_pad
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
+                    num_tokens=num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
                 )
 
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup

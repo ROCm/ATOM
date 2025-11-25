@@ -20,6 +20,16 @@ parser.add_argument(
 )
 
 
+def generate_cuda_graph_sizes(max_size):
+# This is for DP split batch size
+    sizes = []
+    power = 1
+    while power <= max_size:
+        sizes.append(power)
+        power *= 2
+    return sizes
+
+
 def main():
     prompts = [
         "introduce yourself",
@@ -28,7 +38,8 @@ def main():
         "如何在一个月内增肌10公斤",
     ]
     args = parser.parse_args()
-    args.cudagraph_capture_sizes = str([1, len(prompts)])
+    # Generate power of 2 sizes for CUDA graph: [1, 2, 4, 8, ...]
+    args.cudagraph_capture_sizes = str(generate_cuda_graph_sizes(len(prompts)))
 
     # Create engine from args
     engine_args = EngineArgs.from_cli_args(args)

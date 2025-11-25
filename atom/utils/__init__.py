@@ -10,7 +10,7 @@ import time
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import Any, Iterator, Optional, Sequence, Union
+from typing import Any, Iterator, Optional, Sequence, Union, Callable, TYPE_CHECKING
 from urllib.parse import urlparse
 from uuid import uuid4
 from transformers import PretrainedConfig
@@ -21,9 +21,48 @@ import torch
 import zmq
 import zmq.asyncio
 from atom.utils.custom_register import direct_register_custom_op
-from typing import Any, Callable, Optional
+
+if TYPE_CHECKING:
+    from atom.config import Config
+from unittest.mock import patch
 
 logger = logging.getLogger("atom")
+
+
+@contextlib.contextmanager
+def set_device_control_env_var(config: "Config", local_dp_rank: int):
+    """
+    Temporarily set CUDA_VISIBLE_DEVICES or equivalent
+    for engine subprocess.
+    """
+    world_size = config.tensor_parallel_size
+    evar = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+
+    value = get_device_indices(evar, local_dp_rank, world_size)
+    print(f"Setting DP rank {local_dp_rank} to {value}")
+    with patch.dict(os.environ, values=((evar, value), )):
+        yield
+
+def get_device_indices(device_control_env_var: str, local_dp_rank: int,
+                       world_size: int):
+    """
+    Returns a comma-separated string of device indices for the specified
+    data parallel rank.
+    For example, if world_size=2 and local_dp_rank=1, and there are 4 devices,
+    this will select devices 2 and 3 for local_dp_rank=1.
+    """
+    try:
+        value = ",".join(
+            str(i)
+            for i in range(local_dp_rank * world_size, (local_dp_rank + 1) *
+                           world_size))
+    except IndexError as e:
+        raise Exception(f"Error setting {device_control_env_var}: "
+                        f"local range: [{local_dp_rank * world_size}, "
+                        f"{(local_dp_rank + 1) * world_size}) "
+                        "base value: "
+                        f"\"{os.getenv(device_control_env_var)}\"") from e
+    return value
 
 def mark_spliting_op(
     is_custom: bool,
@@ -402,7 +441,6 @@ import torch
 from packaging import version
 from packaging.version import Version
 
-from atom.config import CompilationConfig, CompilationLevel, Config
 
 context_manager = None
 torch_compile_start_time: float = 0.0
@@ -507,33 +545,6 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
-
-
-def start_monitoring_torch_compile(vllm_config: Config):
-    global torch_compile_start_time
-    torch_compile_start_time = time.time()
-
-    compilation_config: CompilationConfig = vllm_config.compilation_config
-    if (
-        compilation_config.level == CompilationLevel.PIECEWISE
-        and compilation_config.debug_dump_path
-    ):
-        import depyf
-
-        path = os.path.join(compilation_config.debug_dump_path, "rank_0")
-        # f"rank_{vllm_config.parallel_config.rank}")
-        global context_manager
-        context_manager = depyf.prepare_debug(path)
-        context_manager.__enter__()
-
-
-def end_monitoring_torch_compile(vllm_config: Config):
-    compilation_config: CompilationConfig = vllm_config.compilation_config
-    if compilation_config.level == CompilationLevel.PIECEWISE:
-        global context_manager
-        if context_manager is not None:
-            context_manager.__exit__(None, None, None)
-            context_manager = None
 
 
 def getLogger():
