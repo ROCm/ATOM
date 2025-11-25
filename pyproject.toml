@@ -9,12 +9,12 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dynamic = ["version"]
-dependencies = ["transformers", "zmq", "xxhash"]
+dependencies = ["pybind11", "transformers", "zmq", "xxhash", "fastapi", "psutil", "protobuf"]
 
 [project.urls]
-Homepage = "https://github.com/valarLip/atom"
-Repository = "https://github.com/valarLip/atom"
-Issues = "https://github.com/valarLip/atom/issues"
+Homepage = "https://github.com/ROCm/ATOM"
+Repository = "https://github.com/ROCm/ATOM"
+Issues = "https://github.com/ROCm/ATOM/issues"
 
 [tool.setuptools_scm]
 write_to = "atom/_version.py"
