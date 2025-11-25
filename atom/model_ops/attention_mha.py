@@ -14,7 +14,6 @@ from atom.utils.forward_context import (
 )
 from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
-from atom.model_ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
 
 class Attention(nn.Module):
 
@@ -73,7 +72,7 @@ class Attention(nn.Module):
 
         if k_cache.numel() and v_cache.numel():
             if use_triton_unified_attention:
-                triton_reshape_and_cache_flash(
+                aiter.reshape_and_cache_flash(
                     k,
                     v,
                     k_cache.view(k_cache.shape[0], -1, self.num_kv_heads, self.head_dim),

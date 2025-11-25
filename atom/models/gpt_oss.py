@@ -117,7 +117,7 @@ class OAIAttention(nn.Module):
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_local_key_value_heads,
-            cache_config=cache_config,
+            kv_cache_dtype=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
