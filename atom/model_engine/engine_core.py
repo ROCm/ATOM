@@ -60,10 +60,6 @@ class EngineCore:
         self.stream_output_queue = queue.Queue()  # Queue for streaming intermediate outputs
         self.input_address = input_address
         self.output_address = output_address
-        self.input_thread = threading.Thread(
-            target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        )
-        self.input_thread.start()
         self.output_thread = threading.Thread(
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
         )
@@ -105,6 +101,13 @@ class EngineCore:
                 self._finalizer()
 
         self.scheduler = Scheduler(config)
+
+        # Start input thread AFTER model is loaded so the "ready" signal
+        # is sent only when the engine is truly ready to accept requests
+        self.input_thread = threading.Thread(
+            target=self.process_input_sockets, args=(self.input_address,), daemon=True
+        )
+        self.input_thread.start()
 
     def _init_data_parallel(self, config: Config):
         pass
