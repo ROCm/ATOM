@@ -15,6 +15,7 @@ from atom.utils.forward_context import (
 )
 from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
+from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 
 
 class Attention(nn.Module):
@@ -30,6 +31,7 @@ class Attention(nn.Module):
         mla_modules: Optional[MLAModules] = None,
         sinks: Optional[nn.Parameter] = None,
         sliding_window: Optional[int] = None,
+        rotary_emb: Optional[torch.nn.Module] = None,
         **kwargs,
     ):
         super().__init__()
@@ -47,6 +49,7 @@ class Attention(nn.Module):
         self.sliding_window = (
             (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
         )
+        self.rotary_emb = rotary_emb
 
     def forward(
         self,
@@ -82,27 +85,58 @@ class Attention(nn.Module):
             k_cache = v_cache = torch.tensor([])
             k_scale = v_scale = None
 
+        assert self.rotary_emb is None or (self.rotary_emb is not None and position is not None)
         if k_cache.numel() and v_cache.numel():
             if use_triton_unified_attention:
-                aiter.reshape_and_cache_flash(
-                    k,
-                    v,
-                    k_cache.view(
-                        k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                    ),
-                    v_cache.view(
-                        v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                    ),
-                    attn_metadata.slot_mapping,
-                    (
-                        self.kv_cache_dtype
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else "auto"
-                    ),
-                    self.one_scale,
-                    self.one_scale,
+                k_scale = v_scale = self.one_scale
+                k_cache = k_cache.view(
+                    k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
                 )
+                v_cache = v_cache.view(
+                    v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                )
+                if context.is_prefill or self.rotary_emb is None:
+                    if self.rotary_emb is not None:
+                        q, k = self.rotary_emb(position, q, k)
+                    aiter.reshape_and_cache_flash(
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.slot_mapping,
+                        (
+                            self.kv_cache_dtype
+                            if self.kv_cache_dtype.startswith("fp8")
+                            else "auto"
+                        ),
+                        k_scale,
+                        v_scale,
+                    )
+                else:
+                    q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                        q,
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.slot_mapping,
+                        position,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        k_scale,
+                        v_scale,
+                        self.rotary_emb.is_neox_style,
+                        flash_layout=True,
+                        apply_scale=self.kv_cache_dtype.startswith("fp8"),
+                        offs=None,
+                        q_out=q,
+                        k_out=k,
+                        output_zeros=False,
+                    )
             else:
+                if self.rotary_emb is not None:
+                    assert position is not None
+                    q, k = self.rotary_emb(position, q, k)
                 if self.kv_cache_dtype == "fp8":
                     aiter.reshape_and_cache_with_pertoken_quant(
                         k,
@@ -133,12 +167,8 @@ class Attention(nn.Module):
             if k_cache.numel() and v_cache.numel():
                 unified_attention(
                     q,
-                    k_cache.view(
-                        k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                    ),
-                    v_cache.view(
-                        v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                    ),
+                    k_cache,
+                    v_cache,
                     o,
                     cu_seqlens_q=attn_metadata.cu_seqlens_q,
                     seqused_k=attn_metadata.context_lens,

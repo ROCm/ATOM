@@ -62,6 +62,7 @@ class Attention(nn.Module):
         mla_modules: Optional[MLAModules] = None,
         sinks: Optional[nn.Parameter] = None,
         per_layer_sliding_window: Optional[int] = None,
+        rotary_emb: Optional[torch.nn.Module] = None,
         **kwargs,
     ):
         super().__init__()
@@ -98,6 +99,7 @@ class Attention(nn.Module):
             mla_modules,
             sinks=sinks,
             sliding_window=per_layer_sliding_window,
+            rotary_emb=rotary_emb,
         )
 
         compilation_config = atom_config.compilation_config

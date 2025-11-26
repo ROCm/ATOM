@@ -123,6 +123,7 @@ class OAIAttention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.sinks,
             layer_num=self.layer_idx,
+            rotary_emb=self.rotary_emb,
         )
 
     def forward(
@@ -130,8 +131,8 @@ class OAIAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        # q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output
 
@@ -179,7 +180,7 @@ class MLPBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
 
-        g = self.router(x[..., :self.hidden_size])
+        g = self.router(x[..., : self.hidden_size])
         x = self.experts(hidden_states=x, router_logits=g)
 
         if self.is_sequence_parallel:
@@ -212,7 +213,9 @@ class TransformerBlock(torch.nn.Module):
         )
         self.mlp = MLPBlock(atom_config, self.layer_idx, prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5, x_pad_to_multiple=256)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=1e-5, x_pad_to_multiple=256
+        )
 
     def forward(
         self,
