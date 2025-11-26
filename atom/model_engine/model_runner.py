@@ -271,7 +271,7 @@ class ModelRunner:
             else torch.bfloat16
         )
         torch.set_default_dtype(default_dtype)
-        torch.set_default_device("cuda")
+        torch.set_default_device(self.device)
         self.attn_backend = get_attn_backend(
             self.block_size,
             use_mla=self.use_mla,

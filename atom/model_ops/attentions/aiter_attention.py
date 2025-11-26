@@ -62,7 +62,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ("context_lens", bs),
             ("block_tables", bs),
         ]
-        if self.block_size:
+        if self.has_sliding_window:
             vars_used.append(("cu_seqlens_q", bs + 1))
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         attn_metadata = AttentionMetaData(
