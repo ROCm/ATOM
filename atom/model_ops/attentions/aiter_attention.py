@@ -85,6 +85,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             block_tables=var["block_tables"].gpu[:bs],
             max_q_len=1,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
+            max_seqlen_k=self.model_runner.config.max_model_len,
         )
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(
