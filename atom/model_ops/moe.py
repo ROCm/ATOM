@@ -1123,7 +1123,7 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=16384,  # Default max tokens
+                max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
         if is_rocm_aiter_fusion_shared_expert_enabled():
