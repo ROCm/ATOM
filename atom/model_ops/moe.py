@@ -379,6 +379,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.quant_type = self.quant_config["quant_type"]
         self.quant_dtype = self.quant_config["quant_dtype"]
+        self.quant_method = self.quant_config["quant_method"]
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -527,6 +528,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .contiguous()
                 .view(-1, n)
             )
+        # quark method for moe, split it out?
+        elif self.quant_method == "quark":
+            s0, s1, _ = layer.w13_weight_scale.shape
+            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+            w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
+            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+
+            s0, s1, _ = layer.w2_weight_scale.shape
+            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+            w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
+            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+            return
         else:
             shuffled_w13, shuffled_w2 = shuffle_weights(
                 layer.w13_weight, layer.w2_weight
@@ -922,193 +935,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             doweight_stage1=apply_router_weight_on_input,
         )
-
-
-class Mxfp4MoEMethod(FusedMoEMethodBase):
-    def __init__(self, quant_config: QuantizationConfig):
-        self.quant_config = quant_config
-        self.quant_type = self.quant_config["quant_type"]
-        self.quant_dtype = self.quant_config["quant_dtype"]
-        self.quant_method = self.quant_config["quant_method"]
-        self.block_quant = (
-            self.quant_type == QuantType.per_1x128
-            or self.quant_type == QuantType.per_1x32
-        )
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        self.num_experts = num_experts
-        weight_dtype = params_dtype
-        scale_dtype = torch.uint8
-
-        mxfp4_block = 32
-        pad_align = 256
-
-        intermediate_size_per_partition_after_pad = (
-            (intermediate_size_per_partition + pad_align - 1) // pad_align * pad_align
-        )
-        hidden_size = (hidden_size + pad_align - 1) // pad_align * pad_align
-        self.intermediate_size = intermediate_size_per_partition_after_pad
-        self.hidden_size = hidden_size
-        # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                hidden_size // 2,
-                dtype=weight_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-
-        w13_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                hidden_size // mxfp4_block,
-                dtype=scale_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-
-        # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition_after_pad // 2,
-                dtype=weight_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-
-        w2_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition_after_pad // mxfp4_block,
-                dtype=scale_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
-
-
-    def process_weights_after_loading(self, layer):
-        if layer.w13_bias is not None:
-            layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
-        if layer.w2_bias is not None:
-            layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
-
-        if layer.activation == ActivationType.Swiglu:
-            shuffled_w13 = shuffle_weight_a16w4(layer.w13_weight, 16, True)
-            shuffled_w13_scale = shuffle_scale_a16w4(
-                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
-                self.num_experts,
-                True,
-            )
-            shuffled_w2 = shuffle_weight_a16w4(layer.w2_weight, 16, False)
-            shuffled_w2_scale = shuffle_scale_a16w4(
-                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
-                self.num_experts,
-                False,
-            )
-        # quark method for moe, split it out?
-        elif self.quant_method == "quark":
-            s0, s1, _ = layer.w13_weight_scale.shape
-            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-            w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
-            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
-
-            s0, s1, _ = layer.w2_weight_scale.shape
-            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-            w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
-            return
-        else:
-            shuffled_w13, shuffled_w2 = shuffle_weights(
-                layer.w13_weight, layer.w2_weight
-            )
-            shuffled_w13_scale = fp4_utils.e8m0_shuffle(
-                layer.w13_weight_scale.view(self.num_experts, -1)
-            )
-            shuffled_w2_scale = fp4_utils.e8m0_shuffle(
-                layer.w2_weight_scale.view(self.num_experts, -1)
-            )
-        layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(
-            shuffled_w13_scale, requires_grad=False
-        )
-        layer.w2_weight_scale = torch.nn.Parameter(
-            shuffled_w2_scale, requires_grad=False
-        )
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-        apply_router_weight_on_input: bool = False,
-        activation: ActivationType = ActivationType.Silu,
-    ) -> torch.Tensor:
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
-            routed_scaling_factor=layer.routed_scaling_factor,
-        )
-
-        return fused_moe(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights,
-            topk_ids,
-            expert_mask=expert_map,
-            activation=activation,
-            quant_type=self.quant_type,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            doweight_stage1=apply_router_weight_on_input,
-            hidden_pad=self.hidden_size,
-            intermediate_pad=self.intermediate_size,
-            bias1=layer.w13_bias,
-            bias2=layer.w2_bias,
-        )
-
 
 
 def determine_expert_map(
