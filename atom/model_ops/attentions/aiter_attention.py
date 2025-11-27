@@ -40,7 +40,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         context_lens = [seq.num_tokens for seq in seqs]
         max_seqlen_k = max(context_lens)
-        positions = context_lens
+        positions = [i - 1 for i in context_lens]
         slot_mapping = [
             seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
             for seq in seqs
