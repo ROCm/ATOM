@@ -37,7 +37,7 @@ from aiter import (
     top_k_per_row_prefill,
     top_k_per_row_decode,
 )
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce, tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -86,7 +86,7 @@ from atom.utils import envs
 # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
-ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+
 # only for DS MLA attention
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
@@ -252,7 +252,7 @@ class DeepseekV2MoE(nn.Module):
                 # See DeepseekV2DecoderLayer for more details.
                 final_hidden_states = final_hidden_states + shared_output \
                     * (1. / self.routed_scaling_factor)
-        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+        if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
 
@@ -592,7 +592,6 @@ class DeepseekV2MLAAttention(nn.Module):
                                         self.hidden_size,
                                         bias=False,
                                         quant_config=quant_config,
-                                        reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                                         prefix=f"{prefix}.o_proj")
 
         if rope_scaling:
@@ -765,7 +764,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size,
@@ -781,20 +779,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0:
-            residual, hidden_states = tensor_model_parallel_fused_allreduce_rmsnorm(
-                hidden_states, 
-                residual, 
-                self.input_layernorm.weight, 
-                self.input_layernorm.eps,
-                )
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(
-                        hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -811,16 +801,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual *= 1. / self.routed_scaling_factor
 
         # Fully Connected
-        if ENABLE_ALLREDUCE_RMSNORM_FUSION:
-            residual, hidden_states = tensor_model_parallel_fused_allreduce_rmsnorm(
-                hidden_states, 
-                residual, 
-                self.post_attention_layernorm.weight, 
-                self.post_attention_layernorm.eps,
-                )
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp,
@@ -921,11 +903,8 @@ class DeepseekV2Model(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-        if ENABLE_ALLREDUCE_RMSNORM_FUSION:
-            _, hidden_states = tensor_model_parallel_fused_allreduce_rmsnorm(
-                hidden_states, residual, self.norm.weight, self.norm.eps)
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
