@@ -9,7 +9,13 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant
 from aiter.dist.parallel_state import get_tp_group, get_dp_group
 from aiter.fused_moe import fused_moe
+from aiter.utility import fp4_utils
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_weight_a16w4,
+)
 from torch import nn
+import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
@@ -259,9 +265,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             self._maybe_pad_weight(layer.w2_weight.data), requires_grad=False
         )
         # reshaping weights is required for aiter moe kernel.
-        shuffled_w13, shuffled_w2 = shuffle_weights(
-            layer.w13_weight.data, layer.w2_weight.data
-        )
+        shuffled_w13, shuffled_w2 = shuffle_weights(layer.w13_weight, layer.w2_weight)
 
         layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
@@ -323,7 +327,6 @@ def rocm_aiter_fused_moe_impl(
     a2_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
 
     activation_ = ActivationType(activation)
     quant_type_ = QuantType(quant_type)
@@ -369,6 +372,244 @@ direct_register_custom_op(
     mutates_args=[],
     fake_impl=rocm_aiter_fused_moe_fake,
 )
+
+
+class Mxfp4MoEMethod(FusedMoEMethodBase):
+    def __init__(self, quant_config: QuantizationConfig):
+        self.quant_config = quant_config
+        self.quant_type = self.quant_config["quant_type"]
+        self.quant_dtype = self.quant_config["quant_dtype"]
+        self.quant_method = self.quant_config["quant_method"]
+        self.block_quant = (
+            self.quant_type == QuantType.per_1x128
+            or self.quant_type == QuantType.per_1x32
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        self.num_experts = num_experts
+        weight_dtype = params_dtype
+        scale_dtype = torch.uint8
+
+        mxfp4_block = 32
+        pad_align = 256
+
+        intermediate_size_per_partition_after_pad = (
+            (intermediate_size_per_partition + pad_align - 1) // pad_align * pad_align
+        )
+        hidden_size = (hidden_size + pad_align - 1) // pad_align * pad_align
+        self.intermediate_size = intermediate_size_per_partition_after_pad
+        self.hidden_size = hidden_size
+        self.hidden_pad = self.hidden_size - layer.hidden_size
+        self.intermediate_pad = (
+            self.intermediate_size - layer.intermediate_size_per_partition
+        )
+        # Fused gate_up_proj (column parallel)
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition_after_pad,
+                hidden_size // 2,
+                dtype=weight_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w13_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                2 * intermediate_size_per_partition_after_pad,
+                hidden_size // mxfp4_block,
+                dtype=scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        if layer.has_bias:
+            w13_bias = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+        else:
+            layer.register_parameter("w13_bias", None)
+
+        # down_proj (row parallel)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition_after_pad // 2,
+                dtype=weight_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w2_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition_after_pad // mxfp4_block,
+                dtype=scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        if layer.has_bias:
+            w2_bias = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
+        else:
+            layer.register_parameter("w2_bias", None)
+
+    def process_weights_after_loading(self, layer):
+        if layer.w13_bias is not None:
+            layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
+        if layer.w2_bias is not None:
+            layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
+
+        if layer.activation == ActivationType.Swiglu and layer.w13_bias is not None:
+            e, n, k = layer.w13_weight.shape
+            layer.w13_weight.view(torch.uint8).copy_(
+                layer.w13_weight.data.view(torch.uint8)
+                .view(e, n // 2, 2, k)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(e, n, k)
+            )
+            layer.w13_weight_scale.data = (
+                layer.w13_weight_scale.data.view(e, n // 2, 2, -1)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(e, n, -1)
+            )
+            shuffled_w13 = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+            shuffled_w13_scale = shuffle_scale_a16w4(
+                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                self.num_experts,
+                True,
+            )
+            shuffled_w2 = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+            shuffled_w2_scale = shuffle_scale_a16w4(
+                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                self.num_experts,
+                False,
+            )
+            layer.w13_bias.data = (
+                layer.w13_bias.data.view(-1, n // 2, 2)
+                .permute(0, 2, 1)
+                .contiguous()
+                .view(-1, n)
+            )
+        # quark method for moe, split it out?
+        elif self.quant_method == "quark":
+            s0, s1, _ = layer.w13_weight_scale.shape
+            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+            w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
+            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+
+            s0, s1, _ = layer.w2_weight_scale.shape
+            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+            w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
+            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+            return
+        else:
+            shuffled_w13, shuffled_w2 = shuffle_weights(
+                layer.w13_weight, layer.w2_weight
+            )
+            shuffled_w13_scale = fp4_utils.e8m0_shuffle(
+                layer.w13_weight_scale.view(self.num_experts, -1)
+            )
+            shuffled_w2_scale = fp4_utils.e8m0_shuffle(
+                layer.w2_weight_scale.view(self.num_experts, -1)
+            )
+
+        layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(
+            shuffled_w13_scale, requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            shuffled_w2_scale, requires_grad=False
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: ActivationType = ActivationType.Silu,
+    ) -> torch.Tensor:
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+
+        return fused_moe(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            expert_mask=expert_map,
+            activation=activation,
+            quant_type=self.quant_type,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            doweight_stage1=apply_router_weight_on_input,
+            hidden_pad=self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
+            bias1=layer.w13_bias,
+            bias2=layer.w2_bias,
+        )
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -559,7 +800,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale = nn.Parameter(w2_weight_scale, requires_grad=False)
 
             shuffled_w13, shuffled_w2 = shuffle_weights(
-                layer.w13_weight.data, layer.w2_weight.data
+                layer.w13_weight, layer.w2_weight
             )
 
             layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
@@ -811,6 +1052,7 @@ class FusedMoE(torch.nn.Module):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
+        has_bias: bool = True,
         activation: ActivationType = ActivationType.Silu,
         config: Optional[PretrainedConfig] = None,
     ):
@@ -820,6 +1062,7 @@ class FusedMoE(torch.nn.Module):
             quant_config["quant_dtype"] if quant_config else torch.get_default_dtype()
         )
         self.quant_config = quant_config
+        self.has_bias = has_bias
         # Note: here we guard against accessing the TP and DP groups when
         # uninitialized (this happens when testing)
         # self.tp_size = 1
@@ -893,7 +1136,7 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=16384,  # Default max tokens
+                max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
         if is_rocm_aiter_fusion_shared_expert_enabled():
@@ -928,11 +1171,10 @@ class FusedMoE(torch.nn.Module):
             self.quant_method: Optional[QuantizeMethodBase] = (
                 UnquantizedFusedMoEMethod()
             )
-        elif (
-            quant_config["quant_dtype"] == torch.float8_e4m3fnuz
-            or quant_config["quant_dtype"] == torch.float8_e4m3fn
-        ):
+        elif quant_config["quant_dtype"] == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(quant_config)
+        elif quant_config["quant_dtype"] == dtypes.fp4x2:
+            self.quant_method = Mxfp4MoEMethod(quant_config)
         else:
             raise ValueError(f"Unsupported quant dtype: {quant_config['quant_dtype']}")
 
@@ -1079,7 +1321,10 @@ class FusedMoE(torch.nn.Module):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-        expert_data.copy_(loaded_weight)
+        if expert_data.dtype != dtypes.fp4x2:
+            expert_data.copy_(loaded_weight)
+        else:
+            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
 
     def _load_w2(
         self,
@@ -1099,7 +1344,10 @@ class FusedMoE(torch.nn.Module):
                 shard_dim, shard_size * tp_rank, shard_size
             )
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        if expert_data.dtype != dtypes.fp4x2:
+            expert_data.copy_(loaded_weight)
+        else:
+            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -1134,14 +1382,87 @@ class FusedMoE(torch.nn.Module):
             return expert_id
         return self.expert_map[expert_id].item()
 
+    def mxf4_merged_weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ):
+        # (FIXME) for gpt-oss all experts are combined
+        mxfp4_block = 32
+        ep_rank_start = self.ep_rank * self.local_num_experts
+        ep_rank_end = ep_rank_start + self.local_num_experts
+        tp_rank_start = self.tp_rank * self.intermediate_size_per_partition
+        tp_rank_end = tp_rank_start + self.intermediate_size_per_partition
+        if param is getattr(self, "w13_bias", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
+            dim1 = narrow_weight.shape[1]
+            param[:, :dim1].copy_(narrow_weight)
+        elif param is getattr(self, "w2_bias", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight
+                if self.tp_rank != 0:
+                    narrow_weight.zero_()
+            dim1 = narrow_weight.shape[1]
+            param[:, :dim1].copy_(narrow_weight)
+        elif param is getattr(self, "w13_weight", None):
+            loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[
+                    :, 2 * tp_rank_start : 2 * tp_rank_end, ...
+                ]
+            dim1, dim2 = narrow_weight.shape[1:]
+            param.view(torch.uint8)[:, :dim1, :dim2].copy_(
+                narrow_weight.view(torch.uint8)
+            )
+        elif param is getattr(self, "w2_weight", None):
+            loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[
+                    ..., tp_rank_start // 2 : tp_rank_end // 2
+                ]
+            dim1, dim2 = narrow_weight.shape[1:]
+            param.view(torch.uint8)[:, :dim1, :dim2].copy_(
+                narrow_weight.view(torch.uint8)
+            )
+        elif param is getattr(self, "w13_weight_scale", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[
+                    :, 2 * tp_rank_start : 2 * tp_rank_end, ...
+                ]
+            dim1, dim2 = narrow_weight.shape[1:]
+            param[:, :dim1, :dim2].copy_(narrow_weight)
+        elif param is getattr(self, "w2_weight_scale", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight[
+                    ..., tp_rank_start // mxfp4_block : tp_rank_end // mxfp4_block
+                ]
+            dim1, dim2 = narrow_weight.shape[1:]
+            param[:, :dim1, :dim2].copy_(narrow_weight)
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
+        weight_name: str = "",
+        shard_id: str = "",
+        expert_id: int = 0,
     ) -> None:
+        if self.quant_config["quant_dtype"] == dtypes.fp4x2 and weight_name == "":
+            self.mxf4_merged_weight_loader(param, loaded_weight)
+            return
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
@@ -1412,6 +1733,7 @@ class FusedMoE(torch.nn.Module):
         ckpt_down_proj_name: str,
         ckpt_up_proj_name: str,
         num_experts: int,
+        has_bias: bool = False,
     ) -> List[Tuple[str, str, int, str]]:
 
         return [

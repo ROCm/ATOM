@@ -8,6 +8,7 @@ from aiter import (
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
 )
+from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
@@ -32,17 +33,66 @@ def rmsnorm2d_fwd_with_add_(
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 
+def fused_rmsnorm_pad_fake_tensors(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    x_pad_to_multiple: int = 0,
+) -> torch.Tensor:
+    M, N = x.shape
+    N_out = (N + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
+    out = torch.empty((M, N_out), dtype=x.dtype, device=x.device)
+    return out
+
+
+@torch_compile_guard(gen_fake=fused_rmsnorm_pad_fake_tensors)
+def fused_rmsnorm_pad_(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    x_pad_to_multiple: int = 0,
+) -> torch.Tensor:
+    return fused_add_rmsnorm_pad(x, weight, epsilon, None, x_pad_to_multiple)
+
+
+def fused_add_rmsnorm_pad_fake_tensors(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    res: torch.Tensor,
+    x_pad_to_multiple: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    N_out = (N + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
+    out = torch.empty((M, N_out), dtype=x.dtype, device=x.device)
+    res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
+    return out, res_out
+
+
+@torch_compile_guard(gen_fake=fused_add_rmsnorm_pad_fake_tensors)
+def fused_add_rmsnorm_pad_(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    res: torch.Tensor,
+    x_pad_to_multiple: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
+
+
 class RMSNorm(nn.Module):
 
     def __init__(
         self,
         dim: int,
         eps: float = 1e-6,
+        x_pad_to_multiple: int = 0,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self.x_pad_to_multiple = x_pad_to_multiple
 
     # def rms_forward(
     #     self,
@@ -73,7 +123,16 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
+        if self.x_pad_to_multiple > 0:
+            if residual is None:
+                return fused_rmsnorm_pad_(
+                    x, self.weight, self.eps, self.x_pad_to_multiple
+                )
+            else:
+                return fused_add_rmsnorm_pad_(
+                    x, self.weight, self.eps, residual, self.x_pad_to_multiple
+                )
+        elif residual is None:
             # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
             return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
         else:

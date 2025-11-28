@@ -249,12 +249,14 @@ class QuantizationConfig(dict):
         quant_dtype=torch.bfloat16,
         is_dynamic=True,
         quant_name="",
+        quant_method=None,
     ):
         super().__init__()
         self["quant_type"] = quant_type if quant_type is not None else QuantType.No
         self["quant_dtype"] = quant_dtype if quant_dtype is not None else torch.bfloat16
         self["quant_name"] = quant_name
         self["is_dynamic"] = is_dynamic
+        self["quant_method"] = quant_method
 
     def get_name(self):
         return self["quant_name"]
@@ -276,6 +278,7 @@ class QuantizationConfig(dict):
         factors.append(self["quant_dtype"])
         factors.append(self["quant_name"])
         factors.append(self["is_dynamic"])
+        factors.append(self["quant_method"])
         str_factors = str(factors)
         # assert_hashable(str_factors)
         return hashlib.sha256(str(factors).encode()).hexdigest()
@@ -308,8 +311,10 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
     RE_QUANT_DTYPE = r"\'(?:d?type|weight_dtype|quant_method)\'\:\s*\'(\w+)\'"
     quant_dtype = None
     m = re.search(RE_QUANT_DTYPE, orig_quant_config_str)
-    if m and m.group(1).lower() in ["fp8", "fp4", "int8", "int4", "fp8_e4m3"]:
+    if m and m.group(1).lower() in ["fp8", "fp4", "int8", "int4", "fp8_e4m3", "mxfp4"]:
         dtype = m.group(1).lower().split("_")[0]
+        if dtype == "mxfp4":
+            dtype = "fp4"
         if dtype.endswith("4"):
             dtype += "x2"
         quant_dtype = d_dtypes[dtype]
@@ -330,13 +335,15 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
     assert (
         quant_dtype is not None
     ), f"Cannot parse quant dtype from {orig_quant_config_str}"
+    if quant_dtype == d_dtypes["fp4x2"]:
+        quant_type = QuantType.per_1x32
 
     RE_STATIC_QUANT = r"\'(?:activation_scheme)\'\:\s*\'(static)\'"
     if re.search(RE_STATIC_QUANT, orig_quant_config_str):
         is_dynamic = False
     else:
         is_dynamic = True
-    return QuantizationConfig(quant_type, quant_dtype, is_dynamic)
+    return QuantizationConfig(quant_type, quant_dtype, is_dynamic, quant_method=quant_method)
 
 
 _CONFIG_REGISTRY: dict[str, str] = {

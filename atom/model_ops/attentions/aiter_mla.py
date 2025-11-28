@@ -156,8 +156,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
         if self.is_sparse:
-            self.prepare_block_tables(seqs)
-            attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+            if attn_metadata.block_tables is None:
+                self.prepare_block_tables(seqs)
+                attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
             var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
                 np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
             )
@@ -180,7 +181,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         max_q_len = 1
 
         context_lens = [seq.num_tokens for seq in seqs]
-        positions = context_lens
+        positions = [i - 1 for i in context_lens]
         slot_mapping = [
             seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
             for seq in seqs

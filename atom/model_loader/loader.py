@@ -17,10 +17,17 @@ from atom.model_loader.weight_utils import (
 )
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.moe import is_rocm_aiter_fusion_shared_expert_enabled
+from aiter.dist.parallel_state import get_tp_group
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
-    param.data.copy_(loaded_weight)
+    if loaded_weight.numel() == param.data.numel():
+        param.data.copy_(loaded_weight)
+    elif loaded_weight.numel() // get_tp_group().world_size == param.data.numel():
+        loaded_weight_per_rank = loaded_weight.numel() // get_tp_group().world_size
+        tp_rank_start = loaded_weight_per_rank * get_tp_group().rank
+        tp_rank_end = tp_rank_start + loaded_weight_per_rank
+        param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
 
 
 def safetensors_weights_iterator(
@@ -66,6 +73,7 @@ def load_model(
     load_dummy: bool = False,
 ):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
@@ -74,8 +82,12 @@ def load_model(
                 continue
             if name.endswith("kv_scale"):
                 continue
+            name_suffix = name.split(".")[-1]
+            if name_suffix in weights_mapping.keys():
+                name = name.replace(name_suffix, weights_mapping[name_suffix])
             if "weight_scale_inv" in name:
                 name = name.replace("weight_scale_inv", "weight_scale")
+
             layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
             layerId = int(layerId_.group(1)) if layerId_ else 0
             if hf_config.num_hidden_layers and layerId >= hf_config.num_hidden_layers:

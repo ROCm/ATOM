@@ -4,6 +4,7 @@ import json
 import time
 import queue
 from typing import List, Optional, Dict, Any, AsyncGenerator
+from contextlib import asynccontextmanager
 import uuid
 from collections import defaultdict
 
@@ -197,7 +198,17 @@ async def generate_async(
         }
 
 
-app = FastAPI(title="Atom OpenAI API Server")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup
+    logger.info("Server started successfully and ready to accept requests")
+    print("Server started successfully and ready to accept requests!")
+    yield
+    # Shutdown (if needed in the future)
+
+
+app = FastAPI(title="Atom OpenAI API Server", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
