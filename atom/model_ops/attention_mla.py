@@ -23,7 +23,9 @@ from atom.utils.forward_context import (
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
-from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+
+# from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+from aiter import fused_qk_rope_concat_and_cache_mla
 from aiter.dist.parallel_state import get_dp_group
 
 torch.set_printoptions(threshold=10_000)
@@ -92,6 +94,7 @@ class MLAAttention(nn.Module):
         self.kv_cache = torch.tensor([])
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
+        self._q_scale = self.one_scale
         self.topk_indices_buffer = (
             mla_modules.indexer.topk_indices_buffer
             if mla_modules.indexer is not None
@@ -257,10 +260,10 @@ class MLAAttention(nn.Module):
                 self.topk_indices_buffer[:B],
             )
 
-        q_scale = kv_scale = None
-        if self.kv_cache_dtype.startswith("fp8"):
-            q = q.to(dtypes.fp8)
-            q_scale = kv_scale = self.one_scale
+        # q_scale = kv_scale = None
+        # if self.kv_cache_dtype.startswith("fp8"):
+        #     q = q.to(dtypes.fp8)
+        #     q_scale = kv_scale = self.one_scale
 
         dp_size = get_dp_group().world_size
         is_fp8 = self.kv_cache_dtype.startswith("fp8")
@@ -301,8 +304,8 @@ class MLAAttention(nn.Module):
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            q_scale,
-            kv_scale,
+            self._q_scale,
+            self._k_scale,
         )
 
         return self._v_up_proj_and_o_proj(o)
@@ -351,18 +354,28 @@ class MLAAttention(nn.Module):
             q_nope, q_rope = self._q_proj_and_k_up_proj(q)
 
             if kv_cache.numel() > 0:
-                decode_q, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+                decode_q = torch.empty(
+                    (q_nope.shape[0], self.num_heads, self.qk_head_dim),
+                    dtype=self.kv_cache_dtype,
+                    device=q_nope.device,
+                )
+                fused_qk_rope_concat_and_cache_mla(
                     q_nope,
                     q_rope,
                     k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
                     k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
                     kv_cache,
+                    decode_q,
                     attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                    self._q_scale,
                     positions,
                     self.rotary_emb.cos_cache,
                     self.rotary_emb.sin_cache,
-                    k_scale=self._k_scale,
                     is_neox=self.rotary_emb.is_neox_style,
+                    is_nope_first=True,
+                    q_out_dtype=decode_q.dtype,
                 )
 
             output = self._forward_decode(decode_q, kv_cache, attn_metadata)
