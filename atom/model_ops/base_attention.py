@@ -83,6 +83,7 @@ class Attention(nn.Module):
         self.sinks = sinks
 
         atom_config = get_current_atom_config()
+        dtype = atom_config.torch_dtype
         block_size = atom_config.kv_cache_block_size
         self.attn_backend = get_attn_backend(
             block_size,
@@ -100,6 +101,7 @@ class Attention(nn.Module):
             sinks=sinks,
             sliding_window=per_layer_sliding_window,
             rotary_emb=rotary_emb,
+            dtype=dtype,
         )
 
         compilation_config = atom_config.compilation_config

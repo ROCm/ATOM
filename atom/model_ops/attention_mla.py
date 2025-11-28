@@ -72,6 +72,7 @@ class MLAAttention(nn.Module):
         kv_cache_dtype: str,
         layer_num: int = 0,
         mla_modules: MLAModules = None,
+        dtype: torch.dtype = torch.bfloat16,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -80,6 +81,7 @@ class MLAAttention(nn.Module):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype if kv_cache_dtype == "fp8" else "auto"
+        self.dtype = dtype
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -244,7 +246,7 @@ class MLAAttention(nn.Module):
         B = q.shape[0]
 
         o = torch.empty(
-            B, self.num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+            B, self.num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -355,16 +357,22 @@ class MLAAttention(nn.Module):
 
             if kv_cache.numel() > 0:
                 decode_q = torch.empty(
-                    (q_nope.shape[0], self.num_heads, self.qk_head_dim),
-                    dtype=self.kv_cache_dtype,
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=kv_cache.dtype,
                     device=q_nope.device,
                 )
                 fused_qk_rope_concat_and_cache_mla(
-                    q_nope,
-                    q_rope,
-                    k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                    k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                    kv_cache,
+                    q_nope.view(-1, self.num_heads, self.kv_lora_rank),
+                    q_rope.view(-1, self.num_heads, self.qk_rope_head_dim),
+                    k_nope.view(-1, self.kv_lora_rank),
+                    k_rope.view(-1, self.qk_rope_head_dim),
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
                     decode_q,
                     attn_metadata.slot_mapping,
                     self.kv_cache_dtype,

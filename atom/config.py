@@ -509,6 +509,7 @@ class Config:
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
+    torch_dtype: torch.dtype = torch.bfloat16
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -544,6 +545,11 @@ class Config:
             self._set_cudagraph_sizes()
             self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             self.compilation_config.init_with_cudagraph_sizes()
+        self.torch_dtype = (
+            self.hf_config.torch_dtype
+            if getattr(self.hf_config, "torch_dtype", None) is not None
+            else torch.bfloat16
+        )
 
     def compute_hash(self) -> str:
         """

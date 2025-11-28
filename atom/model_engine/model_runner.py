@@ -265,11 +265,7 @@ class ModelRunner:
             data_parallel_rank=config.parallel_config.data_parallel_rank,
         )
         init_exit_handler(self)
-        default_dtype = (
-            hf_config.torch_dtype
-            if getattr(hf_config, "torch_dtype", None) is not None
-            else torch.bfloat16
-        )
+        default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
         self.attn_backend = get_attn_backend(
