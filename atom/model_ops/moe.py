@@ -38,6 +38,26 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.utils import envs
 
 
+balance_router_logits = None
+
+
+@lru_cache(maxsize=1)
+def init_balance_router_logits(
+    n_routed_experts: int,
+    topk: int,
+    dtype: torch.dtype = torch.bfloat16,
+    max_num_tokens: int = 32768,
+):
+    stride = n_routed_experts + topk
+    max_num_tokens_pad = (max_num_tokens + stride - 1) // stride * stride
+    global balance_router_logits
+    balance_router_logits = torch.zeros(
+        (max_num_tokens_pad, n_routed_experts), dtype=dtype, device="cuda"
+    )
+    balance_router_logits.view(-1, stride)[:, :topk] = 1.0
+    return balance_router_logits
+
+
 @dataclass
 class FusedMoEParallelConfig:
     tp_size: int
@@ -1194,6 +1214,12 @@ class FusedMoE(torch.nn.Module):
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+        self.balance_router_logits = init_balance_router_logits(
+            self.global_num_experts,
+            top_k,
+            torch.get_default_dtype(),
+            atom_config.max_num_batched_tokens,
+        )
 
     @property
     def tp_size(self):
@@ -1629,6 +1655,8 @@ class FusedMoE(torch.nn.Module):
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        if self.balance_router_logits is not None:
+            router_logits = self.balance_router_logits[: hidden_states.shape[0]]
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )
