@@ -51,7 +51,6 @@ class Attention(nn.Module):
         )
         self.rotary_emb = rotary_emb
 
-
     def forward(
         self,
         q: torch.Tensor,
