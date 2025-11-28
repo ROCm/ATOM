@@ -39,7 +39,7 @@ class Attention(nn.Module):
         self.k_scale = self.v_scale = None
         self.layer_num = layer_num
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position: torch.Tensor=None):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, position: torch.Tensor=None, q_scale: torch.Tensor=None):
         o: torch.Tensor
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)

@@ -178,9 +178,9 @@ class MLAAttention(nn.Module):
         x = x.reshape(-1, self.num_heads * self.v_head_dim)
         return self.o_proj(x)
 
-    def _q_proj_and_k_up_proj(self, x):
+    def _q_proj_and_k_up_proj(self, x, x_scale=None):
         q_nope, q_pe = (
-            self.q_proj(x)
+            self.q_proj(x, x_scale)
             .view(-1, self.num_heads, self.qk_head_dim)
             .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         )
@@ -312,6 +312,7 @@ class MLAAttention(nn.Module):
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
         positions: torch.Tensor,
+        q_scale: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
@@ -329,7 +330,7 @@ class MLAAttention(nn.Module):
             kv_cache = torch.tensor([])
 
         if context.is_prefill:
-            prefill_q = self.q_proj(q).view(-1, self.num_heads, self.qk_head_dim)
+            prefill_q = self.q_proj(q, x_scale=q_scale).view(-1, self.num_heads, self.qk_head_dim)
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
@@ -347,7 +348,7 @@ class MLAAttention(nn.Module):
                 prefill_q, k_nope, k_rope, kv_cache, attn_metadata
             )
         else:
-            q_nope, q_rope = self._q_proj_and_k_up_proj(q)
+            q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
             if kv_cache.numel() > 0:
                 decode_q, _, _, _ = fused_qk_rope_cat_and_cache_mla(

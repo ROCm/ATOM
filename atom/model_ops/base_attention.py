@@ -1,5 +1,6 @@
 # from flash_attn import flash_attn_with_kvcache
 from dataclasses import dataclass
+from typing import Optional
 
 import aiter
 import torch
@@ -15,7 +16,7 @@ from atom.config import get_current_atom_config
 from atom.utils.selector import get_attn_backend
 
 def fake_(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor, 
+    q: torch.Tensor, q_scale: Optional[torch.Tensor], k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor, 
     layer_name: str, use_mla: bool
 ) -> torch.Tensor:
     output_shape = list(q.shape)
@@ -32,12 +33,12 @@ def fake_(
 # we can still capture the model's computation graph as a full-graph
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
 def unified_attention_with_output_base(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor, 
+    q: torch.Tensor, q_scale: Optional[torch.Tensor], k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor, 
     layer_name: str, use_mla: bool
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.impl.forward(q, k, v, positions)
+    return self.impl.forward(q, k, v, positions, q_scale)
 
 
 class Attention(nn.Module):
@@ -87,6 +88,6 @@ class Attention(nn.Module):
         compilation_config.static_forward_context[self.layer_name] = self
 
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor=None):
-        output = torch.ops.aiter.unified_attention_with_output_base(q, k, v, positions, self.layer_name, self.use_mla)
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, positions: torch.Tensor=None, q_scale: Optional[torch.Tensor]=None):
+        output = torch.ops.aiter.unified_attention_with_output_base(q, q_scale, k, v, positions, self.layer_name, self.use_mla)
         return output
