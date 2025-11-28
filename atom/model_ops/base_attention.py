@@ -111,8 +111,6 @@ class Attention(nn.Module):
             raise ValueError("Duplicate layer: {}".format(self.layer_name))
         compilation_config.static_forward_context[self.layer_name] = self
 
-
-
     def forward(
         self,
         q: torch.Tensor,
