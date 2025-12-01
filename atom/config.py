@@ -509,7 +509,7 @@ class Config:
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
-    torch_dtype: torch.dtype = torch.bfloat16
+    torch_dtype: torch.dtype = field(init=False)
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
