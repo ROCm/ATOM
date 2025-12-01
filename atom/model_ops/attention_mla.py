@@ -25,7 +25,7 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 )
 
 # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
-from aiter import fused_qk_rope_concat_and_cache_mla
+# from aiter import fused_qk_rope_concat_and_cache_mla
 from aiter.dist.parallel_state import get_dp_group
 
 torch.set_printoptions(threshold=10_000)
