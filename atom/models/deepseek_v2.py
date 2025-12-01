@@ -87,6 +87,7 @@ from atom.utils import envs
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+
 # only for DS MLA attention
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
@@ -660,6 +661,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
         self.fuse_qknorm_quant = ENABLE_DS_QKNORM_QUANT_FUSION and self.quant_dtype is not None
 
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -707,6 +709,7 @@ class DeepseekV2MLAAttention(nn.Module):
                              k_pe,
                              positions,
                              None if not self.fuse_qknorm_quant else hidden_states_or_q_c_scale,)
+
 
 
 class DeepseekV2DecoderLayer(nn.Module):
