@@ -138,13 +138,12 @@ class RMSNorm(nn.Module):
                 )
         if self.fused_allreduce:
             assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
-            residual_out, x_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+            return tensor_model_parallel_fused_allreduce_rmsnorm(
                 x, 
                 residual, 
                 self.weight, 
                 self.eps,
                 )
-            return x_out, residual_out
         else:
             if residual is None:
                 # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
