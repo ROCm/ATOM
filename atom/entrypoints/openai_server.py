@@ -231,19 +231,27 @@ async def chat_completions(request: ChatCompletionRequest):
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         if request.stream:
-            async def generate_stream():
-                stream_queue = queue.Queue()
-                _stream_queues[request_id] = stream_queue
+            stream_queue = queue.Queue()
+            _stream_queues[request_id] = stream_queue
 
-                def stream_callback(request_output: RequestOutput):
-                    send_stream_chunk(request_output)
+            def stream_callback(request_output: RequestOutput):
+                send_stream_chunk(request_output)
 
+            loop = asyncio.get_event_loop()
+            def do_preprocess():
                 seq = engine.io_processor.preprocess(prompt, sampling_params, stream_callback=stream_callback)
-                seq_id = seq.id
-                _seq_id_to_request_id[seq_id] = request_id
-                logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}")
-                engine.core_mgr.add_request([seq])
-                logger.info(f"API: Added request to engine, callback registered: {seq.stream_callback is not None}")
+                return seq
+            
+            seq = await loop.run_in_executor(None, do_preprocess)
+            
+            seq_id = seq.id
+            _seq_id_to_request_id[seq_id] = request_id
+
+            logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}")
+            engine.core_mgr.add_request([seq])
+            logger.info(f"API: Added request to engine, callback registered: {seq.stream_callback is not None}")
+  
+            async def generate_stream():
                 
                 prev_text = ""
                 num_tokens_input = len(tokenizer.encode(prompt))
@@ -338,18 +346,27 @@ async def completions(request: CompletionRequest):
         if request.stream:
             request_id = f"cmpl-{uuid.uuid4().hex}"
 
-            async def generate_stream():
-                stream_queue = queue.Queue()
-                _stream_queues[request_id] = stream_queue
-                
-                def stream_callback(request_output: RequestOutput):
-                    send_stream_chunk(request_output)
-                
+            stream_queue = queue.Queue()
+            _stream_queues[request_id] = stream_queue
+            
+            def stream_callback(request_output: RequestOutput):
+                send_stream_chunk(request_output)
+
+            loop = asyncio.get_event_loop()
+            
+            def do_preprocess():
                 seq = engine.io_processor.preprocess(request.prompt, sampling_params, stream_callback=stream_callback)
-                seq_id = seq.id
-                _seq_id_to_request_id[seq_id] = request_id
-                engine.core_mgr.add_request([seq])
-                
+                return seq
+            
+            seq = await loop.run_in_executor(None, do_preprocess)
+            
+            seq_id = seq.id
+            _seq_id_to_request_id[seq_id] = request_id
+            logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}")
+            engine.core_mgr.add_request([seq])
+            logger.info(f"API: Added request to engine, callback registered: {seq.stream_callback is not None}")
+
+            async def generate_stream():
                 prev_text = ""
                 num_tokens_input = len(tokenizer.encode(request.prompt))
                 num_tokens_output = 0
@@ -384,7 +401,8 @@ async def completions(request: CompletionRequest):
                 
                 # Cleanup
                 _stream_queues.pop(request_id, None)
-                _seq_id_to_request_id.pop(seq_id, None)
+                if seq_id in _seq_id_to_request_id:
+                    _seq_id_to_request_id.pop(seq_id, None)
                 
                 yield create_completion_chunk(request_id, request.model, "", "stop")
                 usage = {
