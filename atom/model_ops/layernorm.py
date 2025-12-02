@@ -9,6 +9,7 @@ from aiter import (
     layernorm2d_fwd_with_add,
 )
 from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
@@ -96,6 +97,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     # def rms_forward(
     #     self,
@@ -136,7 +138,7 @@ class RMSNorm(nn.Module):
                 return fused_add_rmsnorm_pad_(
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
-        if self.fused_allreduce:
+        if self.fused_allreduce and self.tp_size > 1:
             assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
             return tensor_model_parallel_fused_allreduce_rmsnorm(
                 x, 

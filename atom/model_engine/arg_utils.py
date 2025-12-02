@@ -39,8 +39,6 @@ class EngineArgs:
     ):
         self.model = model
         self.tensor_parallel_size = tensor_parallel_size
-        if envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION:
-            assert self.tensor_parallel_size > 1, "AllReduce RMSNorm fusion requires tensor parallelism."
         self.enforce_eager = enforce_eager
         self.enable_prefix_caching = enable_prefix_caching
         self.port = port
