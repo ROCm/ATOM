@@ -28,7 +28,7 @@ class EngineArgs:
         port: int = 8006,
         kv_cache_dtype: str = "bf16",
         block_size: int = 16,
-        max_model_len: int = 8192,
+        max_model_len: int | None = None,
         cudagraph_capture_sizes: str = "[1,2,4,8,16]",
         level: int = 3,
         load_dummy: bool = False,
@@ -98,8 +98,8 @@ class EngineArgs:
         parser.add_argument(
             "--max-model-len",
             type=int,
-            default=8192,
-            help="Maximum model context length.",
+            default=None,
+            help="Maximum model context length, the default is set to hf_config.max_position_embeddings.",
         )
 
         # Compilation configuration
