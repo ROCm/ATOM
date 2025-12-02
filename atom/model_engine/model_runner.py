@@ -20,6 +20,7 @@ from atom.models.deepseek_v2 import DeepseekV2ForCausalLM
 from atom.models.llama import LlamaForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
 from atom.models.qwen3 import Qwen3ForCausalLM
+from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.utils import CpuGpuBuffer, init_exit_handler, get_hf_text_config
 from atom.utils.selector import get_attn_backend
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -39,6 +40,7 @@ from atom.utils.forward_context import (
 
 suppot_model_arch_dict = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
+    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "LlamaForCausalLM": LlamaForCausalLM,
     "MixtralForCausalLM": MixtralForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,

@@ -3,6 +3,7 @@ from typing import List
 
 from atom import AsyncLLMEngine, LLMEngine
 from atom.config import CompilationConfig
+from atom.utils import envs
 
 
 def parse_size_list(size_str: str) -> List[int]:
@@ -38,6 +39,8 @@ class EngineArgs:
     ):
         self.model = model
         self.tensor_parallel_size = tensor_parallel_size
+        if envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION:
+            assert self.tensor_parallel_size > 1, "AllReduce RMSNorm fusion requires tensor parallelism."
         self.enforce_eager = enforce_eager
         self.enable_prefix_caching = enable_prefix_caching
         self.port = port
