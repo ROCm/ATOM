@@ -388,10 +388,10 @@ class ParallelConfig:
     set only in SPMD mode."""
     world_size: int = field(init=False)
     """world_size is TPxPP, it affects the number of workers we create."""
-    data_parallel_master_port: int = 29500
+    data_parallel_master_port: int = 29700
     """Port of the data parallel master."""
 
-    data_parallel_base_port: int = 29400
+    data_parallel_base_port: int = 29600
 
     data_parallel_master_ip: str = "127.0.0.1"
 
@@ -486,7 +486,7 @@ class Config:
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.7
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)

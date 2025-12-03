@@ -97,9 +97,9 @@ class Scheduler:
         total_tokens_num_prefill = num_scheduled_tokens_np.sum()
 
         if num_seqs_prefill > 0:
-            logger.info(
-                f"scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens"
-            )
+            # logger.info(
+            #     f"scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens"
+            # )
             # lip: TODO for prefill/decode mixed batch
             return ScheduledBatch(
                 seqs=scheduled_seqs,

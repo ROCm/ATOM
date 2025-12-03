@@ -476,7 +476,7 @@ def main():
     EngineArgs.add_cli_args(parser)
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument(
-        "--server-port", type=int, default=8000,
+        "--server-port", type=int, default=8888,
         help="Server port (note: --port is used for internal engine communication)"
     )
     args = parser.parse_args()

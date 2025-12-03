@@ -15,6 +15,7 @@ from atom.utils.forward_context import (
 )
 from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 
 
@@ -87,32 +88,55 @@ class Attention(nn.Module):
 
         assert self.rotary_emb is None or (self.rotary_emb is not None and position is not None)
         if k_cache.numel() and v_cache.numel():
-            if use_triton_unified_attention:
-                k_scale = v_scale = self.one_scale
-                k_cache = k_cache.view(
-                    k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                )
-                v_cache = v_cache.view(
-                    v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                )
-                if context.is_prefill or self.rotary_emb is None:
-                    if self.rotary_emb is not None:
-                        q, k = self.rotary_emb(position, q, k)
-                    aiter.reshape_and_cache_flash(
-                        k,
-                        v,
-                        k_cache,
-                        v_cache,
-                        attn_metadata.slot_mapping,
-                        (
-                            self.kv_cache_dtype
-                            if self.kv_cache_dtype.startswith("fp8")
-                            else "auto"
-                        ),
-                        k_scale,
-                        v_scale,
-                    )
-                else:
+            # if use_triton_unified_attention and context.is_prefill:
+            #     # k_scale = v_scale = self.one_scale
+            #     # k_cache = k_cache.view(
+            #     #     k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+            #     # )
+            #     # v_cache = v_cache.view(
+            #     #     v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+            #     # )
+            #     # if context.is_prefill or self.rotary_emb is None:
+            #     #     if self.rotary_emb is not None:
+            #     #         q, k = self.rotary_emb(position, q, k)
+            #     #     aiter.reshape_and_cache_flash(
+            #     #         k,
+            #     #         v,
+            #     #         k_cache,
+            #     #         v_cache,
+            #     #         attn_metadata.slot_mapping,
+            #     #         (
+            #     #             self.kv_cache_dtype
+            #     #             if self.kv_cache_dtype.startswith("fp8")
+            #     #             else "auto"
+            #     #         ),
+            #     #         k_scale,
+            #     #         v_scale,
+            #     #     )
+            #     # else:
+            #         q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+            #             q,
+            #             k,
+            #             v,
+            #             k_cache,
+            #             v_cache,
+            #             attn_metadata.slot_mapping,
+            #             position,
+            #             self.rotary_emb.cos_cache,
+            #             self.rotary_emb.sin_cache,
+            #             k_scale,
+            #             v_scale,
+            #             self.rotary_emb.is_neox_style,
+            #             flash_layout=True,
+            #             apply_scale=self.kv_cache_dtype.startswith("fp8"),
+            #             offs=None,
+            #             q_out=q,
+            #             k_out=k,
+            #             output_zeros=False,
+            #         )
+            # else:
+                if True:
+                    k_scale = v_scale = self.one_scale
                     q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                         q,
                         k,
@@ -126,65 +150,139 @@ class Attention(nn.Module):
                         k_scale,
                         v_scale,
                         self.rotary_emb.is_neox_style,
-                        flash_layout=True,
+                        flash_layout=False,
                         apply_scale=self.kv_cache_dtype.startswith("fp8"),
                         offs=None,
                         q_out=q,
                         k_out=k,
                         output_zeros=False,
                     )
-            else:
-                if self.rotary_emb is not None:
-                    assert position is not None
-                    q, k = self.rotary_emb(position, q, k)
-                if self.kv_cache_dtype == "fp8":
-                    aiter.reshape_and_cache_with_pertoken_quant(
-                        k,
-                        v,
-                        k_cache,
-                        v_cache,
-                        k_scale,
-                        v_scale,
-                        attn_metadata.slot_mapping,
-                        asm_layout=True,
-                    )
                 else:
-                    aiter.reshape_and_cache(
-                        k,
-                        v,
-                        k_cache,
-                        v_cache,
-                        attn_metadata.slot_mapping,
-                        kv_cache_dtype="auto",
-                        k_scale=None,
-                        v_scale=None,
-                        asm_layout=True,
-                    )
+                    if self.rotary_emb is not None:
+                        assert position is not None
+                        q, k = self.rotary_emb(position, q, k)
+                    if self.kv_cache_dtype == "fp8":
+                        aiter.reshape_and_cache_with_pertoken_quant(
+                            k,
+                            v,
+                            k_cache,
+                            v_cache,
+                            k_scale,
+                            v_scale,
+                            attn_metadata.slot_mapping,
+                            asm_layout=True,
+                        )
+                    else:
+                        aiter.reshape_and_cache(
+                            k,
+                            v,
+                            k_cache,
+                            v_cache,
+                            attn_metadata.slot_mapping,
+                            kv_cache_dtype="auto",
+                            k_scale=None,
+                            v_scale=None,
+                            asm_layout=True,
+                        )
 
         if use_triton_unified_attention:
             o = torch.empty_like(q)
             descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
             if k_cache.numel() and v_cache.numel():
-                unified_attention(
-                    q,
-                    k_cache,
-                    v_cache,
-                    o,
-                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                    seqused_k=attn_metadata.context_lens,
-                    max_seqlen_q=attn_metadata.max_seqlen_q,
-                    max_seqlen_k=attn_metadata.max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    alibi_slopes=None,
-                    window_size=self.sliding_window,
-                    block_table=attn_metadata.block_tables,
-                    softcap=0,
-                    q_descale=None,
-                    k_descale=self.one_scale.expand(descale_shape),
-                    v_descale=self.one_scale.expand(descale_shape),
-                    sinks=self.sinks,
-                )
+                q_seq_len, num_heads, head_dim = q.shape
+                if not context.is_prefill:
+                    num_seqs, num_q_heads_total, head_size = q.shape
+                    num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
+                    query_group_size = num_q_heads_total // num_kv_heads
+                    assert num_q_heads_total % num_kv_heads == 0
+
+                    max_context_length = (
+                        min(attn_metadata.max_seqlen_k, self.sliding_window[0])
+                        if self.sliding_window[0] > 0
+                        else attn_metadata.max_seqlen_k
+                    )
+                    # Reconstruct full key/value per sequence
+                    context_partition_size = 128
+                    max_context_partition_num = (
+                        max_context_length + context_partition_size - 1
+                    ) // context_partition_size
+
+                    # Output buffers (same as Triton)
+                    intermediate_shape = (
+                        num_seqs,
+                        num_kv_heads,
+                        max_context_partition_num,
+                        query_group_size,
+                    )
+                    exp_sums = torch.zeros(
+                        intermediate_shape, dtype=torch.float32, device=q.device
+                    )
+                    max_logits = torch.zeros(
+                        intermediate_shape, dtype=torch.float32, device=q.device
+                    )
+                    temporary_output = torch.zeros(
+                        *intermediate_shape,
+                        head_size,
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    #if q.shape[0]==4:
+                    #    print("22")
+                    #print(q.shape)
+                    pa_decode_gluon(
+                        o,
+                        q,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.context_lens,
+                        attn_metadata.block_tables,
+                        self.scale,
+                        1, # query_lenth
+                        max_context_length, # max_context_len
+                        tl.float8e4nv, #compute_type
+                        None,
+                        self.one_scale.expand(num_blocks, num_kv_heads, block_size, 1),
+                        self.one_scale.expand(num_blocks, num_kv_heads, block_size, 1),
+                        exp_sums=exp_sums,
+                        max_logits=max_logits,
+                        temporary_output=temporary_output,
+                        alibi_slopes=None,
+                        sinks=self.sinks,
+                        sliding_window=self.sliding_window[0],
+                    )
+                else:
+                    #if q.shape[0]>1024:
+                    #   print("a")
+                    #print(q.shape)
+                    k_cache = k_cache.view(
+                        k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                    )
+                    v_cache = v_cache.view(
+                        v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                    )
+                    
+                    unified_attention(
+                        q,
+                        k.unsqueeze(1),
+                        v.unsqueeze(1),
+                        #k_cache,
+                        #v_cache,
+                        o,
+                        cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                        seqused_k=attn_metadata.context_lens,
+                        max_seqlen_q=attn_metadata.max_seqlen_q,
+                        max_seqlen_k=attn_metadata.max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=None,
+                        window_size=self.sliding_window,
+                        block_table=attn_metadata.fake_block_tables,
+                        softcap=0,
+                        q_descale=None,
+                        k_descale=self.one_scale.expand(descale_shape),
+                        v_descale=self.one_scale.expand(descale_shape),
+                        sinks=self.sinks,
+                    )
         elif context.is_prefill:
             # if context.block_tables is not None:  # prefix cache
             #     k, v = k_cache, v_cache

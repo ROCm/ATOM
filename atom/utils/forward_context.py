@@ -139,6 +139,7 @@ class AttentionMetaData:
     slot_mapping: Optional[torch.Tensor] = None
     context_lens: Optional[torch.Tensor] = None
     block_tables: Optional[torch.Tensor] = None
+    fake_block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
     max_q_len: Optional[int] = None
@@ -203,6 +204,11 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
+
+        fake_block_table = torch.zeros(cu_seqlens_q.shape[0] - 1, max_seqlen_q).int().cuda()
+        for i in range(cu_seqlens_q.shape[0]-1):
+            fake_block_table[i][0:(cu_seqlens_q[i+1] - cu_seqlens_q[i]).item()] = torch.arange(cu_seqlens_q[i], cu_seqlens_q[i+1], dtype=torch.int).cuda()
+        self.fake_block_tables = fake_block_table
 
     def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
