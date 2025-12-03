@@ -195,18 +195,24 @@ class Attention(nn.Module):
                     num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
                     query_group_size = num_q_heads_total // num_kv_heads
                     assert num_q_heads_total % num_kv_heads == 0
+                    sliding_window = self.sliding_window[0] + 1
 
                     max_context_length = (
-                        min(attn_metadata.max_seqlen_k, self.sliding_window[0])
-                        if self.sliding_window[0] > 0
+                        min(attn_metadata.max_seqlen_k, sliding_window)
+                        if sliding_window > 0
                         else attn_metadata.max_seqlen_k
                     )
                     # Reconstruct full key/value per sequence
-                    context_partition_size = 128
-                    max_context_partition_num = (
-                        max_context_length + context_partition_size - 1
-                    ) // context_partition_size
-
+                    # context_partition_size = 128
+                    # max_context_partition_num = (
+                    #     max_context_length + context_partition_size - 1
+                    # ) // context_partition_size
+                    context_partition_size = 256
+                    if sliding_window> 0:
+                        max_context_length = min(max_context_length, sliding_window)
+                        if max_context_length <= 128:
+                            context_partition_size = 128
+                    max_context_partition_num = triton.cdiv(max_context_length, context_partition_size)
                     # Output buffers (same as Triton)
                     intermediate_shape = (
                         num_seqs,
@@ -248,7 +254,7 @@ class Attention(nn.Module):
                         temporary_output=temporary_output,
                         alibi_slopes=None,
                         sinks=self.sinks,
-                        sliding_window=self.sliding_window[0],
+                        sliding_window=sliding_window,
                     )
                 else:
                     #if q.shape[0]>1024:
