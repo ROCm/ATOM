@@ -604,7 +604,7 @@ class ModelRunner:
                 f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
                 f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
             )
-
+  
         if self.use_mla:
             self.kv_cache = torch.zeros(
                 total_num_layers,
