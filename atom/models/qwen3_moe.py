@@ -315,7 +315,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-# @support_torch_compile
+@support_torch_compile
 class Qwen3MoeModel(nn.Module):
     def __init__(
             self,

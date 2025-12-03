@@ -562,7 +562,12 @@ class ModelRunner:
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            assert hf_config.num_key_value_heads % self.world_size == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            assert self.world_size % hf_config.num_key_value_heads == 0
+            num_kv_heads = 1       
         if self.use_mla:
             self.kv_cache = torch.zeros(
                 hf_config.num_hidden_layers,
