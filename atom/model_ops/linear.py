@@ -423,7 +423,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             # the KV heads across multiple tensor parallel GPUs.
             self.num_kv_heads = 1
             self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-
+        
         input_size = hidden_size
         output_sizes = [
             self.num_heads * self.head_size * tp_size,
