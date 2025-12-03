@@ -520,7 +520,12 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         torch.set_default_device("cpu")
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            assert hf_config.num_key_value_heads % self.world_size == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            assert self.world_size % hf_config.num_key_value_heads == 0
+            num_kv_heads = 1
         if self.use_mla:
             block_bytes = (
                 hf_config.num_hidden_layers
