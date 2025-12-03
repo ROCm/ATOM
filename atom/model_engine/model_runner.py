@@ -7,34 +7,32 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
-from aiter.dist.utils import get_distributed_init_method
-from aiter import destroy_dist_env, dtypes, init_dist_env
-from aiter.dist.parallel_state import graph_capture, get_tp_group
-from atom.config import Config, set_current_atom_config, KVCacheTensor
+from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.sampler import Sampler
-from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.deepseek_v2 import DeepseekV2ForCausalLM
+from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.llama import LlamaForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
 from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.utils import CpuGpuBuffer, init_exit_handler, get_hf_text_config
+from atom.utils import CpuGpuBuffer, envs, get_hf_text_config, init_exit_handler
 from atom.utils.selector import get_attn_backend
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.utils import CpuGpuBuffer, envs, init_exit_handler, get_hf_text_config
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
+
+from aiter import destroy_dist_env, dtypes, init_dist_env
+from aiter.dist.parallel_state import get_dp_group, get_tp_group, graph_capture
+from aiter.dist.utils import get_distributed_init_method
 
 logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
+    DPMetadata,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
-    DPMetadata,
 )
 
 suppot_model_arch_dict = {
@@ -254,7 +252,7 @@ class ModelRunner:
         os.environ["MASTER_PORT"] = str(self.config.port)
         distributed_init_method = get_distributed_init_method(
             config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_base_port,
+            config.parallel_config.data_parallel_base_port+2,
         )
         init_dist_env(
             config.tensor_parallel_size,

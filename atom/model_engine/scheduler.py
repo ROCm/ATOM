@@ -2,16 +2,33 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Optional, cast, List
+from typing import Any, List, Optional, cast
 
 import numpy as np
 import torch
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 
 logger = logging.getLogger("atom")
+
+
+class ScheduledReq(Sequence):
+    def __init__(self, seq: Sequence, num_scheduled_tokens: int):
+        super().__init__(
+            seq.token_ids[-num_scheduled_tokens:],
+            seq.block_size,
+            stop_token_sequences=seq.stop_token_sequences,
+            stream_callback=seq.stream_callback,
+            id=seq.id,
+        )
+        self.temperature = seq.temperature
+        self.max_tokens = seq.max_tokens
+        self.ignore_eos = seq.ignore_eos
+        self.stop_strings = seq.stop_strings
+        self.num_tokens = seq.num_tokens
+        self.block_table = seq.block_table
 
 
 class ScheduledBatch:
@@ -66,6 +83,7 @@ class Scheduler:
     def schedule(self) -> ScheduledBatch:
         # prefill
         scheduled_seqs = {}
+        scheduled_seqs2 = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
 
@@ -90,6 +108,7 @@ class Scheduler:
             seq.type = SequenceType.PREFILL
             self.waiting.popleft()
             self.running.append(seq)
+            scheduled_seqs2[seq.id] = ScheduledReq(seq, num_new_tokens)
             scheduled_seqs[seq.id] = seq
             num_scheduled_tokens.append(num_new_tokens)
 
@@ -101,13 +120,16 @@ class Scheduler:
                 f"scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens"
             )
             # lip: TODO for prefill/decode mixed batch
-            return ScheduledBatch(
-                seqs=scheduled_seqs,
-                num_scheduled_tokens=num_scheduled_tokens_np,
-                total_tokens_num=total_tokens_num_prefill,
-                total_tokens_num_prefill=total_tokens_num_prefill,
-                total_seqs_num=num_seqs_prefill,
-                total_seqs_num_prefill=num_seqs_prefill,
+            return (
+                ScheduledBatch(
+                    seqs=scheduled_seqs2,
+                    num_scheduled_tokens=num_scheduled_tokens_np,
+                    total_tokens_num=total_tokens_num_prefill,
+                    total_tokens_num_prefill=total_tokens_num_prefill,
+                    total_seqs_num=num_seqs_prefill,
+                    total_seqs_num_prefill=num_seqs_prefill,
+                ),
+                scheduled_seqs,
             )
 
         # decode
@@ -123,9 +145,10 @@ class Scheduler:
             else:
                 num_seqs_decode += 1
                 self.block_manager.may_append(seq)
+                num_new_tokens = 1
+                scheduled_seqs2[seq.id] = ScheduledReq(seq, num_new_tokens)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
-                num_new_tokens = 1
                 num_scheduled_tokens.append(num_new_tokens)
 
         num_scheduled_tokens_np = np.array(num_scheduled_tokens, dtype=np.int32)
@@ -136,14 +159,17 @@ class Scheduler:
         # logger.info(
         #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens"
         # )
-        return ScheduledBatch(
-            seqs=scheduled_seqs,
-            num_scheduled_tokens=num_scheduled_tokens_np,
-            total_tokens_num=total_tokens_num_decode,
-            total_tokens_num_decode=total_tokens_num_decode,
-            total_seqs_num=num_seqs_prefill + num_seqs_decode,
-            total_seqs_num_prefill=num_seqs_prefill,
-            total_seqs_num_decode=num_seqs_decode,
+        return (
+            ScheduledBatch(
+                seqs=scheduled_seqs2,
+                num_scheduled_tokens=num_scheduled_tokens_np,
+                total_tokens_num=total_tokens_num_decode,
+                total_tokens_num_decode=total_tokens_num_decode,
+                total_seqs_num=num_seqs_prefill + num_seqs_decode,
+                total_seqs_num_prefill=num_seqs_prefill,
+                total_seqs_num_decode=num_seqs_decode,
+            ),
+            scheduled_seqs,
         )
 
     def preempt(self, seq: Sequence):
@@ -151,12 +177,17 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], prev_token_ids: dict[int, int], stream_output_queue=None) -> list[Sequence]:
+    def postprocess(
+        self,
+        seqs: list[Sequence],
+        prev_token_ids: dict[int, int],
+        stream_output_queue=None,
+    ) -> list[Sequence]:
         is_deferred_out = prev_token_ids.get(-1, False)
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
-        
+
         for seq in self.running:
             if seq.id not in prev_token_ids:
                 continue
@@ -196,12 +227,14 @@ class Scheduler:
                     request_id=seq.id,
                     output_tokens=new_tokens.copy(),
                     finished=(leave_reason is not None),
-                    finish_reason=leave_reason
+                    finish_reason=leave_reason,
                 )
                 # Store sequence ID instead of sequence object to avoid pickling issues
                 stream_outputs.append((seq.id, request_output))
-                logger.debug(f"Scheduler: Created stream output for seq_id={seq.id}, tokens={new_tokens}, finished={leave_reason is not None}")
-            
+                logger.debug(
+                    f"Scheduler: Created stream output for seq_id={seq.id}, tokens={new_tokens}, finished={leave_reason is not None}"
+                )
+
             if leave_reason is not None:
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
@@ -209,7 +242,7 @@ class Scheduler:
 
         if stream_output_queue is not None and stream_outputs:
             stream_output_queue.put_nowait(stream_outputs)
-        
+
         if is_deferred_out:
             # placeholder for the each decode step
             for seq in seqs:
