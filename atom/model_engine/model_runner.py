@@ -544,10 +544,11 @@ class ModelRunner:
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-        num_kvcache_blocks = (
-            int(total * config.gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        )
+        # num_kvcache_blocks = (
+        #     int(total * config.gpu_memory_utilization - used - peak + current)
+        #     // block_bytes
+        # )
+        num_kvcache_blocks = 2048
         assert num_kvcache_blocks > 0, f"need at least {block_bytes} KV cache"
         return num_kvcache_blocks
 
