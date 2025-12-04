@@ -17,7 +17,13 @@ from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.llama import LlamaForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
 from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.utils import CpuGpuBuffer, envs, get_hf_text_config, init_exit_handler
+from atom.utils import (
+    CpuGpuBuffer,
+    envs,
+    get_hf_text_config,
+    get_open_port,
+    init_exit_handler,
+)
 from atom.utils.selector import get_attn_backend
 
 from aiter import destroy_dist_env, dtypes, init_dist_env
@@ -252,7 +258,7 @@ class ModelRunner:
         os.environ["MASTER_PORT"] = str(self.config.port)
         distributed_init_method = get_distributed_init_method(
             config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_base_port + 2,
+            get_open_port(),
         )
         init_dist_env(
             config.tensor_parallel_size,
