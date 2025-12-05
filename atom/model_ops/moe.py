@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 from abc import abstractmethod
 from functools import lru_cache
 from typing import Callable, List, Optional, Tuple
