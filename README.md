@@ -151,3 +151,5 @@ lm_eval --model local-completions \
         --tasks gsm8k \
         --num_fewshot 3
 ```
+
+This project was adapted from nano-vllm (https://github.com/GeeeekExplorer/nano-vllm)
