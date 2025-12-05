@@ -4,17 +4,16 @@ import pickle
 import queue
 import signal
 import threading
-import weakref
 import time
+import weakref
 from contextlib import ExitStack
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, List, Optional
-import torch
 
+import torch
 import zmq
 import zmq.asyncio
-
-from atom.config import Config
+from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
@@ -28,8 +27,9 @@ from atom.utils import (
     shutdown_all_processes,
     zmq_socket_ctx,
 )
-from atom.utils.distributed.utils import stateless_destroy_torch_distributed_process_group
-from atom.config import Config, ParallelConfig
+from atom.utils.distributed.utils import (
+    stateless_destroy_torch_distributed_process_group,
+)
 
 logger = logging.getLogger("atom")
 
@@ -152,15 +152,15 @@ class EngineCore:
                 break
 
     def _process_engine_step(self):
-        scheduled_batch = self.scheduler.schedule()
+        scheduled_batch, seqs = self.scheduler.schedule()
         if scheduled_batch is None:
             logger.debug(f"{self.label}: No sequences to schedule, skipping forward")
             return False
         out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-        seqs = scheduled_batch.seqs.values()
+        seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(seqs, out, stream_output_queue=self.stream_output_queue)
-        
+
         # Send stream outputs to main process via output_queue
         try:
             while not self.stream_output_queue.empty():
@@ -169,7 +169,7 @@ class EngineCore:
                 self.output_queue.put_nowait(("STREAM", stream_outputs))
         except queue.Empty:
             pass
-        
+
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
         return True
@@ -243,7 +243,7 @@ class EngineCore:
                     serialized_obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
                     socket.send(serialized_obj)
                     continue
-                
+
                 # Regular finished sequences
                 seqs = item
                 valid_seqs = [

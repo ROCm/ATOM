@@ -1,39 +1,43 @@
-import logging
 import enum
 import hashlib
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Optional, Union
-from atom.utils import envs
-from torch.distributed import ProcessGroup, ReduceOp
 
-from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 import torch
-from aiter import QuantType
-from aiter.utility.dtypes import d_dtypes
+from atom.utils import envs, get_open_port
+from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
+from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, PretrainedConfig
-from aiter.dist.parallel_state import get_dp_group
 
+from aiter import QuantType
+from aiter.dist.parallel_state import get_dp_group
+from aiter.utility.dtypes import d_dtypes
 
 logger = logging.getLogger("atom")
+
 
 @dataclass
 class KVCacheTensor:
     """
     A class for specifying how the workers should initialize the KV cache.
     """
+
     layer_num: int
-    k_cache: torch.Tensor=torch.tensor([])
-    v_cache: torch.Tensor=torch.tensor([])
-    k_scale: torch.Tensor=None
-    v_scale: torch.Tensor=None
+    k_cache: torch.Tensor = torch.tensor([])
+    v_cache: torch.Tensor = torch.tensor([])
+    k_scale: torch.Tensor = None
+    v_scale: torch.Tensor = None
+
 
 @dataclass
 class KVCacheConfig:
     """
     The KV cache configuration of a model.
     """
+
     kv_cache_tensors: list[KVCacheTensor]
 
 
@@ -178,8 +182,7 @@ class CompilationConfig:
     to integers, it also supports "cudagraph_capture_sizes" to
     specify the sizes for cudagraph capture."""
 
-    static_forward_context: dict[str, Any] = field(default_factory=dict,
-                                                   init=False)
+    static_forward_context: dict[str, Any] = field(default_factory=dict, init=False)
 
     def init_with_cudagraph_sizes(self) -> None:
         """To complete the initialization of config,
@@ -343,7 +346,9 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
         is_dynamic = False
     else:
         is_dynamic = True
-    return QuantizationConfig(quant_type, quant_dtype, is_dynamic, quant_method=quant_method)
+    return QuantizationConfig(
+        quant_type, quant_dtype, is_dynamic, quant_method=quant_method
+    )
 
 
 _CONFIG_REGISTRY: dict[str, str] = {
@@ -395,7 +400,6 @@ class ParallelConfig:
 
     data_parallel_master_ip: str = "127.0.0.1"
 
-
     @property
     def world_size_across_dp(self) -> int:
         """world_size_across_dp is TPxPPxDP, it is the size of the world
@@ -429,16 +433,13 @@ class ParallelConfig:
             self.get_next_dp_init_port(),
             self.data_parallel_rank,
             self.data_parallel_size,
-            backend="gloo")
+            backend="gloo",
+        )
         return dp_group
 
-
     @staticmethod
-    def has_unfinished_dp(dp_group: ProcessGroup,
-                          has_unfinished: bool) -> bool:
-        tensor = torch.tensor([has_unfinished],
-                              dtype=torch.int32,
-                              device="cpu")
+    def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
+        tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
         # dp rank 0: has_unfinished_seqs=True
         # dp rank 1: has_unfinished_seqs=False
         # aggregated: has_unfinished_seqs=True
@@ -469,6 +470,7 @@ class ParallelConfig:
         # Only override with env vars if not already set to non-default values
         # This allows programmatic configuration to take precedence
         import os
+
         if os.getenv("ATOM_DP_SIZE") is not None:
             self.data_parallel_size = envs.ATOM_DP_SIZE
         if os.getenv("ATOM_DP_RANK") is not None:
@@ -476,8 +478,7 @@ class ParallelConfig:
         if os.getenv("ATOM_DP_RANK_LOCAL") is not None:
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
         # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
-        # self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
-
+        self.data_parallel_master_port = get_open_port()
 
 
 @dataclass
@@ -509,6 +510,7 @@ class Config:
     master_addr: str = "127.0.0.1"
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
+    torch_dtype: torch.dtype = field(init=False)
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -530,7 +532,9 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(self.model)
         self.quant_config = get_quant_config(self.hf_config)
-        hf_config_max_position_embeddings = getattr(self.hf_config, "max_position_embeddings", 8192)
+        hf_config_max_position_embeddings = getattr(
+            self.hf_config, "max_position_embeddings", 8192
+        )
         if self.max_model_len is None:
             self.max_model_len = hf_config_max_position_embeddings
         else:
@@ -548,6 +552,11 @@ class Config:
             self._set_cudagraph_sizes()
             self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             self.compilation_config.init_with_cudagraph_sizes()
+        self.torch_dtype = (
+            self.hf_config.torch_dtype
+            if getattr(self.hf_config, "torch_dtype", None) is not None
+            else torch.bfloat16
+        )
 
     def compute_hash(self) -> str:
         """
@@ -570,7 +579,7 @@ class Config:
 
         if self.compilation_config:
             vllm_factors.append(self.compilation_config.compute_hash())
-        
+
         if self.parallel_config:
             vllm_factors.append(self.parallel_config.compute_hash())
 
@@ -592,6 +601,7 @@ def set_current_atom_config(atom_config: Config):
     _current_atom_config = atom_config
     # for MoE to check
     import os
+
     os.environ["ATOM_ENFORCE_EAGER"] = "1" if atom_config.enforce_eager else "0"
 
 

@@ -7,35 +7,39 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
-from aiter.dist.utils import get_distributed_init_method
-from aiter import destroy_dist_env, dtypes, init_dist_env
-from aiter.dist.parallel_state import graph_capture, get_tp_group
-from atom.config import Config, set_current_atom_config, KVCacheTensor
+from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.sampler import Sampler
-from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.deepseek_v2 import DeepseekV2ForCausalLM
+from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.llama import LlamaForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
-from atom.utils import CpuGpuBuffer, init_exit_handler, get_hf_text_config
+from atom.utils import (
+    CpuGpuBuffer,
+    envs,
+    get_hf_text_config,
+    get_open_port,
+    init_exit_handler,
+)
 from atom.utils.selector import get_attn_backend
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.utils import CpuGpuBuffer, envs, init_exit_handler, get_hf_text_config
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
+
+from aiter import destroy_dist_env, dtypes, init_dist_env
+from aiter.dist.parallel_state import get_dp_group, get_tp_group, graph_capture
+from aiter.dist.utils import get_distributed_init_method
 
 logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
+    DPMetadata,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
-    DPMetadata,
 )
 
 suppot_model_arch_dict = {
@@ -96,17 +100,17 @@ class tokenIDProcessor:
     ) -> dict[int, int]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
-            seq_ids = batch.seqs.keys()
-            ret = {seq_id: token_id for seq_id, token_id in zip(seq_ids, token_ids)}
+            req_ids = batch.req_ids
+            ret = {seq_id: token_id for seq_id, token_id in zip(req_ids, token_ids)}
             ret[-1] = 0
             return ret
         token_ids = self.recv_async_output()
         self.send_to_cpu_async(sampled_token_ids)
 
         if self.prev_batch is not None:
-            seq_ids = self.prev_batch.seqs.keys()
+            req_ids = self.prev_batch.req_ids
             token_ids = {
-                seq_id: token_id for seq_id, token_id in zip(seq_ids, token_ids)
+                seq_id: token_id for seq_id, token_id in zip(req_ids, token_ids)
             }
         else:
             # first time, no previous tokens
@@ -121,8 +125,8 @@ class tokenIDProcessor:
         token_ids = self.prev_token_ids
         deferred_prev_indices = [
             i
-            for i, seq_id in enumerate(self.prev_batch.seqs.keys())
-            if seq_id in batch.seqs
+            for i, seq_id in enumerate(self.prev_batch.req_ids)
+            if seq_id in batch.req_ids
         ]
         return (
             deferred_prev_indices,
@@ -138,7 +142,7 @@ class tokenIDProcessor:
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
-        seqs = list(batch.seqs.values())
+        scheduled_tokens = batch.scheduled_tokens  # tokens per req
         token_nums = batch.num_scheduled_tokens
         total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
@@ -147,12 +151,10 @@ class tokenIDProcessor:
         total_reqs_decode = batch.total_seqs_num_decode
         """for prefill: all input ids are new"""
         start_loc = 0
-        for seq, new_token_num in zip(
-            seqs[:total_reqs_prefill], token_nums[:total_reqs_prefill]
+        for tokens, new_token_num in zip(
+            scheduled_tokens[:total_reqs_prefill], token_nums[:total_reqs_prefill]
         ):
-            self.input_ids.np[start_loc : start_loc + new_token_num] = seq[
-                seq.num_cached_tokens :
-            ]
+            self.input_ids.np[start_loc : start_loc + new_token_num] = tokens
             start_loc += new_token_num
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
@@ -162,10 +164,11 @@ class tokenIDProcessor:
 
         if not self.is_deferred_out:
             token_ids = [
-                seq.token_ids[-1]
-                for seq in seqs[
+                token
+                for tokens in scheduled_tokens[
                     total_reqs_prefill : total_reqs_prefill + total_reqs_decode
                 ]
+                for token in tokens
             ]
             self.input_ids.np[:total_tokens_decode] = token_ids
             self.input_ids.copy_to_gpu(total_tokens_decode)
@@ -178,10 +181,11 @@ class tokenIDProcessor:
             num_norm_tokens = total_tokens_decode - num_deferred_tokens
             if num_norm_tokens > 0:
                 token_ids = [
-                    seq.token_ids[-1]
-                    for seq in seqs[
+                    token
+                    for tokens in scheduled_tokens[
                         total_reqs_prefill : total_reqs_prefill + num_norm_tokens
                     ]
+                    for token in tokens
                 ]
                 self.input_ids.np[:num_norm_tokens] = token_ids
                 self.input_ids.copy_to_gpu(num_norm_tokens)
@@ -240,7 +244,7 @@ class ModelRunner:
             f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, local_device_rank={local_device_rank}, device={device}"
         )
         self.device = device
-        
+
         # Initialize profiler for this rank
         self.profiler = None
         self.profiler_dir = None
@@ -256,7 +260,7 @@ class ModelRunner:
         os.environ["MASTER_PORT"] = str(self.config.port)
         distributed_init_method = get_distributed_init_method(
             config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_base_port,
+            config.parallel_config.data_parallel_master_port,
         )
         init_dist_env(
             config.tensor_parallel_size,
@@ -267,11 +271,7 @@ class ModelRunner:
             data_parallel_rank=config.parallel_config.data_parallel_rank,
         )
         init_exit_handler(self)
-        default_dtype = (
-            hf_config.torch_dtype
-            if getattr(hf_config, "torch_dtype", None) is not None
-            else torch.bfloat16
-        )
+        default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
         self.attn_backend = get_attn_backend(
@@ -391,7 +391,7 @@ class ModelRunner:
         return True
 
     def dummy_execution(self):
-        """Execute dummy decode batch for DP synchronization. """
+        """Execute dummy decode batch for DP synchronization."""
         num_tokens_original = 1
 
         seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
@@ -402,7 +402,7 @@ class ModelRunner:
 
         dummy_batch = ScheduledBatch(
             seqs={seq.id: seq},
-            num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32), 
+            num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32),
             total_tokens_num=num_tokens_original,  # original value
             total_tokens_num_decode=num_tokens_original,
             total_seqs_num=1,
@@ -437,7 +437,9 @@ class ModelRunner:
         logits = self.run_model(input_ids)
 
         reset_forward_context()
-        logger.debug(f"{self.label}: dummy batch executed with {num_input_tokens} tokens")
+        logger.debug(
+            f"{self.label}: dummy batch executed with {num_input_tokens} tokens"
+        )
         return True
 
     def warmup_model(self):
@@ -450,11 +452,9 @@ class ModelRunner:
         )
         dp_size = get_dp_group().world_size
         warmup_max_tokens = max_num_batched_tokens // dp_size
-        
-        num_seqs = min(
-            warmup_max_tokens // max_model_len, self.config.max_num_seqs
-        )
-        
+
+        num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
+
         if num_seqs == 0:
             num_seqs = 1
             seq_len = min(warmup_max_tokens, max_model_len)
@@ -468,8 +468,7 @@ class ModelRunner:
             seq_len = max_model_len
 
         seqs = [
-            Sequence([0] * seq_len, block_size=self.block_size)
-            for _ in range(num_seqs)
+            Sequence([0] * seq_len, block_size=self.block_size) for _ in range(num_seqs)
         ]
         seqs = {seq.id: seq for seq in seqs}
 
@@ -735,9 +734,6 @@ class ModelRunner:
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
-            seqs = list(batch.seqs.values())
-            seqs = seqs[batch.total_seqs_num_prefill :]
-            assert len(seqs) == scheduled_bs
             bs = (
                 scheduled_bs
                 if self.enforce_eager
@@ -761,7 +757,7 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=bs,
         )
-        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)        
+        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
         actual_num_tokens = batch.total_tokens_num
         set_forward_context(
             attn_metadata=attn_metadata,
@@ -773,10 +769,9 @@ class ModelRunner:
         return num_input_tokens
 
     def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
-        temperatures = [seq.temperature for seq in batch.seqs.values()]
         bs = batch.total_seqs_num
         buffer = self.forward_vars["temperatures"]
-        buffer.np[:bs] = temperatures
+        buffer.np[:bs] = batch.temperatures
         return buffer.copy_to_gpu(bs)
 
     def prepare_model(self, batch: ScheduledBatch):
