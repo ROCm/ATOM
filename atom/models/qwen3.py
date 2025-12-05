@@ -24,6 +24,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
+from torch import nn
+
+# import torch.distributed as dist
+from aiter.dist.parallel_state import get_tp_group
+from typing import Optional
+from transformers import Qwen3Config
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
