@@ -186,78 +186,79 @@ class Attention(nn.Module):
                         )
 
         if use_triton_unified_attention:
+            o_tmp = torch.empty_like(q)
             o = torch.empty_like(q)
             descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
             if k_cache.numel() and v_cache.numel():
                 q_seq_len, num_heads, head_dim = q.shape
                 if not context.is_prefill:
-                    # num_seqs, num_q_heads_total, head_size = q.shape
-                    # num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-                    # query_group_size = num_q_heads_total // num_kv_heads
-                    # assert num_q_heads_total % num_kv_heads == 0
-                    # sliding_window = self.sliding_window[0] + 1
+                    num_seqs, num_q_heads_total, head_size = q.shape
+                    num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
+                    query_group_size = num_q_heads_total // num_kv_heads
+                    assert num_q_heads_total % num_kv_heads == 0
+                    sliding_window = self.sliding_window[0] + 1
 
-                    # max_context_length = (
-                    #     min(attn_metadata.max_seqlen_k, sliding_window)
-                    #     if sliding_window > 0
-                    #     else attn_metadata.max_seqlen_k
-                    # )
-                    # # Reconstruct full key/value per sequence
-                    # # context_partition_size = 128
-                    # # max_context_partition_num = (
-                    # #     max_context_length + context_partition_size - 1
-                    # # ) // context_partition_size
-                    # context_partition_size = 256
-                    # if sliding_window> 0:
-                    #     max_context_length = min(max_context_length, sliding_window)
-                    #     if max_context_length <= 128:
-                    #         context_partition_size = 128
-                    # max_context_partition_num = triton.cdiv(max_context_length, context_partition_size)
-                    # # Output buffers (same as Triton)
-                    # intermediate_shape = (
-                    #     num_seqs,
-                    #     num_kv_heads,
-                    #     max_context_partition_num,
-                    #     query_group_size,
-                    # )
-                    # exp_sums = torch.zeros(
-                    #     intermediate_shape, dtype=torch.float32, device=q.device
-                    # )
-                    # max_logits = torch.zeros(
-                    #     intermediate_shape, dtype=torch.float32, device=q.device
-                    # )
-                    # temporary_output = torch.zeros(
-                    #     *intermediate_shape,
-                    #     head_size,
-                    #     dtype=q.dtype,
-                    #     device=q.device,
-                    # )
-                    # #if q.shape[0]==4:
-                    # #    print("22")
-                    # #print(q.shape)
+                    max_context_length = (
+                        min(attn_metadata.max_seqlen_k, sliding_window)
+                        if sliding_window > 0
+                        else attn_metadata.max_seqlen_k
+                    )
+                    # Reconstruct full key/value per sequence
+                    # context_partition_size = 128
+                    # max_context_partition_num = (
+                    #     max_context_length + context_partition_size - 1
+                    # ) // context_partition_size
+                    context_partition_size = 256
+                    if sliding_window> 0:
+                        max_context_length = min(max_context_length, sliding_window)
+                        if max_context_length <= 128:
+                            context_partition_size = 128
+                    max_context_partition_num = triton.cdiv(max_context_length, context_partition_size)
+                    # Output buffers (same as Triton)
+                    intermediate_shape = (
+                        num_seqs,
+                        num_kv_heads,
+                        max_context_partition_num,
+                        query_group_size,
+                    )
+                    exp_sums = torch.zeros(
+                        intermediate_shape, dtype=torch.float32, device=q.device
+                    )
+                    max_logits = torch.zeros(
+                        intermediate_shape, dtype=torch.float32, device=q.device
+                    )
+                    temporary_output = torch.zeros(
+                        *intermediate_shape,
+                        head_size,
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    #if q.shape[0]==4:
+                    #    print("22")
+                    #print(q.shape)
                     
-                    # pa_decode_gluon(
-                    #     o,
-                    #     q,
-                    #     k_cache,
-                    #     v_cache,
-                    #     attn_metadata.context_lens,
-                    #     attn_metadata.block_tables,
-                    #     self.scale,
-                    #     1, # query_lenth
-                    #     max_context_length, # max_context_len
-                    #     tl.float8e4nv, #compute_type
-                    #     None,
-                    #     self.one_scale.expand(num_blocks, num_kv_heads, block_size, 1),
-                    #     self.one_scale.expand(num_blocks, num_kv_heads, block_size, 1),
-                    #     exp_sums=exp_sums,
-                    #     max_logits=max_logits,
-                    #     temporary_output=temporary_output,
-                    #     alibi_slopes=None,
-                    #     sinks=self.sinks,
-                    #     sliding_window=sliding_window,
-                    # )
-                    o = torch.empty_like(q)
+                    pa_decode_gluon(
+                        o_tmp,
+                        q,
+                        k_cache,
+                        v_cache,
+                        attn_metadata.context_lens,
+                        attn_metadata.block_tables,
+                        self.scale,
+                        1, # query_lenth
+                        max_context_length, # max_context_len
+                        tl.bfloat16, #compute_type
+                        None,
+                        self.one_scale,
+                        self.one_scale,
+                        exp_sums=exp_sums,
+                        max_logits=max_logits,
+                        temporary_output=temporary_output,
+                        alibi_slopes=None,
+                        sinks=self.sinks,
+                        sliding_window=sliding_window,
+                    )
+                    # gt
                     k_cache = k_cache.transpose(-1, -2).contiguous().view(-1, 8, 64, 16).permute(0,3,1,2).contiguous()
                     v_cache = v_cache.permute(0,3,1,2).contiguous()
                     descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
@@ -285,7 +286,6 @@ class Attention(nn.Module):
                     #if q.shape[0]>1024:
                     #   print("a")
                     #print(q.shape)
-                    
                     unified_attention(
                         q,
                         k.unsqueeze(1),
@@ -337,6 +337,6 @@ class Attention(nn.Module):
                 out_=None,
                 high_precision=0,
             )
-
+        print(o.double().mean(), o.double().std(), o_tmp.double().mean(), o_tmp.double().std())
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
