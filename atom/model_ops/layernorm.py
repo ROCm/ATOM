@@ -101,35 +101,16 @@ class RMSNorm(nn.Module):
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.tp_size = get_tensor_model_parallel_world_size()
+        if self.fused_allreduce:
+            from atom.model_ops.comm_fusion import aiter_allreduce_residual_rmsnorm
+            self.allreduce_rmsnorm_op = aiter_allreduce_residual_rmsnorm
 
-    # def rms_forward(
-    #     self,
-    #     x: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     orig_dtype = x.dtype
-    #     x = x.to(torch.float32)
-    #     var = x.pow(2).mean(dim=-1, keepdim=True)
-    #     x.mul_(torch.rsqrt(var + self.eps))
-    #     x = x.to(orig_dtype).mul_(self.weight)
-    #     return x
-
-    # def add_rms_forward(
-    #     self,
-    #     x: torch.Tensor,
-    #     residual: torch.Tensor,
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     orig_dtype = x.dtype
-    #     x = x.to(torch.float32).add_(residual.to(torch.float32))
-    #     residual = x.to(orig_dtype)
-    #     var = x.pow(2).mean(dim=-1, keepdim=True)
-    #     x.mul_(torch.rsqrt(var + self.eps))
-    #     x = x.to(orig_dtype).mul_(self.weight)
-    #     return x, residual
 
     def forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
+        fp8_out: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
             assert not self.fused_allreduce, "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
@@ -142,13 +123,21 @@ class RMSNorm(nn.Module):
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
         if self.fused_allreduce and self.tp_size > 1:
-            assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
-            return tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, 
-                residual, 
-                self.weight, 
+            assert residual is not None, "aiter_allreduce_residual_rmsnorm requires residual input!"
+            res_out, out, _ = self.allreduce_rmsnorm_op(
+                x,
+                residual,
+                self.weight,
                 self.eps,
-                )
+                fp8_out=fp8_out,
+            )
+            return out, res_out
+            # return tensor_model_parallel_fused_allreduce_rmsnorm(
+            #     x, 
+            #     residual, 
+            #     self.weight, 
+            #     self.eps,
+            #     )
         else:
             if residual is None:
                 # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
