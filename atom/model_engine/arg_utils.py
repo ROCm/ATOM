@@ -6,6 +6,8 @@ from typing import List
 
 from atom import AsyncLLMEngine, LLMEngine
 from atom.config import CompilationConfig
+
+
 def parse_size_list(size_str: str) -> List[int]:
     """Parse a string representation of a list into a Python list."""
     import ast
