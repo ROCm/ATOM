@@ -69,6 +69,10 @@ class EngineCore:
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
         )
         self.output_thread.start()
+        self.input_thread = threading.Thread(
+            target=self.process_input_sockets, args=(self.input_address,), daemon=True
+        )
+        self.input_thread.start()
 
         self.profile_enbaled = config.torch_profiler_dir is not None
         init_exit_handler(self)
@@ -109,10 +113,10 @@ class EngineCore:
 
         # Start input thread AFTER model is loaded so the "ready" signal
         # is sent only when the engine is truly ready to accept requests
-        self.input_thread = threading.Thread(
-            target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        )
-        self.input_thread.start()
+        # self.input_thread = threading.Thread(
+        #     target=self.process_input_sockets, args=(self.input_address,), daemon=True
+        # )
+        # self.input_thread.start()
 
     def _init_data_parallel(self, config: Config):
         pass
@@ -157,10 +161,15 @@ class EngineCore:
                 break
 
     def _process_engine_step(self):
-        scheduled_batch, seqs = self.scheduler.schedule()
-        if scheduled_batch is None:
-            logger.debug(f"{self.label}: No sequences to schedule, skipping forward")
+        if not self.scheduler.has_requests():
             return False
+        scheduled_batch, seqs = self.scheduler.schedule()
+        # if scheduled_batch is None:
+        #     logger.debug(f"{self.label}: No sequences to schedule, skipping forward")
+        #     return False
+        scheduled_batch = self.scheduler.schedule()
+        # if scheduled_batch is None:
+        #     return False
         out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
@@ -311,7 +320,6 @@ class DPEngineCoreProc(EngineCore):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
     def busy_loop(self):
-        shutdown = False
         while True:
             local_is_unfinished = not self.scheduler.is_finished()
 
@@ -340,11 +348,47 @@ class DPEngineCoreProc(EngineCore):
             shutdown = shutdown or self.pull_and_process_input_queue()
 
             executed = self._process_engine_step()
+            local_unfinished_reqs = not self.scheduler.is_finished()
 
             if not executed:
-                logger.debug(f"{self.label}: Executing dummy batch for DP sync")
-                # we must have dummy execution to avoid deadlock in other ranks
+                if not local_unfinished_reqs and not self.engines_running:
+                    # All engines are idle.
+                    continue
                 self._execute_dummy_batch()
+            self.engines_running = self._has_global_unfinished_reqs(
+                local_unfinished_reqs
+            )
+
+        # shutdown = False
+        # while True:
+        #     local_is_unfinished = not self.scheduler.is_finished()
+
+        #     # Synchronize shutdown state across all DP ranks
+        #     # This ensures all ranks know when any rank wants to shutdown
+        #     if not self._shutting_down:
+        #         global_should_shutdown = self._sync_shutdown_state(shutdown and not local_is_unfinished)
+        #         if global_should_shutdown:
+        #             self._shutting_down = True
+        #             logger.debug(f"{self.label}: Entering shutdown phase (synchronized across DP)")
+
+        #     self.engines_running = self._has_global_unfinished_reqs(local_is_unfinished)
+        #     logger.debug(f"{self.label}: [Sync] engines_running={self.engines_running}")
+
+        #     if not self.engines_running:
+        #         logger.debug(f"{self.label}: All DP ranks finished")
+        #         if shutdown:
+        #             break
+        #         shutdown = shutdown or self.pull_and_process_input_queue()
+        #         continue
+
+        #     shutdown = shutdown or self.pull_and_process_input_queue()
+
+        #     executed = self._process_engine_step()
+
+        #     if not executed:
+        #         logger.debug(f"{self.label}: Executing dummy batch for DP sync")
+        #         # we must have dummy execution to avoid deadlock in other ranks
+        #         self._execute_dummy_batch()
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
