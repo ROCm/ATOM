@@ -170,8 +170,6 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         if self.weight_scale is not None:
             self.weight_scale.weight_loader = self.weight_loader
-            # shuffle weight scale once so no reshuffling for every gemm
-            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
 
     @staticmethod
@@ -218,6 +216,8 @@ class LinearBase(nn.Module):
             self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
         ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
             self.weight.data = shuffle_weight(self.weight.data, (16, 16))
+            # shuffle weight scale once so no reshuffling for every gemm
+            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
