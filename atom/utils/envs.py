@@ -11,6 +11,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENFORCE_EAGER": lambda: os.getenv("ATOM_ENFORCE_EAGER", "0") == "1",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: os.getenv("ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1") == "1",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1",
+    "ATOM_ENABLE_QK_NORM_ROPE_FUSION": lambda: os.getenv("ATOM_ENABLE_QK_NORM_ROPE_FUSION", "1") == "1",
 }
 
 def __getattr__(name: str):
