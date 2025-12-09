@@ -371,7 +371,7 @@ class ModelRunner:
         """
         Start profiling for this rank.
 
-        The ATOM_PROFILER environment variable controls detailed profiling features:
+        The ATOM_PROFILER_MORE environment variable controls detailed profiling features:
         - Set to "1" to enable record_shapes, with_stack, and profile_memory.
         - Set to "0" or unset to disable these features (default).
         """
