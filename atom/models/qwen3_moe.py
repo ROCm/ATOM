@@ -85,7 +85,7 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         )
         return inv_freq
 
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
+    def _compute_cos_sin_cache(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
@@ -307,8 +307,8 @@ class Qwen3MoeAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         if ENABLE_QK_NORM_ROPE_FUSION:
             self.rotary_emb(
-                qkv, 
-                self.q_norm.weight, 
+                qkv,
+                self.q_norm.weight,
                 self.k_norm.weight, 
                 positions,
                 num_heads=self.num_heads,
