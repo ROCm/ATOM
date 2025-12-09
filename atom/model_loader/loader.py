@@ -109,6 +109,7 @@ def load_model(
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
                     param = model.get_parameter(param_name)
+                    #test if git config works properly
                     weight_loader = getattr(param, "weight_loader")
                     # weight_loader(param, weight_tensor, shard_id)
                     futures.append(
