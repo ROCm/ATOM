@@ -119,7 +119,6 @@ class RotaryEmbeddingQKNormFused(nn.Module):
             eps=eps,
         )
 
-
 class Qwen3MoeMLP(nn.Module):
     def __init__(
         self,
@@ -309,7 +308,7 @@ class Qwen3MoeAttention(nn.Module):
             self.rotary_emb(
                 qkv,
                 self.q_norm.weight,
-                self.k_norm.weight, 
+                self.k_norm.weight,
                 positions,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
