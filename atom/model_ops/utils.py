@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 from typing import Tuple, Optional, List, Union
 import torch
 from aiter import per_tensor_quant, dtypes, QuantType

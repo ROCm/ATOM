@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 import logging
 import os
 import time
@@ -367,16 +370,23 @@ class ModelRunner:
         return True
 
     def start_profiler(self):
-        """Start profiling for this rank"""
+        """
+        Start profiling for this rank.
+
+        The ATOM_PROFILER_MORE environment variable controls detailed profiling features:
+        - Set to "1" to enable record_shapes, with_stack, and profile_memory.
+        - Set to "0" or unset to disable these features (default).
+        """
         if self.profiler_dir is not None and self.profiler is None:
+            enable_detailed_profiling = os.environ.get("ATOM_PROFILER_MORE", "0") == "1"
             self.profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=True,
-                with_stack=True,
-                profile_memory=True,
+                record_shapes=enable_detailed_profiling,
+                with_stack=enable_detailed_profiling,
+                profile_memory=enable_detailed_profiling,
                 on_trace_ready=torch_profiler.tensorboard_trace_handler(
                     self.profiler_dir, use_gzip=True
                 ),

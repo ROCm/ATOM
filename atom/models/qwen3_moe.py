@@ -40,7 +40,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
-
 from aiter import fused_rope_rms
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
@@ -286,6 +285,7 @@ class Qwen3MoeAttention(nn.Module):
                 base=rope_theta,
                 rope_scaling=rope_scaling,
             )
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
