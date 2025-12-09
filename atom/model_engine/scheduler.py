@@ -251,3 +251,19 @@ class Scheduler:
             self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
+
+    def get_request_counts(self) -> tuple[int, int]:
+        """Returns (num_running_reqs, num_waiting_reqs)."""
+        return len(self.running), len(self.waiting)
+    def get_num_unfinished_requests(self) -> int:
+        return len(self.waiting) + len(self.running)
+
+    def has_unfinished_requests(self) -> bool:
+        """Returns True if there are unfinished requests in the scheduler's
+        internal queue."""
+        return self.get_num_unfinished_requests() > 0
+
+    def has_requests(self) -> bool:
+        """Returns True if there are unfinished requests, or finished requests
+        not yet returned in SchedulerOutputs."""
+        return self.has_unfinished_requests()
