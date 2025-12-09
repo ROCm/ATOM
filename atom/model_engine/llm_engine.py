@@ -31,6 +31,10 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.bos_token_id = self.tokenizer.bos_token_id
         config.eos_token_id = self.tokenizer.eos_token_id
+        stop_token_ids = set(config.stop_token_ids)
+        # separate eos_token_id from stop_token_ids
+        stop_token_ids.discard(config.eos_token_id)
+        config.stop_token_ids = list(stop_token_ids)
         # Set data parallel size in config
         config.parallel_config.data_parallel_size = data_parallel_size
         self.data_parallel_size = data_parallel_size

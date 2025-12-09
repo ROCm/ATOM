@@ -66,6 +66,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
+        self.stop_token_ids = config.stop_token_ids
         self.block_manager = BlockManager(config)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -216,6 +217,8 @@ class Scheduler:
             else:
                 if not seq.ignore_eos and token_id == self.eos_token_id:
                     leave_reason = "eos"
+                elif not seq.ignore_eos and token_id in self.stop_token_ids:
+                    leave_reason = str(token_id)
                 elif seq.num_completion_tokens >= seq.max_tokens:
                     leave_reason = "max_tokens"
             # Prepare stream output
