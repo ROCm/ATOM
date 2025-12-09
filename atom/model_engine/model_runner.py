@@ -370,15 +370,15 @@ class ModelRunner:
     def start_profiler(self):
         """Start profiling for this rank"""
         if self.profiler_dir is not None and self.profiler is None:
-            b_flag = os.environ.get("ATOM_PROFILER", "0") == "1"
+            enable_detailed_profiling = os.environ.get("ATOM_PROFILER_MORE", "0") == "1"
             self.profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=b_flag,
-                with_stack=b_flag,
-                profile_memory=b_flag,
+                record_shapes=enable_detailed_profiling,
+                with_stack=enable_detailed_profiling,
+                profile_memory=enable_detailed_profiling,
                 on_trace_ready=torch_profiler.tensorboard_trace_handler(
                     self.profiler_dir, use_gzip=True
                 ),
