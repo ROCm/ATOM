@@ -14,7 +14,7 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu
+    runs-on: atom-mi355-1gpu
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
 
