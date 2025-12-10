@@ -98,12 +98,28 @@ Run online throughput benchmark:
 
 start the server
 ```bash
-python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --cudagraph-capture-sizes [1,2,4,8,16,32,64,128]
+python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B
 python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 -tp 8 --block-size 1
 ```
 run benchmark
 ```bash
-python -m atom.bench.benchmark_throughput --model Qwen/Qwen3-0.6B -n 128 -r 128 -c 64 -i 1020 -o 1024
+MODEL=deepseek-ai/DeepSeek-R1
+ISL=1024
+OSL=1024
+CONC=128
+PORT=8000
+RESULT_FILENAME=Deepseek-R1-result
+ 
+python benchmark_serving.py \
+--model=$MODEL --backend=vllm --base-url=http://localhost:$PORT \
+--dataset-name=random \
+--random-input-len=$ISL --random-output-len=$OSL \
+--random-range-ratio 0.8 \
+--num-prompts=$(( $CONC * 10 )) \
+--max-concurrency=$CONC \
+--request-rate=inf --ignore-eos \
+--save-result --percentile-metrics="ttft,tpot,itl,e2el" \
+--result-dir=./ --result-filename=$RESULT_FILENAME.json
 ```
 
 
