@@ -142,6 +142,7 @@ class AttentionMetaData:
     slot_mapping: Optional[torch.Tensor] = None
     context_lens: Optional[torch.Tensor] = None
     block_tables: Optional[torch.Tensor] = None
+    fake_block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
     max_q_len: Optional[int] = None
