@@ -14,7 +14,7 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-1gpu
+    runs-on: atom-mi355-8gpu
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
 
@@ -29,12 +29,22 @@ jobs:
       - name: Generate Dockerfile
         run: |
           cat <<EOF > Dockerfile.mod
-          FROM ${{ env.SGL_IMAGE }}
+          FROM ${{ env.ATOM_BASE_IMAGE }}
 
-          RUN pip install aiter -i https://mkmartifactory.amd.com/artifactory/api/pypi/hw-orc3pypi-prod-local/simple
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          
+          RUN git clone https://github.com/ROCm/aiter.git /aiter-test && \
+            cd /aiter-test && \
+            git checkout main && \
+            git submodule sync && git submodule update --init --recursive && \
+            python3 setup.py develop
+
+          RUN echo "=== Installing ATOM ==="
           RUN git clone https://github.com/ROCm/ATOM.git
-          RUN cd ATOM
-          RUN pip install .
+          RUN cd ATOM && pip install .
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
@@ -43,7 +53,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t atom_test:ci -f Dockerfile.mod .
+          docker build --network=host -t atom_test:ci -f Dockerfile.mod .
 
       - name: ls
         run: |
@@ -68,10 +78,11 @@ jobs:
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
           --security-opt seccomp=unconfined \
-          --name atom_test \
           --ulimit memlock=-1 \
-          --ulimit stack=67108864
+          --ulimit stack=67108864 \
+          --name atom_test \
           atom_test:ci 
+
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -83,9 +94,9 @@ jobs:
       - name: Run ATOM tests
         timeout-minutes: 120
         run: |
-          docker exec -u root atom_test bash -c "ls -la"
-          docker exec -u root atom_test bash -c "cd ATOM"
-          docker exec -u root atom_test bash -c "python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --temperature 0"
+          docker exec -u root atom_test bash -c "pip show atom || true"
+          docker exec -u root atom_test bash -c "pip show aiter || true"
+          docker exec -u root atom_test bash -c 'python3 -c "import aiter; print(aiter.__file__)"; python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --temperature 0'
 
       - name: Clean Up
         if: always()
