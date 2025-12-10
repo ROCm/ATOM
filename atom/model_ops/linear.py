@@ -59,12 +59,11 @@ def gemm_a4w4_quant(x: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, w
         dtype=otype,
         device=x.device,
     )
-    #w_scale = fp4_utils.e8m0_shuffle(weight_scale.data)
     y = gemm_a4w4(
         x,
         weight,
         x_scale,
-        weight_scale, #w_scale
+        weight_scale,
         y,
     )
     return y[:m, ...]
