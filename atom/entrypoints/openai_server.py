@@ -4,23 +4,22 @@
 import argparse
 import asyncio
 import json
-import time
+import logging
 import queue
-from typing import List, Optional, Dict, Any, AsyncGenerator
-from contextlib import asynccontextmanager
+import time
 import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 import uvicorn
-from transformers import AutoTokenizer
-
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.request import RequestOutput
-import logging
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from transformers import AutoTokenizer
 
 logger = logging.getLogger("atom")
 
@@ -82,25 +81,28 @@ def create_chat_completion_chunk(
     model: str,
     content: str = "",
     finish_reason: Optional[str] = None,
-    usage: Optional[Dict] = None
+    usage: Optional[Dict] = None,
 ) -> str:
     chunk = {
         "id": request_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "delta": {"content": content} if content else {}, "finish_reason": finish_reason, "logprobs": None}],
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content} if content else {},
+                "finish_reason": finish_reason,
+                "logprobs": None,
+            }
+        ],
     }
     if usage is not None:
         chunk["usage"] = usage
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-def create_chat_usage_chunk(
-    request_id: str,
-    model: str,
-    usage: Dict
-) -> str:
+def create_chat_usage_chunk(request_id: str, model: str, usage: Dict) -> str:
     """Create a chunk containing only usage information for chat completions (no choices)."""
     chunk = {
         "id": request_id,
@@ -117,25 +119,23 @@ def create_completion_chunk(
     model: str,
     text: str,
     finish_reason: Optional[str] = None,
-    usage: Optional[Dict] = None
+    usage: Optional[Dict] = None,
 ) -> str:
     chunk = {
         "id": request_id,
         "object": "text_completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "text": text, "finish_reason": finish_reason, "logprobs": None}],
+        "choices": [
+            {"index": 0, "text": text, "finish_reason": finish_reason, "logprobs": None}
+        ],
     }
     if usage is not None:
         chunk["usage"] = usage
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-def create_usage_chunk(
-    request_id: str,
-    model: str,
-    usage: Dict
-) -> str:
+def create_usage_chunk(request_id: str, model: str, usage: Dict) -> str:
     """Create a chunk containing only usage information (no choices)."""
     chunk = {
         "id": request_id,
@@ -149,23 +149,27 @@ def create_usage_chunk(
 
 def send_stream_chunk(request_output: RequestOutput):
     global tokenizer, _stream_queues, _seq_id_to_request_id
-    
+
     # Get request_id from sequence ID
     request_id = _seq_id_to_request_id.get(request_output.request_id)
     if request_id is None:
-        logger.warning(f"send_stream_chunk: No request_id found for sequence {request_output.request_id}")
+        logger.warning(
+            f"send_stream_chunk: No request_id found for sequence {request_output.request_id}"
+        )
         return
-    
+
     # Decode the new tokens
     new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
-    logger.debug(f"send_stream_chunk: seq_id={request_output.request_id}, request_id={request_id}, tokens={request_output.output_tokens}, text='{new_text}'")
-    
+    logger.debug(
+        f"send_stream_chunk: seq_id={request_output.request_id}, request_id={request_id}, tokens={request_output.output_tokens}, text='{new_text}'"
+    )
+
     # Get the queue for this request
     stream_queue = _stream_queues.get(request_id)
     if stream_queue is None:
         logger.warning(f"send_stream_chunk: No queue found for request_id {request_id}")
         return
-    
+
     # Prepare chunk data
     chunk_data = {
         "text": new_text,
@@ -176,16 +180,18 @@ def send_stream_chunk(request_output: RequestOutput):
 
     try:
         stream_queue.put_nowait(chunk_data)
-        logger.debug(f"send_stream_chunk: Successfully put chunk data into queue for request_id {request_id}")
+        logger.debug(
+            f"send_stream_chunk: Successfully put chunk data into queue for request_id {request_id}"
+        )
     except queue.Full:
-        logger.warning(f"send_stream_chunk: Queue full for request_id {request_id}, skipping chunk")
+        logger.warning(
+            f"send_stream_chunk: Queue full for request_id {request_id}, skipping chunk"
+        )
         pass
 
 
 async def generate_async(
-    prompt: str,
-    sampling_params: SamplingParams,
-    request_id: str
+    prompt: str, sampling_params: SamplingParams, request_id: str
 ) -> AsyncGenerator[Dict[str, Any], None]:
     global engine, tokenizer
     async for output in engine.generate_async(prompt, sampling_params, request_id):
@@ -241,34 +247,40 @@ async def chat_completions(request: ChatCompletionRequest):
                 send_stream_chunk(request_output)
 
             loop = asyncio.get_event_loop()
+
             def do_preprocess():
-                seq = engine.io_processor.preprocess(prompt, sampling_params, stream_callback=stream_callback)
+                seq = engine.io_processor.preprocess(
+                    prompt, sampling_params, stream_callback=stream_callback
+                )
                 return seq
-            
+
             seq = await loop.run_in_executor(None, do_preprocess)
-            
+
             seq_id = seq.id
             _seq_id_to_request_id[seq_id] = request_id
 
-            logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}")
+            logger.info(
+                f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}"
+            )
             engine.core_mgr.add_request([seq])
-            logger.info(f"API: Added request to engine, callback registered: {seq.stream_callback is not None}")
-  
+            logger.info(
+                f"API: Added request to engine, callback registered: {seq.stream_callback is not None}"
+            )
+
             async def generate_stream():
-                
+
                 prev_text = ""
                 num_tokens_input = len(tokenizer.encode(prompt))
                 num_tokens_output = 0
                 yield create_chat_completion_chunk(request_id, request.model, "")
-                
+
                 # Consume chunks from queue using executor to avoid blocking
                 finished = False
                 loop = asyncio.get_event_loop()
                 while not finished:
                     try:
                         chunk_data = await asyncio.wait_for(
-                            loop.run_in_executor(None, stream_queue.get),
-                            timeout=30.0
+                            loop.run_in_executor(None, stream_queue.get), timeout=30.0
                         )
                         new_text = chunk_data["text"]
                         current_text = prev_text + new_text
@@ -277,23 +289,25 @@ async def chat_completions(request: ChatCompletionRequest):
 
                         chunk_token_ids = chunk_data.get("token_ids", [])
                         num_tokens_output += len(chunk_token_ids)
-                        
+
                         yield create_chat_completion_chunk(
-                            request_id, 
-                            request.model, 
+                            request_id,
+                            request.model,
                             new_content,
-                            finish_reason=chunk_data.get("finish_reason")
+                            finish_reason=chunk_data.get("finish_reason"),
                         )
-                        
+
                         if chunk_data.get("finished", False):
                             finished = True
                     except asyncio.TimeoutError:
                         break
-                
+
                 _stream_queues.pop(request_id, None)
                 _seq_id_to_request_id.pop(seq_id, None)
-                
-                yield create_chat_completion_chunk(request_id, request.model, "", "stop")
+
+                yield create_chat_completion_chunk(
+                    request_id, request.model, "", "stop"
+                )
                 usage = {
                     "prompt_tokens": num_tokens_input,
                     "completion_tokens": num_tokens_output,
@@ -325,7 +339,8 @@ async def chat_completions(request: ChatCompletionRequest):
             usage={
                 "prompt_tokens": final_output["num_tokens_input"],
                 "completion_tokens": final_output["num_tokens_output"],
-                "total_tokens": final_output["num_tokens_input"] + final_output["num_tokens_output"],
+                "total_tokens": final_output["num_tokens_input"]
+                + final_output["num_tokens_output"],
                 "ttft_s": round(final_output.get("ttft", 0.0), 4),
                 "tpot_s": round(final_output.get("tpot", 0.0), 4),
                 "latency_s": round(final_output.get("latency", 0.0), 4),
@@ -351,62 +366,67 @@ async def completions(request: CompletionRequest):
 
             stream_queue = queue.Queue()
             _stream_queues[request_id] = stream_queue
-            
+
             def stream_callback(request_output: RequestOutput):
                 send_stream_chunk(request_output)
 
             loop = asyncio.get_event_loop()
-            
+
             def do_preprocess():
-                seq = engine.io_processor.preprocess(request.prompt, sampling_params, stream_callback=stream_callback)
+                seq = engine.io_processor.preprocess(
+                    request.prompt, sampling_params, stream_callback=stream_callback
+                )
                 return seq
-            
+
             seq = await loop.run_in_executor(None, do_preprocess)
-            
+
             seq_id = seq.id
             _seq_id_to_request_id[seq_id] = request_id
-            logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}")
+            logger.info(
+                f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}"
+            )
             engine.core_mgr.add_request([seq])
-            logger.info(f"API: Added request to engine, callback registered: {seq.stream_callback is not None}")
+            logger.info(
+                f"API: Added request to engine, callback registered: {seq.stream_callback is not None}"
+            )
 
             async def generate_stream():
                 prev_text = ""
                 num_tokens_input = len(tokenizer.encode(request.prompt))
                 num_tokens_output = 0
-                
+
                 finished = False
                 loop = asyncio.get_event_loop()
                 while not finished:
                     try:
                         chunk_data = await asyncio.wait_for(
-                            loop.run_in_executor(None, stream_queue.get),
-                            timeout=30.0
+                            loop.run_in_executor(None, stream_queue.get), timeout=30.0
                         )
                         new_text = chunk_data["text"]
                         current_text = prev_text + new_text
                         new_content = new_text
                         prev_text = current_text
-                        
+
                         chunk_token_ids = chunk_data.get("token_ids", [])
                         num_tokens_output += len(chunk_token_ids)
-                        
+
                         yield create_completion_chunk(
                             request_id,
                             request.model,
                             new_content,
-                            finish_reason=chunk_data.get("finish_reason")
+                            finish_reason=chunk_data.get("finish_reason"),
                         )
-                        
+
                         if chunk_data.get("finished", False):
                             finished = True
                     except asyncio.TimeoutError:
                         break
-                
+
                 # Cleanup
                 _stream_queues.pop(request_id, None)
                 if seq_id in _seq_id_to_request_id:
                     _seq_id_to_request_id.pop(seq_id, None)
-                
+
                 yield create_completion_chunk(request_id, request.model, "", "stop")
                 usage = {
                     "prompt_tokens": num_tokens_input,
@@ -440,7 +460,8 @@ async def completions(request: CompletionRequest):
             usage={
                 "prompt_tokens": final_output["num_tokens_input"],
                 "completion_tokens": final_output["num_tokens_output"],
-                "total_tokens": final_output["num_tokens_input"] + final_output["num_tokens_output"],
+                "total_tokens": final_output["num_tokens_input"]
+                + final_output["num_tokens_output"],
                 "ttft_s": round(final_output.get("ttft", 0.0), 4),
                 "tpot_s": round(final_output.get("tpot", 0.0), 4),
                 "latency_s": round(final_output.get("latency", 0.0), 4),
@@ -478,7 +499,9 @@ async def start_profile():
         engine.start_profile()
         return {"status": "success", "message": "Profiling started"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start profiling: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to start profiling: {str(e)}"
+        )
 
 
 @app.post("/stop_profile")
@@ -486,9 +509,14 @@ async def stop_profile():
     global engine
     try:
         engine.stop_profile()
-        return {"status": "success", "message": "Profiling stopped. Trace files generated."}
+        return {
+            "status": "success",
+            "message": "Profiling stopped. Trace files generated.",
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to stop profiling: {str(e)}"
+        )
 
 
 def main():
@@ -497,8 +525,10 @@ def main():
     EngineArgs.add_cli_args(parser)
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument(
-        "--server-port", type=int, default=8000,
-        help="Server port (note: --port is used for internal engine communication)"
+        "--server-port",
+        type=int,
+        default=8000,
+        help="Server port (note: --port is used for internal engine communication)",
     )
     args = parser.parse_args()
 
