@@ -71,6 +71,7 @@ class FusedMoEPrepareAndFinalize(ABC):
         num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
+        quant_type: QuantType = QuantType.No,
     ) -> PrepareResultType:
         """
         Perform any quantization (and/or) dispatching needed for this kernel.
@@ -288,6 +289,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
+        quant_type: QuantType = QuantType.No,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -319,6 +321,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 expert_map,
                 apply_router_weight_on_input,
                 self.quant_config,
+                quant_type
             )
         else:
             # Overlap shared expert compute with all2all dispatch.
@@ -499,6 +502,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             global_num_experts,
             expert_map,
             apply_router_weight_on_input,
+            quant_type
         )
         fused_out = fused_moe(
                 dispatch_a1,

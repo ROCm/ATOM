@@ -6,8 +6,8 @@ import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
-
-
+from aiter import dtypes
+from aiter import QuantType
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
     Prepare/Finalize using MoRI kernels.
@@ -58,6 +58,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
+        quant_type: QuantType = QuantType.No,
     ) -> mk.PrepareResultType:
         """
         Returns a tuple of:
@@ -73,12 +74,16 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "mori does not support apply_router_weight_on_input=True now."
         )
         scale = None
+        if self.use_fp8_dispatch:
+            from aiter import get_hip_quant
+            quant_func = get_hip_quant(quant_type)
+            a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
         # if self.use_fp8_dispatch and self.quant_type is not None:
         #     from aiter import get_hip_quant
         #     quant_func = get_hip_quant(self.quant_type)
         #     # Use the quant_dtype from config, default to float8_e4m3fnuz for ROCm compatibility
-        #     quant_dtype = self.quant_dtype if self.quant_dtype is not None else torch.float8_e4m3fnuz
-        #     a1, scale = quant_func(a1, quant_dtype=quant_dtype)
+        #     print('This is self.quant_type', self.quant_type)
+        #     a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
 
         (
             dispatch_a1,

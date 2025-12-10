@@ -43,6 +43,7 @@ from atom.utils.custom_register import direct_register_custom_op
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.jit.utils.chip_info import get_gfx
 from atom.utils import envs
+from atom.model_ops.fused_moe.config import _has_module
 
 
 @dataclass
@@ -64,7 +65,7 @@ class FusedMoEParallelConfig:
     
     @property
     def use_mori_kernels(self):
-        return True
+        return self.dp_size > 1 and _has_module("mori")
 
     @staticmethod
     def make(
@@ -253,11 +254,22 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # For PTPC (per token per channel) quant, the scale dim for each token is 1
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
+            
+            # Check if quant_dtype is an FP8 type
+            from aiter import QuantType
+            fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
+            is_fp8 = quant_config.quant_dtype in fp8_dtypes
+            
+            # For FP8: use FP8 dtype for communication
+            # For FP4/no quant: use bfloat16
+            mori_dtype = quant_config.quant_dtype if is_fp8 else torch.bfloat16
+            # mori_dtype = torch.bfloat16
+            
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
                 # quant_dtype=quant_config.quant_dtype,
-                quant_dtype=torch.bfloat16,
+                quant_dtype=mori_dtype,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
@@ -270,27 +282,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             )
             handle = all2all_manager.get_handle(all_to_all_args)
 
-            # Note: We may want to use FP8 dispatch just to reduce
-            # data movement.
-            # Check if quant_dtype is an FP8 type
-            from aiter import QuantType
-            fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
-            use_fp8_dispatch = (
-                quant_config.quant_dtype in fp8_dtypes
-                or quant_config.is_per_act_token
-                or quant_config.is_block_quantized
-            )
-            
-            # Determine quant_type for FP8 dispatch
-            quant_type = QuantType.per_Tensor
+            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
+            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
+            use_fp8_dispatch = is_fp8
             if use_fp8_dispatch:
-                quant_type = QuantType.per_Tensor
-            #     if quant_config.is_block_quantized:
-            #         quant_type = QuantType.per_1x128
-            #     else:
-            #         # Default to per_Token for FP8 (including per_act_token case)
-            #         quant_type = QuantType.per_Token
-
+                if quant_config.is_per_act_token:
+                    quant_type = QuantType.per_Token
+                elif quant_config.is_block_quantized:
+                    quant_type = QuantType.per_1x128
+                else:
+                    quant_type = QuantType.per_Tensor
+            else:
+                quant_type = None            # use_fp8_dispatch = False
+            # quant_type = None
+            
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,
                 max_tokens_per_rank=moe.max_num_tokens,
