@@ -254,7 +254,11 @@ class ModelRunner:
         self.profiler_dir = None
         if config.torch_profiler_dir is not None:
             # Create rank-specific profiler directory
-            self.profiler_dir = os.path.join(config.torch_profiler_dir, f"rank_{rank}")
+            if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
+                rank_name = f"dp{dp_rank_local}_tp{rank}"
+            else:
+                rank_name = f"rank_{rank}"
+            self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self.graph_bs = [0]  # for eager fallback
