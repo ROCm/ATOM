@@ -1,0 +1,93 @@
+name: ATOM Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  atom:
+    name: ATOM Test
+    runs-on: atom-mi355-8gpu
+    env:
+      ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+
+      - name: Pull ATOM base image
+        run: |
+          docker pull ${{ env.ATOM_BASE_IMAGE }}
+
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.SGL_IMAGE }}
+
+          RUN pip install aiter -i https://mkmartifactory.amd.com/artifactory/api/pypi/hw-orc3pypi-prod-local/simple
+          RUN git clone https://github.com/ROCm/ATOM.git
+          RUN cd ATOM
+          RUN pip install .
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
+
+      - name: Show Dockerfile
+        run: cat Dockerfile.mod
+
+      - name: Build Docker image
+        run: |
+          docker build -t atom_test:ci -f Dockerfile.mod .
+
+      - name: ls
+        run: |
+          ls -la
+
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom_test | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          echo "Starting container: atom_test:ci"
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+          -v "${GITHUB_WORKSPACE:-$PWD}":/ATOM \
+          --ipc=host --group-add video \
+          --shm-size 16g \
+          --cap-add=SYS_PTRACE \
+          -e HF_TOKEN="${HF_TOKEN:-}" \
+          --security-opt seccomp=unconfined \
+          --name atom_test \
+          --ulimit memlock=-1 \
+          --ulimit stack=67108864
+          atom_test:ci 
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root atom_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root atom_test bash -c "pip config set global.retries 10"
+
+      - name: Run ATOM tests
+        timeout-minutes: 120
+        run: |
+          docker exec -u root atom_test bash -c "ls -la"
+          docker exec -u root atom_test bash -c "cd ATOM"
+          docker exec -u root atom_test bash -c "python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --temperature 0"
+
+      - name: Clean Up
+        if: always()
+        run:
+          docker exec -u root atom_test bash -c "rm -rf /ATOM"
