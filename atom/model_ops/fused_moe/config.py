@@ -67,7 +67,6 @@ GroupShape.PER_TOKEN = GroupShape(1, -1)
 def _quant_flags_to_group_shape(
     quant_dtype: torch.dtype | str | None,
     per_act_token_quant: bool,
-    per_out_ch_quant: bool,
     block_shape: list[int] | None,
 ) -> tuple[GroupShape | None, GroupShape | None]:
     """
@@ -77,7 +76,6 @@ def _quant_flags_to_group_shape(
     w_shape: GroupShape | None
     if block_shape is not None:
         assert not per_act_token_quant
-        assert not per_out_ch_quant
         # TODO(bnell): this is not quite right for activations since first
         # dim should be 1.
         a_shape = GroupShape(row=block_shape[0], col=block_shape[1])
@@ -88,9 +86,6 @@ def _quant_flags_to_group_shape(
 
         if per_act_token_quant:
             a_shape = GroupShape.PER_TOKEN
-
-        if per_out_ch_quant:
-            w_shape = GroupShape.PER_TOKEN
 
     return a_shape, w_shape
 
@@ -227,7 +222,7 @@ class FusedMoEQuantConfig:
             weight_dtype = quant_dtype
 
         a_shape, w_shape = _quant_flags_to_group_shape(
-            quant_dtype, per_act_token_quant, False, block_shape
+            quant_dtype, False, block_shape
         )
         quant_config = FusedMoEQuantConfig(
             _a1=FusedMoEQuantDesc(quant_dtype, a_shape, a1_scale),
@@ -276,7 +271,6 @@ def fp8_w8a8_moe_quant_config(
     a1_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
     per_act_token_quant: bool = False,
-    per_out_ch_quant: bool = False,
     block_shape: list[int] | None = None,
 ) -> FusedMoEQuantConfig:
     """
@@ -289,7 +283,6 @@ def fp8_w8a8_moe_quant_config(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         per_act_token_quant=per_act_token_quant,
-        per_out_ch_quant=per_out_ch_quant,
         block_shape=block_shape,
     )
 

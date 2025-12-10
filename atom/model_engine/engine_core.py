@@ -165,10 +165,6 @@ class EngineCore:
             return False
         scheduled_batch, seqs = self.scheduler.schedule()
         # if scheduled_batch is None:
-        #     logger.debug(f"{self.label}: No sequences to schedule, skipping forward")
-        #     return False
-        scheduled_batch = self.scheduler.schedule()
-        # if scheduled_batch is None:
         #     return False
         out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         seqs = seqs.values()
