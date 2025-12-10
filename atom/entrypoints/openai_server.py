@@ -30,7 +30,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str
+    model: Optional[str] = None
     messages: List[ChatMessage]
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
@@ -41,7 +41,7 @@ class ChatCompletionRequest(BaseModel):
 
 
 class CompletionRequest(BaseModel):
-    model: str
+    model: Optional[str] = None
     prompt: str
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
@@ -223,6 +223,11 @@ app = FastAPI(title="Atom OpenAI API Server", lifespan=lifespan)
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     global engine, tokenizer, model_name
+    if request.model is not None and request.model != model_name:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested model '{request.model}' does not match server model '{model_name}'",
+        )
     try:
         prompt = tokenizer.apply_chat_template(
             [{"role": msg.role, "content": msg.content} for msg in request.messages],
@@ -272,7 +277,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 prev_text = ""
                 num_tokens_input = len(tokenizer.encode(prompt))
                 num_tokens_output = 0
-                yield create_chat_completion_chunk(request_id, request.model, "")
+                yield create_chat_completion_chunk(request_id, model_name, "")
 
                 # Consume chunks from queue using executor to avoid blocking
                 finished = False
@@ -292,7 +297,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
                         yield create_chat_completion_chunk(
                             request_id,
-                            request.model,
+                            model_name,
                             new_content,
                             finish_reason=chunk_data.get("finish_reason"),
                         )
@@ -305,15 +310,13 @@ async def chat_completions(request: ChatCompletionRequest):
                 _stream_queues.pop(request_id, None)
                 _seq_id_to_request_id.pop(seq_id, None)
 
-                yield create_chat_completion_chunk(
-                    request_id, request.model, "", "stop"
-                )
+                yield create_chat_completion_chunk(request_id, model_name, "", "stop")
                 usage = {
                     "prompt_tokens": num_tokens_input,
                     "completion_tokens": num_tokens_output,
                     "total_tokens": num_tokens_input + num_tokens_output,
                 }
-                yield create_chat_usage_chunk(request_id, request.model, usage)
+                yield create_chat_usage_chunk(request_id, model_name, usage)
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
@@ -328,7 +331,7 @@ async def chat_completions(request: ChatCompletionRequest):
         return ChatCompletionResponse(
             id=request_id,
             created=created,
-            model=request.model,
+            model=model_name,
             choices=[
                 {
                     "index": 0,
@@ -353,6 +356,11 @@ async def chat_completions(request: ChatCompletionRequest):
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest):
     global engine, tokenizer, model_name
+    if request.model is not None and request.model != model_name:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested model '{request.model}' does not match server model '{model_name}'",
+        )
     try:
         sampling_params = SamplingParams(
             temperature=request.temperature,
@@ -412,7 +420,7 @@ async def completions(request: CompletionRequest):
 
                         yield create_completion_chunk(
                             request_id,
-                            request.model,
+                            model_name,
                             new_content,
                             finish_reason=chunk_data.get("finish_reason"),
                         )
@@ -427,13 +435,13 @@ async def completions(request: CompletionRequest):
                 if seq_id in _seq_id_to_request_id:
                     _seq_id_to_request_id.pop(seq_id, None)
 
-                yield create_completion_chunk(request_id, request.model, "", "stop")
+                yield create_completion_chunk(request_id, model_name, "", "stop")
                 usage = {
                     "prompt_tokens": num_tokens_input,
                     "completion_tokens": num_tokens_output,
                     "total_tokens": num_tokens_input + num_tokens_output,
                 }
-                yield create_usage_chunk(request_id, request.model, usage)
+                yield create_usage_chunk(request_id, model_name, usage)
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
@@ -449,7 +457,7 @@ async def completions(request: CompletionRequest):
         return CompletionResponse(
             id=request_id,
             created=int(time.time()),
-            model=request.model,
+            model=model_name,
             choices=[
                 {
                     "index": 0,
