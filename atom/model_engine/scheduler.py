@@ -216,7 +216,7 @@ class Scheduler:
             else:
                 if not seq.ignore_eos and token_id == self.eos_token_id:
                     leave_reason = "eos"
-                elif seq.num_completion_tokens == seq.max_tokens:
+                elif seq.num_completion_tokens >= seq.max_tokens:
                     leave_reason = "max_tokens"
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:

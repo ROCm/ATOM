@@ -69,6 +69,7 @@ class Attention(nn.Module):
         sinks: Optional[nn.Parameter] = None,
         per_layer_sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
+        prefix: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
@@ -111,7 +112,8 @@ class Attention(nn.Module):
         )
 
         compilation_config = atom_config.compilation_config
-        self.layer_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
+        default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
+        self.layer_name = prefix if prefix is not None else default_name
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer: {}".format(self.layer_name))
         compilation_config.static_forward_context[self.layer_name] = self

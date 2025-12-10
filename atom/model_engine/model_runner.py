@@ -21,6 +21,7 @@ from atom.models.llama import LlamaForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
+from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -31,7 +32,7 @@ from atom.utils import (
 from atom.utils.selector import get_attn_backend
 
 from aiter import destroy_dist_env, dtypes, init_dist_env
-from aiter.dist.parallel_state import get_dp_group, get_tp_group, graph_capture
+from aiter.dist.parallel_state import get_dp_group, get_tp_group, graph_capture, get_pp_group
 from aiter.dist.utils import get_distributed_init_method
 
 logger = logging.getLogger("atom")
@@ -285,6 +286,8 @@ class ModelRunner:
             self.config.max_num_batched_tokens, self.device
         )
         self.sampler = Sampler()
+        if self.config.speculative_config and get_pp_group().is_last_rank:
+            self.drafter = EagleProposer(self.config, self.device, self)
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -300,6 +303,9 @@ class ModelRunner:
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
         if isinstance(self.model, DeepseekV2ForCausalLM):
             self.use_kv_indptr = True
+        if hasattr(self, "drafter"):
+            logger.info("Loading drafter model...")
+            self.drafter.load_model(self.model)
         torch.set_default_device(self.device)
         self.allocate_forward_vars()
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
@@ -576,10 +582,21 @@ class ModelRunner:
             num_kv_heads = hf_config.num_key_value_heads // self.world_size
         else:
             assert self.world_size % hf_config.num_key_value_heads == 0
-            num_kv_heads = 1       
+            num_kv_heads = 1
+
+        # Calculate total number of layers (target + draft)
+        total_num_layers = hf_config.num_hidden_layers
+        if self.config.speculative_config and hasattr(self, 'drafter'):
+            draft_hf_config = self.config.speculative_config.draft_model_hf_config
+            # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
+            num_draft_layers = getattr(draft_hf_config, 'num_nextn_predict_layers', 1)
+            total_num_layers += num_draft_layers
+            logger.info(f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
+                       f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers")
+
         if self.use_mla:
             self.kv_cache = torch.zeros(
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 config.num_kvcache_blocks,
                 self.block_size,
                 576,
@@ -624,79 +641,88 @@ class ModelRunner:
         # lirong TODO: This is a simple solution to build KVCacheConfig,
         # models with only one type of attention, but not support multi-type of attention models.
         # We need to support it by kv_cache_group in the future.
+
+        # Prepare list of models to bind KV cache
+        models_to_bind = [("target", self.model)]
+        if self.config.speculative_config and hasattr(self, 'drafter'):
+            models_to_bind.append(("draft", self.drafter.model))
+
         kv_cache_tensors = []
         layer_id = 0
         x = 16 // self.kv_cache.element_size()
-        for module in self.model.modules():
-            # Since use attention base and there are child in attention, add base condition
-            if hasattr(module, "base_attention"):
-                if hasattr(module, "use_mla") and not module.use_mla:
-                    # Non-MLA attention
-                    k_cache = self.kv_cache[0, layer_id].view(
-                        config.num_kvcache_blocks,
-                        num_kv_heads,
-                        hf_config.head_dim // x,
-                        self.block_size,
-                        x,
-                    )
-                    v_cache = self.kv_cache[1, layer_id].view(
-                        config.num_kvcache_blocks,
-                        num_kv_heads,
-                        hf_config.head_dim,
-                        self.block_size,
-                    )
-                    module.max_model_len = self.config.max_model_len
-                    if config.kv_cache_dtype == "fp8":
-                        module.k_scale = self.kv_scale[0, layer_id]
-                        module.v_scale = self.kv_scale[1, layer_id]
+        for model_name, model in models_to_bind:
+            logger.info(f"Binding KV cache for {model_name} model starting at layer_id={layer_id}")
 
-                    k_scale = module.k_scale
-                    v_scale = module.v_scale
+            for module in model.modules():
+                # Since use attention base and there are child in attention, add base condition
+                if hasattr(module, "base_attention"):
+                    if hasattr(module, "use_mla") and not module.use_mla:
+                        # Non-MLA attention
+                        k_cache = self.kv_cache[0, layer_id].view(
+                            config.num_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim // x,
+                            self.block_size,
+                            x,
+                        )
+                        v_cache = self.kv_cache[1, layer_id].view(
+                            config.num_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim,
+                            self.block_size,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        if config.kv_cache_dtype == "fp8":
+                            module.k_scale = self.kv_scale[0, layer_id]
+                            module.v_scale = self.kv_scale[1, layer_id]
 
-                    # Store in KVCacheTensor
-                    kv_cache_tensor = KVCacheTensor(
-                        layer_num=layer_id,
-                        k_cache=k_cache,
-                        v_cache=v_cache,
-                        k_scale=k_scale,
-                        v_scale=v_scale,
-                    )
-                    kv_cache_tensors.append(kv_cache_tensor)
+                        k_scale = module.k_scale
+                        v_scale = module.v_scale
 
-                    module.k_cache = k_cache
-                    module.v_cache = v_cache
+                        # Store in KVCacheTensor
+                        kv_cache_tensor = KVCacheTensor(
+                            layer_num=layer_id,
+                            k_cache=k_cache,
+                            v_cache=v_cache,
+                            k_scale=k_scale,
+                            v_scale=v_scale,
+                        )
+                        kv_cache_tensors.append(kv_cache_tensor)
 
-                    layer_id += 1
-                elif hasattr(module, "use_mla") and module.use_mla:
-                    # MLA attention
-                    kv_cache = self.kv_cache[layer_id].view(
-                        config.num_kvcache_blocks * self.block_size,
-                        1,
-                        576,
-                    )
-                    module.max_model_len = self.config.max_model_len
-                    if self.is_deepseek_v32 and module.indexer is not None:
-                        # Use aligned dimension to avoid memory copy in torch inductor
-                        module.indexer.k_cache.kv_cache[0] = self.index_cache[
-                            layer_id
-                        ].view(
+                        module.k_cache = k_cache
+                        module.v_cache = v_cache
+
+                        layer_id += 1
+                    elif hasattr(module, "use_mla") and module.use_mla:
+                        # MLA attention
+                        kv_cache = self.kv_cache[layer_id].view(
                             config.num_kvcache_blocks * self.block_size,
                             1,
-                            aligned_index_dim,
+                            576,
                         )
-                    # Store in KVCacheTensor
-                    kv_cache_tensor = KVCacheTensor(
-                        layer_num=layer_id,
-                        k_cache=kv_cache,
-                        v_cache=None,
-                        k_scale=None,
-                        v_scale=None,
-                    )
-                    kv_cache_tensors.append(kv_cache_tensor)
+                        module.max_model_len = self.config.max_model_len
+                        if self.is_deepseek_v32 and module.indexer is not None:
+                            # Use aligned dimension to avoid memory copy in torch inductor
+                            module.indexer.k_cache.kv_cache[0] = self.index_cache[
+                                layer_id
+                            ].view(
+                                config.num_kvcache_blocks * self.block_size,
+                                1,
+                                aligned_index_dim,
+                            )
+                        # Store in KVCacheTensor
+                        kv_cache_tensor = KVCacheTensor(
+                            layer_num=layer_id,
+                            k_cache=kv_cache,
+                            v_cache=None,
+                            k_scale=None,
+                            v_scale=None,
+                        )
+                        kv_cache_tensors.append(kv_cache_tensor)
 
-                    module.kv_cache = kv_cache
-                    module.max_model_len = self.config.max_model_len
-                    layer_id += 1
+                        module.kv_cache = kv_cache
+                        module.max_model_len = self.config.max_model_len
+                        layer_id += 1
 
         # Store KVCacheConfig
         kv_cache_data = {

@@ -5,7 +5,7 @@ import argparse
 from typing import List
 
 from atom import AsyncLLMEngine, LLMEngine
-from atom.config import CompilationConfig
+from atom.config import CompilationConfig, SpeculativeConfig
 
 
 def parse_size_list(size_str: str) -> List[int]:
@@ -38,6 +38,8 @@ class EngineArgs:
         enable_expert_parallel: bool = False,
         torch_profiler_dir: str = None,
         enable_dp_attention: bool = False,
+        method: str = None,
+        num_speculative_tokens: int = 1,
     ):
         self.model = model
         self.tensor_parallel_size = tensor_parallel_size
@@ -54,6 +56,8 @@ class EngineArgs:
         self.torch_profiler_dir = torch_profiler_dir
         self.enable_dp_attention = enable_dp_attention
         self.data_parallel_size = data_parallel_size
+        self.method = method
+        self.num_speculative_tokens = num_speculative_tokens
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -148,6 +152,22 @@ class EngineArgs:
             action="store_true",
             help="Enable DP attention.",
         )
+
+        parser.add_argument(
+            "--method",
+            type=str,
+            default=None,
+            choices=["mtp"],
+            help="Speculative method",
+        )
+
+        parser.add_argument(
+            "--num-speculative-tokens",
+            type=int,
+            default=1,
+            help="Number of speculative tokens to generate per iteration (draft model runs this many times autoregressively)",
+        )
+
         return parser
 
     @classmethod
@@ -169,6 +189,8 @@ class EngineArgs:
             enable_expert_parallel=args.enable_expert_parallel,
             torch_profiler_dir=args.torch_profiler_dir,
             enable_dp_attention=args.enable_dp_attention,
+            method=args.method,
+            num_speculative_tokens=args.num_speculative_tokens,
         )
 
     def create_engine(self) -> LLMEngine:
@@ -190,6 +212,15 @@ class EngineArgs:
             ),
             data_parallel_size=self.data_parallel_size,
             enable_dp_attention=self.enable_dp_attention,
+            speculative_config=(
+                SpeculativeConfig(
+                    method=self.method,
+                    model=self.model,
+                    num_speculative_tokens=self.num_speculative_tokens,
+                )
+                if self.method
+                else None
+            ),
         )
 
     def create_async_engine(self) -> AsyncLLMEngine:
@@ -212,4 +243,13 @@ class EngineArgs:
             ),
             data_parallel_size=self.data_parallel_size,
             enable_dp_attention=self.enable_dp_attention,
+            speculative_config=(
+                SpeculativeConfig(
+                    method=self.method,
+                    model=self.model,
+                    num_speculative_tokens=self.num_speculative_tokens,
+                )
+                if self.method
+                else None
+            ),
         )

@@ -336,7 +336,7 @@ def sparse_attn_indexer(
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
         num_tokens = hidden_states.shape[0]
-        logits = fp8_mqa_logits(Q=q_fp8[num_decode_tokens:num_tokens], KV=k_fp8, kv_scales=k_scale, weights=weights[num_decode_tokens:num_tokens], 
+        logits = fp8_mqa_logits(Q=q_fp8[num_decode_tokens:num_tokens], KV=k_fp8, kv_scales=k_scale, weights=weights[num_decode_tokens:num_tokens],
                                 cu_starts=cu_seqlen_ks, cu_ends=cu_seqlen_ke)
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
@@ -465,7 +465,7 @@ class Indexer(nn.Module):
                                                cache_config=cache_config)
         self.max_model_len = atom_config.max_model_len
         self.prefix = prefix
-        self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len 
+        self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
     def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, positions,
@@ -655,6 +655,7 @@ class DeepseekV2MLAAttention(nn.Module):
             layer_num=layer_num,
             use_mla=True,
             mla_modules=mla_modules,
+            prefix=prefix,
         )
 
         self.prefix = prefix

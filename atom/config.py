@@ -483,6 +483,41 @@ class ParallelConfig:
         # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
         self.data_parallel_master_port = get_open_port()
 
+@dataclass
+class SpeculativeConfig:
+    method: Optional[str] = ""
+    model: Optional[str] = None
+    num_speculative_tokens: Optional[int] = None
+    draft_model_hf_config: Optional[PretrainedConfig] = None
+
+    def __post_init__(self):
+        if self.draft_model_hf_config is None:
+            self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
+        if callable(self.hf_config_override):
+            self.hf_config_override(self.draft_model_hf_config)
+
+    @staticmethod
+    def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        if hf_config.model_type == "deepseek_v3":
+            hf_config.model_type = "deepseek_mtp"
+        if hf_config.model_type == "deepseek_mtp":
+            # DeepSeek MTP typically uses only 1 layer that gets reused
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            # Override to use only 1 layer if config says otherwise
+            if n_predict != 1:
+                logger.warning(f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                             "(MTP typically uses 1 layer that gets reused)")
+                n_predict = 1
+            hf_config.update({
+                "n_predict": n_predict,
+                "num_nextn_predict_layers": n_predict,
+                "architectures": ["DeepSeekMTPModel"]
+            })
+
+    def __repr__(self) -> str:
+        method = self.method
+        num_spec_tokens = self.num_speculative_tokens
+        return f"SpeculativeConfig({method=}, {num_spec_tokens=})"
 
 @dataclass
 class Config:
@@ -514,6 +549,7 @@ class Config:
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
     torch_dtype: torch.dtype = field(init=False)
+    speculative_config: Optional[SpeculativeConfig] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:

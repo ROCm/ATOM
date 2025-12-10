@@ -21,6 +21,7 @@ from atom.model_loader.weight_utils import (
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.moe import is_rocm_aiter_fusion_shared_expert_enabled
 from aiter.dist.parallel_state import get_tp_group
+from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrite_spec_layer_name
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -74,6 +75,7 @@ def load_model(
     model_name_or_path: str,
     hf_config: AutoConfig,
     load_dummy: bool = False,
+    spec_decode: bool = False,
 ):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
@@ -85,6 +87,11 @@ def load_model(
                 continue
             if name.endswith("kv_scale"):
                 continue
+            if spec_decode:
+                spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
+                if spec_layer is None:
+                    continue
+                name = rewrite_spec_layer_name(spec_layer, name)
             name_suffix = name.split(".")[-1]
             if name_suffix in weights_mapping.keys():
                 name = name.replace(name_suffix, weights_mapping[name_suffix])
@@ -93,7 +100,7 @@ def load_model(
 
             layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
             layerId = int(layerId_.group(1)) if layerId_ else 0
-            if hf_config.num_hidden_layers and layerId >= hf_config.num_hidden_layers:
+            if hf_config.num_hidden_layers and layerId >= hf_config.num_hidden_layers and not spec_decode:
                 # print(f"Skipping loading {name} as layerId {layerId} >= num_hidden_layers {hf_config.num_hidden_layers}")
                 continue
             if (
