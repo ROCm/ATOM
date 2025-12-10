@@ -264,7 +264,7 @@ class ModelRunner:
         os.environ["MASTER_PORT"] = str(self.config.port)
         distributed_init_method = get_distributed_init_method(
             config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_master_port,
+            config.parallel_config.data_parallel_base_port,
         )
         init_dist_env(
             config.tensor_parallel_size,
