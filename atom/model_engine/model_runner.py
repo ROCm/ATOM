@@ -46,7 +46,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 
-suppot_model_arch_dict = {
+support_model_arch_dict = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "LlamaForCausalLM": LlamaForCausalLM,
@@ -297,7 +297,7 @@ class ModelRunner:
             dtype=np.int64,
         )
         self.async_output_copy_stream = torch.cuda.Stream()
-        self.model = suppot_model_arch_dict[hf_config.architectures[0]](config)
+        self.model = support_model_arch_dict[hf_config.architectures[0]](config)
         self.use_kv_indptr = False
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)

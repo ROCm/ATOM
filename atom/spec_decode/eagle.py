@@ -12,7 +12,7 @@ import logging
 logger = logging.getLogger("atom")
 
 
-suppot_eagle_model_arch_dict = {
+support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": DeepSeekMTP,
 }
 
@@ -42,7 +42,7 @@ class EagleProposer:
 
         self.device = device
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
-        self.model = suppot_eagle_model_arch_dict[draft_model_hf_config.architectures[0]](self.config)
+        self.model = support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]](self.config)
 
         self.hidden_size = getattr(self.config.hf_config, "hidden_size", 7168)
         # persistent buffers for cuda graph

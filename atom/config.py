@@ -493,8 +493,7 @@ class SpeculativeConfig:
     def __post_init__(self):
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
-        if callable(self.hf_config_override):
-            self.hf_config_override(self.draft_model_hf_config)
+        self.hf_config_override(self.draft_model_hf_config)
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
