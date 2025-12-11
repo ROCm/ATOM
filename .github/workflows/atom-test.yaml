@@ -71,7 +71,7 @@ jobs:
           fi
 
           echo "Starting container: atom_test:ci"
-          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/ATOM \
           --ipc=host --group-add video \
           --shm-size 16g \
