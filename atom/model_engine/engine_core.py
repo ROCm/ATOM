@@ -60,7 +60,9 @@ class EngineCore:
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[List[Sequence]]()
-        self.stream_output_queue = queue.Queue()  # Queue for streaming intermediate outputs
+        self.stream_output_queue = (
+            queue.Queue()
+        )  # Queue for streaming intermediate outputs
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -93,7 +95,7 @@ class EngineCore:
                     "capture_cudagraph", wait_out=True
                 )
                 logger.info(
-                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost} seconds"
+                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
                 )
             good = True
         finally:
@@ -135,8 +137,8 @@ class EngineCore:
         try:
             if config.parallel_config.data_parallel_size > 1:
                 engine = DPEngineCoreProc(config, input_address, output_address)
-            else:   
-                engine = EngineCore(config, input_address, output_address)            
+            else:
+                engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:
             logger.error(f"run_engine: exception: {e}", exc_info=True)
@@ -162,7 +164,9 @@ class EngineCore:
         out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
-        finished_seqs = self.scheduler.postprocess(seqs, out, stream_output_queue=self.stream_output_queue)
+        finished_seqs = self.scheduler.postprocess(
+            seqs, out, stream_output_queue=self.stream_output_queue
+        )
 
         # Send stream outputs to main process via output_queue
         try:
@@ -213,7 +217,9 @@ class EngineCore:
                     request_type, reqs = pickle.loads(serialized_obj)
                     if request_type == EngineCoreRequestType.ADD:
                         req_ids = [req.id for req in reqs]
-                        logger.debug(f"{self.label}: input get {request_type} {req_ids}")
+                        logger.debug(
+                            f"{self.label}: input get {request_type} {req_ids}"
+                        )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         # Handle utility commands like start_profile/stop_profile
@@ -243,7 +249,9 @@ class EngineCore:
                 if isinstance(item, tuple) and item[0] == "STREAM":
                     # Send stream outputs
                     stream_outputs = item[1]
-                    serialized_obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.STREAM, stream_outputs)
+                    )
                     socket.send(serialized_obj)
                     continue
 
@@ -310,10 +318,14 @@ class DPEngineCoreProc(EngineCore):
             # Synchronize shutdown state across all DP ranks
             # This ensures all ranks know when any rank wants to shutdown
             if not self._shutting_down:
-                global_should_shutdown = self._sync_shutdown_state(shutdown and not local_is_unfinished)
+                global_should_shutdown = self._sync_shutdown_state(
+                    shutdown and not local_is_unfinished
+                )
                 if global_should_shutdown:
                     self._shutting_down = True
-                    logger.debug(f"{self.label}: Entering shutdown phase (synchronized across DP)")
+                    logger.debug(
+                        f"{self.label}: Entering shutdown phase (synchronized across DP)"
+                    )
 
             self.engines_running = self._has_global_unfinished_reqs(local_is_unfinished)
             logger.debug(f"{self.label}: [Sync] engines_running={self.engines_running}")
@@ -339,15 +351,19 @@ class DPEngineCoreProc(EngineCore):
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:
-            tensor = torch.tensor([local_should_shutdown],
-                                dtype=torch.int32,
-                                device="cpu")
-            torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group)
+            tensor = torch.tensor(
+                [local_should_shutdown], dtype=torch.int32, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
+            )
             global_should_shutdown = bool(tensor.item())
             return global_should_shutdown
         except RuntimeError as e:
             # If all_reduce fails, it means other ranks are shutting down
-            logger.warning(f"{self.label}: Shutdown sync failed, assuming shutdown: {e}")
+            logger.warning(
+                f"{self.label}: Shutdown sync failed, assuming shutdown: {e}"
+            )
             return True
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
@@ -355,8 +371,7 @@ class DPEngineCoreProc(EngineCore):
             logger.info(f"{self.label}: Skipping DP sync during shutdown")
             return local_unfinished
         try:
-            return ParallelConfig.has_unfinished_dp(self.dp_group,
-                                                    local_unfinished)
+            return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
         except RuntimeError as e:
             # Handle case where other ranks have already shut down
             logger.warning(f"{self.label}: DP sync failed during shutdown: {e}")
