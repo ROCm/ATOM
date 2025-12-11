@@ -42,6 +42,8 @@ from atom.models.utils import (
 from atom.utils import envs
 
 from aiter import fused_rope_rms
+from atom.utils.distributed.utils import init_aiter_quick_all_reduce
+from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
@@ -120,6 +122,8 @@ class RotaryEmbeddingQKNormFused(nn.Module):
             eps=eps,
         )
 
+ATOM_ROCM_QUICK_REDUCE_QUANTIZATION = envs.ATOM_ROCM_QUICK_REDUCE_QUANTIZATION
+
 class Qwen3MoeMLP(nn.Module):
     def __init__(
         self,
@@ -195,7 +199,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, qr_common: Optional[QuickAllReduce] = None) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
             "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         )
@@ -208,7 +212,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+        if self.tp_size > 1 and qr_common is not None and not qr_common.disabled and qr_common.should_quick_allreduce(final_hidden_states):
+            final_hidden_states = qr_common.quick_all_reduce(final_hidden_states)
+            assert final_hidden_states is not None, "quick_all_reduce should return a tensor!"
+        elif self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
         # return to 1d if input is 1d
@@ -302,6 +309,7 @@ class Qwen3MoeAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        qr_common: Optional[QuickAllReduce] = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         if ENABLE_QK_NORM_ROPE_FUSION:
@@ -323,7 +331,7 @@ class Qwen3MoeAttention(nn.Module):
 
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
-        output = self.o_proj(attn_output)
+        output = self.o_proj(attn_output, qr_common=qr_common)
         return output
 
 
@@ -381,14 +389,20 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 prefix=f"{prefix}.mlp",
             )
+        self.qr_common = None
+        if ATOM_ROCM_QUICK_REDUCE_QUANTIZATION != "NONE":
+            self.qr_common = init_aiter_quick_all_reduce(device=self.self_attn.qkv_proj.weight.device)
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0)
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0,
+            qr_common=self.qr_common,
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            qr_common=self.qr_common,
         )
 
     def forward(
@@ -406,11 +420,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            qr_common=self.qr_common,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, qr_common=self.qr_common)
         return hidden_states, residual
 
 
