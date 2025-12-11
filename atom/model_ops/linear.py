@@ -24,7 +24,7 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from torch import nn
-from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4, gemm_afp4wfp4_preshuffle
+from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 
@@ -64,50 +64,43 @@ def gemm_a4w4_quant(x: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, w
             dtype=otype,
             device=x.device,
         )
-        # w_scale = fp4_utils.e8m0_shuffle(weight_scale.data)    
-        # y = gemm_a4w4(
-        #     x,
-        #     weight,
-        #     x_scale,
-        #     # w_scale,
-        #     weight_scale,
-        #     y,
-        # )
+        # w_scale = fp4_utils.e8m0_shuffle(weight_scale.data)
+        y = gemm_a4w4(
+            x,
+            weight,
+            x_scale,
+            # w_scale,
+            weight_scale,
+            y,
+        )
     else:
-        quant_func = get_triton_quant(QuantType.per_1x32)
+        quant_func = get_hip_quant(QuantType.per_1x32)
         x, x_scale = quant_func(
             x,
             quant_dtype=params_dtype,
-            shuffle=False,
+            shuffle=(x.shape[0] >= 32),
         )
 
         m = x.view(-1, x.size(-1)).shape[0]
         y = torch.empty(
-            (m, output_size),
+            ((m + 31) // 32 * 32, output_size),
             dtype=otype,
             device=x.device,
         )
-        print(x.shape, weight.shape, x_scale.shape, weight_scale.shape, y.shape)
-        y = gemm_afp4wfp4(
-            x.view(torch.uint8),
-            weight.view(torch.uint8),
-            x_scale.view(torch.uint8), 
-            weight_scale.view(torch.uint8), 
-            y=y,
-        )
 
-        # if m >= 32:
-        #     x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
-        # else:
-        #     x_scale = x_scale[:m, ...].view(torch.uint8)
+        if m >= 32:
+            x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+        else:
+            x_scale = x_scale[:m, ...].view(torch.uint8)
             
-        # y = gemm_afp4wfp4_preshuffle(
-        #     x.view(torch.uint8), 
-        #     weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
-        #     x_scale, 
-        #     weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
-        #     y=y,
-        # )
+        y = gemm_afp4wfp4_preshuffle(
+            x.view(torch.uint8), 
+            weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+            x_scale, 
+            weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
+            y=y,
+            use_aot=False,
+        )
 
     return y[:m, ...]
 
@@ -271,8 +264,7 @@ class LinearBase(nn.Module):
                 self.weight.data, self.weight_scale.data
             )
         if self.source_quant_dtype == torch.bfloat16 and self.quant_type == QuantType.per_1x32 and self.params_dtype == torch.float4_e2m1fn_x2:
-            
-            quant_func = get_triton_quant(QuantType.per_1x32)
+            quant_func = get_hip_quant(QuantType.per_1x32)
             w_q, w_s = quant_func(
                 self.weight.data,
                 quant_dtype=self.params_dtype,
@@ -282,9 +274,8 @@ class LinearBase(nn.Module):
             self.weight_scale = torch.nn.Parameter(
                     w_s,
                     requires_grad=False)
-            
-            # self.weight.data = shuffle_weight(self.weight.data, (16, 16))
-            # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+            self.weight.data = shuffle_weight(self.weight.data, (16, 16))
+            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
             if (
                 self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8

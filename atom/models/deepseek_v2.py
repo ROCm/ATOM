@@ -594,9 +594,8 @@ class DeepseekV2MLAAttention(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj",
-            source_quant_dtype=source_quant_dtype)
+            quant_config=quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None,
+            prefix=f"{prefix}.kv_b_proj")
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
@@ -627,7 +626,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 config,
                 hidden_size,
                 q_lora_rank,
-                quant_config,
+                quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None,
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
@@ -668,10 +667,9 @@ class DeepseekV2MLAAttention(nn.Module):
         )
 
         self.prefix = prefix
+        quant_config = quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None
         self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
         self.fuse_qknorm_quant = ENABLE_DS_QKNORM_QUANT_FUSION and self.quant_dtype is not None
-        # self.fuse_qknorm_quant = False
-
 
     def forward(
         self,
@@ -839,7 +837,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-# @support_torch_compile
+@support_torch_compile
 class DeepseekV2Model(nn.Module):
     def __init__(
         self,
