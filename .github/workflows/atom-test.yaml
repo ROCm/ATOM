@@ -89,7 +89,9 @@ jobs:
       - name: Run ATOM tests
         timeout-minutes: 120
         run: |
+          echo "Running ATOM simple inference test: python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0"
           docker exec -u root atom_test bash -c 'python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0'
+          echo "ATOM simple inference test completed successfully."
 
       - name: Clean Up
         if: always()
