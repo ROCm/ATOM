@@ -214,10 +214,10 @@ class AttentionMetaData:
         self.reduce_partial_map = reduce_partial_map
         
         # TODO: will be removed
-        fake_block_table = torch.zeros(cu_seqlens_q.shape[0] - 1, max_seqlen_q).int().cuda()
-        for i in range(cu_seqlens_q.shape[0]-1):
-            fake_block_table[i][0:(cu_seqlens_q[i+1] - cu_seqlens_q[i]).item()] = torch.arange(cu_seqlens_q[i], cu_seqlens_q[i+1], dtype=torch.int).cuda()
-        self.fake_block_tables = fake_block_table
+        # fake_block_table = torch.zeros(cu_seqlens_q.shape[0] - 1, max_seqlen_q).int().cuda()
+        # for i in range(cu_seqlens_q.shape[0]-1):
+        #     fake_block_table[i][0:(cu_seqlens_q[i+1] - cu_seqlens_q[i]).item()] = torch.arange(cu_seqlens_q[i], cu_seqlens_q[i+1], dtype=torch.int).cuda()
+        # self.fake_block_tables = fake_block_table
 
     def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
@@ -290,6 +290,15 @@ def set_forward_context(
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
 
+    # TODO: will be removed. now prefill attention need fake block tables.
+    if _forward_context.context.is_prefill:
+        # TODO: will be removed
+        cu_seqlens_q = attn_metadata.cu_seqlens_q
+        max_seqlen_q = attn_metadata.max_seqlen_q
+        fake_block_table = torch.zeros(cu_seqlens_q.shape[0] - 1, max_seqlen_q).int().cuda()
+        for i in range(cu_seqlens_q.shape[0]-1):
+            fake_block_table[i][0:(cu_seqlens_q[i+1] - cu_seqlens_q[i]).item()] = torch.arange(cu_seqlens_q[i], cu_seqlens_q[i+1], dtype=torch.int).cuda()
+        attn_metadata.fake_block_tables = fake_block_table
 
 def reset_forward_context() -> None:
     global _forward_context
