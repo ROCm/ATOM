@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
 from dataclasses import dataclass
 from typing import Optional, Type
 
@@ -201,11 +202,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sum_blocks = kv_indptr[-1]
 
         def prepare_kv_indices():
-            # sum_blocks = 0
-            # for block_table, num_blocks in zip(batch.block_tables, num_blocks_per_seq):
-            #     var["kv_indices"].np[sum_blocks : sum_blocks + num_blocks] = block_table
-            #     sum_blocks += num_blocks
-            var["kv_indices"].np[:sum_blocks] = np.concat(batch.block_tables)
+            var["kv_indices"].np[:sum_blocks] = np.fromiter(
+                itertools.chain.from_iterable(batch.block_tables),
+                dtype=np.int32,
+                count=sum_blocks,
+            )
 
         prepare_kv_indices()
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
