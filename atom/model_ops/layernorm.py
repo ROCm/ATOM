@@ -144,9 +144,9 @@ class RMSNorm(nn.Module):
         if self.fused_allreduce and self.tp_size > 1:
             assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
             return tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, 
-                residual, 
-                self.weight, 
+                x,
+                residual,
+                self.weight,
                 self.eps,
                 )
         else:
