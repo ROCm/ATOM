@@ -64,12 +64,10 @@ def gemm_a4w4_quant(x: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, w
             dtype=otype,
             device=x.device,
         )
-        # w_scale = fp4_utils.e8m0_shuffle(weight_scale.data)
         y = gemm_a4w4(
             x,
             weight,
             x_scale,
-            # w_scale,
             weight_scale,
             y,
         )
@@ -115,10 +113,11 @@ class LinearBase(nn.Module):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = False,
-        source_quant_dtype: torch.dtype = None,
+        source_quant_dtype: torch.dtype | None = None,
     ):
         if quant_config is None:
             quant_config = QuantizationConfig()
+        self.source_quant_dtype = source_quant_dtype
         quant_type = quant_config["quant_type"]
         params_dtype = quant_config["quant_dtype"]
         super().__init__()
@@ -141,9 +140,7 @@ class LinearBase(nn.Module):
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
         
-        self.source_quant_dtype = source_quant_dtype
-        
-        if self.source_quant_dtype == torch.bfloat16:
+        if self.source_quant_dtype is not None:
             weight_size = (self.output_size, self.input_size)
             self.weight = nn.Parameter(
                 torch.empty(weight_size, dtype=self.source_quant_dtype),
@@ -169,10 +166,7 @@ class LinearBase(nn.Module):
         self.quant_type = quant_type
         self.params_dtype = params_dtype
 
-        if self.source_quant_dtype == torch.bfloat16:
-            self.weight.weight_loader_process = self.weight_loader_process
-            self.register_parameter("weight_scale", None)
-        elif quant_type != QuantType.No:
+        if quant_type != QuantType.No and self.source_quant_dtype is None:
             if quant_type == QuantType.per_Tensor:
                 self.weight_scale = nn.Parameter(
                     torch.empty(len(self.output_partition_sizes), 1, dtype=dtypes.fp32),

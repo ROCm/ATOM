@@ -550,7 +550,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self.layer_num = layer_num
 
         source_quant_dtype = torch.bfloat16
-        # source_quant_dtype = None
+        non_proj_quant_config = quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None
         if self.q_lora_rank is not None:
             # self.q_a_proj = ReplicatedLinear(self.hidden_size,
             #                                  self.q_lora_rank,
@@ -594,7 +594,7 @@ class DeepseekV2MLAAttention(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None,
+            quant_config=non_proj_quant_config,
             prefix=f"{prefix}.kv_b_proj")
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
@@ -626,7 +626,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 config,
                 hidden_size,
                 q_lora_rank,
-                quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None,
+                non_proj_quant_config,
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
@@ -667,8 +667,7 @@ class DeepseekV2MLAAttention(nn.Module):
         )
 
         self.prefix = prefix
-        quant_config = quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None
-        self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
+        self.quant_dtype = non_proj_quant_config["quant_dtype"] if non_proj_quant_config else None
         self.fuse_qknorm_quant = ENABLE_DS_QKNORM_QUANT_FUSION and self.quant_dtype is not None
 
     def forward(
@@ -743,8 +742,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
 
-        # quant_config_mla = quant_config.copy()
-        # quant_config["source_quant_dtype"] = torch.bfloat16
         self.self_attn = DeepseekV2MLAAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -767,7 +764,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
-        # quant_config.pop("source_quant_dtype", None)
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
