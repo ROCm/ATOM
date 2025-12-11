@@ -84,7 +84,7 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         )
         return inv_freq
 
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
+    def _compute_cos_sin_cache(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
@@ -102,7 +102,21 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         eps: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        """Apply fused RoPE and RMSNorm to QKV tensor.
+        
+        Args:
+            qkv: Input QKV tensor to be modified in-place
+            q_weight: Weight tensor for Q normalization
+            k_weight: Weight tensor for K normalization
+            positions: Position indices for RoPE
+            num_heads: Number of query heads
+            num_kv_heads: Number of key-value heads
+            eps: Epsilon value for numerical stability in normalization
+            
+        Returns:
+            torch.Tensor: The modified QKV tensor (same as input, modified in-place)
+        """
         num_tokens = positions.shape[-1]
         fused_rope_rms(
             qkv,
@@ -118,7 +132,7 @@ class RotaryEmbeddingQKNormFused(nn.Module):
             is_neox_style=self.is_neox_style,
             eps=eps,
         )
-
+        return qkv
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -306,10 +320,10 @@ class Qwen3MoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         if ENABLE_QK_NORM_ROPE_FUSION:
-            self.rotary_emb(
-                qkv, 
-                self.q_norm.weight, 
-                self.k_norm.weight, 
+            qkv = self.rotary_emb(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
                 positions,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
