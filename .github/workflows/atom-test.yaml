@@ -21,7 +21,7 @@ jobs:
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
     steps:
-      - name: Checkout aiter repo
+      - name: Checkout ATOM repo
         uses: actions/checkout@v4
 
       - name: Pull ATOM base image
