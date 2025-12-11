@@ -93,9 +93,9 @@ jobs:
       - name: Run ATOM tests
         timeout-minutes: 120
         run: |
-          docker exec -u root atom_test bash -c "pip show atom || true"
-          docker exec -u root atom_test bash -c "pip show aiter || true"
-          docker exec -u root atom_test bash -c 'python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0'
+          docker exec -u root atom_test bash -c "echo '=== ATOM version ===' && pip show atom || true"
+          docker exec -u root atom_test bash -c "echo '=== aiter version ===' && pip show aiter || true"
+          docker exec -u root atom_test bash -c 'echo "=== Running tests ===" && python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0'
 
       - name: Clean Up
         if: always()
