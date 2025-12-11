@@ -93,6 +93,6 @@ jobs:
 
       - name: Clean Up
         if: always()
-        run:
+        run: |
           docker stop atom_test || true
           docker rm atom_test || true
