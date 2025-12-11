@@ -194,14 +194,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
 
-        sum_blocks = 0
         num_blocks_per_seq = [
             (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
         ]
-        for block_table, num_blocks in zip(batch.block_tables, num_blocks_per_seq):
-            var["kv_indices"].np[sum_blocks : sum_blocks + num_blocks] = block_table
-            sum_blocks += num_blocks
         kv_indptr = np.cumsum(num_blocks_per_seq)
+        sum_blocks = kv_indptr[-1]
+
+        def prepare_kv_indices():
+            # sum_blocks = 0
+            # for block_table, num_blocks in zip(batch.block_tables, num_blocks_per_seq):
+            #     var["kv_indices"].np[sum_blocks : sum_blocks + num_blocks] = block_table
+            #     sum_blocks += num_blocks
+            var["kv_indices"].np[:sum_blocks] = np.concat(batch.block_tables)
+
+        prepare_kv_indices()
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
         var["kv_last_page_lens"].np[:scheduled_bs] = batch.last_block_num_tokens
