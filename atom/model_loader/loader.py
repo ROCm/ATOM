@@ -87,6 +87,15 @@ def get_cache_scale(name: str) -> str | None:
     # If no matches, return None
     return None
 
+def convert_layers_to_bracket(name: str) -> str:
+    """
+    Convert only 'layers.数字.' to 'layers[数字].'.
+    Example: model.layers.31.attn.scale -> model.layers[31].attn.scale
+    
+    :param name: parameter name
+    :return: converted parameter name
+    """
+    return re.sub(r'\.layers\.(\d+)\.', r'.layers[\1].', name)
 
 def load_model(
     model: nn.Module,
@@ -105,24 +114,21 @@ def load_model(
             ):
                 # Loading kv cache quantization scales      
                 # param = model.get_parameter(scale_name)
-                param = model.get_parameter(scale_name)
+                # param = model.get_parameter(scale_name)
                 # loaded_weight  = weight_tensor
                 # param = loaded_weight
-                # except:
-                    # for name in params_dict.keys():
-                    #     if "self_attn" in name:
-                    #         print(name)
-                    # exit()
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                assert weight_tensor.numel() == 1, (
-                    f"KV scale numel {weight_tensor.numel()} != 1"
-                )
-                weight_tensor = weight_tensor.squeeze()
-                weight_loader(param, weight_tensor)
-                # loaded_params.add(scale_name)
-                # futures.append(executor.submit(weight_loader, param, weight_tensor))
-                print("load ", scale_name, flush=True)
-                weight_loader(param, weight_tensor)
+      
+                setattr(model, convert_layers_to_bracket(scale_name), weight_tensor)
+                # weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # assert weight_tensor.numel() == 1, (
+                #     f"KV scale numel {weight_tensor.numel()} != 1"
+                # )
+                # weight_tensor = weight_tensor.squeeze()
+                # weight_loader(param, weight_tensor)
+                # # loaded_params.add(scale_name)
+                # # futures.append(executor.submit(weight_loader, param, weight_tensor))
+                # print("load ", scale_name, flush=True)
+                # weight_loader(param, weight_tensor)
                 continue
             if load_dummy:
                 continue

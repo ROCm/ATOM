@@ -673,8 +673,13 @@ class ModelRunner:
                         )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, layer_id]
-                            module.v_scale = self.kv_scale[1, layer_id]
+                            try:
+                                module.k_scale = self.kv_scale[0, layer_id]
+                                module.v_scale = self.kv_scale[1, layer_id]
+                            except:
+                                print("Failed kv module:", module, " dir(module):", dir(module))
+                                raise
+
 
                         k_scale = module.k_scale
                         v_scale = module.v_scale

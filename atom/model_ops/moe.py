@@ -592,7 +592,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        print("expert map:", expert_map)
+        # print("expert map:", expert_map)
         return fused_moe(
             x,
             layer.w13_weight,
