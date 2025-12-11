@@ -435,8 +435,6 @@ class ModelRunner:
         attn_metadata, positions = self.attn_metadata_builder.build(dummy_batch, bs)
         context_bs = dummy_batch.total_seqs_num_decode
 
-        num_input_tokens, num_tokens_across_dp = self._preprocess(dummy_batch)
-
         context = Context(
             positions=positions,
             is_prefill=False,
@@ -449,19 +447,17 @@ class ModelRunner:
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
-            num_tokens=actual_num_tokens,  # original value, not with padding
-            num_tokens_across_dp=num_tokens_across_dp,
         )
 
-        self.tokenID_processor.input_ids.np[:num_input_tokens] = [0] * num_input_tokens
-        self.tokenID_processor.input_ids.copy_to_gpu(num_input_tokens)
-        input_ids = self.tokenID_processor.input_ids.gpu[:num_input_tokens]
+        self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
+        self.tokenID_processor.input_ids.copy_to_gpu(actual_num_tokens)
+        input_ids = self.tokenID_processor.input_ids.gpu[:actual_num_tokens]
 
         logits = self.run_model(input_ids)
 
         reset_forward_context()
         logger.debug(
-            f"{self.label}: dummy batch executed with {num_input_tokens} tokens"
+            f"{self.label}: dummy batch executed with {actual_num_tokens} tokens"
         )
         return True
 
@@ -808,16 +804,11 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=bs,
         )
-        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
-        actual_num_tokens = batch.total_tokens_num
         set_forward_context(
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
-            num_tokens=actual_num_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
         )
-        return num_input_tokens
 
     def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
         bs = batch.total_seqs_num

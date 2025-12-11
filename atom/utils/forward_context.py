@@ -279,11 +279,11 @@ def set_forward_context(
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
-    if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
-        dp_metadata = DPMetadata.make(atom_config.parallel_config,
-                                      # attn_metadata,
-                                      num_tokens or 0,
-                                      num_tokens_across_dp)
+    # if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
+    #     dp_metadata = DPMetadata.make(atom_config.parallel_config,
+    #                                   # attn_metadata,
+    #                                   num_tokens or 0,
+    #                                   num_tokens_across_dp)
 
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,

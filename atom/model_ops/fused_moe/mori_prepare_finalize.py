@@ -74,10 +74,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "mori does not support apply_router_weight_on_input=True now."
         )
         scale = None
-        if self.use_fp8_dispatch:
-            from aiter import get_hip_quant
-            quant_func = get_hip_quant(quant_type)
-            a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
+        # if self.use_fp8_dispatch:
+        #     from aiter import get_hip_quant
+        #     quant_func = get_hip_quant(quant_type)
+        #     a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
         # if self.use_fp8_dispatch and self.quant_type is not None:
         #     from aiter import get_hip_quant
         #     quant_func = get_hip_quant(self.quant_type)
