@@ -119,7 +119,7 @@ def _fuse_rmsnorm_quant(
             transpose_scale,
         )
     elif dtype_quant == dtypes.fp4x2:
-         (out1_quantized, out1_bs), out2, out_res1 = fused_rms_mxfp4_quant(
+         (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = fused_rms_mxfp4_quant(
             x1,
             x1_weight,
             x1_epsilon,
@@ -129,8 +129,9 @@ def _fuse_rmsnorm_quant(
             res1,
             shuffle,
             scale_shuffle_padding,
+            output_unquantized_inp1,
         )
-         out1_unquantized = None
+        #  out1_unquantized = None
     else:
         raise ValueError(f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}.")
     return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
@@ -548,6 +549,8 @@ class DeepseekV2MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
 
+        source_quant_dtype = torch.bfloat16
+        # source_quant_dtype = None
         if self.q_lora_rank is not None:
             # self.q_a_proj = ReplicatedLinear(self.hidden_size,
             #                                  self.q_lora_rank,
@@ -558,7 +561,8 @@ class DeepseekV2MLAAttention(nn.Module):
                 self.hidden_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 bias=False,
-                quant_config=quant_config)
+                quant_config=quant_config,
+                source_quant_dtype=source_quant_dtype)
             self.q_a_layernorm = RMSNorm(self.q_lora_rank,
                                          eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(q_lora_rank,
@@ -566,21 +570,24 @@ class DeepseekV2MLAAttention(nn.Module):
                                                  self.qk_head_dim,
                                                  bias=False,
                                                  quant_config=quant_config,
-                                                 prefix=f"{prefix}.q_b_proj")
+                                                 prefix=f"{prefix}.q_b_proj",
+                                                 source_quant_dtype=source_quant_dtype)
         else:
             self.q_proj = ColumnParallelLinear(self.hidden_size,
                                                self.num_heads *
                                                self.qk_head_dim,
                                                bias=False,
                                                quant_config=quant_config,
-                                               prefix=f"{prefix}.q_proj")
+                                               prefix=f"{prefix}.q_proj",
+                                               source_quant_dtype=source_quant_dtype)
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.kv_a_proj_with_mqa")
+                prefix=f"{prefix}.kv_a_proj_with_mqa",
+                source_quant_dtype=source_quant_dtype)
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
                                       eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -588,13 +595,15 @@ class DeepseekV2MLAAttention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj")
+            prefix=f"{prefix}.kv_b_proj",
+            source_quant_dtype=source_quant_dtype)
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
                                         quant_config=quant_config,
                                         reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
-                                        prefix=f"{prefix}.o_proj")
+                                        prefix=f"{prefix}.o_proj",
+                                        source_quant_dtype=source_quant_dtype)
 
         if rope_scaling:
             rope_scaling["rope_type"] = 'deepseek_yarn'
@@ -661,6 +670,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self.prefix = prefix
         self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
         self.fuse_qknorm_quant = ENABLE_DS_QKNORM_QUANT_FUSION and self.quant_dtype is not None
+        # self.fuse_qknorm_quant = False
 
 
     def forward(
@@ -735,6 +745,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
 
+        # quant_config_mla = quant_config.copy()
+        # quant_config["source_quant_dtype"] = torch.bfloat16
         self.self_attn = DeepseekV2MLAAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -750,12 +762,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             # TODO use ignore layer for mxfp4 attention
-            quant_config=quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None,
+            # quant_config=quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None,
+            quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
             topk_indices_buffer=topk_indices_buffer,
         )
 
+        # quant_config.pop("source_quant_dtype", None)
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
@@ -825,7 +839,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-@support_torch_compile
+# @support_torch_compile
 class DeepseekV2Model(nn.Module):
     def __init__(
         self,
