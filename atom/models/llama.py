@@ -59,7 +59,16 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 
+ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_quant
+
+
+if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+    import aiter as rocm_aiter
+    rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
 class LlamaMLP(nn.Module):
 
@@ -292,6 +301,23 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        scale = self.self_attn.qkv_proj.input_scale
+        # if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        #     #static FP8 quantization
+        #     weight = self.input_layernorm.weight
+        #     eps = self.input_layernorm.eps
+        #     if residual is None:
+        #         residual = hidden_states
+        #         hidden_states, _, _, _ = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+        #                                             None, None, eps,
+        #                                             dtype_quant=rocm_aiter_fp8_dtype,
+        #                                             res1=None)
+        #     else:
+        #         hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+        #                                             None, None, eps,
+        #                                             dtype_quant=rocm_aiter_fp8_dtype,
+        #                                             res1=residual)
+        # else:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -300,7 +326,18 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+            # Static FP8 quantization
+            weight = self.post_attention_layernorm.weight
+            eps = self.post_attention_layernorm.eps
+            hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+                                                None, None, eps,
+                                                dtype_quant=rocm_aiter_fp8_dtype,
+                                                res1=residual)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
