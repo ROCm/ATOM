@@ -96,6 +96,10 @@ jobs:
             "python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
           
           echo ""
+          echo "========== Showing test output below =========="
+          cat atom_test_output.txt
+
+          echo ""
           echo "========== Comparing output with golden outputs =========="
           echo "Showing detailed diff process below..."
           # Ignore whitespace and EOL differences in the diff, but show the diff output directly here
