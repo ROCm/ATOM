@@ -14,9 +14,11 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu
+    runs-on: atom-mi355-1gpu
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+      GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
+      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
     steps:
       - name: Checkout aiter repo
@@ -43,8 +45,10 @@ jobs:
             python3 setup.py develop
 
           RUN echo "=== Installing ATOM ==="
-          RUN git clone https://github.com/ROCm/ATOM.git
-          RUN cd ATOM && pip install .
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /ATOM && \
+            cd /ATOM && \
+            git checkout ${{ env.GITHUB_COMMIT_SHA }} && \
+            pip install .
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
