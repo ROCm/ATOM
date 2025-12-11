@@ -89,9 +89,34 @@ jobs:
       - name: Run ATOM tests
         timeout-minutes: 120
         run: |
-          echo "Running ATOM simple inference test: python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0"
-          docker exec -u root atom_test bash -c 'python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0'
-          echo "ATOM simple inference test completed successfully."
+          # Run the inference and capture output
+          echo "=== Running inference ==="
+          docker exec atom_test bash -c \
+            "python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
+          
+          echo "=== Output ==="
+          cat atom_test_output.txt
+
+          echo "Comparing output with golden outputs..."
+          # Ignore whitespace and EOL differences in the diff
+          diff -B -b -w --strip-trailing-cr atom_test_output.txt .github/workflows/golden_outputs.txt
+          DIFF_EXIT_CODE=$?
+          
+          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+            echo "Output does not match golden outputs."
+            echo "Showing diff:"
+            diff -u -B -b -w --strip-trailing-cr atom_test_output.txt .github/workflows/golden_outputs.txt || true
+            exit 1
+          else
+            echo "Output matches golden outputs."
+          fi
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom_test_output
+          path: atom_test_output.txt
 
       - name: Clean Up
         if: always()
