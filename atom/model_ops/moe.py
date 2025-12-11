@@ -43,7 +43,6 @@ from atom.utils.custom_register import direct_register_custom_op
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.jit.utils.chip_info import get_gfx
 from atom.utils import envs
-from atom.model_ops.fused_moe.config import _has_module
 
 
 @dataclass
@@ -65,7 +64,7 @@ class FusedMoEParallelConfig:
     
     @property
     def use_mori_kernels(self):
-        return self.dp_size > 1 and _has_module("mori")
+        return True
 
     @staticmethod
     def make(
@@ -268,8 +267,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
-                # quant_dtype=quant_config.quant_dtype,
-                quant_dtype=mori_dtype,
+                # quant_dtype=mori_dtype,
+                # We now use bfloat16 for mori
+                quant_dtype=torch.bfloat16,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
@@ -286,16 +286,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
             use_fp8_dispatch = is_fp8
             if use_fp8_dispatch:
-                if quant_config.is_per_act_token:
-                    quant_type = QuantType.per_Token
-                elif quant_config.is_block_quantized:
-                    quant_type = QuantType.per_1x128
-                else:
-                    quant_type = QuantType.per_Tensor
+                quant_type = QuantType.per_Tensor
             else:
                 quant_type = None            # use_fp8_dispatch = False
-            # quant_type = None
-            
+
+
+            # We not use quant for mori now
+            use_fp8_dispatch = False
+            quant_type = None
+
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,
                 max_tokens_per_rank=moe.max_num_tokens,
