@@ -13,9 +13,9 @@ from aiter import (
 )
 from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
-
 
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
@@ -93,6 +93,7 @@ class RMSNorm(nn.Module):
         eps: float = 1e-6,
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
+        qr_common: Optional[QuickAllReduce] = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -101,7 +102,7 @@ class RMSNorm(nn.Module):
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.tp_size = get_tensor_model_parallel_world_size()
-
+        self.qr_common = qr_common
     # def rms_forward(
     #     self,
     #     x: torch.Tensor,
@@ -141,6 +142,21 @@ class RMSNorm(nn.Module):
                 return fused_add_rmsnorm_pad_(
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
+        if (
+            self.qr_common is not None
+            and not self.qr_common.disabled
+            and self.qr_common.should_quick_allreduce(x)
+            and self.tp_size > 1
+        ):
+            x = self.qr_common.quick_all_reduce(x)
+            assert x is not None, "quick_all_reduce should return a tensor!"
+            if residual is None:
+                # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
+                return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+            else:
+                # return self.add_rms_forward(x, residual)
+                return rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
+            
         if self.fused_allreduce and self.tp_size > 1:
             assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
             return tensor_model_parallel_fused_allreduce_rmsnorm(

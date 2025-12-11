@@ -36,6 +36,7 @@ def divide(numerator, denominator):
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter import gemm_a4w4, per_1x32_f4_quant_hip
+from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 
 def gemm_a4w4_quant_fake(x: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, weight_scale: torch.Tensor, params_dtype: torch.dtype,
                     input_scale: torch.Tensor, output_size: int) -> torch.Tensor:
@@ -221,7 +222,7 @@ class LinearBase(nn.Module):
             self.weight.data = shuffle_weight(self.weight.data, (16, 16))
 
     def forward(
-        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16, qr_common: Optional[QuickAllReduce] = None
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(x, self.weight, self.bias)
@@ -275,7 +276,15 @@ class LinearBase(nn.Module):
                 y = gemm_a4w4_quant(x, self.weight, otype, self.weight_scale.data, self.params_dtype, getattr(self, "input_scale", None), self.output_size)
                 if self.bias is not None:
                     y += self.bias
-        if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
+        if (
+            qr_common is not None
+            and not qr_common.disabled
+            and qr_common.should_quick_allreduce(y)
+            and self.tp_size > 1
+        ):
+            y = qr_common.quick_all_reduce(y)
+            assert y is not None, "quick_all_reduce should return a tensor!"
+        elif self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 
