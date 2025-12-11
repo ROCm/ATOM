@@ -86,19 +86,15 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Setup pip config
-        run: |
-          docker exec -u root atom_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root atom_test bash -c "pip config set global.retries 10"
-
       - name: Run ATOM tests
         timeout-minutes: 120
         run: |
           docker exec -u root atom_test bash -c "pip show atom || true"
           docker exec -u root atom_test bash -c "pip show aiter || true"
-          docker exec -u root atom_test bash -c 'python3 -c "import aiter; print(aiter.__file__)"; python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --temperature 0'
+          docker exec -u root atom_test bash -c 'python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0'
 
       - name: Clean Up
         if: always()
         run:
-          docker exec -u root atom_test bash -c "rm -rf /ATOM"
+          docker stop atom_test || true
+          docker rm atom_test || true
