@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 # from flash_attn import flash_attn_with_kvcache
 from dataclasses import dataclass
 from typing import Optional
@@ -69,7 +66,6 @@ class Attention(nn.Module):
         sinks: Optional[nn.Parameter] = None,
         per_layer_sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
@@ -80,7 +76,8 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
-        self.k_scale = self.v_scale = None
+        self.k_scale = nn.Parameter()
+        self.v_scale = nn.Parameter()
         self.layer_num = layer_num
         self.mla_modules = mla_modules
         self.use_mla = use_mla
@@ -112,8 +109,7 @@ class Attention(nn.Module):
         )
 
         compilation_config = atom_config.compilation_config
-        default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
-        self.layer_name = prefix if prefix is not None else default_name
+        self.layer_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer: {}".format(self.layer_name))
         compilation_config.static_forward_context[self.layer_name] = self

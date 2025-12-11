@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 import concurrent.futures
 import os
 import re
@@ -19,9 +16,9 @@ from atom.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
+from atom.config import QuantizationConfig
 from atom.model_ops.moe import is_rocm_aiter_fusion_shared_expert_enabled
 from aiter.dist.parallel_state import get_tp_group
-from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrite_spec_layer_name
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -69,13 +66,33 @@ def safetensors_weights_iterator(
                 for name in f.keys():
                     yield name, f.get_tensor(name)
 
+def get_cache_scale(name: str) -> str | None:
+    """
+    Check whether the param name matches the format for k/v cache scales
+    in quark. If this is the case, return its equivalent param name
+    expected by vLLM
+
+    :param name: param name
+    :return: matching param name for KV cache scale in vLLM
+    """
+    if name.endswith(".output_scale") and ".k_proj" in name:
+        return name.replace(".k_proj.output_scale", ".attn.k_scale")
+    if name.endswith(".output_scale") and ".v_proj" in name:
+        return name.replace(".v_proj.output_scale", ".attn.v_scale")
+    if name.endswith(".output_scale") and ".q_proj" in name:
+        return name.replace(".q_proj.output_scale", ".attn.q_scale")
+    if name.endswith("self_attn.prob_output_scale"):
+        return name.replace(".prob_output_scale", ".attn.prob_scale")
+
+    # If no matches, return None
+    return None
+
 
 def load_model(
     model: nn.Module,
     model_name_or_path: str,
     hf_config: AutoConfig,
     load_dummy: bool = False,
-    spec_decode: bool = False,
 ):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
@@ -83,15 +100,34 @@ def load_model(
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         for name, weight_tensor in safetensors_weights_iterator(model_name_or_path):
+            if model.quant_config is not None and (
+                scale_name := get_cache_scale(name)
+            ):
+                # Loading kv cache quantization scales      
+                # param = model.get_parameter(scale_name)
+                param = model.get_parameter(scale_name)
+                # loaded_weight  = weight_tensor
+                # param = loaded_weight
+                # except:
+                    # for name in params_dict.keys():
+                    #     if "self_attn" in name:
+                    #         print(name)
+                    # exit()
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                assert weight_tensor.numel() == 1, (
+                    f"KV scale numel {weight_tensor.numel()} != 1"
+                )
+                weight_tensor = weight_tensor.squeeze()
+                weight_loader(param, weight_tensor)
+                # loaded_params.add(scale_name)
+                # futures.append(executor.submit(weight_loader, param, weight_tensor))
+                print("load ", scale_name, flush=True)
+                weight_loader(param, weight_tensor)
+                continue
             if load_dummy:
                 continue
             if name.endswith("kv_scale"):
                 continue
-            if spec_decode:
-                spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
-                if spec_layer is None:
-                    continue
-                name = rewrite_spec_layer_name(spec_layer, name)
             name_suffix = name.split(".")[-1]
             if name_suffix in weights_mapping.keys():
                 name = name.replace(name_suffix, weights_mapping[name_suffix])
@@ -100,7 +136,7 @@ def load_model(
 
             layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
             layerId = int(layerId_.group(1)) if layerId_ else 0
-            if hf_config.num_hidden_layers and layerId >= hf_config.num_hidden_layers and not spec_decode:
+            if hf_config.num_hidden_layers and layerId >= hf_config.num_hidden_layers:
                 # print(f"Skipping loading {name} as layerId {layerId} >= num_hidden_layers {hf_config.num_hidden_layers}")
                 continue
             if (
@@ -115,15 +151,18 @@ def load_model(
                 # We handle the experts below in expert_params_mapping
                 if "mlp.experts." in name and name not in params_dict:
                     continue
+
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader")
                     # weight_loader(param, weight_tensor, shard_id)
-                    futures.append(
-                        executor.submit(weight_loader, param, weight_tensor, shard_id)
-                    )
+                    # futures.append(
+                    #     executor.submit(weight_loader, param, weight_tensor, shard_id)
+                    # )
+                    print("load ", param_name, flush=True)
+                    weight_loader(param, weight_tensor, shard_id)
                     break
             else:
                 # Check if model has expert mapping before processing
@@ -172,8 +211,9 @@ def load_model(
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    # weight_loader(param, weight_tensor)
-                    futures.append(executor.submit(weight_loader, param, weight_tensor))
+                    print("load ", name, flush=True)
+                    weight_loader(param, weight_tensor)
+                    # futures.append(executor.submit(weight_loader, param, weight_tensor))
         # Wait for all tasks to complete and raise any exceptions.
         for future in concurrent.futures.as_completed(futures):
             future.result()
@@ -183,3 +223,7 @@ def load_model(
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             quant_method.process_weights_after_loading(module)
+        # quant_config = geattr(module, "quant_config", None)
+        # if isinstance(quant_config, QuantizationConfig):
+        #     print("setting packed modules maping")
+        #     quant_config.packed_modules_mapping = getattr(model.__class__, "packed_modules_mapping")

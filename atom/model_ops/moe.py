@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 from abc import abstractmethod
 from functools import lru_cache
 from typing import Callable, List, Optional, Tuple
@@ -595,7 +592,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-
+        print("expert map:", expert_map)
         return fused_moe(
             x,
             layer.w13_weight,

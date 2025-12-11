@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 import enum
 import hashlib
 import logging
@@ -19,6 +16,7 @@ from aiter import QuantType
 from aiter.dist.parallel_state import get_dp_group
 from aiter.utility.dtypes import d_dtypes
 
+from inspect import getframeinfo, currentframe
 logger = logging.getLogger("atom")
 
 
@@ -256,6 +254,7 @@ class QuantizationConfig(dict):
         is_dynamic=True,
         quant_name="",
         quant_method=None,
+        exclude=None
     ):
         super().__init__()
         self["quant_type"] = quant_type if quant_type is not None else QuantType.No
@@ -263,6 +262,7 @@ class QuantizationConfig(dict):
         self["quant_name"] = quant_name
         self["is_dynamic"] = is_dynamic
         self["quant_method"] = quant_method
+        self["exclude"] = exclude
 
     def get_name(self):
         return self["quant_name"]
@@ -349,8 +349,11 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
         is_dynamic = False
     else:
         is_dynamic = True
+
+    exclude_layers = orig_quant_config.get("exclude")
+    
     return QuantizationConfig(
-        quant_type, quant_dtype, is_dynamic, quant_method=quant_method
+        quant_type, quant_dtype, is_dynamic, quant_method=quant_method, exclude=exclude_layers
     )
 
 
@@ -364,6 +367,7 @@ def get_hf_config(model: str) -> PretrainedConfig:
         model,
     )
     model_type = config_dict.get("model_type")
+    print("At config.py, line:", getframeinfo(currentframe()).lineno, " model_type:", model_type)
 
     def _get_hf_token() -> str | None:
         token = os.getenv("HF_TOKEN")
@@ -483,40 +487,6 @@ class ParallelConfig:
         # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
         self.data_parallel_master_port = get_open_port()
 
-@dataclass
-class SpeculativeConfig:
-    method: Optional[str] = ""
-    model: Optional[str] = None
-    num_speculative_tokens: Optional[int] = None
-    draft_model_hf_config: Optional[PretrainedConfig] = None
-
-    def __post_init__(self):
-        if self.draft_model_hf_config is None:
-            self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
-        self.hf_config_override(self.draft_model_hf_config)
-
-    @staticmethod
-    def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type == "deepseek_v3":
-            hf_config.model_type = "deepseek_mtp"
-        if hf_config.model_type == "deepseek_mtp":
-            # DeepSeek MTP typically uses only 1 layer that gets reused
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
-            # Override to use only 1 layer if config says otherwise
-            if n_predict != 1:
-                logger.warning(f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
-                             "(MTP typically uses 1 layer that gets reused)")
-                n_predict = 1
-            hf_config.update({
-                "n_predict": n_predict,
-                "num_nextn_predict_layers": n_predict,
-                "architectures": ["DeepSeekMTPModel"]
-            })
-
-    def __repr__(self) -> str:
-        method = self.method
-        num_spec_tokens = self.num_speculative_tokens
-        return f"SpeculativeConfig({method=}, {num_spec_tokens=})"
 
 @dataclass
 class Config:
@@ -548,7 +518,6 @@ class Config:
     graph_bs: Optional[list[int]] = None
     enable_dp_attention: bool = False
     torch_dtype: torch.dtype = field(init=False)
-    speculative_config: Optional[SpeculativeConfig] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -568,6 +537,7 @@ class Config:
             self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1
         ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
         assert 1 <= self.tensor_parallel_size <= 8
+    
         self.hf_config = get_hf_config(self.model)
         self.quant_config = get_quant_config(self.hf_config)
         hf_config_max_position_embeddings = getattr(

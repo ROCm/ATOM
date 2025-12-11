@@ -39,6 +39,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from inspect import currentframe, getframeinfo
 from atom.utils import envs
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
@@ -114,7 +115,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )
 
@@ -152,6 +153,7 @@ class Qwen3MoeAttention(nn.Module):
         rope_scaling: tuple | None = None,
         kv_cache_dtype: str = "fp16",
         layer_num: int = 0,
+        prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -174,6 +176,9 @@ class Qwen3MoeAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
+        # print("At qwen3_mo line:", getframeinfo(currentframe()).lineno,  " quant_config mapping:",
+        #       quant_config.packed_modules_mapping, flush=True)
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -181,6 +186,7 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
 
         self.o_proj = RowParallelLinear(
@@ -189,6 +195,7 @@ class Qwen3MoeAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            prefix=f"{prefix}.o_proj"
         )
 
         self.rotary_emb = get_rope(
@@ -205,6 +212,8 @@ class Qwen3MoeAttention(nn.Module):
             self.num_kv_heads,
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
             use_mla=False,
         )
 
@@ -247,6 +256,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         self.layer_idx = layer_num
+        # print("At qwen3_mo line:", getframeinfo(currentframe()).lineno,  " quant_config mapping:",
+        #       quant_config.packed_modules_mapping, flush=True)
 
         self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
@@ -261,6 +272,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
 
         # `mlp_only_layers` in the config.
@@ -328,6 +340,7 @@ class Qwen3MoeModel(nn.Module):
         cache_config = atom_config.kv_cache_dtype
         quant_config = atom_config.quant_config
         self.config = config
+        
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -416,6 +429,15 @@ class Qwen3MoeForCausalLM(
         "up_proj": ("gate_up_proj", 1),
     }
 
+    quant_packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ]
+    }
+
+
     def __init__(
             self,
             atom_config: Config,
@@ -424,12 +446,14 @@ class Qwen3MoeForCausalLM(
         ):
         super().__init__()
         config = atom_config.hf_config
-        quant_config = atom_config.quant_config
         self.config = config
-        self.quant_config = quant_config
+        
         # Only perform the following mapping when Qwen3MoeMLP exists
         if getattr(config, "mlp_only_layers", []):
             self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        atom_config.quant_config.packed_modules_mapping=self.quant_packed_modules_mapping
+        quant_config = atom_config.quant_config
+        self.quant_config = quant_config
         self.model = Qwen3MoeModel(
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "model"),
