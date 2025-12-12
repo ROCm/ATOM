@@ -147,10 +147,6 @@ class EagleProposer:
         inputs_embeds = None
         input_ids = self.input_ids[:num_input_tokens]
 
-        # forwad
-        if str(input_ids.device) == "cuda:0":
-            print(f"draft model forward {input_ids=}")
-
         ret_hidden_states = self.model(
             input_ids=input_ids,
             positions=self.positions[:num_input_tokens],

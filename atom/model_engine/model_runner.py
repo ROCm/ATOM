@@ -1070,7 +1070,7 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = self._latest_tokens_gpu
                 next_token_ids = self._latest_tokens_gpu
             elif self._latest_tokens_gpu.ndim == 2: # spec
-                bs = len(batch.seqs)
+                bs = len(batch.req_ids)
                 col_indices = self._lasted_num_accept - 1
                 next_token_ids = self._latest_tokens_gpu[torch.arange(bs, device=self._latest_tokens_gpu.device), col_indices]
                 self.tokenID_processor.prev_token_ids = next_token_ids
