@@ -222,7 +222,7 @@ class LinearBase(nn.Module):
             self.weight.data = shuffle_weight(self.weight.data, (16, 16))
 
     def forward(
-        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16, qr_common: Optional[QuickAllReduce] = None
+        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(x, self.weight, self.bias)
@@ -276,15 +276,8 @@ class LinearBase(nn.Module):
                 y = gemm_a4w4_quant(x, self.weight, otype, self.weight_scale.data, self.params_dtype, getattr(self, "input_scale", None), self.output_size)
                 if self.bias is not None:
                     y += self.bias
-        if (
-            qr_common is not None
-            and not qr_common.disabled
-            and qr_common.should_quick_allreduce(y)
-            and self.tp_size > 1
-        ):
-            y = qr_common.quick_all_reduce(y)
-            assert y is not None, "quick_all_reduce should return a tensor!"
-        elif self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
+
+        if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 
