@@ -785,6 +785,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                                                 eps=config.rms_norm_eps,
                                                 fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION)
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
 
     def forward(
         self,
@@ -794,9 +795,9 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Self Attention
         if ENABLE_RMSNORM_QUANT_FUSION:
+            assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
-            quant_dtype = self.self_attn.quant_dtype
             if residual is None:
                 residual = hidden_states
                 (hidden_states_quant, hidden_states_quant_scale), _,  _, _ = _fuse_rmsnorm_quant(
@@ -807,12 +808,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                     None,
                     None,
                     None,
-                    quant_dtype,
+                    self.quant_dtype,
                     False,
                     False,
                     128,
                     False,
-                    False
+                    False,
                 )
             else:
                 (hidden_states_quant, hidden_states_quant_scale), _,  _, residual = _fuse_rmsnorm_quant(
@@ -823,12 +824,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                     None,
                     None,
                     residual,
-                    quant_dtype,
+                    self.quant_dtype,
                     False,
                     False,
                     128,
                     False,
-                    False
+                    False,
                 )
             hidden_states = (hidden_states_quant, hidden_states_quant_scale)
         else:
@@ -854,32 +855,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual *= 1. / self.routed_scaling_factor
 
         # Fully Connected
-        if ENABLE_FP8_RMSNORM_QUANT_FUSION:
-            weight = self.post_attention_layernorm.weight
-            eps = self.post_attention_layernorm.eps
-            (hidden_states_quant, hidden_states_quant_scale), hidden_states_unquant,  _, residual = _fuse_rmsnorm_quant(
-                hidden_states,
-                weight,
-                eps,
-                None,
-                None,
-                None,
-                residual,
-                quant_dtype,
-                False,
-                False,
-                128,
-                False,
-                False
-            )
-            if isinstance(self.mlp,
-                          DeepseekV2MoE):
-                hidden_states = ((hidden_states_quant, hidden_states_quant_scale), hidden_states_unquant)
-            else:
-                hidden_states = (hidden_states_quant, hidden_states_quant_scale)
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp,
                       DeepseekV2MLP) and hidden_states.dtype == torch.float16:
