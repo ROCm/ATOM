@@ -12,7 +12,7 @@ from aiter import (
     layernorm2d_fwd_with_add,
 )
 from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -93,7 +93,7 @@ class RMSNorm(nn.Module):
         eps: float = 1e-6,
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
-        qr_common: Optional[QuickAllReduce] = None,
+        use_qr_when_possible: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -102,30 +102,10 @@ class RMSNorm(nn.Module):
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.qr_common = qr_common
-    # def rms_forward(
-    #     self,
-    #     x: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     orig_dtype = x.dtype
-    #     x = x.to(torch.float32)
-    #     var = x.pow(2).mean(dim=-1, keepdim=True)
-    #     x.mul_(torch.rsqrt(var + self.eps))
-    #     x = x.to(orig_dtype).mul_(self.weight)
-    #     return x
-
-    # def add_rms_forward(
-    #     self,
-    #     x: torch.Tensor,
-    #     residual: torch.Tensor,
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     orig_dtype = x.dtype
-    #     x = x.to(torch.float32).add_(residual.to(torch.float32))
-    #     residual = x.to(orig_dtype)
-    #     var = x.pow(2).mean(dim=-1, keepdim=True)
-    #     x.mul_(torch.rsqrt(var + self.eps))
-    #     x = x.to(orig_dtype).mul_(self.weight)
-    #     return x, residual
+        self.qr_comm: Optional[QuickAllReduce] = None
+        if use_qr_when_possible and self.tp_size > 1:
+            assert get_tp_group().device_communicator.qr_comm is not None, "Quick all-reduce communication is not initialized!"
+            self.qr_comm = get_tp_group().device_communicator.qr_comm
 
     def forward(
         self,
@@ -142,20 +122,23 @@ class RMSNorm(nn.Module):
                 return fused_add_rmsnorm_pad_(
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
+        # there is dispatch in aiter all_reduce to decide which path to go
+        # if quick all_reduce is used, then do not fuse rmsnorm
+        # otherwise, use fused_allreduce_rmsnorm
+        # https://github.com/ROCm/aiter/blob/d263d4411d8312dd9291e9e4130c973a7c3f1b04/aiter/dist/device_communicators/communicator_cuda.py#L142
         if (
-            self.qr_common is not None
-            and not self.qr_common.disabled
-            and self.qr_common.should_quick_allreduce(x)
-            and self.tp_size > 1
+            self.fused_allreduce
+            and self.qr_comm is not None
+            and self.qr_comm.should_quick_allreduce(x)
         ):
-            x = self.qr_common.quick_all_reduce(x)
-            assert x is not None, "quick_all_reduce should return a tensor!"
+            ar_out = self.qr_comm.quick_all_reduce(x)
+            assert ar_out is not None, "Quick all-reduce failed to return output!"
             if residual is None:
                 # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
-                return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+                return rmsnorm2d_fwd_(ar_out, self.weight, self.eps, self.dim)
             else:
                 # return self.add_rms_forward(x, residual)
-                return rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
+                return rmsnorm2d_fwd_with_add_(ar_out, self.weight, residual, self.eps, self.dim)
             
         if self.fused_allreduce and self.tp_size > 1:
             assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
