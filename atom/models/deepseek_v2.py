@@ -65,7 +65,8 @@ from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    MergedReplicatedLinear
+    MergedReplicatedLinear,
+    use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
@@ -549,8 +550,17 @@ class DeepseekV2MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
 
-        source_quant_dtype = torch.bfloat16
-        non_proj_quant_config = quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None
+        if quant_config["quant_dtype"] == torch.float4_e2m1fn_x2:
+            if not use_triton_gemm(): 
+                # TODO use ignore layer for mxfp4 attention
+                source_quant_dtype = quant_config = non_proj_quant_config = None
+            else:
+                source_quant_dtype = torch.bfloat16
+                non_proj_quant_config = None
+        else:
+            source_quant_dtype = None
+            non_proj_quant_config = quant_config
+        
         if self.q_lora_rank is not None:
             # self.q_a_proj = ReplicatedLinear(self.hidden_size,
             #                                  self.q_lora_rank,
@@ -756,8 +766,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
-            # TODO use ignore layer for mxfp4 attention
-            # quant_config=quant_config if not quant_config["quant_dtype"] == torch.float4_e2m1fn_x2 else None,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
