@@ -194,6 +194,12 @@ class Scheduler:
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
+        num_placeholder = (
+            2 * self.mtp_k if is_deferred_out and self.use_spec else
+            1              if is_deferred_out else
+            self.mtp_k     if self.use_spec else
+            0
+        )
 
         for seq in self.running:
             if seq.id not in prev_token_ids:
@@ -201,12 +207,10 @@ class Scheduler:
             token_ids = prev_token_ids[seq.id]
             new_tokens = []
             if is_deferred_out:
-                idx = seq.token_ids.index(self.eos_token_id)
-                seq.token_ids[idx:] = token_ids
+                seq.token_ids[-num_placeholder:] = token_ids
 
                 if seq.output_tokens:
-                    idx = seq.output_tokens.index(self.eos_token_id)
-                    seq.output_tokens[idx:] = token_ids
+                    seq.output_tokens[-num_placeholder:] = token_ids
 
                 else:
                     seq.output_tokens.extend(token_ids)
@@ -258,12 +262,7 @@ class Scheduler:
         if stream_output_queue is not None and stream_outputs:
             stream_output_queue.put_nowait(stream_outputs)
 
-        num_placeholder = (
-            2 * self.mtp_k if is_deferred_out and self.use_spec else
-            1              if is_deferred_out else
-            self.mtp_k     if self.use_spec else
-            0
-        )
+
         if num_placeholder > 0:
             # placeholder for the each decode step
             for seq in seqs:

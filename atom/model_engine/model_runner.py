@@ -97,7 +97,7 @@ class tokenIDProcessor:
 
         self.prev_batch: Optional[ScheduledBatch] = None
 
-        self.pre_num_decode_token_pre_seq = 1
+        self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
 
     def prepare_sampled_ids(
@@ -148,7 +148,7 @@ class tokenIDProcessor:
             i for i, seq_id in enumerate(self.prev_batch.req_ids)
             if seq_id in batch.req_ids
         ]
-        num_deferred_tokens = len(alive_seq_indices) * self.pre_num_decode_token_pre_seq
+        num_deferred_tokens = len(alive_seq_indices) * self.pre_num_decode_token_per_seq
         is_all_alive = len(alive_seq_indices) == len(self.prev_batch.req_ids)
         return alive_seq_indices, num_deferred_tokens, is_all_alive
 
@@ -208,7 +208,7 @@ class tokenIDProcessor:
                 self.input_ids.np[:num_norm_tokens] = token_ids
                 self.input_ids.copy_to_gpu(num_norm_tokens)
             # no new requests added and old requests finished
-            if self.draft_token_ids is not None and self.pre_num_decode_token_pre_seq > 1:
+            if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
                 alive_prev = self.prev_token_ids[alive_seq_indices]
                 alive_draft = self.draft_token_ids[alive_seq_indices]
                 combined = torch.cat([
@@ -232,7 +232,7 @@ class tokenIDProcessor:
             #     self.input_ids_loc.gpu[:num_deferred_tokens],
             #     out=self.input_ids.gpu[:num_deferred_tokens],
             # )
-            if self.draft_token_ids is not None and self.pre_num_decode_token_pre_seq > 1:
+            if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
                 alive_prev = self.prev_token_ids[alive_seq_indices]  # (num_alive_seqs,)
                 alive_draft = self.draft_token_ids[alive_seq_indices]  # (num_alive_seqs, mtp_n_grams-1)
                 combined = torch.cat([
@@ -1095,7 +1095,7 @@ class ModelRunner:
         self.forward_vars["draft_tokens"].gpu[:bs, :self.drafter.mtp_k] = draft_token
         self.forward_vars["draft_tokens"].copy_to_cpu()
         self.tokenID_processor.draft_token_ids = draft_token
-        self.tokenID_processor.pre_num_decode_token_pre_seq = 2
+        self.tokenID_processor.pre_num_decode_token_per_seq = 2
 
         return None
 
