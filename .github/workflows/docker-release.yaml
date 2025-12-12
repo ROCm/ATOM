@@ -1,4 +1,4 @@
-name: Docker Release
+name: Nightly Docker Release
 
 on:
   pull_request:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   docker-release:
-    name: Docker Release
+    name: Nightly Docker Release
     runs-on: atom-mi355-1gpu
 
     steps:
