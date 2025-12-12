@@ -230,7 +230,7 @@ class Scheduler:
                         break
             else:
                 # Check the last token in the list for EOS
-                if token_ids and not seq.ignore_eos and token_ids[-1] == self.eos_token_id:
+                if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
                     leave_reason = "eos"
                 elif not seq.ignore_eos and token_id in self.stop_token_ids:
                     leave_reason = str(token_id)

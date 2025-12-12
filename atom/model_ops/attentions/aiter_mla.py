@@ -338,10 +338,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
-        max_q_len=2 # fixme@@@@
+        max_q_len= 1 if not hasattr(self, "drafter") else var["mtp_k"] + 1
         ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
         attn_matadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_q_len=max_q_len,

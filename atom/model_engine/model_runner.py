@@ -116,7 +116,7 @@ class tokenIDProcessor:
                         ret[seq_id] = token_id
                 else:
                     ret[seq_id] = [token_id]
-            ret[-1] = 0 # is_deferred_out flag
+            ret[-1] = 0  # is_deferred_out flag
             return ret
 
         token_ids = self.recv_async_output()
@@ -571,7 +571,6 @@ class ModelRunner:
         }
         if hasattr(self, "drafter"):
             self.forward_vars["draft_tokens"] = CpuGpuBuffer((self.max_bs, self.drafter.mtp_k), **i32_kwargs)
-            self.forward_vars["num_accepted"] = CpuGpuBuffer(self.max_bs, **i32_kwargs)
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
 
     def get_num_blocks(self):
@@ -855,8 +854,7 @@ class ModelRunner:
         actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
-        if hasattr(self, "drafter"):
-            if self.tokenID_processor.pre_num_decode_token_pre_seq > 1:
+        if not is_prefill and hasattr(self, "drafter"):
                 num_draft_tokens = np.zeros(bs, dtype=np.int32)
                 num_draft_tokens[:] = self.drafter.mtp_k
                 spec_decode_metadata = self._calc_spec_decode_metadata(
@@ -945,17 +943,12 @@ class ModelRunner:
         )
 
         if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
-            if spec_decode_metadata is None:
-                num_accepted = torch.ones(sampled_tokens.shape[0], dtype=torch.int32, device=sampled_tokens.device)
-            else:
+            if spec_decode_metadata is not None:
                 num_accepted = (sampled_tokens != -1).sum(dim=1)
-            bs = len(batch.req_ids)
-            self.forward_vars["num_accepted"].gpu[:bs] = num_accepted
-            self.forward_vars["num_accepted"].copy_to_cpu(bs)
-
-            # temp, to be removed
-            self._lasted_num_accept = num_accepted
-            self._latest_tokens_gpu = sampled_tokens
+                last_indices = num_accepted - 1
+                bs = len(batch.req_ids)
+                next_token_ids = sampled_tokens[torch.arange(bs, device=sampled_tokens.device), last_indices]
+                self.tokenID_processor.prev_token_ids = next_token_ids
 
         return token_ids
 
@@ -1055,28 +1048,13 @@ class ModelRunner:
         hidden_states: torch.Tensor,
     ):
         num_scheduled_tokens = batch.total_tokens_num
-        index_to_req_id = {idx: req_id for req_id, idx in batch.req_id_to_index.items()}
 
         positions = get_forward_context().context.positions
         spec_decode_metadata = get_forward_context().spec_decode_metadata
 
         assert isinstance(self.drafter, EagleProposer)
         if self.tokenID_processor.is_deferred_out:
-            valid_mask = self._lasted_num_accept > 0
-            if not valid_mask.any():
-                return
-            token_indices = self._lasted_num_accept - 1
-            if self._latest_tokens_gpu.ndim == 1: # No spec
-                self.tokenID_processor.prev_token_ids = self._latest_tokens_gpu
-                next_token_ids = self._latest_tokens_gpu
-            elif self._latest_tokens_gpu.ndim == 2: # spec
-                bs = len(batch.req_ids)
-                col_indices = self._lasted_num_accept - 1
-                next_token_ids = self._latest_tokens_gpu[torch.arange(bs, device=self._latest_tokens_gpu.device), col_indices]
-                self.tokenID_processor.prev_token_ids = next_token_ids
-                self.debug(f"{next_token_ids=}")
-            else:
-                raise ValueError(f"Unexpected tensor dimension: {self._latest_tokens_gpu.ndim}")
+            next_token_ids = self.tokenID_processor.prev_token_ids
         else:
             next_token_ids: list[int] = []
             for k, v in sampled_token_ids.items():
@@ -1093,6 +1071,7 @@ class ModelRunner:
             target_hidden_states = hidden_states[:num_scheduled_tokens]
         else:
             num_draft_tokens = spec_decode_metadata.num_draft_tokens
+            index_to_req_id = {idx: req_id for req_id, idx in batch.req_id_to_index.items()}
             num_rejected_tokens = [
                 n + 1 - len(sampled_token_ids[index_to_req_id[i]]) if n > 0 else 0
                 for i, n in enumerate(num_draft_tokens)
