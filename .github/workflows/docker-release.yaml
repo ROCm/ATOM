@@ -1,0 +1,64 @@
+name: Nightly Docker Release
+
+on:
+  schedule:
+    - cron: '0 15 * * *'  # Every day at 15:00 UTC
+  pull_request:
+    branches: [main] # For testing
+  workflow_dispatch:
+
+jobs:
+  docker-release:
+    name: Nightly Docker Release
+    runs-on: atom-mi355-1gpu
+
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build --network=host -t atom_release:ci -f docker/Dockerfile .
+          docker inspect atom_release:ci
+
+      - name: Test Docker image
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom_release_ci | xargs -r docker stop | xargs -r docker rm
+              
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+              
+          echo "Starting container: atom_release_ci (image: atom_release:ci)"
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            --ipc=host --group-add video \
+            --shm-size 16g \
+            --cap-add=SYS_PTRACE \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            --name atom_release_ci \
+            atom_release:ci
+              
+          docker exec atom_release_ci bash -c \
+            "python3 -m atom.examples.simple_inference \
+               --model meta-llama/Meta-Llama-3-8B-Instruct \
+               --temperature 0 | grep -E '^Prompt: |^Completion:'"
+
+      - name: Push Docker image
+        run: |
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          TAG=$(date +%Y%m%d%H%M%S)
+          docker tag atom_release:ci rocm/atom:${TAG}
+          docker push rocm/atom:${TAG}
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker stop atom_release || true
+          docker rm atom_release || true
