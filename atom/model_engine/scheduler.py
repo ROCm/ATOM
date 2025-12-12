@@ -201,19 +201,15 @@ class Scheduler:
             token_ids = prev_token_ids[seq.id]
             new_tokens = []
             if is_deferred_out:
-                print(f"{token_ids=}")
                 idx = seq.token_ids.index(self.eos_token_id)
                 seq.token_ids[idx:] = token_ids
-                print(f"{seq.token_ids=}")
 
                 if seq.output_tokens:
                     idx = seq.output_tokens.index(self.eos_token_id)
                     seq.output_tokens[idx:] = token_ids
-                    print(f"{seq.output_tokens=}")
 
                 else:
                     seq.output_tokens.extend(token_ids)
-                    print(f"{seq.output_tokens=}")
 
                 new_tokens = token_ids
             else:
