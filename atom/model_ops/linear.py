@@ -23,6 +23,7 @@ from aiter import (
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
@@ -33,10 +34,6 @@ def divide(numerator, denominator):
         numerator % denominator == 0
     ), f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
-
-
-from aiter import gemm_a4w4, per_1x32_f4_quant_hip
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 def gemm_a4w4_quant_fake(
