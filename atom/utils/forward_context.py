@@ -287,9 +287,9 @@ def set_forward_context(
         # TODO: will be removed
         cu_seqlens_q = attn_metadata.cu_seqlens_q
         max_seqlen_q = attn_metadata.max_seqlen_q
-        fake_block_table = torch.zeros(cu_seqlens_q.shape[0] - 1, max_seqlen_q).int().cuda()
+        fake_block_table = torch.empty(cu_seqlens_q.shape[0] - 1, max_seqlen_q, dtype=torch.int, device='cuda')
         for i in range(cu_seqlens_q.shape[0]-1):
-            fake_block_table[i][0:(cu_seqlens_q[i+1] - cu_seqlens_q[i]).item()] = torch.arange(cu_seqlens_q[i], cu_seqlens_q[i+1], dtype=torch.int).cuda()
+            fake_block_table[i][0:(cu_seqlens_q[i+1] - cu_seqlens_q[i]).item()] = torch.arange(cu_seqlens_q[i], cu_seqlens_q[i+1], dtype=torch.int, device='cuda')
         attn_metadata.fake_block_tables = fake_block_table
 
 def reset_forward_context() -> None:
