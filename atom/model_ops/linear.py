@@ -25,9 +25,13 @@ from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from torch import nn
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
+from atom.utils import envs
 
+def use_triton_gemm() -> bool:
+    return envs.ATOM_USE_TRITON_GEMM
 
 def divide(numerator, denominator):
     assert (
@@ -49,7 +53,7 @@ def gemm_a4w4_quant_fake(x: torch.Tensor, weight: torch.Tensor, otype: torch.dty
 def gemm_a4w4_quant(x: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, weight_scale: torch.Tensor, params_dtype: torch.dtype,
                     input_scale: torch.Tensor, output_size: int) -> torch.Tensor:
 
-    if False:
+    if not use_triton_gemm():
         quant_func = get_hip_quant(QuantType.per_1x32)
         x, x_scale = quant_func(
             x,
@@ -72,33 +76,42 @@ def gemm_a4w4_quant(x: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, w
             y,
         )
     else:
-        quant_func = get_hip_quant(QuantType.per_1x32)
-        x, x_scale = quant_func(
-            x,
-            quant_dtype=params_dtype,
-            shuffle=(x.shape[0] >= 32),
-        )
+        m, k = x.view(-1, x.size(-1)).shape
+        n = weight.shape[0]
 
-        m = x.view(-1, x.size(-1)).shape[0]
         y = torch.empty(
             ((m + 31) // 32 * 32, output_size),
             dtype=otype,
             device=x.device,
         )
 
-        if m >= 32:
-            x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+        if not (m <= 256 and n == 7168 and k == 2048):
+            quant_func = get_hip_quant(QuantType.per_1x32)
+            x, x_scale = quant_func(
+                x,
+                quant_dtype=params_dtype,
+                shuffle=(m >= 32),
+            )
+
+            if m >= 32:
+                x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+            else:
+                x_scale = x_scale[:m, ...].view(torch.uint8)
+                
+            y = gemm_afp4wfp4_preshuffle(
+                x.view(torch.uint8), 
+                weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+                x_scale, 
+                weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
+                y=y,
+            )
         else:
-            x_scale = x_scale[:m, ...].view(torch.uint8)
-            
-        y = gemm_afp4wfp4_preshuffle(
-            x.view(torch.uint8), 
-            weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
-            x_scale, 
-            weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
-            y=y,
-            use_aot=False,
-        )
+            y = gemm_a16wfp4_preshuffle(
+                x, 
+                weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+                weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
+                y=y,
+            )
 
     return y[:m, ...]
 

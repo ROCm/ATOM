@@ -272,6 +272,7 @@ class MLAAttention(nn.Module):
         dp_size = get_dp_group().world_size
         is_fp8 = self.kv_cache_dtype.startswith("fp8")
         use_persistent_mode = not (dp_size == 8 and not is_fp8)
+        use_persistent_mode = False
 
         if not use_persistent_mode:
             # DP + bf16: disable persistent mode to avoid overflow
