@@ -21,7 +21,27 @@ jobs:
 
       - name: Test Docker image
         run: |
-          docker run -dt --device=/dev/kfd --device=/dev/dri --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit memlock=-1 --ulimit stack=67108864 --name atom_release atom_release:ci
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom_release | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          echo "Starting container: atom_release:ci"
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          --ipc=host --group-add video \
+          --shm-size 16g \
+          --cap-add=SYS_PTRACE \
+          -e HF_TOKEN="${HF_TOKEN:-}" \
+          --security-opt seccomp=unconfined \
+          --ulimit memlock=-1 \
+          --ulimit stack=67108864 \
+          --name atom_release \
+          atom_release:ci
           docker exec atom_release bash -c "python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0 | grep -E '^Prompt: |^Completion:'"
     
       - name: Clean Up
