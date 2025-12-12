@@ -38,10 +38,10 @@ torch.set_printoptions(threshold=10_000)
 logger = logging.getLogger("atom")
 
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
-    return envs.ATOM_USE_AITER_TRITON_MXFP4_BMM 
+    return envs.ATOM_USE_TRITON_MXFP4_BMM  
 
 if is_rocm_aiter_fp4bmm_enabled():
-    from atom.quantization.quark.utils import quark_post_load_weights
+    from atom.model_ops.utils import quark_post_load_weights
     # from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import  batched_gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
@@ -117,26 +117,6 @@ class MLAAttention(nn.Module):
         self.layer_num = layer_num
 
     def process_weights_after_loading(self):
-        # kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
-        # assert kv_b_proj_weight.shape == (
-        #     self.kv_lora_rank,
-        #     self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-        # ), (
-        #     f"{kv_b_proj_weight.shape=}, "
-        #     f"{self.kv_lora_rank=}, "
-        #     f"{self.num_heads=}, "
-        #     f"{self.qk_nope_head_dim=}, "
-        #     f"{self.v_head_dim=}"
-        # )
-        # kv_b_proj_weight = kv_b_proj_weight.view(
-        #     self.kv_lora_rank,
-        #     self.num_heads,
-        #     self.qk_nope_head_dim + self.v_head_dim,
-        # )
-        # W_UK, W_UV = kv_b_proj_weight.split(
-        #     [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        # )
-
         if (is_rocm_aiter_fp4bmm_enabled()):
             kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj)
             self.W_K, self.W_K_scale, W_V, self.W_V_scale = (
@@ -148,6 +128,25 @@ class MLAAttention(nn.Module):
             self.W_V = self.W_V.transpose(-2, -1).contiguous()
             self.W_V_scale = self.W_V_scale.transpose(-2, -1).contiguous()
         else:  # is_rocm_aiter_fp8bmm_enabled():
+            kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
+            assert kv_b_proj_weight.shape == (
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            ), (
+                f"{kv_b_proj_weight.shape=}, "
+                f"{self.kv_lora_rank=}, "
+                f"{self.num_heads=}, "
+                f"{self.qk_nope_head_dim=}, "
+                f"{self.v_head_dim=}"
+            )
+            kv_b_proj_weight = kv_b_proj_weight.view(
+                self.kv_lora_rank,
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+            )
+            W_UK, W_UV = kv_b_proj_weight.split(
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
             W_K = W_UK.transpose(0, 1)  # 16 512 128 #First
             W_V = W_UV.permute(1, 2, 0)  # 16 128 512
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
