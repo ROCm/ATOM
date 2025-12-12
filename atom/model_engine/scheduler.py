@@ -217,7 +217,7 @@ class Scheduler:
             else:
                 if not seq.ignore_eos and token_id == self.eos_token_id:
                     leave_reason = "eos"
-                elif token_id in self.stop_token_ids:
+                elif not seq.ignore_eos and token_id in self.stop_token_ids:
                     leave_reason = str(token_id)
                 elif seq.num_completion_tokens == seq.max_tokens:
                     leave_reason = "max_tokens"
