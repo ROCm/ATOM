@@ -25,7 +25,10 @@ from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from torch import nn
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
-from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
+try:
+    from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
+except ImportError: # backward compatibility
+    gemm_a16wfp4_preshuffle = None
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 from atom.utils import envs
@@ -85,7 +88,14 @@ def gemm_a4w4_quant(x: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, w
             device=x.device,
         )
 
-        if not (m <= 256 and n == 7168 and k == 2048):
+        if gemm_a16wfp4_preshuffle is not None and (m <= 256 and n == 7168 and k == 2048): # check boundary
+            y = gemm_a16wfp4_preshuffle(
+                x, 
+                weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+                weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
+                y=y,
+            )
+        else:
             quant_func = get_hip_quant(QuantType.per_1x32)
             x, x_scale = quant_func(
                 x,
@@ -102,13 +112,6 @@ def gemm_a4w4_quant(x: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, w
                 x.view(torch.uint8), 
                 weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
                 x_scale, 
-                weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
-                y=y,
-            )
-        else:
-            y = gemm_a16wfp4_preshuffle(
-                x, 
-                weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
                 weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
                 y=y,
             )
