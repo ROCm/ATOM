@@ -216,6 +216,7 @@ class ModelRunner:
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
+        #quick test to see user in git config
         self.use_mla = self.is_deepseek_mla()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
