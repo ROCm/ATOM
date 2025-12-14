@@ -23,14 +23,26 @@ logger = logging.getLogger("atom")
 
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, model, skip_tokenizer=False, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get('data_parallel_size', 1)
         config = Config(model, **config_kwargs)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.bos_token_id = self.tokenizer.bos_token_id
-        config.eos_token_id = self.tokenizer.eos_token_id
+        
+        if skip_tokenizer:
+            # User must provide bos_token_id and eos_token_id when skipping tokenizer
+            self.tokenizer = None
+            if 'bos_token_id' not in kwargs or 'eos_token_id' not in kwargs:
+                raise ValueError(
+                    "When skip_tokenizer=True, you must provide bos_token_id and eos_token_id"
+                )
+            config.bos_token_id = kwargs['bos_token_id']
+            config.eos_token_id = kwargs['eos_token_id']
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+            config.bos_token_id = self.tokenizer.bos_token_id
+            config.eos_token_id = self.tokenizer.eos_token_id
+        
         # Set data parallel size in config
         config.parallel_config.data_parallel_size = data_parallel_size
         self.data_parallel_size = data_parallel_size
@@ -125,16 +137,29 @@ class InputOutputProcessor:
         self, prompt_or_tokens: str | list[int], sampling_params: SamplingParams, stream_callback=None
     ):
         """responsible for:
-        1) Tokenize
+        1) Tokenize (if tokenizer is available and input is string)
         2) Create Sequence object"""
-        tokens = (
-            self.tokenizer.encode(prompt_or_tokens)
-            if isinstance(prompt_or_tokens, str)
-            else prompt_or_tokens
-        )
+        if self.tokenizer is None:
+            # No tokenizer: input must be pre-tokenized
+            if isinstance(prompt_or_tokens, str):
+                raise ValueError(
+                    "When skip_tokenizer=True, input must be pre-tokenized (list[int]), not string"
+                )
+            tokens = prompt_or_tokens
+        else:
+            tokens = (
+                self.tokenizer.encode(prompt_or_tokens)
+                if isinstance(prompt_or_tokens, str)
+                else prompt_or_tokens
+            )
         
         stop_token_sequences = []
         if sampling_params.stop_strings:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "Cannot use stop_strings when skip_tokenizer=True. "
+                    "Use stop_token_ids in SamplingParams instead (if supported)."
+                )
             stops = [sampling_params.stop_strings] if isinstance(sampling_params.stop_strings, str) else sampling_params.stop_strings
             for stop_str in stops:
                 # Encode the full stop string as a sequence of tokens
@@ -153,11 +178,11 @@ class InputOutputProcessor:
     def postprocess(self, reqs: List[Sequence]):
         """responsible for:
         1) Compute stats for logging
-        2) Detokenize"""
+        2) Detokenize (if tokenizer is available)"""
         outputs = {}
         for req in reqs:
             self.requests.pop(req.id)
-            output_str = self.tokenizer.decode(req.completion_token_ids)
+            output_str = self.tokenizer.decode(req.completion_token_ids) if self.tokenizer else ""
             req.leave_time = time.time()
             
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
@@ -313,7 +338,7 @@ class AsyncLLMEngine(LLMEngine):
             latency = seq.leave_time - seq.arrive_time
         
         return {
-            "text": self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=True),
+            "text": self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=True) if self.tokenizer else "",
             "token_ids": seq.completion_token_ids.copy(), 
             "finished": seq.is_finished,
             "finish_reason": getattr(seq, "leave_reason", None),
