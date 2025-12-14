@@ -572,20 +572,20 @@ class ModelRunner:
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-        self.num_kvcache_blocks = (
+        num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
             // block_bytes
         ) // self.attn_metadata_builder.block_ratio
-        self.num_physical_kvcache_blocks = (
-            self.num_kvcache_blocks * self.attn_metadata_builder.block_ratio
-        )
-        assert self.num_kvcache_blocks > 0, f"need at least {block_bytes} KV cache"
-        return self.num_kvcache_blocks
+        assert num_kvcache_blocks > 0, f"need at least {block_bytes} KV cache"
+        return num_kvcache_blocks
 
     def allocate_kv_cache(self, num_kvcache_blocks):
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
+        self.num_physical_kvcache_blocks = (
+            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
+        )
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
             num_kv_heads = hf_config.num_key_value_heads // self.world_size
