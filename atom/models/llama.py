@@ -60,6 +60,10 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
 if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
@@ -105,8 +109,8 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        x = self.gate_up_proj(x)
+    def forward(self, x, x_scale: Optional[torch.Tensor] = None):
+        x = self.gate_up_proj(x, x_scale=x_scale)
         x = self.act_fn(x)
         x = self.down_proj(x)
         return x
@@ -203,8 +207,9 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
@@ -302,47 +307,63 @@ class LlamaDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         scale = self.self_attn.qkv_proj.input_scale
-        # if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-        #     #static FP8 quantization
-        #     weight = self.input_layernorm.weight
-        #     eps = self.input_layernorm.eps
-        #     if residual is None:
-        #         residual = hidden_states
-        #         hidden_states, _, _, _ = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
-        #                                             None, None, eps,
-        #                                             dtype_quant=rocm_aiter_fp8_dtype,
-        #                                             res1=None)
-        #     else:
-        #         hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
-        #                                             None, None, eps,
-        #                                             dtype_quant=rocm_aiter_fp8_dtype,
-        #                                             res1=residual)
-        # else:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+
+        if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+            # logger.info(f"loc1 ----- , scale = {scale}")
+            #static FP8 quantization
+            weight = self.input_layernorm.weight
+            eps = self.input_layernorm.eps
+            if residual is None:
+                residual = hidden_states
+                hidden_states, tmp_rms_out, _, _ = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+                                                    None, None, eps,
+                                                    dtype_quant=rocm_aiter_fp8_dtype,
+                                                    res1=None,
+                                                    output_unquantized_inp1=True)
+                logger.info(f"loc1, tmp_rms_out = {tmp_rms_out[0][0:128]}")
+            else:
+                hidden_states, tmp_rms_out, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+                                                    None, None, eps,
+                                                    dtype_quant=rocm_aiter_fp8_dtype,
+                                                    res1=residual,
+                                                    output_unquantized_inp1=True)
+                logger.info(f"loc2, tmp_rms_out = {tmp_rms_out[0][0:128]}")
+            x_scale=scale.view(1)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+                logger.info(f"loc1, hidden_states = {hidden_states[0][0:128]}")
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+                logger.info(f"loc2, hidden_states = {hidden_states[0][0:128]}")
+            x_scale=None
+        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states, x_scale=x_scale)
 
         # Fully Connected
+        scale = self.mlp.gate_up_proj.input_scale
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+            # logger.info(f"loc2 ----- , scale = {scale}")
             # Static FP8 quantization
             weight = self.post_attention_layernorm.weight
             eps = self.post_attention_layernorm.eps
-            hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+            hidden_states, tmp_rms_out, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
                                                 None, None, eps,
                                                 dtype_quant=rocm_aiter_fp8_dtype,
-                                                res1=residual)
+                                                res1=residual,
+                                                output_unquantized_inp1=True)
+            logger.info(f"loc3, tmp_rms_out = {tmp_rms_out[0][0:128]}")
+            x_scale=scale.view(1)
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-
-        hidden_states = self.mlp(hidden_states)
+            logger.info(f"loc3, hidden_states = {hidden_states[0][0:128]}")
+            x_scale=None
+        hidden_states = self.mlp(hidden_states, x_scale=x_scale)
         return hidden_states, residual
 
 
-@support_torch_compile
+# @support_torch_compile
 class LlamaModel(nn.Module):
     def __init__(
         self,
