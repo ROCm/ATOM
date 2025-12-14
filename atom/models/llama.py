@@ -62,8 +62,6 @@ from atom.models.utils import (
 from atom.utils import envs
 import logging
 
-logger = logging.getLogger(__name__)
-
 
 ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
 if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
@@ -309,7 +307,6 @@ class LlamaDecoderLayer(nn.Module):
         scale = self.self_attn.qkv_proj.input_scale
 
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-            # logger.info(f"loc1 ----- , scale = {scale}")
             #static FP8 quantization
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
@@ -319,33 +316,26 @@ class LlamaDecoderLayer(nn.Module):
                                                     None, None, eps,
                                                     dtype_quant=rocm_aiter_fp8_dtype,
                                                     res1=None,
-                                                    output_unquantized_inp1=True,
-                                                    intermediate_convert_to_inp1_type=True)
-                logger.info(f"loc1, tmp_rms_out = {tmp_rms_out[0][0:128]}")
+                                                    output_unquantized_inp1=True)
             else:
                 hidden_states, tmp_rms_out, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
                                                     None, None, eps,
                                                     dtype_quant=rocm_aiter_fp8_dtype,
                                                     res1=residual,
-                                                    output_unquantized_inp1=True,
-                                                    intermediate_convert_to_inp1_type=True)
-                logger.info(f"loc2, tmp_rms_out = {tmp_rms_out[0][0:128]}")
+                                                    output_unquantized_inp1=True)
             x_scale=scale.view(1)
         else:
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
-                logger.info(f"loc1, hidden_states = {hidden_states[0][0:128]}")
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
-                logger.info(f"loc2, hidden_states = {hidden_states[0][0:128]}")
             x_scale=None
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states, x_scale=x_scale)
 
         # Fully Connected
         scale = self.mlp.gate_up_proj.input_scale
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-            # logger.info(f"loc2 ----- , scale = {scale}")
             # Static FP8 quantization
             weight = self.post_attention_layernorm.weight
             eps = self.post_attention_layernorm.eps
@@ -353,14 +343,11 @@ class LlamaDecoderLayer(nn.Module):
                                                 None, None, eps,
                                                 dtype_quant=rocm_aiter_fp8_dtype,
                                                 res1=residual,
-                                                output_unquantized_inp1=True,
-                                                intermediate_convert_to_inp1_type=True)
-            logger.info(f"loc3, tmp_rms_out = {tmp_rms_out[0][0:128]}")
+                                                output_unquantized_inp1=True)
             x_scale=scale.view(1)
         else:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-            logger.info(f"loc3, hidden_states = {hidden_states[0][0:128]}")
             x_scale=None
         hidden_states = self.mlp(hidden_states, x_scale=x_scale)
         return hidden_states, residual
