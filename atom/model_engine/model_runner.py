@@ -32,7 +32,12 @@ from atom.utils import (
 from atom.utils.selector import get_attn_backend
 
 from aiter import destroy_dist_env, dtypes, init_dist_env
-from aiter.dist.parallel_state import get_dp_group, get_tp_group, graph_capture, get_pp_group
+from aiter.dist.parallel_state import (
+    get_dp_group,
+    get_pp_group,
+    get_tp_group,
+    graph_capture,
+)
 from aiter.dist.utils import get_distributed_init_method
 
 logger = logging.getLogger("atom")
@@ -309,6 +314,7 @@ class ModelRunner:
         torch.set_default_device(self.device)
         self.allocate_forward_vars()
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
+        self.physical_block_size = self.attn_metadata_builder.block_size
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
         torch.set_default_device("cpu")
@@ -544,7 +550,7 @@ class ModelRunner:
         if self.use_mla:
             block_bytes = (
                 hf_config.num_hidden_layers
-                * self.block_size
+                * self.physical_block_size
                 * 576
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
@@ -553,7 +559,7 @@ class ModelRunner:
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
                 block_bytes += (
                     hf_config.num_hidden_layers
-                    * self.block_size
+                    * self.physical_block_size
                     * aligned_index_dim
                     * dtypes.fp8.itemsize
                 )
@@ -561,17 +567,20 @@ class ModelRunner:
             block_bytes = (
                 2
                 * hf_config.num_hidden_layers
-                * self.block_size
+                * self.physical_block_size
                 * num_kv_heads
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-        num_kvcache_blocks = (
+        self.num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
             // block_bytes
+        ) // self.attn_metadata_builder.block_ratio
+        self.num_physical_kvcache_blocks = (
+            self.num_kvcache_blocks * self.attn_metadata_builder.block_ratio
         )
-        assert num_kvcache_blocks > 0, f"need at least {block_bytes} KV cache"
-        return num_kvcache_blocks
+        assert self.num_kvcache_blocks > 0, f"need at least {block_bytes} KV cache"
+        return self.num_kvcache_blocks
 
     def allocate_kv_cache(self, num_kvcache_blocks):
         config = self.config
@@ -586,19 +595,21 @@ class ModelRunner:
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
-        if self.config.speculative_config and hasattr(self, 'drafter'):
+        if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
             # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
-            num_draft_layers = getattr(draft_hf_config, 'num_nextn_predict_layers', 1)
+            num_draft_layers = getattr(draft_hf_config, "num_nextn_predict_layers", 1)
             total_num_layers += num_draft_layers
-            logger.info(f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
-                       f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers")
+            logger.info(
+                f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
+                f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
+            )
 
         if self.use_mla:
             self.kv_cache = torch.zeros(
                 total_num_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
                 576,
                 dtype=dtypes.d_dtypes[config.kv_cache_dtype],
                 device="cuda",
@@ -610,8 +621,8 @@ class ModelRunner:
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
                 self.index_cache = torch.zeros(
                     hf_config.num_hidden_layers,
-                    config.num_kvcache_blocks,
-                    self.block_size,
+                    self.num_physical_kvcache_blocks,
+                    self.physical_block_size,
                     aligned_index_dim,
                     dtype=dtypes.fp8,
                     device="cuda",
@@ -620,8 +631,8 @@ class ModelRunner:
             self.kv_cache = torch.zeros(
                 2,
                 hf_config.num_hidden_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
                 num_kv_heads,
                 hf_config.head_dim,
                 dtype=dtypes.d_dtypes[config.kv_cache_dtype],
@@ -631,8 +642,8 @@ class ModelRunner:
             self.kv_scale = torch.zeros(
                 2,
                 hf_config.num_hidden_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
                 num_kv_heads,
                 dtype=dtypes.fp32,
                 device="cuda",
@@ -644,14 +655,16 @@ class ModelRunner:
 
         # Prepare list of models to bind KV cache
         models_to_bind = [("target", self.model)]
-        if self.config.speculative_config and hasattr(self, 'drafter'):
+        if self.config.speculative_config and hasattr(self, "drafter"):
             models_to_bind.append(("draft", self.drafter.model))
 
         kv_cache_tensors = []
         layer_id = 0
         x = 16 // self.kv_cache.element_size()
         for model_name, model in models_to_bind:
-            logger.info(f"Binding KV cache for {model_name} model starting at layer_id={layer_id}")
+            logger.info(
+                f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
+            )
 
             for module in model.modules():
                 # Since use attention base and there are child in attention, add base condition
@@ -659,17 +672,17 @@ class ModelRunner:
                     if hasattr(module, "use_mla") and not module.use_mla:
                         # Non-MLA attention
                         k_cache = self.kv_cache[0, layer_id].view(
-                            config.num_kvcache_blocks,
+                            self.num_physical_kvcache_blocks,
                             num_kv_heads,
                             hf_config.head_dim // x,
-                            self.block_size,
+                            self.physical_block_size,
                             x,
                         )
                         v_cache = self.kv_cache[1, layer_id].view(
-                            config.num_kvcache_blocks,
+                            self.num_physical_kvcache_blocks,
                             num_kv_heads,
                             hf_config.head_dim,
-                            self.block_size,
+                            self.physical_block_size,
                         )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":
@@ -696,7 +709,7 @@ class ModelRunner:
                     elif hasattr(module, "use_mla") and module.use_mla:
                         # MLA attention
                         kv_cache = self.kv_cache[layer_id].view(
-                            config.num_kvcache_blocks * self.block_size,
+                            self.num_physical_kvcache_blocks * self.physical_block_size,
                             1,
                             576,
                         )
@@ -706,7 +719,8 @@ class ModelRunner:
                             module.indexer.k_cache.kv_cache[0] = self.index_cache[
                                 layer_id
                             ].view(
-                                config.num_kvcache_blocks * self.block_size,
+                                self.num_physical_kvcache_blocks
+                                * self.physical_block_size,
                                 1,
                                 aligned_index_dim,
                             )
