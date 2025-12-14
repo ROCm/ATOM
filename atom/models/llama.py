@@ -319,14 +319,16 @@ class LlamaDecoderLayer(nn.Module):
                                                     None, None, eps,
                                                     dtype_quant=rocm_aiter_fp8_dtype,
                                                     res1=None,
-                                                    output_unquantized_inp1=True)
+                                                    output_unquantized_inp1=True,
+                                                    intermediate_convert_to_inp1_type=True)
                 logger.info(f"loc1, tmp_rms_out = {tmp_rms_out[0][0:128]}")
             else:
                 hidden_states, tmp_rms_out, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
                                                     None, None, eps,
                                                     dtype_quant=rocm_aiter_fp8_dtype,
                                                     res1=residual,
-                                                    output_unquantized_inp1=True)
+                                                    output_unquantized_inp1=True,
+                                                    intermediate_convert_to_inp1_type=True)
                 logger.info(f"loc2, tmp_rms_out = {tmp_rms_out[0][0:128]}")
             x_scale=scale.view(1)
         else:
@@ -351,7 +353,8 @@ class LlamaDecoderLayer(nn.Module):
                                                 None, None, eps,
                                                 dtype_quant=rocm_aiter_fp8_dtype,
                                                 res1=residual,
-                                                output_unquantized_inp1=True)
+                                                output_unquantized_inp1=True,
+                                                intermediate_convert_to_inp1_type=True)
             logger.info(f"loc3, tmp_rms_out = {tmp_rms_out[0][0:128]}")
             x_scale=scale.view(1)
         else:
