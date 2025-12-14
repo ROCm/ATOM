@@ -3,6 +3,9 @@
 
 from functools import partial as functools_partial
 from typing import Callable, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn.functional as F
@@ -248,11 +251,17 @@ class LinearBase(nn.Module):
                 if self.quant_type.value == QuantType.per_1x128.value:
                     quant_func = functools_partial(quant_func, transpose_scale=True)
                 if self.quant_type.value != QuantType.per_1x32.value:
+
                     x, x_scale = quant_func(
                         x,
                         quant_dtype=self.params_dtype,
                         scale=getattr(self, "input_scale", None),
                     )
+            
+            # logger.info(f"x_scale_shape = {x_scale.shape}, type = {x_scale.dtype}")
+            # logger.info(f"x_shape = {x.shape}, type = {x.dtype}")
+            # logger.info(f"weight_shape = {self.weight.shape}, type = {self.weight.dtype}")
+            # logger.info(f"weight_scale_shape = {self.weight_scale.shape}, type = {self.weight_scale.dtype}")
             if self.quant_type.value == QuantType.per_Tensor.value:
                 y = tgemm.mm(
                     x,
