@@ -186,6 +186,8 @@ class Attention(nn.Module):
                         )
 
         if use_triton_unified_attention:
+            o_pa = torch.empty_like(q)
+            o_unified = torch.empty_like(q)
             o_tmp = torch.empty_like(q)
             o = torch.empty_like(q)
             descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
@@ -238,8 +240,11 @@ class Attention(nn.Module):
                     #print(q.shape)
                     
                     pa_decode_gluon(
+                        o_pa,
                         o_tmp,
                         q,
+                        q,
+                        None,
                         k_cache,
                         v_cache,
                         attn_metadata.context_lens,
@@ -247,6 +252,7 @@ class Attention(nn.Module):
                         self.scale,
                         1, # query_lenth
                         max_context_length, # max_context_len
+                        context_partition_size,
                         tl.bfloat16, #compute_type
                         None,
                         self.one_scale,
@@ -258,6 +264,9 @@ class Attention(nn.Module):
                         sinks=self.sinks,
                         sliding_window=sliding_window,
                     )
+                    pa_key_cache = k_cache
+                    pa_value_cache = v_cache
+
                     # gt
                     k_cache = k_cache.transpose(-1, -2).contiguous().view(-1, 8, 64, 16).permute(0,3,1,2).contiguous()
                     v_cache = v_cache.permute(0,3,1,2).contiguous()
@@ -282,6 +291,27 @@ class Attention(nn.Module):
                         v_descale=self.one_scale.expand(descale_shape),
                         sinks=self.sinks,
                     )
+
+                    # pa_data = {
+                    #     "o": o_pa.detach(),
+                    #     "o_unified": o.detach(),
+                    #     "q_arg3": q.detach(),
+                    #     "q_arg4": q.detach(),
+                    #     "k_cache": pa_key_cache.detach(),
+                    #     "v_cache": pa_value_cache.detach(),
+                    #     "context_lens": attn_metadata.context_lens.detach(),
+                    #     "block_tables": attn_metadata.block_tables.detach(),
+                    #     "scale": float(self.scale),
+                    #     "max_context_length": int(max_context_length),
+                    #     "context_partition_size": int(context_partition_size),
+                    #     "exp_sums": exp_sums.detach(),
+                    #     "max_logits": max_logits.detach(),
+                    #     "temporary_output": temporary_output.detach(),
+                    #     "sinks": None if self.sinks is None else self.sinks.detach(),
+                    #     "sliding_window": int(sliding_window),
+                    # }
+                    # torch.save(pa_data, "upstream_pa_data.pt")
+
                 else:
                     #if q.shape[0]>1024:
                     #   print("a")
@@ -337,6 +367,6 @@ class Attention(nn.Module):
                 out_=None,
                 high_precision=0,
             )
-        print(o.double().mean(), o.double().std(), o_tmp.double().mean(), o_tmp.double().std())
+        # print(o.double().mean(), o.double().std(), o_tmp.double().mean(), o_tmp.double().std())
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
