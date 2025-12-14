@@ -126,10 +126,11 @@ class RMSNorm(nn.Module):
         # if quick all_reduce is used, then do not fuse rmsnorm
         # otherwise, use fused_allreduce_rmsnorm
         # https://github.com/ROCm/aiter/blob/d263d4411d8312dd9291e9e4130c973a7c3f1b04/aiter/dist/device_communicators/communicator_cuda.py#L142
+        num_tokens = x.size(0)
         if (
             self.fused_allreduce
             and self.qr_comm is not None
-            and self.qr_comm.should_quick_allreduce(x)
+            and num_tokens > 512
         ):
             ar_out = self.qr_comm.quick_all_reduce(x)
             assert ar_out is not None, "Quick all-reduce failed to return output!"
