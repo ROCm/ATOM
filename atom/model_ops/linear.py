@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -385,12 +388,22 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
         tp_size = get_tp_group().world_size
         self.num_heads = divide(self.total_num_heads, tp_size)
-        self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        
         input_size = hidden_size
         output_sizes = [
-            self.total_num_heads * self.head_size,
-            self.total_num_kv_heads * self.head_size,
-            self.total_num_kv_heads * self.head_size,
+            self.num_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.head_size * tp_size,
         ]
 
         super().__init__(
@@ -408,14 +421,17 @@ class QKVParallelLinear(ColumnParallelLinear):
         if loaded_shard_id == "q":
             shard_size = self.num_heads * self.head_size
             shard_offset = 0
+            shard_rank = self.tp_rank
         elif loaded_shard_id == "k":
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size
+            shard_rank = self.tp_rank // self.num_kv_head_replicas
         else:
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = (
                 self.num_heads * self.head_size + self.num_kv_heads * self.head_size
             )
+            shard_rank = self.tp_rank // self.num_kv_head_replicas
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
         ):
@@ -427,8 +443,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_offset = ["q", "k", "v"].index(loaded_shard_id)
                 shard_size = 1
 
+        start_idx = shard_rank * shard_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
 
 

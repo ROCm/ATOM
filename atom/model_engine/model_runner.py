@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 import logging
 import os
 import time
@@ -7,38 +10,45 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
-from aiter.dist.utils import get_distributed_init_method
-from aiter import destroy_dist_env, dtypes, init_dist_env
-from aiter.dist.parallel_state import graph_capture, get_tp_group
-from atom.config import Config, set_current_atom_config, KVCacheTensor
+from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.sampler import Sampler
-from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.deepseek_v2 import DeepseekV2ForCausalLM
+from atom.models.gpt_oss import GptOssForCausalLM
 from atom.models.llama import LlamaForCausalLM
 from atom.models.mixtral import MixtralForCausalLM
 from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.utils import CpuGpuBuffer, init_exit_handler, get_hf_text_config
+from atom.models.qwen3_moe import Qwen3MoeForCausalLM
+from atom.spec_decode.eagle import EagleProposer
+from atom.utils import (
+    CpuGpuBuffer,
+    envs,
+    get_hf_text_config,
+    get_open_port,
+    init_exit_handler,
+)
 from atom.utils.selector import get_attn_backend
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.utils import CpuGpuBuffer, envs, init_exit_handler, get_hf_text_config
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
+
+from aiter import destroy_dist_env, dtypes, init_dist_env
+from aiter.dist.parallel_state import get_dp_group, get_tp_group, graph_capture, get_pp_group
+from aiter.dist.utils import get_distributed_init_method
 
 logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
+    DPMetadata,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
-    DPMetadata,
 )
 
-suppot_model_arch_dict = {
+support_model_arch_dict = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
+    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "LlamaForCausalLM": LlamaForCausalLM,
     "MixtralForCausalLM": MixtralForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
@@ -94,17 +104,17 @@ class tokenIDProcessor:
     ) -> dict[int, int]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
-            seq_ids = batch.seqs.keys()
-            ret = {seq_id: token_id for seq_id, token_id in zip(seq_ids, token_ids)}
+            req_ids = batch.req_ids
+            ret = {seq_id: token_id for seq_id, token_id in zip(req_ids, token_ids)}
             ret[-1] = 0
             return ret
         token_ids = self.recv_async_output()
         self.send_to_cpu_async(sampled_token_ids)
 
         if self.prev_batch is not None:
-            seq_ids = self.prev_batch.seqs.keys()
+            req_ids = self.prev_batch.req_ids
             token_ids = {
-                seq_id: token_id for seq_id, token_id in zip(seq_ids, token_ids)
+                seq_id: token_id for seq_id, token_id in zip(req_ids, token_ids)
             }
         else:
             # first time, no previous tokens
@@ -119,8 +129,8 @@ class tokenIDProcessor:
         token_ids = self.prev_token_ids
         deferred_prev_indices = [
             i
-            for i, seq_id in enumerate(self.prev_batch.seqs.keys())
-            if seq_id in batch.seqs
+            for i, seq_id in enumerate(self.prev_batch.req_ids)
+            if seq_id in batch.req_ids
         ]
         return (
             deferred_prev_indices,
@@ -136,7 +146,7 @@ class tokenIDProcessor:
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
-        seqs = list(batch.seqs.values())
+        scheduled_tokens = batch.scheduled_tokens  # tokens per req
         token_nums = batch.num_scheduled_tokens
         total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
@@ -145,12 +155,10 @@ class tokenIDProcessor:
         total_reqs_decode = batch.total_seqs_num_decode
         """for prefill: all input ids are new"""
         start_loc = 0
-        for seq, new_token_num in zip(
-            seqs[:total_reqs_prefill], token_nums[:total_reqs_prefill]
+        for tokens, new_token_num in zip(
+            scheduled_tokens[:total_reqs_prefill], token_nums[:total_reqs_prefill]
         ):
-            self.input_ids.np[start_loc : start_loc + new_token_num] = seq[
-                seq.num_cached_tokens :
-            ]
+            self.input_ids.np[start_loc : start_loc + new_token_num] = tokens
             start_loc += new_token_num
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
@@ -160,10 +168,11 @@ class tokenIDProcessor:
 
         if not self.is_deferred_out:
             token_ids = [
-                seq.token_ids[-1]
-                for seq in seqs[
+                token
+                for tokens in scheduled_tokens[
                     total_reqs_prefill : total_reqs_prefill + total_reqs_decode
                 ]
+                for token in tokens
             ]
             self.input_ids.np[:total_tokens_decode] = token_ids
             self.input_ids.copy_to_gpu(total_tokens_decode)
@@ -176,10 +185,11 @@ class tokenIDProcessor:
             num_norm_tokens = total_tokens_decode - num_deferred_tokens
             if num_norm_tokens > 0:
                 token_ids = [
-                    seq.token_ids[-1]
-                    for seq in seqs[
+                    token
+                    for tokens in scheduled_tokens[
                         total_reqs_prefill : total_reqs_prefill + num_norm_tokens
                     ]
+                    for token in tokens
                 ]
                 self.input_ids.np[:num_norm_tokens] = token_ids
                 self.input_ids.copy_to_gpu(num_norm_tokens)
@@ -238,7 +248,7 @@ class ModelRunner:
             f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, local_device_rank={local_device_rank}, device={device}"
         )
         self.device = device
-        
+
         # Initialize profiler for this rank
         self.profiler = None
         self.profiler_dir = None
@@ -254,7 +264,7 @@ class ModelRunner:
         os.environ["MASTER_PORT"] = str(self.config.port)
         distributed_init_method = get_distributed_init_method(
             config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_base_port,
+            config.parallel_config.data_parallel_master_port,
         )
         init_dist_env(
             config.tensor_parallel_size,
@@ -265,11 +275,7 @@ class ModelRunner:
             data_parallel_rank=config.parallel_config.data_parallel_rank,
         )
         init_exit_handler(self)
-        default_dtype = (
-            hf_config.torch_dtype
-            if getattr(hf_config, "torch_dtype", None) is not None
-            else torch.bfloat16
-        )
+        default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
         self.attn_backend = get_attn_backend(
@@ -280,6 +286,8 @@ class ModelRunner:
             self.config.max_num_batched_tokens, self.device
         )
         self.sampler = Sampler()
+        if self.config.speculative_config and get_pp_group().is_last_rank:
+            self.drafter = EagleProposer(self.config, self.device, self)
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -289,12 +297,15 @@ class ModelRunner:
             dtype=np.int64,
         )
         self.async_output_copy_stream = torch.cuda.Stream()
-        self.model = suppot_model_arch_dict[hf_config.architectures[0]](config)
+        self.model = support_model_arch_dict[hf_config.architectures[0]](config)
         self.use_kv_indptr = False
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
         if isinstance(self.model, DeepseekV2ForCausalLM):
             self.use_kv_indptr = True
+        if hasattr(self, "drafter"):
+            logger.info("Loading drafter model...")
+            self.drafter.load_model(self.model)
         torch.set_default_device(self.device)
         self.allocate_forward_vars()
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
@@ -365,16 +376,23 @@ class ModelRunner:
         return True
 
     def start_profiler(self):
-        """Start profiling for this rank"""
+        """
+        Start profiling for this rank.
+
+        The ATOM_PROFILER_MORE environment variable controls detailed profiling features:
+        - Set to "1" to enable record_shapes, with_stack, and profile_memory.
+        - Set to "0" or unset to disable these features (default).
+        """
         if self.profiler_dir is not None and self.profiler is None:
+            enable_detailed_profiling = os.environ.get("ATOM_PROFILER_MORE", "0") == "1"
             self.profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=True,
-                with_stack=True,
-                profile_memory=True,
+                record_shapes=enable_detailed_profiling,
+                with_stack=enable_detailed_profiling,
+                profile_memory=enable_detailed_profiling,
                 on_trace_ready=torch_profiler.tensorboard_trace_handler(
                     self.profiler_dir, use_gzip=True
                 ),
@@ -389,7 +407,7 @@ class ModelRunner:
         return True
 
     def dummy_execution(self):
-        """Execute dummy decode batch for DP synchronization. """
+        """Execute dummy decode batch for DP synchronization."""
         num_tokens_original = 1
 
         seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
@@ -400,7 +418,7 @@ class ModelRunner:
 
         dummy_batch = ScheduledBatch(
             seqs={seq.id: seq},
-            num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32), 
+            num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32),
             total_tokens_num=num_tokens_original,  # original value
             total_tokens_num_decode=num_tokens_original,
             total_seqs_num=1,
@@ -435,7 +453,9 @@ class ModelRunner:
         logits = self.run_model(input_ids)
 
         reset_forward_context()
-        logger.debug(f"{self.label}: dummy batch executed with {num_input_tokens} tokens")
+        logger.debug(
+            f"{self.label}: dummy batch executed with {num_input_tokens} tokens"
+        )
         return True
 
     def warmup_model(self):
@@ -448,11 +468,9 @@ class ModelRunner:
         )
         dp_size = get_dp_group().world_size
         warmup_max_tokens = max_num_batched_tokens // dp_size
-        
-        num_seqs = min(
-            warmup_max_tokens // max_model_len, self.config.max_num_seqs
-        )
-        
+
+        num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
+
         if num_seqs == 0:
             num_seqs = 1
             seq_len = min(warmup_max_tokens, max_model_len)
@@ -466,8 +484,7 @@ class ModelRunner:
             seq_len = max_model_len
 
         seqs = [
-            Sequence([0] * seq_len, block_size=self.block_size)
-            for _ in range(num_seqs)
+            Sequence([0] * seq_len, block_size=self.block_size) for _ in range(num_seqs)
         ]
         seqs = {seq.id: seq for seq in seqs}
 
@@ -518,7 +535,12 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         torch.set_default_device("cpu")
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            assert hf_config.num_key_value_heads % self.world_size == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            assert self.world_size % hf_config.num_key_value_heads == 0
+            num_kv_heads = 1
         if self.use_mla:
             block_bytes = (
                 hf_config.num_hidden_layers
@@ -555,10 +577,26 @@ class ModelRunner:
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            assert hf_config.num_key_value_heads % self.world_size == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            assert self.world_size % hf_config.num_key_value_heads == 0
+            num_kv_heads = 1
+
+        # Calculate total number of layers (target + draft)
+        total_num_layers = hf_config.num_hidden_layers
+        if self.config.speculative_config and hasattr(self, 'drafter'):
+            draft_hf_config = self.config.speculative_config.draft_model_hf_config
+            # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
+            num_draft_layers = getattr(draft_hf_config, 'num_nextn_predict_layers', 1)
+            total_num_layers += num_draft_layers
+            logger.info(f"Allocating KV cache for {hf_config.num_hidden_layers} target layers + "
+                       f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers")
+
         if self.use_mla:
             self.kv_cache = torch.zeros(
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 config.num_kvcache_blocks,
                 self.block_size,
                 576,
@@ -603,79 +641,88 @@ class ModelRunner:
         # lirong TODO: This is a simple solution to build KVCacheConfig,
         # models with only one type of attention, but not support multi-type of attention models.
         # We need to support it by kv_cache_group in the future.
+
+        # Prepare list of models to bind KV cache
+        models_to_bind = [("target", self.model)]
+        if self.config.speculative_config and hasattr(self, 'drafter'):
+            models_to_bind.append(("draft", self.drafter.model))
+
         kv_cache_tensors = []
         layer_id = 0
         x = 16 // self.kv_cache.element_size()
-        for module in self.model.modules():
-            # Since use attention base and there are child in attention, add base condition
-            if hasattr(module, "base_attention"):
-                if hasattr(module, "use_mla") and not module.use_mla:
-                    # Non-MLA attention
-                    k_cache = self.kv_cache[0, layer_id].view(
-                        config.num_kvcache_blocks,
-                        num_kv_heads,
-                        hf_config.head_dim // x,
-                        self.block_size,
-                        x,
-                    )
-                    v_cache = self.kv_cache[1, layer_id].view(
-                        config.num_kvcache_blocks,
-                        num_kv_heads,
-                        hf_config.head_dim,
-                        self.block_size,
-                    )
-                    module.max_model_len = self.config.max_model_len
-                    if config.kv_cache_dtype == "fp8":
-                        module.k_scale = self.kv_scale[0, layer_id]
-                        module.v_scale = self.kv_scale[1, layer_id]
+        for model_name, model in models_to_bind:
+            logger.info(f"Binding KV cache for {model_name} model starting at layer_id={layer_id}")
 
-                    k_scale = module.k_scale
-                    v_scale = module.v_scale
+            for module in model.modules():
+                # Since use attention base and there are child in attention, add base condition
+                if hasattr(module, "base_attention"):
+                    if hasattr(module, "use_mla") and not module.use_mla:
+                        # Non-MLA attention
+                        k_cache = self.kv_cache[0, layer_id].view(
+                            config.num_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim // x,
+                            self.block_size,
+                            x,
+                        )
+                        v_cache = self.kv_cache[1, layer_id].view(
+                            config.num_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim,
+                            self.block_size,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        if config.kv_cache_dtype == "fp8":
+                            module.k_scale = self.kv_scale[0, layer_id]
+                            module.v_scale = self.kv_scale[1, layer_id]
 
-                    # Store in KVCacheTensor
-                    kv_cache_tensor = KVCacheTensor(
-                        layer_num=layer_id,
-                        k_cache=k_cache,
-                        v_cache=v_cache,
-                        k_scale=k_scale,
-                        v_scale=v_scale,
-                    )
-                    kv_cache_tensors.append(kv_cache_tensor)
+                        k_scale = module.k_scale
+                        v_scale = module.v_scale
 
-                    module.k_cache = k_cache
-                    module.v_cache = v_cache
+                        # Store in KVCacheTensor
+                        kv_cache_tensor = KVCacheTensor(
+                            layer_num=layer_id,
+                            k_cache=k_cache,
+                            v_cache=v_cache,
+                            k_scale=k_scale,
+                            v_scale=v_scale,
+                        )
+                        kv_cache_tensors.append(kv_cache_tensor)
 
-                    layer_id += 1
-                elif hasattr(module, "use_mla") and module.use_mla:
-                    # MLA attention
-                    kv_cache = self.kv_cache[layer_id].view(
-                        config.num_kvcache_blocks * self.block_size,
-                        1,
-                        576,
-                    )
-                    module.max_model_len = self.config.max_model_len
-                    if self.is_deepseek_v32 and module.indexer is not None:
-                        # Use aligned dimension to avoid memory copy in torch inductor
-                        module.indexer.k_cache.kv_cache[0] = self.index_cache[
-                            layer_id
-                        ].view(
+                        module.k_cache = k_cache
+                        module.v_cache = v_cache
+
+                        layer_id += 1
+                    elif hasattr(module, "use_mla") and module.use_mla:
+                        # MLA attention
+                        kv_cache = self.kv_cache[layer_id].view(
                             config.num_kvcache_blocks * self.block_size,
                             1,
-                            aligned_index_dim,
+                            576,
                         )
-                    # Store in KVCacheTensor
-                    kv_cache_tensor = KVCacheTensor(
-                        layer_num=layer_id,
-                        k_cache=kv_cache,
-                        v_cache=None,
-                        k_scale=None,
-                        v_scale=None,
-                    )
-                    kv_cache_tensors.append(kv_cache_tensor)
+                        module.max_model_len = self.config.max_model_len
+                        if self.is_deepseek_v32 and module.indexer is not None:
+                            # Use aligned dimension to avoid memory copy in torch inductor
+                            module.indexer.k_cache.kv_cache[0] = self.index_cache[
+                                layer_id
+                            ].view(
+                                config.num_kvcache_blocks * self.block_size,
+                                1,
+                                aligned_index_dim,
+                            )
+                        # Store in KVCacheTensor
+                        kv_cache_tensor = KVCacheTensor(
+                            layer_num=layer_id,
+                            k_cache=kv_cache,
+                            v_cache=None,
+                            k_scale=None,
+                            v_scale=None,
+                        )
+                        kv_cache_tensors.append(kv_cache_tensor)
 
-                    module.kv_cache = kv_cache
-                    module.max_model_len = self.config.max_model_len
-                    layer_id += 1
+                        module.kv_cache = kv_cache
+                        module.max_model_len = self.config.max_model_len
+                        layer_id += 1
 
         # Store KVCacheConfig
         kv_cache_data = {
@@ -723,9 +770,6 @@ class ModelRunner:
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
-            seqs = list(batch.seqs.values())
-            seqs = seqs[batch.total_seqs_num_prefill :]
-            assert len(seqs) == scheduled_bs
             bs = (
                 scheduled_bs
                 if self.enforce_eager
@@ -749,7 +793,7 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=bs,
         )
-        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)        
+        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
         actual_num_tokens = batch.total_tokens_num
         set_forward_context(
             attn_metadata=attn_metadata,
@@ -761,10 +805,9 @@ class ModelRunner:
         return num_input_tokens
 
     def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
-        temperatures = [seq.temperature for seq in batch.seqs.values()]
         bs = batch.total_seqs_num
         buffer = self.forward_vars["temperatures"]
-        buffer.np[:bs] = temperatures
+        buffer.np[:bs] = batch.temperatures
         return buffer.copy_to_gpu(bs)
 
     def prepare_model(self, batch: ScheduledBatch):

@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 from copy import copy
 from enum import Enum, auto
 from itertools import count
-from typing import Optional, Callable, Any
+from typing import Any, Callable, Optional
 
 from atom.sampling_params import SamplingParams
 
@@ -29,15 +32,16 @@ class Sequence:
     counter = count()
 
     def __init__(
-        self, 
-        token_ids: list[int], 
-        block_size: int, 
-        sampling_params=SamplingParams(), 
-        stop_token_sequences: list[list[int]] = None, 
-        stream_callback: Optional[Callable[[Any], None]] = None
+        self,
+        token_ids: list[int],
+        block_size: int,
+        sampling_params=SamplingParams(),
+        stop_token_sequences: list[list[int]] = None,
+        stream_callback: Optional[Callable[[Any], None]] = None,
+        id=None,
     ):
         self.block_size = block_size
-        self.id = next(Sequence.counter)
+        self.id = id or next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
         self.token_ids = copy(token_ids)
@@ -54,7 +58,7 @@ class Sequence:
 
         # stream callback
         self.stream_callback = stream_callback
-        self.output_tokens = [] # cache for newly generate tokens
+        self.output_tokens = []  # cache for newly generate tokens
 
         # statistics fields
         self.arrive_time = 0.0
@@ -70,14 +74,16 @@ class Sequence:
 
     @property
     def num_tokens(self):
-        '''The total number of tokens in the sequence. i.e. prompt + completion'''
+        """The total number of tokens in the sequence. i.e. prompt + completion"""
         return self._num_tokens
 
     @num_tokens.setter
     def num_tokens(self, value):
         self._num_tokens = value
         self.num_blocks = (value + self.block_size - 1) // self.block_size
-        self.last_block_num_tokens = self._num_tokens - (self.num_blocks - 1) * self.block_size
+        self.last_block_num_tokens = (
+            self._num_tokens - (self.num_blocks - 1) * self.block_size
+        )
 
     @property
     def is_finished(self):

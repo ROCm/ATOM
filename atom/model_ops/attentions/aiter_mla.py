@@ -1,19 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+import itertools
 from dataclasses import dataclass
-from typing import Type, Optional
+from typing import Optional, Type
 
+import numpy as np
+import torch
 from atom.config import KVCacheConfig, KVCacheTensor
-from atom.utils.forward_context import AttentionMetaData, Context
-from .backends import CommonAttentionBuilder, AttentionBackend
-import torch
-import numpy as np
-
-import numpy as np
-import torch
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
-from aiter import get_mla_metadata_v1, get_mla_metadata_info_v1, dtypes
-from aiter.dist.parallel_state import get_tp_group
 from atom.utils import CpuGpuBuffer
+from atom.utils.forward_context import AttentionMetaData, Context
+
+from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter.dist.parallel_state import get_tp_group
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -152,12 +153,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = super().prepare_prefill(batch)
         bs = batch.total_seqs_num_prefill
-        seqs = list(batch.seqs.values())
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
         if self.is_sparse:
             if attn_metadata.block_tables is None:
-                self.prepare_block_tables(seqs)
+                self.prepare_block_tables(batch)
                 attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
             var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
                 np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
@@ -176,15 +176,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
-        seqs = list(batch.seqs.values())
         dropout_p = 0.0
         max_q_len = 1
 
-        context_lens = [seq.num_tokens for seq in seqs]
+        context_lens = batch.context_lens
         positions = [i - 1 for i in context_lens]
         slot_mapping = [
-            seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-            for seq in seqs
+            block_table[-1] * self.block_size + last_block_num - 1
+            for block_table, last_block_num in zip(
+                batch.block_tables, batch.last_block_num_tokens
+            )
         ]
 
         var = self.model_runner.forward_vars
@@ -194,18 +195,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
 
-        sum_blocks = 0
-        for seq in seqs:
-            var["kv_indices"].np[
-                sum_blocks : sum_blocks + seq.num_blocks
-            ] = seq.block_table
-            sum_blocks += seq.num_blocks
-        kv_indptr = np.cumsum([seq.num_blocks for seq in seqs])
+        num_blocks_per_seq = [
+            (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
+        ]
+        kv_indptr = np.cumsum(num_blocks_per_seq)
+        sum_blocks = kv_indptr[-1]
+
+        def prepare_kv_indices():
+            var["kv_indices"].np[:sum_blocks] = np.fromiter(
+                itertools.chain.from_iterable(batch.block_tables),
+                dtype=np.int32,
+                count=sum_blocks,
+            )
+
+        prepare_kv_indices()
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
-        var["kv_last_page_lens"].np[:scheduled_bs] = [
-            seq.last_block_num_tokens for seq in seqs
-        ]
+        var["kv_last_page_lens"].np[:scheduled_bs] = batch.last_block_num_tokens
         var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
         vars_used = [
             ("slot_mapping", bs),  # TODO: MTP support
@@ -216,7 +222,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ("kv_last_page_lens", bs),
         ]
         if self.is_sparse:
-            self.prepare_block_tables(seqs)
+            self.prepare_block_tables(batch)
             vars_used.append(("block_tables", bs))
             index_topk = self.index_topk
             sparse_context_lens = np.clip(var["context_lens"].np[:bs], None, index_topk)

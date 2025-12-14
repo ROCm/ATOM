@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 # from flash_attn import flash_attn_with_kvcache
 from dataclasses import dataclass
 
@@ -57,6 +60,7 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         position: torch.Tensor = None,
+        q_scale: torch.Tensor=None,
     ):
         o: torch.Tensor
         q = q.view(-1, self.num_heads, self.head_dim)

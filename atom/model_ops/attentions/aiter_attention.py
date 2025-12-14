@@ -1,13 +1,16 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 from dataclasses import dataclass
-from typing import Type, Optional
+from typing import Optional, Type
 
-from atom.utils.forward_context import AttentionMetaData, Context
-from .backends import CommonAttentionBuilder, AttentionBackend
-import torch
 import numpy as np
-
+import torch
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
+from atom.utils.forward_context import AttentionMetaData, Context
+
+from .backends import AttentionBackend, CommonAttentionBuilder
 
 
 class AiterBackend(AttentionBackend):
@@ -32,27 +35,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
-        seqs = list(batch.seqs.values())
         self.total_blocks = 0
         dropout_p = 0.0
         max_q_len = 1
         min_seqlen_q = 0
 
-        context_lens = [seq.num_tokens for seq in seqs]
+        context_lens = batch.context_lens
         max_seqlen_k = max(context_lens)
         positions = [i - 1 for i in context_lens]
         slot_mapping = [
-            seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-            for seq in seqs
+            block_table[-1] * self.block_size + last_block_num - 1
+            for block_table, last_block_num in zip(
+                batch.block_tables, batch.last_block_num_tokens
+            )
         ]
         slot_mapping.extend([-1] * (bs - scheduled_bs))
 
-        var = self.model_runner.forward_vars
-        block_tables = var["block_tables"].np
-        for i, seq in enumerate(seqs):
-            block_tables[i] = 0
-            block_tables[i, : seq.num_blocks] = seq.block_table
+        self.prepare_block_tables(batch)
 
+        var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
         var["slot_mapping"].np[:bs] = slot_mapping
         var["positions"].np[:sum_scheduled_tokens] = positions

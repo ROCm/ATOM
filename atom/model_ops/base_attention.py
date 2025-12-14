@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 # from flash_attn import flash_attn_with_kvcache
 from dataclasses import dataclass
+from typing import Optional
 
 import aiter
 import torch
@@ -17,6 +21,7 @@ from atom.utils.selector import get_attn_backend
 
 def fake_(
     q: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
@@ -37,6 +42,7 @@ def fake_(
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
 def unified_attention_with_output_base(
     q: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
@@ -45,7 +51,7 @@ def unified_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.impl.forward(q, k, v, positions)
+    return self.impl.forward(q, k, v, positions, q_scale)
 
 
 class Attention(nn.Module):
@@ -63,6 +69,7 @@ class Attention(nn.Module):
         sinks: Optional[nn.Parameter] = None,
         per_layer_sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
+        prefix: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
@@ -83,6 +90,7 @@ class Attention(nn.Module):
         self.sinks = sinks
 
         atom_config = get_current_atom_config()
+        dtype = atom_config.torch_dtype
         block_size = atom_config.kv_cache_block_size
         self.attn_backend = get_attn_backend(
             block_size,
@@ -100,10 +108,12 @@ class Attention(nn.Module):
             sinks=sinks,
             sliding_window=per_layer_sliding_window,
             rotary_emb=rotary_emb,
+            dtype=dtype,
         )
 
         compilation_config = atom_config.compilation_config
-        self.layer_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
+        default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
+        self.layer_name = prefix if prefix is not None else default_name
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer: {}".format(self.layer_name))
         compilation_config.static_forward_context[self.layer_name] = self
@@ -114,8 +124,9 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         positions: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor]=None,
     ):
         output = torch.ops.aiter.unified_attention_with_output_base(
-            q, k, v, positions, self.layer_name, self.use_mla
+            q, q_scale, k, v, positions, self.layer_name, self.use_mla
         )
         return output

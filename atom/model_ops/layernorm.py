@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 from typing import List, Tuple, Optional, Union
 import torch
 from torch import nn
@@ -8,6 +11,8 @@ from aiter import (
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
 )
+from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
@@ -87,12 +92,15 @@ class RMSNorm(nn.Module):
         dim: int,
         eps: float = 1e-6,
         x_pad_to_multiple: int = 0,
+        fused_allreduce: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
         self.x_pad_to_multiple = x_pad_to_multiple
+        self.fused_allreduce = fused_allreduce
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     # def rms_forward(
     #     self,
@@ -124,6 +132,7 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
+            assert not self.fused_allreduce, "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
             if residual is None:
                 return fused_rmsnorm_pad_(
                     x, self.weight, self.eps, self.x_pad_to_multiple
@@ -132,12 +141,21 @@ class RMSNorm(nn.Module):
                 return fused_add_rmsnorm_pad_(
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
-        elif residual is None:
-            # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
-            return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+        if self.fused_allreduce and self.tp_size > 1:
+            assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
+            return tensor_model_parallel_fused_allreduce_rmsnorm(
+                x, 
+                residual, 
+                self.weight, 
+                self.eps,
+                )
         else:
-            # return self.add_rms_forward(x, residual)
-            return rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
+            if residual is None:
+                # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
+                return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+            else:
+                # return self.add_rms_forward(x, residual)
+                return rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
 
 
 @torch_compile_guard()

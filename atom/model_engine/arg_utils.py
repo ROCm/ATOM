@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 import argparse
 from typing import List
 
 from atom import AsyncLLMEngine, LLMEngine
-from atom.config import CompilationConfig
+from atom.config import CompilationConfig, SpeculativeConfig
 
 
 def parse_size_list(size_str: str) -> List[int]:
@@ -28,13 +31,15 @@ class EngineArgs:
         port: int = 8006,
         kv_cache_dtype: str = "bf16",
         block_size: int = 16,
-        max_model_len: int = 8192,
+        max_model_len: int | None = None,
         cudagraph_capture_sizes: str = "[1,2,4,8,16]",
         level: int = 3,
         load_dummy: bool = False,
         enable_expert_parallel: bool = False,
         torch_profiler_dir: str = None,
         enable_dp_attention: bool = False,
+        method: str = None,
+        num_speculative_tokens: int = 1,
     ):
         self.model = model
         self.tensor_parallel_size = tensor_parallel_size
@@ -51,6 +56,8 @@ class EngineArgs:
         self.torch_profiler_dir = torch_profiler_dir
         self.enable_dp_attention = enable_dp_attention
         self.data_parallel_size = data_parallel_size
+        self.method = method
+        self.num_speculative_tokens = num_speculative_tokens
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -98,8 +105,8 @@ class EngineArgs:
         parser.add_argument(
             "--max-model-len",
             type=int,
-            default=8192,
-            help="Maximum model context length.",
+            default=None,
+            help="Maximum model context length, the default is set to hf_config.max_position_embeddings.",
         )
 
         # Compilation configuration
@@ -145,6 +152,22 @@ class EngineArgs:
             action="store_true",
             help="Enable DP attention.",
         )
+
+        parser.add_argument(
+            "--method",
+            type=str,
+            default=None,
+            choices=["mtp"],
+            help="Speculative method",
+        )
+
+        parser.add_argument(
+            "--num-speculative-tokens",
+            type=int,
+            default=1,
+            help="Number of speculative tokens to generate per iteration (draft model runs this many times autoregressively)",
+        )
+
         return parser
 
     @classmethod
@@ -166,6 +189,8 @@ class EngineArgs:
             enable_expert_parallel=args.enable_expert_parallel,
             torch_profiler_dir=args.torch_profiler_dir,
             enable_dp_attention=args.enable_dp_attention,
+            method=args.method,
+            num_speculative_tokens=args.num_speculative_tokens,
         )
 
     def create_engine(self) -> LLMEngine:
@@ -187,6 +212,15 @@ class EngineArgs:
             ),
             data_parallel_size=self.data_parallel_size,
             enable_dp_attention=self.enable_dp_attention,
+            speculative_config=(
+                SpeculativeConfig(
+                    method=self.method,
+                    model=self.model,
+                    num_speculative_tokens=self.num_speculative_tokens,
+                )
+                if self.method
+                else None
+            ),
         )
 
     def create_async_engine(self) -> AsyncLLMEngine:
@@ -209,4 +243,13 @@ class EngineArgs:
             ),
             data_parallel_size=self.data_parallel_size,
             enable_dp_attention=self.enable_dp_attention,
+            speculative_config=(
+                SpeculativeConfig(
+                    method=self.method,
+                    model=self.model,
+                    num_speculative_tokens=self.num_speculative_tokens,
+                )
+                if self.method
+                else None
+            ),
         )

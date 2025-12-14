@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -23,7 +26,8 @@ from atom.utils.forward_context import (
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
-from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+
+from aiter import fused_qk_rope_concat_and_cache_mla
 from aiter.dist.parallel_state import get_dp_group
 
 torch.set_printoptions(threshold=10_000)
@@ -70,6 +74,7 @@ class MLAAttention(nn.Module):
         kv_cache_dtype: str,
         layer_num: int = 0,
         mla_modules: MLAModules = None,
+        dtype: torch.dtype = torch.bfloat16,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -78,6 +83,7 @@ class MLAAttention(nn.Module):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype if kv_cache_dtype == "fp8" else "auto"
+        self.dtype = dtype
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -92,6 +98,7 @@ class MLAAttention(nn.Module):
         self.kv_cache = torch.tensor([])
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
+        self._q_scale = self.one_scale
         self.topk_indices_buffer = (
             mla_modules.indexer.topk_indices_buffer
             if mla_modules.indexer is not None
@@ -179,9 +186,9 @@ class MLAAttention(nn.Module):
         x = x.reshape(-1, self.num_heads * self.v_head_dim)
         return self.o_proj(x)
 
-    def _q_proj_and_k_up_proj(self, x):
+    def _q_proj_and_k_up_proj(self, x, x_scale=None):
         q_nope, q_pe = (
-            self.q_proj(x)
+            self.q_proj(x, x_scale)
             .view(-1, self.num_heads, self.qk_head_dim)
             .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         )
@@ -241,7 +248,7 @@ class MLAAttention(nn.Module):
         B = q.shape[0]
 
         o = torch.empty(
-            B, self.num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+            B, self.num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -257,10 +264,10 @@ class MLAAttention(nn.Module):
                 self.topk_indices_buffer[:B],
             )
 
-        q_scale = kv_scale = None
-        if self.kv_cache_dtype.startswith("fp8"):
-            q = q.to(dtypes.fp8)
-            q_scale = kv_scale = self.one_scale
+        # q_scale = kv_scale = None
+        # if self.kv_cache_dtype.startswith("fp8"):
+        #     q = q.to(dtypes.fp8)
+        #     q_scale = kv_scale = self.one_scale
 
         dp_size = get_dp_group().world_size
         is_fp8 = self.kv_cache_dtype.startswith("fp8")
@@ -301,8 +308,8 @@ class MLAAttention(nn.Module):
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            q_scale,
-            kv_scale,
+            self._q_scale,
+            self._k_scale,
         )
 
         return self._v_up_proj_and_o_proj(o)
@@ -313,6 +320,7 @@ class MLAAttention(nn.Module):
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
         positions: torch.Tensor,
+        q_scale: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
@@ -330,7 +338,9 @@ class MLAAttention(nn.Module):
             kv_cache = torch.tensor([])
 
         if context.is_prefill:
-            prefill_q = self.q_proj(q).view(-1, self.num_heads, self.qk_head_dim)
+            prefill_q = self.q_proj(q, x_scale=q_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
@@ -348,21 +358,35 @@ class MLAAttention(nn.Module):
                 prefill_q, k_nope, k_rope, kv_cache, attn_metadata
             )
         else:
-            q_nope, q_rope = self._q_proj_and_k_up_proj(q)
+            q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
             if kv_cache.numel() > 0:
-                decode_q, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+                decode_q = torch.empty(
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=kv_cache.dtype,
+                    device=q_nope.device,
+                )
+                fused_qk_rope_concat_and_cache_mla(
                     q_nope,
                     q_rope,
-                    k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                    k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                    kv_cache,
+                    k_nope,
+                    k_rope,
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
+                    decode_q,
                     attn_metadata.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
                     positions,
                     self.rotary_emb.cos_cache,
                     self.rotary_emb.sin_cache,
-                    k_scale=self._k_scale,
                     is_neox=self.rotary_emb.is_neox_style,
+                    is_nope_first=True,
                 )
 
             output = self._forward_decode(decode_q, kv_cache, attn_metadata)

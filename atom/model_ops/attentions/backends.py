@@ -1,13 +1,16 @@
-from abc import ABC, abstractmethod
-from typing import Type, Tuple, Generic, Optional, List, TypeVar, Dict, Any
-from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mla import MLAModules
-import numpy as np
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from atom.utils.forward_context import AttentionMetaData
-from atom.utils import CpuGpuBuffer
-from atom.model_engine.sequence import Sequence
+from abc import ABC, abstractmethod
+from typing import Any, Dict, Generic, List, Optional, Tuple, Type, TypeVar
+
+import numpy as np
 import torch
+from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.sequence import Sequence
+from atom.model_ops.attention_mla import MLAModules
+from atom.utils import CpuGpuBuffer
+from atom.utils.forward_context import AttentionMetaData
 from torch import nn
 
 T = TypeVar("T", bound="BroadcastableModelInput")
@@ -118,13 +121,15 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    def prepare_block_tables(self, batch: ScheduledBatch):
         var = self.model_runner.forward_vars
         block_tables = var["block_tables"].np
-        for i, seq in enumerate(seqs):
+        num_blocks = [
+            (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
+        ]
+        for i, block_table in enumerate(batch.block_tables):
             block_tables[i] = 0
-            if len(seq.block_table) > 0:
-                block_tables[i, : seq.num_blocks] = seq.block_table
+            block_tables[i, : num_blocks[i]] = block_table
 
     def prepare_prefill(self, batch: ScheduledBatch):
         bs = batch.total_seqs_num_prefill
@@ -135,27 +140,32 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
-        seqs = list(batch.seqs.values())
-        seqs = seqs[:bs]
-        for seq in seqs:
-            seqlen = seq.num_tokens
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
+        # seqs = list(batch.seqs.values())
+        # seqs = seqs[:bs]
+        for i in range(bs):
+            seqlen = batch.context_lens[i]
+            cached_seqlen = batch.num_cached_tokens[i]
+            positions.extend(list(range(cached_seqlen, seqlen)))
+            seqlen_q = seqlen - cached_seqlen
             seqlen_k = seqlen
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:
+            if not batch.block_tables:
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
+            num_blocks = (seqlen + self.block_size - 1) // self.block_size
+            num_cached_blocks = (cached_seqlen + self.block_size - 1) // self.block_size
+            last_block_tokens = batch.last_block_num_tokens[i]
+            block_table = batch.block_tables[i]
+            for i in range(num_cached_blocks, num_blocks):
+                start = block_table[i] * self.block_size
+                if i != num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens
+                    end = start + last_block_tokens
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > batch.total_tokens_num:  # prefix cache
-            self.prepare_block_tables(seqs)
+            self.prepare_block_tables(batch)
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
@@ -167,9 +177,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ("slot_mapping", len(slot_mapping)),
         ]
         if self.has_sliding_window:
-            var["context_lens"].np[: bs] = [seq.num_tokens for seq in seqs]
+            var["context_lens"].np[:bs] = batch.context_lens[:bs]
             vars_used.append(("context_lens", bs))
-            self.prepare_block_tables(seqs)
+            self.prepare_block_tables(batch)
             vars_used.append(("block_tables", bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}

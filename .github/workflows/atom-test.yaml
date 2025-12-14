@@ -1,0 +1,126 @@
+name: ATOM Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  atom:
+    name: ATOM Test
+    runs-on: atom-mi355-1gpu
+    env:
+      ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+      GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
+      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+
+      - name: Pull ATOM base image
+        run: |
+          docker pull ${{ env.ATOM_BASE_IMAGE }}
+
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.ATOM_BASE_IMAGE }}
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          
+          RUN git clone https://github.com/ROCm/aiter.git /aiter-test && \
+            cd /aiter-test && \
+            git checkout main && \
+            git submodule sync && git submodule update --init --recursive && \
+            python3 setup.py develop
+
+          RUN echo "=== Installing ATOM ==="
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /ATOM && \
+            cd /ATOM && \
+            git checkout ${{ env.GITHUB_COMMIT_SHA }} && \
+            pip install .
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
+
+      - name: Show Dockerfile
+        run: cat Dockerfile.mod
+
+      - name: Build Docker image
+        run: |
+          docker build --network=host -t atom_test:ci -f Dockerfile.mod .
+
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom_test | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          echo "Starting container: atom_test:ci"
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          --ipc=host --group-add video \
+          --shm-size 16g \
+          --cap-add=SYS_PTRACE \
+          -e HF_TOKEN="${HF_TOKEN:-}" \
+          --security-opt seccomp=unconfined \
+          --ulimit memlock=-1 \
+          --ulimit stack=67108864 \
+          --name atom_test \
+          atom_test:ci
+
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Run ATOM tests
+        timeout-minutes: 60
+        run: |
+          # Run the inference and capture output
+          echo ""
+          echo "========== Running test =========="
+          docker exec atom_test bash -c \
+            "python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
+          
+          echo ""
+          echo "========== Showing test output below =========="
+          cat atom_test_output.txt
+
+          echo ""
+          echo "========== Comparing output with golden outputs =========="
+          # Ignore whitespace and EOL differences in the diff
+          diff -u -B -w --strip-trailing-cr atom_test_output.txt .github/workflows/golden_outputs.txt || true
+          DIFF_EXIT_CODE=$?
+          
+          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+            echo "Output does not match golden outputs."
+            exit 1
+          else
+            echo "Output matches golden outputs."
+          fi
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom_test_output
+          path: atom_test_output.txt
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker stop atom_test || true
+          docker rm atom_test || true
