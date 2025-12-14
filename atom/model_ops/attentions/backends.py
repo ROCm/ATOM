@@ -10,8 +10,8 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
-from atom.utils.forward_context import AttentionMetaData
 from atom.utils.block_convert import block_table_convert_triton
+from atom.utils.forward_context import AttentionMetaData
 from torch import nn
 
 T = TypeVar("T", bound="BroadcastableModelInput")
@@ -92,7 +92,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     def __init__(self, model_runner):
         self.model_runner = model_runner
-        self.block_size = model_runner.block_size if not model_runner.use_mla else 1
+        self.block_size = 16 if not model_runner.use_mla else 1
         assert model_runner.block_size % self.block_size == 0
         self.block_ratio = model_runner.block_size // self.block_size
         self.device = model_runner.device
@@ -200,7 +200,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 var["block_tables_converted"].gpu[:bs],
                 var["context_lens"].gpu[:bs],
                 self.block_ratio,
-                self.model_runner.block_size,
             )
             ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(

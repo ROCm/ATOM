@@ -73,7 +73,7 @@ def block_table_convert_triton(block_table, block_table_convert, context_lens, r
 def kv_indices_convert_kernel(
     kv_indices_ptr,
     output_ptr,
-    context_lens_ptr,
+    kv_indptr_convert_ptr,
     ratio: tl.constexpr,
     ori_block_size,
     bs,
@@ -88,59 +88,40 @@ def kv_indices_convert_kernel(
     # Load original values
     val = tl.load(kv_indices_ptr + offsets, mask=mask, other=-1)
 
-    # Determine batch (row) and local column (col) using context_lens and ori_block_size.
-    # Each batch contributes num_blocks = ceil(ctx_len / ori_block_size) entries to kv_indices.
-    row = tl.full([BLOCK_SIZE], -1, dtype=tl.int32)
     col = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-    acc = tl.zeros([BLOCK_SIZE], dtype=tl.int32)  # running prefix of num_blocks
+    ctx = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    out_bs_start = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
 
-    # Iterate over batches to place each offset into its batch segment
-    # n_rows is small enough to loop; Triton will unroll if constexpr.
+    acc_block = 0
     for j in range(0, bs):
-        ctx_j = tl.load(context_lens_ptr + j)
-        num_blocks_j = (ctx_j + ori_block_size - 1) // ori_block_size
+        start_j = tl.load(kv_indptr_convert_ptr + j)
+        end_j = tl.load(kv_indptr_convert_ptr + (j + 1))
+        ctx_len = end_j - start_j
+        num_block = tl.cdiv(ctx_len, ori_block_size)
+        in_this = (offsets >= acc_block) & (offsets < (acc_block + num_block)) & mask
+        col = tl.where(in_this, (offsets - acc_block) * ratio, col)
+        ctx = tl.where(in_this, ctx_len, ctx)
+        out_bs_start = tl.where(in_this, start_j, out_bs_start)
+        acc_block += num_block
 
-        in_this = (offsets >= acc) & (offsets < acc + num_blocks_j) & mask & (row == -1)
-        row = tl.where(in_this, j, row)
-        col = tl.where(in_this, offsets - acc, col)
-
-        acc += num_blocks_j
-
-    # For any not found (e.g., offsets beyond total), set safe defaults
-    row = tl.maximum(row, 0)
-    ctx = tl.load(context_lens_ptr + row, mask=mask, other=0)
-    num_blocks = (ctx + ori_block_size - 1) // ori_block_size  # per-thread vector
-
-    # Vectorized expansion over ratio
-    r = tl.arange(0, ratio)
-    val_exp = val[:, None]
-    is_neg_one = val_exp == -1
-    new_val = val_exp * ratio + r[None, :]
-
-    # Validate against available blocks after expansion
-    # After expansion, each original block splits into `ratio` sub-blocks.
-    # Valid if original block index < num_blocks for the batch.
-    valid = (col[:, None] < num_blocks[:, None]) & mask[:, None]
-
-    # If original was -1 or exceeds context-derived blocks, write -1
-    write_val = tl.where(is_neg_one | (~valid), -1, new_val)
-
-    # Compute output indices in flattened space
-    out_idx = offsets[:, None] * ratio + r[None, :]
-    tl.store(output_ptr + out_idx, write_val, mask=mask[:, None])
+    for r_i in range(0, ratio):
+        cond = (col + r_i) < ctx
+        cand = val * ratio + r_i
+        tl.store(output_ptr + out_bs_start + col + r_i, cand, mask=mask & cond)
 
 
 def kv_indices_convert_triton(
-    kv_indices, kv_indices_convert, context_lens, ratio, ori_block_size
+    kv_indices, kv_indices_convert, kv_indptr_convert, ratio, block_size
 ):
+    ori_block_size = block_size * ratio
+    bs = kv_indptr_convert.shape[0] - 1
     n_input_elements = kv_indices.numel()
-    bs = context_lens.shape[0]
     grid = lambda meta: (triton.cdiv(n_input_elements, meta["BLOCK_SIZE"]),)
 
     kv_indices_convert_kernel[grid](
         kv_indices,
         kv_indices_convert,
-        context_lens,
+        kv_indptr_convert,
         ratio,
         ori_block_size,
         bs,
@@ -149,3 +130,39 @@ def kv_indices_convert_triton(
     )
 
     return kv_indices_convert
+
+
+if __name__ == "__main__":
+    # Example usage and test
+    import numpy as np
+
+    block_table = torch.tensor(
+        [[0, 1, 2, -1], [3, 4, -1, -1], [5, 6, 7, 8]], dtype=torch.int32
+    ).cuda()
+    context_lens = torch.tensor([10, 5, 15], dtype=torch.int32).cuda()
+    ratio = 4
+    block_table_converted = torch.empty(
+        (block_table.shape[0], block_table.shape[1] * ratio),
+        dtype=torch.int32,
+    ).cuda()
+
+    block_table_convert_triton(block_table, block_table_converted, context_lens, ratio)
+
+    print("Original Block Table:")
+    print(block_table.cpu().numpy())
+    print("Converted Block Table:")
+    print(block_table_converted.cpu().numpy())
+
+    kv_indices = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int32).cuda()
+    kv_indptr_convert = torch.tensor([0, 3, 9, 11, 18], dtype=torch.int32).cuda()
+    ori_block_size = 4
+    kv_indices_converted = torch.zeros(
+        (kv_indices.shape[0] * ratio,), dtype=torch.int32
+    ).cuda()
+    kv_indices_convert_triton(
+        kv_indices, kv_indices_converted, kv_indptr_convert, ratio, ori_block_size
+    )
+    print("Original KV Indices:")
+    print(kv_indices.cpu().numpy())
+    print("Converted KV Indices:")
+    print(kv_indices_converted.cpu().numpy())

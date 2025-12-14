@@ -11,11 +11,11 @@ from atom.config import KVCacheConfig, KVCacheTensor
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import CpuGpuBuffer
-from atom.utils.forward_context import AttentionMetaData, Context
 from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_convert_triton,
 )
+from atom.utils.forward_context import AttentionMetaData, Context
 
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
@@ -98,7 +98,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 **i32_kwargs,
             ),
             "kv_last_page_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
-            "kv_indices_converted": None,
         }
         if self.block_ratio > 1:
             mla_metadata["kv_indices_converted"] = CpuGpuBuffer(
@@ -169,6 +168,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
                 attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+                if self.block_ratio > 1:
+                    block_table_convert_triton(
+                        var["block_tables"].gpu[:bs],
+                        var["block_tables_converted"].gpu[:bs],
+                        var["context_lens"].gpu[:bs],
+                        self.block_ratio,
+                    )
+                    attn_metadata.block_tables = var["block_tables_converted"].gpu[:bs]
             var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
                 np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
             )
@@ -192,7 +199,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         context_lens = batch.context_lens
         positions = [i - 1 for i in context_lens]
         slot_mapping = [
-            block_table[-1] * self.block_size + last_block_num - 1
+            block_table[-1] * self.model_runner.block_size + last_block_num - 1
             for block_table, last_block_num in zip(
                 batch.block_tables, batch.last_block_num_tokens
             )
@@ -210,12 +217,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ]
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1]
+        sum_blocks_before_converted = sum([(i + self.block_ratio - 1) // self.block_ratio for i in num_blocks_per_seq])
+
 
         def prepare_kv_indices():
-            var["kv_indices"].np[:sum_blocks] = np.fromiter(
+            var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
                 itertools.chain.from_iterable(batch.block_tables),
                 dtype=np.int32,
-                count=sum_blocks,
+                count=sum_blocks_before_converted,
             )
 
         prepare_kv_indices()
@@ -251,9 +260,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ctx.update(ctx_mla_ps)
         if self.block_ratio > 1:
             kv_indices_convert_triton(
-                var["kv_indices"].gpu[:sum_blocks],
+                var["kv_indices"].gpu[:sum_blocks_before_converted],
                 var["kv_indices_converted"].gpu[:sum_blocks],
-                var["context_lens"].gpu[:bs],
+                var["kv_indptr"].gpu[:bs + 1],
                 self.block_ratio,
                 self.block_size,
             )
