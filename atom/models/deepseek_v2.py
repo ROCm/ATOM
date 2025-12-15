@@ -68,6 +68,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     use_triton_gemm,
 )
+from atom.model_ops.attention_mla import is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
     is_rocm_aiter_fuse_routed_scaling_factor,
@@ -604,8 +605,9 @@ class DeepseekV2MLAAttention(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=non_proj_quant_config,
-            prefix=f"{prefix}.kv_b_proj")
+            quant_config=quant_config if is_rocm_aiter_fp4bmm_enabled() else non_proj_quant_config,
+            prefix=f"{prefix}.kv_b_proj",
+            source_quant_dtype=source_quant_dtype if is_rocm_aiter_fp4bmm_enabled() else None,)
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
