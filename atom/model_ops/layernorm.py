@@ -16,6 +16,10 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from atom.utils.forward_context import (
+    ForwardContext,
+    get_forward_context,
+)
 
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
@@ -85,6 +89,39 @@ def fused_add_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
+def quick_ar_or_fused_arnorm_fake_tensors(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    eps: float,
+    dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return (torch.empty_like(x), torch.empty_like(residual))
+
+
+@torch_compile_guard(gen_fake=quick_ar_or_fused_arnorm_fake_tensors)
+def quick_ar_or_fused_arnorm_(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    eps: float,
+    dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    forward_context: ForwardContext = get_forward_context()
+    context = forward_context.context
+    if context.is_prefill:
+        qr_comm = get_tp_group().device_communicator.qr_comm
+        assert qr_comm is not None, "Quick all-reduce communication is not initialized!"
+        ar_out = qr_comm.quick_all_reduce(x)
+        return rmsnorm2d_fwd_with_add_(ar_out, weight, residual, eps, dim)
+    return tensor_model_parallel_fused_allreduce_rmsnorm(
+        x, 
+        residual, 
+        weight, 
+        eps,
+        )
+
+
 class RMSNorm(nn.Module):
 
     def __init__(
@@ -121,34 +158,18 @@ class RMSNorm(nn.Module):
             else:
                 return fused_add_rmsnorm_pad_(
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
-                )
-        # there is dispatch in aiter all_reduce to decide which path to go
-        # if quick all_reduce is used, then do not fuse rmsnorm
-        # otherwise, use fused_allreduce_rmsnorm
-        # https://github.com/ROCm/aiter/blob/d263d4411d8312dd9291e9e4130c973a7c3f1b04/aiter/dist/device_communicators/communicator_cuda.py#L142
-        num_tokens = x.size(0)
-        if (
-            self.fused_allreduce
-            and self.qr_comm is not None
-            and num_tokens > 512
-        ):
-            ar_out = self.qr_comm.quick_all_reduce(x)
-            assert ar_out is not None, "Quick all-reduce failed to return output!"
-            if residual is None:
-                # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
-                return rmsnorm2d_fwd_(ar_out, self.weight, self.eps, self.dim)
-            else:
-                # return self.add_rms_forward(x, residual)
-                return rmsnorm2d_fwd_with_add_(ar_out, self.weight, residual, self.eps, self.dim)
-            
+                )            
         if self.fused_allreduce and self.tp_size > 1:
-            assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
-            return tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, 
-                residual, 
-                self.weight, 
+            # use quick allreduce for prefill, will not fuse rmsnorm
+            # use fused allreduce rmsnorm for decode
+            assert residual is not None, "residual input must be provided."
+            return quick_ar_or_fused_arnorm_(
+                x,
+                self.weight,
+                residual,
                 self.eps,
-                )
+                self.dim,
+            )
         else:
             if residual is None:
                 # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
