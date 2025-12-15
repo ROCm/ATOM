@@ -248,13 +248,11 @@ class LinearBase(nn.Module):
                 if self.quant_type.value == QuantType.per_1x128.value:
                     quant_func = functools_partial(quant_func, transpose_scale=True)
                 if self.quant_type.value != QuantType.per_1x32.value:
-
                     x, x_scale = quant_func(
                         x,
                         quant_dtype=self.params_dtype,
                         scale=getattr(self, "input_scale", None),
                     )
-            
             if self.quant_type.value == QuantType.per_Tensor.value:
                 y = tgemm.mm(
                     x,
