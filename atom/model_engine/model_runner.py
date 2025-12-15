@@ -217,7 +217,7 @@ class ModelRunner:
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
         if (self.hf_text_config.model_type in ["llama"] and self.hf_text_config.torch_dtype in [torch.bfloat16, torch.float16]):
-            os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "FP"
+            os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
