@@ -611,10 +611,10 @@ class DeepseekV2MLAAttention(nn.Module):
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
-                                        quant_config=quant_config,
+                                        quant_config=non_proj_quant_config,
                                         reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                                         prefix=f"{prefix}.o_proj",
-                                        source_quant_dtype=source_quant_dtype)
+                                        source_quant_dtype=None)
 
         if rope_scaling:
             rope_scaling["rope_type"] = 'deepseek_yarn'
