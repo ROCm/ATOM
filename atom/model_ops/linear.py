@@ -3,7 +3,6 @@
 
 from functools import partial as functools_partial
 from typing import Callable, Optional
-import logging
 
 import torch
 import torch.nn.functional as F

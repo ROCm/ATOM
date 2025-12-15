@@ -60,7 +60,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
-import logging
 
 
 ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
@@ -353,7 +352,7 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-# @support_torch_compile
+@support_torch_compile
 class LlamaModel(nn.Module):
     def __init__(
         self,
