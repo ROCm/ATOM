@@ -607,7 +607,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config if is_rocm_aiter_fp4bmm_enabled() else non_proj_quant_config,
             prefix=f"{prefix}.kv_b_proj",
-            source_quant_dtype=source_quant_dtype if is_rocm_aiter_fp4bmm_enabled() else None,)
+            source_quant_dtype=source_quant_dtype if is_rocm_aiter_fp4bmm_enabled() else None)
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
