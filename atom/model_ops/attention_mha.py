@@ -188,7 +188,6 @@ class Attention(nn.Module):
         if use_triton_unified_attention:
             o_pa = torch.empty_like(q)
             o_unified = torch.empty_like(q)
-            o_tmp = torch.empty_like(q)
             o = torch.empty_like(q)
             descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
             if k_cache.numel() and v_cache.numel():
@@ -240,8 +239,8 @@ class Attention(nn.Module):
                     #print(q.shape)
                     
                     pa_decode_gluon(
-                        o_pa,
-                        o_tmp,
+                        o,
+                        o,
                         q,
                         q,
                         None,
@@ -264,33 +263,34 @@ class Attention(nn.Module):
                         sinks=self.sinks,
                         sliding_window=sliding_window,
                     )
-                    pa_key_cache = k_cache
-                    pa_value_cache = v_cache
 
-                    # gt
-                    k_cache = k_cache.transpose(-1, -2).contiguous().view(-1, 8, 64, 16).permute(0,3,1,2).contiguous()
-                    v_cache = v_cache.permute(0,3,1,2).contiguous()
-                    descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
-                    unified_attention(
-                        q,
-                        k_cache,
-                        v_cache,
-                        o,
-                        cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                        seqused_k=attn_metadata.context_lens,
-                        max_seqlen_q=attn_metadata.max_seqlen_q,
-                        max_seqlen_k=attn_metadata.max_seqlen_k,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        alibi_slopes=None,
-                        window_size=self.sliding_window,
-                        block_table=attn_metadata.block_tables,
-                        softcap=0,
-                        q_descale=None,
-                        k_descale=self.one_scale.expand(descale_shape),
-                        v_descale=self.one_scale.expand(descale_shape),
-                        sinks=self.sinks,
-                    )
+                    # pa_key_cache = k_cache
+                    # pa_value_cache = v_cache
+
+                    # # gt
+                    # k_cache = k_cache.transpose(-1, -2).contiguous().view(-1, 8, 64, 16).permute(0,3,1,2).contiguous()
+                    # v_cache = v_cache.permute(0,3,1,2).contiguous()
+                    # descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
+                    # unified_attention(
+                    #     q,
+                    #     k_cache,
+                    #     v_cache,
+                    #     o,
+                    #     cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                    #     seqused_k=attn_metadata.context_lens,
+                    #     max_seqlen_q=attn_metadata.max_seqlen_q,
+                    #     max_seqlen_k=attn_metadata.max_seqlen_k,
+                    #     softmax_scale=self.scale,
+                    #     causal=True,
+                    #     alibi_slopes=None,
+                    #     window_size=self.sliding_window,
+                    #     block_table=attn_metadata.block_tables,
+                    #     softcap=0,
+                    #     q_descale=None,
+                    #     k_descale=self.one_scale.expand(descale_shape),
+                    #     v_descale=self.one_scale.expand(descale_shape),
+                    #     sinks=self.sinks,
+                    # )
 
                     # pa_data = {
                     #     "o": o_pa.detach(),
