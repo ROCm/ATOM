@@ -311,17 +311,15 @@ class LlamaDecoderLayer(nn.Module):
             eps = self.input_layernorm.eps
             if residual is None:
                 residual = hidden_states
-                hidden_states, tmp_rms_out, _, _ = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+                hidden_states, _, _, _ = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
                                                     None, None, eps,
                                                     dtype_quant=rocm_aiter_fp8_dtype,
-                                                    res1=None,
-                                                    output_unquantized_inp1=True)
+                                                    res1=None)
             else:
-                hidden_states, tmp_rms_out, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+                hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
                                                     None, None, eps,
                                                     dtype_quant=rocm_aiter_fp8_dtype,
-                                                    res1=residual,
-                                                    output_unquantized_inp1=True)
+                                                    res1=residual)
             x_scale=scale.view(1)
         else:
             if residual is None:
@@ -338,11 +336,10 @@ class LlamaDecoderLayer(nn.Module):
             # Static FP8 quantization
             weight = self.post_attention_layernorm.weight
             eps = self.post_attention_layernorm.eps
-            hidden_states, tmp_rms_out, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
+            hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
                                                 None, None, eps,
                                                 dtype_quant=rocm_aiter_fp8_dtype,
-                                                res1=residual,
-                                                output_unquantized_inp1=True)
+                                                res1=residual)
             x_scale=scale.view(1)
         else:
             hidden_states, residual = self.post_attention_layernorm(
