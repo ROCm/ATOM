@@ -15,6 +15,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: os.getenv("ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1") == "1",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1",
     "ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT": lambda: os.getenv("ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "1") == "1"
+    "ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT": lambda: os.getenv("ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT", "1") = "1"
 }
 
 def __getattr__(name: str):
