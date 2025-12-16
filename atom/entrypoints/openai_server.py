@@ -27,17 +27,31 @@ logger = logging.getLogger("atom")
 class ChatMessage(BaseModel):
     role: str
     content: str
+    
+    class Config:
+        extra = "allow"
 
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
-    messages: List[ChatMessage]
+    messages: Optional[List[ChatMessage]] = None
+    prompt: Optional[List[ChatMessage]] = None  # Accept 'prompt' as alias for 'messages'
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     max_tokens: Optional[int] = 256
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
+    seed: Optional[int] = None
+    
+    def get_messages(self) -> List[ChatMessage]:
+        """Get messages from either 'messages' or 'prompt' field"""
+        if self.messages is not None:
+            return self.messages
+        elif self.prompt is not None:
+            return self.prompt
+        else:
+            raise ValueError("Either 'messages' or 'prompt' field is required")
 
 
 class CompletionRequest(BaseModel):
@@ -58,6 +72,9 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[Dict[str, Any]]
     usage: Dict[str, Any]
+    
+    class Config:
+        extra = "allow"
 
 
 class CompletionResponse(BaseModel):
@@ -229,8 +246,9 @@ async def chat_completions(request: ChatCompletionRequest):
             detail=f"Requested model '{request.model}' does not match server model '{model_name}'",
         )
     try:
+        messages = request.get_messages()
         prompt = tokenizer.apply_chat_template(
-            [{"role": msg.role, "content": msg.content} for msg in request.messages],
+            [{"role": msg.role, "content": msg.content} for msg in messages],
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -328,7 +346,7 @@ async def chat_completions(request: ChatCompletionRequest):
         if final_output is None:
             raise RuntimeError("No output generated")
 
-        return ChatCompletionResponse(
+        response_data = ChatCompletionResponse(
             id=request_id,
             created=created,
             model=model_name,
@@ -337,6 +355,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     "index": 0,
                     "message": {"role": "assistant", "content": final_output["text"]},
                     "finish_reason": final_output["finish_reason"],
+                    "text": final_output["text"],
                 }
             ],
             usage={
@@ -349,6 +368,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 "latency_s": round(final_output.get("latency", 0.0), 4),
             },
         )
+        return response_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
