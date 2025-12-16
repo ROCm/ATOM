@@ -786,6 +786,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                                                 fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION)
         self.routed_scaling_factor = config.routed_scaling_factor
         self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
+        self.fuse_rmsnorm_quant = ENABLE_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
 
     def forward(
         self,
@@ -794,42 +795,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if ENABLE_RMSNORM_QUANT_FUSION:
-            assert self.quant_dtype is not None
+        if self.fuse_rmsnorm_quant:
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
             if residual is None:
                 residual = hidden_states
                 (hidden_states_quant, hidden_states_quant_scale), _,  _, _ = _fuse_rmsnorm_quant(
-                    hidden_states,
-                    weight,
-                    eps,
-                    None,
-                    None,
-                    None,
-                    None,
-                    self.quant_dtype,
-                    False,
-                    False,
-                    128,
-                    False,
-                    False,
+                    x1=hidden_states,
+                    x1_weight=weight,
+                    x1_epsilon=eps,
+                    res1=None,
+                    dtype_quant=self.quant_dtype,
+                    group_size=128,
                 )
             else:
                 (hidden_states_quant, hidden_states_quant_scale), _,  _, residual = _fuse_rmsnorm_quant(
-                    hidden_states,
-                    weight,
-                    eps,
-                    None,
-                    None,
-                    None,
-                    residual,
-                    self.quant_dtype,
-                    False,
-                    False,
-                    128,
-                    False,
-                    False,
+                    x1=hidden_states,
+                    x1_weight=weight,
+                    x1_epsilon=eps,
+                    res1=residual,
+                    dtype_quant=self.quant_dtype,
+                    group_size=128,
                 )
             hidden_states = (hidden_states_quant, hidden_states_quant_scale)
         else:
