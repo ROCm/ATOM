@@ -21,6 +21,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1",
     "ATOM_GPT_OSS_MODEL": lambda: os.getenv("ATOM_GPT_OSS_MODEL", "0") == "1",
     "ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT": lambda: os.getenv("ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "1") == "1"
+    "ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT": lambda: os.getenv("ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT", "1") = "1"
 }
 
 def __getattr__(name: str):
