@@ -89,6 +89,7 @@ from atom.utils import envs
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+ENABLE_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_RMSNORM_QUANT_FUSION
 
 # only for DS MLA attention
 def _fuse_rmsnorm_quant(
@@ -687,8 +688,12 @@ class DeepseekV2MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        hidden_states_scale = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+
         if self.q_lora_rank is not None:
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)
+            qkv_lora = self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
             # ckq = self.q_a_proj(hidden_states)
             q_c, kv_c, k_pe = torch.split(
                 qkv_lora,
@@ -717,7 +722,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
             hidden_states_or_q_c = hidden_states
-            kv_c, k_pe = torch.split(self.kv_a_proj_with_mqa(hidden_states),
+            kv_c, k_pe = torch.split(self.kv_a_proj_with_mqa(hidden_states, hidden_states_scale),
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         if not self.fuse_qknorm_quant:
             kv_c_normed = self.kv_a_layernorm(kv_c)
@@ -798,6 +803,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                                                 eps=config.rms_norm_eps,
                                                 fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION)
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
 
     def forward(
         self,
@@ -806,12 +812,51 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        if ENABLE_RMSNORM_QUANT_FUSION:
+            assert self.quant_dtype is not None
+            weight = self.input_layernorm.weight
+            eps = self.input_layernorm.eps
+            if residual is None:
+                residual = hidden_states
+                (hidden_states_quant, hidden_states_quant_scale), _,  _, _ = _fuse_rmsnorm_quant(
+                    hidden_states,
+                    weight,
+                    eps,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.quant_dtype,
+                    False,
+                    False,
+                    128,
+                    False,
+                    False,
+                )
+            else:
+                (hidden_states_quant, hidden_states_quant_scale), _,  _, residual = _fuse_rmsnorm_quant(
+                    hidden_states,
+                    weight,
+                    eps,
+                    None,
+                    None,
+                    None,
+                    residual,
+                    self.quant_dtype,
+                    False,
+                    False,
+                    128,
+                    False,
+                    False,
+                )
+            hidden_states = (hidden_states_quant, hidden_states_quant_scale)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
