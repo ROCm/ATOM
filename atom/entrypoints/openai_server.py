@@ -303,7 +303,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 while not finished:
                     try:
                         chunk_data = await asyncio.wait_for(
-                            loop.run_in_executor(None, stream_queue.get), timeout=30.0
+                            loop.run_in_executor(None, stream_queue.get), timeout=60.0
                         )
                         new_text = chunk_data["text"]
                         current_text = prev_text + new_text
@@ -428,7 +428,7 @@ async def completions(request: CompletionRequest):
                 while not finished:
                     try:
                         chunk_data = await asyncio.wait_for(
-                            loop.run_in_executor(None, stream_queue.get), timeout=30.0
+                            loop.run_in_executor(None, stream_queue.get), timeout=60.0
                         )
                         new_text = chunk_data["text"]
                         current_text = prev_text + new_text
