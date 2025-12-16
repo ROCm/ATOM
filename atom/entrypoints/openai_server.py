@@ -164,28 +164,14 @@ def create_usage_chunk(request_id: str, model: str, usage: Dict) -> str:
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-def send_stream_chunk(request_output: RequestOutput):
-    global tokenizer, _stream_queues, _seq_id_to_request_id
-
-    # Get request_id from sequence ID
-    request_id = _seq_id_to_request_id.get(request_output.request_id)
-    if request_id is None:
-        logger.warning(
-            f"send_stream_chunk: No request_id found for sequence {request_output.request_id}"
-        )
-        return
-
+def _send_stream_chunk_direct(request_output: RequestOutput, request_id: str, stream_queue: queue.Queue):
+    """Send stream chunk directly without global mapping lookup - avoids race condition"""
+    global tokenizer
     # Decode the new tokens
     new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     logger.debug(
-        f"send_stream_chunk: seq_id={request_output.request_id}, request_id={request_id}, tokens={request_output.output_tokens}, text='{new_text}'"
+        f"send_stream_chunk_direct: seq_id={request_output.request_id}, request_id={request_id}, tokens={request_output.output_tokens}, text='{new_text[:50]}...'"
     )
-
-    # Get the queue for this request
-    stream_queue = _stream_queues.get(request_id)
-    if stream_queue is None:
-        logger.warning(f"send_stream_chunk: No queue found for request_id {request_id}")
-        return
 
     # Prepare chunk data
     chunk_data = {
@@ -197,14 +183,28 @@ def send_stream_chunk(request_output: RequestOutput):
 
     try:
         stream_queue.put_nowait(chunk_data)
-        logger.debug(
-            f"send_stream_chunk: Successfully put chunk data into queue for request_id {request_id}"
-        )
     except queue.Full:
         logger.warning(
-            f"send_stream_chunk: Queue full for request_id {request_id}, skipping chunk"
+            f"send_stream_chunk_direct: Queue full for request_id {request_id}, skipping chunk"
         )
-        pass
+
+
+def send_stream_chunk(request_output: RequestOutput):
+    global tokenizer, _stream_queues, _seq_id_to_request_id
+
+    request_id = _seq_id_to_request_id.get(request_output.request_id)
+    if request_id is None:
+        logger.warning(
+            f"send_stream_chunk: No request_id found for sequence {request_output.request_id}"
+        )
+        return
+
+    stream_queue = _stream_queues.get(request_id)
+    if stream_queue is None:
+        logger.warning(f"send_stream_chunk: No queue found for request_id {request_id}")
+        return
+
+    _send_stream_chunk_direct(request_output, request_id, stream_queue)
 
 
 async def generate_async(
@@ -266,8 +266,11 @@ async def chat_completions(request: ChatCompletionRequest):
             stream_queue = queue.Queue()
             _stream_queues[request_id] = stream_queue
 
+            captured_request_id = request_id
+            captured_stream_queue = stream_queue
+            
             def stream_callback(request_output: RequestOutput):
-                send_stream_chunk(request_output)
+                _send_stream_chunk_direct(request_output, captured_request_id, captured_stream_queue)
 
             loop = asyncio.get_event_loop()
 
@@ -275,12 +278,12 @@ async def chat_completions(request: ChatCompletionRequest):
                 seq = engine.io_processor.preprocess(
                     prompt, sampling_params, stream_callback=stream_callback
                 )
+                _seq_id_to_request_id[seq.id] = captured_request_id
                 return seq
 
             seq = await loop.run_in_executor(None, do_preprocess)
 
             seq_id = seq.id
-            _seq_id_to_request_id[seq_id] = request_id
 
             logger.info(
                 f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}"
@@ -303,7 +306,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 while not finished:
                     try:
                         chunk_data = await asyncio.wait_for(
-                            loop.run_in_executor(None, stream_queue.get), timeout=30.0
+                            loop.run_in_executor(None, stream_queue.get), timeout=60.0
                         )
                         new_text = chunk_data["text"]
                         current_text = prev_text + new_text
@@ -395,8 +398,11 @@ async def completions(request: CompletionRequest):
             stream_queue = queue.Queue()
             _stream_queues[request_id] = stream_queue
 
+            captured_request_id = request_id
+            captured_stream_queue = stream_queue
+            
             def stream_callback(request_output: RequestOutput):
-                send_stream_chunk(request_output)
+                _send_stream_chunk_direct(request_output, captured_request_id, captured_stream_queue)
 
             loop = asyncio.get_event_loop()
 
@@ -404,12 +410,12 @@ async def completions(request: CompletionRequest):
                 seq = engine.io_processor.preprocess(
                     request.prompt, sampling_params, stream_callback=stream_callback
                 )
+                _seq_id_to_request_id[seq.id] = captured_request_id
                 return seq
 
             seq = await loop.run_in_executor(None, do_preprocess)
 
             seq_id = seq.id
-            _seq_id_to_request_id[seq_id] = request_id
             logger.info(
                 f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}"
             )
