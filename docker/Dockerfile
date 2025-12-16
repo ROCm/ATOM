@@ -25,7 +25,7 @@ RUN pip uninstall -y atom || true
 RUN git clone $ATOM_REPO /ATOM && \
     cd /ATOM && \
     git checkout $ATOM_COMMIT && \
-    pip install .
+    pip install -e .
 RUN pip show atom || true
 
 CMD ["/bin/bash"]
