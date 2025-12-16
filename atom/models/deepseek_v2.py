@@ -680,8 +680,13 @@ class DeepseekV2MLAAttention(nn.Module):
         )
 
         self.prefix = prefix
-        self.quant_dtype = non_proj_quant_config["quant_dtype"] if non_proj_quant_config else None
-        self.fuse_qknorm_quant = ENABLE_DS_QKNORM_QUANT_FUSION and self.quant_dtype is not None
+        if quant_config["quant_dtype"] == torch.float4_e2m1fn_x2:
+            if use_triton_gemm():
+                self.quant_dtype = quant_config["quant_dtype"]
+                self.fuse_qknorm_quant = True
+            else: 
+                self.quant_dtype = None
+                self.fuse_qknorm_quant = False
 
     def forward(
         self,
@@ -713,7 +718,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     None,
                     dtype_quant=self.quant_dtype,
                     shuffle=False,
-                    scale_shuffle_padding=False,
+                    scale_shuffle_padding=True,
                     group_size=128,
                     output_unquantized_inp1=False,
                     transpose_scale=False,
