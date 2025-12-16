@@ -95,6 +95,7 @@ def quick_ar_or_fused_arnorm_fake_tensors(
     residual: torch.Tensor,
     eps: float,
     dim: int,
+    use_qr_when_possible,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return (torch.empty_like(x), torch.empty_like(residual))
 
@@ -106,10 +107,11 @@ def quick_ar_or_fused_arnorm_(
     residual: torch.Tensor,
     eps: float,
     dim: int,
+    use_qr_when_possible: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     forward_context: ForwardContext = get_forward_context()
     context = forward_context.context
-    if context.is_prefill:
+    if use_qr_when_possible and context.is_prefill:
         qr_comm = get_tp_group().device_communicator.qr_comm
         assert qr_comm is not None, "Quick all-reduce communication is not initialized!"
         ar_out = qr_comm.quick_all_reduce(x)
@@ -139,10 +141,7 @@ class RMSNorm(nn.Module):
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.qr_comm: Optional[QuickAllReduce] = None
-        if use_qr_when_possible and self.tp_size > 1:
-            assert get_tp_group().device_communicator.qr_comm is not None, "Quick all-reduce communication is not initialized!"
-            self.qr_comm = get_tp_group().device_communicator.qr_comm
+        self.use_qr_when_possible = use_qr_when_possible
 
     def forward(
         self,
@@ -169,6 +168,7 @@ class RMSNorm(nn.Module):
                 residual,
                 self.eps,
                 self.dim,
+                self.use_qr_when_possible,
             )
         else:
             if residual is None:
