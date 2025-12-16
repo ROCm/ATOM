@@ -2,9 +2,9 @@ name: Nightly Docker Release
 
 on:
   schedule:
-    - cron: '0 15 * * *'  # Every day at 15:00 UTC
+    - cron: '0 1 * * *'  # Every day at 09:00 Beijing Time (UTC+8)
   pull_request:
-    branches: [main] # For testing
+    branches: [main] # for testing
   workflow_dispatch:
 
 jobs:
@@ -53,7 +53,7 @@ jobs:
       - name: Push Docker image
         run: |
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
-          TAG=$(date +%Y%m%d%H%M%S)
+          TAG=$(date +%Y%m%d%H%M)
           docker tag atom_release:ci rocm/atom:${TAG}
           docker push rocm/atom:${TAG}
 
