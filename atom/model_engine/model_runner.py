@@ -373,7 +373,7 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
                 record_shapes=True,
-                with_stack=True,
+                with_stack=False,
                 profile_memory=True,
                 on_trace_ready=torch_profiler.tensorboard_trace_handler(
                     self.profiler_dir, use_gzip=True
