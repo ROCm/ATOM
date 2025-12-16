@@ -48,7 +48,24 @@ jobs:
           docker exec atom_release_ci bash -c \
             "python3 -m atom.examples.simple_inference \
                --model meta-llama/Meta-Llama-3-8B-Instruct \
-               --temperature 0 | grep -E '^Prompt: |^Completion:'"
+               --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_release_output.txt
+          
+          echo ""
+          echo "========== Showing release output below =========="
+          cat atom_release_output.txt
+
+          echo ""
+          echo "========== Comparing output with golden outputs =========="
+          # Ignore whitespace and EOL differences in the diff
+          diff -u -B -w --strip-trailing-cr atom_release_output.txt .github/workflows/golden_outputs.txt || true
+          DIFF_EXIT_CODE=$?
+          
+          if [ $DIFF_EXIT_CODE -ne 0 ]; then
+            echo "Output does not match golden outputs."
+            exit 1
+          else
+            echo "Output matches golden outputs."
+          fi
 
       - name: Push Docker image
         run: |
