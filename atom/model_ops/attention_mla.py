@@ -28,7 +28,7 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 )
 
 # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
-# from aiter import fused_qk_rope_concat_and_cache_mla
+from aiter import fused_qk_rope_concat_and_cache_mla
 from aiter.dist.parallel_state import get_dp_group
 
 from atom.utils import envs
@@ -412,47 +412,32 @@ class MLAAttention(nn.Module):
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
             if kv_cache.numel() > 0:
-                # decode_q = torch.empty(
-                #     (
-                #         q_nope.shape[0],
-                #         self.num_heads,
-                #         self.kv_lora_rank + self.qk_rope_head_dim,
-                #     ),
-                #     dtype=kv_cache.dtype,
-                #     device=q_nope.device,
-                # )
-                # fused_qk_rope_concat_and_cache_mla(
-                #     q_nope,
-                #     q_rope,
-                #     k_nope,
-                #     k_rope,
-                #     kv_cache.view(
-                #         kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                #     ),
-                #     decode_q,
-                #     attn_metadata.slot_mapping,
-                #     self._k_scale,
-                #     self._q_scale,
-                #     positions,
-                #     self.rotary_emb.cos_cache,
-                #     self.rotary_emb.sin_cache,
-                #     is_neox=self.rotary_emb.is_neox_style,
-                #     is_nope_first=True,
-                # )
-                from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
-                decode_q, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+                decode_q = torch.empty(
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=kv_cache.dtype,
+                    device=q_nope.device,
+                )
+                fused_qk_rope_concat_and_cache_mla(
                     q_nope,
                     q_rope,
-                    k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                    k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                    kv_cache,
+                    k_nope,
+                    k_rope,
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
+                    decode_q,
                     attn_metadata.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
                     positions,
                     self.rotary_emb.cos_cache,
                     self.rotary_emb.sin_cache,
-                    k_scale=self._k_scale,
                     is_neox=self.rotary_emb.is_neox_style,
-                    q_out_dtype=kv_cache.dtype,
+                    is_nope_first=True,
                 )
 
             output = self._forward_decode(decode_q, kv_cache, attn_metadata)
