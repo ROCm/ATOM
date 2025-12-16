@@ -54,7 +54,7 @@ jobs:
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
-          TAG=$(date +%Y%m%d%H%M)
+          TAG=nightly-$(date +%Y%m%d%H%M)
           docker tag atom_release:ci rocm/atom:${TAG}
           docker tag atom_release:ci rocm/atom:latest
           docker push rocm/atom:${TAG}
