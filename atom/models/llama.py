@@ -59,6 +59,17 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
+
+
+ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT
+if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT:
+    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+
+
+if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT:
+    import aiter as rocm_aiter
+    rocm_aiter_mxfp4_dtype = rocm_aiter.dtypes.fp4x2
 
 
 class LlamaMLP(nn.Module):
@@ -96,8 +107,8 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        x = self.gate_up_proj(x)
+    def forward(self, x, x_scale: Optional[torch.Tensor] = None):
+        x = self.gate_up_proj(x, x_scale=x_scale)
         x = self.act_fn(x)
         x = self.down_proj(x)
         return x
@@ -194,8 +205,9 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
@@ -291,17 +303,48 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        # Self Attention + FP4 quant
+        scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT:
+            weight = self.input_layernorm.weight
+            eps = self.input_layernorm.eps
+            if residual is None:
+                residual = hidden_states
+                hidden_states, _, _, _ = fused_rms_mxfp4_quant(hidden_states, weight, eps, scale,
+                                                    None, None, eps,
+                                                    dtype_quant=rocm_aiter_mxfp4_dtype,
+                                                    res1=None)
+            else:
+                hidden_states, _, _, residual = fused_rms_mxfp4_quant(hidden_states, weight, eps, scale,
+                                                    None, None, eps,
+                                                    dtype_quant=rocm_aiter_mxfp4_dtype,
+                                                    res1=residual)
+            x_scale=scale.view(1)
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            x_scale=None
+        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states, x_scale=x_scale)
+
+        # Fully Connected + FP4 quant
+        scale = self.mlp.gate_up_proj.input_scale
+        if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT:
+            weight = self.post_attention_layernorm.weight
+            eps = self.post_attention_layernorm.eps
+            hidden_states, _, _, residual = fused_rms_mxfp4_per_tensor_static_quant(hidden_states, weight, eps, scale,
+                                                None, None, eps,
+                                                dtype_quant=rocm_aiter_mxfp4_dtype,
+                                                res1=residual)
+            x_scale=scale.view(1)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            x_scale=None
+        hidden_states = self.mlp(hidden_states, x_scale=x_scale)
         return hidden_states, residual
 
 

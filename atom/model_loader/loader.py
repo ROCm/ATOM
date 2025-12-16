@@ -118,12 +118,13 @@ def load_model(
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
-                    param = model.get_parameter(param_name)
-                    weight_loader = getattr(param, "weight_loader")
-                    # weight_loader(param, weight_tensor, shard_id)
-                    futures.append(
-                        executor.submit(weight_loader, param, weight_tensor, shard_id)
-                    )
+                    if ("output_scale" not in param_name):
+                        param = model.get_parameter(param_name)
+                        weight_loader = getattr(param, "weight_loader")
+                        # weight_loader(param, weight_tensor, shard_id)
+                        futures.append(
+                            executor.submit(weight_loader, param, weight_tensor, shard_id)
+                        )
                     break
             else:
                 # Check if model has expert mapping before processing
