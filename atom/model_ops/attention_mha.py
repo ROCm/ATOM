@@ -192,7 +192,10 @@ class Attention(nn.Module):
         
         pa_decode_gluon(
             o,
+            o,
             q,
+            q,
+            None,
             k_cache,
             v_cache,
             attn_metadata.context_lens,
@@ -200,6 +203,7 @@ class Attention(nn.Module):
             self.scale,
             1, # query_lenth
             max_context_length, # max_context_len
+            context_partition_size,
             tl.bfloat16, #compute_type
             None,
             self.one_scale,
