@@ -1103,6 +1103,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                                                 fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION)
         self.routed_scaling_factor = config.routed_scaling_factor
         self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
+        self.fuse_rmsnorm_quant = ENABLE_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
 
 
     def forward(
