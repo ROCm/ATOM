@@ -66,10 +66,14 @@ ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED
 if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_quant
 
+ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
+    from aiter.ops.triton.fused_fp8_quant import fused_silu_mul_fp8_per_tensor_static_quant
 
-if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT or ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
     import aiter as rocm_aiter
     rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
 
 class LlamaMLP(nn.Module):
 
@@ -108,8 +112,15 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
-        x = self.act_fn(x)
-        x = self.down_proj(x)
+        scale = self.down_proj.input_scale
+        if scale is not None and ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
+            x = fused_silu_mul_fp8_per_tensor_static_quant(x, x_scale,
+                                                      dtype_quant=rocm_aiter_fp8_dtype)
+            x_scale = scale.view(1)
+        else:
+            x = self.act_fn(x)
+            x_scale = None
+        x = self.down_proj(x, x_scale=x_scale)
         return x
 
 
