@@ -717,7 +717,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     self.kv_a_layernorm.eps,
                     None,
                     dtype_quant=self.quant_dtype,
-                    shuffle=False,
+                    shuffle=True,
                     scale_shuffle_padding=True,
                     group_size=128,
                     output_unquantized_inp1=False,
