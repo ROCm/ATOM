@@ -9,8 +9,6 @@ from torch.distributed import ProcessGroup
 from torch.distributed.rendezvous import rendezvous
 import torch
 from datetime import timedelta
-from typing import Union
-import os
 
 from atom.utils import is_torch_equal_or_newer
 
@@ -138,19 +136,3 @@ def stateless_destroy_torch_distributed_process_group(
         _shutdown_backend(pg)
 
     _unregister_process_group(pg.group_name)
-
-
-def init_aiter_quick_all_reduce(
-        device: Union[int, str, torch.device]
-    ):
-    from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
-    from aiter.dist.parallel_state import get_tp_group
-    
-    # Use ATOM_ROCM_QUICK_REDUCE_QUANTIZATION to override AITER_QUICK_REDUCE_QUANTIZATION
-    atom_qr_regime = os.environ.get("ATOM_ROCM_QUICK_REDUCE_QUANTIZATION", None)
-    if atom_qr_regime is not None:
-        os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = atom_qr_regime
-    
-    group = get_tp_group()
-    qr = QuickAllReduce(group=group, device=device)
-    return qr
