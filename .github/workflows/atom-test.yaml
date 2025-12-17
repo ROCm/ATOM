@@ -97,6 +97,7 @@ jobs:
         timeout-minutes: 60
         run: |
           # Run the inference and capture output
+          set -ex
           echo ""
           echo "========== Running test =========="
 
