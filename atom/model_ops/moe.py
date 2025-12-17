@@ -44,6 +44,8 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.jit.utils.chip_info import get_gfx
 from atom.utils import envs
 
+from atom.utils import envs, mark_spliting_op
+from atom.model_ops.fused_moe.config import _has_module
 
 @dataclass
 class FusedMoEParallelConfig:
@@ -59,8 +61,7 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        return self.dp_size > 1 
-        return self.dp_size > 1 and self.use_ep
+        return self.dp_size > 1 and _has_module("mori")
     
     @property
     def use_mori_kernels(self):
@@ -447,27 +448,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
         )
-        return self.fused_experts(
+        if self.fused_experts:
+            return self.fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=False,
+                activation=activation,
+                quant_type=QuantType.No,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+            )
+        return fused_moe(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
-            topk_weights=topk_weights,
+            topk_weight=topk_weights,
             topk_ids=topk_ids,
-            inplace=False,
+            expert_mask=expert_map,
             activation=activation,
-            quant_type=QuantType.No,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
         )
-        # return fused_moe(
-        #     hidden_states=x,
-        #     w1=layer.w13_weight,
-        #     w2=layer.w2_weight,
-        #     topk_weight=topk_weights,
-        #     topk_ids=topk_ids,
-        #     expert_mask=expert_map,
-        #     activation=activation,
-        # )
 
 
 def rocm_aiter_fused_moe_impl(
@@ -1457,9 +1459,7 @@ class FusedMoE(torch.nn.Module):
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
 
-        self.use_chunked = (get_dp_group().world_size > 1) and (
-            not envs.ATOM_ENFORCE_EAGER
-        )
+        self.use_chunked = (get_dp_group().world_size > 1)
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError(
