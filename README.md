@@ -9,7 +9,7 @@
 ## 🚀 Features
 
 - **ROCm Optimized**: Built on AMD's ROCm platform with torch compile support
-- **Model Support**: Compatible with **[Deepseek](https://huggingface.co/deepseek-ai)**, **[Qwen](https://huggingface.co/Qwen)**, **[Llama](https://huggingface.co/meta-llama)**, and **[Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)**.
+- **Model Support**: Compatible with **[Deepseek](https://huggingface.co/deepseek-ai)**, **[Qwen](https://huggingface.co/Qwen)**, **[Llama](https://huggingface.co/meta-llama)**, **[Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)**, **[GPTOSS](https://huggingface.co/openai)**.
 - **Easy Integration**: Simple API for quick deployment
 
 ## 📋 Requirements
@@ -56,7 +56,7 @@ pip install .
 
 ### Basic Example
 
-The default optimization level is 3 (running with torch compile). Supported models include **[Deepseek](https://huggingface.co/deepseek-ai)**, **[Qwen](https://huggingface.co/Qwen)**, **[Llama](https://huggingface.co/meta-llama)**, and **[Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)**.
+The default optimization level is 3 (running with torch compile). Supported models include **[Deepseek](https://huggingface.co/deepseek-ai)**, **[Qwen](https://huggingface.co/Qwen)**, **[Llama](https://huggingface.co/meta-llama)**, **[Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)**, **[GPTOSS](https://huggingface.co/openai)**.
 
 ```bash
 python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B
@@ -99,7 +99,7 @@ Run online throughput benchmark:
 start the server
 ```bash
 python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B
-python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 -tp 8 --block-size 1
+python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 -tp 8
 ```
 run benchmark
 ```bash
