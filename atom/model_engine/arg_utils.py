@@ -139,6 +139,7 @@ class EngineArgs:
             default=1,
             help="Number of speculative tokens to generate per iteration (draft model runs this many times autoregressively)",
         )
+
         parser.add_argument(
             "--max-num-batched-tokens",
             type=int,
@@ -157,7 +158,6 @@ class EngineArgs:
             default=0.9,
             help="GPU memory utilization (0.0 to 1.0)",
         )
-
         return parser
 
     @classmethod
