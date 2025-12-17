@@ -3,6 +3,8 @@ name: Nightly Docker Release
 on:
   schedule:
     - cron: '0 1 * * *'  # Every day at 09:00 Beijing Time (UTC+8)
+  pull_request:
+    branches: [main] # for testing
   workflow_dispatch:
 
 jobs:
@@ -80,7 +82,7 @@ jobs:
       - name: Push Docker image
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
-          if ${{ matrix.baes_image }} == "rocm/pytorch-private:ROCm_7.2_atom_1216"; then
+          if [[ ${{ matrix.baes_image }} == *ROCm_7.2* ]]; then
             TAG=nightly_rocm_7.2_preview_$(date +%Y%m%d%H%M)
             docker tag atom_release:ci rocm/atom:rocm_7.2_preview_latest
             docker push rocm/atom:rocm_7.2_preview_latest
