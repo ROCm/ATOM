@@ -1132,7 +1132,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     scale_shuffle_padding=True,
                     group_size=128,
                     output_unquantized_inp1=False,
-                    transpose_scale=False,
+                    transpose_scale=True,
                 )
             else:
                 (hidden_states_quant, hidden_states_quant_scale), _, _, residual = _fuse_rmsnorm_quant(
@@ -1148,7 +1148,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     scale_shuffle_padding=True,
                     group_size=128,
                     output_unquantized_inp1=False,
-                    transpose_scale=False,
+                    transpose_scale=True,
                 )
 
             hidden_states = (hidden_states_quant, hidden_states_quant_scale)
