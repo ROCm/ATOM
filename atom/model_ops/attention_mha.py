@@ -122,34 +122,50 @@ class Attention(nn.Module):
         #    k_scale = v_scale = self.one_scale
         k_scale = v_scale = self.one_scale
 
-        if flash_layout:
-            k_cache = k_cache.view(
-                k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+        if self.rotary_emb:
+            if flash_layout:
+                k_cache = k_cache.view(
+                    k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                )
+                v_cache = v_cache.view(
+                    v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                )
+            
+            q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                position,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                k_scale,
+                v_scale,
+                self.rotary_emb.is_neox_style,
+                flash_layout=flash_layout,
+                apply_scale=self.kv_cache_dtype.startswith("fp8"),
+                offs=None,
+                q_out=q,
+                k_out=k,
+                output_zeros=False,
             )
-            v_cache = v_cache.view(
-                v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+        else:
+            aiter.reshape_and_cache_flash(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                (
+                    self.kv_cache_dtype
+                    if self.kv_cache_dtype.startswith("fp8")
+                    else "auto"
+                ),
+                k_scale,
+                v_scale,
             )
-        
-        q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
-            q,
-            k,
-            v,
-            k_cache,
-            v_cache,
-            attn_metadata.slot_mapping,
-            position,
-            self.rotary_emb.cos_cache,
-            self.rotary_emb.sin_cache,
-            k_scale,
-            v_scale,
-            self.rotary_emb.is_neox_style,
-            flash_layout=flash_layout,
-            apply_scale=self.kv_cache_dtype.startswith("fp8"),
-            offs=None,
-            q_out=q,
-            k_out=k,
-            output_zeros=False,
-        )
         
         return q, k, v, k_cache, v_cache, k_scale, v_scale
         
