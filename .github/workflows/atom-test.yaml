@@ -108,11 +108,11 @@ jobs:
           fi
 
           docker exec atom_test bash -c \
-            "python3 -m atom.examples.simple_inference --model ${{ matrix.model }} ${extraArgs} --temperature 0 | grep -E '^Prompt: |^Completion:'" > ${{ matrix.model }}_output.txt
+            "python3 -m atom.examples.simple_inference --model ${{ matrix.model }} ${extraArgs} --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
           
           echo ""
           echo "========== Showing test output below =========="
-          cat ${{ matrix.model }}_output.txt
+          cat atom_test_output.txt
 
           echo ""
           echo "========== Comparing output with golden outputs =========="
@@ -131,8 +131,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.model }}_output.txt
-          path: ${{ matrix.model }}_output.txt
+          name: ${{ matrix.model }}_atom_test_output.txt
+          path: atom_test_output.txt
 
       - name: Clean Up
         if: always()
