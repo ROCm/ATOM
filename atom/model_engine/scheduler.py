@@ -267,3 +267,17 @@ class Scheduler:
         """Returns True if there are unfinished requests, or finished requests
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests()
+
+    def get_next_batch_info(self) -> tuple[bool, int]:
+        if self.waiting:
+            # new request is waiting, will do prefill
+            seq = self.waiting[0]
+            num_tokens = seq.num_tokens - seq.num_cached_tokens
+            return (True, num_tokens)
+        elif self.running:
+            # decode
+            num_tokens = len(self.running)
+            return (False, num_tokens)
+        else:
+            # No requests
+            return (False, 0)

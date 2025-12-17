@@ -354,6 +354,25 @@ class DPEngineCoreProc(EngineCore):
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
             )
+            
+            if not global_has_unfinished and not self.engines_running:
+                self.engines_running = False
+                continue
+            
+            if global_has_prefill and not local_is_prefill:
+                # We must do dummy prefill to sync here
+                # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
+                logger.info(
+                    f"{self.label}: Running dummy prefill ({global_max_tokens} tokens) "
+                    f"to sync with other DP ranks doing prefill"
+                )
+                self._execute_dummy_prefill(global_max_tokens)
+            else:
+                executed = self._process_engine_step()
+                if not executed:
+                    self._execute_dummy_batch()
+            
+            self.engines_running = global_has_unfinished
 
         # shutdown = False
         # while True:
@@ -388,6 +407,38 @@ class DPEngineCoreProc(EngineCore):
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
+
+    def _execute_dummy_prefill(self, num_tokens: int):
+        """Execute dummy prefill batch to sync with other DP ranks doing prefill."""
+        return self.runner_mgr.call_func("dummy_prefill_execution", num_tokens, wait_out=True)
+
+    def _sync_dp_state(
+        self, local_is_prefill: bool, local_num_tokens: int, local_has_unfinished: bool
+    ) -> tuple[bool, int, bool]:
+        if self._shutting_down:
+            return (local_is_prefill, local_num_tokens, local_has_unfinished)
+        
+        try:
+            # Pack all state: [is_prefill, num_tokens, has_unfinished]
+            state_tensor = torch.tensor(
+                [
+                    1 if local_is_prefill else 0,
+                    local_num_tokens,
+                    1 if local_has_unfinished else 0
+                ],
+                dtype=torch.int64,
+                device="cpu"
+            )
+            torch.distributed.all_reduce(
+                state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
+            )
+            global_has_prefill = state_tensor[0].item() == 1
+            global_max_tokens = state_tensor[1].item()
+            global_has_unfinished = state_tensor[2].item() == 1
+            return (global_has_prefill, global_max_tokens, global_has_unfinished)
+        except RuntimeError as e:
+            logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
+            return (local_is_prefill, local_num_tokens, local_has_unfinished)
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:

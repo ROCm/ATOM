@@ -461,6 +461,42 @@ class ModelRunner:
         )
         return True
 
+    def dummy_prefill_execution(self, num_tokens: int):
+        """
+        Execute dummy prefill batch for DP synchronization.
+        """
+        if num_tokens <= 0:
+            num_tokens = 1
+        
+        seq = Sequence([0] * num_tokens, block_size=self.block_size)
+        seqs = {seq.id: seq}
+        
+        dummy_batch = ScheduledBatch(
+            seqs=seqs,
+            num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
+            total_tokens_num=num_tokens,
+            total_tokens_num_prefill=num_tokens,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+        )
+        
+        self.prepare_intputs(dummy_batch)
+        
+        self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
+        self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
+        input_ids = self.tokenID_processor.input_ids.gpu[:num_tokens]
+        
+        self.run_model(input_ids)
+        
+        torch.cuda.synchronize()
+        
+        reset_forward_context()
+        
+        logger.info(
+            f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens"
+        )
+        return True
+
     def warmup_model(self):
         start_time = time.time()
         torch.cuda.empty_cache()
@@ -776,9 +812,10 @@ class ModelRunner:
     def prepare_intputs(self, batch: ScheduledBatch):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
-        num_scheduled_tokens = batch.num_scheduled_tokens
-        cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
+        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
+        context_bs = (
+            batch.total_seqs_num_prefill if is_prefill else batch.total_seqs_num_decode
+        )
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
             bs = (
@@ -787,16 +824,6 @@ class ModelRunner:
                 else next((x for x in self.graph_bs if x >= scheduled_bs), scheduled_bs)
                 # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
             )
-            assert (
-                bs >= scheduled_bs
-            ), f"current decode {scheduled_bs=} > max graph_bs{bs}"
-            self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
-                self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
-            )
-        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
-        context_bs = (
-            batch.total_seqs_num_prefill if is_prefill else batch.total_seqs_num_decode
-        )
 
         context = Context(
             positions=positions,

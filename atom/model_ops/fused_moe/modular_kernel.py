@@ -5,6 +5,7 @@ from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
 from atom.utils import envs
 from atom.utils.dbo.ubatching import dbo_enabled
+from atom.utils.forward_context import get_forward_context
 import torch
 from math import prod
 from typing import Callable, Optional, final
@@ -177,9 +178,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         that handles DBO and async.
         """
         if not self.prepare_finalize.supports_async():
-            # We shouldn't be running an a2a kernel that doesn't
-            # support async prepare/finalize
-            # TODO(lucas): enable in follow-up
+            # TODO: enable dbo
             assert not dbo_enabled()
 
             (
@@ -289,6 +288,22 @@ class FusedMoEModularKernel(torch.nn.Module):
             apply_router_weight_on_input,
             quant_type
         )
+        
+        # optimize fused_moe hidden_states
+        # mori dispatch expands buffer to (max_tokens * world_size, hidden_dim)
+        # but actual valid tokens = batch_size * topk
+        context = get_forward_context().context
+        batch_size = context.batch_size
+        # batch_size = hidden_states.shape[0]
+        topk = topk_ids.shape[1]
+        total_valid_tokens = batch_size * topk
+        if total_valid_tokens < dispatch_a1.shape[0] and not context.is_prefill:
+            dispatch_a1 = dispatch_a1[:total_valid_tokens]
+            dispatch_ids = dispatch_ids[:total_valid_tokens]
+            dispatch_weights = dispatch_weights[:total_valid_tokens]
+            if dispatch_scale is not None:
+                dispatch_scale = dispatch_scale[:total_valid_tokens]
+        
         fused_out = fused_moe(
                 dispatch_a1,
                 w1,

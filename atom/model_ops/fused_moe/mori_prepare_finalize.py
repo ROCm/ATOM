@@ -1,13 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import mori
+from typing import Any
+
 import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from aiter import dtypes
 from aiter import QuantType
+
+# Lazy import mori
+try:
+    import mori
+    MORI_AVAILABLE = True
+except ImportError:
+    mori = None  # type: ignore
+    MORI_AVAILABLE = False
+
+
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
     Prepare/Finalize using MoRI kernels.
@@ -15,13 +26,18 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     def __init__(
         self,
-        mori_op: mori.ops.EpDispatchCombineOp,
+        mori_op: Any,  # mori.ops.EpDispatchCombineOp when mori is available
         max_tokens_per_rank: int,
         num_dispatchers: int,
         use_fp8_dispatch: bool = False,
         quant_type = None,
         quant_dtype: torch.dtype = None,
     ):
+        if not MORI_AVAILABLE:
+            raise ImportError(
+                "mori is required for MoriPrepareAndFinalize but not installed. "
+                "Please install mori to use this feature."
+            )
         super().__init__()
         self.mori_op = mori_op
         self.num_dispatchers_ = num_dispatchers

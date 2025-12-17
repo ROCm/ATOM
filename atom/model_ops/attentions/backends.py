@@ -216,7 +216,27 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
     def build(self, batch: ScheduledBatch, bs: int):
-        if batch.total_tokens_num_prefill > 0:
+        is_prefill = batch.total_tokens_num_prefill > 0
+        num_scheduled_tokens = batch.num_scheduled_tokens
+        cu_seqlens_q, arange = self.model_runner._get_cumsum_and_arange(num_scheduled_tokens)
+        forward_vars = self.model_runner.forward_vars
+        forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
+        if not is_prefill:
+            scheduled_bs = batch.total_seqs_num_decode
+            bs = (
+                scheduled_bs
+                if self.model_runner.enforce_eager
+                else next((x for x in self.model_runner.graph_bs if x >= scheduled_bs), scheduled_bs)
+                # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
+            )
+            assert (
+                bs >= scheduled_bs
+            ), f"current decode {scheduled_bs=} > max graph_bs{bs}"
+            forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
+                forward_vars["cu_seqlens_q"].np[scheduled_bs]
+            )
+
+        if is_prefill:
             return self.prepare_prefill(batch)
         else:
             return self.prepare_decode(batch, bs)
