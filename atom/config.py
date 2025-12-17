@@ -496,7 +496,7 @@ class ParallelConfig:
 @dataclass
 class Config:
     model: str
-    max_num_batched_tokens: int = 20000
+    max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9

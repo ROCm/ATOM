@@ -38,6 +38,7 @@ class EngineArgs:
         enable_expert_parallel: bool = False,
         torch_profiler_dir: str = None,
         enable_dp_attention: bool = False,
+        max_num_batched_tokens: int = 16384,
     ):
         self.model = model
         self.tensor_parallel_size = tensor_parallel_size
@@ -54,6 +55,7 @@ class EngineArgs:
         self.torch_profiler_dir = torch_profiler_dir
         self.enable_dp_attention = enable_dp_attention
         self.data_parallel_size = data_parallel_size
+        self.max_num_batched_tokens = max_num_batched_tokens
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -148,6 +150,13 @@ class EngineArgs:
             action="store_true",
             help="Enable DP attention.",
         )
+
+        parser.add_argument(
+            "--max-num-batched-tokens",
+            type=int,
+            default=16384,
+            help="Maximum number of batched tokens for a single step.",
+        )
         return parser
 
     @classmethod
@@ -169,6 +178,7 @@ class EngineArgs:
             enable_expert_parallel=args.enable_expert_parallel,
             torch_profiler_dir=args.torch_profiler_dir,
             enable_dp_attention=args.enable_dp_attention,
+            max_num_batched_tokens=args.max_num_batched_tokens,
         )
 
     def create_engine(self) -> LLMEngine:
@@ -190,6 +200,7 @@ class EngineArgs:
             ),
             data_parallel_size=self.data_parallel_size,
             enable_dp_attention=self.enable_dp_attention,
+            max_num_batched_tokens=self.max_num_batched_tokens,
         )
 
     def create_async_engine(self) -> AsyncLLMEngine:
