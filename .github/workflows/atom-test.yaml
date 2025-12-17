@@ -100,20 +100,11 @@ jobs:
         timeout-minutes: 60
         run: |
           # Run the inference and capture output
-          set -ex
+          set -euo pipefail
           echo ""
           echo "========== Running test =========="
 
-          docker exec atom_test bash -c \
-            "python3 -m atom.examples.simple_inference --model ${{ matrix.model_path }} ${{ matrix.extraArgs }} --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
-          
-          EXIT_CODE=$?
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "Test failed."
-            exit 1
-          else
-            echo "Test passed."
-          fi
+          docker exec atom_test bash -c "set -euo pipefail && python3 -m atom.examples.simple_inference --model ${{ matrix.model_path }} ${{ matrix.extraArgs }} --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
           
           echo ""
           echo "========== Showing test output below =========="
