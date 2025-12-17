@@ -112,7 +112,7 @@ jobs:
           
           echo ""
           echo "========== Showing test output below =========="
-          cat atom_test_output.txt
+          cat ${{ matrix.model }}_output.txt
 
           echo ""
           echo "========== Comparing output with golden outputs =========="
@@ -131,8 +131,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: atom_test_output
-          path: atom_test_output.txt
+          name: ${{ matrix.model }}_output.txt
+          path: ${{ matrix.model }}_output.txt
 
       - name: Clean Up
         if: always()
