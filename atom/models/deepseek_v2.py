@@ -788,6 +788,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
         self.fuse_rmsnorm_quant = ENABLE_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
 
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -807,6 +808,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     res1=None,
                     dtype_quant=self.quant_dtype,
                     group_size=128,
+                    transpose_scale=True,
                 )
             else:
                 (hidden_states_quant, hidden_states_quant_scale), _,  _, residual = _fuse_rmsnorm_quant(
@@ -816,6 +818,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     res1=residual,
                     dtype_quant=self.quant_dtype,
                     group_size=128,
+                    transpose_scale=True,
                 )
             hidden_states = (hidden_states_quant, hidden_states_quant_scale)
         else:
@@ -856,7 +859,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-@support_torch_compile
+# @support_torch_compile
 class DeepseekV2Model(nn.Module):
     def __init__(
         self,
