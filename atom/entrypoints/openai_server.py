@@ -27,17 +27,31 @@ logger = logging.getLogger("atom")
 class ChatMessage(BaseModel):
     role: str
     content: str
+    
+    class Config:
+        extra = "allow"
 
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
-    messages: List[ChatMessage]
+    messages: Optional[List[ChatMessage]] = None
+    prompt: Optional[List[ChatMessage]] = None  # Accept 'prompt' as alias for 'messages'
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     max_tokens: Optional[int] = 256
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
+    seed: Optional[int] = None
+    
+    def get_messages(self) -> List[ChatMessage]:
+        """Get messages from either 'messages' or 'prompt' field"""
+        if self.messages is not None:
+            return self.messages
+        elif self.prompt is not None:
+            return self.prompt
+        else:
+            raise ValueError("Either 'messages' or 'prompt' field is required")
 
 
 class CompletionRequest(BaseModel):
@@ -58,6 +72,9 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[Dict[str, Any]]
     usage: Dict[str, Any]
+    
+    class Config:
+        extra = "allow"
 
 
 class CompletionResponse(BaseModel):
@@ -147,28 +164,14 @@ def create_usage_chunk(request_id: str, model: str, usage: Dict) -> str:
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-def send_stream_chunk(request_output: RequestOutput):
-    global tokenizer, _stream_queues, _seq_id_to_request_id
-
-    # Get request_id from sequence ID
-    request_id = _seq_id_to_request_id.get(request_output.request_id)
-    if request_id is None:
-        logger.warning(
-            f"send_stream_chunk: No request_id found for sequence {request_output.request_id}"
-        )
-        return
-
+def _send_stream_chunk_direct(request_output: RequestOutput, request_id: str, stream_queue: queue.Queue):
+    """Send stream chunk directly without global mapping lookup - avoids race condition"""
+    global tokenizer
     # Decode the new tokens
     new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
     logger.debug(
-        f"send_stream_chunk: seq_id={request_output.request_id}, request_id={request_id}, tokens={request_output.output_tokens}, text='{new_text}'"
+        f"send_stream_chunk_direct: seq_id={request_output.request_id}, request_id={request_id}, tokens={request_output.output_tokens}, text='{new_text[:50]}...'"
     )
-
-    # Get the queue for this request
-    stream_queue = _stream_queues.get(request_id)
-    if stream_queue is None:
-        logger.warning(f"send_stream_chunk: No queue found for request_id {request_id}")
-        return
 
     # Prepare chunk data
     chunk_data = {
@@ -180,14 +183,28 @@ def send_stream_chunk(request_output: RequestOutput):
 
     try:
         stream_queue.put_nowait(chunk_data)
-        logger.debug(
-            f"send_stream_chunk: Successfully put chunk data into queue for request_id {request_id}"
-        )
     except queue.Full:
         logger.warning(
-            f"send_stream_chunk: Queue full for request_id {request_id}, skipping chunk"
+            f"send_stream_chunk_direct: Queue full for request_id {request_id}, skipping chunk"
         )
-        pass
+
+
+def send_stream_chunk(request_output: RequestOutput):
+    global tokenizer, _stream_queues, _seq_id_to_request_id
+
+    request_id = _seq_id_to_request_id.get(request_output.request_id)
+    if request_id is None:
+        logger.warning(
+            f"send_stream_chunk: No request_id found for sequence {request_output.request_id}"
+        )
+        return
+
+    stream_queue = _stream_queues.get(request_id)
+    if stream_queue is None:
+        logger.warning(f"send_stream_chunk: No queue found for request_id {request_id}")
+        return
+
+    _send_stream_chunk_direct(request_output, request_id, stream_queue)
 
 
 async def generate_async(
@@ -229,8 +246,9 @@ async def chat_completions(request: ChatCompletionRequest):
             detail=f"Requested model '{request.model}' does not match server model '{model_name}'",
         )
     try:
+        messages = request.get_messages()
         prompt = tokenizer.apply_chat_template(
-            [{"role": msg.role, "content": msg.content} for msg in request.messages],
+            [{"role": msg.role, "content": msg.content} for msg in messages],
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -248,8 +266,11 @@ async def chat_completions(request: ChatCompletionRequest):
             stream_queue = queue.Queue()
             _stream_queues[request_id] = stream_queue
 
+            captured_request_id = request_id
+            captured_stream_queue = stream_queue
+            
             def stream_callback(request_output: RequestOutput):
-                send_stream_chunk(request_output)
+                _send_stream_chunk_direct(request_output, captured_request_id, captured_stream_queue)
 
             loop = asyncio.get_event_loop()
 
@@ -257,12 +278,12 @@ async def chat_completions(request: ChatCompletionRequest):
                 seq = engine.io_processor.preprocess(
                     prompt, sampling_params, stream_callback=stream_callback
                 )
+                _seq_id_to_request_id[seq.id] = captured_request_id
                 return seq
 
             seq = await loop.run_in_executor(None, do_preprocess)
 
             seq_id = seq.id
-            _seq_id_to_request_id[seq_id] = request_id
 
             logger.info(
                 f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}"
@@ -285,7 +306,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 while not finished:
                     try:
                         chunk_data = await asyncio.wait_for(
-                            loop.run_in_executor(None, stream_queue.get), timeout=30.0
+                            loop.run_in_executor(None, stream_queue.get), timeout=60.0
                         )
                         new_text = chunk_data["text"]
                         current_text = prev_text + new_text
@@ -328,7 +349,7 @@ async def chat_completions(request: ChatCompletionRequest):
         if final_output is None:
             raise RuntimeError("No output generated")
 
-        return ChatCompletionResponse(
+        response_data = ChatCompletionResponse(
             id=request_id,
             created=created,
             model=model_name,
@@ -337,6 +358,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     "index": 0,
                     "message": {"role": "assistant", "content": final_output["text"]},
                     "finish_reason": final_output["finish_reason"],
+                    "text": final_output["text"],
                 }
             ],
             usage={
@@ -349,6 +371,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 "latency_s": round(final_output.get("latency", 0.0), 4),
             },
         )
+        return response_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -375,8 +398,11 @@ async def completions(request: CompletionRequest):
             stream_queue = queue.Queue()
             _stream_queues[request_id] = stream_queue
 
+            captured_request_id = request_id
+            captured_stream_queue = stream_queue
+            
             def stream_callback(request_output: RequestOutput):
-                send_stream_chunk(request_output)
+                _send_stream_chunk_direct(request_output, captured_request_id, captured_stream_queue)
 
             loop = asyncio.get_event_loop()
 
@@ -384,12 +410,12 @@ async def completions(request: CompletionRequest):
                 seq = engine.io_processor.preprocess(
                     request.prompt, sampling_params, stream_callback=stream_callback
                 )
+                _seq_id_to_request_id[seq.id] = captured_request_id
                 return seq
 
             seq = await loop.run_in_executor(None, do_preprocess)
 
             seq_id = seq.id
-            _seq_id_to_request_id[seq_id] = request_id
             logger.info(
                 f"API: Created request_id={request_id}, seq_id={seq_id}, queue={stream_queue is not None}"
             )

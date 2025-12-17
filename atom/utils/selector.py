@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from typing import Tuple, Optional, Type, List
 from abc import ABC, abstractmethod
 from functools import cache
-from atom.utils import resolve_obj_by_qualname
+from typing import List, Optional, Tuple, Type
+
+import torch
 from atom.model_ops.attentions.backends import AttentionBackend
+from atom.utils import resolve_obj_by_qualname
 
 
 def get_attn_backend(
@@ -39,12 +40,12 @@ def _cached_get_attn_backend(
 
 def get_attn_backend_cls(block_size, use_mla) -> str:
     if use_mla:
-        if block_size == 1:
-            return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"  # noqa: E501
-        else:
-            raise ValueError(
-                f" The selected backend"
-                f"does not support block size {block_size}."
-                "(currently only supports block size 1)")
+        # if block_size == 1:
+        return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"  # noqa: E501
+        # else:
+        #     raise ValueError(
+        #         f" The selected backend"
+        #         f"does not support block size {block_size}."
+        #         "(currently only supports block size 1)")
 
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501
