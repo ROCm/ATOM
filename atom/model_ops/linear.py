@@ -98,6 +98,10 @@ def gemm_a4w4_quant(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor
             )
 
         if m >= 32:
+            pad_m = ((m + 31) // 32) * 32
+            if x_scale.shape[0] < pad_m:
+                padding = torch.zeros(pad_m - x_scale.shape[0], x_scale.shape[1], dtype=x_scale.dtype, device=x_scale.device)
+                x_scale = torch.cat([x_scale, padding], dim=0)
             x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
         else:
             x_scale = x_scale[:m, ...].view(torch.uint8)
