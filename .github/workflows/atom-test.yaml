@@ -14,7 +14,7 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu
+    runs-on: atom-mi355-4gpu
     strategy:
       fail-fast: false
       matrix:
@@ -24,7 +24,7 @@ jobs:
             extraArgs: ""
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8"
+            extraArgs: "--kv_cache_dtype fp8 -tp 4"
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
