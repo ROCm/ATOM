@@ -95,7 +95,7 @@ def quick_ar_or_fused_arnorm_fake_tensors(
     residual: torch.Tensor,
     eps: float,
     dim: int,
-    use_qr_when_possible,
+    use_qr_when_possible: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return (torch.empty_like(x), torch.empty_like(residual))
 
