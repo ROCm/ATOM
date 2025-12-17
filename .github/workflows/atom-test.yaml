@@ -14,7 +14,7 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-1gpu
+    runs-on: atom-mi355-8gpu
     strategy:
       fail-fast: false
       matrix:
@@ -108,7 +108,7 @@ jobs:
           fi
 
           docker exec atom_test bash -c \
-            "python3 -m atom.examples.simple_inference --model ${{ matrix.model }} ${extraArgs} --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
+            "python3 -m atom.examples.simple_inference --model ${{ matrix.model }} ${extraArgs} --temperature 0 | grep -E '^Prompt: |^Completion:'" > ${{ matrix.model }}_output.txt
           
           echo ""
           echo "========== Showing test output below =========="
