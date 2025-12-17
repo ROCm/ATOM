@@ -43,8 +43,6 @@ from atom.models.utils import (
 from atom.utils import envs
 
 from aiter import fused_rope_rms
-from atom.utils.distributed.utils import init_aiter_quick_all_reduce
-from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
@@ -387,9 +385,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 prefix=f"{prefix}.mlp",
             )
-        # self.qr_common = None
-        # if ATOM_ROCM_QUICK_REDUCE_QUANTIZATION != "NONE":
-        #     self.qr_common = init_aiter_quick_all_reduce(device=self.self_attn.qkv_proj.weight.device)
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
