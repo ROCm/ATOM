@@ -15,11 +15,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build Docker image
+        timeout-minutes: 60
         run: |
           docker build --network=host -t atom_release:ci -f docker/Dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image
+        timeout-minutes: 60
         run: |
           echo "Clean up containers..."
           docker ps -aq -f name=atom_release_ci | xargs -r docker stop | xargs -r docker rm
