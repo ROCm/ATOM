@@ -35,8 +35,6 @@ def divide(numerator, denominator):
     ), f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
 
-from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter import gemm_a4w4, per_1x32_f4_quant_hip
 
 def gemm_a4w4_quant_fake(
     x: torch.Tensor,
@@ -425,7 +423,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             # the KV heads across multiple tensor parallel GPUs.
             self.num_kv_heads = 1
             self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        
+
         input_size = hidden_size
         output_sizes = [
             self.num_heads * self.head_size * tp_size,

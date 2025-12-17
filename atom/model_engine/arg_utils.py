@@ -7,7 +7,6 @@ from typing import List, Optional
 
 from atom import AsyncLLMEngine, LLMEngine
 from atom.config import CompilationConfig, SpeculativeConfig
-from atom.config import CompilationConfig
 
 
 def parse_size_list(size_str: str) -> List[int]:
@@ -139,7 +138,6 @@ class EngineArgs:
             default=1,
             help="Number of speculative tokens to generate per iteration (draft model runs this many times autoregressively)",
         )
-
         parser.add_argument(
             "--max-num-batched-tokens",
             type=int,
@@ -158,6 +156,7 @@ class EngineArgs:
             default=0.9,
             help="GPU memory utilization (0.0 to 1.0)",
         )
+
         return parser
 
     @classmethod
