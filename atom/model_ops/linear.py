@@ -6,6 +6,10 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
+from atom.config import QuantizationConfig
+from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
+from torch import nn
+
 from aiter import (
     QuantType,
     dtypes,
@@ -21,13 +25,12 @@ import logging
 logger = logging.getLogger("atom")
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
-from torch import nn
-from atom.config import QuantizationConfig
-from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 from atom.utils import envs
+
 
 def divide(numerator, denominator):
     assert (
@@ -52,7 +55,7 @@ def gemm_a4w4_quant_fake(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.T
             (*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device
         )
 
-#It's important to use mutates_args=[] to avoid functionized_v2 op generation
+# It's important to use mutates_args=[] to avoid functionized_v2 op generation
 @torch_compile_guard(gen_fake=gemm_a4w4_quant_fake, mutates_args=[])
 def gemm_a4w4_quant(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, weight_scale: torch.Tensor, params_dtype: torch.dtype,
                     input_scale: torch.Tensor, output_size: int) -> torch.Tensor:
@@ -295,7 +298,12 @@ class LinearBase(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(x, self.weight, self.bias)
+            y = tgemm.mm(
+                x,
+                self.weight,
+                self.bias,
+                otype=otype,
+            )
         else:
             if x_scale is None:
                 quant_func = get_hip_quant(self.quant_type)
@@ -476,7 +484,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             # the KV heads across multiple tensor parallel GPUs.
             self.num_kv_heads = 1
             self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        
+
         input_size = hidden_size
         output_sizes = [
             self.num_heads * self.head_size * tp_size,
