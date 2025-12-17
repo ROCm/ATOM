@@ -15,6 +15,13 @@ jobs:
   atom:
     name: ATOM Test
     runs-on: atom-mi355-1gpu
+    strategy:
+      fail-fast: false
+      matrix:
+        model: 
+          - "meta-llama/Meta-Llama-3-8B-Instruct"
+          - "deepseek-ai/DeepSeek-R1-0528"
+
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
@@ -92,8 +99,15 @@ jobs:
           # Run the inference and capture output
           echo ""
           echo "========== Running test =========="
+
+          if [[ "${{ matrix.model }}" == *DeepSeek* ]]; then
+              extraArgs="--kv_cache_dtype fp8 -tp 8"
+          else
+              extraArgs=""
+          fi
+
           docker exec atom_test bash -c \
-            "python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
+            "python3 -m atom.examples.simple_inference --model ${{ matrix.model }} ${extraArgs} --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
           
           echo ""
           echo "========== Showing test output below =========="
