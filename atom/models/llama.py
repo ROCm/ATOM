@@ -114,7 +114,7 @@ class LlamaMLP(nn.Module):
         x = self.gate_up_proj(x, x_scale=x_scale)
         scale = self.down_proj.input_scale
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
-            x = fused_silu_mul_fp8_per_tensor_static_quant(x, x_scale,
+            x = fused_silu_mul_fp8_per_tensor_static_quant(x, scale,
                                                       dtype_quant=rocm_aiter_fp8_dtype)
             x_scale = scale.view(1)
         else:
