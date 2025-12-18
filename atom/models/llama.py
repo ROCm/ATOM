@@ -112,7 +112,7 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
-        scale = self.down_proj.input_scale
+        scale=getattr(self.down_proj, "input_scale", None)
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
             x = fused_silu_mul_fp8_per_tensor_static_quant(x, scale,
                                                       dtype_quant=rocm_aiter_fp8_dtype)
@@ -314,7 +314,9 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        scale = self.self_attn.qkv_proj.input_scale
+
+        scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
+        # scale = self.self_attn.qkv_proj.input_scale
 
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
             #static FP8 quantization
@@ -342,7 +344,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states, x_scale=x_scale)
 
         # Fully Connected
-        scale = self.mlp.gate_up_proj.input_scale
+        scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
             # Static FP8 quantization
             weight = self.post_attention_layernorm.weight
