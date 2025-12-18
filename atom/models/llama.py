@@ -334,8 +334,7 @@ class LlamaDecoderLayer(nn.Module):
             x_scale = torch.ones(hidden_states.shape[0], hidden_states.shape[1]//32)
             weight = self.post_attention_layernorm.weight
             eps = self.post_attention_layernorm.eps
-            #(hidden_states, t1), t2, t3, residual = 
-            fused_rms_mxfp4_quant(hidden_states, weight, eps, x_scale,
+            (hidden_states, t1), t2, t3, residual = fused_rms_mxfp4_quant(hidden_states, weight, eps, x_scale,
                                                 None, None, eps,
                                                 res1=residual)
         else:
