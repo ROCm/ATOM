@@ -62,7 +62,9 @@ class EngineCore:
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[List[Sequence]]()
-        self.stream_output_queue = queue.Queue()  # Queue for streaming intermediate outputs
+        self.stream_output_queue = (
+            queue.Queue()
+        )  # Queue for streaming intermediate outputs
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -117,7 +119,9 @@ class EngineCore:
         #     target=self.process_input_sockets, args=(self.input_address,), daemon=True
         # )
         # self.input_thread.start()
-        # We can not start input thread here since dp need to sync with other ranks
+
+        # We can not start input thread here since dp need to sync with other ranks,
+        # Otherwise, DP will hang always.
         # Thus we add new signal READY to notify CoreManager
 
         self._send_ready_signal()
@@ -149,8 +153,8 @@ class EngineCore:
         try:
             if config.parallel_config.data_parallel_size > 1:
                 engine = DPEngineCoreProc(config, input_address, output_address)
-            else:   
-                engine = EngineCore(config, input_address, output_address)            
+            else:
+                engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:
             logger.error(f"run_engine: exception: {e}", exc_info=True)
@@ -177,7 +181,9 @@ class EngineCore:
         out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
-        finished_seqs = self.scheduler.postprocess(seqs, out, stream_output_queue=self.stream_output_queue)
+        finished_seqs = self.scheduler.postprocess(
+            seqs, out, stream_output_queue=self.stream_output_queue
+        )
 
         # Send stream outputs to main process via output_queue
         try:
@@ -228,7 +234,9 @@ class EngineCore:
                     request_type, reqs = pickle.loads(serialized_obj)
                     if request_type == EngineCoreRequestType.ADD:
                         req_ids = [req.id for req in reqs]
-                        logger.debug(f"{self.label}: input get {request_type} {req_ids}")
+                        logger.debug(
+                            f"{self.label}: input get {request_type} {req_ids}"
+                        )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         # Handle utility commands like start_profile/stop_profile
@@ -258,10 +266,12 @@ class EngineCore:
                 if isinstance(item, tuple) and item[0] == "STREAM":
                     # Send stream outputs
                     stream_outputs = item[1]
-                    serialized_obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.STREAM, stream_outputs)
+                    )
                     socket.send(serialized_obj)
                     continue
-                
+
                 if isinstance(item, tuple) and item[0] == "READY":
                     # Send READY signal to indicate EngineCore is fully initialized
                     serialized_obj = pickle.dumps((EngineCoreRequestType.READY, None))
@@ -328,22 +338,29 @@ class DPEngineCoreProc(EngineCore):
         shutdown = False
         while True:
             shutdown = shutdown or self.pull_and_process_input_queue()
-            
+
             local_is_prefill, local_num_tokens = self.scheduler.get_next_batch_info()
             local_unfinished = not self.scheduler.is_finished()
-            
-            global_has_prefill, global_max_tokens, global_has_unfinished, global_shutdown = self._sync_dp_state(
+
+            (
+                global_has_prefill,
+                global_max_tokens,
+                global_has_unfinished,
+                global_shutdown,
+            ) = self._sync_dp_state(
                 local_is_prefill, local_num_tokens, local_unfinished, shutdown
             )
-            
+
             if global_shutdown and not global_has_unfinished:
-                logger.info(f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop")
+                logger.info(
+                    f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
+                )
                 break
-            
+
             if not global_has_unfinished and not self.engines_running:
                 self.engines_running = False
                 continue
-            
+
             if global_has_prefill and not local_is_prefill:
                 # We must do dummy prefill to sync here
                 # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
@@ -356,23 +373,28 @@ class DPEngineCoreProc(EngineCore):
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()
-            
-            self.engines_running = global_has_unfinished
 
+            self.engines_running = global_has_unfinished
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
 
     def _execute_dummy_prefill(self, num_tokens: int):
         """Execute dummy prefill batch to sync with other DP ranks doing prefill."""
-        return self.runner_mgr.call_func("dummy_prefill_execution", num_tokens, wait_out=True)
+        return self.runner_mgr.call_func(
+            "dummy_prefill_execution", num_tokens, wait_out=True
+        )
 
     def _sync_dp_state(
-        self, local_is_prefill: bool, local_num_tokens: int, local_has_unfinished: bool, local_shutdown: bool = False
+        self,
+        local_is_prefill: bool,
+        local_num_tokens: int,
+        local_has_unfinished: bool,
+        local_shutdown: bool = False,
     ) -> tuple[bool, int, bool, bool]:
         if self._shutting_down:
             return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
-        
+
         try:
             # Pack all state: [is_prefill, num_tokens, has_unfinished, shutdown]
             state_tensor = torch.tensor(
@@ -380,10 +402,10 @@ class DPEngineCoreProc(EngineCore):
                     1 if local_is_prefill else 0,
                     local_num_tokens,
                     1 if local_has_unfinished else 0,
-                    1 if local_shutdown else 0
+                    1 if local_shutdown else 0,
                 ],
                 dtype=torch.int64,
-                device="cpu"
+                device="cpu",
             )
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
@@ -392,7 +414,12 @@ class DPEngineCoreProc(EngineCore):
             global_max_tokens = state_tensor[1].item()
             global_has_unfinished = state_tensor[2].item() == 1
             global_shutdown = state_tensor[3].item() == 1
-            return (global_has_prefill, global_max_tokens, global_has_unfinished, global_shutdown)
+            return (
+                global_has_prefill,
+                global_max_tokens,
+                global_has_unfinished,
+                global_shutdown,
+            )
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             # If sync fails, assume shutdown to prevent hang
@@ -401,15 +428,19 @@ class DPEngineCoreProc(EngineCore):
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:
-            tensor = torch.tensor([local_should_shutdown],
-                                dtype=torch.int32,
-                                device="cpu")
-            torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group)
+            tensor = torch.tensor(
+                [local_should_shutdown], dtype=torch.int32, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
+            )
             global_should_shutdown = bool(tensor.item())
             return global_should_shutdown
         except RuntimeError as e:
             # If all_reduce fails, it means other ranks are shutting down
-            logger.warning(f"{self.label}: Shutdown sync failed, assuming shutdown: {e}")
+            logger.warning(
+                f"{self.label}: Shutdown sync failed, assuming shutdown: {e}"
+            )
             return True
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
@@ -417,8 +448,7 @@ class DPEngineCoreProc(EngineCore):
             logger.info(f"{self.label}: Skipping DP sync during shutdown")
             return local_unfinished
         try:
-            return ParallelConfig.has_unfinished_dp(self.dp_group,
-                                                    local_unfinished)
+            return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
         except RuntimeError as e:
             # Handle case where other ranks have already shut down
             logger.warning(f"{self.label}: DP sync failed during shutdown: {e}")
