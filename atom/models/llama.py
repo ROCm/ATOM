@@ -124,15 +124,12 @@ class LlamaMLP(nn.Module):
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
         scale = getattr(self.down_proj, "input_scale", None)
-        if scale is not None and ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
-            x = fused_silu_mul_fp8_per_tensor_static_quant(
-                x, scale, dtype_quant=rocm_aiter_fp8_dtype
-            )
-            x_scale = scale.view(1)
+        x = self.act_fn(x, scale)
+        if isinstance(x, (tuple)):
+            x, scale = x
         else:
-            x = self.act_fn(x)
-            x_scale = None
-        x = self.down_proj(x, x_scale=x_scale)
+            scale = None
+        x = self.down_proj(x, x_scale=scale)
         return x
 
 
@@ -326,75 +323,22 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-
         scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
-        # scale = self.self_attn.qkv_proj.input_scale
-
-        if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-            # static FP8 quantization
-            weight = self.input_layernorm.weight
-            eps = self.input_layernorm.eps
-            if residual is None:
-                residual = hidden_states
-                hidden_states, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
-                    hidden_states,
-                    weight,
-                    eps,
-                    scale,
-                    None,
-                    None,
-                    eps,
-                    dtype_quant=rocm_aiter_fp8_dtype,
-                    res1=None,
-                )
-            else:
-                hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
-                    hidden_states,
-                    weight,
-                    eps,
-                    scale,
-                    None,
-                    None,
-                    eps,
-                    dtype_quant=rocm_aiter_fp8_dtype,
-                    res1=residual,
-                )
-            x_scale = scale.view(1)
+        if residual is None:
+            residual = hidden_states
+            hidden_states, _, scale = self.input_layernorm(hidden_states, scale)
         else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
-            x_scale = None
+            hidden_states, residual, scale = self.input_layernorm(hidden_states, scale, residual)
         hidden_states = self.self_attn(
-            positions=positions, hidden_states=hidden_states, x_scale=x_scale
+            positions=positions, hidden_states=hidden_states, x_scale=scale
         )
 
         # Fully Connected
         scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
-        if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-            # Static FP8 quantization
-            weight = self.post_attention_layernorm.weight
-            eps = self.post_attention_layernorm.eps
-            hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
-                hidden_states,
-                weight,
-                eps,
-                scale,
-                None,
-                None,
-                eps,
-                dtype_quant=rocm_aiter_fp8_dtype,
-                res1=residual,
-            )
-            x_scale = scale.view(1)
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-            x_scale = None
-        hidden_states = self.mlp(hidden_states, x_scale=x_scale)
+        hidden_states, residual, scale = self.post_attention_layernorm(
+            hidden_states, scale, residual
+        )
+        hidden_states = self.mlp(hidden_states, x_scale=scale)
         return hidden_states, residual
 
 
@@ -479,7 +423,7 @@ class LlamaModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ , _= self.norm(hidden_states, None, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
