@@ -50,6 +50,8 @@ from aiter.ops.triton.pa_mqa_logits import (
 from aiter.rotary_embedding import get_rope
 from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.dist.utils import cdiv
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -89,22 +91,72 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_RMSNORM_QUANT_FUSION
 
+
+def _fuse_rmsnorm_quant_fake(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: Optional[float] = None,
+    res1: Optional[torch.Tensor] = None,
+    dtype_quant: torch.dtype = dtypes.fp8,
+    shuffle: bool = False,
+    scale_shuffle_padding: bool = False,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    m, n1 = x1.shape
+    if x2 is not None:
+        _, n2 = x2.shape
+    if dtype_quant == dtypes.fp8:
+        out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
+        out1_bs = torch.empty((m, cdiv(n1, group_size)), dtype=torch.float32, device=x1.device)
+        out1_unquantized = None
+        if output_unquantized_inp1:
+            out1_unquantized = torch.empty_like(x1)
+        out2 = None
+        if x2 is not None:
+            out2 = torch.empty((m, n2), dtype=x1.dtype, device=x1.device)
+        out_res1 = None
+        if res1 is not None:
+            out_res1 = torch.empty((m, n1), dtype=x1.dtype, device=x1.device)
+    else:
+        raise ValueError(f"No fused rmsnorm quant kernel available for quant dtype: {dtype_quant}.")
+
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
 # only for DS MLA attention
+@torch_compile_guard(gen_fake=_fuse_rmsnorm_quant_fake)
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
     x2: Optional[torch.Tensor] = None,
     x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: float = 0.0,
+    x2_epsilon: Optional[float] = None,
     res1: Optional[torch.Tensor] = None,
-    dtype_quant=dtypes.fp8,
-    shuffle: Optional[bool] = False,
-    scale_shuffle_padding: Optional[bool] = False,
-    group_size=128,
-    output_unquantized_inp1=False,
-    transpose_scale=False,
-):
+    dtype_quant: torch.dtype = dtypes.fp8,
+    shuffle: bool = False,
+    scale_shuffle_padding: bool = False,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     if dtype_quant == dtypes.fp8:
         (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = fused_rms_fp8_group_quant(
             x1,
@@ -120,7 +172,7 @@ def _fuse_rmsnorm_quant(
             transpose_scale,
         )
     elif dtype_quant == dtypes.fp4x2:
-         (out1_quantized, out1_bs), out2, out_res1 = fused_rms_mxfp4_quant(
+        (out1_quantized, out1_bs), out2, out_res1 = fused_rms_mxfp4_quant(
             x1,
             x1_weight,
             x1_epsilon,
@@ -131,10 +183,10 @@ def _fuse_rmsnorm_quant(
             shuffle,
             scale_shuffle_padding,
         )
-         out1_unquantized = None
+        out1_unquantized = None
     else:
         raise ValueError(f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}.")
-    return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 class DeepseekV2MLP(nn.Module):
 
@@ -683,8 +735,7 @@ class DeepseekV2MLAAttention(nn.Module):
             )
             # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
             if self.fuse_qknorm_quant:
-                (hidden_states_or_q_c,
-                 hidden_states_or_q_c_scale), _, kv_c_normed, _ = _fuse_rmsnorm_quant(
+                hidden_states_or_q_c, hidden_states_or_q_c_scale, _, kv_c_normed, _ = _fuse_rmsnorm_quant(
                     q_c,
                     self.q_a_layernorm.weight,
                     self.q_a_layernorm.eps,
@@ -801,7 +852,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             eps = self.input_layernorm.eps
             if residual is None:
                 residual = hidden_states
-                (hidden_states_quant, hidden_states_quant_scale), _,  _, _ = _fuse_rmsnorm_quant(
+                hidden_states_quant, hidden_states_quant_scale, _,  _, _ = _fuse_rmsnorm_quant(
                     x1=hidden_states,
                     x1_weight=weight,
                     x1_epsilon=eps,
@@ -811,7 +862,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     transpose_scale=True,
                 )
             else:
-                (hidden_states_quant, hidden_states_quant_scale), _,  _, residual = _fuse_rmsnorm_quant(
+                hidden_states_quant, hidden_states_quant_scale, _,  _, residual = _fuse_rmsnorm_quant(
                     x1=hidden_states,
                     x1_weight=weight,
                     x1_epsilon=eps,
@@ -859,7 +910,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-# @support_torch_compile
+@support_torch_compile
 class DeepseekV2Model(nn.Module):
     def __init__(
         self,
