@@ -7,8 +7,17 @@ from typing import Callable, List, Optional, Tuple
 
 from dataclasses import dataclass
 
-from atom.model_ops.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG, FusedMoEConfig, FusedMoEQuantConfig, fp8_w8a8_moe_quant_config, mxfp4_w4a16_moe_quant_config
-from atom.model_ops.fused_moe.modular_kernel import FusedMoEModularKernel, FusedMoEPrepareAndFinalize
+from atom.model_ops.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG,
+    FusedMoEConfig,
+    FusedMoEQuantConfig,
+    fp8_w8a8_moe_quant_config,
+    mxfp4_w4a16_moe_quant_config,
+)
+from atom.model_ops.fused_moe.modular_kernel import (
+    FusedMoEModularKernel,
+    FusedMoEPrepareAndFinalize,
+)
 from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
 from atom.utils.forward_context import ForwardContext, get_forward_context
 import torch
@@ -47,6 +56,7 @@ from atom.utils import envs
 from atom.utils import envs, mark_spliting_op
 from atom.model_ops.fused_moe.config import _has_module
 
+
 @dataclass
 class FusedMoEParallelConfig:
     tp_size: int
@@ -62,7 +72,7 @@ class FusedMoEParallelConfig:
     @property
     def use_all2all_kernels(self):
         return self.dp_size > 1 and _has_module("mori")
-    
+
     @property
     def use_mori_kernels(self):
         return True
@@ -85,7 +95,6 @@ class FusedMoEParallelConfig:
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
         tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
         atom_config = get_current_atom_config()
-
 
         if not use_ep:
             return FusedMoEParallelConfig(
@@ -112,7 +121,8 @@ class FusedMoEParallelConfig:
             ep_size=ep_size,
             ep_rank=ep_rank,
             use_ep=True,
-            local_ep_size=atom_config.parallel_config.data_parallel_size_local * tp_size_,
+            local_ep_size=atom_config.parallel_config.data_parallel_size_local
+            * tp_size_,
         )
 
 
@@ -235,13 +245,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> FusedMoEQuantConfig | None:
         raise NotImplementedError
 
-
     @staticmethod
     def _maybe_make_prepare_finalize(
         moe: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig | None,
     ) -> FusedMoEPrepareAndFinalize | None:
         from aiter.dist.parallel_state import get_ep_group
+
         all2all_manager = get_ep_group().device_communicator.all2all_manager
         assert all2all_manager is not None
 
@@ -254,10 +264,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # For PTPC (per token per channel) quant, the scale dim for each token is 1
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
-            
+
             # Check if quant_dtype is an FP8 type
             from aiter import QuantType
-            fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
+
+            fp8_dtypes = (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+                torch.float8_e5m2,
+                torch.float8_e5m2fnuz,
+            )
             is_fp8 = quant_config.quant_dtype in fp8_dtypes
             # For FP8: enable FP8 dispatch in Mori (quantize before communication)
             # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
@@ -268,12 +284,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                     quant_type = QuantType.per_1x128
                 elif quant_config.is_per_act_token:
                     quant_type = QuantType.per_Token
-            
+
             # For FP8: use FP8 dtype for communication
             # For FP4/no quant: use bfloat16
-            mori_dtype = quant_config.quant_dtype if is_fp8 and quant_type is not None else torch.bfloat16
+            mori_dtype = (
+                quant_config.quant_dtype
+                if is_fp8 and quant_type is not None
+                else torch.bfloat16
+            )
             # mori_dtype = torch.bfloat16
-            
+
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
@@ -334,9 +354,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             #     "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
             # )
             assert self.topk_indices_dtype is None
-            assert self.fused_experts is None, (
-                f"Attempt to override experts for {id(self)}!"
-            )
+            assert (
+                self.fused_experts is None
+            ), f"Attempt to override experts for {id(self)}!"
             self.topk_indices_dtype = prepare_finalize.topk_indices_dtype()
             # experts = self.select_gemm_impl(prepare_finalize, layer)
             self.fused_experts = FusedMoEModularKernel(
@@ -345,6 +365,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # layer.shared_experts,
                 quant_config=self.moe_quant_config,
             )
+
     @property
     def using_modular_kernel(self) -> bool:
         return self.fused_experts is not None
@@ -768,7 +789,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -840,28 +860,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias2=layer.w2_bias,
             )
         return self.fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=False,
-                activation=activation,
-                quant_type=self.quant_type,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a1_scale=None,
-                a2_scale=None,
-                bias1=layer.w13_bias,
-                bias2=layer.w2_bias,
-                hidden_pad=self.hidden_pad,
-                intermediate_pad=self.intermediate_pad,
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=False,
+            activation=activation,
+            quant_type=self.quant_type,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=None,
+            a2_scale=None,
+            bias1=layer.w13_bias,
+            bias2=layer.w2_bias,
+            hidden_pad=self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
         )
-
-
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -1140,22 +1158,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return
 
-
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
         return fp8_w8a8_moe_quant_config(
-            w1_scale=(
-                layer.w13_weight_scale
-            ),
-            w2_scale=(
-                layer.w2_weight_scale
-            ),
+            w1_scale=(layer.w13_weight_scale),
+            w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=None,
         )
-
 
     def apply(
         self,
@@ -1460,7 +1472,7 @@ class FusedMoE(torch.nn.Module):
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
 
-        self.use_chunked = (get_dp_group().world_size > 1)
+        self.use_chunked = get_dp_group().world_size > 1
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError(
@@ -1483,8 +1495,8 @@ class FusedMoE(torch.nn.Module):
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
         if quant_config["quant_type"] == QuantType.No:
-            self.quant_method: Optional[QuantizeMethodBase] = (
-                UnquantizedFusedMoEMethod(moe)
+            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
+                moe
             )
         elif quant_config["quant_dtype"] == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(quant_config, moe)

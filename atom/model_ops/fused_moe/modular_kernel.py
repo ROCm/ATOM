@@ -13,6 +13,7 @@ from enum import Enum
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
 
+
 class FusedMoEActivationFormat(Enum):
     """
     The standard activation format (num_tokens, hidden dim).
@@ -45,6 +46,7 @@ class ExpertTokensMetadata:
             expert_num_tokens=expert_num_tokens_cpu.to(device, non_blocking=True),
             expert_num_tokens_cpu=expert_num_tokens_cpu,
         )
+
 
 PrepareResultType = tuple[
     torch.Tensor,
@@ -111,7 +113,6 @@ class FusedMoEPrepareAndFinalize(ABC):
     ) -> tuple[Callable, Callable] | Callable:
         raise NotImplementedError
 
-
     @abstractmethod
     def topk_indices_dtype(self) -> torch.dtype | None:
         raise NotImplementedError
@@ -148,14 +149,12 @@ class FusedMoEModularKernel(torch.nn.Module):
         self.shared_experts = shared_experts
         self.quant_config = quant_config
 
-
     def output_is_reduced(self) -> bool:
         """
         Indicates whether or not the output of fused MoE kernel
         is reduced across all ranks.
         """
         return self.prepare_finalize.output_is_reduced()
-
 
     def _prepare(
         self,
@@ -195,7 +194,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 expert_map,
                 apply_router_weight_on_input,
                 self.quant_config,
-                quant_type
+                quant_type,
             )
         else:
             assert False, "Now DBO async is not supported"
@@ -207,7 +206,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         )
 
         return a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights
-
 
     def _finalize(
         self,
@@ -270,7 +268,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         hidden_pad: Optional[int] = 0,
         intermediate_pad: Optional[int] = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    
+
         if inplace and self.shared_experts is None and not disable_inplace():
             output = hidden_states
         else:
@@ -279,16 +277,22 @@ class FusedMoEModularKernel(torch.nn.Module):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
-        dispatch_a1, dispatch_scale, expert_tokens_meta, dispatch_ids, dispatch_weights = self._prepare(
+        (
+            dispatch_a1,
+            dispatch_scale,
+            expert_tokens_meta,
+            dispatch_ids,
+            dispatch_weights,
+        ) = self._prepare(
             hidden_states,
             topk_weights,
             topk_ids,
             global_num_experts,
             expert_map,
             apply_router_weight_on_input,
-            quant_type
+            quant_type,
         )
-        
+
         # optimize fused_moe hidden_states
         # mori dispatch expands buffer to (max_tokens * world_size, hidden_dim)
         # but actual valid tokens = batch_size * topk
@@ -303,28 +307,28 @@ class FusedMoEModularKernel(torch.nn.Module):
             dispatch_weights = dispatch_weights[:total_valid_tokens]
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
-        
+
         fused_out = fused_moe(
-                dispatch_a1,
-                w1,
-                w2,
-                dispatch_weights,
-                dispatch_ids,
-                expert_map,
-                activation,
-                quant_type=quant_type,
-                num_local_tokens=expert_tokens_meta.expert_num_tokens,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,  
-                a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
-                a2_scale=a2_scale,
-                doweight_stage1=apply_router_weight_on_input,
-                hidden_pad=hidden_pad,
-                intermediate_pad=intermediate_pad,
-                bias1=bias1,
-                bias2=bias2,
-                dtype=hidden_states.dtype,
-            )
+            dispatch_a1,
+            w1,
+            w2,
+            dispatch_weights,
+            dispatch_ids,
+            expert_map,
+            activation,
+            quant_type=quant_type,
+            num_local_tokens=expert_tokens_meta.expert_num_tokens,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
+            a2_scale=a2_scale,
+            doweight_stage1=apply_router_weight_on_input,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+            dtype=hidden_states.dtype,
+        )
         return self._finalize(
             output,
             fused_out,
@@ -333,5 +337,3 @@ class FusedMoEModularKernel(torch.nn.Module):
             topk_ids,
             apply_router_weight_on_input,
         )
-
-
