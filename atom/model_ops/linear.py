@@ -43,7 +43,6 @@ def gemm_a4w4_quant_fake(
     weight_scale: torch.Tensor,
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
-    output_size: int,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
 
@@ -57,7 +56,6 @@ def gemm_a4w4_quant(
     weight_scale: torch.Tensor,
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
-    output_size: int,
 ) -> torch.Tensor:
 
     quant_func = get_hip_quant(QuantType.per_1x32)
@@ -68,21 +66,15 @@ def gemm_a4w4_quant(
         shuffle=True,
     )
 
-    m = x.view(-1, x.size(-1)).shape[0]
-    y = torch.empty(
-        ((m + 31) // 32 * 32, output_size),
-        dtype=otype,
-        device=x.device,
-    )
     w_scale = fp4_utils.e8m0_shuffle(weight_scale.data)
     y = gemm_a4w4(
         x,
         weight,
         x_scale,
         w_scale,
-        y,
+        dtype=otype,
     )
-    return y[:m, ...]
+    return y
 
 
 class LinearBase(nn.Module):
@@ -296,7 +288,6 @@ class LinearBase(nn.Module):
                     self.weight_scale.data,
                     self.params_dtype,
                     getattr(self, "input_scale", None),
-                    self.output_size,
                 )
                 if self.bias is not None:
                     y += self.bias
