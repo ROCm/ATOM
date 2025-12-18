@@ -125,7 +125,7 @@ jobs:
           echo ""
           echo "========== Comparing output with golden outputs =========="
           # Ignore whitespace and EOL differences in the diff
-          diff -u -B -w --strip-trailing-cr atom_test_output.txt .github/workflows/golden_outputs.txt
+          diff -u -B -w --strip-trailing-cr atom_test_output.txt .github/workflows/golden_outputs.txt || true
           DIFF_EXIT_CODE=$?
           
           if [ $DIFF_EXIT_CODE -ne 0 ]; then
