@@ -85,6 +85,7 @@ jobs:
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           --ipc=host --group-add video \
           --shm-size 16g \
+          --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
           --security-opt seccomp=unconfined \
