@@ -3,6 +3,7 @@
 
 import os
 from typing import Callable, Any
+
 # Data parallel environment variables
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -12,12 +13,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     "ATOM_ENFORCE_EAGER": lambda: os.getenv("ATOM_ENFORCE_EAGER", "0") == "1",
-    "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: os.getenv("ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1") == "1",
-    "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1",
-    "ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT": lambda: os.getenv("ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "1") == "1",
-    "ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT": lambda: os.getenv("ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT", "1") == "1"
+    "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: os.getenv(
+        "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1"
+    )
+    == "1",
+    "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv(
+        "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1"
+    )
+    == "1",
+    "ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT": lambda: os.getenv(
+        "ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "1"
+    )
+    == "1",
+    "ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT": lambda: os.getenv(
+        "ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT", "1"
+    )
+    == "1",
 }
+
 
 def __getattr__(name: str):
     # lazy evaluation of environment variables
