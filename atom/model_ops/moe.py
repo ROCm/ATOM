@@ -259,10 +259,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             from aiter import QuantType
             fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
             is_fp8 = quant_config.quant_dtype in fp8_dtypes
+            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
+            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
+            use_fp8_dispatch = is_fp8
+            quant_type = None
+            if use_fp8_dispatch:
+                if quant_config.is_block_quantized:
+                    quant_type = QuantType.per_1x128
+                elif quant_config.is_per_act_token:
+                    quant_type = QuantType.per_Token
             
             # For FP8: use FP8 dtype for communication
             # For FP4/no quant: use bfloat16
-            mori_dtype = quant_config.quant_dtype if is_fp8 else torch.bfloat16
+            mori_dtype = quant_config.quant_dtype if is_fp8 and quant_type is not None else torch.bfloat16
             # mori_dtype = torch.bfloat16
             
             all_to_all_args = dict(
@@ -270,6 +279,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 num_ep_ranks=all2all_manager.world_size,
                 # quant_dtype=mori_dtype,
                 # We now use bfloat16 for mori
+                # TODO: To support quant
                 quant_dtype=torch.bfloat16,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
@@ -282,15 +292,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
             )
             handle = all2all_manager.get_handle(all_to_all_args)
-
-            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
-            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
-            use_fp8_dispatch = is_fp8
-            if use_fp8_dispatch:
-                quant_type = QuantType.per_Tensor
-            else:
-                quant_type = None            # use_fp8_dispatch = False
-
 
             # We not use quant for mori now
             use_fp8_dispatch = False

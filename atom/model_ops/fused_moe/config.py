@@ -100,7 +100,6 @@ class FusedMoEQuantDesc:
 
     # The quantized type of this parameters.  None means unquantized or
     # already quantized.
-    # TODO (bnell): use scalar_type instead of Union.
     dtype: torch.dtype | str | None = None
 
     # A field that describes the quantization group shape, from quant_utils.py.
@@ -113,11 +112,9 @@ class FusedMoEQuantDesc:
     shape: GroupShape | None = None
 
     # Quantization scales.
-    # TODO(bnell): maybe put PrecisionConfigs in subclass of QuantDesc?
     scale: Union[torch.Tensor, "PrecisionConfig", None] = None
 
     # Quantization alphas or gscales, used for nvfp4 types.
-    # TODO(bnell): put some of these in subclasses
     alpha_or_gscale: torch.Tensor | None = None
 
     # Zero points for int4/int8 types
