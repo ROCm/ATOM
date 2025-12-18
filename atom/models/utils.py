@@ -46,7 +46,8 @@ class PPMissingLayer(torch.nn.Identity):
         Wraps the input in a tuple if `self.return_tuple` is True.
         """
         input = args[0] if args else next(iter(kwargs.values()))
-        return (input,) if self.return_tuple else input
+        return (input, None, None)
+        # return (input, ) if self.return_tuple else input
 
 
 def get_pp_indices(

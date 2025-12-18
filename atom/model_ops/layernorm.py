@@ -16,6 +16,22 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+from atom.utils import envs
+
+
+ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
+    envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+)
+if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_quant
+
+if (
+    ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+):
+    import aiter as rocm_aiter
+    rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
+
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
@@ -104,33 +120,68 @@ class RMSNorm(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
         residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
             assert not self.fused_allreduce, "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
             if residual is None:
-                return fused_rmsnorm_pad_(
+                x = fused_rmsnorm_pad_(
                     x, self.weight, self.eps, self.x_pad_to_multiple
                 )
+                return x, None, None
             else:
-                return fused_add_rmsnorm_pad_(
+                x, residual = fused_add_rmsnorm_pad_(
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
-                )      
+                )
+                return x, residual, None
         if self.fused_allreduce and self.tp_size > 1:
             assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
-            return tensor_model_parallel_fused_allreduce_rmsnorm(
+            x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x, 
                 residual, 
                 self.weight, 
                 self.eps,
                 )
+            return x, residual, None
         else:
-            if residual is None:
-                # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
-                return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+            if x_scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+                # static FP8 quantization
+                if residual is None:
+                    x, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
+                        x,
+                        self.weight,
+                        self.eps,
+                        x_scale,
+                        None,
+                        None,
+                        self.eps,
+                        dtype_quant=rocm_aiter_fp8_dtype,
+                        res1=None,
+                    )
+                    return x, None, x_scale
+                else:
+                    x, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
+                        x,
+                        self.weight,
+                        self.eps,
+                        x_scale,
+                        None,
+                        None,
+                        self.eps,
+                        dtype_quant=rocm_aiter_fp8_dtype,
+                        res1=residual,
+                    )
+                    return x, residual, x_scale
             else:
-                # return self.add_rms_forward(x, residual)
-                return rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
+                if residual is None:
+                    # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
+                    x = rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+                    return x, None, None
+                else:
+                    # return self.add_rms_forward(x, residual)
+                    x, residual = rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
+                    return x, residual, None
 
 
 @torch_compile_guard()
