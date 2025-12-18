@@ -53,6 +53,8 @@ class EngineCoreRequestType(enum.Enum):
     SHUTDOWN = b"\x05"
     # Stream output for callbacks
     STREAM = b"\x06"
+    # Signal that EngineCore is fully initialized and ready
+    READY = b"\x07"
 
 
 class EngineCore:
@@ -115,6 +117,14 @@ class EngineCore:
         #     target=self.process_input_sockets, args=(self.input_address,), daemon=True
         # )
         # self.input_thread.start()
+        # We can not start input thread here since dp need to sync with other ranks
+        # Thus we add new signal READY to notify CoreManager
+
+        self._send_ready_signal()
+        logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    def _send_ready_signal(self):
+        self.output_queue.put_nowait(("READY", None))
 
     def _init_data_parallel(self, config: Config):
         pass
@@ -251,6 +261,13 @@ class EngineCore:
                     serialized_obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
                     socket.send(serialized_obj)
                     continue
+                
+                if isinstance(item, tuple) and item[0] == "READY":
+                    # Send READY signal to indicate EngineCore is fully initialized
+                    serialized_obj = pickle.dumps((EngineCoreRequestType.READY, None))
+                    socket.send(serialized_obj)
+                    logger.debug(f"{self.label}: sent READY signal")
+                    continue
 
                 # Regular finished sequences
                 seqs = item
@@ -308,14 +325,20 @@ class DPEngineCoreProc(EngineCore):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
     def busy_loop(self):
+        shutdown = False
         while True:
-            self.pull_and_process_input_queue()
+            shutdown = shutdown or self.pull_and_process_input_queue()
             
             local_is_prefill, local_num_tokens = self.scheduler.get_next_batch_info()
             local_unfinished = not self.scheduler.is_finished()
-            global_has_prefill, global_max_tokens, global_has_unfinished = self._sync_dp_state(
-                local_is_prefill, local_num_tokens, local_unfinished
+            
+            global_has_prefill, global_max_tokens, global_has_unfinished, global_shutdown = self._sync_dp_state(
+                local_is_prefill, local_num_tokens, local_unfinished, shutdown
             )
+            
+            if global_shutdown and not global_has_unfinished:
+                logger.info(f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop")
+                break
             
             if not global_has_unfinished and not self.engines_running:
                 self.engines_running = False
@@ -336,36 +359,6 @@ class DPEngineCoreProc(EngineCore):
             
             self.engines_running = global_has_unfinished
 
-        # shutdown = False
-        # while True:
-        #     local_is_unfinished = not self.scheduler.is_finished()
-
-        #     # Synchronize shutdown state across all DP ranks
-        #     # This ensures all ranks know when any rank wants to shutdown
-        #     if not self._shutting_down:
-        #         global_should_shutdown = self._sync_shutdown_state(shutdown and not local_is_unfinished)
-        #         if global_should_shutdown:
-        #             self._shutting_down = True
-        #             logger.debug(f"{self.label}: Entering shutdown phase (synchronized across DP)")
-
-        #     self.engines_running = self._has_global_unfinished_reqs(local_is_unfinished)
-        #     logger.debug(f"{self.label}: [Sync] engines_running={self.engines_running}")
-
-        #     if not self.engines_running:
-        #         logger.debug(f"{self.label}: All DP ranks finished")
-        #         if shutdown:
-        #             break
-        #         shutdown = shutdown or self.pull_and_process_input_queue()
-        #         continue
-
-        #     shutdown = shutdown or self.pull_and_process_input_queue()
-
-        #     executed = self._process_engine_step()
-
-        #     if not executed:
-        #         logger.debug(f"{self.label}: Executing dummy batch for DP sync")
-        #         # we must have dummy execution to avoid deadlock in other ranks
-        #         self._execute_dummy_batch()
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
@@ -375,18 +368,19 @@ class DPEngineCoreProc(EngineCore):
         return self.runner_mgr.call_func("dummy_prefill_execution", num_tokens, wait_out=True)
 
     def _sync_dp_state(
-        self, local_is_prefill: bool, local_num_tokens: int, local_has_unfinished: bool
-    ) -> tuple[bool, int, bool]:
+        self, local_is_prefill: bool, local_num_tokens: int, local_has_unfinished: bool, local_shutdown: bool = False
+    ) -> tuple[bool, int, bool, bool]:
         if self._shutting_down:
-            return (local_is_prefill, local_num_tokens, local_has_unfinished)
+            return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
         
         try:
-            # Pack all state: [is_prefill, num_tokens, has_unfinished]
+            # Pack all state: [is_prefill, num_tokens, has_unfinished, shutdown]
             state_tensor = torch.tensor(
                 [
                     1 if local_is_prefill else 0,
                     local_num_tokens,
-                    1 if local_has_unfinished else 0
+                    1 if local_has_unfinished else 0,
+                    1 if local_shutdown else 0
                 ],
                 dtype=torch.int64,
                 device="cpu"
@@ -397,10 +391,13 @@ class DPEngineCoreProc(EngineCore):
             global_has_prefill = state_tensor[0].item() == 1
             global_max_tokens = state_tensor[1].item()
             global_has_unfinished = state_tensor[2].item() == 1
-            return (global_has_prefill, global_max_tokens, global_has_unfinished)
+            global_shutdown = state_tensor[3].item() == 1
+            return (global_has_prefill, global_max_tokens, global_has_unfinished, global_shutdown)
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
-            return (local_is_prefill, local_num_tokens, local_has_unfinished)
+            # If sync fails, assume shutdown to prevent hang
+            self._shutting_down = True
+            return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:
