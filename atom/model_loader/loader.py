@@ -118,6 +118,7 @@ def load_model(
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
+                    #FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
                     if ("output_scale" not in param_name):
                         param = model.get_parameter(param_name)
                         weight_loader = getattr(param, "weight_loader")
