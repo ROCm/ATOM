@@ -84,7 +84,7 @@ jobs:
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           --ipc=host --group-add video \
-          --shm-size 16g \
+          --shm-size=16G \
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
