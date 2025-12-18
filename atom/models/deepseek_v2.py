@@ -54,6 +54,7 @@ from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
 )
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+from aiter.dist.utils import cdiv
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -191,7 +192,7 @@ def _fuse_rmsnorm_quant(
     x1_epsilon: float,
     x2: Optional[torch.Tensor] = None,
     x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: float = 0.0,
+    x2_epsilon: Optional[float] = None,
     res1: Optional[torch.Tensor] = None,
     dtype_quant=dtypes.fp8,
     shuffle: Optional[bool] = True,
@@ -229,7 +230,7 @@ def _fuse_rmsnorm_quant(
         )
     else:
         raise ValueError(f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}.")
-    return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
