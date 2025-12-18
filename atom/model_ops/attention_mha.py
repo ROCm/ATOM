@@ -234,6 +234,7 @@ class Attention(nn.Module):
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
+            one_shot=True,
         )
         
         return o
