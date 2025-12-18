@@ -8,6 +8,7 @@ import pickle
 import queue
 import signal
 import sys
+import time
 import weakref
 from threading import Thread
 from typing import List
@@ -108,11 +109,16 @@ class CoreManager:
                     shutdown_path = get_open_zmq_inproc_path()
                     self.shutdown_paths.append(shutdown_path)
 
-                    output_thread = self._create_output_thread(dp_rank, output_socket, shutdown_path)
+                self._wait_for_all_ready_signals()
+                logger.info(f"{self.label}: All EngineCores are fully initialized and ready")
+
+                for dp_rank in range(self.local_engine_count):
+                    output_thread = self._create_output_thread(
+                        dp_rank, self.output_sockets[dp_rank], self.shutdown_paths[dp_rank]
+                    )
                     output_thread.start()
                     self.output_threads.append(output_thread)
 
-                    logger.info(f"{self.label}: DP rank {dp_rank} initialized successfully")
             finally:
                 if self.finished_procs():
                     logger.error(f"{self.label}: Some processes failed to start, shutting down all")
@@ -124,12 +130,55 @@ class CoreManager:
             self.close()
             raise
 
-        logger.info(f"{self.label}: All {self.local_engine_count} EngineCores initialized")
+        logger.info(f"{self.label}: All {self.local_engine_count} EngineCores initialized and ready")
         self._finalizer = weakref.finalize(self, self.close)
         self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
         self._output_handler_task = None
         self._asyncio_mode = config.asyncio_mode
 
+    def _wait_for_all_ready_signals(self, timeout_seconds: float = 600.0):
+        """Wait for READY signals from all DP ranks in parallel.
+        """
+        poller = zmq.Poller()
+        for dp_rank, output_socket in enumerate(self.output_sockets):
+            poller.register(output_socket, zmq.POLLIN)
+        
+        ready_received = [False] * self.local_engine_count
+        remaining = self.local_engine_count
+        timeout_ms = int(timeout_seconds * 1000)
+        start_time = time.time()
+        
+        while remaining > 0:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            remaining_timeout = max(0, timeout_ms - elapsed_ms)
+            
+            if remaining_timeout <= 0:
+                not_ready = [i for i, r in enumerate(ready_received) if not r]
+                raise RuntimeError(
+                    f"{self.label}: Timeout waiting for READY signals from DP ranks: {not_ready}"
+                )
+            
+            socks = poller.poll(timeout=remaining_timeout)
+            if not socks:
+                continue
+            
+            for socket, _ in socks:
+                # Find which DP rank this socket belongs to
+                dp_rank = self.output_sockets.index(socket)
+                if ready_received[dp_rank]:
+                    continue
+                
+                obj = socket.recv(copy=False)
+                request_type, data = pickle.loads(obj)
+                
+                if request_type == EngineCoreRequestType.READY:
+                    logger.info(f"{self.label}: DP rank {dp_rank} is fully initialized and ready")
+                    ready_received[dp_rank] = True
+                    remaining -= 1
+                else:
+                    raise RuntimeError(
+                        f"{self.label}: Expected READY signal from DP rank {dp_rank}, but got {request_type}"
+                    )
 
     def _create_output_thread(self, dp_rank: int, output_socket: zmq.Socket, shutdown_path: str) -> Thread:
         def process_outputs_socket():
@@ -296,13 +345,23 @@ class CoreManager:
         except queue.Empty:
             return None
     
-    def send_utility_command(self, cmd: str, dp_rank: int = 0):
-        logger.debug(f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}")
-        self.input_sockets[dp_rank].send_multipart(
-            [self.engine_core_identities[dp_rank], 
-             pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))],
-            copy=False,
-        )
+    def send_utility_command(self, cmd: str, dp_rank: int = None):
+        if dp_rank is None:
+            # Send to all DP ranks
+            for rank in range(self.local_engine_count):
+                logger.debug(f"{self.label}: Send utility command '{cmd}' to DP rank {rank}")
+                self.input_sockets[rank].send_multipart(
+                    [self.engine_core_identities[rank], 
+                     pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))],
+                    copy=False,
+                )
+        else:
+            logger.debug(f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}")
+            self.input_sockets[dp_rank].send_multipart(
+                [self.engine_core_identities[dp_rank], 
+                 pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))],
+                copy=False,
+            )
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
         if dp_rank >= len(self.engine_core_processes):
