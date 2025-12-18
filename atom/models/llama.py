@@ -31,6 +31,7 @@ from torch import nn
 from transformers import LlamaConfig
 
 from aiter import QuantType
+
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
 
@@ -62,16 +63,26 @@ from atom.models.utils import (
 from atom.utils import envs
 
 
-ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
+    envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+)
 if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_quant
 
-ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = envs.ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
+    envs.ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+)
 if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
-    from aiter.ops.triton.fused_fp8_quant import fused_silu_mul_fp8_per_tensor_static_quant
+    from aiter.ops.triton.fused_fp8_quant import (
+        fused_silu_mul_fp8_per_tensor_static_quant,
+    )
 
-if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT or ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
+if (
+    ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+    or ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+):
     import aiter as rocm_aiter
+
     rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
 
@@ -112,10 +123,11 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
-        scale=getattr(self.down_proj, "input_scale", None)
+        scale = getattr(self.down_proj, "input_scale", None)
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
-            x = fused_silu_mul_fp8_per_tensor_static_quant(x, scale,
-                                                      dtype_quant=rocm_aiter_fp8_dtype)
+            x = fused_silu_mul_fp8_per_tensor_static_quant(
+                x, scale, dtype_quant=rocm_aiter_fp8_dtype
+            )
             x_scale = scale.view(1)
         else:
             x = self.act_fn(x)
@@ -319,29 +331,45 @@ class LlamaDecoderLayer(nn.Module):
         # scale = self.self_attn.qkv_proj.input_scale
 
         if scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-            #static FP8 quantization
+            # static FP8 quantization
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
             if residual is None:
                 residual = hidden_states
-                hidden_states, _, _, _ = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
-                                                    None, None, eps,
-                                                    dtype_quant=rocm_aiter_fp8_dtype,
-                                                    res1=None)
+                hidden_states, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
+                    hidden_states,
+                    weight,
+                    eps,
+                    scale,
+                    None,
+                    None,
+                    eps,
+                    dtype_quant=rocm_aiter_fp8_dtype,
+                    res1=None,
+                )
             else:
-                hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
-                                                    None, None, eps,
-                                                    dtype_quant=rocm_aiter_fp8_dtype,
-                                                    res1=residual)
-            x_scale=scale.view(1)
+                hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
+                    hidden_states,
+                    weight,
+                    eps,
+                    scale,
+                    None,
+                    None,
+                    eps,
+                    dtype_quant=rocm_aiter_fp8_dtype,
+                    res1=residual,
+                )
+            x_scale = scale.view(1)
         else:
             if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
-            x_scale=None
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states, x_scale=x_scale)
+            x_scale = None
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states, x_scale=x_scale
+        )
 
         # Fully Connected
         scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
@@ -349,15 +377,23 @@ class LlamaDecoderLayer(nn.Module):
             # Static FP8 quantization
             weight = self.post_attention_layernorm.weight
             eps = self.post_attention_layernorm.eps
-            hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(hidden_states, weight, eps, scale,
-                                                None, None, eps,
-                                                dtype_quant=rocm_aiter_fp8_dtype,
-                                                res1=residual)
-            x_scale=scale.view(1)
+            hidden_states, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
+                hidden_states,
+                weight,
+                eps,
+                scale,
+                None,
+                None,
+                eps,
+                dtype_quant=rocm_aiter_fp8_dtype,
+                res1=residual,
+            )
+            x_scale = scale.view(1)
         else:
             hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
-            x_scale=None
+                hidden_states, residual
+            )
+            x_scale = None
         hidden_states = self.mlp(hidden_states, x_scale=x_scale)
         return hidden_states, residual
 
@@ -393,10 +429,10 @@ class LlamaModel(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
-                layer_num=layer_num
+                layer_num=layer_num,
             ),
             prefix=f"{prefix}.layers",
-            layer_num_offset=0
+            layer_num_offset=0,
         )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
