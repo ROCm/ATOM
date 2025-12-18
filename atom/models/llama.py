@@ -30,8 +30,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from aiter import QuantType
-
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
 
@@ -60,30 +58,6 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.utils import envs
-
-
-ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
-    envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
-)
-if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_quant
-
-ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
-    envs.ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
-)
-if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
-    from aiter.ops.triton.fused_fp8_quant import (
-        fused_silu_mul_fp8_per_tensor_static_quant,
-    )
-
-if (
-    ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
-    or ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
-):
-    import aiter as rocm_aiter
-
-    rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
 
 class LlamaMLP(nn.Module):
@@ -328,7 +302,9 @@ class LlamaDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states, _, scale = self.input_layernorm(hidden_states, scale)
         else:
-            hidden_states, residual, scale = self.input_layernorm(hidden_states, scale, residual)
+            hidden_states, residual, scale = self.input_layernorm(
+                hidden_states, scale, residual
+            )
         hidden_states = self.self_attn(
             positions=positions, hidden_states=hidden_states, x_scale=scale
         )
@@ -423,7 +399,7 @@ class LlamaModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ , _= self.norm(hidden_states, None, residual)
+        hidden_states, _, _ = self.norm(hidden_states, None, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
