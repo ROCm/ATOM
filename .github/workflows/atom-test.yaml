@@ -97,6 +97,10 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Check shm size
+        run: |
+          docker exec atom_test df -h /dev/shm
+
       - name: Run ATOM tests
         timeout-minutes: 60
         run: |
