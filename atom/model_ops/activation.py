@@ -6,6 +6,7 @@ from typing import Optional
 from torch import nn
 import torch.nn.functional as F
 from aiter import silu_and_mul
+from atom.config import QuantizationConfig
 
 from aiter import (
     dtypes,
@@ -28,9 +29,12 @@ if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
 
 
 class SiluAndMul(nn.Module):
-
-    def __init__(self):
+    def __init__(
+        self,
+        quant_config: Optional[QuantizationConfig] = None,
+    )->None: 
         super().__init__()
+        quant_type = quant_config["quant_type"]
 
     def forward_native(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
