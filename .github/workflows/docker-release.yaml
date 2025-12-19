@@ -13,8 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         baes_image:
-          - "rocm/pytorch:latest"
-          - "rocm/pytorch-private:ROCm_7.2_atom_1216"
+          - "rocm/pytorch-private:14_ubuntu24.04_py3.12_pytorch_release-2.9_74f4335a-rc1"
 
     steps:
       - name: Checkout ATOM repo
