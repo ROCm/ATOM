@@ -8,7 +8,7 @@ ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="207594140d0e62ed76110666ee387099c59f3ef4"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="f2d16272cc618c404d83a4355ee17ba81450e9da"
+ARG AITER_COMMIT="db619aa38ecf6a92812223816782260f756b7367"
 
 # Install Aiter
 RUN pip uninstall -y aiter || true
