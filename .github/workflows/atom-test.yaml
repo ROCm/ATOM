@@ -123,6 +123,7 @@ jobs:
           cat atom_test_output.txt
 
       - name: Compare output with golden outputs
+        if: ${{ matrix.model_name == 'Meta-Llama-3-8B-Instruct' }}
         run: |
           echo "========== Comparing output with golden outputs =========="
           if ! diff -u -B -w --strip-trailing-cr \
@@ -133,6 +134,18 @@ jobs:
           else
             echo "Success: Output matches golden outputs."
           fi
+      
+      - name: Accuracy Test
+        run: |
+          set -euo pipefail
+          echo "========== Installing lm-eval =========="
+          pip install lm-eval[api]
+          echo "========== Running accuracy test =========="
+          docker exec atom_test bash -lc "
+            set -euo pipefail
+            python3 -m atom.examples.accuracy_test \
+              --model ${{ matrix.model_path }} \
+              ${{ matrix.extraArgs }} \
 
       - name: Upload output
         if: always()
