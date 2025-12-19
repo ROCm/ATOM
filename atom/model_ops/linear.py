@@ -57,8 +57,7 @@ def gemm_a4w4_quant_fake(
     weight_scale: torch.Tensor, 
     params_dtype: torch.dtype,
     input_scale: torch.Tensor, 
-    output_size: int) 
-    -> torch.Tensor:
+    output_size: int) -> torch.Tensor:
     return torch.empty(
             (*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device
         )
@@ -73,8 +72,7 @@ def gemm_a4w4_quant(
     weight_scale: torch.Tensor, 
     params_dtype: torch.dtype,
     input_scale: torch.Tensor, 
-    output_size: int) 
-    -> torch.Tensor:
+    output_size: int) -> torch.Tensor:
     
     if gemm_afp4wfp4_preshuffle is None:
         if x_scale is None: 
