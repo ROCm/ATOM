@@ -304,29 +304,24 @@ async def chat_completions(request: ChatCompletionRequest):
                 finished = False
                 loop = asyncio.get_event_loop()
                 while not finished:
-                    try:
-                        chunk_data = await asyncio.wait_for(
-                            loop.run_in_executor(None, stream_queue.get), timeout=60.0
-                        )
-                        new_text = chunk_data["text"]
-                        current_text = prev_text + new_text
-                        new_content = new_text
-                        prev_text = current_text
+                    chunk_data = await loop.run_in_executor(None, stream_queue.get)
+                    new_text = chunk_data["text"]
+                    current_text = prev_text + new_text
+                    new_content = new_text
+                    prev_text = current_text
 
-                        chunk_token_ids = chunk_data.get("token_ids", [])
-                        num_tokens_output += len(chunk_token_ids)
+                    chunk_token_ids = chunk_data.get("token_ids", [])
+                    num_tokens_output += len(chunk_token_ids)
 
-                        yield create_chat_completion_chunk(
-                            request_id,
-                            model_name,
-                            new_content,
-                            finish_reason=chunk_data.get("finish_reason"),
-                        )
+                    yield create_chat_completion_chunk(
+                        request_id,
+                        model_name,
+                        new_content,
+                        finish_reason=chunk_data.get("finish_reason"),
+                    )
 
-                        if chunk_data.get("finished", False):
-                            finished = True
-                    except asyncio.TimeoutError:
-                        break
+                    if chunk_data.get("finished", False):
+                        finished = True
 
                 _stream_queues.pop(request_id, None)
                 _seq_id_to_request_id.pop(seq_id, None)
@@ -432,29 +427,24 @@ async def completions(request: CompletionRequest):
                 finished = False
                 loop = asyncio.get_event_loop()
                 while not finished:
-                    try:
-                        chunk_data = await asyncio.wait_for(
-                            loop.run_in_executor(None, stream_queue.get), timeout=30.0
-                        )
-                        new_text = chunk_data["text"]
-                        current_text = prev_text + new_text
-                        new_content = new_text
-                        prev_text = current_text
+                    chunk_data = await loop.run_in_executor(None, stream_queue.get)
+                    new_text = chunk_data["text"]
+                    current_text = prev_text + new_text
+                    new_content = new_text
+                    prev_text = current_text
 
-                        chunk_token_ids = chunk_data.get("token_ids", [])
-                        num_tokens_output += len(chunk_token_ids)
+                    chunk_token_ids = chunk_data.get("token_ids", [])
+                    num_tokens_output += len(chunk_token_ids)
 
-                        yield create_completion_chunk(
-                            request_id,
-                            model_name,
-                            new_content,
-                            finish_reason=chunk_data.get("finish_reason"),
-                        )
+                    yield create_completion_chunk(
+                        request_id,
+                        model_name,
+                        new_content,
+                        finish_reason=chunk_data.get("finish_reason"),
+                    )
 
-                        if chunk_data.get("finished", False):
-                            finished = True
-                    except asyncio.TimeoutError:
-                        break
+                    if chunk_data.get("finished", False):
+                        finished = True
 
                 # Cleanup
                 _stream_queues.pop(request_id, None)
