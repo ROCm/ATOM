@@ -204,22 +204,20 @@ def _fuse_rmsnorm_quant(
         scale_shuffle_padding,
         output_unquantized_inp1,
     )
-    # out1_unquantized = None
-    # elif dtype_quant == dtypes.fp8:
-        # (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = fused_rms_fp8_group_quant(
-        #     x1,
-        #     x1_weight,
-        #     x1_epsilon,
-        #     x2,
-        #     x2_weight,
-        #     x2_epsilon,
-        #     group_size,
-        #     dtype_quant,
-        #     res1,
-        #     output_unquantized_inp1,
-        #     transpose_scale,
-        # )
-        # pass
+    elif dtype_quant == dtypes.fp8:
+        (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = fused_rms_fp8_group_quant(
+            x1,
+            x1_weight,
+            x1_epsilon,
+            x2,
+            x2_weight,
+            x2_epsilon,
+            group_size,
+            dtype_quant,
+            res1,
+            output_unquantized_inp1,
+            transpose_scale,
+        )
     else:
         raise ValueError(f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}.")
     return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
