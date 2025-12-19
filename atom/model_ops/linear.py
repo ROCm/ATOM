@@ -49,17 +49,33 @@ else:
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter import gemm_a4w4, per_1x32_f4_quant_hip
 
-def gemm_a4w4_quant_fake(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, weight_scale: torch.Tensor, params_dtype: torch.dtype,
-                    input_scale: torch.Tensor, output_size: int) -> torch.Tensor:
+def gemm_a4w4_quant_fake(
+    x: torch.Tensor, 
+    x_scale: torch.Tensor, 
+    weight: torch.Tensor, 
+    otype: torch.dtype, 
+    weight_scale: torch.Tensor, 
+    params_dtype: torch.dtype,
+    input_scale: torch.Tensor, 
+    output_size: int) 
+    -> torch.Tensor:
     return torch.empty(
             (*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device
         )
 
 # It's important to use mutates_args=[] to avoid functionized_v2 op generation
 @torch_compile_guard(gen_fake=gemm_a4w4_quant_fake, mutates_args=[])
-def gemm_a4w4_quant(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, otype: torch.dtype, weight_scale: torch.Tensor, params_dtype: torch.dtype,
-                    input_scale: torch.Tensor, output_size: int) -> torch.Tensor:
-
+def gemm_a4w4_quant(
+    x: torch.Tensor, 
+    x_scale: torch.Tensor, 
+    weight: torch.Tensor, 
+    otype: torch.dtype, 
+    weight_scale: torch.Tensor, 
+    params_dtype: torch.dtype,
+    input_scale: torch.Tensor, 
+    output_size: int) 
+    -> torch.Tensor:
+    
     if gemm_afp4wfp4_preshuffle is None:
         if x_scale is None: 
             quant_func = get_hip_quant(QuantType.per_1x32)
@@ -101,10 +117,6 @@ def gemm_a4w4_quant(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor
             )
 
         if m >= 32:
-            pad_m = ((m + 31) // 32) * 32
-            if x_scale.shape[0] < pad_m:
-                padding = torch.zeros(pad_m - x_scale.shape[0], x_scale.shape[1], dtype=x_scale.dtype, device=x_scale.device)
-                x_scale = torch.cat([x_scale, padding], dim=0)
             x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
         else:
             x_scale = x_scale[:m, ...].view(torch.uint8)
@@ -351,7 +363,16 @@ class LinearBase(nn.Module):
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
-                y = gemm_a4w4_quant(x, x_scale, self.weight, otype, self.weight_scale.data, self.params_dtype, getattr(self, "input_scale", None), self.output_size)
+                y = gemm_a4w4_quant(
+                    x, 
+                    x_scale, 
+                    self.weight, 
+                    otype, 
+                    self.weight_scale.data, 
+                    self.params_dtype, 
+                    getattr(self, "input_scale", None), 
+                    self.output_size
+                )
                 if self.bias is not None:
                     y += self.bias
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
