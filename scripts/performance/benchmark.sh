@@ -24,9 +24,9 @@ fi
 for ISL in "${ISL_LIST[@]}"; do
 
     for CONC in "${CONC_LIST[@]}"; do
-    echo "========================================" | tee -a "$LOG_FILE"
-    echo "开始测试 ISL=$ISL, OSL=$OSL, CONC=$CONC" | tee -a "$LOG_FILE"
-    echo "========================================" | tee -a "$LOG_FILE"
+    echo "=========================================" | tee -a "$LOG_FILE"
+    echo "Start Test ISL=$ISL, OSL=$OSL, CONC=$CONC" | tee -a "$LOG_FILE"
+    echo "=========================================" | tee -a "$LOG_FILE"
         
         python bench_serving/benchmark_serving.py \
             --model="$MODEL_PATH" \

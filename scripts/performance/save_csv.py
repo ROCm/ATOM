@@ -7,7 +7,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 def parse_log_file(log_file_path):
-    """解析日志文件，提取关键指标"""
+    """Parse log file and extract key metrics"""
     results = []
     
     with open(log_file_path, 'r', encoding='utf-8') as f:
@@ -37,17 +37,17 @@ def parse_log_file(log_file_path):
     return results
 
 def create_excel_repeating_format(results, output_file):
-    """创建重复格式的Excel文件：每个ISL/OSL组合重复显示，确保ISL行有完整边框"""
+    """Create Excel file with repeating format: each ISL/OSL combination repeats display, ensure ISL row has complete border"""
     
-    # 按ISL和CONC排序
+    # Sort by ISL and CONC
     results.sort(key=lambda x: (x['ISL'], -x['CONC']))
     
-    # 创建新的工作簿
+    # Create new workbook
     wb = Workbook()
     ws = wb.active
     ws.title = "Benchmark Results"
     
-    # 定义边框样式 - 确保所有边框都设置
+    # Define border style - ensure all borders are set
     full_border = Border(
         left=Side(style='thin'),
         right=Side(style='thin'),
@@ -55,7 +55,7 @@ def create_excel_repeating_format(results, output_file):
         bottom=Side(style='thin')
     )
     
-    # 定义填充样式
+    # Define fill styles
     header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
     isl_header_fills = [
         PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid"),
@@ -64,7 +64,7 @@ def create_excel_repeating_format(results, output_file):
         PatternFill(start_color="D1ECF1", end_color="D1ECF1", fill_type="solid")
     ]
     
-    # 定义字体样式
+    # Define font styles
     header_font = Font(bold=True, size=11, color="000000")
     isl_title_font = Font(bold=True, size=12, color="000000")
     data_font = Font(size=10)
@@ -78,30 +78,30 @@ def create_excel_repeating_format(results, output_file):
             grouped_results[key] = []
         grouped_results[key].append(result)
     
-    # 按ISL排序
+    # Sort by ISL
     sorted_keys = sorted(grouped_results.keys())
     
-    # 为每个ISL/OSL组合创建独立的4行区域
+    # Create independent 4-row area for each ISL/OSL combination
     for idx, (isl, osl) in enumerate(sorted_keys):
         data_list = grouped_results[(isl, osl)]
-        data_list.sort(key=lambda x: -x['CONC'])  # 按CONC降序排列
+        data_list.sort(key=lambda x: -x['CONC'])  # Sort by CONC descending
         
-        # 第1行：ISL/OSL标题行（合并4个单元格） - 确保有完整边框
+        # Row 1: ISL/OSL title row (merge 4 cells) - ensure complete border
         ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=4)
         
         cell = ws.cell(row=current_row, column=1, value=f"ISL={isl}, OSL={osl}")
         cell.fill = isl_header_fills[idx % len(isl_header_fills)]
         cell.font = isl_title_font
         cell.alignment = center_alignment
-        cell.border = full_border  # 确保有完整边框
+        cell.border = full_border  # Ensure complete border
         
-        # 为合并单元格的每个单元格单独设置边框（确保显示）
+        # Set border for each cell of merged cells individually (ensure display)
         for col in range(1, 5):
             ws.cell(row=current_row, column=col).border = full_border
         
         current_row += 1
         
-        # 第2行：表头行
+        # Row 2: Header row
         for col, header in enumerate(["Concurrency", "Mean TTFT (ms)", "Mean TPOT (ms)", "Total Throughput (tok/s)"], 1):
             cell = ws.cell(row=current_row, column=col, value=header)
             cell.fill = header_fill
@@ -111,8 +111,8 @@ def create_excel_repeating_format(results, output_file):
         
         current_row += 1
         
-        # 第3-4行：数据行（最多2个并发数）
-        for i, data in enumerate(data_list):  # 只取前2个并发数
+        # Row 3-4: Data rows (maximum 2 concurrency values)
+        for i, data in enumerate(data_list):  # Take first 2 concurrency values
             # Concurrency
             cell = ws.cell(row=current_row, column=1, value=data['CONC'])
             cell.font = data_font
@@ -139,32 +139,32 @@ def create_excel_repeating_format(results, output_file):
             
             current_row += 1
         
-        # 添加空行分隔不同ISL/OSL组合（不带边框）
+        # Add empty row to separate different ISL/OSL combinations (no border)
         current_row += 1
     
-    # 删除最后的空行
+    # Remove last empty row
     if current_row > 1:
         current_row -= 1
     
-    # 自动调整列宽
+    # Auto adjust column width
     for col_idx in range(1, 5):
         column_letter = get_column_letter(col_idx)
         
-        if col_idx == 1:  # Concurrency列
+        if col_idx == 1:  # Concurrency column
             ws.column_dimensions[column_letter].width = 12
-        elif col_idx == 2 or col_idx == 3:  # Mean TTFT/TPOT列
+        elif col_idx == 2 or col_idx == 3:  # Mean TTFT/TPOT columns
             ws.column_dimensions[column_letter].width = 15
-        else:  # Total Throughput列
+        else:  # Total Throughput column
             ws.column_dimensions[column_letter].width = 22
     
-    # 保存文件
+    # Save file
     wb.save(output_file)
     return output_file
 
 def print_csv_repeating_format(results):
-    """以CSV表格格式打印数据（重复格式）"""
+    """Print data in CSV table format (repeating format)"""
     
-    # 按ISL分组
+    # Group by ISL
     grouped_results = {}
     for result in results:
         key = (result['ISL'], result['OSL'])
@@ -172,28 +172,28 @@ def print_csv_repeating_format(results):
             grouped_results[key] = []
         grouped_results[key].append(result)
     
-    # 按ISL排序
+    # Sort by ISL
     sorted_keys = sorted(grouped_results.keys())
     
     print("\n" + "=" * 60)
     print("DEEPSEEK-V3.2 BENCHMARK RESULTS")
     print("=" * 60)
     
-    # 为每个ISL/OSL组合打印独立的表格
+    # Print independent table for each ISL/OSL combination
     for idx, (isl, osl) in enumerate(sorted_keys):
         data_list = grouped_results[(isl, osl)]
-        data_list.sort(key=lambda x: -x['CONC'])  # 按CONC降序排列
+        data_list.sort(key=lambda x: -x['CONC'])  # Sort by CONC descending
         
         print(f"\n┌{'ISL=' + str(isl) + ', OSL=' + str(osl):^52}┐")
         print("├────────────────────────────────────────────────────┤")
         print("│ Concurrency │ Mean TTFT │ Mean TPOT │  Throughput  │")
         print("├─────────────┼───────────┼───────────┼──────────────┤")
         
-        # 打印最多2行数据
+        # Print maximum 2 rows of data
         for i, data in enumerate(data_list):
             print(f"│ {data['CONC']:^11} │ {data['Mean TTFT (ms)']:>9.2f} │ {data['Mean TPOT (ms)']:>9.2f} │ {data['Total Throughput (tok/s)']:>12.2f} │")
         
-        # 如果数据少于2行，用空行补齐
+        # If data has less than 2 rows, fill with empty rows
         while len(data_list) < 2 and i < 1:
             print("│             │           │           │              │")
             i += 1
@@ -203,15 +203,15 @@ def print_csv_repeating_format(results):
     print("=" * 60)
 
 def main():
-    # 输入文件路径
+    # Input file path
     parser = argparse.ArgumentParser(
         description='benchmark infomation',
     )
     
-    # 添加参数
+    # Add parameter
     parser.add_argument(
         'input_file',
-        nargs='?',  # 可选参数
+        nargs='?',  # Optional parameter
         default='result.txt',
         help='the path of input file, default:result.txt.'
     )
@@ -226,23 +226,23 @@ def main():
     output_file = "benchmark.xlsx"
     
     try:
-        # 解析日志文件
+        # Parse log file
         results = parse_log_file(log_file_path)
         
         if results:
-            # 以CSV表格格式打印数据
+            # Print data in CSV table format
             print_csv_repeating_format(results)
             
-            # 创建Excel文件
+            # Create Excel file
             create_excel_repeating_format(results, output_file)
             
         else:
-            print("没有找到有效的基准测试结果")
+            print("No valid benchmark results found")
             
     except FileNotFoundError:
-        print(f"错误: 找不到日志文件 {log_file_path}")
+        print(f"Error: cannot find log file {log_file_path}")
     except Exception as e:
-        print(f"处理过程中出现错误: {e}")
+        print(f"Error during processing: {e}")
 
 if __name__ == "__main__":
     main()
