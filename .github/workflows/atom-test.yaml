@@ -14,7 +14,7 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu
+    runs-on: atom-mi355-8gpu.test
     strategy:
       fail-fast: false
       matrix:
