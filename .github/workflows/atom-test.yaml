@@ -128,8 +128,10 @@ jobs:
           if ! diff -u -B -w --strip-trailing-cr \
             atom_test_output.txt \
             ".github/workflows/golden_outputs/${{ matrix.model_name }}_golden_output.txt"; then
-            echo "Output does not match golden outputs."
+            echo "Failed: Output does not match golden outputs."
             exit 1
+          else
+            echo "Success: Output matches golden outputs."
           fi
 
       - name: Upload output
