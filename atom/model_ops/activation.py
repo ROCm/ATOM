@@ -9,9 +9,13 @@ from aiter import silu_and_mul
 from atom.config import QuantizationConfig
 
 from aiter import (
+    QuantType,
     dtypes,
 )
 from atom.utils import envs
+from aiter.ops.triton.fused_mxfp4_quant import (
+    fused_reduce_act_mul_and_mxfp4_quant,
+)
 
 
 ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
@@ -35,6 +39,9 @@ class SiluAndMul(nn.Module):
     )->None: 
         super().__init__()
         quant_type = quant_config["quant_type"]
+        params_dtype = quant_config["quant_dtype"]
+        self.quant_type = quant_type
+        self.params_dtype = params_dtype
 
     def forward_native(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
@@ -51,8 +58,12 @@ class SiluAndMul(nn.Module):
             )
             return x, x_scale
         else:
-            out = torch.empty(
-                [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
-            )
-            silu_and_mul(out, x)
-            return x
+            if self.quant_type.value == QuantType.per_1x32.value:
+                (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu")
+                return x, x_scale
+            else:
+                out = torch.empty(
+                    [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
+                )
+                silu_and_mul(out, x)
+                return x
