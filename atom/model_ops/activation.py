@@ -57,13 +57,12 @@ class SiluAndMul(nn.Module):
                 x, x_scale, dtype_quant=rocm_aiter_fp8_dtype
             )
             return x, x_scale
+        elif x_scale is None and self.quant_type.value == QuantType.per_1x32.value:
+            (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu")
+            return x, x_scale
         else:
-            if self.quant_type.value == QuantType.per_1x32.value:
-                (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu")
-                return x, x_scale
-            else:
-                out = torch.empty(
-                    [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
-                )
-                silu_and_mul(out, x)
-                return x
+            out = torch.empty(
+                [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
+            )
+            silu_and_mul(out, x)
+            return x
