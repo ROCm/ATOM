@@ -14,7 +14,7 @@ def parse_log_file(log_file_path):
         content = f.read()
     
     test_blocks = re.findall(
-        r'开始测试 ISL=(\d+), OSL=(\d+), CONC=(\d+)(.*?)==================================================',
+        r'Start Test ISL=(\d+), OSL=(\d+), CONC=(\d+)(.*?)==================================================',
         content,
         re.DOTALL
     )
