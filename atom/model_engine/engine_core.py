@@ -101,7 +101,7 @@ class EngineCore:
                     "capture_cudagraph", wait_out=True
                 )
                 logger.info(
-                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost} seconds"
+                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
                 )
             good = True
         finally:
