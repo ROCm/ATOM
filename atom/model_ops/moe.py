@@ -300,13 +300,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # quant_dtype=mori_dtype,
                 # We now use bfloat16 for mori
                 # TODO: To support quant
-                quant_dtype=torch.bfloat16,
+                quant_dtype=moe.in_dtype,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
                 max_num_tokens_per_dp_rank=16384,
                 # input_dtype=moe.in_dtype,
-                input_dtype=torch.bfloat16,
+                input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
@@ -1236,22 +1236,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        # return torch.ops.aiter.rocm_aiter_fused_moe(
-        #     x,
-        #     layer.w13_weight,
-        #     layer.w2_weight,
-        #     topk_weights,
-        #     topk_ids,
-        #     expert_mask=expert_map,
-        #     activation=activation.value,
-        #     quant_type=self.quant_type.value,
-        #     w1_scale=layer.w13_weight_scale,
-        #     w2_scale=layer.w2_weight_scale,
-        #     a1_scale=layer.w13_input_scale,
-        #     a2_scale=layer.w2_input_scale,
-        #     doweight_stage1=apply_router_weight_on_input,
-        # )
-
 
 def determine_expert_map(
     ep_size: int, ep_rank: int, global_num_experts: int
@@ -1484,7 +1468,7 @@ class FusedMoE(torch.nn.Module):
             hidden_dim=hidden_size,
             num_local_experts=self.local_num_experts,
             moe_parallel_config=self.moe_parallel_config,
-            in_dtype=self.params_dtype,
+            in_dtype=atom_config.torch_dtype,
             max_num_tokens=atom_config.max_num_batched_tokens,
             has_bias=self.has_bias,
             # is_act_and_mul=True,

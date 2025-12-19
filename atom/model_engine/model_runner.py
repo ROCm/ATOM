@@ -486,7 +486,8 @@ class ModelRunner:
         self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
         input_ids = self.tokenID_processor.input_ids.gpu[:num_tokens]
         
-        self.run_model(input_ids)
+        with torch.no_grad():
+            self.run_model(input_ids)
         
         torch.cuda.synchronize()
         
@@ -937,15 +938,10 @@ class ModelRunner:
                 attn_metadata, context = (
                     self.attn_metadata_builder.build_for_cudagraph_capture(bs)
                 )
-                num_tokens = bs
-                num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
-                num_tokens += num_pad
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
-                    num_tokens=num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
                 )
 
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup

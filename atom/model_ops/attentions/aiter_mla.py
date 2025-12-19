@@ -18,7 +18,7 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_tp_group, get_dp_group
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -326,7 +326,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
-        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs)
+        dp_size = get_dp_group().world_size
+        if dp_size > 1:
+            ctx_mla_ps = {}
+        else:
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs)
         attn_matadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],

@@ -360,11 +360,10 @@ class MLAAttention(nn.Module):
         #     q_scale = kv_scale = self.one_scale
 
         dp_size = get_dp_group().world_size
-        is_fp8 = self.kv_cache_dtype.startswith("fp8")
-        use_persistent_mode = not (dp_size == 8 and not is_fp8)
+        use_persistent_mode = not (dp_size > 1)
 
         if not use_persistent_mode:
-            # DP + bf16: disable persistent mode to avoid overflow
+            # DP : disable persistent mode to avoid overflow
             work_meta_data = None
             work_indptr = None
             work_info_set = None
