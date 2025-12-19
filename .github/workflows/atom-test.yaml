@@ -138,14 +138,17 @@ jobs:
       - name: Accuracy Test
         run: |
           set -euo pipefail
+          echo ""
           echo "========== Installing lm-eval =========="
           pip install lm-eval[api]
+          echo ""
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
-            set -euo pipefail
-            python3 -m atom.examples.accuracy_test \
-              --model ${{ matrix.model_path }} \
-              ${{ matrix.extraArgs }} \
+            lm_eval --model local-completions \
+              --model_args model=${{ matrix.model_path }},base_url=http://localhost:8000/v1/completions,num_concurrent=8,max_retries=3,tokenized_requests=False \
+              --tasks gsm8k \
+              --num_fewshot 3
+          "
 
       - name: Upload output
         if: always()
