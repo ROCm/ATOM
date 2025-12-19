@@ -60,13 +60,16 @@ def gemm_a4w4_quant(
     output_size: int,
 ) -> torch.Tensor:
 
-    quant_func = get_hip_quant(QuantType.per_1x32)
-    x, x_scale = quant_func(
-        x,
-        quant_dtype=params_dtype,
-        scale=input_scale,
-        shuffle=True,
-    )
+    if input_scale is None:
+        quant_func = get_hip_quant(QuantType.per_1x32)
+        x, x_scale = quant_func(
+            x,
+            quant_dtype=params_dtype,
+            scale=input_scale,
+            shuffle=True,
+        )
+    else:
+        x_scale = input_scale
 
     m = x.view(-1, x.size(-1)).shape[0]
     y = torch.empty(
@@ -289,13 +292,15 @@ class LinearBase(nn.Module):
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
+                
                 y = gemm_a4w4_quant(
                     x,
                     self.weight,
                     otype,
                     self.weight_scale.data,
                     self.params_dtype,
-                    getattr(self, "input_scale", None),
+                    x_scale,
+                    # getattr(self, "input_scale", None),
                     self.output_size,
                 )
                 if self.bias is not None:
