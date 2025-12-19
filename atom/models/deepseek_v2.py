@@ -142,7 +142,42 @@ def _fuse_rmsnorm_fp4_quant_fake(
         out_res1 = torch.empty((m, n1), dtype=x1.dtype, device=x1.device)
 
     out1_unquantized = None
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
+
+def _fused_rms_fp8_group_quant_fake(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: Optional[float] = None,
+    res1: Optional[torch.Tensor] = None,
+    dtype_quant: torch.dtype = dtypes.fp8,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    m, n1 = x1.shape
+    out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
+    out1_bs = torch.empty((m, cdiv(n1, group_size)), dtype=torch.float32, device=x1.device)
+    if transpose_scale:
+        out1_bs = out1_bs.transpose(0, 1).contiguous().view(*out1_bs.shape)
+    out1_unquantized = None
+    if output_unquantized_inp1:
+        out1_unquantized = torch.empty_like(x1)
+    out2 = None
+    if x2 is not None:
+        _, n2 = x2.shape
+        out2 = torch.empty((m, n2), dtype=x1.dtype, device=x1.device)
+    out_res1 = None
+    if res1 is not None:
+        out_res1 = torch.empty((m, n1), dtype=x1.dtype, device=x1.device)
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
@@ -186,6 +221,42 @@ def _fuse_rmsnorm_fp4_quant(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
+@torch_compile_guard(gen_fake=_fused_rms_fp8_group_quant_fake)
+def _fused_rms_fp8_group_quant(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: Optional[float] = None,
+    res1: Optional[torch.Tensor] = None,
+    dtype_quant: torch.dtype = dtypes.fp8,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = fused_rms_fp8_group_quant(
+        x1,
+        x1_weight,
+        x1_epsilon,
+        x2,
+        x2_weight,
+        x2_epsilon,
+        group_size,
+        dtype_quant,
+        res1,
+        output_unquantized_inp1,
+        transpose_scale,
+    )
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -194,12 +265,12 @@ def _fuse_rmsnorm_quant(
     x2_weight: Optional[torch.Tensor] = None,
     x2_epsilon: Optional[float] = None,
     res1: Optional[torch.Tensor] = None,
-    dtype_quant=dtypes.fp8,
-    shuffle: Optional[bool] = True,
-    scale_shuffle_padding: Optional[bool] = True,
-    group_size=128,
-    output_unquantized_inp1=False,
-    transpose_scale=False,
+    dtype_quant: torch.dtype = dtypes.fp8,
+    shuffle: bool = True,
+    scale_shuffle_padding: bool = False,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
 ):
     if dtype_quant == dtypes.fp4x2:
         out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = _fuse_rmsnorm_fp4_quant(
@@ -222,15 +293,15 @@ def _fuse_rmsnorm_quant(
             x2,
             x2_weight,
             x2_epsilon,
-            group_size,
-            dtype_quant,
             res1,
+            dtype_quant,
+            group_size,
             output_unquantized_inp1,
             transpose_scale,
         )
     else:
         raise ValueError(f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}.")
-    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+    return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
 
 
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
