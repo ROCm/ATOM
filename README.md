@@ -46,7 +46,7 @@ docker run -it --network=host \
 ### 3. Clone and Setup
 
 ```bash
-pip install aiter -i https://mkmartifactory.amd.com/artifactory/api/pypi/hw-orc3pypi-prod-local/simple
+pip install amd-aiter
 git clone https://github.com/ROCm/ATOM.git
 cd ./ATOM
 pip install .
@@ -59,7 +59,7 @@ pip install .
 The default optimization level is 3 (running with torch compile). Supported models include **[Deepseek](https://huggingface.co/deepseek-ai)**, **[Qwen](https://huggingface.co/Qwen)**, **[Llama](https://huggingface.co/meta-llama)**, **[Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)**, **[GPTOSS](https://huggingface.co/openai)**.
 
 ```bash
-python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B
+python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B --kv_cache_dtype fp8 
 ```
 
 > **Note:** First-time execution may take approximately 10 minutes for model compilation.
@@ -68,11 +68,11 @@ python -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B
 
 Profile offline inference
 ```bash
-python -m atom.examples.profile_offline --model Qwen/Qwen3-0.6B
+python -m atom.examples.profile_offline --model Qwen/Qwen3-0.6B --kv_cache_dtype fp8 
 ```
 Or profile offline with custom input length
 ```bash
-python -m atom.examples.profile_offline --model Qwen/Qwen3-0.6B --random-input --input-length 1024 --output-length 32
+python -m atom.examples.profile_offline --model Qwen/Qwen3-0.6B --kv_cache_dtype fp8 --random-input --input-length 1024 --output-length 32
 ```
 
 Profile online inference, after starting the server
@@ -98,8 +98,8 @@ Run online throughput benchmark:
 
 start the server
 ```bash
-python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B
-python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 -tp 8
+python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --kv_cache_dtype fp8 
+python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8
 ```
 run benchmark
 ```bash
@@ -156,14 +156,14 @@ pip install lm-eval[api]
 Next, start an OpenAI-compatible server using `openai_server.py`:
 
 ```bash
-python -m atom.entrypoints.openai_server --model meta-llama/Meta-Llama-3-8B
+python -m atom.entrypoints.openai_server --model meta-llama/Meta-Llama-3-8B --kv_cache_dtype fp8 
 ```
 
 Finally, run the evaluation by choosing your datasets:
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=meta-llama/Meta-Llama-3-8B,base_url=http://localhost:8000/v1/completions,num_concurrent=8,max_retries=3,tokenized_requests=False \
+        --model_args model=meta-llama/Meta-Llama-3-8B,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
 ```

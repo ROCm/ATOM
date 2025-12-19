@@ -66,12 +66,11 @@ def gemm_a4w4_quant(
         shuffle=True,
     )
 
-    w_scale = fp4_utils.e8m0_shuffle(weight_scale.data)
     y = gemm_a4w4(
         x,
         weight,
         x_scale,
-        w_scale,
+        weight_scale,
         dtype=otype,
     )
     return y
@@ -223,6 +222,9 @@ class LinearBase(nn.Module):
             self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
         ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
             self.weight.data = shuffle_weight(self.weight.data, (16, 16))
+        # shuffle weight scale once so no reshuffling for every gemm
+        if self.quant_type == QuantType.per_1x32:
+            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16

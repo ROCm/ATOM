@@ -14,7 +14,17 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-1gpu
+    runs-on: atom-mi355-8gpu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model_name: "Meta-Llama-3-8B-Instruct"
+            model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
+            extraArgs: ""
+          - model_name: "DeepSeek-R1-0528"
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
+            extraArgs: "--kv_cache_dtype fp8 -tp 8"
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
@@ -74,7 +84,8 @@ jobs:
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           --ipc=host --group-add video \
-          --shm-size 16g \
+          --shm-size=16G \
+          --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
           --security-opt seccomp=unconfined \
@@ -86,14 +97,26 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Check shm size
+        run: |
+          docker exec atom_test df -h /dev/shm
+
       - name: Run ATOM tests
         timeout-minutes: 60
         run: |
           # Run the inference and capture output
+          set -euo pipefail
           echo ""
           echo "========== Running test =========="
-          docker exec atom_test bash -c \
-            "python3 -m atom.examples.simple_inference --model meta-llama/Meta-Llama-3-8B-Instruct --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_test_output.txt
+
+          docker exec atom_test bash -lc "
+            set -euo pipefail
+            python3 -m atom.examples.simple_inference \
+              --model ${{ matrix.model_path }} \
+              ${{ matrix.extraArgs }} \
+              --temperature 0 \
+            | grep -E '^Prompt: |^Completion:'
+          " > atom_test_output.txt
           
           echo ""
           echo "========== Showing test output below =========="
@@ -116,7 +139,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: atom_test_output
+          name: ${{ matrix.model_name }}_atom_test_output.txt
           path: atom_test_output.txt
 
       - name: Clean Up
