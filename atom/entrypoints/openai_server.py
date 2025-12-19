@@ -325,6 +325,8 @@ async def chat_completions(request: ChatCompletionRequest):
 
                 _stream_queues.pop(request_id, None)
                 _seq_id_to_request_id.pop(seq_id, None)
+                # Clean up pending request from io_processor
+                engine.io_processor.requests.pop(seq_id, None)
 
                 yield create_chat_completion_chunk(request_id, model_name, "", "stop")
                 usage = {
@@ -450,6 +452,8 @@ async def completions(request: CompletionRequest):
                 _stream_queues.pop(request_id, None)
                 if seq_id in _seq_id_to_request_id:
                     _seq_id_to_request_id.pop(seq_id, None)
+                # Clean up pending request from io_processor
+                engine.io_processor.requests.pop(seq_id, None)
 
                 yield create_completion_chunk(request_id, model_name, "", "stop")
                 usage = {

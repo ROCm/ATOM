@@ -516,7 +516,7 @@ class ModelRunner:
         config = self.config
         hidden_size = config.hf_config.hidden_size
         hidden_type = config.hf_config.torch_dtype
-        self.max_bs = min(self.config.max_num_seqs, 512)
+        self.max_bs = self.config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
