@@ -308,6 +308,7 @@ class ModelRunner:
         self.use_kv_indptr = False
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        logger.info(f"Model load done: {config.model}")
         if isinstance(self.model, DeepseekV2ForCausalLM):
             self.use_kv_indptr = True
         if hasattr(self, "drafter"):
