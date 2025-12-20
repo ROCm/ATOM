@@ -160,28 +160,17 @@ class CoreManager:
         self._output_handler_task = None
         self._asyncio_mode = config.asyncio_mode
 
-    def _wait_for_all_ready_signals(self, timeout_seconds: float = 600.0):
-        """Wait for READY signals from all DP ranks in parallel."""
+    def _wait_for_all_ready_signals(self):
+        """Wait for READY signals from all DP ranks in parallel (no timeout)."""
         poller = zmq.Poller()
         for dp_rank, output_socket in enumerate(self.output_sockets):
             poller.register(output_socket, zmq.POLLIN)
 
         ready_received = [False] * self.local_engine_count
         remaining = self.local_engine_count
-        timeout_ms = int(timeout_seconds * 1000)
-        start_time = time.time()
 
         while remaining > 0:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            remaining_timeout = max(0, timeout_ms - elapsed_ms)
-
-            if remaining_timeout <= 0:
-                not_ready = [i for i, r in enumerate(ready_received) if not r]
-                raise RuntimeError(
-                    f"{self.label}: Timeout waiting for READY signals from DP ranks: {not_ready}"
-                )
-
-            socks = poller.poll(timeout=remaining_timeout)
+            socks = poller.poll()  # Wait indefinitely
             if not socks:
                 continue
 

@@ -360,7 +360,7 @@ class MLAAttention(nn.Module):
         #     q_scale = kv_scale = self.one_scale
 
         dp_size = get_dp_group().world_size
-        use_persistent_mode = not (dp_size > 1)
+        use_persistent_mode = not (dp_size > 1 and self.kv_cache_dtype == "fp8")
 
         if not use_persistent_mode:
             # DP : disable persistent mode to avoid overflow
