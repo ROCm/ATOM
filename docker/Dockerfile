@@ -14,7 +14,7 @@ ARG ATOM_COMMIT="207594140d0e62ed76110666ee387099c59f3ef4"
 RUN pip uninstall -y aiter || true
 RUN cd /tmp && \
     rm -rf aiter && \
-    git clone --recursive -b atom_quick_fix https://github.com/ROCm/aiter.git && \
+    git clone --recursive -b atom_quick_fix_srok https://github.com/ROCm/aiter.git && \
     cd aiter && \
     pip uninstall -y aiter || true && \
     pip install --upgrade pip setuptools wheel && \
