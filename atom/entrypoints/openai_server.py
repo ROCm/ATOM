@@ -456,10 +456,6 @@ async def setup_streaming_request(
 
     # Add request to engine
     engine.core_mgr.add_request([seq])
-    logger.info(
-        f"API: Added request to engine, callback registered: "
-        f"{seq.stream_callback is not None}"
-    )
 
     return seq_id, stream_queue
 
@@ -547,7 +543,7 @@ async def stream_completion_response(
         )
 
         if chunk_data.get("finished", False):
-            logger.info(
+            logger.debug(
                 _stream_finish_log(
                     request_id,
                     chunk_data.get("started_at"),
