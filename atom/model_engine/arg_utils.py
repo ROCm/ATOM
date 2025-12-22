@@ -5,7 +5,7 @@ import argparse
 from dataclasses import dataclass, fields
 from typing import List, Optional
 
-from atom import AsyncLLMEngine, LLMEngine
+from atom import LLMEngine
 from atom.config import CompilationConfig, SpeculativeConfig
 
 
@@ -198,7 +198,3 @@ class EngineArgs:
     def create_engine(self) -> LLMEngine:
         """Create and return an LLMEngine instance with the configured parameters."""
         return LLMEngine(self.model, **self._get_engine_kwargs())
-
-    def create_async_engine(self) -> AsyncLLMEngine:
-        """Create and return an AsyncLLMEngine instance with the configured parameters."""
-        return AsyncLLMEngine(self.model, asyncio_mode=True, **self._get_engine_kwargs())
