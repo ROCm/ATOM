@@ -326,12 +326,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
-        dp_size = get_dp_group().world_size
-        if dp_size > 1 and self.model_runner.config.kv_cache_dtype == "fp8":
-            # avoid buffer overflow in persistent mode for fp8 + nhead 128
-            ctx_mla_ps = {}
-        else:
-            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs)
+        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs)
         attn_matadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
