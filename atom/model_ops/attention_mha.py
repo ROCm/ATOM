@@ -20,7 +20,11 @@ from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+from aiter import fused_qk_norm_rope_cache_quant_shuffle
+from aiter.dist.parallel_state import get_tp_group
 
+from atom.utils import envs
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 
 class Attention(nn.Module):
 
@@ -36,6 +40,10 @@ class Attention(nn.Module):
         sinks: Optional[nn.Parameter] = None,
         sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
+        use_triton_prefill: bool = True,
+        use_triton_decode: bool = True,
+        q_norm: Optional[torch.nn.Module] = None,
+        k_norm: Optional[torch.nn.Module] = None,
         **kwargs,
     ):
         super().__init__()
@@ -54,7 +62,11 @@ class Attention(nn.Module):
         self.rotary_emb = rotary_emb
         # kv cache layout
         self.flash_layout = False
-
+        # backend selection
+        self.use_triton_prefill = use_triton_prefill
+        self.use_triton_decode = use_triton_decode
+        self.q_norm = q_norm
+        self.k_norm = k_norm
 
     def forward(
         self,
@@ -63,6 +75,7 @@ class Attention(nn.Module):
         v: torch.Tensor,
         position: torch.Tensor = None,
         q_scale: torch.Tensor=None,
+        qkv: torch.Tensor = None,
     ):
 
         fwd_args: ForwardContext = get_forward_context()
@@ -79,18 +92,18 @@ class Attention(nn.Module):
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         
         # rope cache
-        q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(q, k, v, position, fwd_args)           
+        q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(q, k, v, qkv, position, fwd_args)
         
         attn_impl = self.dispatch_backend(fwd_args)
-                
-        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args)
-        
+
+        o = attn_impl(q.contiguous(), k.contiguous(), v.contiguous(), k_cache, v_cache, k_scale, v_scale, fwd_args)
+
         o = o.view(-1, self.num_heads * self.head_dim)
 
         return o
     
     
-    def rope_cache(self, q, k, v, position, fwd_args: ForwardContext, flash_layout=False):
+    def rope_cache(self, q, k, v, qkv, position, fwd_args: ForwardContext, flash_layout=False):
         
         # if flash kv_cache layout, the shape of kv_cache is:
         #
@@ -111,40 +124,91 @@ class Attention(nn.Module):
         v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
-        
-        # TODO: if kv_scale has value, do not use one scale here.
-        # if k_scale is None and v_scale is None:
-        #    k_scale = v_scale = self.one_scale
-        k_scale = v_scale = self.one_scale
 
-        if flash_layout:
-            k_cache = k_cache.view(
-                k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            fused_qk_norm_rope_cache_quant_shuffle(
+                qkv,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_kv_heads,
+                num_heads_v=self.num_kv_heads,
+                head_dim=self.head_dim,
+                eps=self.q_norm.eps,
+                qw=self.q_norm.weight,
+                kw=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                is_neox_style=self.rotary_emb.is_neox_style,
+                pos_ids=position,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                slot_mapping=attn_metadata.slot_mapping,
+                kv_cache_dtype="auto",  #self.kv_cache_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
-            v_cache = v_cache.view(
-                v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+
+            qkv = qkv.view(qkv.shape[0], 
+                           -1,
+                           self.head_dim)
+            q, k, v = qkv.split([self.num_heads,
+                                self.num_kv_heads,
+                                self.num_kv_heads], dim=1)
+        elif self.rotary_emb is None:
+            if self.kv_cache_dtype == "fp8":
+                aiter.reshape_and_cache_with_pertoken_quant(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    k_scale,
+                    v_scale,
+                    attn_metadata.slot_mapping,
+                    asm_layout=True,
+                )
+            else:
+                aiter.reshape_and_cache(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    attn_metadata.slot_mapping,
+                    kv_cache_dtype="auto",
+                    k_scale=None,
+                    v_scale=None,
+                    asm_layout=True,
+                )
+        else:
+            # TODO: if kv_scale has value, do not use one scale here.
+            # if k_scale is None and v_scale is None:
+            #    k_scale = v_scale = self.one_scale
+            k_scale = v_scale = self.one_scale
+            if flash_layout:
+                k_cache = k_cache.view(
+                    k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                )
+                v_cache = v_cache.view(
+                    v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                )
+            
+            q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                position,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                k_scale,
+                v_scale,
+                self.rotary_emb.is_neox_style,
+                flash_layout=flash_layout,
+                apply_scale=self.kv_cache_dtype.startswith("fp8"),
+                offs=None,
+                q_out=q,
+                k_out=k,
+                output_zeros=False,
             )
-        
-        q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
-            q,
-            k,
-            v,
-            k_cache,
-            v_cache,
-            attn_metadata.slot_mapping,
-            position,
-            self.rotary_emb.cos_cache,
-            self.rotary_emb.sin_cache,
-            k_scale,
-            v_scale,
-            self.rotary_emb.is_neox_style,
-            flash_layout=flash_layout,
-            apply_scale=self.kv_cache_dtype.startswith("fp8"),
-            offs=None,
-            q_out=q,
-            k_out=k,
-            output_zeros=False,
-        )
         
         return q, k, v, k_cache, v_cache, k_scale, v_scale
         
@@ -316,14 +380,32 @@ class Attention(nn.Module):
     def dispatch_backend(self, fwd_args: ForwardContext):
         
         ctx = fwd_args.context
+        # print("self.use_triton_prefill", self.use_triton_prefill)
+        # print("self.use_triton_decode", self.use_triton_decode)
         
         if ctx.is_prefill:
             if self.sliding_window or self.sinks is not None:
-                return self.prefill_attention_triton
+                if self.use_triton_prefill:
+                    # print("self.use_triton_prefill, prefill_attention_triton")
+                    return self.prefill_attention_triton
+                else:
+                    # print("self.use_triton_prefill, prefill_attention_asm")
+                    return self.prefill_attention_asm
             else:
+                # print("prefill_attention_asm")
                 return self.prefill_attention_asm
         else:
             if self.sliding_window or self.sinks is not None:
-                return self.paged_attention_triton
+                if self.use_triton_decode:
+                    # print("self.use_triton_decode, paged_attention_triton")
+                    return self.paged_attention_triton
+                else:
+                    if ctx.batch_size == 64:
+                        # print("self.use_triton_decode, paged_attention_triton, ctx.batch_size == 64", ctx.batch_size)
+                        return self.paged_attention_triton
+                    else:
+                        # print("self.use_triton_decode, paged_attention_asm, ctx.batch_size != 64", ctx.batch_size)
+                        return self.paged_attention_asm
             else:
+                # print("paged_attention_asm")
                 return self.paged_attention_asm

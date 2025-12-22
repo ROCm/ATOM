@@ -43,9 +43,17 @@ from atom.models.utils import (
 from atom.utils import envs
 
 from aiter import fused_rope_rms
+# from atom.utils.distributed.utils import init_aiter_quick_all_reduce
+# from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
+# from atom.utils.forward_context import (
+#     ForwardContext,
+#     get_forward_context,
+# )
+from aiter import fused_qk_norm_rope_cache_quant_shuffle
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 # use AITER env var for simplicity
 ENABLE_QUICK_AR = os.environ.get("AITER_QUICK_REDUCE_QUANTIZATION", None) is not None
 
@@ -72,7 +80,10 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         sin = sin.to(dtype)
         cache = torch.cat((cos, sin), dim=-1)
         self.cos_sin_cache: torch.Tensor
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            self.register_buffer("cos_sin_cache", cache.view(cache.size(0), self.head_size), persistent=False)
+        else:
+            self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -272,7 +283,8 @@ class Qwen3MoeAttention(nn.Module):
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
-        if ENABLE_QK_NORM_ROPE_FUSION:
+        if ENABLE_QK_NORM_ROPE_FUSION or ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        # if ENABLE_QK_NORM_ROPE_FUSION:
             self.rotary_emb = RotaryEmbeddingQKNormFused(
                 head_size=self.head_dim,
                 rotary_dim=self.head_dim,
@@ -289,18 +301,48 @@ class Qwen3MoeAttention(nn.Module):
                 base=rope_theta,
                 rope_scaling=rope_scaling,
             )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_kv_heads,
-            kv_cache_dtype=kv_cache_dtype,
-            layer_num=layer_num,
-            use_mla=False,
-        )
-
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+                kv_cache_dtype=kv_cache_dtype,
+                layer_num=layer_num,
+                use_mla=False,
+                rotary_emb=self.rotary_emb,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                use_triton_prefill=False,
+                use_triton_decode=False,
+            )
+        elif ENABLE_QK_NORM_ROPE_FUSION:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+                kv_cache_dtype=kv_cache_dtype,
+                layer_num=layer_num,
+                use_mla=False,
+                use_triton_prefill=False,
+                use_triton_decode=False,
+            )
+        else:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+                kv_cache_dtype=kv_cache_dtype,
+                layer_num=layer_num,
+                use_mla=False,
+            )
+        self.kv_cache_dtype = kv_cache_dtype
+        self.layer_num = layer_num
+
 
     def forward(
         self,
@@ -308,7 +350,30 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        if ENABLE_QK_NORM_ROPE_FUSION:
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn(q, k, v, positions, None, qkv)
+        # elif ENABLE_QK_NORM_ROPE_FUSION:
+        #     self.rotary_emb(
+        #         qkv,
+        #         self.q_norm.weight,
+        #         self.k_norm.weight,
+        #         positions,
+        #         num_heads=self.num_heads,
+        #         num_kv_heads=self.num_kv_heads,
+        #         eps=self.q_norm.eps,
+        #     )
+        #     q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+        #     attn_output = self.attn(q, k, v)
+        # else:
+        #     q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+        #     # Add qk-norm
+        #     q = self.q_norm(q)
+        #     k = self.k_norm(k)
+
+        #     q, k = self.rotary_emb(positions, q, k)
+        #     attn_output = self.attn(q, k, v)
+        elif ENABLE_QK_NORM_ROPE_FUSION:
             self.rotary_emb(
                 qkv,
                 self.q_norm.weight,
@@ -319,6 +384,7 @@ class Qwen3MoeAttention(nn.Module):
                 eps=self.q_norm.eps,
             )
             q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn(q, k, v)
         else:
             q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
             # Add qk-norm
@@ -326,7 +392,7 @@ class Qwen3MoeAttention(nn.Module):
             k = self.k_norm(k)
 
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v)
         output = self.o_proj(attn_output)
         return output
 
@@ -433,6 +499,7 @@ class Qwen3MoeModel(nn.Module):
         config = atom_config.hf_config
         cache_config = atom_config.kv_cache_dtype
         quant_config = atom_config.quant_config
+        # config.num_hidden_layers = 3
         self.config = config
 
         if get_pp_group().is_first_rank:
