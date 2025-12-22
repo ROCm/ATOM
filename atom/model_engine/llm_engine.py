@@ -5,7 +5,6 @@ import asyncio
 import itertools
 import logging
 import time
-import asyncio
 from dataclasses import fields
 from typing import List, Union, AsyncGenerator, Dict, Optional
 
@@ -15,6 +14,7 @@ from transformers import AutoTokenizer
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
+from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
@@ -122,7 +122,11 @@ class InputOutputProcessor:
         self.requests = {}
 
     def preprocess(
-        self, prompt_or_tokens: str | list[int], sampling_params: SamplingParams, stream_callback=None
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        stream_callback=None,
+        request_id: Optional[str] = None,
     ):
         """responsible for:
         1) Tokenize
@@ -142,7 +146,14 @@ class InputOutputProcessor:
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
         
-        seq = Sequence(tokens, self.block_size, sampling_params, stop_token_sequences, stream_callback=stream_callback)
+        seq = Sequence(
+            tokens,
+            self.block_size,
+            sampling_params,
+            stop_token_sequences,
+            stream_callback=stream_callback,
+            request_id_str=request_id,
+        )
         seq.arrive_time = time.time()
         self.requests[seq.id] = seq
         print(
@@ -193,99 +204,125 @@ class InputOutputProcessor:
 
 class AsyncLLMEngine(LLMEngine):
     def __init__(self, *args, **kwargs):
+        # Force asyncio mode so CoreManager builds async queues/handler.
+        kwargs["asyncio_mode"] = True
         super().__init__(*args, **kwargs)
-        self._request_queues: Dict[str, asyncio.Queue] = {}
-        self._seq_id_to_request_id: Dict[int, str] = {}
         self._running = True
-        self._output_task = None
-    
-    def _ensure_output_task(self):
-        if self._output_task is None:
-            try:
-                loop = asyncio.get_running_loop()
-                self._output_task = loop.create_task(self._process_outputs_loop())
-            except RuntimeError:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    self._output_task = loop.create_task(self._process_outputs_loop())
-                else:
-                    raise RuntimeError("AsyncLLMEngine requires a running event loop")
-    
-    async def _process_outputs_loop(self):
-        while self._running:
-            try:
-                try:
-                    seqs = await asyncio.wait_for(
-                        self.core_mgr.get_output_async(), 
-                        timeout=1.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                
-                for seq in seqs:
-                    request_id = self._seq_id_to_request_id.get(seq.id)
-                    if request_id and request_id in self._request_queues:
-                        try:
-                            self._request_queues[request_id].put_nowait(seq)
-                        except asyncio.QueueFull:
-                            try:
-                                old_seq = self._request_queues[request_id].get_nowait()
-                                logger.debug(f"Request {request_id} queue full, dropping old result and adding new one")
-                            except asyncio.QueueEmpty:
-                                pass
-                            try:
-                                self._request_queues[request_id].put_nowait(seq)
-                            except asyncio.QueueFull:
-                                logger.warning(f"Request {request_id} queue still full, result lost")
-                    else:
-                        logger.debug(f"Sequence {seq.id} request queue does not exist (request_id={request_id}), ignoring result")
-                
-            except Exception as e:
-                logger.error(f"Error in output processing loop: {e}", exc_info=True)
-                await asyncio.sleep(0.1)
-    
+
+    async def add_request_async(
+        self,
+        prompt_or_tokens_list: List[Union[str, List[int]]],
+        sampling_params_list: SamplingParams | List[SamplingParams],
+        stream_callback=None,
+    ):
+        """Add requests without blocking the event loop."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.add_request,
+            prompt_or_tokens_list,
+            sampling_params_list,
+            stream_callback,
+        )
+
+    async def step_async(self) -> list[Sequence]:
+        """Async counterpart of step() using CoreManager async queue."""
+        return await self.core_mgr.get_output_async()
+
+    async def generate_batch_async(
+        self,
+        prompts: list[str],
+        sampling_params: SamplingParams | list[SamplingParams],
+    ) -> list[dict]:
+        """Async version of generate that returns full outputs once ready."""
+        await self.add_request_async(prompts, sampling_params)
+        outputs: Dict[int, Dict] = {}
+
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seqs = await self.step_async()
+            outs = self.io_processor.postprocess(seqs)
+            outputs.update(outs)
+
+        return [outputs[seq_id] for seq_id in sorted(outputs)]
+
     async def generate_async(
         self,
         prompt: str,
         sampling_params: SamplingParams,
         request_id: str
     ) -> AsyncGenerator[Dict, None]:
-        self._ensure_output_task()
-        
-        output_queue = asyncio.Queue(maxsize=1)
-        self._request_queues[request_id] = output_queue
-        
-        seq = None
+        """Stream incremental outputs via the engine's stream_callback without dropping tokens."""
+        loop = asyncio.get_running_loop()
+        output_queue: asyncio.Queue[RequestOutput] = asyncio.Queue()
+
+        arrival_time = time.time()
+        prompt_tokens = len(self.tokenizer.encode(prompt))
+        first_token_time: float | None = None
+        completion_token_ids: list[int] = []
+
         seq_id = None
+        finished = False
         try:
-            req = self.io_processor.preprocess(prompt, sampling_params)
+            def stream_callback(request_output: RequestOutput) -> None:
+                nonlocal first_token_time
+                if first_token_time is None:
+                    first_token_time = time.time()
+                loop.call_soon_threadsafe(output_queue.put_nowait, request_output)
+
+            req = await loop.run_in_executor(
+                None,
+                self.io_processor.preprocess,
+                prompt,
+                sampling_params,
+                stream_callback,
+                request_id,
+            )
             seq_id = req.id
-            if seq_id in self._seq_id_to_request_id:
-                logger.warning(f"Sequence ID {seq_id} already exists in mapping, overwriting old mapping")
-            self._seq_id_to_request_id[seq_id] = request_id
             self.core_mgr.add_request([req])
-            
+
             while True:
-                seq = await output_queue.get()
-                
-                if seq.id != seq_id:
-                    logger.error(f"Received wrong sequence ID: expected {seq_id}, got {seq.id}, request_id={request_id}")
-                    continue
-                
-                result = self._postprocess_sequence(seq)
-                
-                if seq.is_finished:
-                    yield result
-                    break
-                
+                req_output = await output_queue.get()
+
+                completion_token_ids.extend(req_output.output_tokens)
+                text = self.tokenizer.decode(
+                    completion_token_ids, skip_special_tokens=True
+                )
+
+                ttft = (
+                    0.0
+                    if first_token_time is None
+                    else first_token_time - arrival_time
+                )
+                tpot = 0.0
+                if first_token_time is not None and len(completion_token_ids) > 1:
+                    elapsed_since_first = time.time() - first_token_time
+                    tpot = elapsed_since_first / (len(completion_token_ids) - 1)
+
+                latency = time.time() - arrival_time if req_output.finished else 0.0
+
+                result = {
+                    "text": text,
+                    "token_ids": completion_token_ids.copy(),
+                    "finished": req_output.finished,
+                    "finish_reason": req_output.finish_reason,
+                    "ttft": ttft,
+                    "tpot": tpot,
+                    "latency": latency,
+                    "num_tokens_input": prompt_tokens,
+                    "num_tokens_output": len(completion_token_ids),
+                }
+
                 yield result
-                
+
+                finished = req_output.finished
+                if finished:
+                    break
+
         finally:
-            self._request_queues.pop(request_id, None)
             if seq_id is not None:
-                self._seq_id_to_request_id.pop(seq_id, None)
-                # Clean up pending request if sequence didn't finish normally
-                if seq is None or not seq.is_finished:
+                if not finished:
                     self.io_processor.requests.pop(seq_id, None)
     
     #TODO add tokenizer process to handle tokens combination for utf8 decoding
@@ -322,20 +359,7 @@ class AsyncLLMEngine(LLMEngine):
             "latency": latency,
         }
 
-    #TODO enable abort request
-    # def abort_request(self, request_id: str):
-    #     if request_id in self._request_queues:
-    #         # Find seq_id from request_id mapping
-    #         seq_id = None
-    #         for sid, rid in self._seq_id_to_request_id.items():
-    #             if rid == request_id:
-    #                 seq_id = sid
-    #                 break
-    #         # Remove from pending requests using seq_id
-    #         if seq_id is not None:
-    #             self.io_processor.requests.pop(seq_id, None)
-    #         self._request_queues.pop(request_id, None)
-    #         logger.info(f"Request {request_id} aborted")
+    # TODO enable abort request (needs request_id to seq cleanup if added)
     
     async def close(self):
         self._running = False

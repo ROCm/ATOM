@@ -38,6 +38,7 @@ class Sequence:
         sampling_params=SamplingParams(),
         stop_token_sequences: list[list[int]] = None,
         stream_callback: Optional[Callable[[Any], None]] = None,
+        request_id_str: Optional[str] = None,
         id=None,
     ):
         self.block_size = block_size
@@ -59,6 +60,7 @@ class Sequence:
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
+        self.request_id_str = request_id_str
 
         # statistics fields
         self.arrive_time = 0.0

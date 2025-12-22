@@ -129,7 +129,6 @@ engine = None
 tokenizer: Optional[AutoTokenizer] = None
 model_name: str = ""
 _stream_queues: Dict[str, asyncio.Queue] = {}
-_seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
 
@@ -341,9 +340,9 @@ def send_stream_chunk(request_output: RequestOutput) -> None:
     Args:
         request_output: Output from the engine
     """
-    global tokenizer, _stream_queues, _seq_id_to_request_id, _stream_loops
+    global tokenizer, _stream_queues, _stream_loops
 
-    request_id = _seq_id_to_request_id.get(request_output.request_id)
+    request_id = request_output.user_request_id
     if request_id is None:
         logger.warning(
             f"send_stream_chunk: No request_id found for sequence "
@@ -424,7 +423,7 @@ async def setup_streaming_request(
     Returns:
         Tuple of (sequence_id, stream_queue)
     """
-    global engine, _stream_queues, _seq_id_to_request_id, _stream_loops, _request_start_times
+    global engine, _stream_queues, _stream_loops, _request_start_times
 
     stream_queue: asyncio.Queue = asyncio.Queue()
     stream_loop = asyncio.get_running_loop()
@@ -440,11 +439,12 @@ async def setup_streaming_request(
     executor_loop = asyncio.get_event_loop()
 
     def do_preprocess():
-        seq = engine.io_processor.preprocess(
-            prompt, sampling_params, stream_callback=stream_callback
+        return engine.io_processor.preprocess(
+            prompt,
+            sampling_params,
+            stream_callback=stream_callback,
+            request_id=request_id,
         )
-        _seq_id_to_request_id[seq.id] = request_id
-        return seq
 
     seq = await executor_loop.run_in_executor(None, do_preprocess)
     seq_id = seq.id
@@ -467,98 +467,87 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
         request_id: Request identifier
         seq_id: Sequence identifier
     """
-    global engine, _stream_queues, _seq_id_to_request_id, _stream_loops, _request_start_times
+    global engine, _stream_queues, _stream_loops, _request_start_times
 
     _stream_queues.pop(request_id, None)
-    _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
     engine.io_processor.requests.pop(seq_id, None)
 
 
 async def stream_chat_response(
-    request_id: str, model: str, prompt: str, stream_queue: asyncio.Queue, seq_id: int
+    request_id: str,
+    model: str,
+    prompt: str,
+    sampling_params: SamplingParams,
 ) -> AsyncGenerator[str, None]:
-    """Generate streaming chat completion response."""
-    global tokenizer
+    """Generate streaming chat completion response via async engine."""
+    global tokenizer, engine
 
     num_tokens_input = len(tokenizer.encode(prompt))
-    num_tokens_output = 0
+    last_token_count = 0
 
     # Send initial empty chunk
     yield create_chat_completion_chunk(request_id, model, "")
 
-    while True:
-        chunk_data = await stream_queue.get()
-        new_text = chunk_data["text"]
+    async for output in engine.generate_async(prompt, sampling_params, request_id):
+        token_ids = output.get("token_ids") or []
+        new_tokens = token_ids[last_token_count:]
+        last_token_count = len(token_ids)
 
-        num_tokens_output += len(chunk_data.get("token_ids", []))
+        new_text = (
+            tokenizer.decode(new_tokens, skip_special_tokens=True) if new_tokens else ""
+        )
 
         yield create_chat_completion_chunk(
             request_id,
             model,
             new_text,
-            finish_reason=chunk_data.get("finish_reason"),
+            finish_reason=output.get("finish_reason"),
         )
 
-        if chunk_data.get("finished", False):
-            logger.info(
-                _stream_finish_log(
-                    request_id,
-                    chunk_data.get("started_at"),
-                    chunk_data.get("finished_at"),
-                    "stream_chat_response",
-                )
-            )
+        if output.get("finished"):
+            usage = _build_usage(num_tokens_input, len(token_ids))
+            yield create_chat_completion_chunk(request_id, model, "", "stop")
+            yield create_chat_usage_chunk(request_id, model, usage)
+            yield STREAM_DONE_MESSAGE
             break
-
-    cleanup_streaming_request(request_id, seq_id)
-
-    usage = _build_usage(num_tokens_input, num_tokens_output)
-    yield create_chat_completion_chunk(request_id, model, "", "stop")
-    yield create_chat_usage_chunk(request_id, model, usage)
-    yield STREAM_DONE_MESSAGE
 
 
 async def stream_completion_response(
-    request_id: str, model: str, prompt: str, stream_queue: asyncio.Queue, seq_id: int
+    request_id: str,
+    model: str,
+    prompt: str,
+    sampling_params: SamplingParams,
 ) -> AsyncGenerator[str, None]:
-    """Generate streaming text completion response."""
-    global tokenizer
+    """Generate streaming text completion response via async engine."""
+    global tokenizer, engine
 
     num_tokens_input = len(tokenizer.encode(prompt))
-    num_tokens_output = 0
+    last_token_count = 0
 
-    while True:
-        chunk_data = await stream_queue.get()
-        new_text = chunk_data["text"]
+    async for output in engine.generate_async(prompt, sampling_params, request_id):
+        token_ids = output.get("token_ids") or []
+        new_tokens = token_ids[last_token_count:]
+        last_token_count = len(token_ids)
 
-        num_tokens_output += len(chunk_data.get("token_ids", []))
+        new_text = (
+            tokenizer.decode(new_tokens, skip_special_tokens=True) if new_tokens else ""
+        )
 
         yield create_completion_chunk(
             request_id,
             model,
             new_text,
-            finish_reason=chunk_data.get("finish_reason"),
+            finish_reason=output.get("finish_reason"),
         )
 
-        if chunk_data.get("finished", False):
-            logger.debug(
-                _stream_finish_log(
-                    request_id,
-                    chunk_data.get("started_at"),
-                    chunk_data.get("finished_at"),
-                    "stream_completion_response",
-                )
-            )
+        if output.get("finished"):
+            usage = _build_usage(num_tokens_input, len(token_ids))
+            yield create_completion_chunk(request_id, model, "", "stop")
+            yield create_usage_chunk(request_id, model, usage)
+            yield STREAM_DONE_MESSAGE
             break
-
-    cleanup_streaming_request(request_id, seq_id)
-
-    usage = _build_usage(num_tokens_input, num_tokens_output)
-    yield create_completion_chunk(request_id, model, "", "stop")
-    yield create_usage_chunk(request_id, model, usage)
-    yield STREAM_DONE_MESSAGE
 
 
 # ============================================================================
@@ -617,13 +606,9 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Handle streaming requests
         if request.stream:
-            seq_id, stream_queue = await setup_streaming_request(
-                prompt, sampling_params, request_id
-            )
-
             return StreamingResponse(
                 stream_chat_response(
-                    request_id, model_name, prompt, stream_queue, seq_id
+                    request_id, model_name, prompt, sampling_params
                 ),
                 media_type="text/event-stream",
             )
@@ -698,13 +683,9 @@ async def completions(request: CompletionRequest):
 
         # Handle streaming requests
         if request.stream:
-            seq_id, stream_queue = await setup_streaming_request(
-                request.prompt, sampling_params, request_id
-            )
-
             return StreamingResponse(
                 stream_completion_response(
-                    request_id, model_name, request.prompt, stream_queue, seq_id
+                    request_id, model_name, request.prompt, sampling_params
                 ),
                 media_type="text/event-stream",
             )

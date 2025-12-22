@@ -225,6 +225,7 @@ class Scheduler:
                     output_tokens=new_tokens.copy(),
                     finished=(leave_reason is not None),
                     finish_reason=leave_reason,
+                    user_request_id=getattr(seq, "request_id_str", None),
                 )
                 # Store sequence ID instead of sequence object to avoid pickling issues
                 stream_outputs.append((seq.id, request_output))

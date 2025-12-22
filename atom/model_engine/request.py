@@ -12,4 +12,5 @@ class RequestOutput:
     output_tokens: List[int]  # Newly generated tokens since last callback
     finished: bool  # Whether the sequence is finished
     finish_reason: Optional[str] = None  # Reason for finishing (eos, max_tokens, stop_sequence, etc.)
+    user_request_id: Optional[str] = None  # Optional user-level request id for routing
 
