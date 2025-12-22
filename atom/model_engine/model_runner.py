@@ -224,14 +224,6 @@ class tokenIDProcessor:
 
         elif num_deferred_tokens == total_tokens_decode:
             # no new requests added but some old requests finished
-            # self.input_ids_loc.np[:num_deferred_tokens] = alive_seq_indices
-            # self.input_ids_loc.copy_to_gpu(num_deferred_tokens)
-            # torch.gather(
-            #     self.prev_token_ids,
-            #     0,
-            #     self.input_ids_loc.gpu[:num_deferred_tokens],
-            #     out=self.input_ids.gpu[:num_deferred_tokens],
-            # )
             if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
                 alive_prev = self.prev_token_ids[alive_seq_indices]  # (num_alive_seqs,)
                 alive_draft = self.draft_token_ids[alive_seq_indices]  # (num_alive_seqs, mtp_n_grams-1)
@@ -1095,7 +1087,7 @@ class ModelRunner:
         self.forward_vars["draft_tokens"].gpu[:bs, :self.drafter.mtp_k] = draft_token
         self.forward_vars["draft_tokens"].copy_to_cpu()
         self.tokenID_processor.draft_token_ids = draft_token
-        self.tokenID_processor.pre_num_decode_token_per_seq = 2
+        self.tokenID_processor.pre_num_decode_token_per_seq = self.drafter.mtp_k + 1
 
         return None
 
