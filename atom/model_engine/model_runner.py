@@ -894,6 +894,8 @@ class ModelRunner:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
 
+        assert self.graph_bs[0] <= self.config.max_num_seqs, "cudagraph capture sizes must be less than max_num_seqs."
+
         self.forward_vars["cu_seqlens_q"].np[: self.graph_bs[0] + 1] = np.arange(
             0, self.graph_bs[0] + 1
         )
