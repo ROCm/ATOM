@@ -9,7 +9,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dynamic = ["version"]
-dependencies = ["pybind11", "transformers", "zmq", "xxhash", "fastapi", "psutil", "protobuf", "uvicorn", "aiohttp", "datasets"]
+dependencies = ["pybind11", "transformers", "zmq", "xxhash", "fastapi", "psutil", "protobuf", "uvicorn", "aiohttp", "datasets", "triton==3.5.0"]
 
 [project.urls]
 Homepage = "https://github.com/ROCm/ATOM"
