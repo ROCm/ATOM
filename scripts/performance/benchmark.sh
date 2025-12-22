@@ -2,7 +2,6 @@
 set -euo pipefail
 
 # step 1: please pip install pandas openpyxl
-# step 2: git clone https://github.com/kimbochen/bench_serving.git in current path
 # step 3: change the variables as below
 # step 4: bash benchmark.sh
 
@@ -20,7 +19,8 @@ if [ -f "$LOG_FILE" ]; then
     rm "$LOG_FILE"
 fi
 
-
+SCRIPT_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+RUN_PAYH="$SCRIPT_DIR/../../atom/benchmarks/benchmark_serving.py"
 for ISL in "${ISL_LIST[@]}"; do
 
     for CONC in "${CONC_LIST[@]}"; do
@@ -28,7 +28,7 @@ for ISL in "${ISL_LIST[@]}"; do
     echo "Start Test ISL=$ISL, OSL=$OSL, CONC=$CONC" | tee -a "$LOG_FILE"
     echo "=========================================" | tee -a "$LOG_FILE"
         
-        python bench_serving/benchmark_serving.py \
+        python $RUN_PAYH \
             --model="$MODEL_PATH" \
             --backend=vllm \
             --base-url="http://localhost:$PORT" \
