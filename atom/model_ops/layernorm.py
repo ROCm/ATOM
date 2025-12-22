@@ -16,10 +16,6 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from atom.utils.forward_context import (
-    ForwardContext,
-    get_forward_context,
-)
 
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
@@ -89,41 +85,6 @@ def fused_add_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
-def quick_ar_or_fused_arnorm_fake_tensors(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    residual: torch.Tensor,
-    eps: float,
-    dim: int,
-    use_qr_when_possible: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return (torch.empty_like(x), torch.empty_like(residual))
-
-
-@torch_compile_guard(gen_fake=quick_ar_or_fused_arnorm_fake_tensors)
-def quick_ar_or_fused_arnorm_(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    residual: torch.Tensor,
-    eps: float,
-    dim: int,
-    use_qr_when_possible: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    forward_context: ForwardContext = get_forward_context()
-    context = forward_context.context
-    if use_qr_when_possible and context.is_prefill:
-        qr_comm = get_tp_group().device_communicator.qr_comm
-        assert qr_comm is not None, "Quick all-reduce communication is not initialized!"
-        ar_out = qr_comm.quick_all_reduce(x)
-        return rmsnorm2d_fwd_with_add_(ar_out, weight, residual, eps, dim)
-    return tensor_model_parallel_fused_allreduce_rmsnorm(
-        x, 
-        residual, 
-        weight, 
-        eps,
-        )
-
-
 class RMSNorm(nn.Module):
 
     def __init__(
@@ -132,7 +93,6 @@ class RMSNorm(nn.Module):
         eps: float = 1e-6,
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
-        use_qr_when_possible: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -141,7 +101,6 @@ class RMSNorm(nn.Module):
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.use_qr_when_possible = use_qr_when_possible
 
     def forward(
         self,
@@ -159,17 +118,13 @@ class RMSNorm(nn.Module):
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )            
         if self.fused_allreduce and self.tp_size > 1:
-            # use quick allreduce for prefill, will not fuse rmsnorm
-            # use fused allreduce rmsnorm for decode
-            assert residual is not None, "residual input must be provided."
-            return quick_ar_or_fused_arnorm_(
-                x,
-                self.weight,
-                residual,
+            assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
+            return tensor_model_parallel_fused_allreduce_rmsnorm(
+                x, 
+                residual, 
+                self.weight, 
                 self.eps,
-                self.dim,
-                self.use_qr_when_possible,
-            )
+                )
         else:
             if residual is None:
                 # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
