@@ -239,7 +239,7 @@ class Attention(nn.Module):
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
-            one_shot=True,
+            one_shot=True if num_seqs >= 32 and self.sinks is not None else None,  # only enable one-shot for gpt oss
         )
         
         return o
