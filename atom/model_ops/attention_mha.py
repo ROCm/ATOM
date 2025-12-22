@@ -124,8 +124,11 @@ class Attention(nn.Module):
         v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
-
+        
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            k_scale.fill_(self.one_scale)
+            v_scale.fill_(self.one_scale)
+
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
                 num_heads_q=self.num_heads,
@@ -141,9 +144,9 @@ class Attention(nn.Module):
                 k_cache=k_cache,
                 v_cache=v_cache,
                 slot_mapping=attn_metadata.slot_mapping,
-                kv_cache_dtype="auto",  #self.kv_cache_dtype,
-                k_scale=k_scale,
-                v_scale=v_scale,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=self.one_scale,
+                v_scale=self.one_scale,
             )
 
             qkv = qkv.view(qkv.shape[0], 
@@ -380,32 +383,26 @@ class Attention(nn.Module):
     def dispatch_backend(self, fwd_args: ForwardContext):
         
         ctx = fwd_args.context
-        # print("self.use_triton_prefill", self.use_triton_prefill)
-        # print("self.use_triton_decode", self.use_triton_decode)
-        
+
+        # add use_triton_prefill=False and use_triton_decode=False for Qwen,
+        # which use asm backend for prefill,
+        # use gluon pa for decode when batch size is 64.
         if ctx.is_prefill:
             if self.sliding_window or self.sinks is not None:
                 if self.use_triton_prefill:
-                    # print("self.use_triton_prefill, prefill_attention_triton")
                     return self.prefill_attention_triton
                 else:
-                    # print("self.use_triton_prefill, prefill_attention_asm")
                     return self.prefill_attention_asm
             else:
-                # print("prefill_attention_asm")
                 return self.prefill_attention_asm
         else:
             if self.sliding_window or self.sinks is not None:
                 if self.use_triton_decode:
-                    # print("self.use_triton_decode, paged_attention_triton")
                     return self.paged_attention_triton
                 else:
                     if ctx.batch_size == 64:
-                        # print("self.use_triton_decode, paged_attention_triton, ctx.batch_size == 64", ctx.batch_size)
                         return self.paged_attention_triton
                     else:
-                        # print("self.use_triton_decode, paged_attention_asm, ctx.batch_size != 64", ctx.batch_size)
                         return self.paged_attention_asm
             else:
-                # print("paged_attention_asm")
                 return self.paged_attention_asm

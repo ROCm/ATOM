@@ -353,26 +353,6 @@ class Qwen3MoeAttention(nn.Module):
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
             attn_output = self.attn(q, k, v, positions, None, qkv)
-        # elif ENABLE_QK_NORM_ROPE_FUSION:
-        #     self.rotary_emb(
-        #         qkv,
-        #         self.q_norm.weight,
-        #         self.k_norm.weight,
-        #         positions,
-        #         num_heads=self.num_heads,
-        #         num_kv_heads=self.num_kv_heads,
-        #         eps=self.q_norm.eps,
-        #     )
-        #     q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        #     attn_output = self.attn(q, k, v)
-        # else:
-        #     q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        #     # Add qk-norm
-        #     q = self.q_norm(q)
-        #     k = self.k_norm(k)
-
-        #     q, k = self.rotary_emb(positions, q, k)
-        #     attn_output = self.attn(q, k, v)
         elif ENABLE_QK_NORM_ROPE_FUSION:
             self.rotary_emb(
                 qkv,
