@@ -17,7 +17,7 @@ RUN git clone $AITER_REPO /aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
-    PREBUILD_KERNELS=2 GPU_ARCHS=$GPU_ARCH_LIST pip install -e .
+    PREBUILD_KERNELS=2 GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 RUN pip show amd-aiter || true
 
 # Install ATOM
