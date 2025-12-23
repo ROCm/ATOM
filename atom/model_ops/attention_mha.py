@@ -124,13 +124,8 @@ class Attention(nn.Module):
         v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
-
-        num_blocks, page_size = v_cache.size(0), v_cache.size(-1)
         
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            k_scale = torch.zeros([num_blocks, page_size], dtype=torch.float32, device="cuda")
-            v_scale = torch.zeros([num_blocks, page_size], dtype=torch.float32, device="cuda")
-
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
                 num_heads_q=self.num_heads,
