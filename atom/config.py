@@ -583,7 +583,7 @@ class Config:
         self.generation_config = get_generation_config(self.model)
         if self.generation_config is not None:
             if (eos_ids := getattr(self.generation_config, "eos_token_id", None)) is not None:
-                self.stop_token_ids = list(eos_ids) if isinstance(eos_ids, int) else eos_ids
+                self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
         self.quant_config = get_quant_config(self.hf_config)
         hf_config_max_position_embeddings = getattr(
             self.hf_config, "max_position_embeddings", 8192
