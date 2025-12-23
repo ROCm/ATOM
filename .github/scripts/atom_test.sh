@@ -2,7 +2,7 @@ set -euo pipefail
 
 TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
-EXTRA_ARGS=${3:-""}
+EXTRA_ARGS="${@:3}"
 
 
 if [ "$TYPE" == "launch" ]; then

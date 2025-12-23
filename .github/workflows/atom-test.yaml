@@ -142,7 +142,6 @@ jobs:
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          docker exec atom_test ls -la .github/scripts
           docker exec atom_test bash -lc "
             .github/scripts/atom_test.sh launch ${{ matrix.model_path }} ${{ matrix.extraArgs }}
           "
