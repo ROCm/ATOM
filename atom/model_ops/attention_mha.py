@@ -18,7 +18,6 @@ from atom.utils.forward_context import (
 )
 from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 
 
@@ -174,21 +173,10 @@ class Attention(nn.Module):
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
         query_group_size = num_q_heads_total // num_kv_heads
         assert num_q_heads_total % num_kv_heads == 0
-
-        max_context_length = (
-            min(attn_metadata.max_seqlen_k, self.sliding_window)
-            if self.sliding_window > 0
-            else attn_metadata.max_seqlen_k
-        )
         
-        context_partition_size = 256
-        if self.sliding_window> 0:
-            max_context_length = min(max_context_length, self.sliding_window)
-            if max_context_length <= 128:
-                context_partition_size = 128
-        
+        context_partition_size = 128
         # cdiv
-        max_context_partition_num = (max_context_length + context_partition_size - 1) // context_partition_size
+        max_context_partition_num = attn_metadata.max_context_partition_num
 
         # Output buffers (same as Triton)
         intermediate_shape = (
@@ -210,7 +198,7 @@ class Attention(nn.Module):
             device=q.device,
         )
         
-        pa_decode_gluon(
+        torch.ops.aiter.pa_decode_gluon(
             o,
             o,
             q,
@@ -222,9 +210,9 @@ class Attention(nn.Module):
             attn_metadata.block_tables,
             self.scale,
             1, # query_lenth
-            max_context_length, # max_context_len
+            attn_metadata.max_seqlen_k, # max_context_len
             context_partition_size,
-            tl.bfloat16, #compute_type
+            torch.bfloat16, #compute_type
             None,
             self.one_scale,
             self.one_scale,
@@ -234,7 +222,8 @@ class Attention(nn.Module):
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
-            one_shot=True if num_seqs >= 32 and self.sinks is not None else None,  # only enable one-shot for gpt oss
+            ps=True,  # enable persistent mode
+            page_size=attn_metadata.page_size,
         )
         
         return o

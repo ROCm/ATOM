@@ -162,6 +162,8 @@ class AttentionMetaData:
 
     block_tables_converted: Optional[torch.Tensor] = None
     kv_indices_converted: Optional[torch.Tensor] = None
+    max_context_partition_num: int = 1
+    page_size: torch.Tensor | None = None
 
     def __init__(
         self,

@@ -10,7 +10,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
 from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData, Context
-
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_page_size, get_recommended_splits
 from .backends import AttentionBackend, CommonAttentionBuilder
 
 
@@ -33,6 +33,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
+        # 获取 hf_config
+        hf_config = self.model_runner.config.hf_config
+        
+        # 获取 num_kv_heads (考虑 tensor parallel)
+        world_size = self.model_runner.world_size
+        if hf_config.num_key_value_heads >= world_size:
+            assert hf_config.num_key_value_heads % world_size == 0
+            self.num_kv_heads = hf_config.num_key_value_heads // world_size
+        else:
+            assert world_size % hf_config.num_key_value_heads == 0
+            self.num_kv_heads = 1
+
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
@@ -84,7 +96,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
-
+        max_context_partition_num = get_recommended_splits(bs, self.num_kv_heads)
+        page_size = get_recommended_page_size(attn_metadata.context_lens, max_context_partition_num, 128)
+        attn_metadata.max_context_partition_num = max_context_partition_num
+        attn_metadata.page_size = page_size
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         return attn_metadata, positions
 
