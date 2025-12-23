@@ -1,5 +1,4 @@
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
-import os
 
 import torch
 from torch import nn
@@ -43,13 +42,6 @@ from atom.models.utils import (
 from atom.utils import envs
 
 from aiter import fused_rope_rms
-# from atom.utils.distributed.utils import init_aiter_quick_all_reduce
-# from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
-# from atom.utils.forward_context import (
-#     ForwardContext,
-#     get_forward_context,
-# )
-from aiter import fused_qk_norm_rope_cache_quant_shuffle
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
@@ -475,7 +467,6 @@ class Qwen3MoeModel(nn.Module):
         config = atom_config.hf_config
         cache_config = atom_config.kv_cache_dtype
         quant_config = atom_config.quant_config
-        # config.num_hidden_layers = 3
         self.config = config
 
         if get_pp_group().is_first_rank:
