@@ -30,7 +30,7 @@ jobs:
       - name: Build Docker image
         timeout-minutes: 60
         run: |
-          docker build --network=host -t atom_release:ci --build-arg BASE_IMAGE=${{ matrix.baes_image }} GPU_ARCH=${{ matrix.gpu_arch }} -f docker/Dockerfile .
+          docker build --network=host -t atom_release:ci --build-arg BASE_IMAGE=${{ matrix.baes_image }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -f docker/Dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image
