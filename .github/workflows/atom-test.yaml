@@ -91,6 +91,8 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
           --name atom_test \
           atom_test:ci
 
