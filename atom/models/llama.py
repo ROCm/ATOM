@@ -93,7 +93,7 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul(quant_config=quant_config)
 
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
@@ -318,7 +318,7 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-@support_torch_compile
+#@support_torch_compile
 class LlamaModel(nn.Module):
     def __init__(
         self,
