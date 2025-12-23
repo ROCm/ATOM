@@ -142,13 +142,14 @@ jobs:
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
+          docker exec atom_test ls -la .github/scripts
           docker exec atom_test bash -lc "
-            .github/workflows/scripts/atom_test.sh launch ${{ matrix.model_path }} ${{ matrix.extraArgs }}
+            .github/scripts/atom_test.sh launch ${{ matrix.model_path }} ${{ matrix.extraArgs }}
           "
           echo ""
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
-            .github/workflows/scripts/accuracy_test.sh accuracy ${{ matrix.model_path }}
+            .github/scripts/accuracy_test.sh accuracy ${{ matrix.model_path }}
           "
 
       - name: Upload output
