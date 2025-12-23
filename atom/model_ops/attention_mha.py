@@ -141,7 +141,7 @@ class Attention(nn.Module):
                 k_cache=k_cache,
                 v_cache=v_cache,
                 slot_mapping=attn_metadata.slot_mapping,
-                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype="auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype,
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
