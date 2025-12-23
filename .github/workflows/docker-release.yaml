@@ -28,7 +28,7 @@ jobs:
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build Docker image
-        timeout-minutes: 240
+        timeout-minutes: 60
         run: |
           docker build --network=host -t atom_release:ci --build-arg BASE_IMAGE=${{ matrix.baes_image }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -f docker/Dockerfile .
           docker inspect atom_release:ci
