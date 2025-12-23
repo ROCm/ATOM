@@ -151,8 +151,6 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -ex
           echo "========== Cleaning up workspace =========="
-          ls -all ${{ github.workspace }}
-          docker run --rm  -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged  --name atom_test_clean rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ || true"
-          ls -all ${{ github.workspace }}
+          docker run --rm  -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged  --name atom_test_clean rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
           docker stop atom_test || true
           docker rm atom_test || true
