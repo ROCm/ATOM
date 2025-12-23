@@ -14,7 +14,7 @@ if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Waiting for ATOM server to start =========="
   max_retries=60
-  retry_interval=1
+  retry_interval=60
   for ((i=1; i<=max_retries; i++)); do
       if curl -s http://localhost:8000/v1/completions -o /dev/null; then
           echo "ATOM server is up."

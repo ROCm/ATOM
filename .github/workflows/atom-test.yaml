@@ -149,7 +149,7 @@ jobs:
           echo ""
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
-            .github/scripts/accuracy_test.sh accuracy ${{ matrix.model_path }}
+            .github/scripts/atom_test.sh accuracy ${{ matrix.model_path }}
           "
 
       - name: Upload output
