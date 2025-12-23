@@ -8,7 +8,7 @@ EXTRA_ARGS=${3:-""}
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
-  python -m atom.entrypoints.openai_server --model $MODEL_PATH $EXTRA_ARGS
+  python -m atom.entrypoints.openai_server --model $MODEL_PATH $EXTRA_ARGS &
   atom_server_pid=$!
 
   echo ""
