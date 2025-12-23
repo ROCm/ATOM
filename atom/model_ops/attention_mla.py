@@ -27,13 +27,22 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 
+# from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 from aiter import fused_qk_rope_concat_and_cache_mla
 from aiter.dist.parallel_state import get_dp_group
 
+from atom.utils import envs
 torch.set_printoptions(threshold=10_000)
 
 logger = logging.getLogger("atom")
 
+def is_rocm_aiter_fp4bmm_enabled() -> bool:
+    return envs.ATOM_USE_TRITON_MXFP4_BMM  
+
+if is_rocm_aiter_fp4bmm_enabled():
+    from atom.model_ops.utils import quark_post_load_weights
+    # from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import  batched_gemm_afp4wfp4_pre_quant
+    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
 # MLA Specific Arguments
 @dataclass
@@ -107,28 +116,37 @@ class MLAAttention(nn.Module):
         self.layer_num = layer_num
 
     def process_weights_after_loading(self):
-        kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
-        assert kv_b_proj_weight.shape == (
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-        ), (
-            f"{kv_b_proj_weight.shape=}, "
-            f"{self.kv_lora_rank=}, "
-            f"{self.num_heads=}, "
-            f"{self.qk_nope_head_dim=}, "
-            f"{self.v_head_dim=}"
-        )
-        kv_b_proj_weight = kv_b_proj_weight.view(
-            self.kv_lora_rank,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
-        W_UK, W_UV = kv_b_proj_weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
+        if (is_rocm_aiter_fp4bmm_enabled()):
+            kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj)
+            self.W_K, self.W_K_scale, W_V, self.W_V_scale = (
+                quark_post_load_weights(self, kv_b_proj_weight, "mxfp4"))
+            self.W_V = W_V.contiguous().transpose(1, 2)
 
-        if True:  # is_rocm_aiter_fp8bmm_enabled():
-            W_K = W_UK.transpose(0, 1)  # 16 512 128
+            self.W_K = self.W_K.transpose(-2, -1).contiguous()
+            self.W_K_scale = self.W_K_scale.transpose(-2, -1).contiguous()
+            self.W_V = self.W_V.transpose(-2, -1).contiguous()
+            self.W_V_scale = self.W_V_scale.transpose(-2, -1).contiguous()
+        else:  # is_rocm_aiter_fp8bmm_enabled():
+            kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
+            assert kv_b_proj_weight.shape == (
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            ), (
+                f"{kv_b_proj_weight.shape=}, "
+                f"{self.kv_lora_rank=}, "
+                f"{self.num_heads=}, "
+                f"{self.qk_nope_head_dim=}, "
+                f"{self.v_head_dim=}"
+            )
+            kv_b_proj_weight = kv_b_proj_weight.view(
+                self.kv_lora_rank,
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+            )
+            W_UK, W_UV = kv_b_proj_weight.split(
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
+            W_K = W_UK.transpose(0, 1)  # 16 512 128 
             W_V = W_UV.permute(1, 2, 0)  # 16 128 512
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
                 W_K, dtype=dtypes.fp8
@@ -137,53 +155,38 @@ class MLAAttention(nn.Module):
                 W_V, dtype=dtypes.fp8
             )
 
-            # The kernel operates on non-padded inputs. Hence, pre-compiling
-            # triton kernel to avoid runtime compilation for unseen batch sizes
-            # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
-            # On DS-R1, this step adds roughly 50s to the model loading time.
-            # max_batch_size = 1024  # [ToDo] Find the optimal upper limit
-            # pre_compilation_list = list(range(1, max_batch_size + 1))
-            # if get_tp_group().is_first_rank:
-            #     pre_compilation_list = tqdm(
-            #         pre_compilation_list,
-            #         desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
-            #         total=max_batch_size,
-            #     )
-
-            # for m in pre_compilation_list:
-            #     x = torch.empty(
-            #         (self.W_K.shape[0], m, self.W_K.shape[2]),
-            #         dtype=torch.bfloat16,
-            #         device=self.W_K.device,
-            #     )
-            #     _aiter_triton_fp8_bmm(
-            #         x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
-            #     )
-
-            #     x = torch.empty(
-            #         (self.W_V.shape[0], m, self.W_V.shape[2]),
-            #         dtype=torch.bfloat16,
-            #         device=self.W_V.device,
-            #     )
-            #     _aiter_triton_fp8_bmm(
-            #         x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
-            #     )
-        else:
-            # Convert from (L, N, V) to (N, L, V)
-            self.W_UV = W_UV.transpose(0, 1)
-            # Convert from (L, N, P) to (N, P, L)
-            self.W_UK_T = W_UK.permute(1, 2, 0)
-
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
-        x = _aiter_triton_fp8_bmm(
-            x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
-        )
-        # Convert from (B, N, V) to (B, N * V)
-        x = x.reshape(-1, self.num_heads * self.v_head_dim)
+        # Convert from (B, N, L) to (N, B, L)
+        if (is_rocm_aiter_fp4bmm_enabled()):
+            output = torch.empty(
+                x.shape[1],
+                x.shape[0],
+                self.W_V.shape[1],
+                device=x.device,
+                dtype=torch.bfloat16,
+            )
+            output = batched_gemm_a16wfp4(
+                x,
+                self.W_V,
+                self.W_V_scale,
+                y=output,
+                transpose_bm=True,
+                prequant=True,
+                y_scale=None,
+            )
+            # x = x.transpose(0, 1).flatten(1, 2)
+            output = output.view(-1, self.num_heads * self.v_head_dim)
+            x = output
+        else: 
+            x = _aiter_triton_fp8_bmm(
+                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
+            )
+            # Convert from (B, N, V) to (B, N * V)
+            x = x.reshape(-1, self.num_heads * self.v_head_dim)
         return self.o_proj(x)
 
     def _q_proj_and_k_up_proj(self, x, x_scale=None):
@@ -195,11 +198,24 @@ class MLAAttention(nn.Module):
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
-        # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
-        ql_nope = _aiter_triton_fp8_bmm(
-            q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
-        )
+
+        if is_rocm_aiter_fp4bmm_enabled():
+        # FP4 BMM: (N, B, P) x (N, P, L) -> (N, B, L)
+            ql_nope = batched_gemm_a16wfp4(
+                q_nope,
+                self.W_K,
+                self.W_K_scale,
+                y=None,
+                transpose_bm=True,
+                prequant=True,
+                y_scale=None,
+            )
+        else:
+            # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
+            # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
+            ql_nope = _aiter_triton_fp8_bmm(
+                q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
+            )
         return ql_nope, q_pe
 
     def _forward_prefill(
@@ -338,9 +354,7 @@ class MLAAttention(nn.Module):
             kv_cache = torch.tensor([])
 
         if context.is_prefill:
-            prefill_q = self.q_proj(q, x_scale=q_scale).view(
-                -1, self.num_heads, self.qk_head_dim
-            )
+            prefill_q = self.q_proj(q, x_scale=q_scale).view(-1, self.num_heads, self.qk_head_dim)
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 

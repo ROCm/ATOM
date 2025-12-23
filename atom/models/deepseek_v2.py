@@ -344,13 +344,14 @@ def sparse_attn_indexer(
             num_decode_tokens:num_tokens, :topk_tokens
         ]
         top_k_per_row_prefill(
-            logits,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
+            logits=logits,
+            rowStarts=cu_seqlen_ks,
+            rowEnds=cu_seqlen_ke,
+            indices=topk_indices,
+            values=None,
+            numRows=num_rows,
+            stride0=logits.stride(0),
+            stride1=logits.stride(1),
         )
     else:
         decode_metadata = attn_metadata

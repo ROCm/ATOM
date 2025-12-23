@@ -54,8 +54,6 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
-# use AITER env var for simplicity
-ENABLE_QUICK_AR = os.environ.get("AITER_QUICK_REDUCE_QUANTIZATION", None) is not None
 
 class RotaryEmbeddingQKNormFused(nn.Module):
     def __init__(
@@ -435,13 +433,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0,
-            use_qr_when_possible=ENABLE_QUICK_AR,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
-            use_qr_when_possible=ENABLE_QUICK_AR,
         )
 
     def forward(
@@ -507,7 +503,6 @@ class Qwen3MoeModel(nn.Module):
                 config.hidden_size,
                 eps=config.rms_norm_eps,
                 fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
-                use_qr_when_possible=ENABLE_QUICK_AR,
             )
         else:
             self.norm = PPMissingLayer()

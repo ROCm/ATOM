@@ -231,6 +231,8 @@ class ModelRunner:
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
+        if (self.hf_text_config.model_type in ["llama"] and self.hf_text_config.torch_dtype in [torch.bfloat16, torch.float16]):
+            os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
@@ -306,6 +308,7 @@ class ModelRunner:
         self.use_kv_indptr = False
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        logger.info(f"Model load done: {config.model}")
         if isinstance(self.model, DeepseekV2ForCausalLM):
             self.use_kv_indptr = True
         if hasattr(self, "drafter"):
@@ -516,7 +519,7 @@ class ModelRunner:
         config = self.config
         hidden_size = config.hf_config.hidden_size
         hidden_type = config.hf_config.torch_dtype
-        self.max_bs = min(self.config.max_num_seqs, 512)
+        self.max_bs = self.config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         i32_kwargs = {"dtype": torch.int32, "device": self.device}

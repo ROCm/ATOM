@@ -9,15 +9,25 @@ jobs:
   docker-release:
     name: Nightly Docker Release
     runs-on: atom-mi355-1gpu
+    strategy:
+      fail-fast: false
+      matrix:
+        baes_image:
+          - "rocm/pytorch:latest"
+          - "rocm/pytorch-private:ROCm_7.2_atom_1216"
 
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
 
+      - name: Login to Docker Hub
+        run: |
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Build Docker image
         timeout-minutes: 60
         run: |
-          docker build --network=host -t atom_release:ci -f docker/Dockerfile .
+          docker build --network=host -t atom_release:ci --build-arg BASE_IMAGE=${{ matrix.baes_image }} -f docker/Dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image
@@ -70,12 +80,17 @@ jobs:
       - name: Push Docker image
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
-          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
-          TAG=nightly-$(date +%Y%m%d%H%M)
+          if [[ ${{ matrix.baes_image }} == *ROCm_7.2* ]]; then
+            TAG=nightly_rocm_7.2_preview_$(date +%Y%m%d%H%M)
+            docker tag atom_release:ci rocm/atom:rocm_7.2_preview_latest
+            docker push rocm/atom:rocm_7.2_preview_latest
+          else
+            TAG=nightly-$(date +%Y%m%d%H%M)
+            docker tag atom_release:ci rocm/atom:latest
+            docker push rocm/atom:latest
+          fi
           docker tag atom_release:ci rocm/atom:${TAG}
-          docker tag atom_release:ci rocm/atom:latest
           docker push rocm/atom:${TAG}
-          docker push rocm/atom:latest
 
       - name: Clean Up
         if: always()

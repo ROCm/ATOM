@@ -3,7 +3,7 @@ ARG BASE_IMAGE="rocm/pytorch:latest"
 
 FROM $BASE_IMAGE
 
-ARG GPU_ARCH=gfx950
+ARG GPU_ARCH="gfx942;gfx950"
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
@@ -17,7 +17,7 @@ RUN git clone $AITER_REPO /aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
-    PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+    PREBUILD_KERNELS=2 GPU_ARCHS=$GPU_ARCH_LIST pip install -e .
 RUN pip show amd-aiter || true
 
 # Install ATOM
