@@ -26,7 +26,7 @@ jobs:
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
     env:
-      ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+      ATOM_BASE_IMAGE: rocm/pytorch:latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -60,6 +60,7 @@ jobs:
             git checkout ${{ env.GITHUB_COMMIT_SHA }} && \
             pip install .
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          RUN echo "=== Other dependencies versions ===" && pip list || true
           EOF
 
       - name: Show Dockerfile
