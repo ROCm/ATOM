@@ -96,7 +96,7 @@ class Attention(nn.Module):
         
         attn_impl = self.dispatch_backend(fwd_args)
 
-        o = attn_impl(q.contiguous(), k.contiguous(), v.contiguous(), k_cache, v_cache, k_scale, v_scale, fwd_args)
+        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args)
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
@@ -124,10 +124,12 @@ class Attention(nn.Module):
         v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
+
+        num_blocks, page_size = v_cache.size(0), v_cache.size(-1)
         
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            k_scale.fill_(self.one_scale)
-            v_scale.fill_(self.one_scale)
+            k_scale = torch.zeros([num_blocks, page_size], dtype=torch.float32, device="cuda")
+            v_scale = torch.zeros([num_blocks, page_size], dtype=torch.float32, device="cuda")
 
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
@@ -145,8 +147,8 @@ class Attention(nn.Module):
                 v_cache=v_cache,
                 slot_mapping=attn_metadata.slot_mapping,
                 kv_cache_dtype=self.kv_cache_dtype,
-                k_scale=self.one_scale,
-                v_scale=self.one_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
 
             qkv = qkv.view(qkv.shape[0], 
