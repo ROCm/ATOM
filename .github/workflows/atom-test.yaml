@@ -14,7 +14,7 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu
+    runs-on: atom-mi355-8gpu.test
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +33,8 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
+        with:
+          clean: flase
 
       - name: Pull ATOM base image
         run: |
@@ -146,5 +148,6 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
+          docker exec atom_test rm -rf /ATOM /aiter-test || true
           docker stop atom_test || true
           docker rm atom_test || true
