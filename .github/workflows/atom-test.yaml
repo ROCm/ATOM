@@ -60,6 +60,7 @@ jobs:
             git checkout ${{ env.GITHUB_COMMIT_SHA }} && \
             pip install .
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          RUN echo "=== Other dependencies versions ===" && pip list || true
           EOF
 
       - name: Show Dockerfile
