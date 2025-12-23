@@ -84,13 +84,13 @@ jobs:
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
           if [[ ${{ matrix.baes_image }} == *ROCm_7.2* ]]; then
-            TAG=nightly_rocm_7.2_preview_$(date +%Y%m%d%H%M)
-            docker tag atom_release:ci rocm/atom:rocm_7.2_preview_latest
-            docker push rocm/atom:rocm_7.2_preview_latest
+            TAG=nightly_rocm_7.2_preview_${{ matrix.gpu_arch }}_$(date +%Y%m%d%H%M)
+            docker tag atom_release:ci rocm/atom:rocm_7.2_preview_${{ matrix.gpu_arch }}_latest
+            docker push rocm/atom:rocm_7.2_preview_${{ matrix.gpu_arch }}_latest
           else
-            TAG=nightly-$(date +%Y%m%d%H%M)
-            docker tag atom_release:ci rocm/atom:latest
-            docker push rocm/atom:latest
+            TAG=nightly_${{ matrix.gpu_arch }}_$(date +%Y%m%d%H%M)
+            docker tag atom_release:ci rocm/atom:${{ matrix.gpu_arch }}_latest
+            docker push rocm/atom:${{ matrix.gpu_arch }}_latest
           fi
           docker tag atom_release:ci rocm/atom:${TAG}
           docker push rocm/atom:${TAG}
