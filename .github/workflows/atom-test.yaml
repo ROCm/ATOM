@@ -33,8 +33,6 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
-        with:
-          clean: flase
 
       - name: Pull ATOM base image
         run: |
@@ -86,6 +84,7 @@ jobs:
           echo "Starting container: atom_test:ci"
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          -w /workspace \
           --ipc=host --group-add video \
           --shm-size=16G \
           --privileged \
@@ -148,6 +147,12 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          docker exec atom_test rm -rf /ATOM /aiter-test || true
+          # TODO: run another container to clean up the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
+          # We should use non-root user to run the test to avoid this issue.
+          set -ex
+          echo "========== Cleaning up workspace =========="
+          ls -all ${{ github.workspace }}
+          docker run --rm  -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged  --name atom_test_clean rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ || true"
+          ls -all ${{ github.workspace }}
           docker stop atom_test || true
           docker rm atom_test || true
