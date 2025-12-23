@@ -15,6 +15,9 @@ jobs:
         baes_image:
           - "rocm/pytorch:latest"
           - "rocm/pytorch-private:ROCm_7.2_atom_1216"
+        gpu_arch:
+          - "gfx942"
+          - "gfx950"
 
     steps:
       - name: Checkout ATOM repo
@@ -27,7 +30,7 @@ jobs:
       - name: Build Docker image
         timeout-minutes: 60
         run: |
-          docker build --network=host -t atom_release:ci --build-arg BASE_IMAGE=${{ matrix.baes_image }} -f docker/Dockerfile .
+          docker build --network=host -t atom_release:ci --build-arg BASE_IMAGE=${{ matrix.baes_image }} GPU_ARCH=${{ matrix.gpu_arch }} -f docker/Dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image

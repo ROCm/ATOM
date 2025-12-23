@@ -1,5 +1,6 @@
 # Default base images
 ARG BASE_IMAGE="rocm/pytorch:latest"
+ARG GPU_ARCH="gfx942;gfx950"
 
 FROM $BASE_IMAGE
 
