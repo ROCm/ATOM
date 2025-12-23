@@ -101,7 +101,7 @@ jobs:
         run: |
           docker exec atom_test df -h /dev/shm
 
-      - name: Run ATOM tests
+      - name: Run ATOM simple inference
         timeout-minutes: 60
         run: |
           # Run the inference and capture output
@@ -135,19 +135,18 @@ jobs:
             echo "Success: Output matches golden outputs."
           fi
       
-      - name: Accuracy Test
+      - name: Run ATOM accuracy test
         run: |
           set -euo pipefail
           echo ""
-          echo "========== Installing lm-eval =========="
-          docker exec atom_test bash -lc "pip install lm-eval[api]"
+          echo "========== Launching ATOM server =========="
+          docker exec atom_test bash -lc "
+            .github/workflows/scripts/atom_test.sh launch ${{ matrix.model_path }} ${{ matrix.extraArgs }}
+          "
           echo ""
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
-            lm_eval --model local-completions \
-              --model_args model=${{ matrix.model_path }},base_url=http://localhost:8000/v1/completions,num_concurrent=8,max_retries=3,tokenized_requests=False \
-              --tasks gsm8k \
-              --num_fewshot 3
+            .github/workflows/scripts/accuracy_test.sh accuracy ${{ matrix.model_path }}
           "
 
       - name: Upload output
