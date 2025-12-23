@@ -19,8 +19,12 @@ if [ -f "$LOG_FILE" ]; then
     rm "$LOG_FILE"
 fi
 
-SCRIPT_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
-RUN_PAYH="$SCRIPT_DIR/../../atom/benchmarks/benchmark_serving.py"
+# health check
+curl -sf "http://localhost:$PORT/health" > /dev/null || {
+    echo "ERROR: Server not running on port $PORT at vllm backend"
+    exit 1
+}
+
 for ISL in "${ISL_LIST[@]}"; do
 
     for CONC in "${CONC_LIST[@]}"; do
@@ -28,7 +32,7 @@ for ISL in "${ISL_LIST[@]}"; do
     echo "Start Test ISL=$ISL, OSL=$OSL, CONC=$CONC" | tee -a "$LOG_FILE"
     echo "=========================================" | tee -a "$LOG_FILE"
         
-        python $RUN_PAYH \
+        python -m atom.benchmarks.benchmark_serving \
             --model="$MODEL_PATH" \
             --backend=vllm \
             --base-url="http://localhost:$PORT" \
