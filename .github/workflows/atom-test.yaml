@@ -23,7 +23,7 @@ jobs:
             model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
             extraArgs: ""
           - model_name: "DeepSeek-R1-0528"
-            model_path: "models/deepseek-ai/DeepSeek-R1-0528"
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:latest
@@ -84,7 +84,7 @@ jobs:
           echo "Starting container: atom_test:ci"
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-          -v ~/models:/models \
+          -v /models:/models \
           -w /workspace \
           --ipc=host --group-add video \
           --shm-size=16G \
@@ -106,7 +106,8 @@ jobs:
 
       - name: Check models directory
         run: |
-          docker exec atom_test ls -all /models
+          docker exec atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
+          docker exec atom_test bash -lc "ls -all /models/${{ matrix.model_path }}"
 
       - name: Run ATOM tests
         timeout-minutes: 60
@@ -119,7 +120,7 @@ jobs:
           docker exec atom_test bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
-              --model ${{ matrix.model_path }} \
+              --model /models/${{ matrix.model_path }} \
               ${{ matrix.extraArgs }} \
               --temperature 0 \
             | grep -E '^Prompt: |^Completion:'
