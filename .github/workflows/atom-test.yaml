@@ -116,7 +116,6 @@ jobs:
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
             docker exec atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
-            docker exec atom_test bash -lc "ls -all /models/${{ matrix.model_path }}"
           else
             echo "/models directory not found, skipping model download"
           fi
