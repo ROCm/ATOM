@@ -17,7 +17,7 @@ CONC_LOOP=(1 8 64 128)
 OSL=1024
 ISL_OSL_CONC=(1023:8192:64)
 PORT=8888
-LOG_FILE="gptoss"
+LOG_FILE="llama"
 ########################## CONFIGS ##########################
 
 source $BENCHMARK_SCRIPT
