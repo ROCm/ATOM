@@ -62,12 +62,12 @@ def gemm_a4w4_quant(
     output_size: int,
 ) -> torch.Tensor:
 
-    logger.info(f"loc1, x_shape = {x.shape}, dtype = {x.dtype}")
-    logger.info(f"weight_scale, shape = {weight_scale.shape}, dtype = {weight_scale.dtype}")
-    if input_scale is not None:
-        logger.info(f"input_scale, shape = {input_scale.shape}, dtype = {input_scale.dtype}")
-    else:
-        logger.info(f"input_scale_is_none======================")
+    # logger.info(f"loc1, x_shape = {x.shape}, dtype = {x.dtype}")
+    # logger.info(f"weight_scale, shape = {weight_scale.shape}, dtype = {weight_scale.dtype}")
+    # if input_scale is not None:
+    #     logger.info(f"input_scale, shape = {input_scale.shape}, dtype = {input_scale.dtype}")
+    # else:
+    #     logger.info(f"input_scale_is_none======================")
 
 
     if input_scale is None:
@@ -80,8 +80,8 @@ def gemm_a4w4_quant(
         )
     else:
         x_scale = input_scale.view(torch.float8_e8m0fnu)
-    logger.info(f"loc2, x_shape = {x.shape}, dtype = {x.dtype}")
-    logger.info(f"x_scale, shape = {x_scale.shape}, dtype = {x_scale.dtype}")
+    # logger.info(f"loc2, x_shape = {x.shape}, dtype = {x.dtype}")
+    # logger.info(f"x_scale, shape = {x_scale.shape}, dtype = {x_scale.dtype}")
 
     m = x.view(-1, x.size(-1)).shape[0]
     y = torch.empty(
