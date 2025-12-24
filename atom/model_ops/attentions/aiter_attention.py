@@ -105,7 +105,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
-        attn_matadata = AttentionMetaData(
+        attn_metadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
@@ -118,8 +118,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 else None
             ),
         )
+        max_context_partition_num = get_recommended_splits(bs, self.num_kv_heads)
+        page_size = get_recommended_page_size(attn_metadata.context_lens, max_context_partition_num, 128)
+        attn_metadata.max_context_partition_num = max_context_partition_num
+        attn_metadata.page_size = page_size
+
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )
-        return attn_matadata, context
+        return attn_metadata, context
