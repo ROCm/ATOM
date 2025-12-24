@@ -261,7 +261,11 @@ class ModelRunner:
         self.profiler_dir = None
         if config.torch_profiler_dir is not None:
             # Create rank-specific profiler directory
-            self.profiler_dir = os.path.join(config.torch_profiler_dir, f"rank_{rank}")
+            if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
+                rank_name = f"dp{dp_rank_local}_tp{rank}"
+            else:
+                rank_name = f"rank_{rank}"
+            self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self.graph_bs = [0]  # for eager fallback
@@ -271,7 +275,7 @@ class ModelRunner:
         os.environ["MASTER_PORT"] = str(self.config.port)
         distributed_init_method = get_distributed_init_method(
             config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_master_port,
+            config.parallel_config.data_parallel_base_port,
         )
         init_dist_env(
             config.tensor_parallel_size,
@@ -437,8 +441,6 @@ class ModelRunner:
         attn_metadata, positions = self.attn_metadata_builder.build(dummy_batch, bs)
         context_bs = dummy_batch.total_seqs_num_decode
 
-        num_input_tokens, num_tokens_across_dp = self._preprocess(dummy_batch)
-
         context = Context(
             positions=positions,
             is_prefill=False,
@@ -451,19 +453,54 @@ class ModelRunner:
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
-            num_tokens=actual_num_tokens,  # original value, not with padding
-            num_tokens_across_dp=num_tokens_across_dp,
         )
 
-        self.tokenID_processor.input_ids.np[:num_input_tokens] = [0] * num_input_tokens
-        self.tokenID_processor.input_ids.copy_to_gpu(num_input_tokens)
-        input_ids = self.tokenID_processor.input_ids.gpu[:num_input_tokens]
+        self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
+        self.tokenID_processor.input_ids.copy_to_gpu(actual_num_tokens)
+        input_ids = self.tokenID_processor.input_ids.gpu[:actual_num_tokens]
 
         logits = self.run_model(input_ids)
 
         reset_forward_context()
         logger.debug(
-            f"{self.label}: dummy batch executed with {num_input_tokens} tokens"
+            f"{self.label}: dummy batch executed with {actual_num_tokens} tokens"
+        )
+        return True
+
+    def dummy_prefill_execution(self, num_tokens: int):
+        """
+        Execute dummy prefill batch for DP synchronization.
+        """
+        if num_tokens <= 0:
+            num_tokens = 1
+        
+        seq = Sequence([0] * num_tokens, block_size=self.block_size)
+        seqs = {seq.id: seq}
+        
+        dummy_batch = ScheduledBatch(
+            seqs=seqs,
+            num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
+            total_tokens_num=num_tokens,
+            total_tokens_num_prefill=num_tokens,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+        )
+        
+        self.prepare_intputs(dummy_batch)
+        
+        self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
+        self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
+        input_ids = self.tokenID_processor.input_ids.gpu[:num_tokens]
+        
+        with torch.no_grad():
+            self.run_model(input_ids)
+        
+        torch.cuda.synchronize()
+        
+        reset_forward_context()
+        
+        logger.info(
+            f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens"
         )
         return True
 
@@ -782,9 +819,10 @@ class ModelRunner:
     def prepare_intputs(self, batch: ScheduledBatch):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
-        num_scheduled_tokens = batch.num_scheduled_tokens
-        cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
+        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
+        context_bs = (
+            batch.total_seqs_num_prefill if is_prefill else batch.total_seqs_num_decode
+        )
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
             bs = (
@@ -793,16 +831,6 @@ class ModelRunner:
                 else next((x for x in self.graph_bs if x >= scheduled_bs), scheduled_bs)
                 # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
             )
-            assert (
-                bs >= scheduled_bs
-            ), f"current decode {scheduled_bs=} > max graph_bs{bs}"
-            self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
-                self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
-            )
-        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
-        context_bs = (
-            batch.total_seqs_num_prefill if is_prefill else batch.total_seqs_num_decode
-        )
 
         context = Context(
             positions=positions,
@@ -810,16 +838,11 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=bs,
         )
-        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
-        actual_num_tokens = batch.total_tokens_num
         set_forward_context(
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
-            num_tokens=actual_num_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
         )
-        return num_input_tokens
 
     def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
         bs = batch.total_seqs_num
@@ -919,15 +942,10 @@ class ModelRunner:
                 attn_metadata, context = (
                     self.attn_metadata_builder.build_for_cudagraph_capture(bs)
                 )
-                num_tokens = bs
-                num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
-                num_tokens += num_pad
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
-                    num_tokens=num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
                 )
 
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
