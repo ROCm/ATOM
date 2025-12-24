@@ -137,7 +137,7 @@ jobs:
           docker exec atom_test bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
-              --model $model_path \
+              --model \"$model_path\" \
               ${{ matrix.extraArgs }} \
               --temperature 0 \
             | grep -E '^Prompt: |^Completion:'
