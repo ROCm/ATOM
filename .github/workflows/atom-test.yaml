@@ -14,7 +14,7 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu.test
+    runs-on: atom-mi355-8gpu.predownload
     strategy:
       fail-fast: false
       matrix:
