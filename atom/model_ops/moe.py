@@ -31,11 +31,6 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
-from atom.model_ops.fused_moe_triton import (
-    _swizzle_mxfp4,
-    has_triton_kernels,
-    triton_kernel_moe_forward,
-)
 from atom.model_ops.utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
@@ -395,6 +390,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         self.use_triton = get_gfx().startswith("gfx94")
         if self.use_triton:
+            from atom.model_ops.fused_moe_triton import has_triton_kernels
+
             assert has_triton_kernels(), "triton_kernels is not installed"
 
     def create_weights(
@@ -508,13 +505,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
         if self.use_triton:
+            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-                layer.w13_weight.view(torch.uint8), layer.w13_weight_scale.view(torch.uint8)
+                layer.w13_weight.view(torch.uint8),
+                layer.w13_weight_scale,
             )
             w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-                layer.w2_weight.view(torch.uint8), layer.w2_weight_scale.view(torch.uint8)
+                layer.w2_weight.view(torch.uint8),
+                layer.w2_weight_scale,
             )
 
             self.w13_precision_config = PrecisionConfig(
@@ -616,6 +616,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
         if self.use_triton:
+            from atom.model_ops.fused_moe_triton import triton_kernel_moe_forward
+
             return triton_kernel_moe_forward(
                 x,
                 layer.w13_weight,
