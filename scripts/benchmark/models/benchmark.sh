@@ -30,8 +30,8 @@ for ISL in "${ISL_LOOP[@]}"; do
             --dataset-name=random \
             --random-input-len="$ISL" \
             --random-output-len="$OSL" \
-            --random-range-ratio 1 \
-            --num-prompts=$(( CONC * 2)) \
+            --random-range-ratio 0.8 \
+            --num-prompts=$(( CONC * 10)) \
             --max-concurrency="$CONC" \
             --request-rate=inf \
             --ignore-eos \
