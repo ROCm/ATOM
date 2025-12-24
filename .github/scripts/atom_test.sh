@@ -36,8 +36,14 @@ echo "========== Installing lm-eval =========="
 pip install lm-eval[api]
 echo ""
 echo "========== Running accuracy test =========="
+if [ "$MODEL_PATH" == "meta-llama/Meta-Llama-3-8B-Instruct" ]; then
+   APPLY_CHAT_TEMPLATE="--apply_chat_template"
+else
+   APPLY_CHAT_TEMPLATE=""
+fi
 lm_eval --model local-completions \
-        --model_args model=$MODEL_PATH,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+        --model_args model=$MODEL_PATH,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False $APPLY_CHAT_TEMPLATE \
         --tasks gsm8k \
+        $APPLY_CHAT_TEMPLATE \
         --num_fewshot 3
 fi
