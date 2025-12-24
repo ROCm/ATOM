@@ -26,7 +26,7 @@ RUN cd /tmp && rm -rf aiter aiter-test && \
     pip uninstall -y amd-aiter && \
     pip install --upgrade pip setuptools wheel && \
     pip install ninja && pip install pybind11==3.0.1 && \
-    pip install psutil && PREBUILD_KERNELS=2 GPU_ARCHS="gfx950" python3 setup.py instal
+    pip install psutil && PREBUILD_KERNELS=2 GPU_ARCHS="gfx950" python3 setup.py install
 RUN pip show amd-aiter || true
 
 # Install ATOM
