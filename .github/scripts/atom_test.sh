@@ -31,20 +31,25 @@ if [ "$TYPE" == "launch" ]; then
 fi
 
 if [ "$TYPE" == "accuracy" ]; then
-echo ""
-echo "========== Installing lm-eval =========="
-pip install lm-eval[api]
-echo ""
-echo "========== Running accuracy test =========="
-if [ "$MODEL_PATH" == "meta-llama/Meta-Llama-3-8B-Instruct" ]; then
-  lm_eval --model local-completions \
-          --model_args model=$MODEL_PATH,base_url=http://localhost:8000/v1/chat/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
-          --tasks gsm8k \
-          --apply_chat_template \
-          --num_fewshot 8
-else
-  lm_eval --model local-completions \
-          --model_args model=$MODEL_PATH,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False $APPLY_CHAT_TEMPLATE \
-          --tasks gsm8k \
-          --num_fewshot 3
+  echo ""
+  echo "========== Installing lm-eval =========="
+  pip install lm-eval[api]
+
+  echo ""
+  echo "========== Running accuracy test =========="
+
+  if [[ "$MODEL_PATH" == *Meta-Llama-3-8B-Instruct* ]]; then
+    echo "Running accuracy test for Meta-Llama-3-8B-Instruct"
+    lm_eval --model local-completions \
+            --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+            --tasks gsm8k \
+            --apply_chat_template \
+            --num_fewshot 8
+  else
+    echo "Running accuracy test for general models"
+    lm_eval --model local-completions \
+            --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+            --tasks gsm8k \
+            --num_fewshot 3
+  fi
 fi

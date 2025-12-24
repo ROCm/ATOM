@@ -171,13 +171,18 @@ jobs:
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
+          if [ -d "/models" ]; then
+            model_path="/models/${{ matrix.model_path }}"
+          else
+            model_path="${{ matrix.model_path }}"
+          fi
           docker exec atom_test bash -lc "
-            .github/scripts/atom_test.sh launch ${{ matrix.model_path }} ${{ matrix.extraArgs }}
+            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
           "
           echo ""
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
-            .github/scripts/atom_test.sh accuracy ${{ matrix.model_path }}
+            .github/scripts/atom_test.sh accuracy $model_path 
           "
 
       - name: Upload output
