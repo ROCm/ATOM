@@ -126,7 +126,7 @@ jobs:
           fi
 
       - name: Run ATOM simple inference
-        timeout-minutes: 60
+        timeout-minutes: 30
         run: |
           # Run the inference and capture output
           set -euo pipefail
@@ -153,6 +153,7 @@ jobs:
           cat atom_test_output.txt
 
       - name: Compare output with golden outputs
+        timeout-minutes: 30
         if: ${{ matrix.model_name == 'Meta-Llama-3-8B-Instruct' }}
         run: |
           echo "========== Comparing output with golden outputs =========="
