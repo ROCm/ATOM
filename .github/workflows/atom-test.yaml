@@ -14,7 +14,7 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu
+    runs-on: atom-mi355-8gpu.predownload
     strategy:
       fail-fast: false
       matrix:
@@ -26,7 +26,7 @@ jobs:
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
     env:
-      ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+      ATOM_BASE_IMAGE: rocm/pytorch:latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -60,6 +60,7 @@ jobs:
             git checkout ${{ env.GITHUB_COMMIT_SHA }} && \
             pip install .
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          RUN echo "=== Other dependencies versions ===" && pip list || true
           EOF
 
       - name: Show Dockerfile
@@ -80,9 +81,18 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          if [ -d "/models" ]; then
+            MODEL_MOUNT="-v /models:/models"
+          else
+            echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
+            MODEL_MOUNT=""
+          fi
+
           echo "Starting container: atom_test:ci"
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          $MODEL_MOUNT \
+          -w /workspace \
           --ipc=host --group-add video \
           --shm-size=16G \
           --privileged \
@@ -103,6 +113,18 @@ jobs:
         run: |
           docker exec atom_test df -h /dev/shm
 
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
+            if ! docker exec atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
       - name: Run ATOM simple inference
         timeout-minutes: 60
         run: |
@@ -111,10 +133,16 @@ jobs:
           echo ""
           echo "========== Running test =========="
 
+          if [ -d "/models" ]; then
+            model_path="/models/${{ matrix.model_path }}"
+          else
+            model_path="${{ matrix.model_path }}"
+          fi
+          echo "Model path: $model_path"
           docker exec atom_test bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
-              --model ${{ matrix.model_path }} \
+              --model \"$model_path\" \
               ${{ matrix.extraArgs }} \
               --temperature 0 \
             | grep -E '^Prompt: |^Completion:'
@@ -161,5 +189,10 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
+          # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
+          # We should use non-root user to run the test to avoid this issue.
+          set -x
+          echo "========== Cleaning up workspace =========="
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
           docker stop atom_test || true
           docker rm atom_test || true
