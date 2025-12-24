@@ -223,7 +223,7 @@ def main():
         print(f"file not exist - {log_file_path}")
         sys.exit(1)
 
-    output_file = "benchmark.xlsx"
+    output_file = args.input_file + "_benchmark.xlsx"
     
     try:
         # Parse log file
