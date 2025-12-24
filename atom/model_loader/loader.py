@@ -126,9 +126,9 @@ def load_model(
                     # )
                     if "output_scale" not in param_name:
                         param = model.get_parameter(param_name)
-                        weight_loader = getattr(param, "weight_loadter")
+                        weight_loader = getattr(param, "weight_loader")
                         futures.append(
-                            executor.submit(weight_loader, param, weight_tensor, shared_id)
+                            executor.submit(weight_loader, param, weight_tensor, shard_id)
                         )
                     break
             else:
