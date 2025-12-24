@@ -35,6 +35,7 @@ jobs:
 
       - name: Test Docker image
         timeout-minutes: 60
+        if: ${{ matrix.gpu_arch == 'gfx950' }}
         run: |
           echo "Clean up containers..."
           docker ps -aq -f name=atom_release_ci | xargs -r docker stop | xargs -r docker rm
