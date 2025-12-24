@@ -210,7 +210,7 @@ class Attention(nn.Module):
             attn_metadata.block_tables,
             self.scale,
             1, # query_lenth
-            attn_metadata.max_seqlen_k, # max_context_len
+            max_context_partition_num,
             context_partition_size,
             torch.bfloat16, #compute_type
             None,
