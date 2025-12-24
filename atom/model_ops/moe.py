@@ -507,7 +507,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
-        if layer.activation == ActivationType.Swiglu and layer.w13_bias is not None:
+        if self.use_triton:
+            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+                layer.w13_weight.view(torch.uint8), layer.w13_weight_scale.view(torch.uint8)
+            )
+            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+                layer.w2_weight.view(torch.uint8), layer.w2_weight_scale.view(torch.uint8)
+            )
+
+            self.w13_precision_config = PrecisionConfig(
+                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            )
+            self.w2_precision_config = PrecisionConfig(
+                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            )
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            layer.w13_weight = w13_weight
+            layer.w2_weight = w2_weight
+            layer.w13_weight_scale = None
+            layer.w2_weight_scale = None
+            return
+        elif layer.activation == ActivationType.Swiglu and layer.w13_bias is not None:
             e, n, k = layer.w13_weight.shape
             layer.w13_weight.view(torch.uint8).copy_(
                 layer.w13_weight.data.view(torch.uint8)
@@ -552,26 +577,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
             return
-        elif self.use_triton:
-            from triton_kernels.matmul import FlexCtx, PrecisionConfig
-
-            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-                layer.w13_weight, layer.w13_weight_scale
-            )
-            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-                layer.w2_weight, layer.w2_weight_scale
-            )
-
-            self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
-            )
-            self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-            )
-            shuffled_w13 = w13_weight
-            shuffled_w2 = w2_weight
-            shuffled_w13_scale = w13_scale
-            shuffled_w2_scale = w2_scale
         else:
             shuffled_w13, shuffled_w2 = shuffle_weights(
                 layer.w13_weight, layer.w2_weight
@@ -623,6 +628,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_precision_config=self.w2_precision_config,
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
+                expert_map=expert_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
             )
 
         topk_weights, topk_ids = FusedMoE.select_experts(
