@@ -96,7 +96,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
-        max_context_partition_num = get_recommended_splits(bs, self.num_kv_heads)
+        max_context_partition_num = get_recommended_splits(scheduled_bs, self.num_kv_heads)
         page_size = get_recommended_page_size(attn_metadata.context_lens, max_context_partition_num, 128)
         attn_metadata.max_context_partition_num = max_context_partition_num
         attn_metadata.page_size = page_size
