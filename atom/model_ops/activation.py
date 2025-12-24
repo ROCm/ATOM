@@ -58,10 +58,10 @@ class SiluAndMul(nn.Module):
                 x, x_scale, dtype_quant=rocm_aiter_fp8_dtype
             )
             return x, x_scale
-        # elif x_scale is None and self.quant_type.value == QuantType.per_1x32.value:
-        #     (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
-            # x = x.view(torch.float4_e2m1fn_x2)
-            # x_scale = x_scale.view(torch.float8_e8m0fnu)
+        elif x_scale is None and self.quant_type.value == QuantType.per_1x32.value:
+            (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
+            x = x.view(torch.float4_e2m1fn_x2)
+            x_scale = x_scale.view(torch.float8_e8m0fnu)
             # logger.info(f"x_shape = {x.shape}, dtype = {x.dtype}")
             # logger.info(f"silu, x_scale = {x_scale.shape}, dtype = {x_scale.dtype}")
             return x, x_scale
