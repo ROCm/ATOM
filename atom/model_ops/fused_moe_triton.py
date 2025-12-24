@@ -69,7 +69,7 @@ def _swizzle_mxfp4(quant_tensor, scale):
         wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
     )
     scale = convert_layout(
-        wrap_torch_tensor(scale, dtype=FP4), scale_layout, **scale_layout_opts
+        wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
     )
     return quant_tensor, InFlexData(), scale
 
