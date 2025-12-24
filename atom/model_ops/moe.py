@@ -31,6 +31,11 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
+from atom.model_ops.fused_moe_triton import (
+    _swizzle_mxfp4,
+    has_triton_kernels,
+    triton_kernel_moe_forward,
+)
 from atom.model_ops.utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
@@ -38,6 +43,7 @@ from atom.model_ops.utils import (
 )
 from atom.utils.custom_register import direct_register_custom_op
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.jit.utils.chip_info import get_gfx
 from atom.utils import envs
 
 
@@ -387,6 +393,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
+        self.use_triton = get_gfx().startswith("gfx94")
+        if self.use_triton:
+            assert has_triton_kernels(), "triton_kernels is not installed"
 
     def create_weights(
         self,
@@ -543,6 +552,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
             return
+        elif self.use_triton:
+            from triton_kernels.matmul import FlexCtx, PrecisionConfig
+
+            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+                layer.w13_weight, layer.w13_weight_scale
+            )
+            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+                layer.w2_weight, layer.w2_weight_scale
+            )
+
+            self.w13_precision_config = PrecisionConfig(
+                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            )
+            self.w2_precision_config = PrecisionConfig(
+                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            )
+            shuffled_w13 = w13_weight
+            shuffled_w2 = w2_weight
+            shuffled_w13_scale = w13_scale
+            shuffled_w2_scale = w2_scale
         else:
             shuffled_w13, shuffled_w2 = shuffle_weights(
                 layer.w13_weight, layer.w2_weight
@@ -581,6 +610,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        if self.use_triton:
+            return triton_kernel_moe_forward(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                activation=activation,
+                w13_precision_config=self.w13_precision_config,
+                w2_precision_config=self.w2_precision_config,
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+            )
+
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
