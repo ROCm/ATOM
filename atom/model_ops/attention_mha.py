@@ -117,12 +117,12 @@ class Attention(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
         
-        # TODO: if kv_scale has value, do not use one scale here.
-        # if k_scale is None and v_scale is None:
-        #    k_scale = v_scale = self.one_scale
-        k_scale = v_scale = self.one_scale
+        use_triton_attn = (
+            self.sliding_window != -1 or self.head_dim != 128
+        )
+        self.use_triton_attn = use_triton_attn
 
-        if self.rotary_emb:
+        if use_triton_attn:
             if flash_layout:
                 k_cache = k_cache.view(
                     k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
@@ -130,7 +130,10 @@ class Attention(nn.Module):
                 v_cache = v_cache.view(
                     v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
                 )
-            
+
+            # TODO: if kv_scale has value, do not use one scale here.
+            k_scale = v_scale = self.one_scale
+
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
@@ -152,20 +155,32 @@ class Attention(nn.Module):
                 output_zeros=False,
             )
         else:
-            aiter.reshape_and_cache_flash(
-                k,
-                v,
-                k_cache,
-                v_cache,
-                attn_metadata.slot_mapping,
-                (
-                    self.kv_cache_dtype
-                    if self.kv_cache_dtype.startswith("fp8")
-                    else "auto"
-                ),
-                k_scale,
-                v_scale,
-            )
+            # for asm paged attention 
+            assert position is not None
+            q, k = self.rotary_emb(position, q, k)
+            if self.kv_cache_dtype == "fp8":
+                aiter.reshape_and_cache_with_pertoken_quant(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    k_scale,
+                    v_scale,
+                    attn_metadata.slot_mapping,
+                    asm_layout=True,
+                )
+            else:
+                aiter.reshape_and_cache(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    attn_metadata.slot_mapping,
+                    kv_cache_dtype="auto",
+                    k_scale=None,
+                    v_scale=None,
+                    asm_layout=True,
+                )
         
         return q, k, v, k_cache, v_cache, k_scale, v_scale
         
@@ -340,12 +355,12 @@ class Attention(nn.Module):
         ctx = fwd_args.context
         
         if ctx.is_prefill:
-            if self.sliding_window or self.sinks is not None:
+            if self.use_triton_attn:
                 return self.prefill_attention_triton
             else:
                 return self.prefill_attention_asm
         else:
-            if self.sliding_window or self.sinks is not None:
+            if self.use_triton_attn:
                 return self.paged_attention_triton
             else:
                 return self.paged_attention_asm
