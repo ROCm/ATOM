@@ -104,7 +104,7 @@ jobs:
         run: |
           docker exec atom_test df -h /dev/shm
 
-      - name: Check models directory
+      - name: Download and verify models
         run: |
           docker exec atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
           docker exec atom_test bash -lc "ls -all /models/${{ matrix.model_path }}"
@@ -153,10 +153,10 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          # TODO: run another container to clean up the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
+          # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
           # We should use non-root user to run the test to avoid this issue.
           set -ex
           echo "========== Cleaning up workspace =========="
-          docker run --rm  -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged  --name atom_test_clean rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
+          docker run --rm  -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
           docker stop atom_test || true
           docker rm atom_test || true
