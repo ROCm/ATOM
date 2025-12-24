@@ -81,10 +81,17 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          if [ -d "/models" ]; then
+            MODEL_MOUNT="-v /models:/models"
+          else
+            echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
+            MODEL_MOUNT=""
+          fi
+
           echo "Starting container: atom_test:ci"
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-          -v /models:/models \
+          $MODEL_MOUNT \
           -w /workspace \
           --ipc=host --group-add video \
           --shm-size=16G \
@@ -157,6 +164,6 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -ex
           echo "========== Cleaning up workspace =========="
-          docker run --rm  -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
           docker stop atom_test || true
           docker rm atom_test || true
