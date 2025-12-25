@@ -47,7 +47,12 @@ class Attention(nn.Module):
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
         self.layer_num = layer_num
-        self.one_scale = torch.tensor(1.0, dtype=torch.float32)
+        self.kv_scale_float = (
+            torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
+            if self.kv_cache_dtype == "fp8"
+            else 1.0
+        )
+        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
         self.sinks = sinks
         self.sliding_window = (
             (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
@@ -60,7 +65,7 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         position: torch.Tensor = None,
-        q_scale: torch.Tensor=None,
+        q_scale: torch.Tensor = None,
     ):
         o: torch.Tensor
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -89,10 +94,12 @@ class Attention(nn.Module):
             k_cache = v_cache = torch.tensor([])
             k_scale = v_scale = None
 
-        assert self.rotary_emb is None or (self.rotary_emb is not None and position is not None)
+        assert self.rotary_emb is None or (
+            self.rotary_emb is not None and position is not None
+        )
         if k_cache.numel() and v_cache.numel():
             if use_triton_unified_attention:
-                k_scale = v_scale = self.one_scale
+                k_scale = v_scale = self.kv_scale
                 k_cache = k_cache.view(
                     k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
                 )
@@ -185,8 +192,8 @@ class Attention(nn.Module):
                     block_table=attn_metadata.block_tables,
                     softcap=0,
                     q_descale=None,
-                    k_descale=self.one_scale.expand(descale_shape),
-                    v_descale=self.one_scale.expand(descale_shape),
+                    k_descale=k_scale.expand(descale_shape),
+                    v_descale=v_scale.expand(descale_shape),
                     sinks=self.sinks,
                 )
         elif context.is_prefill:
