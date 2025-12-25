@@ -15,21 +15,23 @@ ARG TRITON_COMMIT="v3.5.1"
 
 # Update Triton
 RUN pip uninstall -y triton || true
-RUN git clone $TRITON_REPO --depth=1 $TRITON_COMMIT
-RUN cd triton && \
+RUN git clone $TRITON_REPO --depth=1 $TRITON_COMMIT /triton-test && \
+    cd /triton-test && \
     pip install -r python/requirements.txt && \
     pip install filecheck && \
-    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
+    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install . && \
+    rm -rf /triton-test
 RUN pip show triton || true
 
 # Install Aiter
 RUN pip uninstall -y aiter || true
 RUN git clone $AITER_REPO /aiter-test && \
     cd /aiter-test && \
-    pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
-    PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+    pip install -r requirements.txt && \
+    PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop && \
+    rm -rf /aiter-test
 RUN pip show amd-aiter || true
 
 # Install ATOM
