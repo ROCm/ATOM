@@ -27,6 +27,7 @@ def fake_(
     positions: torch.Tensor,
     layer_name: str,
     use_mla: bool,
+    qkv: torch.Tensor,
 ) -> torch.Tensor:
     output_shape = list(q.shape)
     if use_mla:
@@ -48,10 +49,11 @@ def unified_attention_with_output_base(
     positions: torch.Tensor,
     layer_name: str,
     use_mla: bool,
+    qkv: torch.Tensor,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.impl.forward(q, k, v, positions, q_scale)
+    return self.impl.forward(q, k, v, positions, q_scale, qkv)
 
 
 class Attention(nn.Module):
@@ -70,6 +72,10 @@ class Attention(nn.Module):
         per_layer_sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
         prefix: Optional[str] = None,
+        use_triton_prefill: bool = True,
+        use_triton_decode: bool = True,
+        q_norm: Optional[torch.nn.Module] = None,
+        k_norm: Optional[torch.nn.Module] = None,
         **kwargs,
     ):
         super().__init__()
@@ -109,6 +115,10 @@ class Attention(nn.Module):
             sliding_window=per_layer_sliding_window,
             rotary_emb=rotary_emb,
             dtype=dtype,
+            use_triton_prefill=use_triton_prefill,
+            use_triton_decode=use_triton_decode,
+            q_norm=q_norm,
+            k_norm=k_norm,
         )
 
         compilation_config = atom_config.compilation_config
@@ -125,8 +135,9 @@ class Attention(nn.Module):
         v: torch.Tensor,
         positions: torch.Tensor = None,
         q_scale: Optional[torch.Tensor]=None,
+        qkv: torch.Tensor = None,
     ):
         output = torch.ops.aiter.unified_attention_with_output_base(
-            q, q_scale, k, v, positions, self.layer_name, self.use_mla
+            q, q_scale, k, v, positions, self.layer_name, self.use_mla, qkv
         )
         return output

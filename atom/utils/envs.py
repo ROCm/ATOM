@@ -14,6 +14,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENFORCE_EAGER": lambda: os.getenv("ATOM_ENFORCE_EAGER", "0") == "1",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: os.getenv("ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1") == "1",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1",
+    "ATOM_ENABLE_QK_NORM_ROPE_FUSION": lambda: os.getenv("ATOM_ENABLE_QK_NORM_ROPE_FUSION", "1") == "1",
+    # add qk-norm-rope-cache-quant fusion for Qwen3-Moe model, default disabled,
+    # Qwen3-Moe model should enable this for better performance.
+    "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1",
 }
 

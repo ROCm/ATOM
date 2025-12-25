@@ -337,6 +337,7 @@ class MLAAttention(nn.Module):
         k_rope: torch.Tensor,
         positions: torch.Tensor,
         q_scale: Optional[torch.Tensor],
+        qkv: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
