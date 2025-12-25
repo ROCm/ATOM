@@ -2,13 +2,13 @@ set -euo pipefail
 
 TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
-EXTRA_ARGS="${@:3}"
+EXTRA_ARGS=("${@:3}")
 
 
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
-  python -m atom.entrypoints.openai_server --model $MODEL_PATH $EXTRA_ARGS &
+  python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${EXTRA_ARGS[@]}" &
   atom_server_pid=$!
 
   echo ""
@@ -32,8 +32,12 @@ fi
 
 if [ "$TYPE" == "accuracy" ]; then
   echo ""
-  echo "========== Installing lm-eval =========="
-  pip install lm-eval[api]
+  if ! command -v lm_eval >/dev/null 2>&1; then
+    echo "========== Installing lm-eval =========="
+    pip install lm-eval[api]
+  else
+    echo "========== lm-eval already installed; skipping installation =========="
+  fi
 
   echo ""
   echo "========== Running accuracy test =========="
