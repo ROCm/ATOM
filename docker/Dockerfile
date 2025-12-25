@@ -10,6 +10,17 @@ ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
+ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
+ARG TRITON_COMMIT="v3.5.1"
+
+# Update Triton
+RUN pip uninstall -y triton || true
+RUN git clone $TRITON_REPO --depth=1 $TRITON_COMMIT
+RUN cd triton && \
+    pip install -r python/requirements.txt && \
+    pip install filecheck && \
+    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
+RUN pip show triton || true
 
 # Install Aiter
 RUN pip uninstall -y aiter || true
