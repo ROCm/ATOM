@@ -167,6 +167,7 @@ jobs:
           fi
       
       - name: Run ATOM accuracy test
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           echo ""
@@ -182,7 +183,7 @@ jobs:
           echo ""
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
-            .github/scripts/atom_test.sh accuracy $model_path 
+            .github/scripts/atom_test.sh accuracy $model_path
           "
 
       - name: Upload output
