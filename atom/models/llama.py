@@ -188,6 +188,7 @@ class LlamaAttention(nn.Module):
             layer_num=layer_num,
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
+            rotary_emb=self.rotary_emb,
         )
 
     def forward(
