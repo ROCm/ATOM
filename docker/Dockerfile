@@ -15,7 +15,7 @@ ARG TRITON_COMMIT="v3.5.1"
 
 # Update Triton
 RUN pip uninstall -y triton || true
-RUN git clone $TRITON_REPO --depth=1 $TRITON_COMMIT /triton-test && \
+RUN git clone $TRITON_REPO --depth=1 --branch $TRITON_COMMIT /triton-test && \
     cd /triton-test && \
     pip install -r python/requirements.txt && \
     pip install filecheck && \
