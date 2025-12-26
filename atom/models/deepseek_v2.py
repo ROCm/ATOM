@@ -88,6 +88,10 @@ from atom.utils import envs
 from aiter.jit.utils.torch_guard import torch_compile_guard
 # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
+import logging
+
+logger = logging.getLogger("atom")
+
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_RMSNORM_QUANT_FUSION
@@ -234,6 +238,7 @@ class DeepseekV2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        logger.info(f"{reduce_results=}")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             bias=False,
@@ -263,12 +268,14 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
         prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self.reduce_results = reduce_results
 
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
@@ -340,7 +347,7 @@ class DeepseekV2MoE(nn.Module):
                 # See DeepseekV2DecoderLayer for more details.
                 final_hidden_states = final_hidden_states + shared_output \
                     * (1. / self.routed_scaling_factor)
-        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+        if self.tp_size > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
 
@@ -635,16 +642,21 @@ class DeepseekV2MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
 
-        if quant_config["quant_dtype"] == torch.float4_e2m1fn_x2:
+        # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains BF16 GEMM,
+        # Otherwise, if use_triton_gemm() is off, all projections are BF16 GEMMs
+        # For FP8, use_triton_gemm() is ignored and AITER FP8 GEMM is used
+        if quant_config["quant_dtype"] == dtypes.fp4x2:
             if not use_triton_gemm(): 
                 # TODO use ignore layer for mxfp4 attention
-                source_quant_dtype = quant_config = non_proj_quant_config = None
+                source_quant_dtype = None
+                quant_config = None
+                base_quant_config = None
             else:
                 source_quant_dtype = torch.bfloat16
-                non_proj_quant_config = None
+                base_quant_config = None
         else:
             source_quant_dtype = None
-            non_proj_quant_config = quant_config
+            base_quant_config = quant_config
         
         if self.q_lora_rank is not None:
             # self.q_a_proj = ReplicatedLinear(self.hidden_size,
@@ -689,13 +701,13 @@ class DeepseekV2MLAAttention(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=quant_config if is_rocm_aiter_fp4bmm_enabled() else non_proj_quant_config,
+            quant_config=quant_config if is_rocm_aiter_fp4bmm_enabled() else base_quant_config,
             prefix=f"{prefix}.kv_b_proj",
             source_quant_dtype=source_quant_dtype if is_rocm_aiter_fp4bmm_enabled() else None)
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         bias=False,
-                                        quant_config=non_proj_quant_config,
+                                        quant_config=base_quant_config,
                                         reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                                         prefix=f"{prefix}.o_proj",
                                         source_quant_dtype=None)
@@ -722,7 +734,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 config,
                 hidden_size,
                 q_lora_rank,
-                non_proj_quant_config,
+                base_quant_config,
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
@@ -762,17 +774,15 @@ class DeepseekV2MLAAttention(nn.Module):
             prefix=prefix,
         )
 
+        # self.fuse_qknorm_quant is turned on only if FP8 or (FP4 and use_triton_gemm()),
+        # because for (FP4 and not use_triton_gemm()) case, BF16 GEMMs are used
         self.prefix = prefix
-        if quant_config["quant_dtype"] == torch.float4_e2m1fn_x2:
-            if use_triton_gemm():
+        self.quant_dtype = None
+        self.fuse_qknorm_quant = False
+        if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
+            if quant_config["quant_dtype"] == dtypes.fp8 or (quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()):
                 self.quant_dtype = quant_config["quant_dtype"]
                 self.fuse_qknorm_quant = True
-            else: 
-                self.quant_dtype = None
-                self.fuse_qknorm_quant = False
-
-        # self.quant_dtype = non_proj_quant_config["quant_dtype"] if non_proj_quant_config else None
-        # self.fuse_qknorm_quant = ENABLE_DS_QKNORM_QUANT_FUSION and self.quant_dtype is not None
 
     def forward(
         self,
@@ -870,31 +880,51 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
+        # self.fuse_input_norm_quant is turned on only if FP8 or (FP4 and use_triton_gemm()),
+        # because for (FP4 and not use_triton_gemm()) case, BF16 GEMMs are used
+        # note that ENABLE_ALLREDUCE_RMSNORM_FUSION will be turned off if it was on
+        self.quant_dtype = None
+        self.fuse_input_norm_quant = False
+        self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
+        if quant_config is not None and ENABLE_RMSNORM_QUANT_FUSION:
+            if quant_config["quant_dtype"] == dtypes.fp8 or (quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()):
+                self.quant_dtype = quant_config["quant_dtype"]
+                self.fuse_input_norm_quant = True
+                if self.fuse_ar_input_norm:
+                    self.fuse_ar_input_norm = False
+                    logger.info("Warning: Because ENABLE_RMSNORM_QUANT_FUSION is turned on, AR + RMS fusion is turned off for input_layernorm and reduce_results is re-enabled for first k dense layer down_proj")
+        
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
+                reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
             )
         else:
+            # next_layer_dense = True
+            # if (config.n_routed_experts is not None
+            #     and (layer_idx + 1) >= config.first_k_dense_replace
+            #     and (layer_idx + 1) % config.moe_layer_freq == 0):
+            #     next_layer_dense = False
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+                reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps,
-                                       fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0)
+                                       fused_allreduce=self.fuse_ar_input_norm and self.layer_idx > 0)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION)
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
+
 
     def forward(
         self,
@@ -903,7 +933,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if ENABLE_RMSNORM_QUANT_FUSION:
+        if self.fuse_input_norm_quant:
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
@@ -1032,9 +1062,11 @@ class DeepseekV2Model(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
+            logger.info(f"fuse_ar_input_norm {self.layers[self.end_layer - 1].fuse_ar_input_norm}")
             self.norm = RMSNorm(config.hidden_size,
                                 eps=config.rms_norm_eps,
-                                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,)
+                                fused_allreduce=self.layers[self.end_layer - 1].fuse_ar_input_norm,)
+                                # fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,)
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = (
