@@ -46,7 +46,7 @@ class PPMissingLayer(torch.nn.Identity):
         Wraps the input in a tuple if `self.return_tuple` is True.
         """
         input = args[0] if args else next(iter(kwargs.values()))
-        return (input,) if self.return_tuple else input
+        return (input, None, None)
 
 
 def get_pp_indices(
@@ -113,8 +113,10 @@ def make_layers(
     )
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
-        + [layer_fn(prefix=f"{prefix}.{idx}", layer_num=layer_num_offset + idx) 
-           for idx in range(start_layer, end_layer)]
+        + [
+            layer_fn(prefix=f"{prefix}.{idx}", layer_num=layer_num_offset + idx)
+            for idx in range(start_layer, end_layer)
+        ]
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
     )
     return start_layer, end_layer, modules

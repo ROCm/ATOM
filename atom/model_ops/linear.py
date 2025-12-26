@@ -74,12 +74,13 @@ def gemm_a4w4_quant(
         dtype=otype,
         device=x.device,
     )
-    w_scale = fp4_utils.e8m0_shuffle(weight_scale.data)
+    #w_scale = fp4_utils.e8m0_shuffle(weight_scale.data)
     y = gemm_a4w4(
         x,
         weight,
         x_scale,
-        w_scale,
+        #w_scale,
+        weight_scale,
         y,
     )
     return y[:m, ...]
@@ -185,6 +186,8 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         if self.weight_scale is not None:
             self.weight_scale.weight_loader = self.weight_loader
+            # shuffle weight scale once so no reshuffling for every gemm
+            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
 
     @staticmethod

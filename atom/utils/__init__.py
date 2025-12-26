@@ -553,7 +553,7 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
 def getLogger():
     global logger
     if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
+        logger.setLevel(logging.INFO)
 
         console_handler = logging.StreamHandler()
         if int(os.environ.get("AITER_LOG_MORE", 0)):
