@@ -30,7 +30,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from aiter import QuantType
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
 
@@ -96,10 +95,15 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        x = self.gate_up_proj(x)
-        x = self.act_fn(x)
-        x = self.down_proj(x)
+    def forward(self, x, x_scale: Optional[torch.Tensor] = None):
+        x = self.gate_up_proj(x, x_scale=x_scale)
+        scale = getattr(self.down_proj, "input_scale", None)
+        x = self.act_fn(x, scale)
+        if isinstance(x, (tuple)):
+            x, scale = x
+        else:
+            scale = None
+        x = self.down_proj(x, x_scale=scale)
         return x
 
 
@@ -194,8 +198,9 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
@@ -292,16 +297,24 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, _, scale = self.input_layernorm(hidden_states, scale)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+            hidden_states, residual, scale = self.input_layernorm(
+                hidden_states, scale, residual
+            )
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states, x_scale=scale
+        )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
+        hidden_states, residual, scale = self.post_attention_layernorm(
+            hidden_states, scale, residual
+        )
+        hidden_states = self.mlp(hidden_states, x_scale=scale)
         return hidden_states, residual
 
 
@@ -336,10 +349,10 @@ class LlamaModel(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
-                layer_num=layer_num
+                layer_num=layer_num,
             ),
             prefix=f"{prefix}.layers",
-            layer_num_offset=0
+            layer_num_offset=0,
         )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -386,7 +399,7 @@ class LlamaModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _, _ = self.norm(hidden_states, None, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
