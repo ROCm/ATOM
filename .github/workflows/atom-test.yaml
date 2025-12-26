@@ -93,6 +93,7 @@ jobs:
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           $MODEL_MOUNT \
           -w /workspace \
+          --cpus=8 \
           --ipc=host --group-add video \
           --shm-size=16G \
           --privileged \
