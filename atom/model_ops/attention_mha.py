@@ -77,17 +77,21 @@ class Attention(nn.Module):
         attn_metadata = forward_context.attn_metadata
         context = forward_context.context
 
+        # Skip real attention for dummy runs (warmup, dummy_execution, dummy_prefill_execution)
+        slot_mapping_numel = attn_metadata.slot_mapping.numel() if attn_metadata.slot_mapping is not None else 0
+        context_is_dummy = context.is_dummy_run if context else False
+        is_dummy = (slot_mapping_numel == 0) or context_is_dummy
+        if is_dummy:
+            # dummy run: skip real attention and return zeros
+            o = torch.zeros_like(q).view(-1, self.num_heads * self.head_dim)
+            return o
+
+        # Normal execution: get kv_cache
         kv_cache_data = forward_context.kv_cache_data
-        if attn_metadata.slot_mapping.numel():
-            # not dummy run
-            k_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
-            v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
-            k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
-            v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
-        else:
-            # dummy run before allocate kv_cache, thus we create manually
-            k_cache = v_cache = torch.tensor([])
-            k_scale = v_scale = None
+        k_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
+        k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
+        v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
         assert self.rotary_emb is None or (self.rotary_emb is not None and position is not None)
         if k_cache.numel() and v_cache.numel():
