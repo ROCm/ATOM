@@ -32,6 +32,7 @@ def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
 class DPMetadata:
     max_tokens_across_dp_cpu: torch.Tensor
     cu_tokens_across_dp_cpu: torch.Tensor
+    max_tokens_across_dp: int  # Pre-computed int value for cudagraph compatibility
     local_sizes: Optional[list[int]] = None
 
     @staticmethod
@@ -73,7 +74,8 @@ class DPMetadata:
                 batchsize, dp_size, dp_rank)
         max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp)
         cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_across_dp, dim=0)
-        return DPMetadata(max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu)
+        max_tokens_across_dp = max_tokens_across_dp_cpu.item()  # Pre-compute int for cudagraph
+        return DPMetadata(max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu, max_tokens_across_dp)
 
     @contextmanager
     def chunked_sizes(self, max_chunk_size_per_rank: int, chunk_idx: int):
@@ -119,6 +121,7 @@ class Context:
     is_prefill: bool = False
     batch_size: int = 0
     graph_bs: int = 0
+    is_dummy_run: bool = False  # Skip real attention for dummy execution
 
     def __init__(
         self,
@@ -126,11 +129,13 @@ class Context:
         is_prefill: bool = False,
         batch_size: int = 0,
         graph_bs: int = 0,
+        is_dummy_run: bool = False,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
         self.batch_size = batch_size
         self.graph_bs = graph_bs
+        self.is_dummy_run = is_dummy_run
 
 
 @dataclass
@@ -279,11 +284,11 @@ def set_forward_context(
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
-    # if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
-    #     dp_metadata = DPMetadata.make(atom_config.parallel_config,
-    #                                   # attn_metadata,
-    #                                   num_tokens or 0,
-    #                                   num_tokens_across_dp)
+    if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
+        dp_metadata = DPMetadata.make(atom_config.parallel_config,
+                                      # attn_metadata,
+                                      num_tokens or 0,
+                                      num_tokens_across_dp)
 
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,

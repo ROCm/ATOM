@@ -71,6 +71,7 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
+        # return False
         return self.dp_size > 1 and _has_module("mori")
 
     @property

@@ -226,7 +226,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         return attn_metadata, positions
 
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
+    def prepare_decode(self, batch: ScheduledBatch, bs: int, is_dummy_run: bool=False):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
         max_q_len = 1
@@ -242,10 +242,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[:scheduled_bs] = slot_mapping
-        var["slot_mapping"].np[scheduled_bs:bs] = -1
+        if is_dummy_run:
+            var["slot_mapping"].np[:bs] = -1
+        else:
+            var["slot_mapping"].np[:scheduled_bs] = slot_mapping
+            var["slot_mapping"].np[scheduled_bs:bs] = -1
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
+        var["context_lens"].np[scheduled_bs:bs] = 0
 
         num_blocks_per_seq = [
             (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
