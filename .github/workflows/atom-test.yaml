@@ -21,7 +21,7 @@ jobs:
         include:
           - model_name: "Meta-Llama-3-8B-Instruct"
             model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
-            extraArgs: ""
+            extraArgs: "--kv_cache_dtype fp8"
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
@@ -101,6 +101,8 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
           --name atom_test \
           atom_test:ci
 
@@ -123,8 +125,8 @@ jobs:
             echo "/models directory not found, skipping model download"
           fi
 
-      - name: Run ATOM tests
-        timeout-minutes: 60
+      - name: Run ATOM simple inference
+        timeout-minutes: 30
         run: |
           # Run the inference and capture output
           set -euo pipefail
@@ -150,18 +152,39 @@ jobs:
           echo "========== Showing test output below =========="
           cat atom_test_output.txt
 
-          echo ""
+      - name: Compare output with golden outputs
+        timeout-minutes: 30
+        if: ${{ matrix.model_name == 'Meta-Llama-3-8B-Instruct' }}
+        run: |
           echo "========== Comparing output with golden outputs =========="
-          # Ignore whitespace and EOL differences in the diff
-          diff -u -B -w --strip-trailing-cr atom_test_output.txt .github/workflows/golden_outputs.txt || true
-          DIFF_EXIT_CODE=$?
-          
-          if [ $DIFF_EXIT_CODE -ne 0 ]; then
-            echo "Output does not match golden outputs."
+          if ! diff -u -B -w --strip-trailing-cr \
+            atom_test_output.txt \
+            ".github/workflows/golden_outputs/${{ matrix.model_name }}_golden_output.txt"; then
+            echo "Failed: Output does not match golden outputs."
             exit 1
           else
-            echo "Output matches golden outputs."
+            echo "Success: Output matches golden outputs."
           fi
+      
+      - name: Run ATOM accuracy test
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========== Launching ATOM server =========="
+          if [ -d "/models" ]; then
+            model_path="/models/${{ matrix.model_path }}"
+          else
+            model_path="${{ matrix.model_path }}"
+          fi
+          docker exec atom_test bash -lc "
+            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
+          "
+          echo ""
+          echo "========== Running accuracy test =========="
+          docker exec atom_test bash -lc "
+            .github/scripts/atom_test.sh accuracy $model_path
+          "
 
       - name: Upload output
         if: always()
