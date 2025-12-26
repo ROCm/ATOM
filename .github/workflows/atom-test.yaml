@@ -102,7 +102,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           --name atom_test \
-          rocm/atom:latest
+          atom_test:ci
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
@@ -124,46 +124,6 @@ jobs:
           fi
 
       - name: Run ATOM tests
-        timeout-minutes: 60
-        run: |
-          # Run the inference and capture output
-          set -euo pipefail
-          echo ""
-          echo "========== Running test =========="
-
-          if [ -d "/models" ]; then
-            model_path="/models/${{ matrix.model_path }}"
-          else
-            model_path="${{ matrix.model_path }}"
-          fi
-          echo "Model path: $model_path"
-          docker exec atom_test bash -lc "
-            set -euo pipefail
-            python3 -m atom.examples.simple_inference \
-              --model \"$model_path\" \
-              ${{ matrix.extraArgs }} \
-              --temperature 0 \
-            | grep -E '^Prompt: |^Completion:'
-          " > atom_test_output.txt
-          
-          echo ""
-          echo "========== Showing test output below =========="
-          cat atom_test_output.txt
-
-          echo ""
-          echo "========== Comparing output with golden outputs =========="
-          # Ignore whitespace and EOL differences in the diff
-          diff -u -B -w --strip-trailing-cr atom_test_output.txt .github/workflows/golden_outputs.txt || true
-          DIFF_EXIT_CODE=$?
-          
-          if [ $DIFF_EXIT_CODE -ne 0 ]; then
-            echo "Output does not match golden outputs."
-            exit 1
-          else
-            echo "Output matches golden outputs."
-          fi
-          
-      - name: Run ATOM tests (again)
         timeout-minutes: 60
         run: |
           # Run the inference and capture output
