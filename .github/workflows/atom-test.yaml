@@ -81,8 +81,8 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
-          if [ -d "/models" ]; then
-            MODEL_MOUNT="-v /models:/models"
+          if [ -d "/it-share/models" ]; then
+            MODEL_MOUNT="-v /it-share/models:/models"
           else
             echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
             MODEL_MOUNT=""
@@ -113,14 +113,14 @@ jobs:
 
       - name: Download models
         run: |
-          if [ -d "/models" ]; then
-            echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
+          if [ -d "/it-share/models" ]; then
+            echo "/it-share/models directory found, downloading model to /it-share/models/${{ matrix.model_path }}"
             if ! docker exec atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
           else
-            echo "/models directory not found, skipping model download"
+            echo "/it-share/models directory not found, skipping model download"
           fi
 
       - name: Run ATOM tests
@@ -131,7 +131,7 @@ jobs:
           echo ""
           echo "========== Running test =========="
 
-          if [ -d "/models" ]; then
+          if [ -d "/it-share/models" ]; then
             model_path="/models/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
