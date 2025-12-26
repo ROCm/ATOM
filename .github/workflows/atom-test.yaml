@@ -113,7 +113,7 @@ jobs:
 
       - name: Download models
         run: |
-          if [ -d "models" ]; then
+          if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
             if ! docker exec atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
