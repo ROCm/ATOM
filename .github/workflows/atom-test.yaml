@@ -102,7 +102,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           --name atom_test \
-          atom_test:ci
+          rocm/atom:latest
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
