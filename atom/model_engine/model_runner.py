@@ -431,27 +431,15 @@ class ModelRunner:
             total_seqs_num=1,
             total_seqs_num_decode=1,
         )
-
-        attn_metadata, positions = self.attn_metadata_builder.build(dummy_batch, bs)
-        context_bs = dummy_batch.total_seqs_num_decode
-
-        context = Context(
-            positions=positions,
-            is_prefill=False,
-            batch_size=context_bs,
-            graph_bs=bs,
-        )
-
+        
+        self.prepare_intputs(dummy_batch, is_dummy_run=True)
         actual_num_tokens = dummy_batch.total_tokens_num
-        set_forward_context(
-            attn_metadata=attn_metadata,
-            atom_config=self.config,
-            context=context,
-        )
 
-        self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
-        self.tokenID_processor.input_ids.copy_to_gpu(actual_num_tokens)
-        input_ids = self.tokenID_processor.input_ids.gpu[:actual_num_tokens]
+
+        # self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
+        # self.tokenID_processor.input_ids.copy_to_gpu(actual_num_tokens)
+        # input_ids = self.tokenID_processor.input_ids.gpu[:actual_num_tokens]
+        input_ids = torch.zeros(actual_num_tokens, dtype=torch.int32, device=self.device)
 
         logits = self.run_model(input_ids)
 
@@ -467,7 +455,6 @@ class ModelRunner:
         """
         if num_tokens <= 0:
             num_tokens = 1
-        
         seq = Sequence([0] * num_tokens, block_size=self.block_size)
         seqs = {seq.id: seq}
         
@@ -479,13 +466,17 @@ class ModelRunner:
             total_seqs_num=1,
             total_seqs_num_prefill=1,
         )
+
+        self.prepare_intputs(dummy_batch, is_dummy_run=True)
+
         
-        self.prepare_intputs(dummy_batch)
+        # self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
+        # self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
+        # input_ids = self.tokenID_processor.input_ids.gpu[:num_tokens]
+        input_ids= torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
         
-        self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
-        self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
-        input_ids = self.tokenID_processor.input_ids.gpu[:num_tokens]
-        
+        # not exe run_model and synchronize: acc 0.79
+
         with torch.no_grad():
             self.run_model(input_ids)
         
@@ -794,7 +785,7 @@ class ModelRunner:
         # TODO(tms) : There are many cases where padding is enabled for
         # prefills, causing unnecessary and excessive padding of activations.
 
-        if dp_size == 1 or self.enforce_eager:
+        if dp_size == 1:
             # Early exit.
             return 0, None
         num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
@@ -810,32 +801,48 @@ class ModelRunner:
         num_input_tokens += num_pad
         return num_input_tokens, num_tokens_across_dp
 
-    def prepare_intputs(self, batch: ScheduledBatch):
+    def prepare_intputs(self, batch: ScheduledBatch, is_dummy_run: bool = False):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
-        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
-        context_bs = (
-            batch.total_seqs_num_prefill if is_prefill else batch.total_seqs_num_decode
-        )
+        num_scheduled_tokens = batch.num_scheduled_tokens
+        cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
+            # num_pad, num_tokens_across_dp = self.get_dp_padding(scheduled_bs)
+            # padded_scheduled_bs = scheduled_bs + num_pad
+            padded_scheduled_bs = scheduled_bs
             bs = (
-                scheduled_bs
+                padded_scheduled_bs
                 if self.enforce_eager
-                else next((x for x in self.graph_bs if x >= scheduled_bs), scheduled_bs)
+                else next((x for x in self.graph_bs if x >= padded_scheduled_bs), padded_scheduled_bs)
                 # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
             )
-
+            assert (
+                bs >= padded_scheduled_bs
+            ), f"current decode {padded_scheduled_bs=} > max graph_bs{bs}"
+            self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
+                self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
+            )
+        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs, is_dummy_run)
+        context_bs = (
+            batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        )
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
             batch_size=context_bs,
             graph_bs=bs,
+            is_dummy_run=is_dummy_run,
         )
+        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
+        actual_num_tokens = batch.total_tokens_num
         set_forward_context(
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
+            num_tokens=actual_num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
         )
 
     def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
@@ -869,6 +876,11 @@ class ModelRunner:
             hidden_states = self.model(input_ids, positions)
         else:
             graph_bs = context.graph_bs
+            # self.forward_vars["input_ids"].gpu[:bs].copy_(input_ids[:bs])
+            # self.forward_vars["positions"].gpu[:bs].copy_(positions[:bs])
+            # if bs < graph_bs:
+            #     self.forward_vars["input_ids"].gpu[bs:graph_bs].fill_(0)
+            #     self.forward_vars["positions"].gpu[bs:graph_bs].fill_(0)
             self.graphs[graph_bs].replay()
             hidden_states = self.forward_vars["outputs"][:bs]
         return self.model.compute_logits(hidden_states)

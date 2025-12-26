@@ -34,7 +34,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     def __init__(self, model_runner):
         super().__init__(model_runner)
 
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
+    def prepare_decode(self, batch: ScheduledBatch, bs: int, is_dummy_run: bool=False):
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
         dropout_p = 0.0
@@ -56,7 +56,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[:bs] = slot_mapping
+        if is_dummy_run:
+            var["slot_mapping"].np[:bs] = -1
+        else:
+            var["slot_mapping"].np[:bs] = slot_mapping
+            
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0

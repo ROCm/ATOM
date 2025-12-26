@@ -368,7 +368,9 @@ def sparse_attn_indexer(
     attn_metadata = forward_context.attn_metadata
     context = forward_context.context
     slot_mapping = attn_metadata.slot_mapping
-    if kv_cache.numel() == 0:
+    # Skip for dummy runs to avoid corrupting KV cache
+    context_is_dummy = context.is_dummy_run if context else False
+    if kv_cache.numel() == 0 or context_is_dummy:
         # dummy runner
         return weights
     num_decode_tokens = context.batch_size if not context.is_prefill else 0

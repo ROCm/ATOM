@@ -26,7 +26,7 @@ from atom.utils.forward_context import (
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
-
+from atom.config import get_current_atom_config
 # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 from aiter import fused_qk_rope_concat_and_cache_mla
 from aiter.dist.parallel_state import get_dp_group
@@ -427,9 +427,17 @@ class MLAAttention(nn.Module):
                 kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
             else:
                 kv_cache = torch.tensor([])
-        else:
-            # dummy run before allocate kv_cache, thus we create manually
-            kv_cache = torch.tensor([])
+        slot_mapping_numel = attn_metadata.slot_mapping.numel() if attn_metadata.slot_mapping is not None else 0
+        context_is_dummy = context.is_dummy_run if context else False
+        is_dummy = (slot_mapping_numel == 0) or context_is_dummy 
+        if is_dummy:
+            # dummy run: skip real attention and return
+            output_shape = list(q.shape)
+            output_shape[-1] = 7168
+            atom_config = get_current_atom_config()
+            output_dtype = atom_config.torch_dtype
+            output = torch.zeros(output_shape, dtype=output_dtype, device=q.device)
+            return output
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
