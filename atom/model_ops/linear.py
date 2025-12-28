@@ -28,6 +28,8 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 
+import logging
+logger = logging.getLogger(__name__)
 
 def divide(numerator, denominator):
     assert (
@@ -60,13 +62,24 @@ def gemm_a4w4_quant(
     output_size: int,
 ) -> torch.Tensor:
 
-    quant_func = get_hip_quant(QuantType.per_1x32)
-    x, x_scale = quant_func(
-        x,
-        quant_dtype=params_dtype,
-        scale=input_scale,
-        shuffle=True,
-    )
+    #quant_func = get_hip_quant(QuantType.per_1x32)
+    #x, x_scale = quant_func(
+    #    x,
+    #    quant_dtype=params_dtype,
+    #    scale=input_scale,
+    #    shuffle=True,
+    #)
+
+    if input_scale is None:
+        quant_func = get_hip_quant(QuantType.per_1x32)
+        x, x_scale = quant_func(
+            x,
+            quant_dtype=params_dtype,
+            scale=input_scale,
+            shuffle=True,
+        )
+    else:
+        x_scale = input_scale
 
     m = x.view(-1, x.size(-1)).shape[0]
     y = torch.empty(
@@ -79,7 +92,6 @@ def gemm_a4w4_quant(
         x,
         weight,
         x_scale,
-        #w_scale,
         weight_scale,
         y,
     )
@@ -298,7 +310,8 @@ class LinearBase(nn.Module):
                     otype,
                     self.weight_scale.data,
                     self.params_dtype,
-                    getattr(self, "input_scale", None),
+                    x_scale,
+                    # getattr(self, "input_scale", None),
                     self.output_size,
                 )
                 if self.bias is not None:

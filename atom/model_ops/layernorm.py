@@ -3,6 +3,7 @@
 
 from typing import List, Tuple, Optional, Union
 import torch
+from atom.config import QuantizationConfig
 from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
@@ -106,6 +107,7 @@ class RMSNorm(nn.Module):
         self,
         dim: int,
         eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] = None,
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
     ) -> None:
@@ -113,6 +115,12 @@ class RMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        if quant_config is None:
+            quant_config = QuantizationConfig()
+        quant_type = quant_config["quant_type"]
+        params_dtype = quant_config["quant_dtype"]
+        self.quant_type = quant_type
+        self.params_dtype = params_dtype
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.tp_size = get_tensor_model_parallel_world_size()

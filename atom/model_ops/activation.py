@@ -6,12 +6,17 @@ from typing import Optional
 from torch import nn
 import torch.nn.functional as F
 from aiter import silu_and_mul
-
+from atom.config import QuantizationConfig
 from aiter import (
+    QuantType,
     dtypes,
 )
 from atom.utils import envs
-
+from aiter.ops.triton.fused_mxfp4_quant import (
+    fused_reduce_act_mul_and_mxfp4_quant,
+)
+import logging
+logger = logging.getLogger(__name__)
 
 ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
     envs.ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
@@ -29,8 +34,15 @@ if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
 
 class SiluAndMul(nn.Module):
 
-    def __init__(self):
+    def __init__(
+        self,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
         super().__init__()
+        quant_type = quant_config["quant_type"]
+        params_dtype = quant_config["quant_dtype"]
+        self.quant_type = quant_type
+        self.params_dtype = params_dtype        
 
     def forward_native(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
@@ -45,6 +57,13 @@ class SiluAndMul(nn.Module):
             x = fused_silu_mul_fp8_per_tensor_static_quant(
                 x, x_scale, dtype_quant=rocm_aiter_fp8_dtype
             )
+            return x, x_scale
+        elif x_scale is None and self.quant_type.value == QuantType.per_1x32.value:
+            (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
+            # x = x.view(torch.float4_e2m1fn_x2)
+            # x_scale = x_scale.view(torch.float8_e8m0fnu)
+            #logger.info(f"silu, x, shape = {x.shape}, dtype = {x.dtype}")
+            #logger.info(f"silu, x_scale, shape = {x_scale.shape}, dtype = {x_scale.dtype}")
             return x, x_scale
         else:
             out = torch.empty(
