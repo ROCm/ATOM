@@ -8,7 +8,6 @@ from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
     rmsnorm2d_fwd_with_add,
-    rms_norm,
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
 )
@@ -17,8 +16,14 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.utils import envs
+from aiter import (
+    QuantType,
+)
 
+from atom.utils import envs
+from aiter.ops.triton.fused_mxfp4_quant import (
+    fused_rms_mxfp4_quant,
+)
 
 ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
     envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
@@ -204,6 +209,13 @@ class RMSNorm(nn.Module):
                         dtype_quant=rocm_aiter_fp8_dtype,
                         res1=residual,
                     )
+                    return x, residual, x_scale
+            elif x_scale is None and self.quant_type.value == QuantType.per_1x32.value:
+                if residual is None:
+                    (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, self.weight, self.eps, shuffle=True)
+                    return x, None, x_scale
+                else:
+                    (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(x, self.weight, self.eps, shuffle=True, res1=residual)
                     return x, residual, x_scale
             else:
                 if residual is None:
