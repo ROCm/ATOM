@@ -10,6 +10,7 @@ ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
+ARG PREBUILD_KERNELS=1
 
 # Update Triton
 RUN pip show triton || true
@@ -28,7 +29,7 @@ RUN git clone $AITER_REPO /aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
-    PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+    PREBUILD_KERNELS=$PREBUILD_KERNELS GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 RUN pip show amd-aiter || true
 
 # Install ATOM

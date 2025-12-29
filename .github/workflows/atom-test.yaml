@@ -43,7 +43,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build --network=host -t atom_test:ci --build-arg BASE_IMAGE=${{ env.ATOM_BASE_IMAGE }} --build-arg GPU_ARCH=gfx950 --build-arg ATOM_REPO=${{ env.GITHUB_REPO_URL }} --build-arg ATOM_COMMIT=${{ env.GITHUB_COMMIT_SHA }} -f docker/Dockerfile .
+          docker build --network=host -t atom_test:ci --build-arg BASE_IMAGE=${{ env.ATOM_BASE_IMAGE }} --build-arg PREBUILD_KERNELS=0 --build-arg GPU_ARCH=gfx950 --build-arg ATOM_REPO=${{ env.GITHUB_REPO_URL }} --build-arg ATOM_COMMIT=${{ env.GITHUB_COMMIT_SHA }} -f docker/Dockerfile .
 
       - name: Start CI container
         run: |
@@ -178,3 +178,4 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
           docker stop atom_test || true
           docker rm atom_test || true
+          
