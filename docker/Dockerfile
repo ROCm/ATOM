@@ -12,6 +12,10 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
 
+RUN pip install --upgrade pip
+RUN pip install lm-eval[api]
+RUN pip show lm-eval || true
+
 # Update Triton
 RUN pip show triton || true
 RUN pip uninstall -y triton
