@@ -50,7 +50,17 @@ jobs:
           RUN pip uninstall -y aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
-          
+
+          RUN echo "=== Update Triton  ==="
+          RUN pip show triton || true
+          RUN pip uninstall -y triton
+          RUN git clone --depth=1 --branch release/internal/3.5.x https://github.com/triton-lang/triton.git /triton-test && \
+            cd /triton-test && \
+            pip install -r python/requirements.txt && \
+            pip install filecheck && \
+            MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
+          RUN pip show triton || true
+
           RUN git clone https://github.com/ROCm/aiter.git /aiter-test && \
             cd /aiter-test && \
             git checkout main && \
