@@ -41,47 +41,9 @@ jobs:
         run: |
           docker pull ${{ env.ATOM_BASE_IMAGE }}
 
-      - name: Generate Dockerfile
-        run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_IMAGE }}
-
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
-          RUN pip uninstall -y aiter
-          RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip show pybind11
-
-          RUN echo "=== Update Triton  ==="
-          RUN pip show triton || true
-          RUN pip uninstall -y triton
-          RUN git clone --depth=1 --branch release/internal/3.5.x https://github.com/ROCm/triton.git /triton-test && \
-            cd /triton-test && \
-            pip install -r python/requirements.txt && \
-            pip install filecheck && \
-            MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
-          RUN pip show triton || true
-
-          RUN git clone https://github.com/ROCm/aiter.git /aiter-test && \
-            cd /aiter-test && \
-            git checkout main && \
-            git submodule sync && git submodule update --init --recursive && \
-            python3 setup.py develop
-
-          RUN echo "=== Installing ATOM ==="
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /ATOM && \
-            cd /ATOM && \
-            git checkout ${{ env.GITHUB_COMMIT_SHA }} && \
-            pip install .
-          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          RUN echo "=== Other dependencies versions ===" && pip list || true
-          EOF
-
-      - name: Show Dockerfile
-        run: cat Dockerfile.mod
-
       - name: Build Docker image
         run: |
-          docker build --network=host -t atom_test:ci -f Dockerfile.mod .
+          docker build --network=host -t atom_test:ci --build-arg BASE_IMAGE=${{ env.ATOM_BASE_IMAGE }} --build-arg GPU_ARCH=gfx950 --build-arg ATOM_REPO=${{ env.GITHUB_REPO_URL }} --build-arg ATOM_COMMIT=${{ env.GITHUB_COMMIT_SHA }} -f docker/Dockerfile .
 
       - name: Start CI container
         run: |
