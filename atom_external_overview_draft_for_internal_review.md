@@ -8,10 +8,9 @@
 
 ## Executive Summary
 
-The rapid evolution of generative AI toward agentic, multi‑step, and MoE‑heavy workloads places unprecedented demands on inference infrastructure. Achieving low latency, high throughput, and predictable scaling now requires tight hardware–software co‑design rather than loosely coupled open‑source components.
+The rapid evolution of generative AI toward agentic, multi‑step, and MoE‑heavy workloads places unprecedented demands on inference infrastructure. Achieving low latency, high throughput, and predictable scaling requires tight hardware–software co‑design. rather than loosely coupled open‑source components.
 
-ATOM (AITER Optimized Model) is AMD’s unified, high‑performance inference engine for AMD Instinct™ GPUs. It provides a consistent, AMD‑optimized execution layer that integrates system‑level scheduling, compiler‑driven graph optimization, and kernel acceleration with scalable distributed inference. ATOM enables faster customer proof‑of‑concepts (POCs), more consistent performance across frameworks, and rapid adoption of new hardware features such as FP8 and emerging FP4 precision.
-
+ATOM (AITER Optimized Model) is AMD’s unified, high‑performance inference engine for AMD Instinct™ GPUs. It provides a consistent, AMD‑optimized execution layer that integrates system‑level scheduling, compiler‑driven graph optimization, and kernel acceleration with scalable distributed inference. ATOM enables faster customer proof‑of‑concepts (POCs), reliable and consistent performance across frameworks, and rapid adoption of new hardware features such as FP8 and emerging FP4 precision.
 By unifying execution across popular open‑source inference frameworks, ATOM positions AMD Instinct GPUs as a production‑ready platform for modern reasoning, MoE, and high‑concurrency inference workloads.
 
 ---
