@@ -14,7 +14,7 @@ ARG AITER_COMMIT="HEAD"
 # Update Triton
 RUN pip show triton || true
 RUN pip uninstall -y triton
-RUN git clone --depth=1 --branch release/internal/3.5.x https://github.com/triton-lang/triton.git /triton-test && \
+RUN git clone --depth=1 --branch release/internal/3.5.x https://github.com/ROCm/triton.git /triton-test && \
   cd /triton-test && \
   pip install -r python/requirements.txt && \
   pip install filecheck && \
