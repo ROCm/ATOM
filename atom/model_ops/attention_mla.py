@@ -22,10 +22,21 @@ from atom.utils.forward_context import (
     ForwardContext,
     get_forward_context,
 )
-
+from atom.model_ops.linear import use_triton_gemm
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
+from aiter import (
+    QuantType,
+    dtypes,
+    get_hip_quant,
+)
+
+if use_triton_gemm():
+    try:
+        from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import fused_gemm_afp4wfp4_preshuffle_split_cat
+    except:
+        fused_gemm_afp4wfp4_preshuffle_split_cat = None
 
 # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 # from aiter import fused_qk_rope_concat_and_cache_mla
@@ -199,7 +210,7 @@ class MLAAttention(nn.Module):
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
         # Convert from (B, N, L) to (N, B, L)
-        if (is_rocm_aiter_fp4bmm_enabled()):
+        if is_rocm_aiter_fp4bmm_enabled():
             output = torch.empty(
                 x.shape[1],
                 x.shape[0],
@@ -266,14 +277,81 @@ class MLAAttention(nn.Module):
     ) -> torch.Tensor:
         assert attn_metadata is not None
 
-        kv_nope = self.kv_b_proj(kv_c_normed).view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-        )
-        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
         if k_rope.dim() == 2:
             k_rope = k_rope.unsqueeze(1)
-        k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
+
+        if use_triton_gemm():
+            weight = self.kv_b_proj.weight
+            weight_scale = self.kv_b_proj.weight_scale
+            if fused_gemm_afp4wfp4_preshuffle_split_cat is not None and weight.dtype == dtypes.fp4x2: # FP4 GEMM + split + cat
+                m = kv_c_normed.shape[0]
+                # from aiter.ops.triton.quant import dynamic_mxfp4_quant
+                # input = kv_c_normed
+                # input_2d = input.view(-1, input.shape[-1])
+                output_dtype = kv_c_normed.dtype
+
+                # q_input, x_scale = dynamic_mxfp4_quant(input_2d)
+                quant_func = get_hip_quant(QuantType.per_1x32)
+                q_input, x_scale = quant_func(
+                    kv_c_normed,
+                    quant_dtype=dtypes.fp4x2,
+                    shuffle=(m >= 32),
+                )
+
+                if m >= 32:
+                    x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+                else:
+                    x_scale = x_scale[:m, ...].view(torch.uint8)
+
+                k, v = fused_gemm_afp4wfp4_preshuffle_split_cat(
+                    q_input.view(torch.uint8),
+                    weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+                    k_rope.expand((-1, self.num_heads, -1)),
+                    x_scale,
+                    weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1),
+                    self.qk_nope_head_dim,
+                    self.v_head_dim,
+                    output_dtype
+                )
+            else:  # FP8 GEMM + split + cat
+                kv_nope = self.kv_b_proj(kv_c_normed).view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+                k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
+
+                # from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import fused_gemm_a8w8_blockscale_split_cat
+                # import aiter as rocm_aiter
+                # from aiter import get_hip_quant
+                # aiter_per1x128_quant = get_hip_quant(rocm_aiter.QuantType.per_1x128)
+                # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
+
+                # input = kv_c_normed
+                # weight = self.kv_b_proj.weight
+                # block_size = self.kv_b_proj.quant_method.quant_config.weight_block_size
+                # weight_scale = self.kv_b_proj.weight_scale
+
+                # input_2d = input.view(-1, input.shape[-1])
+                # output_dtype = input.dtype
+
+                # if current_platform.is_fp8_fnuz():
+                #     q_input, x_scale = aiter_per1x128_quant(
+                #         input_2d.contiguous(), quant_dtype=rocm_aiter.dtypes.fp8)
+                # else:
+                #     q_input, x_scale = per_token_group_quant_fp8(
+                #         input_2d, block_size[1], column_major_scales=False)
+
+                # k, v = fused_gemm_a8w8_blockscale_split_cat(
+                #     q_input, weight, k_rope.expand((-1, self.num_heads, -1)), x_scale, weight_scale, self.qk_nope_head_dim, self.v_head_dim, output_dtype
+                # )
+        else:
+            kv_nope = self.kv_b_proj(kv_c_normed).view(
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+            k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
         output = flash_attn_varlen_func(
             q=q,
