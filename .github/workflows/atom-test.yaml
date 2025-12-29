@@ -64,6 +64,7 @@ jobs:
           fi
 
           if [ -d "/it-share/models" ]; then
+            echo "/it-share/models directory found, mounting to /models"
             MODEL_MOUNT="-v /it-share/models:/models"
           else
             echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
