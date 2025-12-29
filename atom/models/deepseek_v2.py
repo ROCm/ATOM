@@ -49,7 +49,11 @@ from aiter.ops.triton.pa_mqa_logits import (
 )
 from aiter.rotary_embedding import get_rope
 from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
-from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+from aiter.ops.triton.fused_mxfp4_quant import (
+    fused_rms_mxfp4_quant,
+    fused_reduce_rms_mxfp4_quant,
+)
+from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -162,7 +166,7 @@ def _fuse_rmsnorm_fp4_quant(
 ]:
     m = x1.shape[0]
 
-    shuffle_bool = True and (m >= 32)
+    shuffle_bool = shuffle and (m >= 32)
 
     (out1_quantized, out1_bs), _out1_unquantized, out2, out_res1 = fused_rms_mxfp4_quant(
         x1=x1,
@@ -173,12 +177,13 @@ def _fuse_rmsnorm_fp4_quant(
         x2_epsilon=0.0 if x2_epsilon is None else x2_epsilon,
         res1=res1,
         shuffle=shuffle_bool,
-        scale_shuffle_padding=True,
+        scale_shuffle_padding=scale_shuffle_padding,
         output_unquantized_inp1=output_unquantized_inp1,
     )
 
     out1_unquantized = None
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
 
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
@@ -189,8 +194,8 @@ def _fuse_rmsnorm_quant(
     x2_epsilon: float = 0.0,
     res1: Optional[torch.Tensor] = None,
     dtype_quant=dtypes.fp8,
-    shuffle: Optional[bool] = False,
-    scale_shuffle_padding: Optional[bool] = False,
+    shuffle: Optional[bool] = True,
+    scale_shuffle_padding: Optional[bool] = True,
     group_size=128,
     output_unquantized_inp1=False,
     transpose_scale=False,
@@ -226,6 +231,157 @@ def _fuse_rmsnorm_quant(
         raise ValueError(f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}.")
     return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
 
+
+def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
+    hidden_states_quant: torch.Tensor,
+    hidden_states_quant_scale: torch.Tensor,
+    weight_qkv_a_proj: torch.Tensor,
+    weight_scale_qkv_a_proj: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    shuffle: bool = True,
+    scale_shuffle_padding: bool = True,
+    output_unquantized_inp1: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor
+]:
+    M = hidden_states_quant.shape[0]
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    device = hidden_states_quant.device
+    q_c = torch.empty((M, q_lora_rank // 2), dtype=torch.uint8, device=device)
+    scale_n_valid = (q_lora_rank + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    scale_m = ((M + 255) // 256) * 256
+    scale_n = ((scale_n_valid + 7) // 8) * 8
+    q_c_scale = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=device)
+    kv_c_normed = torch.empty((M, kv_lora_rank), dtype=torch.bfloat16, device=device)
+    k_pe = torch.empty((M, q_lora_rank + kv_lora_rank + qk_rope_head_dim), dtype=torch.bfloat16, device=device)[..., :qk_rope_head_dim]
+    return q_c, q_c_scale, kv_c_normed, k_pe
+
+
+@torch_compile_guard(gen_fake=_fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake, mutates_args=[])
+def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
+    hidden_states_quant: torch.Tensor,
+    hidden_states_quant_scale: torch.Tensor,
+    weight_qkv_a_proj: torch.Tensor,
+    weight_scale_qkv_a_proj: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    shuffle: bool = True,
+    scale_shuffle_padding: bool = True,
+    output_unquantized_inp1: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor
+]:
+    M = hidden_states_quant.shape[0]
+
+    if M >= 32:
+        hidden_states_quant_scale = hidden_states_quant_scale.view(torch.uint8).view(hidden_states_quant_scale.shape[0] // 32, -1)
+    else:
+        hidden_states_quant_scale = hidden_states_quant_scale[:M, ...].view(torch.uint8)
+
+    qkv_lora = gemm_afp4wfp4_preshuffle(
+        hidden_states_quant.view(torch.uint8), 
+        weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
+        hidden_states_quant_scale, 
+        weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // 32, -1), 
+        skip_reduce=True)
+
+    q_c, kv_c, k_pe = torch.split(
+                    qkv_lora,
+                    [q_lora_rank, kv_lora_rank, qk_rope_head_dim],
+                    dim=-1,
+                )
+    
+    shuffle_bool = shuffle and (M >= 32)
+
+    k_pe_reduced = None
+    k_pe_reduced_out = None
+    if k_pe.dim() == 3:
+        device = hidden_states_quant.device
+        k_pe_reduced = k_pe
+        k_pe_reduced_out = torch.empty((M, q_lora_rank + kv_lora_rank + qk_rope_head_dim), dtype=torch.bfloat16, device=device)[..., :qk_rope_head_dim]
+    (q_c, q_c_scale), _, kv_c_normed, _, k_pe_reduced_out = fused_reduce_rms_mxfp4_quant(
+        q_c,
+        q_a_layernorm_weight,
+        q_a_layernorm_variance_epsilon, 
+        kv_c,
+        kv_a_layernorm_weight,
+        kv_a_layernorm_variance_epsilon,
+        k_pe_reduced,
+        res1=None,
+        shuffle=shuffle_bool,
+        scale_shuffle_padding=scale_shuffle_padding,
+        output_unquantized_inp1=output_unquantized_inp1,
+        dtype=torch.bfloat16,
+        out3=k_pe_reduced_out,
+    )
+
+    if k_pe_reduced_out is not None:
+        k_pe = k_pe_reduced_out
+    return q_c, q_c_scale, kv_c_normed, k_pe
+
+def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
+    hidden_states_quant: torch.Tensor,
+    hidden_states_quant_scale: torch.Tensor,
+    weight_qkv_a_proj: torch.Tensor,
+    weight_scale_qkv_a_proj: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dtype_quant=dtypes.fp8,
+    shuffle: Optional[bool] = False,
+    scale_shuffle_padding: Optional[bool] = False,
+    group_size: Optional[int] = 128,
+    output_unquantized_inp1: Optional[bool] = False,
+    transpose_scale: Optional[bool] = False,
+):
+    if dtype_quant == dtypes.fp4x2:
+        q_c, q_c_scale, kv_c_normed, k_pe = _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
+            hidden_states_quant,
+            hidden_states_quant_scale,
+            weight_qkv_a_proj,
+            weight_scale_qkv_a_proj,
+            q_a_layernorm_weight,
+            q_a_layernorm_variance_epsilon,
+            kv_a_layernorm_weight,
+            kv_a_layernorm_variance_epsilon,
+            q_lora_rank,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            shuffle,
+            scale_shuffle_padding,
+            output_unquantized_inp1,
+        )
+    elif dtype_quant == dtypes.fp8:
+        # TODO add
+        raise ValueError(f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}.")
+    else:
+        raise ValueError(f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}.")
+
+    
+    # logger.info(f"{q_c.shape=}, {q_c_scale.shape=}, {kv_c_normed.shape=}, {k_pe.shape=}, {q_c.stride()=}, {q_c_scale.stride()=}, {kv_c_normed.stride()=}, {k_pe.stride()=}")
+    return q_c, q_c_scale, kv_c_normed, k_pe
+
 class DeepseekV2MLP(nn.Module):
 
     def __init__(
@@ -238,7 +394,6 @@ class DeepseekV2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        logger.info(f"{reduce_results=}")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             bias=False,
@@ -794,24 +949,19 @@ class DeepseekV2MLAAttention(nn.Module):
             hidden_states, hidden_states_scale = hidden_states
 
         if self.q_lora_rank is not None:
-            qkv_lora = self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
-            # ckq = self.q_a_proj(hidden_states)
-            q_c, kv_c, k_pe = torch.split(
-                qkv_lora,
-                [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
-                dim=-1,
-            )
-            # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
-            if self.fuse_qknorm_quant:
-                (hidden_states_or_q_c, 
-                hidden_states_or_q_c_scale), _, kv_c_normed, _ = _fuse_rmsnorm_quant(
-                    q_c,
+            if self.fuse_qknorm_quant and self.quant_dtype != dtypes.fp8:
+                q_c, q_c_scale, kv_c_normed, k_pe = _fuse_qkv_a_proj_reduce_rmsnorm_quant(
+                    hidden_states,
+                    hidden_states_scale,
+                    self.fused_qkv_a_proj.weight,
+                    self.fused_qkv_a_proj.weight_scale,
                     self.q_a_layernorm.weight,
                     self.q_a_layernorm.eps,
-                    kv_c,
                     self.kv_a_layernorm.weight,
                     self.kv_a_layernorm.eps,
-                    None,
+                    self.q_lora_rank,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
                     dtype_quant=self.quant_dtype,
                     shuffle=True,
                     scale_shuffle_padding=True,
@@ -819,8 +969,36 @@ class DeepseekV2MLAAttention(nn.Module):
                     output_unquantized_inp1=False,
                     transpose_scale=False,
                 )
+                hidden_states_or_q_c = q_c
+                hidden_states_or_q_c_scale = q_c_scale
             else:
-                hidden_states_or_q_c = self.q_a_layernorm(q_c)
+                qkv_lora = self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
+                # ckq = self.q_a_proj(hidden_states)
+                q_c, kv_c, k_pe = torch.split(
+                    qkv_lora,
+                    [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
+                    dim=-1,
+                )
+                # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
+                if self.fuse_qknorm_quant:
+                    (hidden_states_or_q_c, 
+                    hidden_states_or_q_c_scale), _, kv_c_normed, _ = _fuse_rmsnorm_quant(
+                        q_c,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.eps,
+                        kv_c,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.eps,
+                        None,
+                        dtype_quant=self.quant_dtype,
+                        shuffle=True,
+                        scale_shuffle_padding=True,
+                        group_size=128,
+                        output_unquantized_inp1=False,
+                        transpose_scale=False,
+                    )
+                else:
+                    hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
             hidden_states_or_q_c = hidden_states
             kv_c, k_pe = torch.split(self.kv_a_proj_with_mqa(hidden_states, hidden_states_scale),
@@ -948,8 +1126,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                     None,
                     None,
                     dtype_quant=self.quant_dtype,
-                    shuffle=False,
-                    scale_shuffle_padding=False,
+                    shuffle=True,
+                    scale_shuffle_padding=True,
                     group_size=128,
                     output_unquantized_inp1=False,
                     transpose_scale=False,
@@ -964,8 +1142,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                     None,
                     residual,
                     dtype_quant=self.quant_dtype,
-                    shuffle=False,
-                    scale_shuffle_padding=False,
+                    shuffle=True,
+                    scale_shuffle_padding=True,
                     group_size=128,
                     output_unquantized_inp1=False,
                     transpose_scale=False,
@@ -1062,7 +1240,6 @@ class DeepseekV2Model(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
-            logger.info(f"fuse_ar_input_norm {self.layers[self.end_layer - 1].fuse_ar_input_norm}")
             self.norm = RMSNorm(config.hidden_size,
                                 eps=config.rms_norm_eps,
                                 fused_allreduce=self.layers[self.end_layer - 1].fuse_ar_input_norm,)
