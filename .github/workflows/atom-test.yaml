@@ -25,6 +25,9 @@ jobs:
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
+          - model_name: "gpt-oss-120b"
+            model_path: "openai/gpt-oss-120b"
+            extraArgs: "--kv_cache_dtype fp8"
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
