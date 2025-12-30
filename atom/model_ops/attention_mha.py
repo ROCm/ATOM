@@ -54,7 +54,6 @@ class Attention(nn.Module):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
-        self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
         self.rotary_emb = rotary_emb
@@ -133,7 +132,7 @@ class Attention(nn.Module):
                 )
 
             # TODO: if kv_scale has value, do not use one scale here.
-            k_scale = v_scale = self.one_scale
+            k_scale = v_scale = self.kv_scale
 
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
@@ -247,8 +246,8 @@ class Attention(nn.Module):
             context_partition_size,
             tl.bfloat16, #compute_type
             None,
-            self.one_scale,
-            self.one_scale,
+            self.kv_scale,
+            self.kv_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
@@ -344,8 +343,8 @@ class Attention(nn.Module):
             block_table=block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.one_scale.expand(descale_shape),
-            v_descale=self.one_scale.expand(descale_shape),
+            k_descale=self.kv_scale.expand(descale_shape),
+            v_descale=self.kv_scale.expand(descale_shape),
             sinks=self.sinks,
         )
         
