@@ -22,12 +22,16 @@ jobs:
           - model_name: "Meta-Llama-3-8B-Instruct"
             model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
             extraArgs: "--kv_cache_dtype fp8"
+            env_vars: ""
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
+            env_vars: ""
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8"
+            env_vars: |
+              ATOM_GPT_OSS_MODEL=1
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
@@ -70,7 +74,14 @@ jobs:
             MODEL_MOUNT=""
           fi
 
+          cat > /tmp/env_file.txt << 'EOF'
+          ${{ matrix.env_vars }}
+          EOF
+
           echo "Starting container: atom_test:ci"
+          echo "Model-specific environment variables for ${{ matrix.model_name }}:"
+          cat /tmp/env_file.txt
+
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           $MODEL_MOUNT \
@@ -81,6 +92,7 @@ jobs:
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
+          --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \

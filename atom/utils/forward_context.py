@@ -9,6 +9,9 @@ from atom.config import Config, KVCacheTensor
 import torch
 from abc import ABC, abstractmethod
 from atom.config import Config, ParallelConfig
+from atom.utils import envs
+
+gpt_oss_model = envs.ATOM_GPT_OSS_MODEL
 
 def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
                                       max_num_tokens: int,
@@ -288,8 +291,9 @@ def set_forward_context(
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
 
-    # TODO: will be removed. now prefill attention need fake block tables.
-    if _forward_context.context.is_prefill:
+    # TODO: will be removed. Now gpt-oss model has sink and sliding window config,
+    # prefill attention need fake block tables to be compatible with paged attention.
+    if _forward_context.context.is_prefill and gpt_oss_model:
         # TODO: will be removed
         cu_seqlens_q = attn_metadata.cu_seqlens_q
         max_seqlen_q = attn_metadata.max_seqlen_q
