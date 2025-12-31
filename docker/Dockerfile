@@ -11,6 +11,7 @@ ARG ATOM_COMMIT="HEAD"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
+ARG MAX_JOBS
 
 RUN pip install --upgrade pip
 RUN pip install lm-eval[api]
@@ -33,7 +34,7 @@ RUN git clone $AITER_REPO /aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
-    PREBUILD_KERNELS=$PREBUILD_KERNELS GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+    MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 RUN pip show amd-aiter || true
 
 # Install ATOM
