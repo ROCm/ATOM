@@ -274,7 +274,6 @@ class Qwen3MoeAttention(nn.Module):
         )
 
         if ENABLE_QK_NORM_ROPE_FUSION or ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-        # if ENABLE_QK_NORM_ROPE_FUSION:
             self.rotary_emb = RotaryEmbeddingQKNormFused(
                 head_size=self.head_dim,
                 rotary_dim=self.head_dim,
@@ -305,8 +304,6 @@ class Qwen3MoeAttention(nn.Module):
                 rotary_emb=self.rotary_emb,
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
-                use_triton_prefill=False,
-                use_triton_decode=False,
             )
         elif ENABLE_QK_NORM_ROPE_FUSION:
             self.attn = Attention(
@@ -317,8 +314,6 @@ class Qwen3MoeAttention(nn.Module):
                 kv_cache_dtype=kv_cache_dtype,
                 layer_num=layer_num,
                 use_mla=False,
-                use_triton_prefill=False,
-                use_triton_decode=False,
             )
         else:
             self.attn = Attention(
@@ -329,6 +324,7 @@ class Qwen3MoeAttention(nn.Module):
                 kv_cache_dtype=kv_cache_dtype,
                 layer_num=layer_num,
                 use_mla=False,
+                rotary_emb=self.rotary_emb,
             )
         self.kv_cache_dtype = kv_cache_dtype
         self.layer_num = layer_num
@@ -361,7 +357,6 @@ class Qwen3MoeAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-            q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
         output = self.o_proj(attn_output)
         return output

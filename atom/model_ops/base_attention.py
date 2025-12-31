@@ -72,8 +72,6 @@ class Attention(nn.Module):
         per_layer_sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
         prefix: Optional[str] = None,
-        use_triton_prefill: bool = True,
-        use_triton_decode: bool = True,
         q_norm: Optional[torch.nn.Module] = None,
         k_norm: Optional[torch.nn.Module] = None,
         **kwargs,
@@ -115,8 +113,6 @@ class Attention(nn.Module):
             sliding_window=per_layer_sliding_window,
             rotary_emb=rotary_emb,
             dtype=dtype,
-            use_triton_prefill=use_triton_prefill,
-            use_triton_decode=use_triton_decode,
             q_norm=q_norm,
             k_norm=k_norm,
         )

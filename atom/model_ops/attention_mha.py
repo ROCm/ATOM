@@ -21,10 +21,10 @@ from aiter.ops.triton.unified_attention import unified_attention
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
-from aiter.dist.parallel_state import get_tp_group
 
 from atom.utils import envs
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+ATOM_ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
 
 class Attention(nn.Module):
 
@@ -40,8 +40,6 @@ class Attention(nn.Module):
         sinks: Optional[nn.Parameter] = None,
         sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
-        use_triton_prefill: bool = True,
-        use_triton_decode: bool = True,
         q_norm: Optional[torch.nn.Module] = None,
         k_norm: Optional[torch.nn.Module] = None,
         **kwargs,
@@ -65,11 +63,12 @@ class Attention(nn.Module):
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
         self.rotary_emb = rotary_emb
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            assert self.rotary_emb is not None, "rotary_emb must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
+            assert self.q_norm is not None, "q_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
+            assert self.k_norm is not None, "k_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
         # kv cache layout
         self.flash_layout = False
-        # backend selection
-        self.use_triton_prefill = use_triton_prefill
-        self.use_triton_decode = use_triton_decode
         self.q_norm = q_norm
         self.k_norm = k_norm
 
@@ -129,7 +128,12 @@ class Attention(nn.Module):
         v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
-        
+
+        use_triton_attn = (
+            self.sliding_window != -1 or self.head_dim != 128
+        )
+        self.use_triton_attn = use_triton_attn
+
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
@@ -157,7 +161,42 @@ class Attention(nn.Module):
             q, k, v = qkv.split([self.num_heads,
                                 self.num_kv_heads,
                                 self.num_kv_heads], dim=1)
-        elif self.rotary_emb is None:
+        elif use_triton_attn or not ATOM_ENABLE_QK_NORM_ROPE_FUSION:
+            if flash_layout:
+                k_cache = k_cache.view(
+                    k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                )
+                v_cache = v_cache.view(
+                    v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
+                )
+
+            # TODO: if kv_scale has value, do not use one scale here.
+            k_scale = v_scale = self.kv_scale
+
+            q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                position,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                k_scale,
+                v_scale,
+                self.rotary_emb.is_neox_style,
+                flash_layout=flash_layout,
+                apply_scale=self.kv_cache_dtype.startswith("fp8"),
+                offs=None,
+                q_out=q,
+                k_out=k,
+                output_zeros=False,
+            )
+        else:
+            # for asm paged attention 
+            assert position is not None
+            q, k = self.rotary_emb(position, q, k)
             if self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
@@ -181,39 +220,6 @@ class Attention(nn.Module):
                     v_scale=None,
                     asm_layout=True,
                 )
-        else:
-            # TODO: if kv_scale has value, do not use one scale here.
-            # if k_scale is None and v_scale is None:
-            #    k_scale = v_scale = self.one_scale
-            k_scale = v_scale = self.one_scale
-            if flash_layout:
-                k_cache = k_cache.view(
-                    k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                )
-                v_cache = v_cache.view(
-                    v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                )
-            
-            q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
-                q,
-                k,
-                v,
-                k_cache,
-                v_cache,
-                attn_metadata.slot_mapping,
-                position,
-                self.rotary_emb.cos_cache,
-                self.rotary_emb.sin_cache,
-                k_scale,
-                v_scale,
-                self.rotary_emb.is_neox_style,
-                flash_layout=flash_layout,
-                apply_scale=self.kv_cache_dtype.startswith("fp8"),
-                offs=None,
-                q_out=q,
-                k_out=k,
-                output_zeros=False,
-            )
         
         return q, k, v, k_cache, v_cache, k_scale, v_scale
         
@@ -279,8 +285,8 @@ class Attention(nn.Module):
             context_partition_size,
             tl.bfloat16, #compute_type
             None,
-            self.one_scale,
-            self.one_scale,
+            self.kv_scale,
+            self.kv_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
@@ -375,8 +381,8 @@ class Attention(nn.Module):
             block_table=block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.one_scale.expand(descale_shape),
-            v_descale=self.one_scale.expand(descale_shape),
+            k_descale=self.kv_scale.expand(descale_shape),
+            v_descale=self.kv_scale.expand(descale_shape),
             sinks=self.sinks,
         )
         
@@ -386,25 +392,14 @@ class Attention(nn.Module):
         
         ctx = fwd_args.context
 
-        # add use_triton_prefill=False and use_triton_decode=False for Qwen,
-        # which use asm backend for prefill,
-        # use gluon pa for decode when batch size is 64.
         if ctx.is_prefill:
-            if self.sliding_window or self.sinks is not None:
-                if self.use_triton_prefill:
-                    return self.prefill_attention_triton
-                else:
-                    return self.prefill_attention_asm
+            if self.use_triton_attn:
+                return self.prefill_attention_triton
             else:
                 return self.prefill_attention_asm
         else:
-            if self.sliding_window or self.sinks is not None:
-                if self.use_triton_decode:
-                    return self.paged_attention_triton
-                else:
-                    if ctx.batch_size == 64:
-                        return self.paged_attention_triton
-                    else:
-                        return self.paged_attention_asm
+            if self.use_triton_attn:
+                return self.paged_attention_triton
             else:
-                return self.paged_attention_asm
+                # Qwen only uses gluon pa decode when bs=64
+                return self.paged_attention_triton if ctx.batch_size == 64 else self.paged_attention_asm

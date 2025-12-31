@@ -218,7 +218,7 @@ class AttentionMetaData:
         if block_tables_converted is not None:
             self.block_tables = block_tables_converted
         if kv_indices_converted is not None:
-            self.kv_indices = kv_indices_converted        
+            self.kv_indices = kv_indices_converted
 
     def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
