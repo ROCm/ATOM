@@ -32,6 +32,14 @@ from aiter.utility import fp4_utils
 from atom.utils import envs
 
 
+def use_triton_gemm() -> bool:
+    return envs.ATOM_USE_TRITON_GEMM
+
+if use_triton_gemm():
+    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
+else:
+    gemm_a8w8_blockscale_preshuffle = None
+
 def divide(numerator, denominator):
     assert (
         numerator % denominator == 0
@@ -128,6 +136,29 @@ def gemm_a4w4_quant(
         )
 
     return y[:m, ...]
+
+
+def gemm_a8w8_blockscale_preshuffle_fake(x: torch.Tensor, weight: torch.Tensor,
+                                         x_scale: torch.Tensor, w_scale: torch.Tensor,
+                                         dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    return torch.empty(
+        (*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device
+    )
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_preshuffle_fake, mutates_args=[])
+def gemm_a8w8_blockscale_preshuffle_impl(x: torch.Tensor, weight: torch.Tensor,
+                                         x_scale: torch.Tensor, w_scale: torch.Tensor,
+                                         dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    if gemm_a8w8_blockscale_preshuffle is None:
+        weight_shuffled = weight.reshape(
+            weight.shape[0] // 16,
+            weight.shape[1] * 16
+        )
+        y = gemm_a8w8_blockscale_preshuffle(x, weight_shuffled, x_scale, w_scale, dtype)
+    else:
+        y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+    return y
 
 
 class LinearBase(nn.Module):
@@ -355,7 +386,7 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
-                y = gemm_a8w8_blockscale_bpreshuffle(
+                y = gemm_a8w8_blockscale_preshuffle_impl(
                     x, self.weight, x_scale, self.weight_scale, dtype=otype
                 )
                 if self.bias is not None:
