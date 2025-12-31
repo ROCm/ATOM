@@ -56,7 +56,12 @@ class Attention(nn.Module):
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
         self.layer_num = layer_num
-        self.one_scale = torch.tensor(1.0, dtype=torch.float32)
+        self.kv_scale_float = (
+            torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
+            if self.kv_cache_dtype == "fp8"
+            else 1.0
+        )
+        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
         self.rotary_emb = rotary_emb

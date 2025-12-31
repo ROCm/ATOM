@@ -14,19 +14,26 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu
+    runs-on: atom-mi355-8gpu.predownload
     strategy:
       fail-fast: false
       matrix:
         include:
           - model_name: "Meta-Llama-3-8B-Instruct"
             model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
-            extraArgs: ""
+            extraArgs: "--kv_cache_dtype fp8"
+            env_vars: ""
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
+            env_vars: ""
+          - model_name: "gpt-oss-120b"
+            model_path: "openai/gpt-oss-120b"
+            extraArgs: "--kv_cache_dtype fp8"
+            env_vars: |
+              ATOM_GPT_OSS_MODEL=1
     env:
-      ATOM_BASE_IMAGE: rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+      ATOM_BASE_IMAGE: rocm/pytorch:latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -38,36 +45,16 @@ jobs:
         run: |
           docker pull ${{ env.ATOM_BASE_IMAGE }}
 
-      - name: Generate Dockerfile
-        run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_IMAGE }}
-
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
-          RUN pip uninstall -y aiter
-          RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip show pybind11
-          
-          RUN git clone https://github.com/ROCm/aiter.git /aiter-test && \
-            cd /aiter-test && \
-            git checkout main && \
-            git submodule sync && git submodule update --init --recursive && \
-            python3 setup.py develop
-
-          RUN echo "=== Installing ATOM ==="
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /ATOM && \
-            cd /ATOM && \
-            git checkout ${{ env.GITHUB_COMMIT_SHA }} && \
-            pip install .
-          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          EOF
-
-      - name: Show Dockerfile
-        run: cat Dockerfile.mod
-
       - name: Build Docker image
         run: |
-          docker build --network=host -t atom_test:ci -f Dockerfile.mod .
+          docker build --network=host \
+            -t atom_test:ci \
+            --build-arg BASE_IMAGE=${{ env.ATOM_BASE_IMAGE }} \
+            --build-arg PREBUILD_KERNELS=0 \
+            --build-arg GPU_ARCH=gfx950 \
+            --build-arg ATOM_REPO=${{ env.GITHUB_REPO_URL }} \
+            --build-arg ATOM_COMMIT=${{ env.GITHUB_COMMIT_SHA }} \
+            -f docker/Dockerfile .
 
       - name: Start CI container
         run: |
@@ -80,17 +67,36 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          if [ -d "/models" ]; then
+            MODEL_MOUNT="-v /models:/models"
+          else
+            echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
+            MODEL_MOUNT=""
+          fi
+
+          cat > /tmp/env_file.txt << 'EOF'
+          ${{ matrix.env_vars }}
+          EOF
+
           echo "Starting container: atom_test:ci"
+          echo "Model-specific environment variables for ${{ matrix.model_name }}:"
+          cat /tmp/env_file.txt
+
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          $MODEL_MOUNT \
+          -w /workspace \
           --ipc=host --group-add video \
           --shm-size=16G \
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
+          --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
           --name atom_test \
           atom_test:ci
 
@@ -101,18 +107,38 @@ jobs:
         run: |
           docker exec atom_test df -h /dev/shm
 
-      - name: Run ATOM tests
-        timeout-minutes: 60
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
+            if ! docker exec atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
+      - name: Run ATOM simple inference
+        timeout-minutes: 30
         run: |
           # Run the inference and capture output
           set -euo pipefail
           echo ""
           echo "========== Running test =========="
 
+          if [ -d "/models" ]; then
+            model_path="/models/${{ matrix.model_path }}"
+          else
+            model_path="${{ matrix.model_path }}"
+          fi
+          echo "Model path: $model_path"
+          echo "ls -la $model_path"
+          ls -la $model_path
           docker exec atom_test bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
-              --model ${{ matrix.model_path }} \
+              --model \"$model_path\" \
               ${{ matrix.extraArgs }} \
               --temperature 0 \
             | grep -E '^Prompt: |^Completion:'
@@ -122,18 +148,39 @@ jobs:
           echo "========== Showing test output below =========="
           cat atom_test_output.txt
 
-          echo ""
+      - name: Compare output with golden outputs
+        timeout-minutes: 30
+        if: ${{ matrix.model_name == 'Meta-Llama-3-8B-Instruct' }}
+        run: |
           echo "========== Comparing output with golden outputs =========="
-          # Ignore whitespace and EOL differences in the diff
-          diff -u -B -w --strip-trailing-cr atom_test_output.txt .github/workflows/golden_outputs.txt || true
-          DIFF_EXIT_CODE=$?
-          
-          if [ $DIFF_EXIT_CODE -ne 0 ]; then
-            echo "Output does not match golden outputs."
+          if ! diff -u -B -w --strip-trailing-cr \
+            atom_test_output.txt \
+            ".github/workflows/golden_outputs/${{ matrix.model_name }}_golden_output.txt"; then
+            echo "Failed: Output does not match golden outputs."
             exit 1
           else
-            echo "Output matches golden outputs."
+            echo "Success: Output matches golden outputs."
           fi
+      
+      - name: Run ATOM accuracy test
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========== Launching ATOM server =========="
+          if [ -d "/models" ]; then
+            model_path="/models/${{ matrix.model_path }}"
+          else
+            model_path="${{ matrix.model_path }}"
+          fi
+          docker exec atom_test bash -lc "
+            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
+          "
+          echo ""
+          echo "========== Running accuracy test =========="
+          docker exec atom_test bash -lc "
+            .github/scripts/atom_test.sh accuracy $model_path
+          "
 
       - name: Upload output
         if: always()
@@ -145,5 +192,11 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
+          # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
+          # We should use non-root user to run the test to avoid this issue.
+          set -x
+          echo "========== Cleaning up workspace =========="
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
           docker stop atom_test || true
           docker rm atom_test || true
+          

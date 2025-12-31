@@ -50,6 +50,7 @@ from aiter.ops.triton.pa_mqa_logits import (
 from aiter.rotary_embedding import get_rope
 from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -58,7 +59,6 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.fp8_mqa_logits import fp8_mqa_logits
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -338,6 +338,7 @@ def sparse_attn_indexer(
         num_tokens = hidden_states.shape[0]
         logits = fp8_mqa_logits(Q=q_fp8[num_decode_tokens:num_tokens], KV=k_fp8, kv_scales=k_scale, weights=weights[num_decode_tokens:num_tokens],
                                 cu_starts=cu_seqlen_ks, cu_ends=cu_seqlen_ke)
+        
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices = topk_indices_buffer[

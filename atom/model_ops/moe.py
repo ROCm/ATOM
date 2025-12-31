@@ -38,6 +38,7 @@ from atom.model_ops.utils import (
 )
 from atom.utils.custom_register import direct_register_custom_op
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.jit.utils.chip_info import get_gfx
 from atom.utils import envs
 
 
@@ -387,6 +388,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
+        self.use_triton = get_gfx().startswith("gfx94")
+        if self.use_triton:
+            from atom.model_ops.fused_moe_triton import has_triton_kernels
+
+            assert has_triton_kernels(), "triton_kernels is not installed"
 
     def create_weights(
         self,
@@ -498,7 +504,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
-        if layer.activation == ActivationType.Swiglu and layer.w13_bias is not None:
+        if self.use_triton:
+            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
+            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+                layer.w13_weight.view(torch.uint8),
+                layer.w13_weight_scale,
+            )
+            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+                layer.w2_weight.view(torch.uint8),
+                layer.w2_weight_scale,
+            )
+
+            self.w13_precision_config = PrecisionConfig(
+                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            )
+            self.w2_precision_config = PrecisionConfig(
+                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            )
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            layer.w13_weight = w13_weight
+            layer.w2_weight = w2_weight
+            layer.w13_weight_scale = None
+            layer.w2_weight_scale = None
+            return
+        elif layer.activation == ActivationType.Swiglu and layer.w13_bias is not None:
             e, n, k = layer.w13_weight.shape
             layer.w13_weight.view(torch.uint8).copy_(
                 layer.w13_weight.data.view(torch.uint8)
@@ -581,6 +615,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        if self.use_triton:
+            from atom.model_ops.fused_moe_triton import triton_kernel_moe_forward
+
+            return triton_kernel_moe_forward(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                activation=activation,
+                w13_precision_config=self.w13_precision_config,
+                w2_precision_config=self.w2_precision_config,
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                expert_map=expert_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+            )
+
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,

@@ -83,7 +83,6 @@ class Scheduler:
     def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
         # prefill
         scheduled_seqs = {}
-        scheduled_seqs2 = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
 

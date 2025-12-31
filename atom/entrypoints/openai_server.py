@@ -381,17 +381,75 @@ async def generate_async(
     """
     global engine, tokenizer
 
-    async for output in engine.generate_async(prompt, sampling_params, request_id):
-        yield {
-            "text": output["text"],
-            "token_ids": output["token_ids"],
-            "finish_reason": output.get("finish_reason"),
-            "num_tokens_input": len(tokenizer.encode(prompt)),
-            "num_tokens_output": len(output["token_ids"]),
-            "ttft": output.get("ttft", 0.0),
-            "tpot": output.get("tpot", 0.0),
-            "latency": output.get("latency", 0.0),
-        }
+    token_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    started_at = time.time()
+    first_token_at: Optional[float] = None
+    last_token_at: Optional[float] = None
+    all_token_ids: List[int] = []
+    finish_reason: Optional[str] = None
+    seq = None
+
+    def completion_callback(request_output: RequestOutput):
+        """Callback that receives incremental tokens and completion signal."""
+        now = time.time()
+        loop.call_soon_threadsafe(
+            token_queue.put_nowait,
+            {
+                "token_ids": request_output.output_tokens,
+                "finished": request_output.finished,
+                "finish_reason": request_output.finish_reason,
+                "ts": now,
+            },
+        )
+
+    def do_preprocess():
+        return engine.io_processor.preprocess(
+            prompt, sampling_params, stream_callback=completion_callback
+        )
+
+    seq = await loop.run_in_executor(None, do_preprocess)
+
+    engine.core_mgr.add_request([seq])
+
+    # Consume tokens until finished
+    while True:
+        item = await token_queue.get()
+        token_ids = item.get("token_ids") or []
+        if token_ids:
+            if first_token_at is None:
+                first_token_at = item.get("ts", time.time())
+            last_token_at = item.get("ts", time.time())
+            all_token_ids.extend(token_ids)
+        if item.get("finished", False):
+            finish_reason = item.get("finish_reason")
+            break
+
+    text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
+    num_tokens_input = seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
+    num_tokens_output = len(all_token_ids)
+    finished_at = time.time()
+    latency = finished_at - started_at
+    ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
+    tpot = (
+        (last_token_at - first_token_at) / (num_tokens_output - 1)
+        if first_token_at is not None
+        and last_token_at is not None
+        and num_tokens_output > 1
+        else 0.0
+    )
+
+    yield {
+        "text": text,
+        "token_ids": all_token_ids,
+        "finish_reason": finish_reason,
+        "num_tokens_input": num_tokens_input,
+        "num_tokens_output": num_tokens_output,
+        "ttft": ttft,
+        "tpot": tpot,
+        "latency": latency,
+    }
 
 
 def validate_model(requested_model: Optional[str]) -> None:
@@ -847,9 +905,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model_name = args.model
 
-    print(f"Initializing async engine with model {args.model}...")
+    print(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
-    engine = engine_args.create_async_engine()
+    engine = engine_args.create_engine()
 
     print(f"Starting server on {args.host}:{args.server_port}...")
     uvicorn.run(app, host=args.host, port=args.server_port)
