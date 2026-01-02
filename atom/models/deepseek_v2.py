@@ -286,7 +286,7 @@ def _fuse_rmsnorm_quant(
         output_unquantized_inp1,
     )
     elif dtype_quant == dtypes.fp8:
-        (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = fused_rms_fp8_group_quant(
+        (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = _fused_rms_fp8_group_quant(
             x1,
             x1_weight,
             x1_epsilon,

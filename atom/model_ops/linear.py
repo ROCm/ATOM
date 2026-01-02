@@ -29,15 +29,17 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
+from aiter import gemm_a4w4, per_1x32_f4_quant_hip
 from atom.utils import envs
-
 
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
 if use_triton_gemm():
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
     from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
 else:
+    gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_preshuffle = None
 
 def divide(numerator, denominator):
@@ -45,17 +47,6 @@ def divide(numerator, denominator):
         numerator % denominator == 0
     ), f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
-
-def use_triton_gemm() -> bool:
-    return envs.ATOM_USE_TRITON_GEMM
-
-if use_triton_gemm():
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
-else:
-    gemm_afp4wfp4_preshuffle = None
-
-from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter import gemm_a4w4, per_1x32_f4_quant_hip
 
 def gemm_a4w4_quant_fake(
     x: torch.Tensor, 
