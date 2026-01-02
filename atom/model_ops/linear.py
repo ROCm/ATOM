@@ -150,7 +150,7 @@ def gemm_a8w8_blockscale_preshuffle_fake(x: torch.Tensor, weight: torch.Tensor,
 def gemm_a8w8_blockscale_preshuffle_impl(x: torch.Tensor, weight: torch.Tensor,
                                          x_scale: torch.Tensor, w_scale: torch.Tensor,
                                          dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    if gemm_a8w8_blockscale_preshuffle is None:
+    if gemm_a8w8_blockscale_preshuffle is not None:
         weight_shuffled = weight.reshape(
             weight.shape[0] // 16,
             weight.shape[1] * 16
