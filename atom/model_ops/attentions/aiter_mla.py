@@ -330,7 +330,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
-        # if str(positions.device) == "cuda:0":
+        if str(positions.device) == "cuda:0":
+            print(f"{context_lens=}")
+            print(f"{positions=}")
+            print(f"{slot_mapping=}")
+            print(f"{batch.block_tables=}")
+            print(f"{kv_indptr=}")
+            print(f"kv_indices {sum_blocks=}")
         #     for el, var in ctx.items():
         #         print(f"{el}: {var}")
         return attn_metadata, positions

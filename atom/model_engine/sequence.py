@@ -60,6 +60,9 @@ class Sequence:
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
 
+        # save speculative tokens if is_deferred_output = False or prefill is inter
+        self.spec_token_ids: list[int] = []
+
         # statistics fields
         self.arrive_time = 0.0
         self.first_token_time = 0.0
@@ -123,6 +126,8 @@ class Sequence:
         self.output_tokens.append(token_id)
         self.num_tokens += 1
 
+    def __repr__(self):
+        return f"Sequence ({self.id=}, {self.token_ids=}, {self.spec_token_ids})"
     # def __getstate__(self):
     #     return (
     #         self.num_tokens,
