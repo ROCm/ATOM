@@ -4,6 +4,7 @@
 import logging
 import time
 from collections import deque
+from typing import Optional
 
 import numpy as np
 from atom.config import Config
@@ -26,6 +27,7 @@ class ScheduledBatch:
         total_seqs_num_prefill: int = 0,
         total_seqs_num_decode: int = 0,
         req_id_to_index: dict[int, int] = {},
+        scheduled_spec_decode_tokens: dict[int, list[int]] = {},
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
         # self.seqs = seqs
@@ -34,8 +36,8 @@ class ScheduledBatch:
             seq.token_ids[-num_tokens:]
             for seq, num_tokens in zip(seqs.values(), num_scheduled_tokens)
         ]
-        # print(f"{num_scheduled_tokens=}")
-        # print(f"{self.scheduled_tokens=}")
+        print(f"{num_scheduled_tokens=}")
+        print(f"{self.scheduled_tokens=}")
         self.temperatures = [seq.temperature for seq in seqs.values()]
         self.context_lens = [seq.num_tokens for seq in seqs.values()]
         self.block_tables = [
@@ -59,7 +61,7 @@ class ScheduledBatch:
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
         self.req_id_to_index = req_id_to_index
-
+        self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
 
 class Scheduler:
 
@@ -93,6 +95,7 @@ class Scheduler:
         num_batched_tokens = 0
 
         num_scheduled_tokens: list[int] = []
+        scheduled_spec_decode_tokens: dict[int, list[int]] = {}
 
         if not self.running and not self.waiting:
             # self.block_manager.reset()
@@ -121,7 +124,7 @@ class Scheduler:
 
         if num_seqs_prefill > 0:
             logger.info(
-                f"scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens"
+                f"scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens, keys: {scheduled_seqs.keys()}"
             )
             # lip: TODO for prefill/decode mixed batch
             return (
@@ -149,6 +152,8 @@ class Scheduler:
                     break
             else:
                 req_id_to_index[seq.id] = num_seqs_decode
+                if seq.spec_token_ids:
+                    scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
 
                 num_seqs_decode += 1
                 self.block_manager.may_append(seq)
@@ -162,9 +167,9 @@ class Scheduler:
 
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs.values()))
-        # logger.info(
-        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens"
-        # )
+        logger.info(
+            f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, keys: {scheduled_seqs.keys()}"
+        )
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -175,6 +180,7 @@ class Scheduler:
                 total_seqs_num_prefill=num_seqs_prefill,
                 total_seqs_num_decode=num_seqs_decode,
                 req_id_to_index=req_id_to_index,
+                scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             ),
             scheduled_seqs,
         )
@@ -188,9 +194,12 @@ class Scheduler:
         self,
         seqs: list[Sequence],
         prev_token_ids: dict[int, list[int]],
+        draft_token_ids: Optional[dict[int, list[int]]],
         stream_output_queue=None,
     ) -> list[Sequence]:
         is_deferred_out = prev_token_ids.get(-1, False)
+        print(f"{draft_token_ids=}")
+        # print(f"{is_deferred_out=}")
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
@@ -200,13 +209,13 @@ class Scheduler:
             self.mtp_k     if self.use_spec else
             0
         )
-
+        print(f"{num_placeholder=}")
         for seq in self.running:
             if seq.id not in prev_token_ids:
                 continue
             token_ids = prev_token_ids[seq.id]
             new_tokens = []
-            if is_deferred_out:
+            if is_deferred_out or (self.use_spec and self.eos_token_id == seq.token_ids[-1]):
                 seq.token_ids[-num_placeholder:] = token_ids
 
                 if seq.output_tokens:
@@ -221,6 +230,10 @@ class Scheduler:
                     seq.append_token(token_id)
 
             new_tokens = token_ids
+
+            if draft_token_ids and seq.id in draft_token_ids:
+                seq.spec_token_ids = draft_token_ids[seq.id]
+                print(f"{seq=}")
 
             if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()

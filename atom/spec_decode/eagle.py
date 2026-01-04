@@ -1,7 +1,9 @@
-from atom.config import CompilationLevel, Config
 import torch
 import torch.nn as nn
 import numpy as np
+
+from atom.config import CompilationLevel, Config
+from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils.forward_context import AttentionMetaData, get_forward_context
 from atom.model_loader.loader import load_model
 from atom.models.deepseek_mtp import DeepSeekMTP
@@ -122,8 +124,10 @@ class EagleProposer:
         target_hidden_states: torch.Tensor,
         # [batch_size]
         next_token_ids: torch.Tensor,
+        # batch: ScheduledBatch,
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
+        bs = next_token_ids.shape[0]
 
         forward_context = get_forward_context()
         forward_context.context.is_draft = True
@@ -144,20 +148,20 @@ class EagleProposer:
         self.positions[:num_tokens] = target_positions
         self.hidden_states[:num_tokens] = target_hidden_states
 
-        inputs_embeds = None
         input_ids = self.input_ids[:num_input_tokens]
 
         ret_hidden_states = self.model(
             input_ids=input_ids,
             positions=self.positions[:num_input_tokens],
             hidden_states=self.hidden_states[:num_input_tokens],
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=None,
         )
         last_hidden_states = ret_hidden_states
         hidden_states = last_hidden_states
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        positions = target_positions[last_token_indices]
         hidden_states = hidden_states[last_token_indices]
 
         draft_token_ids = logits.argmax(dim=-1)
@@ -170,8 +174,33 @@ class EagleProposer:
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
-        for _ in range(self.mtp_k - 1):
-            pass  # TODO: support multiple num_speculative_tokens
+        # attn_metadata.cu_seqlens_q = self.arange[:bs + 1]
+        # attn_metadata.max_q_len = 1
+
+        # for i in range(self.mtp_k - 1):
+        #     input_ids = draft_token_ids_list[-1].int()
+        #     positions += 1
+        #     forward_context.context.is_prefill = False
+
+        #     attn_metadata, pos = self.runner.attn_metadata_builder.build_for_drafting(batch, bs, i+1)
+        #     print(f"{attn_metadata.max_q_len=}")
+        #     print(f"{attn_metadata.slot_mapping=}")
+        #     print(f"{attn_metadata.context_lens=}")
+        #     print(f"{attn_metadata.block_tables=}")
+        #     print(f"{attn_metadata.kv_indices=}")
+        #     print(f"{attn_metadata.kv_last_page_lens=}")
+        #     print(f"{attn_metadata.kv_indptr=}")
+        #     print(f"{pos=}")
+
+        #     hidden_states = self.model(
+        #         input_ids=input_ids,
+        #         positions=positions,
+        #         hidden_states=hidden_states,
+        #         inputs_embeds=None,
+        #     )
+        #     logits = self.model.compute_logits(hidden_states)
+        #     draft_token_ids = logits.argmax(dim=-1)
+        #     draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
