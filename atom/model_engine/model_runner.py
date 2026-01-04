@@ -432,14 +432,16 @@ class ModelRunner:
             total_seqs_num_decode=1,
         )
         
-        self.prepare_intputs(dummy_batch, is_dummy_run=True)
+        bs = self.prepare_intputs(dummy_batch, is_dummy_run=True)
         actual_num_tokens = dummy_batch.total_tokens_num
 
 
         # self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
         # self.tokenID_processor.input_ids.copy_to_gpu(actual_num_tokens)
         # input_ids = self.tokenID_processor.input_ids.gpu[:actual_num_tokens]
-        input_ids = torch.zeros(actual_num_tokens, dtype=torch.int32, device=self.device)
+        # input_ids = torch.zeros(actual_num_tokens, dtype=torch.int32, device=self.device)
+        self.forward_vars["input_ids"].gpu[:bs].zero_()
+        input_ids = self.forward_vars["input_ids"].gpu[:bs]
 
         logits = self.run_model(input_ids)
 
@@ -467,13 +469,15 @@ class ModelRunner:
             total_seqs_num_prefill=1,
         )
 
-        self.prepare_intputs(dummy_batch, is_dummy_run=True)
+        bs = self.prepare_intputs(dummy_batch, is_dummy_run=True)
 
         
         # self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
         # self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
         # input_ids = self.tokenID_processor.input_ids.gpu[:num_tokens]
-        input_ids= torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+        # input_ids= torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+        self.forward_vars["input_ids"].gpu[:bs].zero_()
+        input_ids = self.forward_vars["input_ids"].gpu[:bs]
         
         # not exe run_model and synchronize: acc 0.79
 
@@ -806,12 +810,13 @@ class ModelRunner:
         bs = batch.total_seqs_num
         num_scheduled_tokens = batch.num_scheduled_tokens
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
             # num_pad, num_tokens_across_dp = self.get_dp_padding(scheduled_bs)
             # padded_scheduled_bs = scheduled_bs + num_pad
-            padded_scheduled_bs = scheduled_bs
+            padded_scheduled_bs = num_input_tokens
             bs = (
                 padded_scheduled_bs
                 if self.enforce_eager
@@ -828,14 +833,14 @@ class ModelRunner:
         context_bs = (
             batch.total_seqs_num_prefill if is_prefill else scheduled_bs
         )
+        graph_bs = num_input_tokens if is_prefill else bs
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
             batch_size=context_bs,
-            graph_bs=bs,
+            graph_bs=graph_bs,
             is_dummy_run=is_dummy_run,
         )
-        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
         actual_num_tokens = batch.total_tokens_num
         set_forward_context(
             attn_metadata=attn_metadata,
@@ -844,6 +849,7 @@ class ModelRunner:
             num_tokens=actual_num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
         )
+        return graph_bs
 
     def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
         bs = batch.total_seqs_num
@@ -873,14 +879,32 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            hidden_states = self.model(input_ids, positions)
+            # if not is_prefill:
+            #     # padding like cudagraph
+            #     graph_bs = context.graph_bs
+            #     attn_metadata, context = (
+            #         self.attn_metadata_builder.build_for_cudagraph_capture(graph_bs)
+            #     )
+            #     num_tokens = graph_bs
+            #     num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
+            #     num_tokens += num_pad
+            #     set_forward_context(
+            #         attn_metadata=attn_metadata,
+            #         atom_config=self.config,
+            #         context=context,
+            #         num_tokens=num_tokens,
+            #         num_tokens_across_dp=num_tokens_across_dp,
+            #     )
+            #     input_ids = self.forward_vars["input_ids"].gpu[:graph_bs]
+            #     positions = self.forward_vars["positions"].gpu[:graph_bs]
+            #     outputs = self.forward_vars["outputs"]
+            #     outputs[:graph_bs] = self.model(input_ids, positions)
+            #     hidden_states = outputs[:bs]
+            # else:
+                hidden_states = self.model(input_ids, positions)
         else:
             graph_bs = context.graph_bs
-            # self.forward_vars["input_ids"].gpu[:bs].copy_(input_ids[:bs])
-            # self.forward_vars["positions"].gpu[:bs].copy_(positions[:bs])
-            # if bs < graph_bs:
-            #     self.forward_vars["input_ids"].gpu[bs:graph_bs].fill_(0)
-            #     self.forward_vars["positions"].gpu[bs:graph_bs].fill_(0)
+            # torch.cuda.synchronize()
             self.graphs[graph_bs].replay()
             hidden_states = self.forward_vars["outputs"][:bs]
         return self.model.compute_logits(hidden_states)
@@ -950,11 +974,16 @@ class ModelRunner:
                 attn_metadata, context = (
                     self.attn_metadata_builder.build_for_cudagraph_capture(bs)
                 )
+                num_tokens = bs
+                num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
+                num_tokens += num_pad
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
-                )
+                    num_tokens=num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                )                
 
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
 
