@@ -32,6 +32,11 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
+          - model_name: "Qwen3-235B-A22B-Instruct-2507-FP8"
+            model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+            extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
+            env_vars: |
+              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
     env:
       ATOM_BASE_IMAGE: rocm/pytorch:latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
