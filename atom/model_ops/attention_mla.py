@@ -293,19 +293,36 @@ class MLAAttention(nn.Module):
             max_q_len = 1
 
         if kv_c_and_k_pe_cache.numel() > 0:
-            mla_prefill_fwd(
-                q,
-                kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
-                o,
-                paged_cu_seqlens_q,
-                paged_kv_indptr,
-                paged_kv_indices,
-                kv_last_page_lens,
-                max_q_len,
-                self.scale,
-                0.0,
-                None,
-            )
+            if self.kv_cache_dtype.startswith("fp8"):
+                mla_decode_fwd(
+                    q,
+                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    o,
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    kv_last_page_lens,
+                    max_q_len,
+                    self.scale,
+                    0.0,
+                    None,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                )
+            else:
+                mla_prefill_fwd(
+                    q,
+                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    o,
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    kv_last_page_lens,
+                    max_q_len,
+                    self.scale,
+                    0.0,
+                    None,
+                )
 
         return self._v_up_proj_and_o_proj(o)
 
