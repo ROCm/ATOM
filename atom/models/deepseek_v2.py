@@ -617,6 +617,14 @@ class DeepseekV2MLAAttention(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
 
         if self.is_v32:
+            self.indexer_rope_emb = get_rope(
+                qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=True,
+            )
             self.indexer = Indexer(
                 get_current_atom_config(),
                 config,
@@ -628,6 +636,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 f"{prefix}.indexer",
             )
         else:
+            self.indexer_rope_emb = None
             self.indexer = None
         # In the MLA backend, kv_cache includes both k_c and
         # pe (i.e. decoupled position embeddings). In particular,
@@ -707,7 +716,7 @@ class DeepseekV2MLAAttention(nn.Module):
         if not self.fuse_qknorm_quant:
             kv_c_normed = self.kv_a_layernorm(kv_c)
         if self.is_v32 and self.indexer is not None:
-            _topk_indices = self.indexer(hidden_states, hidden_states_or_q_c, positions, self.rotary_emb)
+            _topk_indices = self.indexer(hidden_states, hidden_states_or_q_c, positions, self.indexer_rope_emb)
 
         return self.mla_attn(hidden_states_or_q_c,
                              kv_c_normed,
