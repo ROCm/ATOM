@@ -311,6 +311,8 @@ def sparse_attn_indexer(
         scale_fmt,
     )
     if context.is_prefill:
+        if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
+            return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
         total_seq_lens = hidden_states.shape[0]
