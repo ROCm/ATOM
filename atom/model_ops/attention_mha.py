@@ -63,14 +63,14 @@ class Attention(nn.Module):
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
         self.rotary_emb = rotary_emb
-        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            assert self.rotary_emb is not None, "rotary_emb must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
-            assert self.q_norm is not None, "q_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
-            assert self.k_norm is not None, "k_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
         # kv cache layout
         self.flash_layout = False
         self.q_norm = q_norm
         self.k_norm = k_norm
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            assert self.rotary_emb is not None, "rotary_emb must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
+            assert self.q_norm is not None, "q_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
+            assert self.k_norm is not None, "k_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
 
     def forward(
         self,
