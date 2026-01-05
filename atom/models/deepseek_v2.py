@@ -472,9 +472,9 @@ class Indexer(nn.Module):
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
-    def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, positions,
-                rotary_emb) -> torch.Tensor:
-        q = self.wq_b(qr)
+    def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, qr_scale: Optional[torch.Tensor],
+                positions, rotary_emb) -> torch.Tensor:
+        q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
@@ -715,14 +715,21 @@ class DeepseekV2MLAAttention(nn.Module):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         if not self.fuse_qknorm_quant:
             kv_c_normed = self.kv_a_layernorm(kv_c)
+            hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None:
-            _topk_indices = self.indexer(hidden_states, hidden_states_or_q_c, positions, self.indexer_rope_emb)
+            _topk_indices = self.indexer(
+                hidden_states,
+                hidden_states_or_q_c,
+                hidden_states_or_q_c_scale,
+                positions,
+                self.indexer_rope_emb,
+            )
 
         return self.mla_attn(hidden_states_or_q_c,
                              kv_c_normed,
                              k_pe,
                              positions,
-                             None if not self.fuse_qknorm_quant else hidden_states_or_q_c_scale,)
+                             hidden_states_or_q_c_scale,)
 
 
 
