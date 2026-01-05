@@ -10,6 +10,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
 from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData, Context
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -84,13 +85,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
+        max_context_partition_num = get_recommended_splits(scheduled_bs, 8)
+        attn_metadata.max_context_partition_num = max_context_partition_num
 
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
-        attn_matadata = AttentionMetaData(
+        attn_metadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
@@ -103,8 +106,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 else None
             ),
         )
+
+        max_context_partition_num = get_recommended_splits(bs, 8)
+        attn_metadata.max_context_partition_num = max_context_partition_num
+
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )
-        return attn_matadata, context
+        return attn_metadata, context
