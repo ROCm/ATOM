@@ -48,7 +48,7 @@ python -m atom.benchmarks.benchmark_serving \
     --save-result --result-dir=${result_dir} --result-filename=$RESULT_FILENAME.json \
     --percentile-metrics="ttft,tpot,itl,e2el"
 ```
-Here is the performance number for both 4 and 8 ranks:
+The performance number for both 4 and 8 ranks are provided as a baseline:
 |              |               |                 |             | TP8 + EP8    |              |              | TP4 + EP4        |              |              |
 | ------------ | ------------- | --------------- | ----------- | ------------ | ------------ | ---------------- | ------------ | ------------ | ---------------- |
 | ISL | OSL | Concurrency | Num Prompts | Mean TTFT (ms) | Mean TPOT (ms) | Total Throughput | Mean TTFT (ms) | Mean TPOT (ms) | Total Throughput |
@@ -61,13 +61,20 @@ Here is the performance number for both 4 and 8 ranks:
 
 
 ### Accuracy test
-We verified the lm_eval accuracy with command:
+We verified the lm_eval accuracy on gsm8k dataset with command:
 ```bash
-lm_eval --model local-completions \
-        --model_args model=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=100,max_retries=3,tokenized_requests=False \
-        --tasks gsm8k \
-        --num_fewshot 5
+lm_eval \
+--model local-completions \
+--model_args model=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=100,max_retries=3,tokenized_requests=False \
+--tasks gsm8k \
+--num_fewshot 5
 ```
 
-
+Here is the reference value when deploying on 8 ranks:
+```bash
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.8810|±  |0.0089|
+|     |       |strict-match    |     5|exact_match|↑  |0.8719|±  |0.0092|
+```
 
