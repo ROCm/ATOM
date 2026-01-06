@@ -10,7 +10,9 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
 from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData, Context
-from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits, get_occupancy
+from aiter.dist.parallel_state import get_tp_group
+from atom.utils import CpuGpuBuffer
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -34,6 +36,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
+        # hf_config = self.model_runner.config.hf_config
+        # self.num_kv_heads = (
+        #     hf_config.num_key_value_heads // get_tp_group().world_size
+        # )
+
+        # i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        # # if self.has_sliding_window:
+        # attention_metadata = {
+        #     "max_context_partition_num": CpuGpuBuffer(1, **i32_kwargs)
+        # }
+        # attention_metadata["max_context_partition_num"].cpu.fill_(1)
+        # attention_metadata["max_context_partition_num"].copy_to_gpu()
+        # self.model_runner.forward_vars.update(attention_metadata)
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
@@ -66,6 +81,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ("context_lens", bs),
             ("block_tables", bs),
         ]
+
+        # total_processor_count = torch.cuda.get_device_properties().multi_processor_count * get_occupancy()
+        # max_context_partition_num = (total_processor_count + bs * self.num_kv_heads - 1) // (bs * self.num_kv_heads)
+        # var["max_context_partition_num"].np[0] = max_context_partition_num
+        # vars_used.append(("max_context_partition_num", 1))
+
         if self.has_sliding_window:
             vars_used.append(("cu_seqlens_q", bs + 1))
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
@@ -85,9 +106,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
-        max_context_partition_num = get_recommended_splits(scheduled_bs, 8)
-        attn_metadata.max_context_partition_num = max_context_partition_num
-
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         return attn_metadata, positions
 
@@ -107,8 +125,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ),
         )
 
-        max_context_partition_num = get_recommended_splits(bs, 8)
-        attn_metadata.max_context_partition_num = max_context_partition_num
+        # attn_metadata.max_context_partition_num = var["max_context_partition_num"].gpu
 
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(

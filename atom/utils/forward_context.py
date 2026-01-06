@@ -162,6 +162,7 @@ class AttentionMetaData:
 
     block_tables_converted: Optional[torch.Tensor] = None
     kv_indices_converted: Optional[torch.Tensor] = None
+    max_context_partition_num: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -189,6 +190,7 @@ class AttentionMetaData:
         reduce_partial_map: Optional[torch.Tensor] = None,
         block_tables_converted: Optional[torch.Tensor] = None,
         kv_indices_converted: Optional[torch.Tensor] = None,
+        max_context_partition_num: Optional[torch.Tensor] = None,
     ):
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_k = cu_seqlens_k
@@ -212,6 +214,7 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
+        self.max_context_partition_num = max_context_partition_num
         if block_tables_converted is not None:
             self.block_tables = block_tables_converted
         if kv_indices_converted is not None:

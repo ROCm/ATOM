@@ -20,6 +20,7 @@ from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
 
 class Attention(nn.Module):
@@ -181,15 +182,19 @@ class Attention(nn.Module):
             else attn_metadata.max_seqlen_k
         )
         
-        context_partition_size = 256
-        if self.sliding_window> 0:
-            max_context_length = min(max_context_length, self.sliding_window)
-            if max_context_length <= 128:
-                context_partition_size = 128
-        
         # cdiv
         # max_context_partition_num = (max_context_length + context_partition_size - 1) // context_partition_size
-        max_context_partition_num = attn_metadata.max_context_partition_num
+        # max_context_partition_num = attn_metadata.max_context_partition_num
+        # max_context_partition_num = triton.cdiv(attn_metadata.total_eu, num_seqs * num_kv_heads)
+        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        
+        context_partition_size = 256
+        if self.sliding_window> 0:
+            max_context_partition_num = 1
+            # max_context_length = min(max_context_length, self.sliding_window)
+            # context_partition_size = (256 if max_context_length > 128 else 128)
+            context_partition_size = 128
+        
 
         # Output buffers (same as Triton)
         intermediate_shape = (
@@ -211,7 +216,7 @@ class Attention(nn.Module):
             device=q.device,
         )
         
-        pa_decode_gluon(
+        torch.ops.aiter.pa_decode_gluon(
             o,
             o,
             q,

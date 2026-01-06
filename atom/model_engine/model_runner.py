@@ -527,6 +527,7 @@ class ModelRunner:
 
         # TODO: remove it in forward_context
         self.forward_vars = {
+            # "max_context_partition_num": CpuGpuBuffer(1, **i32_kwargs),
             "input_ids": self.tokenID_processor.input_ids,
             "positions": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
             "temperatures": CpuGpuBuffer(self.max_bs, **f32_kwargs),
