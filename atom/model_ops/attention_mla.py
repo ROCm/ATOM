@@ -553,13 +553,29 @@ class MLAAttention(nn.Module):
                     ),
                     q_out,
                     attn_metadata.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
                     positions,
                     self.rotary_emb.cos_cache,
                     self.rotary_emb.sin_cache,
-                    k_scale=self._k_scale,
                     is_neox=self.rotary_emb.is_neox_style,
-                    q_out_dtype=kv_cache.dtype,
+                    is_nope_first=True,
                 )
+                # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+                # decode_q, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+                #     q_nope,
+                #     q_rope,
+                #     k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+                #     k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                #     kv_cache,
+                #     attn_metadata.slot_mapping,
+                #     positions,
+                #     self.rotary_emb.cos_cache,
+                #     self.rotary_emb.sin_cache,
+                #     k_scale=self._k_scale,
+                #     is_neox=self.rotary_emb.is_neox_style,
+                #     q_out_dtype=kv_cache.dtype,
+                # )
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
