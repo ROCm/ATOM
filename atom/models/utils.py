@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 class LayerFn(Protocol):
-
-    def __call__(self, prefix: str) -> torch.nn.Module: ...
+    def __call__(self, prefix: str) -> torch.nn.Module:
+        ...
 
 
 class PPMissingLayer(torch.nn.Identity):
@@ -195,7 +195,6 @@ class IntermediateTensors:
 
 
 def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
-
     def make_empty_intermediate_tensors(
         batch_size: int,
         dtype: torch.dtype,
