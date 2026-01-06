@@ -249,7 +249,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["slot_mapping"].np[scheduled_bs:bs] = -1
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
-        var["context_lens"].np[scheduled_bs:bs] = 0
+        # var["context_lens"].np[scheduled_bs:bs] = 0
 
         num_blocks_per_seq = [
             (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens

@@ -71,8 +71,8 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        return False
-        return self.dp_size > 1 and _has_module("mori")
+        # Only use mori all2all kernels when expert parallel is enabled
+        return self.dp_size > 1 and self.use_ep and _has_module("mori")
 
     @property
     def use_mori_kernels(self):
@@ -184,8 +184,8 @@ def reduce_scatter_with_unpadding(
     dim = 0
     dp_group = get_dp_group()
 
-    scattered_output = dp_group.reduce_scatter(x, dim=dim)
-    # scattered_output = dp_group.reduce_scatter_tensor(x)
+    # scattered_output = dp_group.reduce_scatter(x, dim=dim)
+    scattered_output = dp_group.reduce_scatter_tensor(x)
 
     if scattered_output.shape[dim] > original_batch_size:
         slices = [slice(None)] * scattered_output.ndim
@@ -1949,8 +1949,9 @@ class FusedMoE(torch.nn.Module):
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
+        original_hidden_size = None
+        # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
+        if self.dp_size > 1 and not self.moe_parallel_config.use_all2all_kernels:
             hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
             router_logits, _ = all_gather_with_padding(router_logits)
 
@@ -1973,8 +1974,8 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
 
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
+        # Use reduce_scatter when DP > 1 but not using mori all2all kernels
+        if self.dp_size > 1 and not self.moe_parallel_config.use_all2all_kernels:
             final_hidden_states = reduce_scatter_with_unpadding(
                 final_hidden_states, original_hidden_size
             )

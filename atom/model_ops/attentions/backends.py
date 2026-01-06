@@ -73,7 +73,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_decode(self, batch: ScheduledBatch, bs: int, is_dummy_run: bool=False):
+    def prepare_decode(self, batch: ScheduledBatch, bs: int, is_dummy_run: bool = False):
         raise NotImplementedError
 
     @abstractmethod
@@ -215,7 +215,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         return attn_metadata, positions
         # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
-    def build(self, batch: ScheduledBatch, bs: int, is_dummy_run: bool=False):
+    def build(self, batch: ScheduledBatch, bs: int, is_dummy_run: bool = False):
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)

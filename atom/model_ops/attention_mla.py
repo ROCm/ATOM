@@ -336,7 +336,7 @@ class MLAAttention(nn.Module):
         assert attn_metadata is not None
         B = q.shape[0]
 
-        o = torch.empty(
+        o = torch.zeros(
             B, self.num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
         )
 
@@ -428,8 +428,7 @@ class MLAAttention(nn.Module):
             else:
                 kv_cache = torch.tensor([])
         slot_mapping_numel = attn_metadata.slot_mapping.numel() if attn_metadata.slot_mapping is not None else 0
-        context_is_dummy = context.is_dummy_run if context else False
-        is_dummy = (slot_mapping_numel == 0) or context_is_dummy 
+        is_dummy = (slot_mapping_numel == 0)
         if is_dummy:
             # dummy run: skip real attention and return
             output_shape = list(q.shape)
