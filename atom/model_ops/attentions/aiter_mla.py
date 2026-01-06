@@ -113,8 +113,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens, **i32_kwargs
             )
             mla_metadata["sparse_kv_indptr"] = CpuGpuBuffer(
-                self.max_bs + 1, **i32_kwargs
+                self.max_num_batched_tokens + 1, **i32_kwargs
             )
+            mla_metadata["sparse_cu_seqlens_q"] = CpuGpuBuffer(
+                self.max_num_batched_tokens + 1, **i32_kwargs
+            )
+            mla_metadata["sparse_cu_seqlens_q"].np[:] = np.arange(
+                self.max_num_batched_tokens + 1, dtype=np.int32
+            )
+            mla_metadata["sparse_cu_seqlens_q"].copy_to_gpu()
+            mla_metadata["sparse_kv_last_page_lens"] = CpuGpuBuffer(
+                self.max_num_batched_tokens, **i32_kwargs
+            )
+            mla_metadata["sparse_kv_last_page_lens"].np[:] = 1
+            mla_metadata["sparse_kv_last_page_lens"].copy_to_gpu()
+
         self.model_runner.forward_vars.update(mla_metadata)
 
     def set_mla_persistent_worker_buffers(self, bs: int):
@@ -164,7 +177,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
-        if self.is_sparse:
+        if self.is_sparse and attn_metadata.max_seqlen_k > self.index_topk:
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
                 attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
@@ -188,6 +201,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             attn_metadata.cu_seqlen_ke = var["cu_seqlen_ke"].copy_to_gpu(
                 sum_scheduled_tokens
+            )
+            attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
+                : sum_scheduled_tokens + 1
+            ]
+            attn_metadata.kv_last_page_lens = var["sparse_kv_last_page_lens"].gpu[
+                :sum_scheduled_tokens
+            ]
+
+            attn_metadata.token_to_seq_idxs = torch.repeat_interleave(
+                torch.arange(bs, dtype=torch.int32, device=self.device),
+                attn_metadata.context_lens,
+            )
+            var["sparse_kv_indptr"].np[0] = 0
+            var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
+                np.minimum(
+                    np.concatenate([np.arange(1, s + 1) for s in counts]),
+                    self.index_topk,
+                ),
+                dtype=np.int32,
+            )
+            attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
+                sum_scheduled_tokens + 1
             )
         return attn_metadata, positions
 
@@ -217,8 +252,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ]
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1]
-        sum_blocks_before_converted = sum([(i + self.block_ratio - 1) // self.block_ratio for i in num_blocks_per_seq])
-
+        sum_blocks_before_converted = sum(
+            [(i + self.block_ratio - 1) // self.block_ratio for i in num_blocks_per_seq]
+        )
 
         def prepare_kv_indices():
             var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
@@ -262,7 +298,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_indices_convert_triton(
                 var["kv_indices"].gpu[:sum_blocks_before_converted],
                 var["kv_indices_converted"].gpu[:sum_blocks],
-                var["kv_indptr"].gpu[:bs + 1],
+                var["kv_indptr"].gpu[: bs + 1],
                 self.block_ratio,
                 self.block_size,
             )

@@ -9,6 +9,9 @@ from atom.config import Config, KVCacheTensor
 import torch
 from abc import ABC, abstractmethod
 from atom.config import Config, ParallelConfig
+from atom.utils import envs
+
+gpt_oss_model = envs.ATOM_GPT_OSS_MODEL
 
 def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
                                       max_num_tokens: int,
@@ -142,6 +145,7 @@ class AttentionMetaData:
     slot_mapping: Optional[torch.Tensor] = None
     context_lens: Optional[torch.Tensor] = None
     block_tables: Optional[torch.Tensor] = None
+    fake_block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
     max_q_len: Optional[int] = None
@@ -188,6 +192,8 @@ class AttentionMetaData:
         reduce_partial_map: Optional[torch.Tensor] = None,
         block_tables_converted: Optional[torch.Tensor] = None,
         kv_indices_converted: Optional[torch.Tensor] = None,
+        sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
+        token_to_seq_idxs: Optional[torch.Tensor] = None,
     ):
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_k = cu_seqlens_k
@@ -215,6 +221,8 @@ class AttentionMetaData:
             self.block_tables = block_tables_converted
         if kv_indices_converted is not None:
             self.kv_indices = kv_indices_converted
+        self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
+        self.token_to_seq_idxs = token_to_seq_idxs
 
     def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
@@ -287,6 +295,16 @@ def set_forward_context(
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
 
+    # TODO: will be removed. Now gpt-oss model has sink and sliding window config,
+    # prefill attention need fake block tables to be compatible with paged attention.
+    if _forward_context.context.is_prefill and gpt_oss_model:
+        # TODO: will be removed
+        cu_seqlens_q = attn_metadata.cu_seqlens_q
+        max_seqlen_q = attn_metadata.max_seqlen_q
+        fake_block_table = torch.empty(cu_seqlens_q.shape[0] - 1, max_seqlen_q, dtype=torch.int, device='cuda')
+        for i in range(cu_seqlens_q.shape[0]-1):
+            fake_block_table[i][0:(cu_seqlens_q[i+1] - cu_seqlens_q[i]).item()] = torch.arange(cu_seqlens_q[i], cu_seqlens_q[i+1], dtype=torch.int, device='cuda')
+        attn_metadata.fake_block_tables = fake_block_table
 
 def reset_forward_context() -> None:
     global _forward_context

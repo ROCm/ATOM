@@ -13,7 +13,7 @@ import torch
 from atom.utils import envs, get_open_port
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig, GenerationConfig
 
 from aiter import QuantType
 from aiter.dist.parallel_state import get_dp_group
@@ -382,6 +382,15 @@ def get_hf_config(model: str) -> PretrainedConfig:
     return AutoConfig.from_pretrained(model)
 
 
+def get_generation_config(model: str) -> GenerationConfig:
+    try:
+        return GenerationConfig.from_pretrained(
+            model,
+        )
+    except OSError:  # Not found
+        return None
+
+
 @dataclass
 class ParallelConfig:
     data_parallel_size: int = 1
@@ -528,9 +537,11 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
+    generation_config: GenerationConfig = field(init=False)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
     bos_token_id: int = -1
     eos_token_id: int = -1
+    stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
@@ -569,6 +580,10 @@ class Config:
         ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(self.model)
+        self.generation_config = get_generation_config(self.model)
+        if self.generation_config is not None:
+            if (eos_ids := getattr(self.generation_config, "eos_token_id", None)) is not None:
+                self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
         self.quant_config = get_quant_config(self.hf_config)
         hf_config_max_position_embeddings = getattr(
             self.hf_config, "max_position_embeddings", 8192

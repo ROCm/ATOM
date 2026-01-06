@@ -11,7 +11,7 @@ from aiter import (
     dtypes,
     flash_attn_varlen_func,
 )
-from aiter.mla import mla_decode_fwd
+from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.rotary_embedding import RotaryEmbedding
 from torch import nn
 from tqdm import tqdm
@@ -39,7 +39,8 @@ if use_triton_gemm():
         fused_gemm_afp4wfp4_preshuffle_split_cat = None
 
 # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
-# from aiter import fused_qk_rope_concat_and_cache_mla
+# # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+from aiter import fused_qk_rope_concat_and_cache_mla
 from aiter.dist.parallel_state import get_dp_group
 
 from atom.utils import envs
@@ -55,6 +56,7 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
     # from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import  batched_gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+
 
 # MLA Specific Arguments
 @dataclass
@@ -128,10 +130,11 @@ class MLAAttention(nn.Module):
         self.layer_num = layer_num
 
     def process_weights_after_loading(self):
-        if (is_rocm_aiter_fp4bmm_enabled()):
+        if is_rocm_aiter_fp4bmm_enabled():
             kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj)
-            self.W_K, self.W_K_scale, W_V, self.W_V_scale = (
-                quark_post_load_weights(self, kv_b_proj_weight, "mxfp4"))
+            self.W_K, self.W_K_scale, W_V, self.W_V_scale = quark_post_load_weights(
+                self, kv_b_proj_weight, "mxfp4"
+            )
             self.W_V = W_V.contiguous().transpose(1, 2)
 
             self.W_K = self.W_K.transpose(-2, -1).contiguous()
@@ -158,7 +161,7 @@ class MLAAttention(nn.Module):
             W_UK, W_UV = kv_b_proj_weight.split(
                 [self.qk_nope_head_dim, self.v_head_dim], dim=-1
             )
-            W_K = W_UK.transpose(0, 1)  # 16 512 128 #First
+            W_K = W_UK.transpose(0, 1)  # 16 512 128
             W_V = W_UV.permute(1, 2, 0)  # 16 128 512
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
                 W_K, dtype=dtypes.fp8
@@ -166,43 +169,6 @@ class MLAAttention(nn.Module):
             self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
                 W_V, dtype=dtypes.fp8
             )
-
-            # The kernel operates on non-padded inputs. Hence, pre-compiling
-            # triton kernel to avoid runtime compilation for unseen batch sizes
-            # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
-            # On DS-R1, this step adds roughly 50s to the model loading time.
-            # max_batch_size = 1024  # [ToDo] Find the optimal upper limit
-            # pre_compilation_list = list(range(1, max_batch_size + 1))
-            # if get_tp_group().is_first_rank:
-            #     pre_compilation_list = tqdm(
-            #         pre_compilation_list,
-            #         desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
-            #         total=max_batch_size,
-            #     )
-
-            # for m in pre_compilation_list:
-            #     x = torch.empty(
-            #         (self.W_K.shape[0], m, self.W_K.shape[2]),
-            #         dtype=torch.bfloat16,
-            #         device=self.W_K.device,
-            #     )
-            #     _aiter_triton_fp8_bmm(
-            #         x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
-            #     )
-
-            #     x = torch.empty(
-            #         (self.W_V.shape[0], m, self.W_V.shape[2]),
-            #         dtype=torch.bfloat16,
-            #         device=self.W_V.device,
-            #     )
-            #     _aiter_triton_fp8_bmm(
-            #         x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
-            #     )
-        # else:
-        #     # Convert from (L, N, V) to (N, L, V)
-        #     self.W_UV = W_UV.transpose(0, 1)
-        #     # Convert from (L, N, P) to (N, P, L)
-        #     self.W_UK_T = W_UK.permute(1, 2, 0)
 
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -230,7 +196,7 @@ class MLAAttention(nn.Module):
             # x = x.transpose(0, 1).flatten(1, 2)
             output = output.view(-1, self.num_heads * self.v_head_dim)
             x = output
-        else: 
+        else:
             x = _aiter_triton_fp8_bmm(
                 x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
             )
@@ -249,7 +215,7 @@ class MLAAttention(nn.Module):
         q_nope = q_nope.transpose(0, 1)
 
         if is_rocm_aiter_fp4bmm_enabled():
-        # FP4 BMM: (N, B, P) x (N, P, L) -> (N, B, L)
+            # FP4 BMM: (N, B, P) x (N, P, L) -> (N, B, L)
             ql_nope = batched_gemm_a16wfp4(
                 q_nope,
                 self.W_K,
@@ -267,7 +233,7 @@ class MLAAttention(nn.Module):
             )
         return ql_nope, q_pe
 
-    def _forward_prefill(
+    def _forward_prefill_mha(
         self,
         q: torch.Tensor,
         kv_c_normed: torch.Tensor,
@@ -369,6 +335,73 @@ class MLAAttention(nn.Module):
 
         return self.o_proj(output.flatten(start_dim=-2))
 
+    def _forward_prefill_mla(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+    ) -> torch.Tensor:
+        assert attn_metadata is not None
+        B = q.shape[0]
+
+        o = torch.empty(
+            B, self.num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
+        )
+
+        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
+        paged_kv_indptr = attn_metadata.kv_indptr
+        paged_kv_indices = attn_metadata.kv_indices
+        kv_last_page_lens = attn_metadata.kv_last_page_lens
+        max_q_len = attn_metadata.max_q_len
+        if self.topk_indices_buffer is not None:
+            sparse_kv_indices = triton_convert_req_index_to_global_index_dsa_prefill(
+                attn_metadata.sparse_cu_seqlens_q,
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.token_to_seq_idxs,
+                self.topk_indices_buffer[:B],
+                attn_metadata.block_tables,
+                attn_metadata.cu_seqlens_q,
+                NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+            )
+            paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
+            paged_kv_indptr = attn_metadata.sparse_kv_indptr
+            paged_kv_indices = sparse_kv_indices
+            max_q_len = 1
+
+        if kv_c_and_k_pe_cache.numel() > 0:
+            if self.kv_cache_dtype.startswith("fp8"):
+                mla_decode_fwd(
+                    q,
+                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    o,
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    kv_last_page_lens,
+                    max_q_len,
+                    self.scale,
+                    0.0,
+                    None,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                )
+            else:
+                mla_prefill_fwd(
+                    q,
+                    kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+                    o,
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    kv_last_page_lens,
+                    max_q_len,
+                    self.scale,
+                    0.0,
+                    None,
+                )
+
+        return self._v_up_proj_and_o_proj(o)
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -394,6 +427,7 @@ class MLAAttention(nn.Module):
                 paged_kv_indptr,
                 attn_metadata.kv_indices,
                 self.topk_indices_buffer[:B],
+                NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
             )
 
         # q_scale = kv_scale = None
@@ -453,11 +487,16 @@ class MLAAttention(nn.Module):
         k_rope: torch.Tensor,
         positions: torch.Tensor,
         q_scale: Optional[torch.Tensor],
+        qkv: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         context = forward_context.context
+        use_prefill_mla = (
+            self.topk_indices_buffer is not None
+            and attn_metadata.max_seqlen_k > self.topk_indices_buffer.shape[1]
+        )
         if attn_metadata.slot_mapping.numel():
             # not dummy run
             kv_cache_data = forward_context.kv_cache_data
@@ -469,8 +508,10 @@ class MLAAttention(nn.Module):
             # dummy run before allocate kv_cache, thus we create manually
             kv_cache = torch.tensor([])
 
-        if context.is_prefill:
-            prefill_q = self.q_proj(q, x_scale=q_scale).view(-1, self.num_heads, self.qk_head_dim)
+        if context.is_prefill and not use_prefill_mla:
+            prefill_q = self.q_proj(q, x_scale=q_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
@@ -484,47 +525,33 @@ class MLAAttention(nn.Module):
                     scale=self._k_scale,
                 )
 
-            output = self._forward_prefill(
+            output = self._forward_prefill_mha(
                 prefill_q, k_nope, k_rope, kv_cache, attn_metadata
             )
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
+            q_out = torch.empty(
+                (
+                    q_nope.shape[0],
+                    self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=(
+                    dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
+                ),
+                device=q_nope.device,
+            )
             if kv_cache.numel() > 0:
-                # decode_q = torch.empty(
-                #     (
-                #         q_nope.shape[0],
-                #         self.num_heads,
-                #         self.kv_lora_rank + self.qk_rope_head_dim,
-                #     ),
-                #     dtype=kv_cache.dtype,
-                #     device=q_nope.device,
-                # )
-                # fused_qk_rope_concat_and_cache_mla(
-                #     q_nope,
-                #     q_rope,
-                #     k_nope,
-                #     k_rope,
-                #     kv_cache.view(
-                #         kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                #     ),
-                #     decode_q,
-                #     attn_metadata.slot_mapping,
-                #     self._k_scale,
-                #     self._q_scale,
-                #     positions,
-                #     self.rotary_emb.cos_cache,
-                #     self.rotary_emb.sin_cache,
-                #     is_neox=self.rotary_emb.is_neox_style,
-                #     is_nope_first=True,
-                # )
-                from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
-                decode_q, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+                fused_qk_rope_concat_and_cache_mla(
                     q_nope,
                     q_rope,
-                    k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                    k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                    kv_cache,
+                    k_nope,
+                    k_rope,
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
+                    q_out,
                     attn_metadata.slot_mapping,
                     positions,
                     self.rotary_emb.cos_cache,
@@ -534,7 +561,10 @@ class MLAAttention(nn.Module):
                     q_out_dtype=kv_cache.dtype,
                 )
 
-            output = self._forward_decode(decode_q, kv_cache, attn_metadata)
+            if context.is_prefill:
+                output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
+            else:
+                output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
         return output
 
@@ -657,5 +687,112 @@ def triton_convert_req_index_to_global_index(
         # strides
         ti_stride0,
         ti_stride1,
+    )
+    return new_kv_indices
+
+
+@triton.jit
+def _convert_req_index_to_global_index_dsa_prefill_kernel(
+    dsa_qo_indptr,  # int32 [num_tokens + 1]
+    dsa_kv_indptr,  # int32 [num_tokens + 1]
+    token_to_seq_idxs,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    block_table,  # int32 [num_req, max_num_blocks_per_req]
+    cu_seqlens_q,  # int32 [num_tokens + 1]
+    out_kv_indices,  # int32
+    # shapes (compile-time where possible)
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,  # tile width along columns
+    # strides (in elements)
+    ti_stride0: tl.int64,  # topk_indices stride 0
+    ti_stride1: tl.constexpr,  # topk_indices stride 1
+    bt_stride0: tl.int64,  # block_table stride 0
+    bt_stride1: tl.constexpr,  # block_table stride 1
+):
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+
+    col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    req_id = tl.load(token_to_seq_idxs + token_id)  # int32
+
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_end = tl.load(dsa_kv_indptr + token_id + 1)
+    kv_len = kv_end - kv_start
+
+    # Load token indices for this tile
+    indice = tl.load(
+        topk_indices + token_id * ti_stride0 + col_id * ti_stride1
+    )  # int32
+    pre_seqlens_q = tl.load(cu_seqlens_q + req_id)
+
+    # Guard block_table access
+    store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
+    valid_mask = store_mask & (indice >= 0)
+    out_val = tl.load(
+        block_table + req_id * bt_stride0 + (indice - pre_seqlens_q) * bt_stride1,
+        mask=valid_mask,
+        other=-1,
+    )
+
+    # Store results
+    out_ptr_ij = out_kv_indices + kv_start + col_id
+    tl.store(
+        out_ptr_ij,
+        out_val,
+        mask=store_mask,
+    )
+
+
+def triton_convert_req_index_to_global_index_dsa_prefill(
+    dsa_qo_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
+    cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
+    # dsa_kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]           -->>>     output for this kernel
+    PAGE_SIZE: int = 1,  # page_block_size = 1 for now
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 1024,  # tile width along columns
+):
+
+    assert topk_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"BLOCK_N ({BLOCK_N})"
+    )
+
+    num_tokens = dsa_qo_indptr.shape[0] - 1
+    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+
+    new_kv_indices = torch.empty(
+        num_tokens * NUM_TOPK_TOKENS, dtype=torch.int32, device=topk_indices.device
+    )
+
+    # Strides in elements
+    ti_stride0, ti_stride1 = topk_indices.stride()
+    bt_stride0, bt_stride1 = block_table.stride()
+
+    grid = (num_tokens, tiles_per_row)
+
+    _convert_req_index_to_global_index_dsa_prefill_kernel[grid](
+        dsa_qo_indptr,
+        dsa_kv_indptr,
+        token_to_seq_idxs,
+        topk_indices,
+        block_table,
+        cu_seqlens_q,
+        new_kv_indices,
+        # shapes / constexprs
+        NUM_TOPK_TOKENS,
+        PAGE_SIZE,
+        BLOCK_N,
+        # strides
+        ti_stride0,
+        ti_stride1,
+        bt_stride0,
+        bt_stride1,
     )
     return new_kv_indices

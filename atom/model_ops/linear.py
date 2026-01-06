@@ -57,7 +57,8 @@ def gemm_a4w4_quant_fake(
     weight_scale: torch.Tensor, 
     params_dtype: torch.dtype,
     input_scale: torch.Tensor, 
-    output_size: int) -> torch.Tensor:
+    output_size: int,
+) -> torch.Tensor:
     return torch.empty(
             (*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device
         )
@@ -72,7 +73,8 @@ def gemm_a4w4_quant(
     weight_scale: torch.Tensor, 
     params_dtype: torch.dtype,
     input_scale: torch.Tensor, 
-    output_size: int) -> torch.Tensor:
+    output_size: int,
+) -> torch.Tensor:
     
     if gemm_afp4wfp4_preshuffle is None:
         if x_scale is None: 
@@ -296,13 +298,16 @@ class LinearBase(nn.Module):
                     w_s,
                     requires_grad=False)
             self.weight.data = shuffle_weight(self.weight.data, (16, 16))
-            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+            # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
             if (
                 self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
             ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
                 self.weight.data = shuffle_weight(self.weight.data, (16, 16))
-                self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+                # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+        # shuffle weight scale once so no reshuffling for every gemm
+        if self.quant_type == QuantType.per_1x32:
+            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16

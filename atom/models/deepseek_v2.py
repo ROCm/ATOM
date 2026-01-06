@@ -54,6 +54,7 @@ from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
 )
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -62,7 +63,6 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.fp8_mqa_logits import fp8_mqa_logits
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -560,6 +560,8 @@ def sparse_attn_indexer(
         scale_fmt,
     )
     if context.is_prefill:
+        if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
+            return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
         total_seq_lens = hidden_states.shape[0]
@@ -587,19 +589,21 @@ def sparse_attn_indexer(
         num_tokens = hidden_states.shape[0]
         logits = fp8_mqa_logits(Q=q_fp8[num_decode_tokens:num_tokens], KV=k_fp8, kv_scales=k_scale, weights=weights[num_decode_tokens:num_tokens],
                                 cu_starts=cu_seqlen_ks, cu_ends=cu_seqlen_ke)
+        
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices = topk_indices_buffer[
             num_decode_tokens:num_tokens, :topk_tokens
         ]
         top_k_per_row_prefill(
-            logits,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
+            logits=logits,
+            rowStarts=cu_seqlen_ks,
+            rowEnds=cu_seqlen_ke,
+            indices=topk_indices,
+            values=None,
+            numRows=num_rows,
+            stride0=logits.stride(0),
+            stride1=logits.stride(1),
         )
     else:
         decode_metadata = attn_metadata
@@ -717,9 +721,9 @@ class Indexer(nn.Module):
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
-    def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, positions,
-                rotary_emb) -> torch.Tensor:
-        q = self.wq_b(qr)
+    def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, qr_scale: Optional[torch.Tensor],
+                positions, rotary_emb) -> torch.Tensor:
+        q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
@@ -884,6 +888,14 @@ class DeepseekV2MLAAttention(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
 
         if self.is_v32:
+            self.indexer_rope_emb = get_rope(
+                qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=True,
+            )
             self.indexer = Indexer(
                 get_current_atom_config(),
                 config,
@@ -895,6 +907,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 f"{prefix}.indexer",
             )
         else:
+            self.indexer_rope_emb = None
             self.indexer = None
         # In the MLA backend, kv_cache includes both k_c and
         # pe (i.e. decoupled position embeddings). In particular,
@@ -1005,14 +1018,21 @@ class DeepseekV2MLAAttention(nn.Module):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         if not self.fuse_qknorm_quant:
             kv_c_normed = self.kv_a_layernorm(kv_c)
+            hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None:
-            _topk_indices = self.indexer(hidden_states, hidden_states_or_q_c, positions, self.rotary_emb)
+            _topk_indices = self.indexer(
+                hidden_states,
+                hidden_states_or_q_c,
+                hidden_states_or_q_c_scale,
+                positions,
+                self.indexer_rope_emb,
+            )
 
         return self.mla_attn(hidden_states_or_q_c,
                              kv_c_normed,
                              k_pe,
                              positions,
-                             None if not self.fuse_qknorm_quant else hidden_states_or_q_c_scale,)
+                             hidden_states_or_q_c_scale,)
 
 
 
