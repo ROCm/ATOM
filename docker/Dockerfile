@@ -28,6 +28,7 @@ RUN git clone --depth=1 --branch release/internal/3.5.x https://github.com/ROCm/
 RUN pip show triton || true
 
 # Install Aiter
+RUN mkdir -p /app
 RUN pip uninstall -y aiter || true
 RUN git clone $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
