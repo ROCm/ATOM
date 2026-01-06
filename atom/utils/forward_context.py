@@ -121,7 +121,6 @@ class Context:
     is_prefill: bool = False
     batch_size: int = 0
     graph_bs: int = 0
-    is_dummy_run: bool = False  # Skip real attention for dummy execution
 
     def __init__(
         self,
@@ -129,13 +128,11 @@ class Context:
         is_prefill: bool = False,
         batch_size: int = 0,
         graph_bs: int = 0,
-        is_dummy_run: bool = False,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
         self.batch_size = batch_size
         self.graph_bs = graph_bs
-        self.is_dummy_run = is_dummy_run
 
 
 @dataclass

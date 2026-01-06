@@ -839,7 +839,6 @@ class ModelRunner:
             is_prefill=is_prefill,
             batch_size=context_bs,
             graph_bs=graph_bs,
-            is_dummy_run=is_dummy_run,
         )
         actual_num_tokens = batch.total_tokens_num
         set_forward_context(
@@ -879,28 +878,6 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            # if not is_prefill:
-            #     # padding like cudagraph
-            #     graph_bs = context.graph_bs
-            #     attn_metadata, context = (
-            #         self.attn_metadata_builder.build_for_cudagraph_capture(graph_bs)
-            #     )
-            #     num_tokens = graph_bs
-            #     num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
-            #     num_tokens += num_pad
-            #     set_forward_context(
-            #         attn_metadata=attn_metadata,
-            #         atom_config=self.config,
-            #         context=context,
-            #         num_tokens=num_tokens,
-            #         num_tokens_across_dp=num_tokens_across_dp,
-            #     )
-            #     input_ids = self.forward_vars["input_ids"].gpu[:graph_bs]
-            #     positions = self.forward_vars["positions"].gpu[:graph_bs]
-            #     outputs = self.forward_vars["outputs"]
-            #     outputs[:graph_bs] = self.model(input_ids, positions)
-            #     hidden_states = outputs[:bs]
-            # else:
                 hidden_states = self.model(input_ids, positions)
         else:
             graph_bs = context.graph_bs

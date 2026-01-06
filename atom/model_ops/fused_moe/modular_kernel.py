@@ -297,17 +297,17 @@ class FusedMoEModularKernel(torch.nn.Module):
         # optimize fused_moe hidden_states
         # mori dispatch expands buffer to (max_tokens * world_size, hidden_dim)
         # but actual valid tokens = graph_bs * topk * dp_size
-        # context = get_forward_context().context
-        # dp_size = get_dp_group().world_size
-        # topk = topk_ids.shape[1]
-        # # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
-        # total_valid_tokens = context.graph_bs * topk * dp_size
-        # if total_valid_tokens < dispatch_a1.shape[0] and not context.is_prefill:
-        #     dispatch_a1 = dispatch_a1[:total_valid_tokens]
-        #     dispatch_ids = dispatch_ids[:total_valid_tokens]
-        #     dispatch_weights = dispatch_weights[:total_valid_tokens]
-        #     if dispatch_scale is not None:
-        #         dispatch_scale = dispatch_scale[:total_valid_tokens]
+        context = get_forward_context().context
+        dp_size = get_dp_group().world_size
+        topk = topk_ids.shape[1]
+        # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
+        total_valid_tokens = context.graph_bs * topk * dp_size
+        if total_valid_tokens < dispatch_a1.shape[0] and not context.is_prefill:
+            dispatch_a1 = dispatch_a1[:total_valid_tokens]
+            dispatch_ids = dispatch_ids[:total_valid_tokens]
+            dispatch_weights = dispatch_weights[:total_valid_tokens]
+            if dispatch_scale is not None:
+                dispatch_scale = dispatch_scale[:total_valid_tokens]
 
         fused_out = fused_moe(
             dispatch_a1,
