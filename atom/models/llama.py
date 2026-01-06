@@ -61,7 +61,6 @@ from atom.models.utils import (
 
 
 class LlamaMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -108,7 +107,6 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaAttention(nn.Module):
-
     def __init__(
         self,
         config: LlamaConfig,
@@ -151,7 +149,7 @@ class LlamaAttention(nn.Module):
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
@@ -230,7 +228,6 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: LlamaConfig,
@@ -246,9 +243,9 @@ class LlamaDecoderLayer(nn.Module):
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
+            rope_scaling[
+                "original_max_position_embeddings"
+            ] = config.original_max_position_embeddings
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
         # Support internlm/internlm-7b with bias

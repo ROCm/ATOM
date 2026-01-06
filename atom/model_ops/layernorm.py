@@ -25,10 +25,9 @@ ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
 if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_quant
 
-if (
-    ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
-):
+if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
     import aiter as rocm_aiter
+
     rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
 
@@ -101,7 +100,6 @@ def fused_add_rmsnorm_pad_(
 
 
 class RMSNorm(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -124,11 +122,11 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
-            assert not self.fused_allreduce, "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
+            assert (
+                not self.fused_allreduce
+            ), "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
             if residual is None:
-                x = fused_rmsnorm_pad_(
-                    x, self.weight, self.eps, self.x_pad_to_multiple
-                )
+                x = fused_rmsnorm_pad_(x, self.weight, self.eps, self.x_pad_to_multiple)
                 return x, None, None
             else:
                 x, residual = fused_add_rmsnorm_pad_(
@@ -136,13 +134,15 @@ class RMSNorm(nn.Module):
                 )
                 return x, residual, None
         if self.fused_allreduce and self.tp_size > 1:
-            assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
+            assert (
+                residual is not None
+            ), "fused_allreduce_rmsnorm requires residual input!"
             x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, 
-                residual, 
-                self.weight, 
+                x,
+                residual,
+                self.weight,
                 self.eps,
-                )
+            )
             return x, residual, None
         else:
             if x_scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
@@ -180,7 +180,9 @@ class RMSNorm(nn.Module):
                     return x, None, None
                 else:
                     # return self.add_rms_forward(x, residual)
-                    x, residual = rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
+                    x, residual = rmsnorm2d_fwd_with_add_(
+                        x, self.weight, residual, self.eps, self.dim
+                    )
                     return x, residual, None
 
 
@@ -211,7 +213,6 @@ def layernorm2d_fwd_with_add_(
 
 
 class LayerNorm(nn.Module):
-
     def __init__(
         self,
         dim: int,

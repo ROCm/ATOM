@@ -28,7 +28,6 @@ if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
 
 
 class SiluAndMul(nn.Module):
-
     def __init__(self):
         super().__init__()
 
