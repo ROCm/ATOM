@@ -22,7 +22,7 @@ RUN pip uninstall -y aiter || true
 
 RUN cd /tmp && rm -rf aiter aiter-test && \
     git clone --recursive https://github.com/ROCm/aiter.git && \
-    cd aiter && git reset --hard v0.1.9 && \
+    cd aiter && git reset --hard b5ade227732c8f7aca9238ff6b448381bdc6508c && \
     pip uninstall -y amd-aiter && \
     pip install --upgrade pip setuptools wheel && \
     pip install ninja && \
