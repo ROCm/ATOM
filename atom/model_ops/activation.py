@@ -50,4 +50,4 @@ class SiluAndMul(nn.Module):
                 [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
             )
             silu_and_mul(out, x)
-            return x
+            return out
