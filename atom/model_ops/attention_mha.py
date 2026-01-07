@@ -405,4 +405,6 @@ class Attention(nn.Module):
                 return self.paged_attention_triton
             else:
                 # Qwen only uses gluon pa decode when bs=64
-                return self.paged_attention_triton if ctx.batch_size == 64 else self.paged_attention_asm
+                if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+                    return self.paged_attention_triton if ctx.batch_size == 64 else self.paged_attention_asm
+                return self.paged_attention_asm
