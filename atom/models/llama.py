@@ -297,10 +297,10 @@ class LlamaDecoderLayer(nn.Module):
         scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
         if residual is None:
             residual = hidden_states
-            hidden_states, _, scale = self.input_layernorm(hidden_states, scale)
+            hidden_states = self.input_layernorm(hidden_states, x_scale=scale)
         else:
-            hidden_states, residual, scale = self.input_layernorm(
-                hidden_states, scale, residual
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, x_scale=scale
             )
         hidden_states = self.self_attn(
             positions=positions, hidden_states=hidden_states, x_scale=scale
@@ -308,8 +308,8 @@ class LlamaDecoderLayer(nn.Module):
 
         # Fully Connected
         scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
-        hidden_states, residual, scale = self.post_attention_layernorm(
-            hidden_states, scale, residual
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, scale
         )
         hidden_states = self.mlp(hidden_states, x_scale=scale)
         return hidden_states, residual
@@ -396,7 +396,7 @@ class LlamaModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _, _ = self.norm(hidden_states, None, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
