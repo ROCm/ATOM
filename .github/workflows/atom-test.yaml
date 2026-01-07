@@ -53,6 +53,7 @@ jobs:
       - name: Build Docker image
         run: |
           docker build --network=host \
+            --no-cache \
             -t atom_test:ci \
             --build-arg BASE_IMAGE=${{ env.ATOM_BASE_IMAGE }} \
             --build-arg PREBUILD_KERNELS=0 \
