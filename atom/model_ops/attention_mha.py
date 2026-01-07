@@ -402,7 +402,10 @@ class Attention(nn.Module):
                 return self.prefill_attention_asm
         else:
             if self.use_triton_attn:
-                return self.paged_attention_triton
+                if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+                    return self.paged_attention_triton
+                else:
+                    return self.paged_attention_asm
             else:
                 # Qwen only uses gluon pa decode when bs=64
                 if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
