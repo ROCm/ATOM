@@ -28,9 +28,10 @@ RUN git clone --depth=1 --branch release/internal/3.5.x https://github.com/ROCm/
 RUN pip show triton || true
 
 # Install Aiter
+RUN mkdir -p /app
 RUN pip uninstall -y aiter || true
-RUN git clone $AITER_REPO /aiter-test && \
-    cd /aiter-test && \
+RUN git clone $AITER_REPO /app/aiter-test && \
+    cd /app/aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
@@ -39,8 +40,8 @@ RUN pip show amd-aiter || true
 
 # Install ATOM
 RUN pip uninstall -y atom || true
-RUN git clone $ATOM_REPO /ATOM && \
-    cd /ATOM && \
+RUN git clone $ATOM_REPO /app/ATOM && \
+    cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     pip install -e .
 RUN pip show atom || true
