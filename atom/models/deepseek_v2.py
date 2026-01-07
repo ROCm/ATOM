@@ -292,7 +292,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
     M = hidden_states_quant.shape[0]
 
     if hidden_states_quant_scale is None:
-        if M <= 64:
+        if M <= 32:
             qkv_lora = gemm_a16wfp4_preshuffle(
                 hidden_states_quant,
                 weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
