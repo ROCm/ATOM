@@ -17,12 +17,15 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from atom.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
+    maybe_remap_kv_scale_name,
+    remap_output_scale_name,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.moe import is_rocm_aiter_fusion_shared_expert_enabled
 from aiter.dist.parallel_state import get_tp_group
 from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrite_spec_layer_name
 
+from aiter import logger
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     if loaded_weight.numel() == param.data.numel():
@@ -86,7 +89,9 @@ def load_model(
             if load_dummy:
                 continue
             if name.endswith("kv_scale"):
-                continue
+                maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if spec_decode:
                 spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
                 if spec_layer is None:
@@ -118,8 +123,15 @@ def load_model(
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
-                    param = model.get_parameter(param_name)
-                    weight_loader = getattr(param, "weight_loader")
+                    if name.endswith("output_scale"):
+                        possible_name = remap_output_scale_name(name, params_dict)
+                        if possible_name is None:
+                            continue
+                        param = params_dict[possible_name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    else:
+                        param = model.get_parameter(param_name)
+                        weight_loader = getattr(param, "weight_loader")
                     # weight_loader(param, weight_tensor, shard_id)
                     futures.append(
                         executor.submit(weight_loader, param, weight_tensor, shard_id)
@@ -137,8 +149,15 @@ def load_model(
                             name.endswith(".bias") or name.endswith("_bias")
                         ) and name not in dict(model.named_parameters()):
                             continue
-                        param = model.get_parameter(name)
-                        weight_loader = getattr(param, "weight_loader")
+                        if name.endswith("output_scale"):
+                            possible_name = remap_output_scale_name(name, params_dict)
+                            if possible_name is None:
+                                continue
+                            param = params_dict[possible_name]
+                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        else:
+                            param = model.get_parameter(name)
+                            weight_loader = getattr(param, "weight_loader")
                         futures.append(
                             executor.submit(
                                 weight_loader,
@@ -168,7 +187,13 @@ def load_model(
                         # weight_loader(param, weight_tensor)
                 else:
                     # Model doesn't have expert mapping, use generic loading
-                    param = model.get_parameter(name)
+                    if name.endswith("output_scale"):
+                        possible_name = remap_output_scale_name(name, params_dict)
+                        if possible_name is None:
+                            continue
+                        param = params_dict[possible_name]
+                    else:
+                        param = model.get_parameter(name)
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
