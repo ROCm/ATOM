@@ -1223,25 +1223,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     dim=-1,
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
-                if self.fuse_qknorm_quant:
-                    (hidden_states_or_q_c, 
-                    hidden_states_or_q_c_scale), _, kv_c_normed, _ = _fuse_rmsnorm_quant(
-                        q_c,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.eps,
-                        kv_c,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.eps,
-                        None,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
-                        group_size=128,
-                        output_unquantized_inp1=False,
-                        transpose_scale=False,
-                    )
-                else:
-                    hidden_states_or_q_c = self.q_a_layernorm(q_c)
+                hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
             hidden_states_or_q_c = hidden_states
             kv_c, k_pe = torch.split(self.kv_a_proj_with_mqa(hidden_states, hidden_states_scale),
