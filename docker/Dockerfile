@@ -8,21 +8,28 @@ ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
-#ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-#ARG AITER_COMMIT="HEAD"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT="b5ade227732c8f7aca9238ff6b448381bdc6508c"
+ARG TRITON_REPO="https://github.com/ROCm/triton.git"
+ARG TRITON_COMMIT="release/internal/3.5.x"
+
+# Update Triton
+RUN pip uninstall -y triton
+RUN cd /tmp && \
+  git clone --depth=1 --branch ${TRITON_COMMIT} ${TRITON_REPO} triton-test && \
+  cd triton-test && \
+  pip install -r python/requirements.txt && \
+  pip install filecheck && \
+  MAX_JOBS=64 pip --retries=10 --default-timeout=60 install . \
+  cd triton_kernels && \
+  pip install -e . 
+RUN pip show triton || true
 
 # Install Aiter
 RUN pip uninstall -y aiter || true
-#RUN git clone $AITER_REPO /aiter-test && \
-#    cd /aiter-test && \
-#    pip install -r requirements.txt && \
-#    git checkout $AITER_COMMIT && \
-#    git submodule sync && git submodule update --init --recursive && \
-#    PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
-
 RUN cd /tmp && rm -rf aiter aiter-test && \
-    git clone --recursive https://github.com/ROCm/aiter.git && \
-    cd aiter && git reset --hard b5ade227732c8f7aca9238ff6b448381bdc6508c && \
+    git clone --recursive ${AITER_REPO} && \
+    cd aiter && git reset --hard ${AITER_COMMIT} && \
     pip uninstall -y amd-aiter && \
     pip install --upgrade pip setuptools wheel && \
     pip install ninja && \
