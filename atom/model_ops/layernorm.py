@@ -16,7 +16,6 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
@@ -102,30 +101,6 @@ class RMSNorm(nn.Module):
         self.fused_allreduce = fused_allreduce
         self.tp_size = get_tensor_model_parallel_world_size()
 
-    # def rms_forward(
-    #     self,
-    #     x: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     orig_dtype = x.dtype
-    #     x = x.to(torch.float32)
-    #     var = x.pow(2).mean(dim=-1, keepdim=True)
-    #     x.mul_(torch.rsqrt(var + self.eps))
-    #     x = x.to(orig_dtype).mul_(self.weight)
-    #     return x
-
-    # def add_rms_forward(
-    #     self,
-    #     x: torch.Tensor,
-    #     residual: torch.Tensor,
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     orig_dtype = x.dtype
-    #     x = x.to(torch.float32).add_(residual.to(torch.float32))
-    #     residual = x.to(orig_dtype)
-    #     var = x.pow(2).mean(dim=-1, keepdim=True)
-    #     x.mul_(torch.rsqrt(var + self.eps))
-    #     x = x.to(orig_dtype).mul_(self.weight)
-    #     return x, residual
-
     def forward(
         self,
         x: torch.Tensor,
@@ -140,7 +115,7 @@ class RMSNorm(nn.Module):
             else:
                 return fused_add_rmsnorm_pad_(
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
-                )
+                )      
         if self.fused_allreduce and self.tp_size > 1:
             assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
             return tensor_model_parallel_fused_allreduce_rmsnorm(

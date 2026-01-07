@@ -41,7 +41,89 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 
+from aiter import fused_rope_rms
+
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+
+class RotaryEmbeddingQKNormFused(nn.Module):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+
+        cos, sin = self._compute_cos_sin_cache()
+        cos = cos.to(dtype)
+        sin = sin.to(dtype)
+        cache = torch.cat((cos, sin), dim=-1)
+        self.cos_sin_cache: torch.Tensor
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            self.register_buffer("cos_sin_cache", cache.view(cache.size(0), self.head_size), persistent=False)
+        else:
+            self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        """Compute the inverse frequency."""
+        # NOTE(woosuk): To exactly match the HF implementation, we need to
+        # use CPU to compute the cache and then move it to GPU. However, we
+        # create the cache on GPU for faster initialization. This may cause
+        # a slight numerical difference between the HF implementation and ours.
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim
+            )
+        )
+        return inv_freq
+
+    def _compute_cos_sin_cache(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the cos and sin cache."""
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
+
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos().unsqueeze(-2).unsqueeze(-2)
+        sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
+        return cos, sin
+
+    def forward(self,
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        positions: torch.Tensor,
+        num_heads: int,
+        num_kv_heads: int,
+        eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = positions.shape[-1]
+        fused_rope_rms(
+            qkv,
+            q_weight,
+            k_weight,
+            self.cos_sin_cache,
+            positions,
+            num_tokens=num_tokens,
+            num_heads_q=num_heads,
+            num_heads_k=num_kv_heads,
+            num_heads_v=num_kv_heads,
+            head_size=self.head_size,
+            is_neox_style=self.is_neox_style,
+            eps=eps,
+        )
+
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -191,25 +273,62 @@ class Qwen3MoeAttention(nn.Module):
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_kv_heads,
-            kv_cache_dtype=kv_cache_dtype,
-            layer_num=layer_num,
-            use_mla=False,
-        )
-
+        if ENABLE_QK_NORM_ROPE_FUSION or ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            self.rotary_emb = RotaryEmbeddingQKNormFused(
+                head_size=self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position_embeddings=max_position,
+                base=rope_theta,
+                is_neox_style=True,
+                dtype=torch.get_default_dtype(),
+            )
+        else:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+            )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+                kv_cache_dtype=kv_cache_dtype,
+                layer_num=layer_num,
+                use_mla=False,
+                rotary_emb=self.rotary_emb,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+            )
+        elif ENABLE_QK_NORM_ROPE_FUSION:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+                kv_cache_dtype=kv_cache_dtype,
+                layer_num=layer_num,
+                use_mla=False,
+            )
+        else:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_kv_heads,
+                kv_cache_dtype=kv_cache_dtype,
+                layer_num=layer_num,
+                use_mla=False,
+                rotary_emb=self.rotary_emb,
+            )
+        self.kv_cache_dtype = kv_cache_dtype
+        self.layer_num = layer_num
+
 
     def forward(
         self,
@@ -217,13 +336,28 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn(q, k, v, positions, None, qkv)
+        elif ENABLE_QK_NORM_ROPE_FUSION:
+            self.rotary_emb(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                positions,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                eps=self.q_norm.eps,
+            )
+            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn(q, k, v)
+        else:
+            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Add qk-norm
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v)
         output = self.o_proj(attn_output)
         return output
 
@@ -285,11 +419,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0)
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0,
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
     def forward(
@@ -353,7 +488,7 @@ class Qwen3MoeModel(nn.Module):
             self.norm = RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
-                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION
+                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
             )
         else:
             self.norm = PPMissingLayer()

@@ -55,6 +55,8 @@ from aiter.ops.triton.fused_mxfp4_quant import (
 )
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
 from aiter.dist.utils import cdiv
+from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
+from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -63,7 +65,6 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.fp8_mqa_logits import fp8_mqa_logits
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -307,7 +308,6 @@ def _fuse_rmsnorm_quant(
 
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
     hidden_states_quant: torch.Tensor,
-    hidden_states_quant_scale: torch.Tensor,
     weight_qkv_a_proj: torch.Tensor,
     weight_scale_qkv_a_proj: torch.Tensor,
     q_a_layernorm_weight: torch.Tensor,
@@ -317,9 +317,10 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
     q_lora_rank: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    shuffle: bool = True,
-    scale_shuffle_padding: bool = True,
-    output_unquantized_inp1: bool = False,
+    hidden_states_quant_scale: Optional[torch.Tensor] = None,
+    shuffle: Optional[bool] = True,
+    scale_shuffle_padding: Optional[bool] = True,
+    output_unquantized_inp1: Optional[bool] = False,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -342,7 +343,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
 @torch_compile_guard(gen_fake=_fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake, mutates_args=[])
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
     hidden_states_quant: torch.Tensor,
-    hidden_states_quant_scale: torch.Tensor,
     weight_qkv_a_proj: torch.Tensor,
     weight_scale_qkv_a_proj: torch.Tensor,
     q_a_layernorm_weight: torch.Tensor,
@@ -352,9 +352,10 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
     q_lora_rank: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    shuffle: bool = True,
-    scale_shuffle_padding: bool = True,
-    output_unquantized_inp1: bool = False,
+    hidden_states_quant_scale: Optional[torch.Tensor] = None,
+    shuffle: Optional[bool] = True,
+    scale_shuffle_padding: Optional[bool] = True,
+    output_unquantized_inp1: Optional[bool] = False,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -363,17 +364,47 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
 ]:
     M = hidden_states_quant.shape[0]
 
-    if M >= 32:
-        hidden_states_quant_scale = hidden_states_quant_scale.view(torch.uint8).view(hidden_states_quant_scale.shape[0] // 32, -1)
+    if hidden_states_quant_scale is None:
+        if M <= 64:
+            qkv_lora = gemm_a16wfp4_preshuffle(
+                hidden_states_quant,
+                weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
+                weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // 32, -1),
+                prequant=True,
+                skip_reduce=True,
+            )
+        else:
+            quant_func = get_hip_quant(QuantType.per_1x32)
+            x, x_scale = quant_func(
+                hidden_states_quant,
+                quant_dtype=dtypes.fp4x2,
+                shuffle=(M >= 32),
+            )
+            
+            if M >= 32:
+                x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+            else:
+                x_scale = x_scale[:M, ...].view(torch.uint8)
+                
+            qkv_lora = gemm_afp4wfp4_preshuffle(
+                x.view(torch.uint8), 
+                weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
+                x_scale, 
+                weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // 32, -1),
+                skip_reduce=True,
+            )
     else:
-        hidden_states_quant_scale = hidden_states_quant_scale[:M, ...].view(torch.uint8)
+        if M >= 32:
+            hidden_states_quant_scale = hidden_states_quant_scale.view(torch.uint8).view(hidden_states_quant_scale.shape[0] // 32, -1)
+        else:
+            hidden_states_quant_scale = hidden_states_quant_scale[:M, ...].view(torch.uint8)
 
-    qkv_lora = gemm_afp4wfp4_preshuffle(
-        hidden_states_quant.view(torch.uint8), 
-        weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
-        hidden_states_quant_scale, 
-        weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // 32, -1), 
-        skip_reduce=True)
+        qkv_lora = gemm_afp4wfp4_preshuffle(
+            hidden_states_quant.view(torch.uint8), 
+            weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
+            hidden_states_quant_scale, 
+            weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // 32, -1), 
+            skip_reduce=True)
 
     q_c, kv_c, k_pe = torch.split(
                     qkv_lora,
@@ -411,7 +442,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
 
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     hidden_states_quant: torch.Tensor,
-    hidden_states_quant_scale: torch.Tensor,
     weight_qkv_a_proj: torch.Tensor,
     weight_scale_qkv_a_proj: torch.Tensor,
     q_a_layernorm_weight: torch.Tensor,
@@ -421,7 +451,8 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     q_lora_rank: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    dtype_quant=dtypes.fp8,
+    dtype_quant = dtypes.fp8,
+    hidden_states_quant_scale: Optional[torch.Tensor] = None,
     shuffle: Optional[bool] = False,
     scale_shuffle_padding: Optional[bool] = False,
     group_size: Optional[int] = 128,
@@ -431,7 +462,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     if dtype_quant == dtypes.fp4x2:
         q_c, q_c_scale, kv_c_normed, k_pe = _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
             hidden_states_quant,
-            hidden_states_quant_scale,
             weight_qkv_a_proj,
             weight_scale_qkv_a_proj,
             q_a_layernorm_weight,
@@ -441,6 +471,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
             q_lora_rank,
             kv_lora_rank,
             qk_rope_head_dim,
+            hidden_states_quant_scale,
             shuffle,
             scale_shuffle_padding,
             output_unquantized_inp1,
@@ -633,6 +664,8 @@ def sparse_attn_indexer(
         scale_fmt,
     )
     if context.is_prefill:
+        if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
+            return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
         total_seq_lens = hidden_states.shape[0]
@@ -660,19 +693,21 @@ def sparse_attn_indexer(
         num_tokens = hidden_states.shape[0]
         logits = fp8_mqa_logits(Q=q_fp8[num_decode_tokens:num_tokens], KV=k_fp8, kv_scales=k_scale, weights=weights[num_decode_tokens:num_tokens],
                                 cu_starts=cu_seqlen_ks, cu_ends=cu_seqlen_ke)
+        
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices = topk_indices_buffer[
             num_decode_tokens:num_tokens, :topk_tokens
         ]
         top_k_per_row_prefill(
-            logits,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
+            logits=logits,
+            rowStarts=cu_seqlen_ks,
+            rowEnds=cu_seqlen_ke,
+            indices=topk_indices,
+            values=None,
+            numRows=num_rows,
+            stride0=logits.stride(0),
+            stride1=logits.stride(1),
         )
     else:
         decode_metadata = attn_metadata
@@ -790,9 +825,9 @@ class Indexer(nn.Module):
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
-    def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, positions,
-                rotary_emb) -> torch.Tensor:
-        q = self.wq_b(qr)
+    def forward(self, hidden_states: torch.Tensor, qr: torch.Tensor, qr_scale: Optional[torch.Tensor],
+                positions, rotary_emb) -> torch.Tensor:
+        q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
@@ -957,6 +992,14 @@ class DeepseekV2MLAAttention(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
 
         if self.is_v32:
+            self.indexer_rope_emb = get_rope(
+                qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=True,
+            )
             self.indexer = Indexer(
                 get_current_atom_config(),
                 config,
@@ -968,6 +1011,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 f"{prefix}.indexer",
             )
         else:
+            self.indexer_rope_emb = None
             self.indexer = None
         # In the MLA backend, kv_cache includes both k_c and
         # pe (i.e. decoupled position embeddings). In particular,
@@ -1025,7 +1069,6 @@ class DeepseekV2MLAAttention(nn.Module):
             if self.fuse_qknorm_quant and self.quant_dtype != dtypes.fp8:
                 q_c, q_c_scale, kv_c_normed, k_pe = _fuse_qkv_a_proj_reduce_rmsnorm_quant(
                     hidden_states,
-                    hidden_states_scale,
                     self.fused_qkv_a_proj.weight,
                     self.fused_qkv_a_proj.weight_scale,
                     self.q_a_layernorm.weight,
@@ -1036,6 +1079,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
                     dtype_quant=self.quant_dtype,
+                    hidden_states_quant_scale=hidden_states_scale,
                     shuffle=True,
                     scale_shuffle_padding=True,
                     group_size=128,
@@ -1078,14 +1122,21 @@ class DeepseekV2MLAAttention(nn.Module):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         if not self.fuse_qknorm_quant:
             kv_c_normed = self.kv_a_layernorm(kv_c)
+            hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None:
-            _topk_indices = self.indexer(hidden_states, hidden_states_or_q_c, positions, self.rotary_emb)
+            _topk_indices = self.indexer(
+                hidden_states,
+                hidden_states_or_q_c,
+                hidden_states_or_q_c_scale,
+                positions,
+                self.indexer_rope_emb,
+            )
 
         return self.mla_attn(hidden_states_or_q_c,
                              kv_c_normed,
                              k_pe,
                              positions,
-                             None if not self.fuse_qknorm_quant else hidden_states_or_q_c_scale,)
+                             hidden_states_or_q_c_scale,)
 
 
 
@@ -1137,6 +1188,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.quant_dtype = None
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
+
+        # this part enforce fuse_rms_quant and use standalone AR
         if quant_config is not None and ENABLE_RMSNORM_QUANT_FUSION:
             if quant_config["quant_dtype"] == dtypes.fp8 or (quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()):
                 self.quant_dtype = quant_config["quant_dtype"]

@@ -13,10 +13,9 @@ import time
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import Any, Iterator, Optional, Sequence, Union, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence, Union
 from urllib.parse import urlparse
 from uuid import uuid4
-from transformers import PretrainedConfig
 
 import numpy as np
 import psutil
@@ -24,9 +23,11 @@ import torch
 import zmq
 import zmq.asyncio
 from atom.utils.custom_register import direct_register_custom_op
+from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
     from atom.config import Config
+
 from unittest.mock import patch
 
 logger = logging.getLogger("atom")
@@ -43,11 +44,13 @@ def set_device_control_env_var(config: "Config", local_dp_rank: int):
 
     value = get_device_indices(evar, local_dp_rank, world_size)
     print(f"Setting DP rank {local_dp_rank} to {value}")
-    with patch.dict(os.environ, values=((evar, value), )):
+    with patch.dict(os.environ, values=((evar, value),)):
         yield
 
-def get_device_indices(device_control_env_var: str, local_dp_rank: int,
-                       world_size: int):
+
+def get_device_indices(
+    device_control_env_var: str, local_dp_rank: int, world_size: int
+):
     """
     Returns a comma-separated string of device indices for the specified
     data parallel rank.
@@ -57,15 +60,18 @@ def get_device_indices(device_control_env_var: str, local_dp_rank: int,
     try:
         value = ",".join(
             str(i)
-            for i in range(local_dp_rank * world_size, (local_dp_rank + 1) *
-                           world_size))
+            for i in range(local_dp_rank * world_size, (local_dp_rank + 1) * world_size)
+        )
     except IndexError as e:
-        raise Exception(f"Error setting {device_control_env_var}: "
-                        f"local range: [{local_dp_rank * world_size}, "
-                        f"{(local_dp_rank + 1) * world_size}) "
-                        "base value: "
-                        f"\"{os.getenv(device_control_env_var)}\"") from e
+        raise Exception(
+            f"Error setting {device_control_env_var}: "
+            f"local range: [{local_dp_rank * world_size}, "
+            f"{(local_dp_rank + 1) * world_size}) "
+            "base value: "
+            f'"{os.getenv(device_control_env_var)}"'
+        ) from e
     return value
+
 
 def mark_spliting_op(
     is_custom: bool,
@@ -88,6 +94,7 @@ def mark_spliting_op(
         return func
 
     return decorator
+
 
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
@@ -444,7 +451,6 @@ import torch
 from packaging import version
 from packaging.version import Version
 
-
 context_manager = None
 torch_compile_start_time: float = 0.0
 
@@ -556,9 +562,9 @@ def getLogger():
         logger.setLevel(logging.DEBUG)
 
         console_handler = logging.StreamHandler()
-        if int(os.environ.get("AITER_LOG_MORE", 0)):
+        if int(os.environ.get("ATOM_LOG_MORE", 0)):
             formatter = logging.Formatter(
-                fmt="[%(name)s %(levelname)s] %(asctime)s.%(msecs)03d - %(processName)s:%(process)d - %(pathname)s:%(lineno)d - %(funcName)s\n%(message)s",
+                fmt="[%(name)s %(levelname)s] %(asctime)s.%(msecs)01d - %(processName)s:%(process)d - %(pathname)s:%(lineno)d - %(funcName)s\n%(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
         else:
