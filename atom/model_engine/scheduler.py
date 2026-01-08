@@ -26,7 +26,6 @@ class ScheduledBatch:
         total_seqs_num: int = 0,
         total_seqs_num_prefill: int = 0,
         total_seqs_num_decode: int = 0,
-        req_id_to_index: dict[int, int] = {},
         scheduled_spec_decode_tokens: dict[int, list[int]] = {},
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
@@ -36,8 +35,8 @@ class ScheduledBatch:
             seq.token_ids[-num_tokens:]
             for seq, num_tokens in zip(seqs.values(), num_scheduled_tokens)
         ]
-        print(f"{num_scheduled_tokens=}")
-        print(f"{self.scheduled_tokens=}")
+        # print(f"{num_scheduled_tokens=}")
+        # print(f"{self.scheduled_tokens=}")
         self.temperatures = [seq.temperature for seq in seqs.values()]
         self.context_lens = [seq.num_tokens for seq in seqs.values()]
         self.block_tables = [
@@ -60,7 +59,6 @@ class ScheduledBatch:
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
-        self.req_id_to_index = req_id_to_index
         self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
 
 class Scheduler:
@@ -141,7 +139,6 @@ class Scheduler:
 
         # decode
         num_seqs_decode = 0
-        req_id_to_index = {}
         while self.running and num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
@@ -151,7 +148,6 @@ class Scheduler:
                     self.preempt(seq)
                     break
             else:
-                req_id_to_index[seq.id] = num_seqs_decode
                 if seq.spec_token_ids:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
 
@@ -179,7 +175,6 @@ class Scheduler:
                 total_seqs_num=num_seqs_prefill + num_seqs_decode,
                 total_seqs_num_prefill=num_seqs_prefill,
                 total_seqs_num_decode=num_seqs_decode,
-                req_id_to_index=req_id_to_index,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             ),
             scheduled_seqs,
@@ -198,8 +193,6 @@ class Scheduler:
         stream_output_queue=None,
     ) -> list[Sequence]:
         is_deferred_out = prev_token_ids.get(-1, False)
-        print(f"{draft_token_ids=}")
-        # print(f"{is_deferred_out=}")
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
@@ -209,7 +202,6 @@ class Scheduler:
             self.mtp_k     if self.use_spec else
             0
         )
-        print(f"{num_placeholder=}")
         for seq in self.running:
             if seq.id not in prev_token_ids:
                 continue
@@ -233,7 +225,6 @@ class Scheduler:
 
             if draft_token_ids and seq.id in draft_token_ids:
                 seq.spec_token_ids = draft_token_ids[seq.id]
-                print(f"{seq=}")
 
             if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
