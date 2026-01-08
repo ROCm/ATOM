@@ -19,18 +19,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.utils import envs
 
 
-ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
-    envs.ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
-)
-if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_quant
-
-if ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
-    import aiter as rocm_aiter
-
-    rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
-
-
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
@@ -106,6 +94,7 @@ class RMSNorm(nn.Module):
         eps: float = 1e-6,
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
+        fused_quant: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -113,6 +102,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
+        self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(
@@ -145,7 +135,14 @@ class RMSNorm(nn.Module):
             )
             return x, residual
         else:
-            if x_scale is not None and ATOM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+            if x_scale is not None and self.use_fused_quant:
+                from aiter.ops.triton.fused_fp8_quant import (
+                    fused_rms_fp8_per_tensor_static_quant,
+                )
+                import aiter as rocm_aiter
+
+                rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
                 # static FP8 quantization
                 if residual is None:
                     x, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
@@ -159,7 +156,7 @@ class RMSNorm(nn.Module):
                         dtype_quant=rocm_aiter_fp8_dtype,
                         res1=None,
                     )
-                    return x
+                    return (x, x_scale)
                 else:
                     x, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
                         x,
@@ -172,7 +169,7 @@ class RMSNorm(nn.Module):
                         dtype_quant=rocm_aiter_fp8_dtype,
                         res1=residual,
                     )
-                    return x, residual
+                    return (x, x_scale), residual
             else:
                 if residual is None:
                     # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
