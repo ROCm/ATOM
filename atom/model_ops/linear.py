@@ -36,8 +36,13 @@ def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
 if use_triton_gemm():
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
+    try:
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+        # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
+        # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
+    except:    
+        gemm_afp4wfp4_preshuffle = None
+    gemm_a8w8_blockscale_preshuffle = None
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_preshuffle = None

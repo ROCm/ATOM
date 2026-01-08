@@ -74,13 +74,17 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     use_triton_gemm,
 )
+
 from aiter import gemm_a8w8_blockscale_bpreshuffle
-from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
-from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
 if use_triton_gemm():
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
-else:
-    gemm_a8w8_blockscale_preshuffle = None
+    try:
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+        from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
+        from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
+    except:
+        gemm_afp4wfp4_preshuffle = None
+        gemm_a16wfp4_preshuffle = None
+        gemm_a8w8_blockscale_preshuffle = None
 from atom.model_ops.attention_mla import is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
@@ -107,7 +111,7 @@ logger = logging.getLogger("atom")
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
-ENABLE_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_RMSNORM_QUANT_FUSION
+ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -509,7 +513,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
             quant_dtype=dtypes.fp8,
             transpose_scale=transpose_scale
         )
-        if gemm_a8w8_blockscale_preshuffle is not None:
+        if M <= 256:
             qkv_lora = gemm_a8w8_blockscale_preshuffle(
                 x,
                 weight_qkv_a_proj.view(weight_qkv_a_proj.shape[0] // 16, -1),
@@ -526,7 +530,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
                 torch.bfloat16
             )
     else:
-        if gemm_a8w8_blockscale_preshuffle is not None:
+        if M <= 256:
             qkv_lora = gemm_a8w8_blockscale_preshuffle(
                 hidden_states_quant, 
                 weight_qkv_a_proj.view(weight_qkv_a_proj.shape[0] // 16, -1),
@@ -1055,9 +1059,8 @@ class DeepseekV2MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
 
-        # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains BF16 GEMM,
-        # Otherwise, if use_triton_gemm() is off, all projections are BF16 GEMMs
-        # For FP8, use_triton_gemm() is ignored and AITER FP8 GEMM is used
+        # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains AITER BF16 GEMMs,
+        # For FP8 and use_triton_gemm(), fused_qkv_a_proj is AITER-Triton FP8 GEMMs while others remain AITER FP8 GEMMs
         if quant_config["quant_dtype"] == dtypes.fp4x2:
             if not use_triton_gemm(): 
                 # TODO use ignore layer for mxfp4 attention
@@ -1196,13 +1199,12 @@ class DeepseekV2MLAAttention(nn.Module):
             prefix=prefix,
         )
 
-        # self.fuse_qknorm_quant is turned on only if FP8 or (FP4 and use_triton_gemm()),
-        # because for (FP4 and not use_triton_gemm()) case, BF16 GEMMs are used
+        # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if use_triton_gemm() and (FP8 or FP4),
         self.prefix = prefix
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if quant_config["quant_dtype"] == dtypes.fp8 or (quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()):
+            if (quant_config["quant_dtype"] == dtypes.fp8 or quant_config["quant_dtype"] == dtypes.fp4x2) and use_triton_gemm():
                 self.quant_dtype = quant_config["quant_dtype"]
                 self.fuse_qknorm_quant = True
 
@@ -1314,21 +1316,23 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
-        # self.fuse_input_norm_quant is turned on only if FP8 or (FP4 and use_triton_gemm()),
-        # because for (FP4 and not use_triton_gemm()) case, BF16 GEMMs are used
-        # note that ENABLE_ALLREDUCE_RMSNORM_FUSION will be turned off if it was on
+        # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on self.fuse_input_norm_quant is turned on only if use_triton_gemm and (FP8 or FP4),
+        # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
+        #   1. RMS_Quant fusion is only used for input_layernorm
+        #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
+        #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm if ENABLE_ALLREDUCE_RMSNORM_FUSION is turned on
         self.quant_dtype = None
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
-
-        # this part enforce fuse_rms_quant and use standalone AR
-        if quant_config is not None and ENABLE_RMSNORM_QUANT_FUSION:
-            if quant_config["quant_dtype"] == dtypes.fp8 or (quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()):
+        if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
+            if (quant_config["quant_dtype"] == dtypes.fp8 or quant_config["quant_dtype"] == dtypes.fp4x2) and use_triton_gemm():
                 self.quant_dtype = quant_config["quant_dtype"]
                 self.fuse_input_norm_quant = True
                 if self.fuse_ar_input_norm:
                     self.fuse_ar_input_norm = False
-                    logger.info("Warning: Because ENABLE_RMSNORM_QUANT_FUSION is turned on, AR + RMS fusion is turned off for input_layernorm and reduce_results is re-enabled for first k dense layer down_proj")
+                    logger.info("Warning: Because ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on, AR + RMS fusion is turned off for input_layernorm and reduce_results is re-enabled for first k dense layer down_proj")
+            else:
+                logger.info("Info: Because ATOM_USE_TRITON_GEMM is not turned on in DeepSeek-R1, ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned off automatically")
         
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
@@ -1340,11 +1344,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
         else:
-            # next_layer_dense = True
-            # if (config.n_routed_experts is not None
-            #     and (layer_idx + 1) >= config.first_k_dense_replace
-            #     and (layer_idx + 1) % config.moe_layer_freq == 0):
-            #     next_layer_dense = False
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1361,7 +1360,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                                                 fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION)
         self.routed_scaling_factor = config.routed_scaling_factor
         self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
-        self.fuse_rmsnorm_quant = ENABLE_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
+        self.fuse_rmsnorm_quant = ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
 
 
     def forward(
@@ -1499,11 +1498,11 @@ class DeepseekV2Model(nn.Module):
             layer_num_offset=0
         )
 
+        # fused_allreduce will have to be turned off here if the fuse_ar_input_norm variable is False in the last layer
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size,
                                 eps=config.rms_norm_eps,
-                                fused_allreduce=self.layers[self.end_layer - 1].fuse_ar_input_norm,)
-                                # fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,)
+                                fused_allreduce=self.layers[self.end_layer - 1].fuse_ar_input_norm)
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = (
