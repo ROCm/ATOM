@@ -3,6 +3,7 @@
 
 from typing import List, Tuple, Optional, Union
 import torch
+from atom.config import QuantizationConfig
 from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
@@ -16,8 +17,10 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.utils import envs
-
+from aiter import (
+    QuantType,
+    dtypes,
+)
 
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
@@ -95,6 +98,7 @@ class RMSNorm(nn.Module):
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
         fused_quant: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -104,6 +108,13 @@ class RMSNorm(nn.Module):
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
+
+        if quant_config is None:
+            quant_config = QuantizationConfig()
+        quant_type = quant_config["quant_type"]
+        params_dtype = quant_config["quant_dtype"]
+        self.quant_type = quant_type
+        self.params_dtype = params_dtype
 
     def forward(
         self,
@@ -170,6 +181,16 @@ class RMSNorm(nn.Module):
                         res1=residual,
                     )
                     return (x, x_scale), residual
+            elif x_scale is None and self.use_fused_quant and self.quant_type.value == QuantType.per_1x32.value:
+                from aiter.ops.triton.fused_mxfp4_quant import (
+                    fused_rms_mxfp4_quant,
+                )
+
+                if residual is None:
+                    (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, self.weight, self.eps, shuffle=True)
+                    return (x, x_scale)
+                else:
+                    (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(x, self.weight, self.eps, shuffle=True, res1=residual)
             else:
                 if residual is None:
                     # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)

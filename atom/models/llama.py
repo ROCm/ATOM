@@ -60,11 +60,11 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 
-ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
-    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT = (
+    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
 )
-ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
-    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT = (
+    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT
 )
 
 
@@ -95,7 +95,7 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        self.fused_act_quant = ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+        self.fused_act_quant = ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -267,7 +267,7 @@ class LlamaDecoderLayer(nn.Module):
             attention_bias = config.qkv_bias
 
         self.use_fused_rmsnorm_quant = (
-            ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+            ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
         )
 
         self.self_attn = LlamaAttention(
