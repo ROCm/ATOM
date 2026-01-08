@@ -515,6 +515,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
                 hidden_states_quant,
                 weight_qkv_a_proj.view(weight_qkv_a_proj.shape[0] // 16, -1),
                 weight_scale_qkv_a_proj,
+                prequant=False,
                 skip_reduce=True
             )
         else:
@@ -524,7 +525,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
                 quant_dtype=dtypes.fp8,
                 transpose_scale=transpose_scale
             )
-            if M <= 256:
+            if M <= 128:
                 qkv_lora = gemm_a8w8_blockscale_preshuffle(
                     x,
                     weight_qkv_a_proj.view(weight_qkv_a_proj.shape[0] // 16, -1),
@@ -541,7 +542,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
                     torch.bfloat16
                 )
     else:
-        if M <= 256:
+        if M <= 128:
             qkv_lora = gemm_a8w8_blockscale_preshuffle(
                 hidden_states_quant, 
                 weight_qkv_a_proj.view(weight_qkv_a_proj.shape[0] // 16, -1),
