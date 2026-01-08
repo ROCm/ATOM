@@ -44,7 +44,7 @@ class SiluAndMul(nn.Module):
             # x = fused_silu_mul_fp8_per_tensor_static_quant(
             #     x, x_scale, dtype_quant=rocm_aiter_fp8_dtype
             # )
-            return x, x_scale
+            return out, x_scale
         else:
             out = torch.empty(
                 [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
