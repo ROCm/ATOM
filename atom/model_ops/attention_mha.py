@@ -324,6 +324,7 @@ class Attention(nn.Module):
         
         # variable lenth attention use key value as input
         attn_metadata = fwd_args.attn_metadata
+        sliding_window = (self.sliding_window, 0, 0) if self.sliding_window is not None else (-1, -1, 0)
         o = aiter.flash_attn_varlen_func(
             q,
             k,
@@ -336,6 +337,8 @@ class Attention(nn.Module):
             dropout_p=attn_metadata.dropout_p,
             softmax_scale=self.scale,
             causal=True,
+            window_size=sliding_window,
+            sink_ptr=self.sinks,
         )
         
         return o
@@ -396,10 +399,10 @@ class Attention(nn.Module):
         ctx = fwd_args.context
 
         if ctx.is_prefill:
-            if self.use_triton_attn:
-                return self.prefill_attention_triton
-            else:
-                return self.prefill_attention_asm
+            # if self.use_triton_attn:
+            #     return self.prefill_attention_triton
+            # else:
+            return self.prefill_attention_asm
         else:
             if self.use_triton_attn:
                 return self.paged_attention_triton
