@@ -512,7 +512,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
     if hidden_states_quant_scale is None:
         if M <= 32:
             qkv_lora = gemm_a16w8_blockscale_preshuffle(
-                x,
+                hidden_states_quant,
                 weight_qkv_a_proj.view(weight_qkv_a_proj.shape[0] // 16, -1),
                 weight_scale_qkv_a_proj,
                 skip_reduce=True
