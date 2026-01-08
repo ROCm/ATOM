@@ -81,10 +81,13 @@ if use_triton_gemm():
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
         from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
         from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
+        from aiter.ops.triton.gemm_a16w8_blockscale import gemm_a16w8_blockscale_preshuffle
     except:
         gemm_afp4wfp4_preshuffle = None
         gemm_a16wfp4_preshuffle = None
         gemm_a8w8_blockscale_preshuffle = None
+        gemm_a16w8_blockscale_preshuffle = None
+
 from atom.model_ops.attention_mla import is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
@@ -507,28 +510,36 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
     M = hidden_states_quant.shape[0]
 
     if hidden_states_quant_scale is None:
-        quant_func = get_hip_quant(QuantType.per_1x128)
-        x, x_scale = quant_func(
-            hidden_states_quant,
-            quant_dtype=dtypes.fp8,
-            transpose_scale=transpose_scale
-        )
-        if M <= 256:
-            qkv_lora = gemm_a8w8_blockscale_preshuffle(
+        if M <= 32:
+            qkv_lora = gemm_a16w8_blockscale_preshuffle(
                 x,
                 weight_qkv_a_proj.view(weight_qkv_a_proj.shape[0] // 16, -1),
-                x_scale,
                 weight_scale_qkv_a_proj,
                 skip_reduce=True
             )
-        else:            
-            qkv_lora = gemm_a8w8_blockscale_bpreshuffle(
-                x,
-                weight_qkv_a_proj,
-                x_scale,
-                weight_scale_qkv_a_proj,
-                torch.bfloat16
+        else:
+            quant_func = get_hip_quant(QuantType.per_1x128)
+            x, x_scale = quant_func(
+                hidden_states_quant,
+                quant_dtype=dtypes.fp8,
+                transpose_scale=transpose_scale
             )
+            if M <= 256:
+                qkv_lora = gemm_a8w8_blockscale_preshuffle(
+                    x,
+                    weight_qkv_a_proj.view(weight_qkv_a_proj.shape[0] // 16, -1),
+                    x_scale,
+                    weight_scale_qkv_a_proj,
+                    skip_reduce=True
+                )
+            else:            
+                qkv_lora = gemm_a8w8_blockscale_bpreshuffle(
+                    x,
+                    weight_qkv_a_proj,
+                    x_scale,
+                    weight_scale_qkv_a_proj,
+                    torch.bfloat16
+                )
     else:
         if M <= 256:
             qkv_lora = gemm_a8w8_blockscale_preshuffle(
@@ -540,7 +551,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
             )
         else:
             qkv_lora = gemm_a8w8_blockscale_bpreshuffle(
-                x,
+                hidden_states_quant,
                 weight_qkv_a_proj,
                 hidden_states_quant_scale,
                 weight_scale_qkv_a_proj,
@@ -1448,7 +1459,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-# @support_torch_compile
+@support_torch_compile
 class DeepseekV2Model(nn.Module):
     def __init__(
         self,
