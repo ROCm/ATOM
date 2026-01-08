@@ -6,7 +6,7 @@ In particular, we focus on deploying the fp8 model of Qwen3-235B-A22B on MI355 i
 ## Preparing environment
 Pull the latest docker from https://hub.docker.com/r/rocm/atom/ :
 ```bash
-docker pull rocm/atom:gfx950_latest
+docker pull rocm/atom:rocm_7.2_preview_gfx950_latest
 ```
 All the oparations in the next will be executed inside the container.
 
@@ -48,17 +48,38 @@ python -m atom.benchmarks.benchmark_serving \
     --save-result --result-dir=${result_dir} --result-filename=$RESULT_FILENAME.json \
     --percentile-metrics="ttft,tpot,itl,e2el"
 ```
-The performance number for both 4 and 8 ranks are provided as a baseline:
+The performance number for both 4 and 8 ranks are provided as a reference, with the following environment:
+- docker image: rocm/atom:rocm_7.2_preview_gfx950_latest, pulled on 1/7/2026.
+- ATOM: the one comes with the image, main branch, commit 2f713064。
+- AITER: yadai/moe_tile_config_v1, commit 88857df.
+
 |              |               |                 |             | TP8 + EP8    |              |              | TP4 + EP4        |              |              |
 | ------------ | ------------- | --------------- | ----------- | ------------ | ------------ | ---------------- | ------------ | ------------ | ---------------- |
 | ISL | OSL | Concurrency | Num Prompts | Mean TTFT (ms) | Mean TPOT (ms) | Total Throughput | Mean TTFT (ms) | Mean TPOT (ms) | Total Throughput |
-| 1000         | 1000          | 256             | 1024        | 2523.16      | 23.06        | 19994.9          | 3315.62      | 28.91        | 15879.98         |
-| 1000         | 1000          | 128             | 512         | 1396.19      | 18.8         | 12670.42         | 1820.53      | 23.62        | 10061.07         |
-| 4000         | 1000          | 128             | 512         | 4897.86      | 23.96        | 22173.88         | 6479.95      | 29.62        | 17725.37         |
-| 4000         | 1000          | 64              | 256         | 2585.34      | 20.09        | 14111.39         | 3427.88      | 24.1         | 11629.43         |
-| 10000        | 1000          | 64              | 256         | 6502.95      | 25.88        | 21741.39         | 8765.1       | 31.4         | 17529.47         |
-| 10000        | 1000          | 32              | 128         | 3378.36      | 23.34        | 13179.94         | 4525.85      | 23.55        | 12544.81         |
+| 1000  | 1000 | 256 | 1024 | 2452.83 | 20.55 | 22239.78 | 3214.23 | 27.79 | 16506.71 |
+| 1000  | 1000 | 128 | 512  | 1326.08 | 16.47 | 14380.66 | 1743.22 | 21.15 | 11182.11 |
+| 4000  | 1000 | 128 | 512  | 4656.93 | 21.32 | 24632.52 | 6215.98 | 26.79 | 19388.74 |
+| 4000  | 1000 | 64  | 256  | 2444.89 | 17.52 | 16024.13 | 3252.3  | 19.88 | 13837.46 |
+| 10000 | 1000 | 64  | 256  | 6144.75 | 22.8  | 24318.56 | 8340.75 | 26.84 | 20015.67 |
+| 10000 | 1000 | 32  | 128  | 3208.08 | 19.08 | 15799.19 | 4330.11 | 21.44 | 13663.56 |
 
+Here are the steps to reinstall ATOM/AITER in the docker, if you are trying to verify with other specefic commits:
+```bash
+# uninstall existing ATOM/AITER
+pip uninstall -y atom amd-aiter
+
+cd PATH_TO_ATOM
+# normally ATOM is already installed in develop mode
+# you may just do checkout wihtout reinstall
+git checkout specefic_branch_or_commit
+pip install -e .
+
+cd PATH_TO_AITER
+rm -rf aiter/jit/build aiter/jit/*.so
+git checkout specefic_branch_or_commit
+git submodule sync && git submodule update --init --recursive
+python setup.py develop
+```
 
 ### Accuracy test
 We verified the lm_eval accuracy on gsm8k dataset with command:
