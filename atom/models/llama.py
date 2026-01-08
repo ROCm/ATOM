@@ -107,7 +107,7 @@ class LlamaMLP(nn.Module):
         x = self.gate_up_proj(x, x_scale=x_scale)
         scale = getattr(self.down_proj, "input_scale", None)
         x = self.act_fn(x, scale)
-        if self.fused_act_quant:
+        if scale is not None and self.fused_act_quant:
             x, scale = x
         else:
             scale = None
@@ -321,7 +321,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual, x_scale=scale
             )
-        if self.use_fused_rmsnorm_quant:
+        if scale is not None and self.use_fused_rmsnorm_quant:
             hidden_states, scale = hidden_states
         else:
             scale = None
@@ -335,7 +335,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual, scale
         )
-        if self.use_fused_rmsnorm_quant:
+        if scale is not None and self.use_fused_rmsnorm_quant:
             hidden_states, scale = hidden_states
         else:
             scale = None
