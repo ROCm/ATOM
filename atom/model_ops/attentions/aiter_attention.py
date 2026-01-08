@@ -84,13 +84,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
-
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
-        attn_matadata = AttentionMetaData(
+        attn_metadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
@@ -103,8 +102,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 else None
             ),
         )
+
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )
-        return attn_matadata, context
+        return attn_metadata, context
