@@ -28,8 +28,12 @@ if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
 
 
 class SiluAndMul(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        fused_quant: bool = False,
+    ):
         super().__init__()
+        self.fused_quant = fused_quant
 
     def forward_native(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
@@ -40,7 +44,7 @@ class SiluAndMul(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if x_scale is not None and ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
+        if x_scale is not None and self.fused_quant:
             x = fused_silu_mul_fp8_per_tensor_static_quant(
                 x, x_scale, dtype_quant=rocm_aiter_fp8_dtype
             )
