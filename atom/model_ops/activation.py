@@ -5,7 +5,7 @@ import torch
 from typing import Optional
 from torch import nn
 import torch.nn.functional as F
-from aiter import silu_and_mul
+from aiter import silu_and_mul, scaled_silu_and_mul
 
 from aiter import (
     dtypes,
@@ -35,12 +35,15 @@ class SiluAndMul(nn.Module):
                 fused_silu_mul_fp8_per_tensor_static_quant,
             )
             import aiter as rocm_aiter
-
             rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
-            x = fused_silu_mul_fp8_per_tensor_static_quant(
-                x, x_scale, dtype_quant=rocm_aiter_fp8_dtype
+            out = torch.empty(
+                [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=rocm_aiter_fp8_dtype
             )
+            x = scaled_silu_and_mul(out, x, x_scale)
+            # x = fused_silu_mul_fp8_per_tensor_static_quant(
+            #     x, x_scale, dtype_quant=rocm_aiter_fp8_dtype
+            # )
             return x, x_scale
         else:
             out = torch.empty(
