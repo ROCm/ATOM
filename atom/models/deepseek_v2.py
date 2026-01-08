@@ -545,6 +545,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
         output_unquantized_inp1=output_unquantized_inp1,
         dtype=torch.bfloat16,
         out3=k_pe_reduced_out,
+        transpose_scale=transpose_scale,
     )
 
     if k_pe_reduced_out is not None:
@@ -1210,7 +1211,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     scale_shuffle_padding=True,
                     group_size=128,
                     output_unquantized_inp1=False,
-                    transpose_scale=False,
+                    transpose_scale=True,
                 )
                 hidden_states_or_q_c = q_c
                 hidden_states_or_q_c_scale = q_c_scale
