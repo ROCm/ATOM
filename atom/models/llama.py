@@ -108,6 +108,8 @@ class LlamaMLP(nn.Module):
         x = self.act_fn(x, scale)
         if self.fused_act_quant:
             x, scale = x
+        else:
+            scale = None
         x = self.down_proj(x, x_scale=scale)
         return x
 
@@ -312,6 +314,8 @@ class LlamaDecoderLayer(nn.Module):
             )
         if self.use_fused_rmsnorm_quant:
             hidden_states, scale = hidden_states
+        else:
+            scale = None
 
         hidden_states = self.self_attn(
             positions=positions, hidden_states=hidden_states, x_scale=scale
@@ -322,6 +326,11 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual, scale
         )
+        if self.use_fused_rmsnorm_quant:
+            hidden_states, scale = hidden_states
+        else:
+            scale = None
+
         hidden_states = self.mlp(hidden_states, x_scale=scale)
         return hidden_states, residual
 
