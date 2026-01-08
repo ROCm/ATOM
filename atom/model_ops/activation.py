@@ -13,20 +13,6 @@ from aiter import (
 from atom.utils import envs
 
 
-ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
-    envs.ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
-)
-if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
-    from aiter.ops.triton.fused_fp8_quant import (
-        fused_silu_mul_fp8_per_tensor_static_quant,
-    )
-
-if ATOM_USE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT:
-    import aiter as rocm_aiter
-
-    rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
-
-
 class SiluAndMul(nn.Module):
     def __init__(
         self,
@@ -45,6 +31,12 @@ class SiluAndMul(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if x_scale is not None and self.fused_quant:
+            from aiter.ops.triton.fused_fp8_quant import (
+                fused_silu_mul_fp8_per_tensor_static_quant,
+            )
+            import aiter as rocm_aiter
+            rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
             x = fused_silu_mul_fp8_per_tensor_static_quant(
                 x, x_scale, dtype_quant=rocm_aiter_fp8_dtype
             )
