@@ -35,6 +35,7 @@ class SiluAndMul(nn.Module):
                 fused_silu_mul_fp8_per_tensor_static_quant,
             )
             import aiter as rocm_aiter
+
             rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
             x = fused_silu_mul_fp8_per_tensor_static_quant(

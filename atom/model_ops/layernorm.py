@@ -136,8 +136,11 @@ class RMSNorm(nn.Module):
             return x, residual
         else:
             if x_scale is not None and self.use_fused_quant:
-                from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_quant
+                from aiter.ops.triton.fused_fp8_quant import (
+                    fused_rms_fp8_per_tensor_static_quant,
+                )
                 import aiter as rocm_aiter
+
                 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
                 # static FP8 quantization

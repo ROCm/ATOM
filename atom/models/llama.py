@@ -67,6 +67,7 @@ ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
     envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
 )
 
+
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -265,7 +266,9 @@ class LlamaDecoderLayer(nn.Module):
         if hasattr(config, "qkv_bias"):
             attention_bias = config.qkv_bias
 
-        self.use_fused_rmsnorm_quant = ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+        self.use_fused_rmsnorm_quant = (
+            ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+        )
 
         self.self_attn = LlamaAttention(
             config=config,
@@ -292,9 +295,15 @@ class LlamaDecoderLayer(nn.Module):
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, fused_quant=self.use_fused_rmsnorm_quant)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.use_fused_rmsnorm_quant,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, fused_quant=self.use_fused_rmsnorm_quant,
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.use_fused_rmsnorm_quant,
         )
 
     def forward(
