@@ -13,9 +13,6 @@ from aiter import (
     QuantType,
 )
 
-#import logging
-#logger = logging.getLogger(__name__)
-
 
 def mxfp4_act_mul_quant_fuse_fake(
     x : torch.Tensor, 

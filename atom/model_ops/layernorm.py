@@ -22,8 +22,6 @@ from aiter import (
     dtypes,
 )
 
-#import logging
-#logger = logging.getLogger(__name__)
 
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
