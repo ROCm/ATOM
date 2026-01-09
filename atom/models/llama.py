@@ -101,7 +101,7 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul(fused_quant=self.fused_act_quant)
+        self.act_fn = SiluAndMul(fused_quant=self.fused_act_quant, quant_config=quant_config)
 
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
@@ -299,11 +299,13 @@ class LlamaDecoderLayer(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=self.use_fused_rmsnorm_quant,
+            quant_config=quant_config,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=self.use_fused_rmsnorm_quant,
+            quant_config=quant_config,
         )
 
     def forward(
