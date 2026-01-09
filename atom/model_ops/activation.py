@@ -7,13 +7,54 @@ from torch import nn
 import torch.nn.functional as F
 from aiter import silu_and_mul
 from atom.config import QuantizationConfig
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from aiter import (
     QuantType,
 )
 
-import logging
-logger = logging.getLogger(__name__)
+#import logging
+#logger = logging.getLogger(__name__)
+
+
+def mxfp4_act_mul_quant_fuse_fake(
+    x : torch.Tensor, 
+    shuffle : bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N1 = x.shape
+    N_half = N1 // 2
+    out = torch.empty((M, N_half // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    SCALE_N_valid = (N_half + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    use_scale_shuffle_padding = shuffle
+    if use_scale_shuffle_padding:
+        SCALE_M = ((M + 255) // 256) * 256
+        SCALE_N = ((SCALE_N_valid + 7) // 8) * 8
+    else:
+        SCALE_M = M
+        SCALE_N = SCALE_N_valid
+    scale = torch.empty(
+        (SCALE_M, SCALE_N),
+        dtype=torch.float8_e8m0fnu,
+        device=x.device,
+    )
+
+    return out, scale
+
+
+# It's important to use mutates_args=[] to avoid functionized_v2 op generation
+@torch_compile_guard(gen_fake=mxfp4_act_mul_quant_fuse_fake, mutates_args=[])
+def mxfp4_act_mul_quant_fuse(
+    x : torch.Tensor, 
+    shuffle : bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_mxfp4_quant import (
+        fused_reduce_act_mul_and_mxfp4_quant,
+    )
+    (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=shuffle)
+
+    return x, x_scale
+
 
 class SiluAndMul(nn.Module):
     def __init__(
@@ -52,13 +93,13 @@ class SiluAndMul(nn.Module):
             return x, x_scale
         # mxfp4 quantization
         elif x_scale is None and self.fused_quant and self.quant_type.value == QuantType.per_1x32.value:
-            from aiter.ops.triton.fused_mxfp4_quant import (
-                fused_reduce_act_mul_and_mxfp4_quant,
-            )
-            logger.info(f"x, shape = {x.shape}, type = {x.dtype}")
-            (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
-            logger.info(f"x_scale, shape = {x_scale.shape}, type = {x_scale.dtype}")
-            return x, x_scale
+            # from aiter.ops.triton.fused_mxfp4_quant import (
+            #     fused_reduce_act_mul_and_mxfp4_quant,
+            # )
+            # (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
+            # return x, x_scale
+            return mxfp4_act_mul_quant_fuse(x, shuffle=True)
+            # return mxfp4_act_mul_quant_fuse(x)
         else:
             out = torch.empty(
                 [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
