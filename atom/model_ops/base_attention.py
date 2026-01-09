@@ -18,6 +18,7 @@ from .attention_mla import MLAModules
 from atom.config import get_current_atom_config
 from atom.utils.selector import get_attn_backend
 
+from aiter import logger
 
 def fake_(
     q: torch.Tensor,
@@ -84,7 +85,8 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
-        self.k_scale = self.v_scale = None
+        self.k_scale = nn.Parameter()
+        self.v_scale = nn.Parameter()
         self.layer_num = layer_num
         self.mla_modules = mla_modules
         self.use_mla = use_mla
