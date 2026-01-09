@@ -45,10 +45,10 @@ from atom.utils.forward_context import (
 )
 
 support_model_arch_dict = {
-    "Qwen3ForCausalLM": "atom.models.qwen3",
-    "Qwen3MoeForCausalLM": "atom.models.qwen3_moe",
-    "LlamaForCausalLM": "atom.models.llama",
-    "MixtralForCausalLM": "atom.models.mixtral",
+    "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
+    "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
+    "LlamaForCausalLM": "atom.models.llama.LlamaForCausalLM",
+    "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
