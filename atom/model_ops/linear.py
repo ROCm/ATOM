@@ -39,13 +39,13 @@ if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
         # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
-        # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
+        # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
     except:    
         gemm_afp4wfp4_preshuffle = None
-    gemm_a8w8_blockscale_preshuffle = None
+    gemm_a8w8_blockscale_bpreshuffle_triton = None
 else:
     gemm_afp4wfp4_preshuffle = None
-    gemm_a8w8_blockscale_preshuffle = None
+    gemm_a8w8_blockscale_bpreshuffle_triton = None
 
 def divide(numerator, denominator):
     assert (
@@ -148,12 +148,12 @@ def gemm_a8w8_blockscale_preshuffle_fake(x: torch.Tensor, weight: torch.Tensor,
 def gemm_a8w8_blockscale_preshuffle_impl(x: torch.Tensor, weight: torch.Tensor,
                                          x_scale: torch.Tensor, w_scale: torch.Tensor,
                                          dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    if gemm_a8w8_blockscale_preshuffle is not None:
+    if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
         weight_shuffled = weight.reshape(
             weight.shape[0] // 16,
             weight.shape[1] * 16
         )
-        y = gemm_a8w8_blockscale_preshuffle(x, weight_shuffled, x_scale, w_scale, dtype)
+        y = gemm_a8w8_blockscale_bpreshuffle_triton(x, weight_shuffled, x_scale, w_scale, dtype)
     else:
         y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
     return y
