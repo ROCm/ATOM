@@ -28,8 +28,8 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 
-import logging
-logger = logging.getLogger(__name__)
+#import logging
+#logger = logging.getLogger(__name__)
 
 def divide(numerator, denominator):
     assert (
@@ -60,14 +60,13 @@ def gemm_a4w4_quant(
     input_scale: torch.Tensor,
 ) -> torch.Tensor:
 
-    logger.info(f"loc1, x_shape = {x.shape}, dtype = {x.dtype}")
-    logger.info(f"loc1, weight_scale, shape = {weight_scale.shape}, dtype = {weight_scale.dtype}")
+    #logger.info(f"loc1, x_shape = {x.shape}, dtype = {x.dtype}")
+    #logger.info(f"loc1, weight_scale, shape = {weight_scale.shape}, dtype = {weight_scale.dtype}")
 
-    if input_scale is not None:
-        logger.info(f"input_scale, shape = {input_scale.shape}, dtype = {input_scale.dtype}")
-    else:
-        logger.info(f"input_scale_is_none======================")
-
+    #if input_scale is not None:
+    #    logger.info(f"input_scale, shape = {input_scale.shape}, dtype = {input_scale.dtype}")
+    #else:
+    #    logger.info(f"input_scale_is_none======================")
     if input_scale is None:
         quant_func = get_hip_quant(QuantType.per_1x32)
         x, x_scale = quant_func(
@@ -76,10 +75,20 @@ def gemm_a4w4_quant(
             scale=input_scale,
             shuffle=True,
         )
+        #x_scale = x_scale.view(torch.float8_e8m0fnu)
     else:
-        x = x.view(torch.float4_e2m1fn_x2)
+        #x = x.view(torch.float4_e2m1fn_x2)
         x_scale = input_scale
-    x_scale = x_scale.view(torch.float8_e8m0fnu)
+        #x_scale = x_scale.view(torch.float8_e8m0fnu)
+    '''
+    quant_func = get_hip_quant(QuantType.per_1x32)
+    x, x_scale = quant_func(
+            x,
+            quant_dtype=params_dtype,
+            scale=input_scale,
+            shuffle=True,
+    )
+    '''
 
     y = gemm_a4w4(
         x,

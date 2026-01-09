@@ -93,6 +93,57 @@ def fused_add_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
+def mxfp4_rms_quant_fuse_fake(
+    x : torch.Tensor, 
+    weight: torch.Tensor,
+    eps: float,
+    shuffle : bool = False,
+    res1: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    M, N = x.shape
+    out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    SCALE_N_valid = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    use_scale_shuffle_padding = shuffle
+    if use_scale_shuffle_padding:
+        SCALE_M = ((M + 255) // 256) * 256
+        SCALE_N = ((SCALE_N_valid + 7) // 8) * 8
+    else:
+        SCALE_M = M
+        SCALE_N = SCALE_N_valid
+    scale = torch.empty(
+        (SCALE_M, SCALE_N),
+        dtype=torch.float8_e8m0fnu,
+        device=x.device,
+    )
+
+    if res1 is None:
+        return (out, scale, None)
+    else:
+        res = torch.empty_like(res1)
+        return (out, scale, res)
+
+
+# It's important to use mutates_args=[] to avoid functionized_v2 op generation
+@torch_compile_guard(gen_fake=mxfp4_rms_quant_fuse_fake, mutates_args=[])
+def mxfp4_rms_quant_fuse(
+    x : torch.Tensor, 
+    weight: torch.Tensor,
+    eps: float,
+    shuffle : bool = False,
+    res1: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_mxfp4_quant import (
+        fused_rms_mxfp4_quant,
+    )
+    if res1 is None:
+        (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, weight, eps, shuffle=True)
+        return (x, x_scale, None)
+    else:
+        (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(x, weight, eps, shuffle=True, res1=res1)
+        return (x, x_scale, residual)
+
+
 class RMSNorm(nn.Module):
     def __init__(
         self,
@@ -185,16 +236,11 @@ class RMSNorm(nn.Module):
                     )
                     return (x, x_scale), residual
             elif self.use_fused_quant and (x_scale is None and self.quant_type.value == QuantType.per_1x32.value):
-                #logger.info(f"rmsnorm, mxfp4_quant")
-                from aiter.ops.triton.fused_mxfp4_quant import (
-                    fused_rms_mxfp4_quant,
-                )
-                
                 if residual is None:
-                    (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, self.weight, self.eps, shuffle=True)
-                    return (x, x_scale)
+                    x, x_scale, _ = mxfp4_rms_quant_fuse(x, self.weight, self.eps, shuffle=True)
+                    return x, x_scale
                 else:
-                    (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(x, self.weight, self.eps, shuffle=True, res1=residual)
+                    x, x_scale, residual = mxfp4_rms_quant_fuse(x, self.weight, self.eps, shuffle=True, res1=residual)
                     return (x, x_scale), residual
             else:
                 if residual is None:

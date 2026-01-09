@@ -64,8 +64,8 @@ from aiter import (
     QuantType,
 )
 
-import logging
-logger = logging.getLogger(__name__)
+#import logging
+#logger = logging.getLogger(__name__)
 
 ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT = (
     envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
@@ -326,7 +326,6 @@ class LlamaDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
-        logger.info(f"loc1")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states, x_scale=scale)
@@ -334,43 +333,40 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual, x_scale=scale
             )
-        logger.info(f"loc2")
         if self.use_fused_rmsnorm_quant and (scale is not None or self.quant_type.value == QuantType.per_1x32.value):
             hidden_states, scale = hidden_states
         else:
             scale = None
 
-        logger.info(f"loc3, x, shape = {hidden_states.shape}, type = {hidden_states.dtype}")
-        if scale is not None:
-            logger.info(f"loc3, x_scale, shape = {scale.shape}, type = {scale.dtype}")
-        else:
-            logger.info(f"scale is None")
+        #logger.info(f"loc3, x, shape = {hidden_states.shape}, type = {hidden_states.dtype}")
+        #if scale is not None:
+        #    logger.info(f"loc3, x_scale, shape = {scale.shape}, type = {scale.dtype}")
+        #else:
+        #    logger.info(f"scale is None")
         hidden_states = self.self_attn(
             positions=positions, hidden_states=hidden_states, x_scale=scale
         )
 
         # Fully Connected
         scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
-        logger.info(f"loc4, before post_attn_layernorm")
-        if scale is None:
-            logger.info(f"loc4, scale is none")
-        if residual is None:
-            logger.info(f"loc4, residual is none")
+        #logger.info(f"loc4, before post_attn_layernorm")
+        #if scale is None:
+        #    logger.info(f"loc4, scale is none")
+        #if residual is None:
+        #    logger.info(f"loc4, residual is none")
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual, scale
         )
-        logger.info(f"loc5")
         if self.use_fused_rmsnorm_quant and (scale is not None or self.quant_type.value == QuantType.per_1x32.value):
             hidden_states, scale = hidden_states
         else:
             scale = None
 
-        logger.info(f"loc6")
         hidden_states = self.mlp(hidden_states, x_scale=scale)
         return hidden_states, residual
 
 
-#@support_torch_compile
+@support_torch_compile
 class LlamaModel(nn.Module):
     def __init__(
         self,
