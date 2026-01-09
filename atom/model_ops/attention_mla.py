@@ -336,7 +336,7 @@ class MLAAttention(nn.Module):
         assert attn_metadata is not None
         B = q.shape[0]
 
-        o = torch.zeros(
+        o = torch.empty(
             B, self.num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
         )
 
