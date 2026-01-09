@@ -15,19 +15,12 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.sampler import Sampler
-from atom.models.deepseek_v2 import DeepseekV2ForCausalLM
-from atom.models.gpt_oss import GptOssForCausalLM
-from atom.models.llama import LlamaForCausalLM
-from atom.models.mixtral import MixtralForCausalLM
-from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
-    envs,
     get_hf_text_config,
-    get_open_port,
     init_exit_handler,
+    resolve_obj_by_qualname,
 )
 from atom.utils.selector import get_attn_backend
 
@@ -52,13 +45,13 @@ from atom.utils.forward_context import (
 )
 
 support_model_arch_dict = {
-    "Qwen3ForCausalLM": Qwen3ForCausalLM,
-    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    "LlamaForCausalLM": LlamaForCausalLM,
-    "MixtralForCausalLM": MixtralForCausalLM,
-    "DeepseekV3ForCausalLM": DeepseekV2ForCausalLM,
-    "DeepseekV32ForCausalLM": DeepseekV2ForCausalLM,
-    "GptOssForCausalLM": GptOssForCausalLM,
+    "Qwen3ForCausalLM": "atom.models.qwen3",
+    "Qwen3MoeForCausalLM": "atom.models.qwen3_moe",
+    "LlamaForCausalLM": "atom.models.llama",
+    "MixtralForCausalLM": "atom.models.mixtral",
+    "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
+    "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
+    "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -89,17 +82,15 @@ class tokenIDProcessor:
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             self.async_copy_event.record(self.async_copy_stream)
         self.token_ids_cpu.append(cpu_tensor)
-        self.token_ids_gpu.append(gpu_tensor)
 
     def recv_async_output(self) -> list[int]:
-        self.async_copy_event.synchronize()
         for _ in self.token_ids_cpu:
+            self.async_copy_event.synchronize()
             token_ids = self.token_ids_cpu.pop(0).tolist()
             return token_ids
         return []
 
     def clean(self):
-        self.token_ids_gpu: list[torch.Tensor] = []
         self.token_ids_cpu: list[torch.Tensor] = []
 
         self.prev_batch: Optional[ScheduledBatch] = None
@@ -231,7 +222,9 @@ class ModelRunner:
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
-        if (self.hf_text_config.model_type in ["llama"] and self.hf_text_config.torch_dtype in [torch.bfloat16, torch.float16]):
+        if self.hf_text_config.model_type in [
+            "llama"
+        ] and self.hf_text_config.torch_dtype in [torch.bfloat16, torch.float16]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.is_deepseek_v32 = (
@@ -251,7 +244,7 @@ class ModelRunner:
             )
 
         device = torch.device(f"cuda:{local_device_rank}")
-        print(
+        logger.info(
             f"ModelRunner rank={rank}, dp_rank_local={dp_rank_local}, local_device_rank={local_device_rank}, device={device}"
         )
         self.device = device
@@ -304,13 +297,13 @@ class ModelRunner:
             dtype=np.int64,
         )
         self.async_output_copy_stream = torch.cuda.Stream()
-        self.model = support_model_arch_dict[hf_config.architectures[0]](config)
-        self.use_kv_indptr = False
+
+        model_class = resolve_obj_by_qualname(support_model_arch_dict[hf_config.architectures[0]])  # type: ignore
+        self.model = model_class(config)
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
         logger.info(f"Model load done: {config.model}")
-        if isinstance(self.model, DeepseekV2ForCausalLM):
-            self.use_kv_indptr = True
+
         if hasattr(self, "drafter"):
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
@@ -320,6 +313,7 @@ class ModelRunner:
         self.physical_block_size = self.attn_metadata_builder.block_size
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -894,7 +888,9 @@ class ModelRunner:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
 
-        assert self.graph_bs[0] <= self.config.max_num_seqs, "cudagraph capture sizes must be less than max_num_seqs."
+        assert (
+            self.graph_bs[0] <= self.config.max_num_seqs
+        ), "cudagraph capture sizes must be less than max_num_seqs."
 
         self.forward_vars["cu_seqlens_q"].np[: self.graph_bs[0] + 1] = np.arange(
             0, self.graph_bs[0] + 1
