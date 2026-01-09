@@ -30,7 +30,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from aiter import QuantType
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
 
@@ -59,10 +58,17 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
+
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
+    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+)
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
+    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+)
 
 
 class LlamaMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -89,22 +95,27 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
+        self.fused_act_quant = ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul(fused_quant=self.fused_act_quant)
 
-    def forward(self, x):
-        x = self.gate_up_proj(x)
-        x = self.act_fn(x)
-        x = self.down_proj(x)
+    def forward(self, x, x_scale: Optional[torch.Tensor] = None):
+        x = self.gate_up_proj(x, x_scale=x_scale)
+        scale = getattr(self.down_proj, "input_scale", None)
+        x = self.act_fn(x, scale)
+        if scale is not None and self.fused_act_quant:
+            x, scale = x
+        else:
+            scale = None
+        x = self.down_proj(x, x_scale=scale)
         return x
 
 
 class LlamaAttention(nn.Module):
-
     def __init__(
         self,
         config: LlamaConfig,
@@ -147,7 +158,7 @@ class LlamaAttention(nn.Module):
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
@@ -195,8 +206,9 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
@@ -225,7 +237,6 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: LlamaConfig,
@@ -241,9 +252,9 @@ class LlamaDecoderLayer(nn.Module):
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
+            rope_scaling[
+                "original_max_position_embeddings"
+            ] = config.original_max_position_embeddings
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
         # Support internlm/internlm-7b with bias
@@ -254,6 +265,10 @@ class LlamaDecoderLayer(nn.Module):
         # support internlm/internlm3-8b with qkv_bias
         if hasattr(config, "qkv_bias"):
             attention_bias = config.qkv_bias
+
+        self.use_fused_rmsnorm_quant = (
+            ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+        )
 
         self.self_attn = LlamaAttention(
             config=config,
@@ -280,9 +295,15 @@ class LlamaDecoderLayer(nn.Module):
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.use_fused_rmsnorm_quant,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.use_fused_rmsnorm_quant,
         )
 
     def forward(
@@ -292,16 +313,34 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states, x_scale=scale)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, x_scale=scale
+            )
+        if scale is not None and self.use_fused_rmsnorm_quant:
+            hidden_states, scale = hidden_states
+        else:
+            scale = None
+
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states, x_scale=scale
+        )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, scale
+        )
+        if scale is not None and self.use_fused_rmsnorm_quant:
+            hidden_states, scale = hidden_states
+        else:
+            scale = None
+
+        hidden_states = self.mlp(hidden_states, x_scale=scale)
         return hidden_states, residual
 
 
@@ -336,10 +375,10 @@ class LlamaModel(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
-                layer_num=layer_num
+                layer_num=layer_num,
             ),
             prefix=f"{prefix}.layers",
-            layer_num_offset=0
+            layer_num_offset=0,
         )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
