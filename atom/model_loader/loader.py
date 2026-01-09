@@ -83,15 +83,12 @@ def load_model(
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
+    #logger.info(str(params_dict))
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         for name, weight_tensor in safetensors_weights_iterator(model_name_or_path):
             if load_dummy:
                 continue
-            if name.endswith("kv_scale"):
-                maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
             if spec_decode:
                 spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
                 if spec_layer is None:
@@ -123,19 +120,35 @@ def load_model(
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
-                    if name.endswith("output_scale"):
+                    if name.endswith("kv_scale"):
+                        maybe_remap_kv_scale_name(name, params_dict)
+                        if name is None:
+                            continue
+                    elif param_name.endswith("output_scale"):
+                        # special case for treating kv cache quant scale weights
+                        #logger.info(str(dict(model.model.named_parameters()).keys()))
                         possible_name = remap_output_scale_name(name, params_dict)
+                        logger.info(possible_name)
                         if possible_name is None:
+                            logger.info("no name given")
                             continue
                         param = params_dict[possible_name]
+                        logger.info("it works!")
+                        # logger.info(param)
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     else:
                         param = model.get_parameter(param_name)
                         weight_loader = getattr(param, "weight_loader")
                     # weight_loader(param, weight_tensor, shard_id)
-                    futures.append(
-                        executor.submit(weight_loader, param, weight_tensor, shard_id)
-                    )
+                    if weight_loader != default_weight_loader:
+                        futures.append(
+                            executor.submit(weight_loader, param, weight_tensor, shard_id)
+                        )
+                    else:
+                        # default weight loader requires two parameters, removed shard id
+                        futures.append(
+                            executor.submit(weight_loader, param, weight_tensor)
+                        )
                     break
             else:
                 # Check if model has expert mapping before processing
@@ -188,10 +201,9 @@ def load_model(
                 else:
                     # Model doesn't have expert mapping, use generic loading
                     if name.endswith("output_scale"):
+                        #logger.info(params_dict.keys())
                         possible_name = remap_output_scale_name(name, params_dict)
-                        if possible_name is None:
-                            continue
-                        param = params_dict[possible_name]
+                        continue
                     else:
                         param = model.get_parameter(name)
                     weight_loader = getattr(
