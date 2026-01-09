@@ -95,13 +95,7 @@ class SiluAndMul(nn.Module):
             and self.fused_quant
             and self.quant_type.value == QuantType.per_1x32.value
         ):
-            # from aiter.ops.triton.fused_mxfp4_quant import (
-            #     fused_reduce_act_mul_and_mxfp4_quant,
-            # )
-            # (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
-            # return x, x_scale
             return mxfp4_act_mul_quant_fuse(x, shuffle=True)
-            # return mxfp4_act_mul_quant_fuse(x)
         else:
             out = torch.empty(
                 [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
