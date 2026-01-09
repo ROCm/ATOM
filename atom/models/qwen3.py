@@ -109,6 +109,7 @@ class Qwen3Attention(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,
+            rotary_emb=self.rotary_emb,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -124,8 +125,8 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
+        # q, k = self.rotary_emb(positions, q, k)
+        o = self.attn(q, k, v, positions)
         output = self.o_proj(o)
         return output
 
