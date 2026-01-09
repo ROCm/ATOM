@@ -58,13 +58,17 @@ def gemm_a4w4_quant(
     input_scale: torch.Tensor,
 ) -> torch.Tensor:
 
-    quant_func = get_hip_quant(QuantType.per_1x32)
-    x, x_scale = quant_func(
-        x,
-        quant_dtype=params_dtype,
-        scale=input_scale,
-        shuffle=True,
-    )
+    if input_scale is None:
+        quant_func = get_hip_quant(QuantType.per_1x32)
+        x, x_scale = quant_func(
+            x,
+            quant_dtype=params_dtype,
+            scale=input_scale,
+            shuffle=True,
+        )
+    else:
+        x_scale = input_scale.view(torch.float8_e8m0fnu)
+        x = x.view(torch.float4_e2m1fn_x2)
 
     y = gemm_a4w4(
         x,
