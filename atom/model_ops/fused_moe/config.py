@@ -12,6 +12,30 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("atom")
 
+@cache
+def _has_module(module_name: str) -> bool:
+    """Return True if *module_name* can be found in the current environment.
+
+    The result is cached so that subsequent queries for the same module incur
+    no additional overhead.
+    """
+    return importlib.util.find_spec(module_name) is not None
+
+
+def has_triton_kernels() -> bool:
+    """Whether the optional `triton_kernels` package is available."""
+    return _has_module("triton_kernels")
+
+if has_triton_kernels():
+    try:
+        from triton_kernels.matmul_ogs import PrecisionConfig
+    except ImportError:
+        logger.error(
+            "Failed to import Triton kernels. Please make sure your triton "
+            "version is compatible."
+        )
+
+
 
 class _GroupShape(NamedTuple):
     row: int

@@ -54,7 +54,8 @@ from aiter.jit.utils.chip_info import get_gfx
 from atom.utils import envs
 
 from atom.utils import envs, mark_spliting_op
-from atom.model_ops.fused_moe_triton import _has_module
+from atom.model_ops.fused_moe.config import _has_module
+
 
 @dataclass
 class FusedMoEParallelConfig:
