@@ -52,8 +52,7 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
-        self.k_scale = nn.Parameter()
-        self.v_scale = nn.Parameter()
+        self.k_scale = self.v_scale = None
         self.layer_num = layer_num
         self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
@@ -404,6 +403,4 @@ class Attention(nn.Module):
                 return self.paged_attention_triton
             else:
                 # Qwen only uses gluon pa decode when bs=64
-                if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-                    return self.paged_attention_triton if ctx.batch_size == 64 else self.paged_attention_asm
-                return self.paged_attention_asm
+                return self.paged_attention_triton if ctx.batch_size == 64 else self.paged_attention_asm
