@@ -22,6 +22,9 @@ from aiter import (
     dtypes,
 )
 
+import logging
+logger = logging.getLogger(__name__)
+
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
@@ -181,16 +184,18 @@ class RMSNorm(nn.Module):
                         res1=residual,
                     )
                     return (x, x_scale), residual
-            elif x_scale is None and self.use_fused_quant and self.quant_type.value == QuantType.per_1x32.value:
+            elif self.use_fused_quant and (x_scale is None or self.quant_type.value == QuantType.per_1x32.value):
+                logger.info(f"rmsnorm, mxfp4_quant")
                 from aiter.ops.triton.fused_mxfp4_quant import (
                     fused_rms_mxfp4_quant,
                 )
-
+                
                 if residual is None:
                     (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, self.weight, self.eps, shuffle=True)
                     return (x, x_scale)
                 else:
                     (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(x, self.weight, self.eps, shuffle=True, res1=residual)
+                    return (x, x_scale), residual
             else:
                 if residual is None:
                     # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)

@@ -10,8 +10,10 @@ from atom.config import QuantizationConfig
 
 from aiter import (
     QuantType,
-    dtypes,
 )
+
+import logging
+logger = logging.getLogger(__name__)
 
 class SiluAndMul(nn.Module):
     def __init__(
@@ -53,7 +55,9 @@ class SiluAndMul(nn.Module):
             from aiter.ops.triton.fused_mxfp4_quant import (
                 fused_reduce_act_mul_and_mxfp4_quant,
             )
+            logger.info(f"x, shape = {x.shape}, type = {x.dtype}")
             (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
+            logger.info(f"x_scale, shape = {x_scale.shape}, type = {x_scale.dtype}")
             return x, x_scale
         else:
             out = torch.empty(
