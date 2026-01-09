@@ -92,10 +92,10 @@ def fused_add_rmsnorm_pad_(
 
 
 def mxfp4_rms_quant_fuse_fake(
-    x : torch.Tensor, 
+    x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    shuffle : bool = False,
+    shuffle: bool = False,
     res1: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, None]:
     M, N = x.shape
@@ -125,20 +125,23 @@ def mxfp4_rms_quant_fuse_fake(
 # It's important to use mutates_args=[] to avoid functionized_v2 op generation
 @torch_compile_guard(gen_fake=mxfp4_rms_quant_fuse_fake, mutates_args=[])
 def mxfp4_rms_quant_fuse(
-    x : torch.Tensor, 
+    x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    shuffle : bool = False,
+    shuffle: bool = False,
     res1: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.fused_mxfp4_quant import (
         fused_rms_mxfp4_quant,
     )
+
     if res1 is None:
         (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, weight, eps, shuffle=True)
         return (x, x_scale, None)
     else:
-        (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(x, weight, eps, shuffle=True, res1=res1)
+        (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(
+            x, weight, eps, shuffle=True, res1=res1
+        )
         return (x, x_scale, residual)
 
 
@@ -233,12 +236,18 @@ class RMSNorm(nn.Module):
                         res1=residual,
                     )
                     return (x, x_scale), residual
-            elif self.use_fused_quant and (x_scale is None and self.quant_type.value == QuantType.per_1x32.value):
+            elif self.use_fused_quant and (
+                x_scale is None and self.quant_type.value == QuantType.per_1x32.value
+            ):
                 if residual is None:
-                    x, x_scale, _ = mxfp4_rms_quant_fuse(x, self.weight, self.eps, shuffle=True)
+                    x, x_scale, _ = mxfp4_rms_quant_fuse(
+                        x, self.weight, self.eps, shuffle=True
+                    )
                     return x, x_scale
                 else:
-                    x, x_scale, residual = mxfp4_rms_quant_fuse(x, self.weight, self.eps, shuffle=True, res1=residual)
+                    x, x_scale, residual = mxfp4_rms_quant_fuse(
+                        x, self.weight, self.eps, shuffle=True, res1=residual
+                    )
                     return (x, x_scale), residual
             else:
                 if residual is None:

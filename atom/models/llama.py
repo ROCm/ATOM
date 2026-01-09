@@ -106,14 +106,18 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul(fused_quant=self.fused_act_quant, quant_config=quant_config)
+        self.act_fn = SiluAndMul(
+            fused_quant=self.fused_act_quant, quant_config=quant_config
+        )
         self.quant_type = quant_config["quant_type"]
 
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
         scale = getattr(self.down_proj, "input_scale", None)
         x = self.act_fn(x, scale)
-        if self.fused_act_quant and (scale is not None or self.quant_type.value == QuantType.per_1x32.value):
+        if self.fused_act_quant and (
+            scale is not None or self.quant_type.value == QuantType.per_1x32.value
+        ):
             x, scale = x
         else:
             scale = None
@@ -331,7 +335,9 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual, x_scale=scale
             )
-        if self.use_fused_rmsnorm_quant and (scale is not None or self.quant_type.value == QuantType.per_1x32.value):
+        if self.use_fused_rmsnorm_quant and (
+            scale is not None or self.quant_type.value == QuantType.per_1x32.value
+        ):
             hidden_states, scale = hidden_states
         else:
             scale = None
@@ -345,7 +351,9 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual, scale
         )
-        if self.use_fused_rmsnorm_quant and (scale is not None or self.quant_type.value == QuantType.per_1x32.value):
+        if self.use_fused_rmsnorm_quant and (
+            scale is not None or self.quant_type.value == QuantType.per_1x32.value
+        ):
             hidden_states, scale = hidden_states
         else:
             scale = None

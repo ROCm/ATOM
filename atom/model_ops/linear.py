@@ -79,7 +79,6 @@ def gemm_a4w4_quant(
 
 
 class LinearBase(nn.Module):
-
     def __init__(
         self,
         input_size: int,
@@ -291,7 +290,6 @@ class LinearBase(nn.Module):
                     otype,
                     self.weight_scale.data,
                     self.params_dtype,
-                    #getattr(self, "input_scale", None),
                     input_scale=x_scale,
                 )
                 if self.bias is not None:
@@ -302,7 +300,6 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
@@ -325,7 +322,6 @@ class ReplicatedLinear(LinearBase):
 
 
 class ColumnParallelLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
@@ -352,7 +348,6 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
@@ -393,7 +388,6 @@ class MergedColumnParallelLinear(LinearBase):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
-
     def __init__(
         self,
         hidden_size: int,
@@ -471,7 +465,6 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,

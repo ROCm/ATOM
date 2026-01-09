@@ -15,8 +15,8 @@ from aiter import (
 
 
 def mxfp4_act_mul_quant_fuse_fake(
-    x : torch.Tensor, 
-    shuffle : bool = False,
+    x: torch.Tensor,
+    shuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, N1 = x.shape
     N_half = N1 // 2
@@ -42,12 +42,13 @@ def mxfp4_act_mul_quant_fuse_fake(
 # It's important to use mutates_args=[] to avoid functionized_v2 op generation
 @torch_compile_guard(gen_fake=mxfp4_act_mul_quant_fuse_fake, mutates_args=[])
 def mxfp4_act_mul_quant_fuse(
-    x : torch.Tensor, 
-    shuffle : bool = False,
+    x: torch.Tensor,
+    shuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.fused_mxfp4_quant import (
         fused_reduce_act_mul_and_mxfp4_quant,
     )
+
     (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=shuffle)
 
     return x, x_scale
@@ -66,7 +67,6 @@ class SiluAndMul(nn.Module):
         self.quant_type = quant_type
         self.params_dtype = params_dtype
 
-
     def forward_native(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -77,11 +77,12 @@ class SiluAndMul(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # fp8 quantization
-        if x_scale is not None and self.fused_quant: 
+        if x_scale is not None and self.fused_quant:
             from aiter.ops.triton.fused_fp8_quant import (
                 fused_silu_mul_fp8_per_tensor_static_quant,
             )
             import aiter as rocm_aiter
+
             rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
             x = fused_silu_mul_fp8_per_tensor_static_quant(
@@ -89,7 +90,11 @@ class SiluAndMul(nn.Module):
             )
             return x, x_scale
         # mxfp4 quantization
-        elif x_scale is None and self.fused_quant and self.quant_type.value == QuantType.per_1x32.value:
+        elif (
+            x_scale is None
+            and self.fused_quant
+            and self.quant_type.value == QuantType.per_1x32.value
+        ):
             # from aiter.ops.triton.fused_mxfp4_quant import (
             #     fused_reduce_act_mul_and_mxfp4_quant,
             # )
