@@ -24,7 +24,7 @@ RUN pip install cmake
 RUN git clone "$RCCL_REPO" /app/rccl \
     && cd /app/rccl \
     && git checkout "$RCCL_BRANCH" \
-    && ./install.sh -p --amdgpu_targets="$AITER_ROCM_ARCH"
+    && ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
 RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all build/release/*.deb
 
 # Update Triton
