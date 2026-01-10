@@ -17,6 +17,17 @@ RUN pip install --upgrade pip
 RUN pip install lm-eval[api]
 RUN pip show lm-eval || true
 
+# Update RCCL
+ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
+ARG RCCL_BRANCH="develop"
+RUN pip install cmake
+RUN apt install rocm-cmake -y
+RUN git clone "$RCCL_REPO" /app/rccl \
+    && cd /app/rccl \
+    && git checkout "$RCCL_BRANCH" \
+    && ./install.sh -p --amdgpu_targets="$AITER_ROCM_ARCH"
+RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all build/release/*.deb
+
 # Update Triton
 RUN pip show triton || true
 RUN pip uninstall -y triton
