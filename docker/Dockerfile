@@ -25,7 +25,7 @@ RUN git clone "$RCCL_REPO" /app/rccl \
     && cd /app/rccl \
     && git checkout "$RCCL_BRANCH" \
     && ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
-RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all build/release/*.deb
+RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all build/release/*.deb && rm -rf /app/rccl/build
 
 # Update Triton
 RUN pip show triton || true
