@@ -20,12 +20,13 @@ RUN pip show lm-eval || true
 # Update RCCL
 ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
 ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
+ARG RCCL_SRC_DIR="/app/rccl/"
 RUN pip install cmake
-RUN git clone "$RCCL_REPO" /app/rccl \
-    && cd /app/rccl \
+RUN git clone "$RCCL_REPO" $RCCL_SRC_DIR \
+    && cd $RCCL_SRC_DIR \
     && git checkout "$RCCL_BRANCH" \
     && ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
-RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all build/release/*.deb && rm -rf /app/rccl/build
+RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all $RCCL_SRC_DIR/build/release/*.deb && rm -rf $RCCL_SRC_DIR/build
 
 # Update Triton
 RUN pip show triton || true
