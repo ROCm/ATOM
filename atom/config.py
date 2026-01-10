@@ -408,7 +408,7 @@ class ParallelConfig:
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
-    data_parallel_base_port: int = 29400
+    data_parallel_base_port: int = get_open_port()
 
     data_parallel_master_ip: str = "127.0.0.1"
 
@@ -490,7 +490,7 @@ class ParallelConfig:
         if os.getenv("ATOM_DP_RANK_LOCAL") is not None:
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
         # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
-        self.data_parallel_master_port = get_open_port()
+        # self.data_parallel_master_port = get_open_port()
 
 @dataclass
 class SpeculativeConfig:
