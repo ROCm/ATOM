@@ -19,9 +19,8 @@ RUN pip show lm-eval || true
 
 # Update RCCL
 ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
-ARG RCCL_BRANCH="develop"
+ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
 RUN pip install cmake
-RUN apt install rocm-cmake -y
 RUN git clone "$RCCL_REPO" /app/rccl \
     && cd /app/rccl \
     && git checkout "$RCCL_BRANCH" \
