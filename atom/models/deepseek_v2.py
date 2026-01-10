@@ -705,7 +705,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     scale_shuffle_padding=False,
                     group_size=128,
                     output_unquantized_inp1=False,
-                    transpose_scale=False,
+                    transpose_scale=True,
                 )
             else:
                 hidden_states_or_q_c = self.q_a_layernorm(q_c)
