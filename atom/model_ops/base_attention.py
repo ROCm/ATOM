@@ -85,8 +85,10 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
-        self.k_scale = nn.Parameter()
-        self.v_scale = nn.Parameter()
+        self.k_scale = torch.nn.Parameter(torch.tensor(-1.0),
+                                           requires_grad=False)
+        self.v_scale = torch.nn.Parameter(torch.tensor(-1.0),
+                                           requires_grad=False)
         self.layer_num = layer_num
         self.mla_modules = mla_modules
         self.use_mla = use_mla
