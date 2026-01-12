@@ -125,7 +125,6 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v, positions)
         output = self.o_proj(o)
         return output
