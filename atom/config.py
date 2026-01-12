@@ -611,6 +611,12 @@ class Config:
             else torch.bfloat16
         )
 
+    @property
+    def num_speculative_tokens(self) -> int:
+        if self.speculative_config is None:
+            return 0
+        return self.speculative_config.num_speculative_tokens or 0
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

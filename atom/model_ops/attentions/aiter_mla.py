@@ -40,10 +40,8 @@ class AiterMLABackend(AttentionBackend):
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
-        super().__init__(
-            model_runner,
-        )
-        assert self.block_size == 1, "AITER MLA requires only block size 1."
+        self.block_size = 1
+        super().__init__(model_runner)
         config = model_runner.config
         hf_config = config.hf_config
         self.num_attention_heads = (
