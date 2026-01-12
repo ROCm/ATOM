@@ -6,6 +6,7 @@ FROM $BASE_IMAGE
 
 ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
+ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
@@ -29,6 +30,7 @@ RUN apt-get update && apt-get install -y \
     cmake \
     libdw1 \
     locales
+
 RUN git clone https://github.com/ROCm/mori.git /app/mori && \
     cd /app/mori && \
     pip install -r requirements-build.txt && \
