@@ -25,7 +25,7 @@ from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.request import RequestOutput
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from transformers import AutoTokenizer
 
 # Configure logging
@@ -54,8 +54,7 @@ class ChatMessage(BaseModel):
     role: str
     content: str
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class ChatCompletionRequest(BaseModel):
@@ -105,8 +104,7 @@ class ChatCompletionResponse(BaseModel):
     choices: List[Dict[str, Any]]
     usage: Dict[str, Any]
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class CompletionResponse(BaseModel):
@@ -427,7 +425,9 @@ async def generate_async(
             break
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
-    num_tokens_input = seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
+    num_tokens_input = (
+        seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
+    )
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
     latency = finished_at - started_at
