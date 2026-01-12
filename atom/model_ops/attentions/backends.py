@@ -92,11 +92,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     def __init__(self, model_runner):
         self.model_runner = model_runner
-        # MLA uses block_size=1, others support 16 or 1024
-        if model_runner.use_mla:
-            self.block_size = 1
-        else:
-            self.block_size = 1024 if model_runner.block_size == 1024 else 16
         assert model_runner.block_size % self.block_size == 0
         self.block_ratio = model_runner.block_size // self.block_size
         self.device = model_runner.device

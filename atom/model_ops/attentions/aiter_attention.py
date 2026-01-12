@@ -37,6 +37,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     BLOCK_TABLE_EXTENDER: list[list[int]] = [[]]
 
     def __init__(self, model_runner):
+        self.block_size = 1024 if model_runner.block_size == 1024 else 16
         super().__init__(model_runner)
         config = model_runner.config
         hf_config = config.hf_config
@@ -44,10 +45,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             hf_config.num_attention_heads // get_tp_group().world_size
         )
         # For speculative decode (MTP), max_qlen = num_speculative_tokens + 1
-        if config.speculative_config is not None and config.speculative_config.num_speculative_tokens is not None:
-            max_qlen = config.speculative_config.num_speculative_tokens + 1
-        else:
-            max_qlen = 1
+        max_qlen = config.num_speculative_tokens + 1
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -60,7 +58,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self.max_bs,
             max_qlen,
             self.num_attention_heads,
-            torch.bfloat16,
+            config.torch_dtype,
             dtypes.d_dtypes[config.kv_cache_dtype],
             is_sparse=False,
             fast_mode=True,
@@ -135,7 +133,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             kv_granularity=max(block_size, 16),
             block_size=block_size,
             max_seqlen_qo=int(max_qlen),
-            uni_seqlen_qo=max_qlen,  # ? equals to max_qlen
+            uni_seqlen_qo=max_qlen,
             fast_mode=True,
             max_split_per_batch=-1,
         )
@@ -239,7 +237,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_q_len=var["max_qlen"],
-            max_seqlen_q=var["max_qlen"],
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],

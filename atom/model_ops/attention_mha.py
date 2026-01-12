@@ -346,7 +346,7 @@ class Attention(nn.Module):
             K=k_cache,
             V=v_cache,
             output=output,
-            max_qlen=attn_metadata.max_seqlen_q,
+            max_qlen=attn_metadata.max_q_len,
             qo_indptr=attn_metadata.cu_seqlens_q,
             kv_indptr=attn_metadata.kv_indptr,
             kv_indices=attn_metadata.kv_indices,
