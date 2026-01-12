@@ -263,20 +263,15 @@ class Attention(nn.Module):
             device=q.device,
         )
 
-        if self.kv_cache_dtype == "bf16":
-            k_scale_ = v_scale_ = None
-        else:
-            # when using per-token quant, original k_scale shape: [num_blocks, block_size, num_kv_heads]
-            # gluon pa decode kernel expects shape: [num_blocks, num_kv_heads, block_size, 1]
-            k_scale_ = self.kv_scale if self.sinks is not None else k_scale.unsqueeze(-1).transpose(1, 2)
-            v_scale_ = self.kv_scale if self.sinks is not None else v_scale.unsqueeze(-1).transpose(1, 2)
-        
+        per_tensor = k_scale.numel() == 1
+        if not per_tensor:
+          k_scale = k_scale.unsqueeze(-1)
+          v_scale = v_scale.unsqueeze(-1)
+        compute_type = torch.bfloat16 if self.kv_cache_dtype == "bf16" or per_tensor else aiter.dtypes.fp8
+
         torch.ops.aiter.pa_decode_gluon(
             o,
-            o,
             q,
-            q,
-            None,
             k_cache,
             v_cache,
             attn_metadata.context_lens,
@@ -285,10 +280,10 @@ class Attention(nn.Module):
             1, # query_lenth
             max_context_partition_num, 
             context_partition_size,
-            torch.bfloat16, #compute_type
+            compute_type,
             None,
-            k_scale_,
-            v_scale_,
+            None if self.kv_cache_dtype == "bf16" else k_scale,
+            None if self.kv_cache_dtype == "bf16" else v_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
