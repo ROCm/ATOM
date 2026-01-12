@@ -269,28 +269,28 @@ class MLAAttention(nn.Module):
                 q_out_dtype=kv_cache.dtype,
                 num_decode_toks_for_zeros=0,
             )
-        else: 
-            from aiter.ops.triton.fused_bmm_rope_kv_cache import fused_fp8_bmm_rope_cat_and_cache_mla
+        # else: 
+        #     from aiter.ops.triton.fused_bmm_rope_kv_cache import fused_fp8_bmm_rope_cat_and_cache_mla
 
-            result, _, _, _ = fused_fp8_bmm_rope_cat_and_cache_mla(
-                q_nope,                 
-                self.W_K,               
-                self.W_K_scale,         
-                q_pe,                   
-                k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                kv_cache,
-                attn_metadata.slot_mapping,
-                positions,
-                self.rotary_emb.cos_cache,
-                self.rotary_emb.sin_cache,
-                group_size=128,
-                transpose_bm=True,
-                k_scale=self._k_scale,
-                is_neox=self.rotary_emb.is_neox_style,
-                q_out_dtype=kv_cache.dtype,
-                num_decode_toks_for_zeros=0,
-            )
+        #     result, _, _, _ = fused_fp8_bmm_rope_cat_and_cache_mla(
+        #         q_nope,                 
+        #         self.W_K,               
+        #         self.W_K_scale,         
+        #         q_pe,                   
+        #         k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+        #         k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+        #         kv_cache,
+        #         attn_metadata.slot_mapping,
+        #         positions,
+        #         self.rotary_emb.cos_cache,
+        #         self.rotary_emb.sin_cache,
+        #         group_size=128,
+        #         transpose_bm=True,
+        #         k_scale=self._k_scale,
+        #         is_neox=self.rotary_emb.is_neox_style,
+        #         q_out_dtype=kv_cache.dtype,
+        #         num_decode_toks_for_zeros=0,
+        #     )
 
         return result
 
