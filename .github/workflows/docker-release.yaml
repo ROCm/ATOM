@@ -7,21 +7,27 @@ on:
     inputs:
       atom_repo:
         description: "ATOM repo"
+        required: true
         default: "https://github.com/ROCm/ATOM.git"
       atom_commit:
         description: "ATOM commit"
+        required: true
         default: "HEAD"
       aiter_repo:
         description: "Aiter repo"
+        required: true
         default: "https://github.com/ROCm/aiter.git"
       aiter_commit:
         description: "Aiter commit"
+        required: true
         default: "HEAD"
       rccl_repo:
         description: "RCCL repo"
+        required: true
         default: "https://github.com/ROCm/rccl.git"
       rccl_branch:
         description: "RCCL branch"
+        required: true
         default: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
 
 jobs:
