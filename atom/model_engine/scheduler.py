@@ -233,15 +233,16 @@ class Scheduler:
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
                 if len(seq.token_ids) >= len(stop_seq):
-                    if seq.token_ids[-len(stop_seq) :] == stop_seq:
+                    if seq.token_ids[-len(stop_seq) :] == stop_seq or (self.use_spec and seq.token_ids[-(len(stop_seq) + self.mtp_k) : - self.mtp_k] == stop_seq):
                         leave_reason = "stop_sequence"
                         break
             else:
                 # Check the last token in the list for EOS
                 if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
                     leave_reason = "eos"
-                elif not seq.ignore_eos and token_id in self.stop_token_ids:
-                    leave_reason = str(token_id)
+                elif not seq.ignore_eos and any(t in self.stop_token_ids for t in token_ids):
+                    hit_stop_token = next(t for t in token_ids if t in self.stop_token_ids)
+                    leave_reason = f"stop_{hit_stop_token}"
                 elif seq.num_completion_tokens >= seq.max_tokens:
                     leave_reason = "max_tokens"
             # Prepare stream output
