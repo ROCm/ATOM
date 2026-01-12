@@ -262,7 +262,8 @@ class Attention(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        compute_type = torch.bfloat16 if k_scale.numel() == 1 else aiter.dtypes.fp8
+        per_tensor = k_scale.numel() == 1
+        compute_type = torch.bfloat16 if per_tensor else aiter.dtypes.fp8
         torch.ops.aiter.pa_decode_gluon(
             o,
             q,
@@ -276,10 +277,10 @@ class Attention(nn.Module):
             context_partition_size,
             compute_type,
             None,
-            # when using per-token quant, original k_scale shape: [num_blocks, block_size, num_kv_heads]
+            # when using per-token quant, original k_scale shape: [num_blocks, num_kv_heads, block_size]
             # gluon pa decode kernel expects shape: [num_blocks, num_kv_heads, block_size, 1]
-            self.kv_scale if self.sinks is not None else k_scale.unsqueeze(-1).transpose(1, 2),
-            self.kv_scale if self.sinks is not None else v_scale.unsqueeze(-1).transpose(1, 2),
+            k_scale if per_tensor else k_scale.unsqueeze(-1),
+            v_scale if per_tensor else v_scale.unsqueeze(-1),
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
