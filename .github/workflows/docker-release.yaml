@@ -4,6 +4,31 @@ on:
   schedule:
     - cron: '0 1 * * *'  # Every day at 09:00 Beijing Time (UTC+8)
   workflow_dispatch:
+    inputs:
+      atom_repo:
+        description: "ATOM repo"
+        required: true
+        default: "https://github.com/ROCm/ATOM.git"
+      atom_commit:
+        description: "ATOM commit"
+        required: true
+        default: "HEAD"
+      aiter_repo:
+        description: "Aiter repo"
+        required: true
+        default: "https://github.com/ROCm/aiter.git"
+      aiter_commit:
+        description: "Aiter commit"
+        required: true
+        default: "HEAD"
+      rccl_repo:
+        description: "RCCL repo"
+        required: true
+        default: "https://github.com/ROCm/rccl.git"
+      rccl_branch:
+        description: "RCCL branch"
+        required: true
+        default: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
 
 jobs:
   docker-release:
@@ -30,7 +55,17 @@ jobs:
       - name: Build Docker image
         timeout-minutes: 120
         run: |
-          docker build --network=host -t atom_release:ci --build-arg BASE_IMAGE=${{ matrix.baes_image }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg MAX_JOBS=64 -f docker/Dockerfile .
+          docker build --network=host -t atom_release:ci \
+          --build-arg BASE_IMAGE=${{ matrix.baes_image }} \
+          --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
+          --build-arg MAX_JOBS=64 \
+          --build-arg ATOM_REPO=${{ inputs.atom_repo }} \
+          --build-arg ATOM_COMMIT=${{ inputs.atom_commit }} \
+          --build-arg AITER_REPO=${{ inputs.aiter_repo }} \
+          --build-arg AITER_COMMIT=${{ inputs.aiter_commit }} \
+          --build-arg RCCL_REPO=${{ inputs.rccl_repo }} \
+          --build-arg RCCL_BRANCH=${{ inputs.rccl_branch }} \
+          -f docker/Dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image
