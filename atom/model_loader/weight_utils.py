@@ -223,13 +223,13 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                    for mo_scale_name in modelopt_scale_names):
                 remapped_name = name.replace(
                     f".self_attn.{scale_name[1]}_proj{scale_name}",
-                    f".self_attn.attn{scale_name}")
+                    f".self_attn.attn.impl{scale_name}")
             elif any(qkv_scale_name in name
                      for qkv_scale_name in qkv_proj_scale_names):
                 # Handle qkv_proj scale parameters
                 remapped_name = name.replace(
                     f".self_attn.qkv_proj{scale_name}",
-                    f".self_attn.attn{scale_name}")
+                    f".self_attn.attn.impl{scale_name}")
             else:
                 remapped_name = name.replace(scale_name, f".attn{scale_name}")
             if remapped_name not in params_dict:
@@ -268,7 +268,7 @@ def remap_output_scale_name(name: str, params_dict: dict) -> Optional[str]:
 
     possible_scale_names = [".k_proj.output_scale", ".v_proj.output_scale"]
     modelopt_scale_names = [
-        ".attn.impl.k_scale", ".attn.impl.v_scale"
+        ".attn.k_scale", ".attn.v_scale"
     ]
 
     for i, scale_name in enumerate(possible_scale_names):
