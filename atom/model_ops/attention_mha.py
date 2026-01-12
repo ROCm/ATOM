@@ -266,6 +266,8 @@ class Attention(nn.Module):
         if self.kv_cache_dtype == "bf16":
             k_scale_ = v_scale_ = None
         else:
+            # when using per-token quant, original k_scale shape: [num_blocks, block_size, num_kv_heads]
+            # gluon pa decode kernel expects shape: [num_blocks, num_kv_heads, block_size, 1]
             k_scale_ = self.kv_scale if self.sinks is not None else k_scale.unsqueeze(-1).transpose(1, 2)
             v_scale_ = self.kv_scale if self.sinks is not None else v_scale.unsqueeze(-1).transpose(1, 2)
         
@@ -285,8 +287,6 @@ class Attention(nn.Module):
             context_partition_size,
             torch.bfloat16, #compute_type
             None,
-            # when using per-token quant, original k_scale shape: [num_blocks, block_size, num_kv_heads]
-            # gluon pa decode kernel expects shape: [num_blocks, num_kv_heads, block_size, 1]
             k_scale_,
             v_scale_,
             exp_sums=exp_sums,
