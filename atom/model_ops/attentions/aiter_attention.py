@@ -45,7 +45,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             hf_config.num_attention_heads // get_tp_group().world_size
         )
         # For speculative decode (MTP), max_qlen = num_speculative_tokens + 1
-        max_qlen = config.num_speculative_tokens + 1
+        if config.speculative_config is not None and config.speculative_config.num_speculative_tokens is not None:
+            max_qlen = config.speculative_config.num_speculative_tokens + 1
+        else:
+            max_qlen = 1
 
         (
             (work_meta_data_size, work_meta_data_type),
