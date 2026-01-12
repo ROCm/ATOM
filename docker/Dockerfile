@@ -19,7 +19,7 @@ RUN pip show lm-eval || true
 
 # Update RCCL
 ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
-ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
+ARG RCCL_BRANCH="22e3a854c9195dea65bb93b6a9a38db1d38cb082"
 ARG RCCL_SRC_DIR="/app/rccl/"
 RUN pip install cmake
 RUN git clone "$RCCL_REPO" $RCCL_SRC_DIR \
