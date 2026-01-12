@@ -49,6 +49,19 @@ RUN git clone $AITER_REPO /app/aiter-test && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 RUN pip show amd-aiter || true
 
+# Install MORI (Modular RDMA Interface)
+# https://github.com/ROCm/mori
+RUN apt-get update && apt-get install -y \
+    libopenmpi-dev \
+    openmpi-bin \
+    libpci-dev
+RUN git clone https://github.com/ROCm/mori.git /app/mori && \
+    cd /app/mori && \
+    pip install -r requirements-build.txt && \
+    git submodule update --init --recursive && \
+    python setup.py install
+RUN pip show mori || true
+
 # Install ATOM
 RUN pip uninstall -y atom || true
 RUN git clone $ATOM_REPO /app/ATOM && \
