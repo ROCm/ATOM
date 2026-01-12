@@ -52,9 +52,15 @@ RUN pip show amd-aiter || true
 # Install MORI (Modular RDMA Interface)
 # https://github.com/ROCm/mori
 RUN apt-get update && apt-get install -y \
-    libopenmpi-dev \
+    git \
+    cython3 \
+    ibverbs-utils \
     openmpi-bin \
-    libpci-dev
+    libopenmpi-dev \
+    libpci-dev \
+    cmake \
+    libdw1 \
+    locales
 RUN git clone https://github.com/ROCm/mori.git /app/mori && \
     cd /app/mori && \
     pip install -r requirements-build.txt && \
