@@ -32,14 +32,6 @@ from aiter import (
     get_hip_quant,
 )
 
-if use_triton_gemm():
-    try:
-        from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import fused_gemm_afp4wfp4_preshuffle_split_cat
-        from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import fused_gemm_a8w8_blockscale_preshuffle_split_cat
-    except:
-        fused_gemm_afp4wfp4_preshuffle_split_cat = None
-        fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
-
 # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 # # from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 from aiter import fused_qk_rope_concat_and_cache_mla
@@ -50,6 +42,15 @@ from atom.utils import envs
 torch.set_printoptions(threshold=10_000)
 
 logger = logging.getLogger("atom")
+
+if use_triton_gemm():
+    try:
+        from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import fused_gemm_afp4wfp4_preshuffle_split_cat
+        from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import fused_gemm_a8w8_blockscale_preshuffle_split_cat
+    except ImportError as e:
+        logger.warning(f"Triton fused GEMM split_cat not available: {e}")
+        fused_gemm_afp4wfp4_preshuffle_split_cat = None
+        fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM  

@@ -12,6 +12,8 @@ import regex as re
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import mxfp4_to_f32, e8m0_to_f32
 
+MXFP4_QUANT_BLOCK_SIZE = 32
+
 
 def per_tensor_dequantize(
     tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
@@ -134,58 +136,10 @@ def get_and_maybe_dequant_weights(layer: nn.Module) -> torch.Tensor:
     return layer.weight
 
 
-# utility for tensor dims > 2 cases
 def b_dynamic_mxfp4_quant(x):
     h, b, d = x.shape
     x, x_scales = dynamic_mxfp4_quant(x.reshape(-1, d))
     return x.view(h, b, d // 2), x_scales.view(h, b, d // 32)
-    # return x.view(h, b, d // 2), x_scales.view(h, b, d // 32)
-
-
-def mxfp4_to_f32(x, is_threed):
-    # 2 because we pack fp4 in uint8.
-    x = x.repeat_interleave(2, dim=-1)
-    if is_threed:
-        x[..., ::2] = x[..., ::2] & 0xF
-        x[..., 1::2] = x[..., 1::2] >> 4
-    else:
-        x[:, ::2] = x[:, ::2] & 0xF
-        x[:, 1::2] = x[:, 1::2] >> 4
-
-    mxfp4_list = [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ]
-    mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
-    return mxfp4_in_f32[x.long()]
-
-
-def e8m0_to_f32(x):
-    # Convert the input tensor `x` (assumed to be in e8m0 format) to float32.
-    # e8m0 is a custom 8-bit floating point format with 8 bits for exponent, 0 for mantissa.
-    # This means the value is essentially 2^(exponent - 127), similar to how IEEE-754 stores floats.
-
-    # Convert x to float32 for computation, and compute the power of 2 by subtracting the bias (127).
-    x_f32 = 2 ** ((x.to(torch.float32)) - 127)
-
-    # If the exponent value was 255 (i.e., 2^(128)), this is a special case usually used to represent NaN or Inf.
-    # Since this custom format has no mantissa, treat 2^128 as NaN.
-    x_f32[x_f32 == 128] = float("nan")
-    return x_f32
 
 
 def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format: str):

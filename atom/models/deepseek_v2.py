@@ -76,17 +76,6 @@ from atom.model_ops.linear import (
 )
 
 from aiter import gemm_a8w8_blockscale_bpreshuffle
-if use_triton_gemm():
-    try:
-        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
-        from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
-        from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
-        from aiter.ops.triton.gemm_a16w8_blockscale import gemm_a16w8_blockscale_preshuffle
-    except:
-        gemm_afp4wfp4_preshuffle = None
-        gemm_a16wfp4_preshuffle = None
-        gemm_a8w8_blockscale_preshuffle = None
-        gemm_a16w8_blockscale_preshuffle = None
 
 from atom.model_ops.attention_mla import is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.moe import FusedMoE
@@ -111,6 +100,19 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 import logging
 
 logger = logging.getLogger("atom")
+if use_triton_gemm():
+    try:
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+        from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4_preshuffle
+        from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle
+        from aiter.ops.triton.gemm_a16w8_blockscale import gemm_a16w8_blockscale_preshuffle
+    except ImportError as e:
+        logger.warning(f"Triton GEMM kernels not available: {e}. Ensure AITER is up-to-date.")
+        gemm_afp4wfp4_preshuffle = None
+        gemm_a16wfp4_preshuffle = None
+        gemm_a8w8_blockscale_preshuffle = None
+        gemm_a16w8_blockscale_preshuffle = None
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
@@ -137,7 +139,6 @@ def _fuse_rmsnorm_fp4_quant_fake(
 ]:
     m, n1 = x1.shape
     n2 = x2.shape[1] if x2 is not None else 0
-    MXFP4_QUANT_BLOCK_SIZE = 32
 
     out1_quantized = torch.empty((m, n1 // 2), dtype=torch.uint8, device=x1.device)
 
@@ -218,7 +219,7 @@ def _fuse_rmsnorm_fp4_quant(
 ]:
     m = x1.shape[0]
 
-    shuffle_bool = shuffle and (m >= 32)
+    shuffle_bool = shuffle and (m >= MXFP4_QUANT_BLOCK_SIZE)
 
     (out1_quantized, out1_bs), _out1_unquantized, out2, out_res1 = fused_rms_mxfp4_quant(
         x1=x1,
@@ -342,7 +343,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
     torch.Tensor
 ]:
     M = hidden_states_quant.shape[0]
-    MXFP4_QUANT_BLOCK_SIZE = 32
     device = hidden_states_quant.device
     q_c = torch.empty((M, q_lora_rank // 2), dtype=torch.uint8, device=device)
     scale_n_valid = (q_lora_rank + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
@@ -410,11 +410,11 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
     M = hidden_states_quant.shape[0]
 
     if hidden_states_quant_scale is None:
-        if M <= 32:
+        if M <= MXFP4_QUANT_BLOCK_SIZE:
             qkv_lora = gemm_a16wfp4_preshuffle(
                 hidden_states_quant,
                 weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
-                weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // 32, -1),
+                weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1),
                 prequant=True,
                 skip_reduce=True,
             )
@@ -423,11 +423,11 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
             x, x_scale = quant_func(
                 hidden_states_quant,
                 quant_dtype=dtypes.fp4x2,
-                shuffle=(M >= 32),
+                shuffle=(M >= MXFP4_QUANT_BLOCK_SIZE),
             )
             
-            if M >= 32:
-                x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+            if M >= MXFP4_QUANT_BLOCK_SIZE:
+                x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1)
             else:
                 x_scale = x_scale[:M, ...].view(torch.uint8)
                 
@@ -435,12 +435,12 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
                 x.view(torch.uint8), 
                 weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
                 x_scale, 
-                weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // 32, -1),
+                weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1),
                 skip_reduce=True,
             )
     else:
-        if M >= 32:
-            hidden_states_quant_scale = hidden_states_quant_scale.view(torch.uint8).view(hidden_states_quant_scale.shape[0] // 32, -1)
+        if M >= MXFP4_QUANT_BLOCK_SIZE:
+            hidden_states_quant_scale = hidden_states_quant_scale.view(torch.uint8).view(hidden_states_quant_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1)
         else:
             hidden_states_quant_scale = hidden_states_quant_scale[:M, ...].view(torch.uint8)
 
@@ -448,7 +448,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
             hidden_states_quant.view(torch.uint8), 
             weight_qkv_a_proj.view(torch.uint8).view(weight_qkv_a_proj.shape[0] // 16, -1),
             hidden_states_quant_scale, 
-            weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // 32, -1), 
+            weight_scale_qkv_a_proj.view(torch.uint8).view(weight_scale_qkv_a_proj.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1), 
             skip_reduce=True)
 
     q_c, kv_c, k_pe = torch.split(
@@ -457,7 +457,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
                     dim=-1,
                 )
     
-    shuffle_bool = shuffle and (M >= 32)
+    shuffle_bool = shuffle and (M >= MXFP4_QUANT_BLOCK_SIZE)
 
     k_pe_reduced = None
     k_pe_reduced_out = None

@@ -40,12 +40,14 @@ if use_triton_gemm():
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
         # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
         # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
-    except:    
+    except ImportError as e:
+        logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 def divide(numerator, denominator):
     assert (
@@ -92,7 +94,7 @@ def gemm_a4w4_quant(
 
         m = x.view(-1, x.size(-1)).shape[0]
         y = torch.empty(
-            ((m + 31) // 32 * 32, output_size),
+            ((m + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE * MXFP4_QUANT_BLOCK_SIZE, output_size),
             dtype=otype,
             device=x.device,
         )
@@ -108,7 +110,7 @@ def gemm_a4w4_quant(
         n = weight.shape[0]
 
         y = torch.empty(
-            ((m + 31) // 32 * 32, output_size),
+            ((m + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE * MXFP4_QUANT_BLOCK_SIZE, output_size),
             dtype=otype,
             device=x.device,
         )
@@ -117,11 +119,11 @@ def gemm_a4w4_quant(
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
-                shuffle=(m >= 32),
+                shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
             )
 
-        if m >= 32:
-            x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+        if m >= MXFP4_QUANT_BLOCK_SIZE:
+            x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1)
         else:
             x_scale = x_scale[:m, ...].view(torch.uint8)
             
@@ -129,7 +131,7 @@ def gemm_a4w4_quant(
             x.view(torch.uint8), 
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale, 
-            weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), 
+            weight_scale.view(torch.uint8).view(weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1), 
             y=y,
         )
 
