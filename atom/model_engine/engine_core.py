@@ -229,6 +229,8 @@ class EngineCore:
                             self.start_profiler()
                         elif cmd == "stop_profile":
                             self.stop_profiler()
+                        elif cmd == "get_mtp_stats":
+                            self.print_mtp_statistics()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
@@ -281,6 +283,18 @@ class EngineCore:
             print("Stopping profiler...")
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
             print("Profiler stopped.")
+
+    def print_mtp_statistics(self):
+        stats = self.runner_mgr.call_func("get_mtp_statistics", wait_out=True)
+        if stats and stats.get("total_draft_tokens", 0) > 0:
+            print(f"\n{'='*50}")
+            print("MTP (Multi-Token Prediction) Statistics:")
+            print(f"  Total draft tokens: {stats['total_draft_tokens']}")
+            print(f"  Accepted tokens:    {stats['total_accepted_tokens']}")
+            print(f"  Acceptance rate:    {stats['acceptance_rate']:.2%}")
+            print(f"{'='*50}\n")
+        else:
+            print("\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n")
 
 
 class DPEngineCoreProc(EngineCore):

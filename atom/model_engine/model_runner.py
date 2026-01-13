@@ -385,6 +385,8 @@ class ModelRunner:
         if self.config.speculative_config and get_pp_group().is_last_rank:
             self.drafter = EagleProposer(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler()
+            self.mtp_total_draft_tokens = 0
+            self.mtp_total_accepted_tokens = 0
         num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
         self.tokenID_processor = tokenIDProcessor(
             self.config.max_num_batched_tokens, self.device, hasattr(self, "drafter"), num_speculative_tokens
@@ -440,6 +442,26 @@ class ModelRunner:
                 and self.hf_text_config.kv_lora_rank is not None
             )
         return False
+
+    def get_mtp_statistics(self) -> dict:
+        if hasattr(self, "mtp_total_draft_tokens"):
+            acceptance_rate = (self.mtp_total_accepted_tokens / self.mtp_total_draft_tokens 
+                              if self.mtp_total_draft_tokens > 0 else 0.0)
+            return {
+                "total_draft_tokens": self.mtp_total_draft_tokens,
+                "total_accepted_tokens": self.mtp_total_accepted_tokens,
+                "acceptance_rate": acceptance_rate,
+            }
+        return {
+            "total_draft_tokens": 0,
+            "total_accepted_tokens": 0,
+            "acceptance_rate": 0.0,
+        }
+    
+    def reset_mtp_statistics(self):
+        if hasattr(self, "mtp_total_draft_tokens"):
+            self.mtp_total_draft_tokens = 0
+            self.mtp_total_accepted_tokens = 0
 
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
@@ -996,6 +1018,23 @@ class ModelRunner:
                 bonus_token_ids,
                 temperatures,
             )
+            # Update MTP acceptance statistics
+            batch_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+            num_valid_per_req = (sampled_tokens != -1).sum(dim=1)
+            # accepted = num_valid - 1 for each request (subtract the corrected/bonus token)
+            batch_accepted_tokens = (num_valid_per_req - 1).sum().item()
+            self.mtp_total_draft_tokens += batch_draft_tokens
+            self.mtp_total_accepted_tokens += batch_accepted_tokens
+            
+            # Log MTP acceptance statistics periodically
+            if self.mtp_total_draft_tokens > 0 and \
+               self.mtp_total_draft_tokens % 1000 < batch_draft_tokens:
+                acceptance_rate = self.mtp_total_accepted_tokens / self.mtp_total_draft_tokens
+                logger.info(
+                    f"[MTP Stats] Total draft tokens: {self.mtp_total_draft_tokens}, "
+                    f"Accepted: {self.mtp_total_accepted_tokens}, "
+                    f"Acceptance rate: {acceptance_rate:.2%}"
+                )
 
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
