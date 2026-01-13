@@ -70,7 +70,7 @@ pip uninstall -y atom amd-aiter
 
 cd PATH_TO_ATOM
 # normally ATOM is already installed in develop mode
-# you may just do checkout wihtout reinstall
+# you may just do checkout without reinstall
 git checkout specefic_branch_or_commit
 pip install -e .
 
