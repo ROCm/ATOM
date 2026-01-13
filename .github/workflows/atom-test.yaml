@@ -24,7 +24,7 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: ""
           - model_name: "Llama-3.3-70B-Instruct-MXFP4-Preview"
-            model_path: "meta-llama-mxfp4/Llama-3.3-70B-Instruct-MXFP4-Preview"
+            model_path: "amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: ""
           - model_name: "DeepSeek-R1-0528"

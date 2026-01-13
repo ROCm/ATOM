@@ -62,6 +62,9 @@ class SiluAndMul(nn.Module):
     ):
         super().__init__()
         self.fused_quant = fused_quant
+        if quant_config is None:
+            quant_config = QuantizationConfig()
+
         quant_type = quant_config["quant_type"]
         params_dtype = quant_config["quant_dtype"]
         self.quant_type = quant_type
