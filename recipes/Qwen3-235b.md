@@ -63,7 +63,7 @@ The performance number for both 4 and 8 ranks are provided as a reference, with 
 | 10000 | 1000 | 64  | 256  | 6144.75 | 22.8  | 24318.56 | 8340.75 | 26.84 | 20015.67 |
 | 10000 | 1000 | 32  | 128  | 3208.08 | 19.08 | 15799.19 | 4330.11 | 21.44 | 13663.56 |
 
-Here are the steps to reinstall ATOM/AITER in the docker, if you are trying to verify with other specefic commits:
+Here are the steps to reinstall ATOM/AITER in the docker, if you are trying to verify with other specific commits:
 ```bash
 # uninstall existing ATOM/AITER
 pip uninstall -y atom amd-aiter
@@ -71,12 +71,12 @@ pip uninstall -y atom amd-aiter
 cd PATH_TO_ATOM
 # normally ATOM is already installed in develop mode
 # you may just do checkout without reinstall
-git checkout specefic_branch_or_commit
+git checkout specific_branch_or_commit
 pip install -e .
 
 cd PATH_TO_AITER
 rm -rf aiter/jit/build aiter/jit/*.so
-git checkout specefic_branch_or_commit
+git checkout specific_branch_or_commit
 git submodule sync && git submodule update --init --recursive
 python setup.py develop
 ```
