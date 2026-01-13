@@ -186,7 +186,13 @@ jobs:
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
-          "
+          " > atom_accuracy_output.txt 2>&1
+      
+      - name: Collect Test Summary
+        if: success()
+        run: |
+          echo "Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          awk '/\|Tasks\|Version\|/{flag=1} flag' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
         if: always()
