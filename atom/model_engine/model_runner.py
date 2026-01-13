@@ -639,7 +639,9 @@ class ModelRunner:
             self.kv_scale = torch.zeros(
                 2,
                 hf_config.num_hidden_layers,
-                self.num_physical_kvcache_blocks * self.physical_block_size * num_kv_heads,
+                self.num_physical_kvcache_blocks,
+                num_kv_heads,
+                self.physical_block_size,
                 dtype=dtypes.fp32,
                 device="cuda",
             )
