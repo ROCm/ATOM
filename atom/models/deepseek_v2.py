@@ -25,6 +25,7 @@
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
+import aiter
 from aiter import (
     QuantType,
     concat_and_cache_mla,
@@ -53,6 +54,7 @@ from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from torch import nn
 from transformers import PretrainedConfig
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.activation import SiluAndMul
@@ -87,6 +89,73 @@ from atom.utils import envs
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+fp8_dtype = aiter.dtypes.fp8
+
+def fused_rms_fp8_group_quant_fake(
+    inp1: torch.Tensor,
+    inp1_weight: torch.Tensor,
+    inp1_epsilon: float,
+    inp2: Optional[torch.Tensor] = None,
+    inp2_weight: Optional[torch.Tensor] = None,
+    inp2_epsilon: Optional[float] = None,
+    group_size: int = 128,
+    dtype_quant: torch.dtype = fp8_dtype,
+    res1: Optional[torch.Tensor] = None,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
+)->Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, N1 = inp1.shape
+    
+    out1_fp8 = inp1.new_empty((M, N1), dtype=dtype_quant)
+    
+    num_bs_cols = (N1 + group_size - 1) // group_size
+    if transpose_scale:
+        out1_bs = inp1.new_empty((num_bs_cols, M), dtype=torch.float32).view(M, num_bs_cols)
+    else:
+        out1_bs = inp1.new_empty((M, num_bs_cols), dtype=torch.float32)
+    
+    out1 = inp1.new_empty((M, N1)) if output_unquantized_inp1 else None
+    
+    out2 = None
+    if inp2 is not None:
+        M2, N2 = inp2.shape
+        out2 = inp1.new_empty((M, N2))
+    
+    out_res1 = inp1.new_empty((M, N1)) if res1 is not None else None
+    
+    return out1_fp8, out1_bs, out1, out2, out_res1
+
+
+@torch_compile_guard(gen_fake=fused_rms_fp8_group_quant_fake)
+def fused_rms_fp8_group_quant_(
+    inp1: torch.Tensor,
+    inp1_weight: torch.Tensor,
+    inp1_epsilon: float,
+    inp2: Optional[torch.Tensor] = None,
+    inp2_weight: Optional[torch.Tensor] = None,
+    inp2_epsilon: Optional[float] = None,
+    group_size: int = 128,
+    dtype_quant: torch.dtype = fp8_dtype,
+    res1: Optional[torch.Tensor] = None,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
+)->Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    (out1_fp8, out1_bs), out1, out2, out_res1 = fused_rms_fp8_group_quant(
+        inp1,
+        inp1_weight,
+        inp1_epsilon,
+        inp2,
+        inp2_weight,
+        inp2_epsilon,
+        group_size,
+        dtype_quant,
+        res1,
+        output_unquantized_inp1,
+        transpose_scale,
+    )
+    return out1_fp8, out1_bs, out1, out2, out_res1
+
+
 
 # only for DS MLA attention
 def _fuse_rmsnorm_quant(
@@ -105,7 +174,7 @@ def _fuse_rmsnorm_quant(
     transpose_scale=False,
 ):
     if dtype_quant == dtypes.fp8:
-        (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = fused_rms_fp8_group_quant(
+        out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = fused_rms_fp8_group_quant_(
             x1,
             x1_weight,
             x1_epsilon,
