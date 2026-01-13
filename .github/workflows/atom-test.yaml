@@ -192,7 +192,7 @@ jobs:
         if: success()
         run: |
           echo "Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          awk '/\|Tasks\|Version\|/{flag=1} flag' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
+          awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
         if: always()
