@@ -43,7 +43,7 @@ if [ "$TYPE" == "accuracy" ]; then
   echo ""
   echo "========== Running accuracy test =========="
   lm_eval --model local-completions \
-          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False \
           --tasks gsm8k \
           --num_fewshot 3
 fi
