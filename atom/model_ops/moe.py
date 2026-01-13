@@ -54,7 +54,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from atom.utils import envs
 
 from atom.utils import envs, mark_spliting_op
-from atom.model_ops.fused_moe.config import _has_module
+from atom.model_ops.utils import _has_module
 
 
 @dataclass
@@ -572,7 +572,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         self.use_triton = get_gfx().startswith("gfx94")
         if self.use_triton:
-            from atom.model_ops.fused_moe_triton import has_triton_kernels
+            from atom.model_ops.utils import has_triton_kernels
 
             assert has_triton_kernels(), "triton_kernels is not installed"
 

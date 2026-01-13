@@ -435,7 +435,7 @@ class MLAAttention(nn.Module):
             output_shape[-1] = 7168
             atom_config = get_current_atom_config()
             output_dtype = atom_config.torch_dtype
-            output = torch.zeros(output_shape, dtype=output_dtype, device=q.device)
+            output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output
 
         if context.is_prefill and not use_prefill_mla:

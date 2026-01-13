@@ -25,6 +25,7 @@ class ScheduledBatch:
         total_seqs_num: int = 0,
         total_seqs_num_prefill: int = 0,
         total_seqs_num_decode: int = 0,
+        is_dummy_run: bool = False,
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
         # self.seqs = seqs
@@ -57,6 +58,8 @@ class ScheduledBatch:
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
+
+        self.is_dummy_run = is_dummy_run
 
 
 class Scheduler:

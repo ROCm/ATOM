@@ -430,9 +430,10 @@ class ModelRunner:
             total_tokens_num_decode=num_tokens_original,
             total_seqs_num=1,
             total_seqs_num_decode=1,
+            is_dummy_run=True,
         )
         
-        bs = self.prepare_intputs(dummy_batch, is_dummy_run=True)
+        bs = self.prepare_intputs(dummy_batch)
         actual_num_tokens = dummy_batch.total_tokens_num
 
 
@@ -467,9 +468,10 @@ class ModelRunner:
             total_tokens_num_prefill=num_tokens,
             total_seqs_num=1,
             total_seqs_num_prefill=1,
+            is_dummy_run=True,
         )
 
-        bs = self.prepare_intputs(dummy_batch, is_dummy_run=True)
+        bs = self.prepare_intputs(dummy_batch)
 
         
         # self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
@@ -533,6 +535,7 @@ class ModelRunner:
             total_tokens_num_prefill=total_tokens_num,
             total_seqs_num=num_seqs,
             total_seqs_num_prefill=num_seqs,
+            is_dummy_run=True,
         )
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
@@ -805,7 +808,7 @@ class ModelRunner:
         num_input_tokens += num_pad
         return num_input_tokens, num_tokens_across_dp
 
-    def prepare_intputs(self, batch: ScheduledBatch, is_dummy_run: bool = False):
+    def prepare_intputs(self, batch: ScheduledBatch):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = batch.num_scheduled_tokens
@@ -829,7 +832,7 @@ class ModelRunner:
             self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
                 self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
             )
-        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs, is_dummy_run)
+        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
         context_bs = (
             batch.total_seqs_num_prefill if is_prefill else scheduled_bs
         )

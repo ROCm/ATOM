@@ -11,6 +11,28 @@ from types import MappingProxyType
 import regex as re
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import mxfp4_to_f32, e8m0_to_f32
+from functools import cache
+import importlib.util
+import logging
+
+logger = logging.getLogger("atom")
+
+
+@cache
+def _has_module(module_name: str) -> bool:
+    """Return True if *module_name* can be found in the current environment.
+
+    The result is cached so that subsequent queries for the same module incur
+    no additional overhead.
+    """
+    return importlib.util.find_spec(module_name) is not None
+
+
+def has_triton_kernels() -> bool:
+    """Whether the optional `triton_kernels` package is available."""
+    return _has_module("triton_kernels")
+
+
 
 def per_tensor_dequantize(
     tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]

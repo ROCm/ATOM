@@ -2,29 +2,14 @@ import logging
 from typing import Optional, Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
 from atom.model_ops.fused_moe.utils import cdiv
+from atom.model_ops.utils import has_triton_kernels
 from atom.utils import envs
 import torch
-from functools import cache
-import importlib.util
 
 if TYPE_CHECKING:
     from atom.model_ops.moe import FusedMoEParallelConfig
 
 logger = logging.getLogger("atom")
-
-@cache
-def _has_module(module_name: str) -> bool:
-    """Return True if *module_name* can be found in the current environment.
-
-    The result is cached so that subsequent queries for the same module incur
-    no additional overhead.
-    """
-    return importlib.util.find_spec(module_name) is not None
-
-
-def has_triton_kernels() -> bool:
-    """Whether the optional `triton_kernels` package is available."""
-    return _has_module("triton_kernels")
 
 if has_triton_kernels():
     try:

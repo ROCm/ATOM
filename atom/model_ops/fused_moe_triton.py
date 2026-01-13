@@ -28,7 +28,7 @@ import logging
 from math import prod
 from aiter.jit.utils.chip_info import get_gfx
 from aiter import dtypes
-from atom.model_ops.fused_moe.config import has_triton_kernels
+from atom.model_ops.utils import has_triton_kernels
 
 logger = logging.getLogger("atom")
 
