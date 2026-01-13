@@ -10,6 +10,15 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
+from aiter import destroy_dist_env, dtypes, init_dist_env
+from aiter.dist.parallel_state import (
+    get_dp_group,
+    get_pp_group,
+    get_tp_group,
+    graph_capture,
+)
+from aiter.dist.utils import get_distributed_init_method
+
 from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -23,15 +32,6 @@ from atom.utils import (
     resolve_obj_by_qualname,
 )
 from atom.utils.selector import get_attn_backend
-
-from aiter import destroy_dist_env, dtypes, init_dist_env
-from aiter.dist.parallel_state import (
-    get_dp_group,
-    get_pp_group,
-    get_tp_group,
-    graph_capture,
-)
-from aiter.dist.utils import get_distributed_init_method
 
 logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
@@ -171,42 +171,38 @@ class tokenIDProcessor:
                 for token in tokens
             ]
             self.input_ids.np[:total_tokens_decode] = token_ids
-            self.input_ids.copy_to_gpu(total_tokens_decode)
-            return self.input_ids.gpu[:total_tokens_decode]
+            return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         """for decode: input ids are from prev_sampled_token_ids"""
         locations, is_all_alive = self.get_prev_alive_locations(batch)
         num_deferred_tokens = len(locations)
+        num_norm_tokens = total_tokens_decode - num_deferred_tokens
         if is_all_alive:
-            num_norm_tokens = total_tokens_decode - num_deferred_tokens
-            if num_norm_tokens > 0:
-                token_ids = [
-                    token
-                    for tokens in scheduled_tokens[
-                        total_reqs_prefill : total_reqs_prefill + num_norm_tokens
-                    ]
-                    for token in tokens
-                ]
-                self.input_ids.np[:num_norm_tokens] = token_ids
-                self.input_ids.copy_to_gpu(num_norm_tokens)
-            # no new requests added and old requests finished
+            # no old requests finished, no reordering needed
             self.input_ids.gpu[
                 num_norm_tokens : num_norm_tokens + num_deferred_tokens
             ] = self.prev_token_ids
 
-        elif num_deferred_tokens == total_tokens_decode:
-            # no new requests added but some old requests finished
+        elif num_deferred_tokens > 0:
+            # some old requests finished, do reordering
             self.input_ids_loc.np[:num_deferred_tokens] = locations
-            self.input_ids_loc.copy_to_gpu(num_deferred_tokens)
             torch.gather(
                 self.prev_token_ids,
                 0,
-                self.input_ids_loc.gpu[:num_deferred_tokens],
-                out=self.input_ids.gpu[:num_deferred_tokens],
+                self.input_ids_loc.copy_to_gpu(num_deferred_tokens),
+                out=self.input_ids.gpu[
+                    num_norm_tokens : num_norm_tokens + num_deferred_tokens
+                ],
             )
-        else:
-            # TODO: new requests' input_ids need to be filled in
-            assert False, "TODO new requests' input_ids need to be filled in"
+        if num_norm_tokens > 0:
+            # for non-deferred tokens, fill in from scheduled_tokens
+            token_ids = [
+                token
+                for tokens in scheduled_tokens[:num_norm_tokens]
+                for token in tokens
+            ]
+            self.input_ids.np[:num_norm_tokens] = token_ids
+            self.input_ids.copy_to_gpu(num_norm_tokens)
         return self.input_ids.gpu[:total_tokens]
 
 
