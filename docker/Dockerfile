@@ -8,9 +8,10 @@ ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
-ARG ATOM_COMMIT="f9b010e4f4f09558f9e74319e77bdc1c70049893"
+ARG ATOM_COMMIT="HEAD"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
+ARG MORI_COMMIT="f9b010e4f4f09558f9e74319e77bdc1c70049893"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
 
@@ -33,6 +34,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN git clone https://github.com/ROCm/mori.git /app/mori && \
     cd /app/mori && \
+    git checkout $MORI_COMMIT && \
     pip install -r requirements-build.txt && \
     git submodule update --init --recursive && \
     python setup.py install
