@@ -4,6 +4,25 @@ on:
   schedule:
     - cron: '0 1 * * *'  # Every day at 09:00 Beijing Time (UTC+8)
   workflow_dispatch:
+    inputs:
+      atom_repo:
+        description: "ATOM repo"
+        default: "https://github.com/ROCm/ATOM.git"
+      atom_commit:
+        description: "ATOM commit"
+        default: "HEAD"
+      aiter_repo:
+        description: "Aiter repo"
+        default: "https://github.com/ROCm/aiter.git"
+      aiter_commit:
+        description: "Aiter commit"
+        default: "HEAD"
+      rccl_repo:
+        description: "RCCL repo"
+        default: "https://github.com/ROCm/rccl.git"
+      rccl_branch:
+        description: "RCCL branch"
+        default: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
 
 jobs:
   docker-release:
@@ -19,6 +38,14 @@ jobs:
           - "gfx942"
           - "gfx950"
 
+    env:
+      ATOM_REPO: "https://github.com/ROCm/ATOM.git"
+      ATOM_COMMIT: "HEAD"
+      AITER_REPO: "https://github.com/ROCm/aiter.git"
+      AITER_COMMIT: "HEAD"
+      RCCL_REPO: "https://github.com/ROCm/rccl.git"
+      RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
+
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
@@ -27,10 +54,29 @@ jobs:
         run: |
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
 
+      - name: Echo environment variables
+        run: |
+          echo "ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}"
+          echo "ATOM_COMMIT: ${{ inputs.atom_commit || env.ATOM_COMMIT }}"
+          echo "AITER_REPO: ${{ inputs.aiter_repo || env.AITER_REPO }}"
+          echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
+          echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
+          echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
+
       - name: Build Docker image
         timeout-minutes: 120
         run: |
-          docker build --network=host -t atom_release:ci --build-arg BASE_IMAGE=${{ matrix.baes_image }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg MAX_JOBS=64 -f docker/Dockerfile .
+          docker build --network=host -t atom_release:ci \
+          --build-arg BASE_IMAGE=${{ matrix.baes_image }} \
+          --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
+          --build-arg MAX_JOBS=64 \
+          --build-arg ATOM_REPO=${{ inputs.atom_repo || env.ATOM_REPO }} \
+          --build-arg ATOM_COMMIT=${{ inputs.atom_commit || env.ATOM_COMMIT }} \
+          --build-arg AITER_REPO=${{ inputs.aiter_repo || env.AITER_REPO }} \
+          --build-arg AITER_COMMIT=${{ inputs.aiter_commit || env.AITER_COMMIT }} \
+          --build-arg RCCL_REPO=${{ inputs.rccl_repo || env.RCCL_REPO }} \
+          --build-arg RCCL_BRANCH=${{ inputs.rccl_branch || env.RCCL_BRANCH }} \
+          -f docker/Dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image

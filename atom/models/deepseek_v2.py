@@ -25,6 +25,7 @@
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
+import aiter
 from aiter import (
     QuantType,
     concat_and_cache_mla,
@@ -59,6 +60,7 @@ from aiter.ops.triton.fused_mxfp4_quant import (
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from torch import nn
 from transformers import PretrainedConfig
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.activation import SiluAndMul
