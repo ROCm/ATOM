@@ -271,7 +271,10 @@ class Attention(nn.Module):
 
         torch.ops.aiter.pa_decode_gluon(
             o,
+            o,
             q,
+            q,
+            None,
             k_cache,
             v_cache,
             attn_metadata.context_lens,
