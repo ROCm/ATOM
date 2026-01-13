@@ -8,7 +8,7 @@ Pull the latest docker from https://hub.docker.com/r/rocm/atom/ :
 ```bash
 docker pull rocm/atom:rocm_7.2_preview_gfx950_latest
 ```
-All the oparations in the next will be executed inside the container.
+All the operations in the next will be executed inside the container.
 
 ## Launching server
 ATOM supports running the model with different parallelism, e.g., tensor parallel, expert parallel, data parallel.
