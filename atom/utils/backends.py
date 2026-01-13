@@ -526,7 +526,8 @@ class VllmBackend:
             cache_dir = os.path.join(
                 VLLM_CACHE_ROOT,
                 "torch_compile_cache",
-                hash_key,
+                "d58db84858",
+                # hash_key,
                 # "996ff366ca",
                 # "e6292aa343",
             )

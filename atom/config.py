@@ -553,6 +553,7 @@ class Config:
         default_factory=lambda: QuantizationConfig()
     )
     asyncio_mode: bool = False
+    mark_trace: bool = False
     load_dummy: bool = False
     enable_expert_parallel: bool = False
     master_addr: str = "127.0.0.1"

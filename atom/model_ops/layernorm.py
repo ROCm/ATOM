@@ -15,6 +15,7 @@ from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rm
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from atom.utils.decorators import mark_trace
 
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
@@ -84,6 +85,7 @@ def fused_add_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
+@mark_trace
 class RMSNorm(nn.Module):
 
     def __init__(
@@ -96,6 +98,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
+        self.prefix = "rms_norm"
         self.weight = nn.Parameter(torch.ones(dim))
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
@@ -158,7 +161,7 @@ def layernorm2d_fwd_with_add_(
     layernorm2d_fwd_with_add(out, x, residual, residual_out, weight, bias, eps)
     return out.view(ori_shape), residual_out.view(ori_shape)
 
-
+@mark_trace
 class LayerNorm(nn.Module):
 
     def __init__(
@@ -169,6 +172,7 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
+        self.prefix = "layer_norm"
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim))
 
