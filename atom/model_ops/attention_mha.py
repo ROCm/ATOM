@@ -87,7 +87,6 @@ class Attention(nn.Module):
         q_scale: torch.Tensor=None,
         qkv: torch.Tensor = None,
     ):
-
         fwd_args: ForwardContext = get_forward_context()
         kv_cache_data = fwd_args.kv_cache_data
 
@@ -111,7 +110,7 @@ class Attention(nn.Module):
         #logger.info(attn_impl)
         #logger.info(k_scale)
         #logger.info(v_scale)
-        o = attn_impl(q, k, v, k_cache, v_cache, self.k_scale, self.v_scale, fwd_args)
+        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args)
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
@@ -233,6 +232,8 @@ class Attention(nn.Module):
                 )
         
         return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    
         
         
     def paged_attention_triton(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext):
