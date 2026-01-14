@@ -50,6 +50,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             max_qlen = 1
 
+        num_head_k = hf_config.num_key_value_heads // get_tp_group().world_size
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -59,12 +60,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = aiter.get_pa_metadata_info_v1(
             self.max_bs,
-            max_qlen,
-            self.num_attention_heads,
-            config.torch_dtype,
-            dtypes.d_dtypes[config.kv_cache_dtype],
-            is_sparse=False,
-            fast_mode=True,
+            num_head_k,
         )
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
@@ -102,7 +98,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         config = self.model_runner.config
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
-        num_kv_heads = hf_config.num_key_value_heads // get_tp_group().world_size
+        num_kv_heads = max(1, hf_config.num_key_value_heads // get_tp_group().world_size)
         block_size = self.block_size
 
 
