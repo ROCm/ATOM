@@ -105,24 +105,24 @@ def fused_rms_fp8_group_quant_fake(
     transpose_scale: bool = False,
 )->Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M, N1 = inp1.shape
-    
+
     out1_fp8 = inp1.new_empty((M, N1), dtype=dtype_quant)
-    
+
     num_bs_cols = (N1 + group_size - 1) // group_size
     if transpose_scale:
         out1_bs = inp1.new_empty((num_bs_cols, M), dtype=torch.float32).view(M, num_bs_cols)
     else:
         out1_bs = inp1.new_empty((M, num_bs_cols), dtype=torch.float32)
-    
+
     out1 = inp1.new_empty((M, N1)) if output_unquantized_inp1 else None
-    
+
     out2 = None
     if inp2 is not None:
         M2, N2 = inp2.shape
         out2 = inp1.new_empty((M, N2))
-    
+
     out_res1 = inp1.new_empty((M, N1)) if res1 is not None else None
-    
+
     return out1_fp8, out1_bs, out1, out2, out_res1
 
 
@@ -409,7 +409,7 @@ def sparse_attn_indexer(
         num_tokens = hidden_states.shape[0]
         logits = fp8_mqa_logits(Q=q_fp8[num_decode_tokens:num_tokens], KV=k_fp8, kv_scales=k_scale, weights=weights[num_decode_tokens:num_tokens],
                                 cu_starts=cu_seqlen_ks, cu_ends=cu_seqlen_ke)
-        
+
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices = topk_indices_buffer[
@@ -812,6 +812,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         cache_config: str = "bf16",
         quant_config: Optional[QuantizationConfig] = None,
         layer_num: int = 0,
+        is_mtp_block: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -864,7 +865,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps,
-                                       fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0)
+                                       fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.layer_idx > 0 and not is_mtp_block)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION)

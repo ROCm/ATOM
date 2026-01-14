@@ -163,9 +163,9 @@ class Scheduler:
 
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs.values()))
-        logger.info(
-            f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, keys: {scheduled_seqs.keys()}"
-        )
+        # logger.info(
+        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, keys: {scheduled_seqs.keys()}"
+        # )
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
