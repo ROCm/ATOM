@@ -38,7 +38,7 @@ jobs:
             env_vars: |
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
     env:
-      ATOM_BASE_IMAGE: rocm/pytorch:latest
+      ATOM_BASE_NIGTHLY_IMAGE: rocm/atom:gfx950_latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -48,19 +48,41 @@ jobs:
 
       - name: Pull ATOM base image
         run: |
-          docker pull ${{ env.ATOM_BASE_IMAGE }}
+          docker pull ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
+
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+
+          RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \\
+              cd /app/aiter-test && \\
+              git checkout HEAD && \\
+              git submodule sync && git submodule update --init --recursive && \\
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+          
+          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
+          RUN pip uninstall -y atom
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM-test && \\
+              cd /app/ATOM-test && \\
+              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
+              pip install -e .
+
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
 
       - name: Build Docker image
         run: |
           docker build --network=host \
             --no-cache \
             -t atom_test:ci \
-            --build-arg BASE_IMAGE=${{ env.ATOM_BASE_IMAGE }} \
-            --build-arg PREBUILD_KERNELS=0 \
-            --build-arg GPU_ARCH=gfx950 \
-            --build-arg ATOM_REPO=${{ env.GITHUB_REPO_URL }} \
-            --build-arg ATOM_COMMIT=${{ env.GITHUB_COMMIT_SHA }} \
-            -f docker/Dockerfile .
+            -f Dockerfile.mod .
 
       - name: Start CI container
         run: |
