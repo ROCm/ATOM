@@ -10,6 +10,15 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
+from aiter import destroy_dist_env, dtypes, init_dist_env
+from aiter.dist.parallel_state import (
+    get_dp_group,
+    get_pp_group,
+    get_tp_group,
+    graph_capture,
+)
+from aiter.dist.utils import get_distributed_init_method
+
 from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -23,15 +32,6 @@ from atom.utils import (
     resolve_obj_by_qualname,
 )
 from atom.utils.selector import get_attn_backend
-
-from aiter import destroy_dist_env, dtypes, init_dist_env
-from aiter.dist.parallel_state import (
-    get_dp_group,
-    get_pp_group,
-    get_tp_group,
-    graph_capture,
-)
-from aiter.dist.utils import get_distributed_init_method
 
 logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
@@ -121,16 +121,35 @@ class tokenIDProcessor:
         token_ids[-1] = 1
         return token_ids
 
-    def get_prev_alive_locations(self, batch: ScheduledBatch) -> tuple[list[int], bool]:
-        token_ids = self.prev_token_ids
-        deferred_prev_indices = [
-            i
-            for i, seq_id in enumerate(self.prev_batch.req_ids)
-            if seq_id in batch.req_ids
-        ]
+    def get_token_locations(
+        self, batch: ScheduledBatch
+    ) -> tuple[list[int], list[int], list[int], list[int], bool]:
+        prev_req_ids = self.prev_batch.req_ids
+        cur_req_ids = batch.req_ids
+        prev_id_to_idx = {req_id: i for i, req_id in enumerate(prev_req_ids)}
+
+        deferred_curr_indices = []
+        deferred_prev_indices = []  # old requests position in prev_batch
+        new_curr_indices = []  # new requests position in cur_batch
+
+        for cur_idx, req_id in enumerate(cur_req_ids):
+            if req_id in prev_id_to_idx:
+                deferred_curr_indices.append(cur_idx)
+                deferred_prev_indices.append(prev_id_to_idx[req_id])
+            else:
+                new_curr_indices.append(cur_idx)
+
+        is_all_same = (
+            len(new_curr_indices) == 0
+            and len(deferred_curr_indices) == len(prev_req_ids)
+            and deferred_curr_indices == deferred_prev_indices
+        )
+
         return (
+            deferred_curr_indices,
             deferred_prev_indices,
-            len(deferred_prev_indices) == token_ids.size(0),
+            new_curr_indices,
+            is_all_same,
         )
 
     def prepare_input_ids(
@@ -171,42 +190,59 @@ class tokenIDProcessor:
                 for token in tokens
             ]
             self.input_ids.np[:total_tokens_decode] = token_ids
-            self.input_ids.copy_to_gpu(total_tokens_decode)
-            return self.input_ids.gpu[:total_tokens_decode]
+            return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         """for decode: input ids are from prev_sampled_token_ids"""
-        locations, is_all_alive = self.get_prev_alive_locations(batch)
-        num_deferred_tokens = len(locations)
-        if is_all_alive:
-            num_norm_tokens = total_tokens_decode - num_deferred_tokens
-            if num_norm_tokens > 0:
-                token_ids = [
-                    token
-                    for tokens in scheduled_tokens[
-                        total_reqs_prefill : total_reqs_prefill + num_norm_tokens
-                    ]
-                    for token in tokens
-                ]
-                self.input_ids.np[:num_norm_tokens] = token_ids
-                self.input_ids.copy_to_gpu(num_norm_tokens)
-            # no new requests added and old requests finished
-            self.input_ids.gpu[
-                num_norm_tokens : num_norm_tokens + num_deferred_tokens
-            ] = self.prev_token_ids
+        deferred_curr_indices, deferred_prev_indices, new_curr_indices, is_all_same = (
+            self.get_token_locations(batch)
+        )
+        num_deferred_tokens = len(deferred_curr_indices)
+        num_new_tokens = len(new_curr_indices)
 
-        elif num_deferred_tokens == total_tokens_decode:
-            # no new requests added but some old requests finished
-            self.input_ids_loc.np[:num_deferred_tokens] = locations
-            self.input_ids_loc.copy_to_gpu(num_deferred_tokens)
-            torch.gather(
-                self.prev_token_ids,
-                0,
-                self.input_ids_loc.gpu[:num_deferred_tokens],
-                out=self.input_ids.gpu[:num_deferred_tokens],
-            )
+        if is_all_same:
+            self.input_ids.gpu[:num_deferred_tokens] = self.prev_token_ids
         else:
-            # TODO: new requests' input_ids need to be filled in
-            assert False, "TODO new requests' input_ids need to be filled in"
+            """
+            (1) prev_batch=[301], cur_batch=[0..255, 301] → Layout: [301 prefill | new | deferred]
+            (2) prev_batch=[0..255], cur_batch=[0..253, 256, 257] → Layout: [deferred | new 256, 257] when conc > max_num_seq
+            """
+            is_prev_prefill = self.prev_batch.total_tokens_num_prefill > 0
+            new_decode_front = (
+                is_prev_prefill
+                and new_curr_indices == list(range(num_new_tokens))
+                and deferred_curr_indices
+                == list(range(num_new_tokens, num_new_tokens + num_deferred_tokens))
+            )
+
+            gathered_tokens = None
+            # old requests (deferred)
+            if num_deferred_tokens > 0:
+                self.input_ids_loc.np[:num_deferred_tokens] = deferred_prev_indices
+                gathered_tokens = torch.gather(
+                    self.prev_token_ids,
+                    0,
+                    self.input_ids_loc.copy_to_gpu(num_deferred_tokens),
+                )
+
+            if new_decode_front:
+                # Layout: [new | deferred]
+                if gathered_tokens is not None:
+                    self.input_ids.gpu[num_new_tokens : num_new_tokens + num_deferred_tokens] = gathered_tokens
+                if num_new_tokens > 0:
+                    token_ids = [token for tokens in scheduled_tokens[:num_new_tokens] for token in tokens]
+                    self.input_ids.np[:num_new_tokens] = token_ids
+                    self.input_ids.copy_to_gpu(num_new_tokens)
+            else:
+                # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
+                if gathered_tokens is not None:
+                    self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
+                if num_new_tokens > 0:
+                    new_token_ids = [scheduled_tokens[idx][0] for idx in new_curr_indices]
+                    self.input_ids.np[:num_new_tokens] = new_token_ids
+                    self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
+                        self.input_ids.copy_to_gpu(num_new_tokens)
+                    )
+
         return self.input_ids.gpu[:total_tokens]
 
 
