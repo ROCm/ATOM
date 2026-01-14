@@ -247,7 +247,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             context_lens = batch.context_lens
             positions = [i - 1 for i in context_lens]
             slot_mapping = [
-                block_table[-1] * self.block_size + last_block_num - 1
+                block_table[-1] * self.model_runner.block_size + last_block_num - 1
                 for block_table, last_block_num in zip(
                     batch.block_tables, batch.last_block_num_tokens
                 )
