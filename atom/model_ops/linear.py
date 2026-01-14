@@ -66,7 +66,9 @@ def gemm_a4w4_quant(
             shuffle=True,
         )
     else:
-        x_scale = input_scale
+        x_scale = input_scale.view(torch.float8_e8m0fnu)
+        x = x.view(torch.float4_e2m1fn_x2)
+
 
     y = gemm_a4w4(
         x,
