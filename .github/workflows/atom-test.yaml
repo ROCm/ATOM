@@ -63,7 +63,7 @@ jobs:
           RUN pip uninstall -y aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
-
+          RUN rm -rf /app/aiter-test
           RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \\
               cd /app/aiter-test && \\
               git checkout HEAD && \\
@@ -73,8 +73,9 @@ jobs:
           
           RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
           RUN pip uninstall -y atom
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM-test && \\
-              cd /app/ATOM-test && \\
+          RUN rm -rf /app/ATOM
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
+              cd /app/ATOM && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               pip install -e .
 
