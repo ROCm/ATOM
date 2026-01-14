@@ -212,7 +212,7 @@ jobs:
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
-          " > atom_accuracy_output.txt 2>&1
+          " 2>&1 | tee atom_accuracy_output.txt
       
       - name: Collect Test Summary
         if: success()
