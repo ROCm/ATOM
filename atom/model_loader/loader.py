@@ -28,9 +28,12 @@ from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrit
 from aiter import logger
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+    #logger.info("default weight loader, param {0}".format(str(param)))
     if loaded_weight.numel() == param.data.numel():
+        #logger.info("if statement entered")
         param.data.copy_(loaded_weight)
     elif loaded_weight.numel() // get_tp_group().world_size == param.data.numel():
+        #logger.info("elif statement entered")
         loaded_weight_per_rank = loaded_weight.numel() // get_tp_group().world_size
         tp_rank_start = loaded_weight_per_rank * get_tp_group().rank
         tp_rank_end = tp_rank_start + loaded_weight_per_rank
@@ -146,6 +149,8 @@ def load_model(
                         )
                     else:
                         # default weight loader requires two parameters, removed shard id
+                        # issue: this causes scale to be loaded incorrectly? 
+                        #logger.info(param)
                         futures.append(
                             executor.submit(weight_loader, param, weight_tensor)
                         )
@@ -203,7 +208,7 @@ def load_model(
                     if name.endswith("output_scale"):
                         #logger.info(params_dict.keys())
                         possible_name = remap_output_scale_name(name, params_dict)
-                        continue
+                        param = model.get_parameter(possible_name)
                     else:
                         param = model.get_parameter(name)
                     weight_loader = getattr(

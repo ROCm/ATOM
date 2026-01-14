@@ -23,6 +23,8 @@ from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
+from aiter import logger
+
 from atom.utils import envs
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
@@ -98,13 +100,18 @@ class Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
+
+        
         
         # rope cache
         q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(q, k, v, qkv, position, fwd_args)
         
-        attn_impl = self.dispatch_backend(fwd_args)
 
-        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args)
+        attn_impl = self.dispatch_backend(fwd_args)
+        #logger.info(attn_impl)
+        #logger.info(k_scale)
+        #logger.info(v_scale)
+        o = attn_impl(q, k, v, k_cache, v_cache, self.k_scale, self.v_scale, fwd_args)
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
@@ -265,7 +272,14 @@ class Attention(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        
+        #logger.info(str(k_scale.unsqueeze(-1).transpose(-1, 0)))
+        # if this works add an if else to check if dimensions for parameter are > 1, if not then load scales in pa decode gluon to be not transposed
+        pa_k_scale = k_scale.unsqueeze(-1)
+        pa_v_scale = v_scale.unsqueeze(-1)
+        if k_scale.dim() > 1:
+            pa_k_scale = pa_k_scale.transpose(1,2)
+        if v_scale.dim() > 1:
+            pa_v_scale = pa_v_scale.transpose(1,2)
         torch.ops.aiter.pa_decode_gluon(
             o,
             o,
@@ -284,8 +298,8 @@ class Attention(nn.Module):
             None,
             # when using per-token quant, original k_scale shape: [num_blocks, block_size, num_kv_heads]
             # gluon pa decode kernel expects shape: [num_blocks, num_kv_heads, block_size, 1]
-            self.kv_scale if self.sinks is not None else k_scale.unsqueeze(-1).transpose(1, 2),
-            self.kv_scale if self.sinks is not None else v_scale.unsqueeze(-1).transpose(1, 2),
+            self.kv_scale if self.sinks is not None else pa_k_scale,
+            self.kv_scale if self.sinks is not None else pa_v_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
@@ -300,7 +314,8 @@ class Attention(nn.Module):
 
     def paged_attention_asm(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext):
         
-        attn_metadata = fwd_args.attn_metadata        
+        attn_metadata = fwd_args.attn_metadata    
+
         o = aiter.pa_fwd_asm(
             q,
             k_cache,
@@ -402,5 +417,6 @@ class Attention(nn.Module):
                 return self.paged_attention_triton
             else:
                 # Qwen only uses gluon pa decode when bs=64
+                logger.info("batch size == 64: {0}".format(ctx.batch_size == 64))
                 return self.paged_attention_triton if ctx.batch_size == 64 else self.paged_attention_asm
 

@@ -268,7 +268,7 @@ def remap_output_scale_name(name: str, params_dict: dict) -> Optional[str]:
 
     possible_scale_names = [".k_proj.output_scale", ".v_proj.output_scale"]
     modelopt_scale_names = [
-        ".attn.k_scale", ".attn.v_scale"
+        ".attn.impl.k_scale", ".attn.impl.v_scale"
     ]
 
     for i, scale_name in enumerate(possible_scale_names):

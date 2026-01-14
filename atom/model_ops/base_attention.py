@@ -104,7 +104,9 @@ class Attention(nn.Module):
             block_size,
             use_mla=self.use_mla,
         )
+        logger.info(self.attn_backend)
         impl_cls = self.attn_backend.get_impl_cls()
+        logger.info(impl_cls)
         self.impl = impl_cls(
             num_heads,
             head_dim,
@@ -120,6 +122,8 @@ class Attention(nn.Module):
             q_norm=q_norm,
             k_norm=k_norm,
         )
+
+        logger.info(self.impl)
 
         compilation_config = atom_config.compilation_config
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
