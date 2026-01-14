@@ -24,7 +24,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     == "1",
     "ATOM_GPT_OSS_MODEL": lambda: os.getenv("ATOM_GPT_OSS_MODEL", "0") == "1",
+    "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0")
+    == "1",
+    "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: os.getenv(
+        "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1"
+    )
     == "1",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: os.getenv(
         "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1"
