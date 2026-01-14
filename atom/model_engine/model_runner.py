@@ -202,17 +202,11 @@ class tokenIDProcessor:
         if is_all_same:
             self.input_ids.gpu[:num_deferred_tokens] = self.prev_token_ids
         else:
+            """
+            (1) prev_batch=[301], cur_batch=[0..255, 301] → Layout: [301 prefill | new | deferred]
+            (2) prev_batch=[0..255], cur_batch=[0..253, 256, 257] → Layout: [deferred | new 256, 257] when conc > max_num_seq
+            """
             is_prev_prefill = self.prev_batch.total_tokens_num_prefill > 0
-            """
-                example:
-                (1) cur batch is [0...255, 301], prev batch is [301],
-                 then new_curr_indices is [0...255], deferred_curr_indices is [256], deferred_prev_indices is [0]
-                (2) cur batch is [0...255, 256, 257] (140,141 finished), prev batch is [0...255],
-                 then 256,257 is not the new request just finished prefill,
-                 the new_curr_indices is [255, 256], deferred_curr_indices is [0...255], deferred_prev_indices is [0...255]
-                 (2) will happen when max_num_seqs is 256, but the num_concurrency > 256,
-            """
-
             new_decode_front = (
                 is_prev_prefill
                 and new_curr_indices == list(range(num_new_tokens))
@@ -220,61 +214,34 @@ class tokenIDProcessor:
                 == list(range(num_new_tokens, num_new_tokens + num_deferred_tokens))
             )
 
+            gathered_tokens = None
+            # old requests (deferred)
+            if num_deferred_tokens > 0:
+                self.input_ids_loc.np[:num_deferred_tokens] = deferred_prev_indices
+                gathered_tokens = torch.gather(
+                    self.prev_token_ids,
+                    0,
+                    self.input_ids_loc.copy_to_gpu(num_deferred_tokens),
+                )
+
             if new_decode_front:
-                # Layout is [A1 prefill | A1 decode | old deferred]
-                # old requests
-                if num_deferred_tokens > 0:
-                    self.input_ids_loc.np[:num_deferred_tokens] = deferred_prev_indices
-                    torch.gather(
-                        self.prev_token_ids,
-                        0,
-                        self.input_ids_loc.copy_to_gpu(num_deferred_tokens),
-                        out=self.input_ids.gpu[
-                            num_new_tokens : num_new_tokens + num_deferred_tokens
-                        ],
-                    )
-                # new requests
+                # Layout: [new | deferred]
+                if gathered_tokens is not None:
+                    self.input_ids.gpu[num_new_tokens : num_new_tokens + num_deferred_tokens] = gathered_tokens
                 if num_new_tokens > 0:
-                    token_ids = [
-                        token
-                        for tokens in scheduled_tokens[:num_new_tokens]
-                        for token in tokens
-                    ]
+                    token_ids = [token for tokens in scheduled_tokens[:num_new_tokens] for token in tokens]
                     self.input_ids.np[:num_new_tokens] = token_ids
                     self.input_ids.copy_to_gpu(num_new_tokens)
             else:
-                # Layout is [old decoded | old deferred | new decoded]
-
-                # old requests, but not contiguous
-                if num_deferred_tokens > 0:
-                    self.input_ids_loc.np[:num_deferred_tokens] = deferred_prev_indices
-                    gathered_tokens = torch.gather(
-                        self.prev_token_ids,
-                        0,
-                        self.input_ids_loc.copy_to_gpu(num_deferred_tokens),
-                    )
-                    curr_indices_gpu = torch.tensor(
-                        deferred_curr_indices,
-                        dtype=torch.long,
-                        device=gathered_tokens.device,
-                    )
-                    self.input_ids.gpu.scatter_(0, curr_indices_gpu, gathered_tokens)
-
+                # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
+                if gathered_tokens is not None:
+                    self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
                 if num_new_tokens > 0:
-                    new_token_ids = [
-                        scheduled_tokens[idx][0] for idx in new_curr_indices
-                    ]
-                    new_tokens_gpu = torch.tensor(
-                        new_token_ids,
-                        dtype=self.input_ids.gpu.dtype,
-                        device=self.input_ids.gpu.device,
+                    new_token_ids = [scheduled_tokens[idx][0] for idx in new_curr_indices]
+                    self.input_ids.np[:num_new_tokens] = new_token_ids
+                    self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
+                        self.input_ids.copy_to_gpu(num_new_tokens)
                     )
-                    new_indices_gpu = torch.tensor(
-                        new_curr_indices,
-                        dtype=torch.long,
-                        device=self.input_ids.gpu.device,
-                    )
-                    self.input_ids.gpu.scatter_(0, new_indices_gpu, new_tokens_gpu)
 
         return self.input_ids.gpu[:total_tokens]
 
