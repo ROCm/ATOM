@@ -79,6 +79,7 @@ def main():
         print(f"Prompt: {prompt!r}")
         print(f"Completion: {output['text']!r}")
 
+    llm.print_mtp_statistics()
 
 if __name__ == "__main__":
     main()

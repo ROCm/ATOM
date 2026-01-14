@@ -15,6 +15,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.sampler import Sampler
+from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
@@ -38,6 +39,7 @@ from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
     DPMetadata,
+    SpecDecodeMetadata,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
@@ -60,7 +62,7 @@ support_model_arch_dict = {
 
 class tokenIDProcessor:
 
-    def __init__(self, max_num_batched_tokens: int, device: torch.device):
+    def __init__(self, max_num_batched_tokens: int, device: torch.device, use_spec: bool, num_speculative_tokens):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         # self.is_deferred_out = False
         self.is_deferred_out = True
@@ -70,6 +72,11 @@ class tokenIDProcessor:
         self.input_ids_loc = CpuGpuBuffer(
             max_num_batched_tokens, dtype=torch.int64, device=device
         )
+        self.use_spec = use_spec
+        if self.use_spec:
+            self.draft_tokens = CpuGpuBuffer((max_num_batched_tokens, num_speculative_tokens), dtype=torch.int32, device=device)
+            self.num_speculative_tokens = num_speculative_tokens
+
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_event = torch.cuda.Event()
         self.async_copy_stream = torch.cuda.Stream()
@@ -90,48 +97,86 @@ class tokenIDProcessor:
             return token_ids
         return []
 
+    def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
+        default_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(self.async_copy_stream):
+            self.async_copy_stream.wait_stream(default_stream)
+            cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            self.async_copy_event.record(self.async_copy_stream)
+        self.draft_token_ids_cpu.append(cpu_tensor)
+        self.draft_token_ids_gpu.append(gpu_tensor)
+
+    def recv_async_output_draft(self) -> list[int]:
+        self.async_copy_event.synchronize()
+        for _ in self.draft_token_ids_cpu:
+            token_ids = self.draft_token_ids_cpu.pop(0).tolist()
+            return token_ids
+        return []
+
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
 
         self.prev_batch: Optional[ScheduledBatch] = None
 
+        self.pre_num_decode_token_per_seq = 1
+        self.draft_token_ids: Optional[torch.Tensor] = None
+        self.draft_token_ids_cpu: list[torch.Tensor] = []
+        self.draft_token_ids_gpu: list[torch.Tensor] = []
+
     def prepare_sampled_ids(
         self, batch: ScheduledBatch, sampled_token_ids: torch.Tensor
-    ) -> dict[int, int]:
+    ) -> dict[int, list[int]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
-            ret = {seq_id: token_id for seq_id, token_id in zip(req_ids, token_ids)}
-            ret[-1] = 0
+            ret = {}
+            for seq_id, token_id in zip(req_ids, token_ids):
+                if isinstance(token_id, list):
+                    if -1 in token_id:
+                        idx = token_id.index(-1)
+                        ret[seq_id] = token_id[:idx]
+                    else:
+                        ret[seq_id] = token_id
+                else:
+                    ret[seq_id] = [token_id]
+            ret[-1] = 0  # is_deferred_out flag
             return ret
+
         token_ids = self.recv_async_output()
         self.send_to_cpu_async(sampled_token_ids)
-
+        token_id_dict = {}
+        self.prev_req_ids = None
         if self.prev_batch is not None:
-            req_ids = self.prev_batch.req_ids
-            token_ids = {
-                seq_id: token_id for seq_id, token_id in zip(req_ids, token_ids)
-            }
+            self.prev_req_ids = self.prev_batch.req_ids
+            for seq_id, token_id in zip(self.prev_req_ids, token_ids):
+                if isinstance(token_id, list):
+                    if -1 in token_id:
+                        idx = token_id.index(-1)
+                        token_id_dict[seq_id] = token_id[:idx]
+                    else:
+                        token_id_dict[seq_id] = token_id
+                else:
+                    token_id_dict[seq_id] = [token_id]
         else:
             # first time, no previous tokens
             token_ids = {}
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
-        token_ids[-1] = 1
-        return token_ids
+        token_id_dict[-1] = 1
 
-    def get_prev_alive_locations(self, batch: ScheduledBatch) -> tuple[list[int], bool]:
-        token_ids = self.prev_token_ids
-        deferred_prev_indices = [
-            i
-            for i, seq_id in enumerate(self.prev_batch.req_ids)
+        return token_id_dict
+
+    def get_prev_alive_locations(self, batch: ScheduledBatch) -> tuple[list[int], int, bool]:
+        # print(f"{self.prev_batch.req_ids=}")
+        # print(f"{batch.req_ids=}")
+        alive_seq_indices = [
+            i for i, seq_id in enumerate(self.prev_batch.req_ids)
             if seq_id in batch.req_ids
         ]
-        return (
-            deferred_prev_indices,
-            len(deferred_prev_indices) == token_ids.size(0),
-        )
+        num_deferred_tokens = len(alive_seq_indices) * self.pre_num_decode_token_per_seq
+        is_all_alive = len(alive_seq_indices) == len(self.prev_batch.req_ids)
+        return alive_seq_indices, num_deferred_tokens, is_all_alive
 
     def prepare_input_ids(
         self,
@@ -163,52 +208,107 @@ class tokenIDProcessor:
             return self.input_ids.gpu[:total_tokens_prefill]
 
         if not self.is_deferred_out:
-            token_ids = [
-                token
-                for tokens in scheduled_tokens[
-                    total_reqs_prefill : total_reqs_prefill + total_reqs_decode
+            if self.use_spec:
+                token_ids = [
+                    token
+                    for tokens, draft_tokens in zip(
+                        scheduled_tokens[
+                            total_reqs_prefill : total_reqs_prefill + total_reqs_decode
+                        ],
+                        batch.scheduled_spec_decode_tokens.values(),
+                    )
+                    for token in [tokens[0]] + draft_tokens
                 ]
-                for token in tokens
-            ]
+            else:
+                token_ids = [
+                    token
+                    for tokens in scheduled_tokens[
+                        total_reqs_prefill : total_reqs_prefill + total_reqs_decode
+                    ]
+                    for token in tokens
+                ]
             self.input_ids.np[:total_tokens_decode] = token_ids
             self.input_ids.copy_to_gpu(total_tokens_decode)
             return self.input_ids.gpu[:total_tokens_decode]
 
         """for decode: input ids are from prev_sampled_token_ids"""
-        locations, is_all_alive = self.get_prev_alive_locations(batch)
-        num_deferred_tokens = len(locations)
+        alive_seq_indices, num_deferred_tokens, is_all_alive = self.get_prev_alive_locations(batch)
         if is_all_alive:
             num_norm_tokens = total_tokens_decode - num_deferred_tokens
             if num_norm_tokens > 0:
-                token_ids = [
-                    token
-                    for tokens in scheduled_tokens[
-                        total_reqs_prefill : total_reqs_prefill + num_norm_tokens
+                if self.use_spec:
+                    actual_norm_tokens = num_norm_tokens // (self.num_speculative_tokens + 1)
+                    token_ids = [
+                        token
+                        for tokens, draft_tokens in zip(
+                            scheduled_tokens[
+                                total_reqs_prefill : total_reqs_prefill + actual_norm_tokens
+                            ],
+                            batch.scheduled_spec_decode_tokens.values(),
+                        )
+                        for token in [tokens[-1]] + draft_tokens
                     ]
-                    for token in tokens
-                ]
+                else:
+                    token_ids = [
+                        token
+                        for tokens in scheduled_tokens[
+                            total_reqs_prefill : total_reqs_prefill + num_norm_tokens
+                        ]
+                        for token in tokens
+                    ]
                 self.input_ids.np[:num_norm_tokens] = token_ids
                 self.input_ids.copy_to_gpu(num_norm_tokens)
             # no new requests added and old requests finished
+            if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
+                alive_prev = self.prev_token_ids[alive_seq_indices]
+                alive_draft = self.draft_token_ids[alive_seq_indices]
+                combined = torch.cat([
+                    alive_prev.unsqueeze(1),  # (num_alive_seqs, 1)
+                    alive_draft               # (num_alive_seqs, mtp_n_grams-1)
+                ], dim=1).reshape(-1)         #  (num_deferred_tokens,)
+            else:
+                # normal decode
+                combined = self.prev_token_ids[alive_seq_indices]
             self.input_ids.gpu[
                 num_norm_tokens : num_norm_tokens + num_deferred_tokens
-            ] = self.prev_token_ids
+            ] = combined
 
         elif num_deferred_tokens == total_tokens_decode:
             # no new requests added but some old requests finished
-            self.input_ids_loc.np[:num_deferred_tokens] = locations
-            self.input_ids_loc.copy_to_gpu(num_deferred_tokens)
-            torch.gather(
-                self.prev_token_ids,
-                0,
-                self.input_ids_loc.gpu[:num_deferred_tokens],
-                out=self.input_ids.gpu[:num_deferred_tokens],
-            )
+            if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
+                alive_prev = self.prev_token_ids[alive_seq_indices]  # (num_alive_seqs,)
+                alive_draft = self.draft_token_ids[alive_seq_indices]  # (num_alive_seqs, mtp_n_grams-1)
+                combined = torch.cat([
+                    alive_prev.unsqueeze(1),  # (num_alive_seqs, 1)
+                    alive_draft               # (num_alive_seqs, mtp_n_grams-1)
+                ], dim=1).reshape(-1)       # (num_deferred_tokens,)
+            else:
+                combined = self.prev_token_ids[alive_seq_indices]
+            self.input_ids.gpu[:num_deferred_tokens] = combined
         else:
             # TODO: new requests' input_ids need to be filled in
             assert False, "TODO new requests' input_ids need to be filled in"
         return self.input_ids.gpu[:total_tokens]
 
+    def prepare_draft_ids(
+            self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
+    ) -> dict[int, list[int]]:
+        if not self.is_deferred_out:
+            draft_token_ids = draft_token_ids.tolist()
+            req_ids = batch.req_ids
+            ret = {seq_id: token_id for seq_id, token_id in zip(req_ids, draft_token_ids)}
+            ret[-1] = 0
+        else:
+            # bs = draft_token_ids.shape[0]
+            self.draft_token_ids = draft_token_ids # tmp, to be removed
+            # self.draft_tokens.gpu[:bs, :self.num_speculative_tokens] = draft_token_ids
+            # self.draft_tokens.copy_to_cpu()
+            self.pre_num_decode_token_per_seq = self.num_speculative_tokens + 1
+            token_ids = self.recv_async_output_draft()
+            self.send_to_cpu_async_draft(draft_token_ids)
+            ret = {seq_id: token_id for seq_id, token_id in zip(self.prev_req_ids, token_ids)} if self.prev_req_ids is not None else {}
+            ret[-1] = 1
+        return ret
 
 class ModelRunner:
 
@@ -282,12 +382,16 @@ class ModelRunner:
             self.block_size,
             use_mla=self.use_mla,
         )
-        self.tokenID_processor = tokenIDProcessor(
-            self.config.max_num_batched_tokens, self.device
-        )
-        self.sampler = Sampler()
         if self.config.speculative_config and get_pp_group().is_last_rank:
             self.drafter = EagleProposer(self.config, self.device, self)
+            self.rejection_sampler = RejectionSampler()
+            self.mtp_total_draft_tokens = 0
+            self.mtp_total_accepted_tokens = 0
+        num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.tokenID_processor = tokenIDProcessor(
+            self.config.max_num_batched_tokens, self.device, hasattr(self, "drafter"), num_speculative_tokens
+        )
+        self.sampler = Sampler()
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -338,6 +442,26 @@ class ModelRunner:
                 and self.hf_text_config.kv_lora_rank is not None
             )
         return False
+
+    def get_mtp_statistics(self) -> dict:
+        if hasattr(self, "mtp_total_draft_tokens"):
+            acceptance_rate = (self.mtp_total_accepted_tokens / self.mtp_total_draft_tokens 
+                              if self.mtp_total_draft_tokens > 0 else 0.0)
+            return {
+                "total_draft_tokens": self.mtp_total_draft_tokens,
+                "total_accepted_tokens": self.mtp_total_accepted_tokens,
+                "acceptance_rate": acceptance_rate,
+            }
+        return {
+            "total_draft_tokens": 0,
+            "total_accepted_tokens": 0,
+            "acceptance_rate": 0.0,
+        }
+    
+    def reset_mtp_statistics(self):
+        if hasattr(self, "mtp_total_draft_tokens"):
+            self.mtp_total_draft_tokens = 0
+            self.mtp_total_accepted_tokens = 0
 
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
@@ -408,6 +532,10 @@ class ModelRunner:
             self.profiler.__exit__(None, None, None)
             self.profiler = None
         return True
+
+    def debug(self, *args: Any):
+        if self.rank == 0:
+            logger.info(*args)
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
@@ -526,6 +654,8 @@ class ModelRunner:
             "temperatures": CpuGpuBuffer(self.max_bs, **f32_kwargs),
             "outputs": torch.empty(self.max_bs, hidden_size, dtype=hidden_type),
         }
+        if hasattr(self, "drafter"):
+            self.forward_vars["mtp_k"] = self.drafter.mtp_k
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -773,7 +903,7 @@ class ModelRunner:
         num_input_tokens += num_pad
         return num_input_tokens, num_tokens_across_dp
 
-    def prepare_intputs(self, batch: ScheduledBatch):
+    def prepare_intputs(self, batch: ScheduledBatch, input_ids: torch.Tensor):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = batch.num_scheduled_tokens
@@ -806,12 +936,22 @@ class ModelRunner:
         )
         num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
         actual_num_tokens = batch.total_tokens_num
+
+        spec_decode_metadata = None
+        if not is_prefill and hasattr(self, "drafter"):
+                num_draft_tokens = np.zeros(bs, dtype=np.int32)
+                num_draft_tokens[:] = self.drafter.mtp_k
+                spec_decode_metadata = self._calc_spec_decode_metadata(
+                    num_draft_tokens, cu_seqlens_q, input_ids
+                )
+
         set_forward_context(
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
             num_tokens=actual_num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
+            spec_decode_metadata=spec_decode_metadata,
         )
         return num_input_tokens
 
@@ -826,10 +966,7 @@ class ModelRunner:
         assert total_tokens_num > 0
 
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        # if self.rank == 0:
-        #     print(f"input_ids: {input_ids}")
-
-        self.prepare_intputs(batch)
+        self.prepare_intputs(batch, input_ids)
         temperatures = self.prepare_sample(batch)
         return (
             input_ids,
@@ -848,29 +985,217 @@ class ModelRunner:
             graph_bs = context.graph_bs
             self.graphs[graph_bs].replay()
             hidden_states = self.forward_vars["outputs"][:bs]
-        return self.model.compute_logits(hidden_states)
+        return self.model.compute_logits(hidden_states), hidden_states
 
     def postprocess(
         self,
         batch: ScheduledBatch,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-    ) -> dict[int, int]:
-        sampled_tokens = self.sampler(logits, temperatures)
+    ) -> dict[int, list[int]]:
+        spec_decode_metadata = get_forward_context().spec_decode_metadata
+
+        if spec_decode_metadata is None:
+            sampled_tokens = self.sampler(logits, temperatures)
+        else:
+            # When indexing with a tensor (bonus_logits_indices), PyTorch
+            # creates a new tensor with separate storage from the original
+            # logits tensor. This means any in-place operations on bonus_logits
+            # won't affect the original logits tensor.
+            assert logits is not None
+            bonus_logits = logits[spec_decode_metadata.bonus_logits_indices]
+            bonus_token_ids = self.sampler(
+                logits=bonus_logits,
+                temperatures=temperatures,
+            )
+            # Just like `bonus_logits`, `target_logits` is a new tensor with
+            # separate storage from the original `logits` tensor. Therefore,
+            # it is safe to update `target_logits` in place.
+            target_logits = logits[spec_decode_metadata.target_logits_indices]
+            sampled_tokens = self.rejection_sampler(
+                spec_decode_metadata,
+                target_logits,
+                bonus_token_ids,
+                temperatures,
+            )
+            # Update MTP acceptance statistics
+            batch_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
+            num_valid_per_req = (sampled_tokens != -1).sum(dim=1)
+            # accepted = num_valid - 1 for each request (subtract the corrected/bonus token)
+            batch_accepted_tokens = (num_valid_per_req - 1).sum().item()
+            self.mtp_total_draft_tokens += batch_draft_tokens
+            self.mtp_total_accepted_tokens += batch_accepted_tokens
+            
+            # Log MTP acceptance statistics periodically
+            if self.mtp_total_draft_tokens > 0 and \
+               self.mtp_total_draft_tokens % 1000 < batch_draft_tokens:
+                acceptance_rate = self.mtp_total_accepted_tokens / self.mtp_total_draft_tokens
+                logger.info(
+                    f"[MTP Stats] Total draft tokens: {self.mtp_total_draft_tokens}, "
+                    f"Accepted: {self.mtp_total_accepted_tokens}, "
+                    f"Acceptance rate: {acceptance_rate:.2%}"
+                )
+
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
         token_ids = self.tokenID_processor.prepare_sampled_ids(
             batch,
             sampled_tokens,
         )
-        return token_ids
+
+        if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
+            if spec_decode_metadata is not None:
+                num_accepted = (sampled_tokens != -1).sum(dim=1)
+                last_indices = num_accepted - 1
+                bs = len(batch.req_ids)
+                next_token_ids = sampled_tokens[torch.arange(bs, device=sampled_tokens.device), last_indices]
+                self.tokenID_processor.prev_token_ids = next_token_ids
+
+        return token_ids, sampled_tokens
 
     @torch.inference_mode()
-    def forward(self, batch: ScheduledBatch) -> dict[int, int]:
+    def forward(self, batch: ScheduledBatch) -> dict[int, list[int]]:
         input_ids, temperatures = self.prepare_model(batch)
-        logits = self.run_model(input_ids)
+        logits, hidden_states = self.run_model(input_ids)
+        sampled_token_ids, cur_sampled_tokens = self.postprocess(batch, logits, temperatures)
+        draft_token_ids = None
+        if hasattr(self, "drafter"):
+            draft_token_ids = self.propose_draft_token_ids(batch, input_ids, cur_sampled_tokens, hidden_states)
         reset_forward_context()
-        return self.postprocess(batch, logits, temperatures)
+        return sampled_token_ids, draft_token_ids
+
+
+    def _calc_spec_decode_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+        input_ids: torch.Tensor,
+    ) -> SpecDecodeMetadata:
+        # Inputs:
+        # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
+        # num_draft_tokens:         [  3,   0,   2,   0,   1]
+        # Outputs:
+        # cu_num_draft_tokens:      [  3,   3,   5,   5,   6]
+        # logits_indices:           [  0,   1,   2,   3, 103, 104, 105, 106,
+        #                            206, 207, 208]
+        # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
+        # bonus_logits_indices:     [  3,   4,   7,   8,  10]
+
+        # Compute the logits indices.
+        # [4, 1, 3, 1, 2]
+        num_sampled_tokens = num_draft_tokens + 1
+
+        # Step 1. cu_num_sampled_tokens: [4, 5, 8, 9, 11]
+        # arange: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]
+        cu_num_sampled_tokens, arange = self._get_cumsum_and_arange(
+            num_sampled_tokens, cumsum_dtype=np.int32
+        )
+        # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
+        logits_indices = np.repeat(
+            cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
+        )
+        # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
+        logits_indices += arange
+
+        # Compute the bonus logits indices.
+        bonus_logits_indices = cu_num_sampled_tokens - 1
+
+        # Compute the draft logits indices.
+        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
+        # arange: [0, 1, 2, 0, 1, 0]
+        cu_num_draft_tokens, arange = self._get_cumsum_and_arange(
+            num_draft_tokens, cumsum_dtype=np.int32
+        )
+        # [0, 0, 0, 5, 5, 9]
+        target_logits_indices = np.repeat(
+            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+        )
+        # [0, 1, 2, 5, 6, 9]
+        target_logits_indices += arange
+
+        # TODO: Optimize the CPU -> GPU copy.
+        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
+            self.device, non_blocking=True
+        )
+        logits_indices = torch.from_numpy(logits_indices).to(
+            self.device, non_blocking=True
+        )
+        target_logits_indices = torch.from_numpy(target_logits_indices).to(
+            self.device, non_blocking=True
+        )
+        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
+            self.device, non_blocking=True
+        )
+
+        # Compute the draft token ids.
+        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        draft_token_ids = input_ids[logits_indices]
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+
+        metadata = SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens.tolist(),
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            logits_indices=logits_indices,
+        )
+        return metadata
+
+    def propose_draft_token_ids(
+        self,
+        batch: ScheduledBatch,
+        input_ids: torch.Tensor,
+        sampled_token_ids: dict[int, list[int]],
+        hidden_states: torch.Tensor,
+    ):
+        num_scheduled_tokens = batch.total_tokens_num
+        if not get_forward_context().attn_metadata.slot_mapping.numel():
+            return self.drafter.dummy_run(input_ids, num_scheduled_tokens)
+
+        positions = get_forward_context().context.positions
+        spec_decode_metadata = get_forward_context().spec_decode_metadata
+
+        assert isinstance(self.drafter, EagleProposer)
+        if self.tokenID_processor.is_deferred_out:
+            next_token_ids = self.tokenID_processor.prev_token_ids
+        else:
+            next_token_ids: list[int] = []
+            for k, v in sampled_token_ids.items():
+                if k != -1:
+                    next_token_ids.append(v[-1])
+            if len(next_token_ids) == 0:
+                return
+            next_token_ids = torch.tensor(
+                next_token_ids, dtype=torch.int32, device=self.device
+            )
+        if spec_decode_metadata is None:
+            target_token_ids = input_ids[:num_scheduled_tokens]
+            target_positions = positions[:num_scheduled_tokens]
+            target_hidden_states = hidden_states[:num_scheduled_tokens]
+        else:
+            num_draft_tokens = spec_decode_metadata.num_draft_tokens
+            num_rejected_tokens = [
+                n + 1 - len(sampled_token_ids[i]) if n > 0 else 0
+                for i, n in enumerate(num_draft_tokens)
+            ]
+            num_rejected_tokens_cpu = torch.tensor(
+                num_rejected_tokens, dtype=torch.int32
+            )
+            token_indices = self.drafter.prepare_inputs(num_rejected_tokens_cpu)
+
+            target_token_ids = input_ids[token_indices]
+            target_positions = positions[token_indices]
+            target_hidden_states = hidden_states[token_indices]
+
+        draft_token = self.drafter.propose(
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+        )
+        return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
+
 
     @torch.inference_mode()
     def capture_cudagraph(self):

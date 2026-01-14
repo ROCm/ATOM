@@ -112,18 +112,20 @@ class BlockManager:
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1 or self.block_size == 1:
-            assert last_block.hash != -1
-            block_id = self.free_block_ids[0]
-            block = self._allocate_block(block_id)
-            block_table.append(block_id)
-            if self.block_size == 1:
-                token_ids = [seq[-1]]
-                prefix = (
-                    self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-                )
-                h = self.compute_hash(token_ids, prefix)
-                block.update(h, token_ids)
-                self.hash_to_block_id[h] = block_id
+            needed_blocks = (len(seq) + seq.block_size - 1) // seq.block_size
+            while len(block_table) < needed_blocks:
+                assert last_block.hash != -1
+                block_id = self.free_block_ids[0]
+                block = self._allocate_block(block_id)
+                block_table.append(block_id)
+                if self.block_size == 1:
+                    token_ids = [seq[-1]]
+                    prefix = (
+                        self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                    )
+                    h = self.compute_hash(token_ids, prefix)
+                    block.update(h, token_ids)
+                    self.hash_to_block_id[h] = block_id
         elif len(seq) % self.block_size == 0:
             assert last_block.hash == -1
             token_ids = seq.block(seq.num_blocks - 1)
