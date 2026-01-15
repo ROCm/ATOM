@@ -19,7 +19,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0"
     )
     == "1",
-    "ATOM_GPT_OSS_MODEL": lambda: os.getenv("ATOM_GPT_OSS_MODEL", "0") == "1",
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0")
     == "1",
