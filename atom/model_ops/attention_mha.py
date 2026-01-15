@@ -15,20 +15,30 @@ from torch import nn
 
 from .attention_mla import MLAModules
 
+from atom.plugin.prepare import is_plugin_mode, is_vllm
+from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
 
-class Attention(nn.Module):
 
+@PagedAttentionImplDecoratorForPluginMode
+class PagedAttentionImpl(nn.Module):
+    """
+    Attention paged implementation
+    """
     def __init__(
         self,
         num_heads,
         head_dim,
         scale,
         num_kv_heads,
+        alibi_slopes: list[float] | None,
+        sliding_window: Optional[int] = None,
         kv_cache_dtype="bf16",
+        logits_soft_cap: float | None = None,
+        attn_type = None,
+        kv_sharing_target_layer_name: int | None = None,
         layer_num=0,
         mla_modules: Optional[MLAModules] = None,
         sinks: Optional[nn.Parameter] = None,
-        sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
         q_norm: Optional[torch.nn.Module] = None,
         k_norm: Optional[torch.nn.Module] = None,
@@ -37,12 +47,16 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
+        # for upper framework, it uses head_size in built-in methods
+        self.head_size = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.alibi_slopes = alibi_slopes
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
+        self.device = 'cuda:' + str(torch.cuda.current_device())
         self.layer_num = layer_num
         self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
@@ -56,7 +70,14 @@ class Attention(nn.Module):
         self.q_norm = q_norm
         self.k_norm = k_norm
 
-    def forward(
+        # for plugin mode(vllm), the query quant is disabled for now
+        if is_vllm():
+            self.supports_quant_query_input = False
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype = torch.bfloat16):
+        pass
+
+    def forward_impl_server_mode(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -414,3 +435,40 @@ class Attention(nn.Module):
                 if atom_config.kv_cache_block_size == 1024:
                     return self.paged_attention_persistent_asm
                 return self.paged_attention_asm
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor = None,
+        attn_metadata = None,
+        position: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor]=None,
+        qkv: torch.Tensor = None,
+        output: torch.Tensor = None,
+        **kwargs,
+    ):
+        if is_plugin_mode():
+            # forward impl method are added by the decorator
+            # PagedAttentionImplDecoratorForPluginMode
+            return self.forward_impl_plugin_mode(layer=layer,
+                                                query=query,
+                                                key=key,
+                                                value=value,
+                                                kv_cache=kv_cache,
+                                                attn_metadata=attn_metadata,
+                                                position=position,
+                                                q_scale=q_scale,
+                                                qkv=qkv)
+        else:
+            # only for server mode, keep the original method
+            o = self.forward_impl_server_mode(q=query,
+                                              k=key,
+                                              v=value,
+                                              position=position,
+                                              q_scale=q_scale,
+                                              qkv=qkv)
+
+            return o

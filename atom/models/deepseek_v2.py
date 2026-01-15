@@ -59,7 +59,7 @@ from atom.config import (
 )
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules, is_rocm_aiter_fp4bmm_enabled
-from atom.model_ops.base_attention import Attention
+import atom.model_ops as ops
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
@@ -1385,11 +1385,12 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer=self.indexer,
         )
 
-        self.mla_attn = Attention(
+        self.mla_attn = ops.ATTN_CLS(
             num_heads=self.num_local_heads,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             scale=self.scaling,
             num_kv_heads=1,
+            alibi_slopes=None,
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             use_mla=True,

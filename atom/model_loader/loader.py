@@ -28,6 +28,7 @@ from atom.models.deepseek_mtp import (
     get_spec_layer_idx_from_weight_name,
     rewrite_spec_layer_name,
 )
+from atom.plugin.prepare import is_vllm
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -76,13 +77,58 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
 
 
+# when plugin mode, model loader method is bind to model implementation
+# thus call this interface to load the model, which leverags the load_model
+# method
+def load_model_in_plugin_mode(
+    model,
+    config,
+    prefix: str = "",
+) -> set[str] | None:
+
+    # during loading model, the outplace operation may consume more
+    # GPU mem, which cached in torch caching allocator, here actively
+    # call empty cache to free the extra reserved but not used memory
+    def _empty_cache():
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    assert config.plugin_config is not None and \
+           config.plugin_config.is_plugin_mode, \
+            "ATOM is not running in plugin mode"
+    if config.plugin_config.is_vllm:
+        model_name_or_path = config.plugin_config.model_config.model
+    elif config.plugin_config.is_sglang:
+        model_name_or_path = config.plugin_config.model_config.model_path
+
+    _empty_cache()
+    loaded_weights_record = load_model(model=model,
+                      model_name_or_path=model_name_or_path,
+                      hf_config=config.hf_config,
+                      load_dummy=config.load_dummy,
+                      spec_decode=False,
+                      prefix=prefix,
+                      is_plugin_mode=True,
+                      act_dtype=config.plugin_config.model_config.dtype)
+    _empty_cache()
+    return loaded_weights_record
+
+
 def load_model(
     model: nn.Module,
     model_name_or_path: str,
     hf_config: AutoConfig,
     load_dummy: bool = False,
     spec_decode: bool = False,
+    prefix: str = "",
+    is_plugin_mode: bool = False,
+    act_dtype: torch.dtype = None,
 ):
+    # need to record the loaded weight name for vllm load check
+    # it is only used in plugin mode for vllm
+    loaded_weights_record = set[str]()
+
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
@@ -138,6 +184,7 @@ def load_model(
                                 weight_loader, param, weight_tensor, shard_id
                             )
                         )
+                        loaded_weights_record.add(prefix + param_name)
                     break
             else:
                 # Check if model has expert mapping before processing
@@ -163,6 +210,7 @@ def load_model(
                                 expert_id,
                             )
                         )
+                        loaded_weights_record.add(prefix + name)
                         # weight_loader(
                         #     param,
                         #     weight_tensor,
@@ -179,6 +227,7 @@ def load_model(
                         futures.append(
                             executor.submit(weight_loader, param, weight_tensor)
                         )
+                        loaded_weights_record.add(prefix + name)
                         # weight_loader(param, weight_tensor)
                 else:
                     # Model doesn't have expert mapping, use generic loading
@@ -188,14 +237,26 @@ def load_model(
                     )
                     # weight_loader(param, weight_tensor)
                     futures.append(executor.submit(weight_loader, param, weight_tensor))
+                    loaded_weights_record.add(prefix + name)
         # Wait for all tasks to complete and raise any exceptions.
         for future in concurrent.futures.as_completed(futures):
             future.result()
     for _, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
-            module.process_weights_after_loading()
+            if is_vllm():
+                from vllm.attention.layer import Attention
+                # call vLLM attn weights post processing with act_dtype if using vLLM attention module
+                if isinstance(module, Attention):
+                    module.process_weights_after_loading(act_dtype=act_dtype)
+                else:
+                    module.process_weights_after_loading()
+            else:
+                module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             quant_method.process_weights_after_loading(module)
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
+
+    if is_plugin_mode:
+        return loaded_weights_record

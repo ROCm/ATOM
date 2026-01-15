@@ -93,7 +93,7 @@ class MLAAttention(nn.Module):
     def __init__(
         self,
         num_heads: int,
-        head_size: int,
+        head_dim: int,
         scale: float,
         num_kv_heads: int,
         kv_cache_dtype: str,
@@ -104,7 +104,7 @@ class MLAAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
-        self.head_size = head_size
+        self.head_dim = head_dim
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype if kv_cache_dtype == "fp8" else "auto"

@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Any, Iterable
 
 import torch
 from torch import nn
@@ -9,9 +9,7 @@ from transformers import PretrainedConfig
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
-
-# from atom.model_ops.attention import Attention
-from atom.model_ops.base_attention import Attention
+import atom.model_ops as ops
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     QKVParallelLinear,
@@ -38,6 +36,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
+from atom.model_loader.loader import load_model_in_plugin_mode
 
 from aiter import fused_rope_rms
 
@@ -240,7 +239,8 @@ class Qwen3MoeAttention(nn.Module):
         rope_scaling: tuple | None = None,
         kv_cache_dtype: str = "fp16",
         layer_num: int = 0,
-        quant_config: Optional[QuantizationConfig] = None,
+        atom_config: Config = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -268,14 +268,14 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
-            quant_config=quant_config,
+            quant_config=atom_config.quant_config,
         )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=atom_config.quant_config,
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
@@ -299,7 +299,7 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            self.attn = Attention(
+            self.attn = ops.ATTN_CLS(
                 self.num_heads,
                 self.head_dim,
                 self.scaling,
@@ -308,11 +308,12 @@ class Qwen3MoeAttention(nn.Module):
                 layer_num=layer_num,
                 use_mla=False,
                 rotary_emb=self.rotary_emb,
+                prefix=f"{prefix}.attn",
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
             )
         else:
-            self.attn = Attention(
+            self.attn = ops.ATTN_CLS(
                 self.num_heads,
                 self.head_dim,
                 self.scaling,
@@ -321,6 +322,7 @@ class Qwen3MoeAttention(nn.Module):
                 layer_num=layer_num,
                 use_mla=False,
                 rotary_emb=self.rotary_emb,
+                prefix=f"{prefix}.attn",
             )
         self.kv_cache_dtype = kv_cache_dtype
         self.layer_num = layer_num
@@ -329,13 +331,14 @@ class Qwen3MoeAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        **model_kwargs: dict[str, Any] | None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
-            attn_output = self.attn(q, k, v, positions, None, qkv)
+            attn_output = self.attn(query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv)
         else:
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
@@ -344,7 +347,7 @@ class Qwen3MoeAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-            attn_output = self.attn(q, k, v, positions)
+            attn_output = self.attn(query=q, key=k, value=v, **model_kwargs)
         output = self.o_proj(attn_output)
         return output
 
@@ -352,15 +355,16 @@ class Qwen3MoeAttention(nn.Module):
 class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Qwen3Config,
-        prefix: str,
-        cache_config: str = "bf16",
-        quant_config: Optional[QuantizationConfig] = None,
+        atom_config = None,
         layer_num: int = 0,
+        prefix: str = ""
     ) -> None:
         super().__init__()
 
+        self.atom_config = atom_config
+        config = self.atom_config.hf_config
         self.hidden_size = config.hidden_size
+        kv_cache_dtype = atom_config.kv_cache_dtype
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
@@ -378,9 +382,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            kv_cache_dtype=cache_config,
+            kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
-            quant_config=quant_config,
+            atom_config=atom_config,
+            prefix=f"{prefix}.self_attn",
         )
 
         # `mlp_only_layers` in the config.
@@ -392,14 +397,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             and (self.layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(
-                config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+                config, quant_config=self.atom_config.quant_config, prefix=f"{prefix}.mlp"
             )
         else:
             self.mlp = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=self.atom_config.quant_config,
                 reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 prefix=f"{prefix}.mlp",
             )
@@ -419,6 +424,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        **model_kwargs: dict[str, Any] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -429,6 +435,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            **model_kwargs,
         )
 
         # Fully Connected
@@ -447,42 +454,37 @@ class Qwen3MoeModel(nn.Module):
     ):
         super().__init__()
 
-        config = atom_config.hf_config
-        cache_config = atom_config.kv_cache_dtype
-        quant_config = atom_config.quant_config
-        self.config = config
+        self.config = atom_config.hf_config
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
+                self.config.vocab_size,
+                self.config.hidden_size,
             )
         else:
             self.embed_tokens = PPMissingLayer()
 
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
+            self.config.num_hidden_layers,
             lambda prefix, layer_num=None: Qwen3MoeDecoderLayer(
-                config,
-                prefix,
-                cache_config=cache_config,
-                quant_config=quant_config,
+                atom_config=atom_config,
                 layer_num=layer_num,
+                prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
         )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(
-                config.hidden_size,
-                eps=config.rms_norm_eps,
-                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+                self.config.hidden_size,
+                eps=self.config.rms_norm_eps,
+                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION
             )
         else:
             self.norm = PPMissingLayer()
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+            ["hidden_states", "residual"], self.config.hidden_size
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -494,6 +496,7 @@ class Qwen3MoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any] | None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -507,7 +510,7 @@ class Qwen3MoeModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(positions, hidden_states, residual, **model_kwargs)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -544,26 +547,22 @@ class Qwen3MoeForCausalLM(nn.Module):
         layer_type: type[nn.Module] = Qwen3MoeDecoderLayer,
     ):
         super().__init__()
-        config = atom_config.hf_config
-        quant_config = atom_config.quant_config
-        self.config = config
-        self.quant_config = quant_config
+        self.atom_config = atom_config
+        self.config = self.atom_config.hf_config
+
         # Only perform the following mapping when Qwen3MoeMLP exists
-        if getattr(config, "mlp_only_layers", []):
+        if getattr(self.config, "mlp_only_layers", []):
             self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
         self.model = Qwen3MoeModel(
-            atom_config=atom_config,
+            atom_config=self.atom_config,
             prefix=maybe_prefix(prefix, "model"),
-            layer_type=layer_type,
         )
 
         if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
+            self.lm_head = ParallelLMHead(num_embeddings=self.config.vocab_size,
+                                          embedding_dim=self.config.hidden_size,
+                                          bias=False,
+                                          prefix=maybe_prefix(prefix, "lm_head"))
         else:
             self.lm_head = PPMissingLayer()
         if self.config.tie_word_embeddings:
@@ -582,9 +581,14 @@ class Qwen3MoeForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any] | None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **model_kwargs,
         )
         return hidden_states
 
@@ -611,3 +615,10 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # load weights in plugin mode and discard passed weights generator
+        loaded_weights_record = load_model_in_plugin_mode(model=self,
+                                                          config=self.atom_config,
+                                                          prefix="model.")
+        return loaded_weights_record

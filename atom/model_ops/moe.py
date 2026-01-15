@@ -46,6 +46,7 @@ from atom.model_ops.utils import (
 )
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
+from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 
 
 @dataclass
@@ -1299,6 +1300,7 @@ direct_register_custom_op(
 )
 
 
+@FusedMoEDecoratorForPluginMode
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 

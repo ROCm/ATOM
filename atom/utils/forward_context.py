@@ -9,6 +9,9 @@ import numpy as np
 import torch
 from atom.config import Config, KVCacheTensor, ParallelConfig
 
+if TYPE_CHECKING:
+    from atom.plugin.attention import MetadataForPluginMode
+
 
 def _compute_chunked_local_num_tokens(
     num_tokens_across_dp_cpu: list[int], max_num_tokens: int, chunk_idx: int
@@ -186,6 +189,9 @@ class AttentionMetaData:
     block_tables_converted: Optional[torch.Tensor] = None
     kv_indices_converted: Optional[torch.Tensor] = None
 
+    # only used for plugin mode to store the metadata for attn
+    plugin_metadata: Optional["MetadataForPluginMode"] = None
+
     def __init__(
         self,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -213,6 +219,7 @@ class AttentionMetaData:
         kv_indices_converted: Optional[torch.Tensor] = None,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
+        plugin_metadata: Optional["MetadataForPluginMode"] = None,
     ):
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_k = cu_seqlens_k
@@ -239,6 +246,10 @@ class AttentionMetaData:
             self.block_tables = block_tables_converted
         if kv_indices_converted is not None:
             self.kv_indices = kv_indices_converted
+        if plugin_metadata is not None:
+            from atom.plugin.prepare import is_plugin_mode
+            assert is_plugin_mode(), "plugin_metadata is only supported for plugin mode"
+            self.plugin_metadata = plugin_metadata
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
 
