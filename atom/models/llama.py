@@ -60,11 +60,16 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 
-ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
-    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+from aiter import (
+    QuantType,
 )
-ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT = (
-    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+
+
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT = (
+    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
+)
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT = (
+    envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT
 )
 
 
@@ -95,19 +100,24 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        self.fused_act_quant = ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_FP8_QUANT
+        self.fused_act_quant = ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul(fused_quant=self.fused_act_quant)
+        self.act_fn = SiluAndMul(
+            fused_quant=self.fused_act_quant, quant_config=quant_config
+        )
+        self.quant_type = quant_config["quant_type"]
 
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
         scale = getattr(self.down_proj, "input_scale", None)
         x = self.act_fn(x, scale)
-        if scale is not None and self.fused_act_quant:
+        if self.fused_act_quant and (
+            scale is not None or self.quant_type.value == QuantType.per_1x32.value
+        ):
             x, scale = x
         else:
             scale = None
@@ -267,8 +277,10 @@ class LlamaDecoderLayer(nn.Module):
             attention_bias = config.qkv_bias
 
         self.use_fused_rmsnorm_quant = (
-            ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+            ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
         )
+
+        self.quant_type = quant_config["quant_type"]
 
         self.self_attn = LlamaAttention(
             config=config,
@@ -299,11 +311,13 @@ class LlamaDecoderLayer(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=self.use_fused_rmsnorm_quant,
+            quant_config=quant_config,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=self.use_fused_rmsnorm_quant,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -321,7 +335,9 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual, x_scale=scale
             )
-        if scale is not None and self.use_fused_rmsnorm_quant:
+        if self.use_fused_rmsnorm_quant and (
+            scale is not None or self.quant_type.value == QuantType.per_1x32.value
+        ):
             hidden_states, scale = hidden_states
         else:
             scale = None
@@ -335,7 +351,9 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual, scale
         )
-        if scale is not None and self.use_fused_rmsnorm_quant:
+        if self.use_fused_rmsnorm_quant and (
+            scale is not None or self.quant_type.value == QuantType.per_1x32.value
+        ):
             hidden_states, scale = hidden_states
         else:
             scale = None

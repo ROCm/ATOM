@@ -81,7 +81,6 @@ def gemm_a4w4_quant(
     input_scale: torch.Tensor, 
     output_size: int,
 ) -> torch.Tensor:
-    
     if gemm_afp4wfp4_preshuffle is None:
         if x_scale is None: 
             quant_func = get_hip_quant(QuantType.per_1x32)
@@ -91,6 +90,9 @@ def gemm_a4w4_quant(
                 scale=input_scale,
                 shuffle=True,
             )
+        else:
+            x_scale = x_scale.view(torch.float8_e8m0fnu)
+            x = x.view(torch.float4_e2m1fn_x2)
 
         m = x.view(-1, x.size(-1)).shape[0]
         y = torch.empty(
@@ -121,6 +123,9 @@ def gemm_a4w4_quant(
                 quant_dtype=params_dtype,
                 shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
             )
+        else:
+            x_scale = x_scale.view(torch.float8_e8m0fnu)
+            x = x.view(torch.float4_e2m1fn_x2)
 
         if m >= MXFP4_QUANT_BLOCK_SIZE:
             x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1)
@@ -162,7 +167,6 @@ def gemm_a8w8_blockscale_preshuffle_impl(x: torch.Tensor, weight: torch.Tensor,
 
 
 class LinearBase(nn.Module):
-
     def __init__(
         self,
         input_size: int,
@@ -413,7 +417,6 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
@@ -438,7 +441,6 @@ class ReplicatedLinear(LinearBase):
 
 
 class ColumnParallelLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
@@ -467,7 +469,6 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
@@ -510,7 +511,6 @@ class MergedColumnParallelLinear(LinearBase):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
-
     def __init__(
         self,
         hidden_size: int,
@@ -590,7 +590,6 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,

@@ -27,6 +27,7 @@ from atom.model_ops.linear import use_triton_gemm
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
+from atom.config import get_current_atom_config
 from aiter import (
     QuantType,
     get_hip_quant,
@@ -500,11 +501,10 @@ class MLAAttention(nn.Module):
         #     q_scale = kv_scale = self.one_scale
 
         dp_size = get_dp_group().world_size
-        is_fp8 = self.kv_cache_dtype.startswith("fp8")
-        use_persistent_mode = not (dp_size == 8 and not is_fp8)
+        use_persistent_mode = not (dp_size > 1 and self.kv_cache_dtype == "fp8")
 
         if not use_persistent_mode:
-            # DP + bf16: disable persistent mode to avoid overflow
+            # DP : disable persistent mode to avoid overflow
             work_meta_data = None
             work_indptr = None
             work_info_set = None
@@ -568,9 +568,16 @@ class MLAAttention(nn.Module):
                 kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
             else:
                 kv_cache = torch.tensor([])
-        else:
-            # dummy run before allocate kv_cache, thus we create manually
-            kv_cache = torch.tensor([])
+        slot_mapping_numel = attn_metadata.slot_mapping.numel() if attn_metadata.slot_mapping is not None else 0
+        is_dummy = (slot_mapping_numel == 0)
+        if is_dummy:
+            # dummy run: skip real attention and return
+            output_shape = list(q.shape)
+            output_shape[-1] = 7168
+            atom_config = get_current_atom_config()
+            output_dtype = atom_config.torch_dtype
+            output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
+            return output
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
