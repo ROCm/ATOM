@@ -28,23 +28,10 @@ import logging
 from math import prod
 from aiter.jit.utils.chip_info import get_gfx
 from aiter import dtypes
+from atom.model_ops.utils import has_triton_kernels
 
 logger = logging.getLogger("atom")
 
-
-# Optional dependency detection utilities
-@cache
-def _has_module(module_name: str) -> bool:
-    """Return True if *module_name* can be found in the current environment.
-
-    The result is cached so that subsequent queries for the same module incur
-    no additional overhead.
-    """
-    return importlib.util.find_spec(module_name) is not None
-
-
-def has_triton_kernels():
-    return _has_module("triton_kernels")
 
 
 if has_triton_kernels():

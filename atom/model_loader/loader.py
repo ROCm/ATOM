@@ -19,7 +19,7 @@ from atom.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.moe import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.moe import FusedMoEMethodBase, is_rocm_aiter_fusion_shared_expert_enabled
 from aiter.dist.parallel_state import get_tp_group
 from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrite_spec_layer_name
 
@@ -185,3 +185,5 @@ def load_model(
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             quant_method.process_weights_after_loading(module)
+        if isinstance(quant_method, FusedMoEMethodBase):
+            quant_method.init_prepare_finalize(module)
