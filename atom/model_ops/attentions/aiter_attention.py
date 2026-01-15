@@ -56,7 +56,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[:bs] = slot_mapping
+        if batch.is_dummy_run:
+            var["slot_mapping"].np[:bs] = -1
+        else:
+            var["slot_mapping"].np[:bs] = slot_mapping
+            
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0

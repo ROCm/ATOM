@@ -216,7 +216,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
     def build(self, batch: ScheduledBatch, bs: int):
-        if batch.total_tokens_num_prefill > 0:
+        is_prefill = batch.total_tokens_num_prefill > 0
+        if is_prefill:
             return self.prepare_prefill(batch)
         else:
             return self.prepare_decode(batch, bs)
