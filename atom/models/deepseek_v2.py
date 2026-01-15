@@ -1214,12 +1214,12 @@ class DeepseekV2MLAAttention(nn.Module):
             prefix=prefix,
         )
 
-        # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if use_triton_gemm() and (FP8 or FP4),
+        # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if FP8 or (use_triton_gemm() and FP4),
         self.prefix = prefix
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if (quant_config["quant_dtype"] == dtypes.fp8 or quant_config["quant_dtype"] == dtypes.fp4x2) and use_triton_gemm():
+            if quant_config["quant_dtype"] == dtypes.fp8 or (quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()):
                 self.quant_dtype = quant_config["quant_dtype"]
                 self.fuse_qknorm_quant = True
 
@@ -1233,7 +1233,7 @@ class DeepseekV2MLAAttention(nn.Module):
             hidden_states, hidden_states_scale = hidden_states
 
         if self.q_lora_rank is not None:
-            if self.fuse_qknorm_quant:
+            if self.fuse_qknorm_quant and use_triton_gemm():
                 q_c, q_c_scale, kv_c_normed, k_pe = _fuse_qkv_a_proj_reduce_rmsnorm_quant(
                     hidden_states,
                     self.fused_qkv_a_proj.weight,
@@ -1264,7 +1264,25 @@ class DeepseekV2MLAAttention(nn.Module):
                     dim=-1,
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
-                hidden_states_or_q_c = self.q_a_layernorm(q_c)
+                if self.fuse_qknorm_quant:
+                    (hidden_states_or_q_c,
+                    hidden_states_or_q_c_scale), _, kv_c_normed, _ = _fuse_rmsnorm_quant(
+                        q_c,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.eps,
+                        kv_c,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.eps,
+                        None,
+                        dtype_quant=self.quant_dtype,
+                        shuffle=False,
+                        scale_shuffle_padding=False,
+                        group_size=128,
+                        output_unquantized_inp1=False,
+                        transpose_scale=True,
+                    )
+                else:
+                    hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
             hidden_states_or_q_c = hidden_states
             kv_c, k_pe = torch.split(self.kv_a_proj_with_mqa(hidden_states, hidden_states_scale),
