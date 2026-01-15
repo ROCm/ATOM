@@ -62,7 +62,7 @@ from torch import nn
 from transformers import PretrainedConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.config import Config, QuantizationConfig, get_current_atom_config, CompilationLevel
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
@@ -76,6 +76,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     use_triton_gemm,
 )
+from atom.model_ops.utils import _has_module
 
 from aiter import gemm_a8w8_blockscale_bpreshuffle
 
@@ -735,22 +736,90 @@ class DeepseekV2MoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
             config=config)
 
-        if config.n_shared_experts is not None and not is_rocm_aiter_fusion_shared_expert_enabled():
-            intermediate_size = (config.moe_intermediate_size *
-                                 config.n_shared_experts)
-            self.shared_experts = DeepseekV2MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=f"{prefix}.shared_experts",
-            )
+        # Dual-stream support: when mori is enabled,
+        # parallelize shared expert and routed expert computation
+        self._use_dual_stream = False
+        self.alt_stream: Optional[torch.cuda.Stream] = None
+
+        if config.n_shared_experts is not None:
+            if (
+                not is_rocm_aiter_fusion_shared_expert_enabled()
+                and _has_module("mori")
+                and get_current_atom_config().compilation_config.level
+                != CompilationLevel.PIECEWISE
+            ):
+                self._use_dual_stream = True
+                self.alt_stream = torch.cuda.Stream()
+
+            if not is_rocm_aiter_fusion_shared_expert_enabled():
+                intermediate_size = (
+                    config.moe_intermediate_size * config.n_shared_experts
+                )
+                self.shared_experts = DeepseekV2MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    prefix=f"{prefix}.shared_experts",
+                )
+
+    def _forward_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+        num_tokens: int,
+        hidden_dim: int,
+    ) -> torch.Tensor:
+        current_stream = torch.cuda.current_stream()
+        alt_stream = self.alt_stream
+
+        alt_stream.wait_stream(current_stream)
+
+        # Execute shared experts on current_stream
+        shared_output = self.shared_experts(hidden_states)
+
+        # Execute routed experts on alt_stream
+        with torch.cuda.stream(alt_stream):
+            router_logits = self.gate(hidden_states)
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits)
+                if not is_rocm_aiter_fuse_routed_scaling_factor():
+                    final_hidden_states = final_hidden_states * self.routed_scaling_factor
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits)
+
+        current_stream.wait_stream(alt_stream)
+
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = final_hidden_states + shared_output
+        else:
+            final_hidden_states = final_hidden_states + shared_output \
+                * (1. / self.routed_scaling_factor)
+
+        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
+        # Use dual-stream forward when mori is enabled
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024
+        if (
+            self._use_dual_stream
+            and self.alt_stream is not None
+            and num_tokens > 0
+            and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
+        ):
+            return self._forward_dual_stream(hidden_states, num_tokens, hidden_dim)
+
         if self.n_shared_experts is not None and not is_rocm_aiter_fusion_shared_expert_enabled():
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
