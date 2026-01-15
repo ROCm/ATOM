@@ -25,7 +25,6 @@ from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
 from atom.utils import envs
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
-ATOM_ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
 
 class Attention(nn.Module):
 
@@ -162,7 +161,7 @@ class Attention(nn.Module):
             q, k, v = qkv.split([self.num_heads,
                                 self.num_kv_heads,
                                 self.num_kv_heads], dim=1)
-        elif use_triton_attn or not ATOM_ENABLE_QK_NORM_ROPE_FUSION:
+        elif use_triton_attn:
             if flash_layout:
                 k_cache = k_cache.view(
                     k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
@@ -263,11 +262,12 @@ class Attention(nn.Module):
             device=q.device,
         )
 
-        per_tensor = k_scale.numel() == 1
-        if not per_tensor:
+        compute_type = torch.bfloat16
+        if k_scale is not None and k_scale.numel() > 1:
           k_scale = k_scale.unsqueeze(-1)
           v_scale = v_scale.unsqueeze(-1)
-        compute_type = torch.bfloat16 if self.kv_cache_dtype == "bf16" or per_tensor else aiter.dtypes.fp8
+          # use fp8 as compute dtype if per-token quant
+          compute_type = aiter.dtypes.fp8
 
         torch.ops.aiter.pa_decode_gluon(
             o,
