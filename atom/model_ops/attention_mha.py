@@ -21,6 +21,7 @@ from aiter.ops.triton.unified_attention import unified_attention
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
 from atom.utils import envs
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
@@ -233,21 +234,14 @@ class Attention(nn.Module):
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
         query_group_size = num_q_heads_total // num_kv_heads
         assert num_q_heads_total % num_kv_heads == 0
-
-        max_context_length = (
-            min(attn_metadata.max_seqlen_k, self.sliding_window)
-            if self.sliding_window > 0
-            else attn_metadata.max_seqlen_k
-        )
+        
+        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
         
         context_partition_size = 256
-        if self.sliding_window> 0:
-            max_context_length = min(max_context_length, self.sliding_window)
-            if max_context_length <= 128:
-                context_partition_size = 128
+        if self.sliding_window > 0:
+            max_context_partition_num = 1
+            context_partition_size = 128
         
-        # cdiv
-        max_context_partition_num = (max_context_length + context_partition_size - 1) // context_partition_size
 
         # Output buffers (same as Triton)
         intermediate_shape = (
@@ -268,34 +262,35 @@ class Attention(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        
-        pa_decode_gluon(
-            o,
+
+        per_tensor = k_scale.numel() == 1
+        if not per_tensor:
+          k_scale = k_scale.unsqueeze(-1)
+          v_scale = v_scale.unsqueeze(-1)
+        compute_type = torch.bfloat16 if self.kv_cache_dtype == "bf16" or per_tensor else aiter.dtypes.fp8
+
+        torch.ops.aiter.pa_decode_gluon(
             o,
             q,
-            q,
-            None,
             k_cache,
             v_cache,
             attn_metadata.context_lens,
             attn_metadata.block_tables,
             self.scale,
             1, # query_lenth
-            max_context_length, # max_context_len
+            max_context_partition_num, 
             context_partition_size,
-            tl.bfloat16, #compute_type
+            compute_type,
             None,
-            # when using per-token quant, original k_scale shape: [num_blocks, block_size, num_kv_heads]
-            # gluon pa decode kernel expects shape: [num_blocks, num_kv_heads, block_size, 1]
-            self.kv_scale if self.sinks is not None else k_scale.unsqueeze(-1).transpose(1, 2),
-            self.kv_scale if self.sinks is not None else v_scale.unsqueeze(-1).transpose(1, 2),
+            None if self.kv_cache_dtype == "bf16" else k_scale,
+            None if self.kv_cache_dtype == "bf16" else v_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
-            one_shot=True if num_seqs >= 32 and self.sinks is not None else None,  # only enable one-shot for gpt oss
+            ps=True,
         )
         
         return o

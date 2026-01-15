@@ -14,7 +14,6 @@ concurrency:
 jobs:
   atom:
     name: ATOM Test
-    runs-on: atom-mi355-8gpu.predownload
     strategy:
       fail-fast: false
       matrix:
@@ -23,22 +22,27 @@ jobs:
             model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: ""
+            runner: atom-mi355-1gpu
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
+            runner: atom-mi355-8gpu.predownload
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
+            runner: atom-mi355-1gpu
           - model_name: "Qwen3-235B-A22B-Instruct-2507-FP8"
             model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
             env_vars: |
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+            runner: atom-mi355-8gpu.predownload
+    runs-on: ${{ matrix.runner }}
     env:
-      ATOM_BASE_IMAGE: rocm/pytorch:latest
+      ATOM_BASE_NIGTHLY_IMAGE: rocm/atom:gfx950_latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -48,19 +52,42 @@ jobs:
 
       - name: Pull ATOM base image
         run: |
-          docker pull ${{ env.ATOM_BASE_IMAGE }}
+          docker pull ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
+
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y amd-aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          RUN rm -rf /app/aiter-test
+          RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \\
+              cd /app/aiter-test && \\
+              git checkout HEAD && \\
+              git submodule sync && git submodule update --init --recursive && \\
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+          
+          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
+          RUN pip uninstall -y atom
+          RUN rm -rf /app/ATOM
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
+              cd /app/ATOM && \\
+              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
+              pip install -e .
+
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
 
       - name: Build Docker image
         run: |
           docker build --network=host \
             --no-cache \
             -t atom_test:ci \
-            --build-arg BASE_IMAGE=${{ env.ATOM_BASE_IMAGE }} \
-            --build-arg PREBUILD_KERNELS=0 \
-            --build-arg GPU_ARCH=gfx950 \
-            --build-arg ATOM_REPO=${{ env.GITHUB_REPO_URL }} \
-            --build-arg ATOM_COMMIT=${{ env.GITHUB_COMMIT_SHA }} \
-            -f docker/Dockerfile .
+            -f Dockerfile.mod .
 
       - name: Start CI container
         run: |
@@ -139,8 +166,7 @@ jobs:
             model_path="${{ matrix.model_path }}"
           fi
           echo "Model path: $model_path"
-          echo "ls -la $model_path"
-          ls -la $model_path
+          ls -la $model_path || true
           docker exec atom_test bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
@@ -186,7 +212,13 @@ jobs:
           echo "========== Running accuracy test =========="
           docker exec atom_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
-          "
+          " 2>&1 | tee atom_accuracy_output.txt
+      
+      - name: Collect Test Summary
+        if: success()
+        run: |
+          echo "Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
         if: always()
@@ -205,4 +237,3 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
           docker stop atom_test || true
           docker rm atom_test || true
-          

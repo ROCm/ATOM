@@ -97,6 +97,9 @@ class LLMEngine:
         prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
     ) -> list[str]:
+        # Reset round-robin counter to ensure consistent DP not core dump
+        self.core_mgr._rr_counter = 0
+        
         self.add_request(prompts, sampling_params)
         outputs = {}
         while not self.is_finished() and (
