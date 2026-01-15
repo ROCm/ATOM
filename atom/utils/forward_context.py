@@ -32,6 +32,7 @@ def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
 class DPMetadata:
     max_tokens_across_dp_cpu: torch.Tensor
     cu_tokens_across_dp_cpu: torch.Tensor
+    max_tokens_across_dp: int  # Pre-computed int value for cudagraph compatibility
     local_sizes: Optional[list[int]] = None
 
     @staticmethod
@@ -73,7 +74,8 @@ class DPMetadata:
                 batchsize, dp_size, dp_rank)
         max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp)
         cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_across_dp, dim=0)
-        return DPMetadata(max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu)
+        max_tokens_across_dp = max_tokens_across_dp_cpu.item()  # Pre-compute int for cudagraph
+        return DPMetadata(max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu, max_tokens_across_dp)
 
     @contextmanager
     def chunked_sizes(self, max_chunk_size_per_rank: int, chunk_idx: int):

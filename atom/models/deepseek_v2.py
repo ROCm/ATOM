@@ -820,6 +820,7 @@ def sparse_attn_indexer(
     attn_metadata = forward_context.attn_metadata
     context = forward_context.context
     slot_mapping = attn_metadata.slot_mapping
+    # Skip for dummy runs to avoid corrupting KV cache
     if kv_cache.numel() == 0:
         # dummy runner
         return weights
