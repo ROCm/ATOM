@@ -28,12 +28,9 @@ from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrit
 from aiter import logger
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
-    #logger.info("default weight loader, param {0}".format(str(param)))
     if loaded_weight.numel() == param.data.numel():
-        #logger.info("if statement entered")
         param.data.copy_(loaded_weight)
     elif loaded_weight.numel() // get_tp_group().world_size == param.data.numel():
-        #logger.info("elif statement entered")
         loaded_weight_per_rank = loaded_weight.numel() // get_tp_group().world_size
         tp_rank_start = loaded_weight_per_rank * get_tp_group().rank
         tp_rank_end = tp_rank_start + loaded_weight_per_rank
@@ -86,7 +83,6 @@ def load_model(
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
-    #logger.info(str(params_dict))
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         for name, weight_tensor in safetensors_weights_iterator(model_name_or_path):
@@ -129,15 +125,10 @@ def load_model(
                             continue
                     elif param_name.endswith("output_scale"):
                         # special case for treating kv cache quant scale weights
-                        #logger.info(str(dict(model.model.named_parameters()).keys()))
                         possible_name = remap_output_scale_name(name, params_dict)
-                        logger.info(possible_name)
                         if possible_name is None:
-                            logger.info("no name given")
                             continue
                         param = params_dict[possible_name]
-                        logger.info("it works!")
-                        # logger.info(param)
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     else:
                         param = model.get_parameter(param_name)
@@ -150,7 +141,6 @@ def load_model(
                     else:
                         # default weight loader requires two parameters, removed shard id
                         # issue: this causes scale to be loaded incorrectly? 
-                        #logger.info(param)
                         futures.append(
                             executor.submit(weight_loader, param, weight_tensor)
                         )
@@ -206,7 +196,6 @@ def load_model(
                 else:
                     # Model doesn't have expert mapping, use generic loading
                     if name.endswith("output_scale"):
-                        #logger.info(params_dict.keys())
                         possible_name = remap_output_scale_name(name, params_dict)
                         param = model.get_parameter(possible_name)
                     else:
@@ -214,6 +203,7 @@ def load_model(
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    
                     # weight_loader(param, weight_tensor)
                     futures.append(executor.submit(weight_loader, param, weight_tensor))
         # Wait for all tasks to complete and raise any exceptions.

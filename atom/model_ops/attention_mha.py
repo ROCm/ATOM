@@ -418,6 +418,5 @@ class Attention(nn.Module):
                 return self.paged_attention_triton
             else:
                 # Qwen only uses gluon pa decode when bs=64
-                logger.info("batch size == 64: {0}".format(ctx.batch_size == 64))
                 return self.paged_attention_triton if ctx.batch_size == 64 else self.paged_attention_asm
 

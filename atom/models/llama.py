@@ -60,6 +60,8 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 
+from aiter import logger
+
 ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = (
     envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
 )
@@ -211,6 +213,8 @@ class LlamaAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, positions)
+        logger.info("after attn")
+        logger.info(self.attn)
         output = self.o_proj(attn_output)
         return output
 
