@@ -273,6 +273,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+        if hasattr(shuffled_w13, 'is_shuffled'):
+            layer.w13_weight.is_shuffled = shuffled_w13.is_shuffled
+        if hasattr(shuffled_w2, 'is_shuffled'):
+            layer.w2_weight.is_shuffled = shuffled_w2.is_shuffled
 
     def apply(
         self,
@@ -567,6 +571,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
+            # Shuffle weights for the "quark" method (scales already shuffled)
+            shuffled_w13, shuffled_w2 = shuffle_weights(layer.w13_weight, layer.w2_weight)
+            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+            if hasattr(shuffled_w13, 'is_shuffled'):
+                layer.w13_weight.is_shuffled = shuffled_w13.is_shuffled
+            if hasattr(shuffled_w2, 'is_shuffled'):
+                layer.w2_weight.is_shuffled = shuffled_w2.is_shuffled
+
             s0, s1, _ = layer.w13_weight_scale.shape
             w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
             w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
@@ -590,6 +603,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+        if hasattr(shuffled_w13, 'is_shuffled'):
+            layer.w13_weight.is_shuffled = shuffled_w13.is_shuffled
+        if hasattr(shuffled_w2, 'is_shuffled'):
+            layer.w2_weight.is_shuffled = shuffled_w2.is_shuffled
         layer.w13_weight_scale = torch.nn.Parameter(
             shuffled_w13_scale, requires_grad=False
         )
@@ -862,6 +879,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+            if hasattr(shuffled_w13, 'is_shuffled'):
+                layer.w13_weight.is_shuffled = shuffled_w13.is_shuffled
+            if hasattr(shuffled_w2, 'is_shuffled'):
+                layer.w2_weight.is_shuffled = shuffled_w2.is_shuffled
             return
         else:
             # Fp8 moe kernels require a single activation scale.
@@ -938,7 +959,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
-
+            if hasattr(shuffled_w13, 'is_shuffled'):
+                layer.w13_weight.is_shuffled = shuffled_w13.is_shuffled
+            if hasattr(shuffled_w2, 'is_shuffled'):
+                layer.w2_weight.is_shuffled = shuffled_w2.is_shuffled
+            
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales, requires_grad=False
             )
