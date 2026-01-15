@@ -23,6 +23,11 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: ""
             runner: atom-mi355-1gpu
+          - model_name: "Llama-3.3-70B-Instruct-MXFP4-Preview"
+            model_path: "amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
+            extraArgs: "--kv_cache_dtype fp8"
+            env_vars: ""
+            runner: atom-mi355-1gpu
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
