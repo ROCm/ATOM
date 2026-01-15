@@ -85,10 +85,7 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
-        self.k_scale = torch.nn.Parameter(torch.tensor(-1.0),
-                                           requires_grad=False)
-        self.v_scale = torch.nn.Parameter(torch.tensor(-1.0),
-                                           requires_grad=False)
+        self.k_scale = self.v_scale = None
         self.layer_num = layer_num
         self.mla_modules = mla_modules
         self.use_mla = use_mla
@@ -104,9 +101,7 @@ class Attention(nn.Module):
             block_size,
             use_mla=self.use_mla,
         )
-        logger.info(self.attn_backend)
         impl_cls = self.attn_backend.get_impl_cls()
-        logger.info(impl_cls)
         self.impl = impl_cls(
             num_heads,
             head_dim,
@@ -123,7 +118,6 @@ class Attention(nn.Module):
             k_norm=k_norm,
         )
 
-        logger.info(self.impl)
 
         compilation_config = atom_config.compilation_config
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
