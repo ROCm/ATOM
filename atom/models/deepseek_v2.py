@@ -691,6 +691,14 @@ class DeepseekV2MLP(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
+    # Using a single shared stream avoids exhausting GPU/HSA resources
+    _shared_alt_stream: Optional[torch.cuda.Stream] = None
+
+    @staticmethod
+    def _get_shared_stream() -> torch.cuda.Stream:
+        if DeepseekV2MoE._shared_alt_stream is None:
+            DeepseekV2MoE._shared_alt_stream = torch.cuda.Stream()
+        return DeepseekV2MoE._shared_alt_stream
 
     def __init__(
         self,
@@ -749,7 +757,7 @@ class DeepseekV2MoE(nn.Module):
                 != CompilationLevel.PIECEWISE
             ):
                 self._use_dual_stream = True
-                self.alt_stream = torch.cuda.Stream()
+                self.alt_stream = DeepseekV2MoE._get_shared_stream()
 
             if not is_rocm_aiter_fusion_shared_expert_enabled():
                 intermediate_size = (
