@@ -133,21 +133,19 @@ def load_model(
                         param = params_dict[possible_name]
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     else:
-                        if weight_loader != default_weight_loader and ("RowParallelLinear" not in str(weight_loader)) : # weight loaders with shardid
-                            logger.info(name)
-                            logger.info(weight_loader)
-                            futures.append(
-                                executor.submit(weight_loader, param, weight_tensor, shard_id)
-                            )
-                        elif ("RowParallelLinear" in str(weight_loader)):
-                            futures.append(
-                                executor.submit(weight_loader, param, weight_tensor)
-                            )
-                        else:
-                            # default weight loader requires two parameters, removed shard id
-                            futures.append(
-                                executor.submit(weight_loader, param, weight_tensor)
-                            )
+                        param = model.get_parameter(param_name)
+                        weight_loader = getattr(param, "weight_loader")
+
+                    if weight_loader != default_weight_loader: # weight loaders with shardid
+                        
+                        futures.append(
+                            executor.submit(weight_loader, param, weight_tensor, shard_id)
+                        )
+                    else:
+                        # default weight loader requires two parameters, removed shard id
+                        futures.append(
+                            executor.submit(weight_loader, param, weight_tensor)
+                        )
                     break
             else:
                 # Check if model has expert mapping before processing
