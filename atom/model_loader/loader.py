@@ -122,9 +122,11 @@ def load_model(
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
                     if name.endswith("kv_scale"):
-                        maybe_remap_kv_scale_name(name, params_dict)
-                        if name is None:
+                        possible_name = maybe_remap_kv_scale_name(name, params_dict)
+                        if possible_name is None:
                             continue
+                        param = params_dict[possible_name]
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     elif param_name.endswith("output_scale"):
                         # special case for treating kv cache quant scale weights
                         possible_name = remap_output_scale_name(name, params_dict)
@@ -159,7 +161,13 @@ def load_model(
                             name.endswith(".bias") or name.endswith("_bias")
                         ) and name not in dict(model.named_parameters()):
                             continue
-                        if name.endswith("output_scale"):
+                        if name.endswith("kv_scale"):
+                            possible_name = maybe_remap_kv_scale_name(name, params_dict)
+                            if possible_name is None:
+                                continue
+                            param = params_dict[possible_name]
+                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        elif name.endswith("output_scale"):
                             possible_name = remap_output_scale_name(name, params_dict)
                             if possible_name is None:
                                 continue
@@ -197,7 +205,10 @@ def load_model(
                         # weight_loader(param, weight_tensor)
                 else:
                     # Model doesn't have expert mapping, use generic loading
-                    if name.endswith("output_scale"):
+                    if name.endswith("kv_scale"):
+                        possible_name = maybe_remap_kv_scale_name(name, params_dict)
+                        param = model.get_parameter(possible_name)
+                    elif name.endswith("output_scale"):
                         possible_name = remap_output_scale_name(name, params_dict)
                         param = model.get_parameter(possible_name)
                     else:

@@ -199,7 +199,7 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
             "Functionally, we will remap kv_scale to k_scale and duplicate "
             "k_scale to v_scale")
         # NOTE: we remap the deprecated kv_scale to k_scale
-        remapped_name = name.replace(".kv_scale", ".attn.k_scale")
+        remapped_name = name.replace(".kv_scale", ".attn.impl.k_scale")
         if remapped_name not in params_dict:
             logger.warning_once(
                 "Found kv_scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv_scale is not loaded.",  #  noqa: E501
@@ -231,7 +231,7 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                     f".self_attn.qkv_proj{scale_name}",
                     f".self_attn.attn.impl{scale_name}")
             else:
-                remapped_name = name.replace(scale_name, f".attn{scale_name}")
+                remapped_name = name.replace(scale_name, f".attn.impl{scale_name}")
             if remapped_name not in params_dict:
                 logger.warning_once(
                     "Found %s in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). %s is not loaded.",  # noqa: E501
