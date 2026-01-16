@@ -108,9 +108,7 @@ def requantize_with_max_scale(
     return max_w_scale, weight.view(quant_dtype)
 
 
-def shuffle_weights(
-    *tensors: torch.nn.Parameter, layout: tuple[int, int] = (16, 16)
-) -> tuple[torch.nn.Parameter ...]:
+def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16, 16)):
     """
     Applies shuffle_weight function from AITER to each
     input tensor and returns them.
@@ -132,9 +130,7 @@ def shuffle_weights(
             tensor.data = shuffle_weight(tensor, layout=layout)
             tensor.is_shuffled = True
         else:
-            raise TypeError(
-                f"Expected torch.nn.Parameter, but got {type(tensor)}"
-            )
+            raise TypeError(f"Expected torch.nn.Parameter, but got {type(tensor)}")
 
 
 def all_close_1d(x: torch.Tensor) -> bool:
