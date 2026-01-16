@@ -3,6 +3,7 @@
 
 from typing import List, Tuple, Optional, Union
 import torch
+from atom.config import QuantizationConfig
 from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
@@ -16,7 +17,10 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.utils import envs
+from aiter import (
+    QuantType,
+    dtypes,
+)
 
 
 @torch_compile_guard()
@@ -87,6 +91,60 @@ def fused_add_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
+def mxfp4_rms_quant_fuse_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    shuffle: bool = False,
+    res1: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    M, N = x.shape
+    out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    SCALE_N_valid = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    use_scale_shuffle_padding = shuffle
+    if use_scale_shuffle_padding:
+        SCALE_M = ((M + 255) // 256) * 256
+        SCALE_N = ((SCALE_N_valid + 7) // 8) * 8
+    else:
+        SCALE_M = M
+        SCALE_N = SCALE_N_valid
+    scale = torch.empty(
+        (SCALE_M, SCALE_N),
+        dtype=torch.float8_e8m0fnu,
+        device=x.device,
+    )
+
+    if res1 is None:
+        return (out, scale, None)
+    else:
+        res = torch.empty_like(res1)
+        return (out, scale, res)
+
+
+# It's important to use mutates_args=[] to avoid functionized_v2 op generation
+@torch_compile_guard(gen_fake=mxfp4_rms_quant_fuse_fake, mutates_args=[])
+def mxfp4_rms_quant_fuse(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    shuffle: bool = False,
+    res1: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_mxfp4_quant import (
+        fused_rms_mxfp4_quant,
+    )
+
+    if res1 is None:
+        (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, weight, eps, shuffle=True)
+        return (x, x_scale, None)
+    else:
+        (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(
+            x, weight, eps, shuffle=True, res1=res1
+        )
+        return (x, x_scale, residual)
+
+
 class RMSNorm(nn.Module):
     def __init__(
         self,
@@ -95,6 +153,7 @@ class RMSNorm(nn.Module):
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
         fused_quant: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -104,6 +163,13 @@ class RMSNorm(nn.Module):
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
+
+        if quant_config is None:
+            quant_config = QuantizationConfig()
+        quant_type = quant_config["quant_type"]
+        params_dtype = quant_config["quant_dtype"]
+        self.quant_type = quant_type
+        self.params_dtype = params_dtype
 
     def forward(
         self,
@@ -168,6 +234,19 @@ class RMSNorm(nn.Module):
                         self.eps,
                         dtype_quant=rocm_aiter_fp8_dtype,
                         res1=residual,
+                    )
+                    return (x, x_scale), residual
+            elif self.use_fused_quant and (
+                x_scale is None and self.quant_type.value == QuantType.per_1x32.value
+            ):
+                if residual is None:
+                    x, x_scale, _ = mxfp4_rms_quant_fuse(
+                        x, self.weight, self.eps, shuffle=True
+                    )
+                    return x, x_scale
+                else:
+                    x, x_scale, residual = mxfp4_rms_quant_fuse(
+                        x, self.weight, self.eps, shuffle=True, res1=residual
                     )
                     return (x, x_scale), residual
             else:

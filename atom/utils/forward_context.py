@@ -9,9 +9,7 @@ from atom.config import Config, KVCacheTensor
 import torch
 from abc import ABC, abstractmethod
 from atom.config import Config, ParallelConfig
-from atom.utils import envs
 
-gpt_oss_model = envs.ATOM_GPT_OSS_MODEL
 
 def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
                                       max_num_tokens: int,
@@ -32,6 +30,7 @@ def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
 class DPMetadata:
     max_tokens_across_dp_cpu: torch.Tensor
     cu_tokens_across_dp_cpu: torch.Tensor
+    max_tokens_across_dp: int  # Pre-computed int value for cudagraph compatibility
     local_sizes: Optional[list[int]] = None
 
     @staticmethod
@@ -73,7 +72,8 @@ class DPMetadata:
                 batchsize, dp_size, dp_rank)
         max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp)
         cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_across_dp, dim=0)
-        return DPMetadata(max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu)
+        max_tokens_across_dp = max_tokens_across_dp_cpu.item()  # Pre-compute int for cudagraph
+        return DPMetadata(max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu, max_tokens_across_dp)
 
     @contextmanager
     def chunked_sizes(self, max_chunk_size_per_rank: int, chunk_idx: int):
@@ -315,16 +315,6 @@ def set_forward_context(
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
 
-    # TODO: will be removed. Now gpt-oss model has sink and sliding window config,
-    # prefill attention need fake block tables to be compatible with paged attention.
-    if _forward_context.context.is_prefill and gpt_oss_model:
-        # TODO: will be removed
-        cu_seqlens_q = attn_metadata.cu_seqlens_q
-        max_seqlen_q = attn_metadata.max_seqlen_q
-        fake_block_table = torch.empty(cu_seqlens_q.shape[0] - 1, max_seqlen_q, dtype=torch.int, device='cuda')
-        for i in range(cu_seqlens_q.shape[0]-1):
-            fake_block_table[i][0:(cu_seqlens_q[i+1] - cu_seqlens_q[i]).item()] = torch.arange(cu_seqlens_q[i], cu_seqlens_q[i+1], dtype=torch.int, device='cuda')
-        attn_metadata.fake_block_tables = fake_block_table
 
 def reset_forward_context() -> None:
     global _forward_context

@@ -262,13 +262,16 @@ class Attention(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        
+
+        per_tensor = k_scale.numel() == 1
+        if not per_tensor:
+          k_scale = k_scale.unsqueeze(-1)
+          v_scale = v_scale.unsqueeze(-1)
+        compute_type = torch.bfloat16 if self.kv_cache_dtype == "bf16" or per_tensor else aiter.dtypes.fp8
+
         torch.ops.aiter.pa_decode_gluon(
             o,
-            o,
             q,
-            q,
-            None,
             k_cache,
             v_cache,
             attn_metadata.context_lens,
@@ -277,12 +280,10 @@ class Attention(nn.Module):
             1, # query_lenth
             max_context_partition_num, 
             context_partition_size,
-            torch.bfloat16, #compute_type
+            compute_type,
             None,
-            # when using per-token quant, original k_scale shape: [num_blocks, block_size, num_kv_heads]
-            # gluon pa decode kernel expects shape: [num_blocks, num_kv_heads, block_size, 1]
-            self.kv_scale if self.sinks is not None else k_scale.unsqueeze(-1).transpose(1, 2),
-            self.kv_scale if self.sinks is not None else v_scale.unsqueeze(-1).transpose(1, 2),
+            None if self.kv_cache_dtype == "bf16" else k_scale,
+            None if self.kv_cache_dtype == "bf16" else v_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
@@ -318,6 +319,7 @@ class Attention(nn.Module):
         
         # variable lenth attention use key value as input
         attn_metadata = fwd_args.attn_metadata
+        sliding_window = (self.sliding_window, 0, 0) if self.sliding_window is not None else (-1, -1, 0)
         o = aiter.flash_attn_varlen_func(
             q,
             k,
@@ -330,6 +332,8 @@ class Attention(nn.Module):
             dropout_p=attn_metadata.dropout_p,
             softmax_scale=self.scale,
             causal=True,
+            window_size=sliding_window,
+            sink_ptr=self.sinks,
         )
         
         return o
@@ -390,10 +394,10 @@ class Attention(nn.Module):
         ctx = fwd_args.context
 
         if ctx.is_prefill:
-            if self.use_triton_attn:
-                return self.prefill_attention_triton
-            else:
-                return self.prefill_attention_asm
+            # if self.use_triton_attn:
+            #     return self.prefill_attention_triton
+            # else:
+            return self.prefill_attention_asm
         else:
             if self.use_triton_attn:
                 return self.paged_attention_triton
