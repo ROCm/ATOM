@@ -1,6 +1,8 @@
 name: Nightly Docker Release
 
 on:
+  pull_request:
+    branches: [main] # for testing
   schedule:
     - cron: '0 1 * * *'  # Every day at 09:00 Beijing Time (UTC+8)
   workflow_dispatch:
