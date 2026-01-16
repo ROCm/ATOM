@@ -67,7 +67,7 @@ jobs:
         timeout-minutes: 120
         run: |
           docker build --network=host -t atom_release:ci \
-          --build-arg BASE_IMAGE="${{ matrix.baes_image }}" \
+          --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
           --build-arg MAX_JOBS=64 \
           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
