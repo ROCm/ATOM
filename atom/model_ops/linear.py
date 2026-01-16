@@ -358,14 +358,14 @@ class LinearBase(nn.Module):
             )
             self.weight.data = w_q
             self.weight_scale = torch.nn.Parameter(w_s, requires_grad=False)
-            shuffle_weights(self.weight, (16, 16))
+            shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
             if (
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
             ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
-                shuffle_weights(self.weight, (16, 16))
+                shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32:
