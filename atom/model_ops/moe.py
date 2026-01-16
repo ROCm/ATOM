@@ -2,11 +2,25 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from abc import abstractmethod
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, List, Optional, Tuple
 
-from dataclasses import dataclass
+import torch
+import torch.nn.functional as F
+from aiter import ActivationType, QuantType, dtypes, get_hip_quant
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
+from aiter.fused_moe import fused_moe
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.utility import fp4_utils
+from torch import nn
+from transformers import PretrainedConfig
 
+from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.model_loader.weight_utils import set_weight_attrs
+from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -19,23 +33,6 @@ from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
-from atom.utils.forward_context import ForwardContext, get_forward_context
-import torch
-from aiter import ActivationType, QuantType, dtypes, get_hip_quant
-from aiter.dist.parallel_state import get_tp_group, get_dp_group
-from aiter.fused_moe import fused_moe
-from aiter.utility import fp4_utils
-from aiter.ops.shuffle import (
-    shuffle_scale_a16w4,
-    shuffle_weight_a16w4,
-)
-from torch import nn
-import torch.nn.functional as F
-from transformers import PretrainedConfig
-
-from atom.config import Config, QuantizationConfig, get_current_atom_config
-from atom.model_loader.weight_utils import set_weight_attrs
-from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
@@ -44,17 +41,14 @@ from atom.model_ops.topK import (
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
 from atom.model_ops.utils import (
+    _has_module,
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
     shuffle_weights,
 )
-from atom.utils.custom_register import direct_register_custom_op
-from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.jit.utils.chip_info import get_gfx
-from atom.utils import envs
-
 from atom.utils import envs, mark_spliting_op
-from atom.model_ops.utils import _has_module
+from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.forward_context import ForwardContext, get_forward_context
 
 
 @dataclass
@@ -432,10 +426,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             self._maybe_pad_weight(layer.w2_weight.data), requires_grad=False
         )
         # reshaping weights is required for aiter moe kernel.
-        shuffled_w13, shuffled_w2 = shuffle_weights(layer.w13_weight, layer.w2_weight)
-
-        layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+        shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -689,8 +680,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
         if self.use_triton:
-            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
@@ -731,13 +723,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .contiguous()
                 .view(e, n, -1)
             )
-            shuffled_w13 = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
             shuffled_w13_scale = shuffle_scale_a16w4(
                 layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
                 self.num_experts,
                 True,
             )
-            shuffled_w2 = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
             shuffled_w2_scale = shuffle_scale_a16w4(
                 layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
                 self.num_experts,
@@ -751,6 +743,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
             s0, s1, _ = layer.w13_weight_scale.shape
             w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
             w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
@@ -762,9 +755,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
             return
         else:
-            shuffled_w13, shuffled_w2 = shuffle_weights(
-                layer.w13_weight, layer.w2_weight
-            )
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
             shuffled_w13_scale = fp4_utils.e8m0_shuffle(
                 layer.w13_weight_scale.view(self.num_experts, -1)
             )
@@ -772,8 +763,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale.view(self.num_experts, -1)
             )
 
-        layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
         layer.w13_weight_scale = torch.nn.Parameter(
             shuffled_w13_scale, requires_grad=False
         )
@@ -1072,12 +1061,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = nn.Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale = nn.Parameter(w2_weight_scale, requires_grad=False)
 
-            shuffled_w13, shuffled_w2 = shuffle_weights(
-                layer.w13_weight, layer.w2_weight
-            )
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
-            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
             return
         else:
             # Fp8 moe kernels require a single activation scale.
@@ -1148,12 +1133,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
                     start += shard_size
 
-            shuffled_w13, shuffled_w2 = shuffle_weights(
-                layer.w13_weight, layer.w2_weight
-            )
-
-            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales, requires_grad=False

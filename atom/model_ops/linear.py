@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
-from atom.config import QuantizationConfig
-from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
-from torch import nn
-
 from aiter import (
     QuantType,
     dtypes,
@@ -21,23 +18,32 @@ from aiter import (
     get_torch_quant,
     get_triton_quant,
 )
-import logging
+from torch import nn
+
+from atom.config import QuantizationConfig
+from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
+
 logger = logging.getLogger("atom")
+from aiter import gemm_a4w4, per_1x32_f4_quant_hip
+
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
-from aiter import gemm_a4w4, per_1x32_f4_quant_hip
+
+from atom.model_ops.utils import shuffle_weights
 from atom.utils import envs
+
 
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
+
 if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+
         # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
         # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
     except ImportError as e:
@@ -49,40 +55,41 @@ else:
     gemm_a8w8_blockscale_bpreshuffle_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
+
 def divide(numerator, denominator):
     assert (
         numerator % denominator == 0
     ), f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
 
+
 def gemm_a4w4_quant_fake(
-    x: torch.Tensor, 
-    x_scale: torch.Tensor, 
-    weight: torch.Tensor, 
-    otype: torch.dtype, 
-    weight_scale: torch.Tensor, 
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    otype: torch.dtype,
+    weight_scale: torch.Tensor,
     params_dtype: torch.dtype,
-    input_scale: torch.Tensor, 
+    input_scale: torch.Tensor,
     output_size: int,
 ) -> torch.Tensor:
-    return torch.empty(
-            (*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device
-        )
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
+
 
 # It's important to use mutates_args=[] to avoid functionized_v2 op generation
 @torch_compile_guard(gen_fake=gemm_a4w4_quant_fake, mutates_args=[])
 def gemm_a4w4_quant(
-    x: torch.Tensor, 
-    x_scale: torch.Tensor, 
-    weight: torch.Tensor, 
-    otype: torch.dtype, 
-    weight_scale: torch.Tensor, 
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    otype: torch.dtype,
+    weight_scale: torch.Tensor,
     params_dtype: torch.dtype,
-    input_scale: torch.Tensor, 
+    input_scale: torch.Tensor,
     output_size: int,
 ) -> torch.Tensor:
     if gemm_afp4wfp4_preshuffle is None:
-        if x_scale is None: 
+        if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
             x, x_scale = quant_func(
                 x,
@@ -96,7 +103,12 @@ def gemm_a4w4_quant(
 
         m = x.view(-1, x.size(-1)).shape[0]
         y = torch.empty(
-            ((m + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE * MXFP4_QUANT_BLOCK_SIZE, output_size),
+            (
+                (m + MXFP4_QUANT_BLOCK_SIZE - 1)
+                // MXFP4_QUANT_BLOCK_SIZE
+                * MXFP4_QUANT_BLOCK_SIZE,
+                output_size,
+            ),
             dtype=otype,
             device=x.device,
         )
@@ -112,11 +124,16 @@ def gemm_a4w4_quant(
         n = weight.shape[0]
 
         y = torch.empty(
-            ((m + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE * MXFP4_QUANT_BLOCK_SIZE, output_size),
+            (
+                (m + MXFP4_QUANT_BLOCK_SIZE - 1)
+                // MXFP4_QUANT_BLOCK_SIZE
+                * MXFP4_QUANT_BLOCK_SIZE,
+                output_size,
+            ),
             dtype=otype,
             device=x.device,
         )
-        if x_scale is None: 
+        if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
             x, x_scale = quant_func(
                 x,
@@ -128,39 +145,48 @@ def gemm_a4w4_quant(
             x = x.view(torch.float4_e2m1fn_x2)
 
         if m >= MXFP4_QUANT_BLOCK_SIZE:
-            x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1)
+            x_scale = x_scale.view(torch.uint8).view(
+                x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
+            )
         else:
             x_scale = x_scale[:m, ...].view(torch.uint8)
-            
+
         y = gemm_afp4wfp4_preshuffle(
-            x.view(torch.uint8), 
+            x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
-            x_scale, 
-            weight_scale.view(torch.uint8).view(weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1), 
+            x_scale,
+            weight_scale.view(torch.uint8).view(
+                weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
+            ),
             y=y,
         )
 
     return y[:m, ...]
 
 
-def gemm_a8w8_blockscale_preshuffle_fake(x: torch.Tensor, weight: torch.Tensor,
-                                         x_scale: torch.Tensor, w_scale: torch.Tensor,
-                                         dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    return torch.empty(
-        (*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device
-    )
+def gemm_a8w8_blockscale_preshuffle_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_preshuffle_fake, mutates_args=[])
-def gemm_a8w8_blockscale_preshuffle_impl(x: torch.Tensor, weight: torch.Tensor,
-                                         x_scale: torch.Tensor, w_scale: torch.Tensor,
-                                         dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+def gemm_a8w8_blockscale_preshuffle_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
     if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
-        weight_shuffled = weight.reshape(
-            weight.shape[0] // 16,
-            weight.shape[1] * 16
+        weight_shuffled = weight.reshape(weight.shape[0] // 16, weight.shape[1] * 16)
+        y = gemm_a8w8_blockscale_bpreshuffle_triton(
+            x, weight_shuffled, x_scale, w_scale, dtype
         )
-        y = gemm_a8w8_blockscale_bpreshuffle_triton(x, weight_shuffled, x_scale, w_scale, dtype)
     else:
         y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
     return y
@@ -201,7 +227,7 @@ class LinearBase(nn.Module):
             self.output_partition_sizes = [
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
-        
+
         if self.source_quant_dtype is not None:
             weight_size = (self.output_size, self.input_size)
             self.weight = nn.Parameter(
@@ -319,7 +345,11 @@ class LinearBase(nn.Module):
             self.weight.data, self.weight_scale.data, _ = normalize_e4m3fn_to_e4m3fnuz(
                 self.weight.data, self.weight_scale.data
             )
-        if self.source_quant_dtype == torch.bfloat16 and self.quant_type == QuantType.per_1x32 and self.params_dtype == torch.float4_e2m1fn_x2:
+        if (
+            self.source_quant_dtype == torch.bfloat16
+            and self.quant_type == QuantType.per_1x32
+            and self.params_dtype == torch.float4_e2m1fn_x2
+        ):
             quant_func = get_hip_quant(QuantType.per_1x32)
             w_q, w_s = quant_func(
                 self.weight.data,
@@ -327,16 +357,15 @@ class LinearBase(nn.Module):
                 shuffle=False,
             )
             self.weight.data = w_q
-            self.weight_scale = torch.nn.Parameter(
-                    w_s,
-                    requires_grad=False)
-            self.weight.data = shuffle_weight(self.weight.data, (16, 16))
+            self.weight_scale = torch.nn.Parameter(w_s, requires_grad=False)
+            shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
             if (
-                self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
+                self.quant_type == QuantType.per_Token
+                and self.params_dtype == dtypes.fp8
             ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
-                self.weight.data = shuffle_weight(self.weight.data, (16, 16))
+                shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32:
@@ -400,14 +429,14 @@ class LinearBase(nn.Module):
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
                 y = gemm_a4w4_quant(
-                    x, 
-                    x_scale, 
-                    self.weight, 
-                    otype, 
-                    self.weight_scale.data, 
-                    self.params_dtype, 
-                    getattr(self, "input_scale", None), 
-                    self.output_size
+                    x,
+                    x_scale,
+                    self.weight,
+                    otype,
+                    self.weight_scale.data,
+                    self.params_dtype,
+                    getattr(self, "input_scale", None),
+                    self.output_size,
                 )
                 if self.bias is not None:
                     y += self.bias
