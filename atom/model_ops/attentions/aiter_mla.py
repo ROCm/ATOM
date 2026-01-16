@@ -18,7 +18,7 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_tp_group, get_dp_group
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -242,10 +242,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[:scheduled_bs] = slot_mapping
-        var["slot_mapping"].np[scheduled_bs:bs] = -1
+        if batch.is_dummy_run:
+            var["slot_mapping"].np[:bs] = -1
+        else:
+            var["slot_mapping"].np[:scheduled_bs] = slot_mapping
+            var["slot_mapping"].np[scheduled_bs:bs] = -1
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
+        # var["context_lens"].np[scheduled_bs:bs] = 0
 
         num_blocks_per_seq = [
             (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens

@@ -11,6 +11,31 @@ from types import MappingProxyType
 import regex as re
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import mxfp4_to_f32, e8m0_to_f32
+from functools import cache
+import importlib.util
+import logging
+
+logger = logging.getLogger("atom")
+
+
+@cache
+def _has_module(module_name: str) -> bool:
+    """Return True if *module_name* can be found in the current environment.
+
+    The result is cached so that subsequent queries for the same module incur
+    no additional overhead.
+    """
+    return importlib.util.find_spec(module_name) is not None
+
+
+def has_triton_kernels() -> bool:
+    """Whether the optional `triton_kernels` package is available."""
+    return _has_module("triton_kernels")
+
+
+
+MXFP4_QUANT_BLOCK_SIZE = 32
+
 
 def per_tensor_dequantize(
     tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
@@ -111,8 +136,8 @@ def all_close_1d(x: torch.Tensor) -> bool:
 
 
 def per_tensor_dequantize(
-        tensor: torch.Tensor, inv_scale: Union[float,
-                                               torch.Tensor]) -> torch.Tensor:
+    tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
+) -> torch.Tensor:
     fake_qweight = tensor.to(torch.float16)
     dq_weight = fake_qweight * inv_scale
     return dq_weight
@@ -132,14 +157,16 @@ def get_and_maybe_dequant_weights(layer: nn.Module) -> torch.Tensor:
         return dequant_weights.T
     return layer.weight
 
-# utility for tensor dims > 2 cases
+
 def b_dynamic_mxfp4_quant(x):
     h, b, d = x.shape
     x, x_scales = dynamic_mxfp4_quant(x.reshape(-1, d))
     return x.view(h, b, d // 2), x_scales.view(h, b, d // 32)
 
+
 def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format: str):
     if "mxfp4" in quant_format:
+
         # when dtype is bf16, the processing flow is to dynamic quantize bf16 tensor to uint8 tensor
         # do w_kc (bf16) first to get the w_kc(uint8) w_s_kc(uint8)
         # and w_vc repeating the same procedure of w_kc to get  w_vc(uint8) w_s_vc(uint8)
@@ -163,7 +190,7 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             # need to upcast it to fp32 to separate w to w_kc and w_vc
             # to ensure the following transpose behavior is correct
             # and then do mxfp4 quant again
-            w = mxfp4_to_f32(w).to(torch.bfloat16)
+            w = mxfp4_to_f32(w, True).to(torch.bfloat16)
             w_scales = self_attn.kv_b_proj.weight_scale.repeat_interleave(32, dim=-1)
             w_scales = e8m0_to_f32(w_scales).to(torch.bfloat16)
             w = w * w_scales

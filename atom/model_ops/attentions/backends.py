@@ -189,9 +189,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ("slot_mapping", len(slot_mapping)),
             ("context_lens", bs),
         ]
-        if self.has_sliding_window:
-            self.prepare_block_tables(batch)
-            vars_used.append(("block_tables", bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         if self.block_ratio > 1 and "block_tables" in ctx:
@@ -216,7 +213,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
     def build(self, batch: ScheduledBatch, bs: int):
-        if batch.total_tokens_num_prefill > 0:
+        is_prefill = batch.total_tokens_num_prefill > 0
+        if is_prefill:
             return self.prepare_prefill(batch)
         else:
             return self.prepare_decode(batch, bs)

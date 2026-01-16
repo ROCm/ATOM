@@ -25,6 +25,7 @@ class ScheduledBatch:
         total_seqs_num: int = 0,
         total_seqs_num_prefill: int = 0,
         total_seqs_num_decode: int = 0,
+        is_dummy_run: bool = False,
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
         # self.seqs = seqs
@@ -57,6 +58,8 @@ class ScheduledBatch:
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
+
+        self.is_dummy_run = is_dummy_run
 
 
 class Scheduler:
@@ -251,3 +254,33 @@ class Scheduler:
             self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
+
+    def get_request_counts(self) -> tuple[int, int]:
+        """Returns (num_running_reqs, num_waiting_reqs)."""
+        return len(self.running), len(self.waiting)
+    def get_num_unfinished_requests(self) -> int:
+        return len(self.waiting) + len(self.running)
+
+    def has_unfinished_requests(self) -> bool:
+        """Returns True if there are unfinished requests in the scheduler's
+        internal queue."""
+        return self.get_num_unfinished_requests() > 0
+
+    def has_requests(self) -> bool:
+        """Returns True if there are unfinished requests, or finished requests
+        not yet returned in SchedulerOutputs."""
+        return self.has_unfinished_requests()
+
+    def get_next_batch_info(self) -> tuple[bool, int]:
+        if self.waiting:
+            # new request is waiting, will do prefill
+            seq = self.waiting[0]
+            num_tokens = seq.num_tokens - seq.num_cached_tokens
+            return (True, num_tokens)
+        elif self.running:
+            # decode
+            num_tokens = len(self.running)
+            return (False, num_tokens)
+        else:
+            # No requests
+            return (False, 0)
