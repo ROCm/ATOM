@@ -11,16 +11,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("atom")
 
-if has_triton_kernels():
-    try:
-        from triton_kernels.matmul_ogs import PrecisionConfig
-    except ImportError:
-        logger.error(
-            "Failed to import Triton kernels. Please make sure your triton "
-            "version is compatible."
-        )
-
-
 
 class _GroupShape(NamedTuple):
     row: int
