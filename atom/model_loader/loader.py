@@ -80,13 +80,21 @@ def load_model(
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
+
+    # Store kv_scale and output_scale tensors for special handling
+    kv_scales_to_load = {}
+
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         for name, weight_tensor in safetensors_weights_iterator(model_name_or_path):
             if load_dummy:
                 continue
+
+            # Handle kv_scale: load to both k_scale and v_scale
             if name.endswith("kv_scale"):
+                kv_scales_to_load[name] = weight_tensor
                 continue
+
             if spec_decode:
                 spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
                 if spec_layer is None:
@@ -118,6 +126,18 @@ def load_model(
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
+
+                    # Handle output_scale for k_proj and v_proj - load to attn.k_scale and attn.v_scale
+                    if "output_scale" in param_name:
+                        if "k_proj" in name and "output_scale" in name:
+                            # k_proj.output_scale -> attn.k_scale
+                            kv_scales_to_load[name] = weight_tensor
+                        elif "v_proj" in name and "output_scale" in name:
+                            # v_proj.output_scale -> attn.v_scale
+                            kv_scales_to_load[name] = weight_tensor
+                        # Skip loading output_scale to the packed module itself
+                        break
+
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader")
                     # weight_loader(param, weight_tensor, shard_id)
@@ -177,6 +197,97 @@ def load_model(
         # Wait for all tasks to complete and raise any exceptions.
         for future in concurrent.futures.as_completed(futures):
             future.result()
+
+    # Load kv_scale and output_scale values to attention modules
+    # These scales are used for FP8 quantization in attention:
+    # - kv_scale: Generic scale for both K and V (loads to both k_scale and v_scale)
+    # - k_proj.output_scale: Scale for K projection (loads to attn.k_scale)
+    # - v_proj.output_scale: Scale for V projection (loads to attn.v_scale)
+    # These scales are used as static scales inside the attention module for dequantization
+    for scale_name, scale_tensor in kv_scales_to_load.items():
+        # Determine if this is a generic kv_scale or output_scale from k_proj/v_proj
+        if scale_name.endswith("kv_scale"):
+            # Generic kv_scale: model.layers.X.self_attn.kv_scale
+            # Load to both k_scale and v_scale
+            base_name = scale_name.replace(".kv_scale", "")
+
+            # Try to get the attention module and set k_scale and v_scale
+            try:
+                # Navigate to the attention module
+                parts = base_name.split('.')
+                module = model
+                for part in parts:
+                    module = getattr(module, part)
+                attn_module = getattr(module, 'attn')
+
+                # Move tensor to the appropriate device
+                if hasattr(attn_module, 'k_scale'):
+                    if hasattr(attn_module.k_scale, 'device'):
+                        scale_tensor = scale_tensor.to(attn_module.k_scale.device)
+                    attn_module.k_scale = scale_tensor
+                if hasattr(attn_module, 'v_scale'):
+                    if hasattr(attn_module.v_scale, 'device'):
+                        scale_tensor = scale_tensor.to(attn_module.v_scale.device)
+                    attn_module.v_scale = scale_tensor
+            except (AttributeError, KeyError):
+                pass  # Skip if the module structure doesn't match
+
+        elif "k_proj" in scale_name and "output_scale" in scale_name:
+            # k_proj.output_scale: model.layers.X.self_attn.k_proj.output_scale (unpacked)
+            # or model.layers.X.self_attn.qkv_proj.k_proj.output_scale (attempting packed, but was captured earlier)
+            # Load to attn.k_scale
+
+            # Try multiple possible paths
+            possible_base_names = []
+            if ".qkv_proj.k_proj.output_scale" in scale_name:
+                possible_base_names.append(scale_name.replace(".qkv_proj.k_proj.output_scale", ""))
+            elif ".k_proj.output_scale" in scale_name:
+                possible_base_names.append(scale_name.replace(".k_proj.output_scale", ""))
+
+            for base_name in possible_base_names:
+                try:
+                    parts = base_name.split('.')
+                    module = model
+                    for part in parts:
+                        module = getattr(module, part)
+                    attn_module = getattr(module, 'attn')
+
+                    if hasattr(attn_module, 'k_scale'):
+                        if hasattr(attn_module.k_scale, 'device'):
+                            scale_tensor = scale_tensor.to(attn_module.k_scale.device)
+                        attn_module.k_scale = scale_tensor
+                        break  # Successfully loaded, exit loop
+                except (AttributeError, KeyError):
+                    continue
+
+        elif "v_proj" in scale_name and "output_scale" in scale_name:
+            # v_proj.output_scale: model.layers.X.self_attn.v_proj.output_scale (unpacked)
+            # or model.layers.X.self_attn.qkv_proj.v_proj.output_scale (attempting packed, but was captured earlier)
+            # Load to attn.v_scale
+
+            # Try multiple possible paths
+            possible_base_names = []
+            if ".qkv_proj.v_proj.output_scale" in scale_name:
+                possible_base_names.append(scale_name.replace(".qkv_proj.v_proj.output_scale", ""))
+            elif ".v_proj.output_scale" in scale_name:
+                possible_base_names.append(scale_name.replace(".v_proj.output_scale", ""))
+
+            for base_name in possible_base_names:
+                try:
+                    parts = base_name.split('.')
+                    module = model
+                    for part in parts:
+                        module = getattr(module, part)
+                    attn_module = getattr(module, 'attn')
+
+                    if hasattr(attn_module, 'v_scale'):
+                        if hasattr(attn_module.v_scale, 'device'):
+                            scale_tensor = scale_tensor.to(attn_module.v_scale.device)
+                        attn_module.v_scale = scale_tensor
+                        break  # Successfully loaded, exit loop
+                except (AttributeError, KeyError):
+                    continue
+
     for _, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
             module.process_weights_after_loading()

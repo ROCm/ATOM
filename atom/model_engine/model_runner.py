@@ -688,8 +688,31 @@ class ModelRunner:
                         )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, layer_id]
-                            module.v_scale = self.kv_scale[1, layer_id]
+                            # Check if static scales were loaded from model weights
+                            # If so, use them as per-tensor scales instead of allocating per-token buffers
+                            loaded_k_scale = getattr(module, 'k_scale', None)
+                            loaded_v_scale = getattr(module, 'v_scale', None)
+
+                            if (loaded_k_scale is not None and loaded_v_scale is not None and
+                                isinstance(loaded_k_scale, torch.Tensor) and isinstance(loaded_v_scale, torch.Tensor)):
+                                # Static scales were loaded - broadcast them to per-token format
+                                # ASM paged attention expects per-token scales, so we fill the scale buffer
+                                # with the static scale value
+                                static_k_scale = loaded_k_scale.flatten()[0].item()
+                                static_v_scale = loaded_v_scale.flatten()[0].item()
+
+                                # Fill the per-token scale buffers with the static scale value
+                                self.kv_scale[0, layer_id].fill_(static_k_scale)
+                                self.kv_scale[1, layer_id].fill_(static_v_scale)
+
+                                # logger.info(f"[SCALE_VERIFY] Broadcasting static scales to per-token format for layer {layer_id}: k_scale={static_k_scale}, v_scale={static_v_scale}")
+                                # logger.info(f"[SCALE_VERIFY] Layer {layer_id} buffer shape: {self.kv_scale[0, layer_id].shape}, first 5 values: {self.kv_scale[0, layer_id][:5].tolist()}")
+                                module.k_scale = self.kv_scale[0, layer_id]
+                                module.v_scale = self.kv_scale[1, layer_id]
+                            else:
+                                # No static scales - use dynamic per-token scale buffers
+                                module.k_scale = self.kv_scale[0, layer_id]
+                                module.v_scale = self.kv_scale[1, layer_id]
 
                         k_scale = module.k_scale
                         v_scale = module.v_scale

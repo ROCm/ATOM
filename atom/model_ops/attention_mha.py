@@ -84,6 +84,15 @@ class Attention(nn.Module):
             v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
             k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
             v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
+
+            # Debug: Print scale info on first call for this layer
+            if not hasattr(self, '_scale_printed'):
+                self._scale_printed = True
+                if k_scale is not None and self.kv_cache_dtype == "fp8":
+                    import logging
+                    logger = logging.getLogger("atom")
+                    logger.info(f"[SCALE_VERIFY] Attention layer {self.layer_num} forward - k_scale shape: {k_scale.shape}, first 5: {k_scale[:5].tolist() if k_scale.numel() > 1 else [k_scale.item()]}")
+                    logger.info(f"[SCALE_VERIFY] Attention layer {self.layer_num} forward - v_scale shape: {v_scale.shape}, first 5: {v_scale[:5].tolist() if v_scale.numel() > 1 else [v_scale.item()]}")
         else:
             # dummy run before allocate kv_cache, thus we create manually
             k_cache = v_cache = torch.tensor([])
@@ -142,14 +151,22 @@ class Attention(nn.Module):
                     assert position is not None
                     q, k = self.rotary_emb(position, q, k)
                 if self.kv_cache_dtype == "fp8":
-                    aiter.reshape_and_cache_with_pertoken_quant(
+                    # Use regular reshape_and_cache with static scales (pre-filled in buffer by model_runner)
+                    # The scales have been broadcast to per-token format but contain the same static value
+                    # if not hasattr(self, '_cache_scale_printed'):
+                    #     self._cache_scale_printed = True
+                    #     import logging
+                    #     logger = logging.getLogger("atom")
+                    #     logger.info(f"[SCALE_VERIFY] Layer {self.layer_num} calling reshape_and_cache with k_scale[0:5]={k_scale[:5].tolist()}, v_scale[0:5]={v_scale[:5].tolist()}")
+                    aiter.reshape_and_cache(
                         k,
                         v,
                         k_cache,
                         v_cache,
-                        k_scale,
-                        v_scale,
                         attn_metadata.slot_mapping,
+                        kv_cache_dtype="fp8",
+                        k_scale=k_scale,
+                        v_scale=v_scale,
                         asm_layout=True,
                     )
                 else:
@@ -206,6 +223,11 @@ class Attention(nn.Module):
                 causal=True,
             )
         else:  # decode
+            # if not hasattr(self, '_pa_scale_printed'):
+            #     self._pa_scale_printed = True
+            #     import logging
+            #     logger = logging.getLogger("atom")
+            #     logger.info(f"[SCALE_VERIFY] Layer {self.layer_num} calling pa_fwd_asm with K_QScale[0:5]={k_scale[:5].tolist()}, V_QScale[0:5]={v_scale[:5].tolist()}")
             o = aiter.pa_fwd_asm(
                 q,
                 k_cache,
