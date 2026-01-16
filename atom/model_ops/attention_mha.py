@@ -84,10 +84,9 @@ class Attention(nn.Module):
     ):
 
         fwd_args: ForwardContext = get_forward_context()
-        kv_cache_data = fwd_args.kv_cache_data
 
         # dummy run will skip attention in cuda graph capture phase
-        if kv_cache_data is None:
+        if fwd_args.attn_metadata.slot_mapping.numel() == 0:
             o = torch.empty_like(q)
             return o
 
