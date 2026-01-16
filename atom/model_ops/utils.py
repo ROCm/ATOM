@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Tuple, Optional, List, Union, Any
-import torch
-from aiter import per_tensor_quant, dtypes, QuantType
-from aiter.ops.shuffle import shuffle_weight
-from torch import nn
-from collections.abc import Iterable, Mapping
-from types import MappingProxyType
-import regex as re
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
-from aiter.utility.fp4_utils import mxfp4_to_f32, e8m0_to_f32
-from functools import cache
 import importlib.util
 import logging
+from collections.abc import Iterable, Mapping
+from functools import cache
+from types import MappingProxyType
+from typing import Any, List, Optional, Tuple, Union
+
+import regex as re
+import torch
+from aiter import QuantType, dtypes, per_tensor_quant
+from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+from torch import nn
 
 logger = logging.getLogger("atom")
 
@@ -31,7 +32,6 @@ def _has_module(module_name: str) -> bool:
 def has_triton_kernels() -> bool:
     """Whether the optional `triton_kernels` package is available."""
     return _has_module("triton_kernels")
-
 
 
 MXFP4_QUANT_BLOCK_SIZE = 32
@@ -109,8 +109,8 @@ def requantize_with_max_scale(
 
 
 def shuffle_weights(
-    *tensors: torch.Tensor, layout: tuple[int, int] = (16, 16)
-) -> tuple[torch.Tensor, ...]:
+    *tensors: torch.nn.Parameter, layout: tuple[int, int] = (16, 16)
+) -> tuple[torch.nn.Parameter ...]:
     """
     Applies shuffle_weight function from AITER to each
     input tensor and returns them.
@@ -127,7 +127,14 @@ def shuffle_weights(
     Returns:
     A Tuple of shuffled tensors.
     """
-    return tuple(shuffle_weight(tensor, layout=layout) for tensor in tensors)
+    for tensor in tensors:
+        if isinstance(tensor, torch.nn.Parameter):
+            tensor.data = shuffle_weight(tensor, layout=layout)
+            tensor.is_shuffled = True
+        else:
+            raise TypeError(
+                f"Expected torch.nn.Parameter, but got {type(tensor)}"
+            )
 
 
 def all_close_1d(x: torch.Tensor) -> bool:
