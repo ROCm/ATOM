@@ -1523,7 +1523,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=self.fuse_ar_input_norm and self.layer_idx > 0,
+            fused_allreduce=self.fuse_ar_input_norm and self.layer_idx > 0 and not is_mtp_block,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
