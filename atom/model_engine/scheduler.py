@@ -201,12 +201,14 @@ class Scheduler:
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
-        num_placeholder = (
-            2 * self.mtp_k if is_deferred_out and self.use_spec else
-            1              if is_deferred_out else
-            self.mtp_k     if self.use_spec else
-            0
-        )
+        if is_deferred_out and self.use_spec:
+            num_placeholder = 2 * self.mtp_k
+        elif is_deferred_out:
+            num_placeholder = 1
+        elif self.use_spec:
+            num_placeholder = self.mtp_k
+        else:
+            num_placeholder = 0
         for seq in self.running:
             if seq.id not in prev_token_ids:
                 continue
