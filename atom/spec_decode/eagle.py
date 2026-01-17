@@ -238,7 +238,7 @@ class EagleProposer:
             device = attn_metadata.cu_seqlens_q.device
             cu_seqlens_q_cpu = attn_metadata.cu_seqlens_q.cpu()
             context_lens_cpu = attn_metadata.context_lens.cpu()
-            
+
             # Only use decode sequences' context_lens and cu_seqlens_q (num_rejected_tokens length matches decode sequences)
             # These may contain padding, so we need to slice to match num_rejected_tokens length
             scheduled_bs = len(num_rejected_tokens)

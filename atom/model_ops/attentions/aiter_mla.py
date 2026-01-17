@@ -233,15 +233,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
 
         if max_q_len > 1:
-            context_lens = np.array(batch.context_lens) - var["mtp_k"]
-            positions = [pos for le in context_lens for pos in (le - var["mtp_k"], le)]
-
+            context_lens = batch.context_lens
+            positions = [
+                pos
+                for seq_len in context_lens
+                for pos in range(seq_len - max_q_len, seq_len)
+            ]
             slot_mapping = [
-                block_table[i]  # TODO: support block_size > 1
-                for block_table, last_block_num in zip(
-                    batch.block_tables, batch.last_block_num_tokens
-                )
-                for i in range(-var["mtp_k"] - 1, 0)
+                block_table[pos // self.block_size] * self.block_size + (pos % self.block_size)
+                for block_table, seq_len in zip(batch.block_tables, context_lens)
+                for pos in range(seq_len - max_q_len, seq_len)
             ]
         else:
             context_lens = batch.context_lens
@@ -341,7 +342,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
-        max_q_len = 1 if not hasattr(self, "drafter") else var["mtp_k"] + 1
+        max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
         attn_matadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
@@ -365,7 +366,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
             **ctx_mla_ps,
         )
-        positions = var["positions"].copy_to_gpu(bs)
+        positions = var["positions"].copy_to_gpu(bs * max_q_len)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )

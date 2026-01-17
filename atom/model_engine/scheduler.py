@@ -214,6 +214,8 @@ class Scheduler:
             new_tokens = []
             if is_deferred_out or (self.use_spec and self.eos_token_id == seq.token_ids[-1]):
                 seq.token_ids[-num_placeholder:] = token_ids
+                # update the number of tokens in the sequence if draft token is rejected
+                seq.num_tokens = len(seq.token_ids)
 
                 if seq.output_tokens:
                     seq.output_tokens[-num_placeholder:] = token_ids
