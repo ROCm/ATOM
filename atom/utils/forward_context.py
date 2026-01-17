@@ -163,6 +163,12 @@ class AttentionMetaData:
     reduce_final_map: Optional[torch.Tensor] = None
     reduce_partial_map: Optional[torch.Tensor] = None
 
+    # for plugin mode, replicate the context into attention metadata
+    # as context contains the metadata required in implementation
+    # for server mode, the context is already in the forward context
+    # and here context will not be used any more
+    context: Optional[Context] = None
+
     block_tables_converted: Optional[torch.Tensor] = None
     kv_indices_converted: Optional[torch.Tensor] = None
 
@@ -190,6 +196,7 @@ class AttentionMetaData:
         reduce_indptr: Optional[torch.Tensor] = None,
         reduce_final_map: Optional[torch.Tensor] = None,
         reduce_partial_map: Optional[torch.Tensor] = None,
+        context: Optional[Context] = None,
         block_tables_converted: Optional[torch.Tensor] = None,
         kv_indices_converted: Optional[torch.Tensor] = None,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -217,6 +224,8 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
+        if context is not None:
+            self.context = context
         if block_tables_converted is not None:
             self.block_tables = block_tables_converted
         if kv_indices_converted is not None:

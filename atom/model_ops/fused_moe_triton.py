@@ -39,7 +39,8 @@ if has_triton_kernels():
         import triton_kernels.swiglu
         from triton_kernels.matmul_ogs import FnSpecs, FusedActivation, matmul_ogs
         from triton_kernels.routing import routing
-        from triton_kernels.matmul_ogs import PrecisionConfig
+        # FIXME: disable here
+        # from triton_kernels.matmul_ogs import PrecisionConfig
     except (AttributeError, ImportError) as e:
         logger.error(
             "Failed to import Triton kernels. Please make sure your triton "

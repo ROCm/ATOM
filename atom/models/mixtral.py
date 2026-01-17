@@ -32,7 +32,7 @@ from transformers import MixtralConfig
 
 from aiter import QuantType
 # from atom.model_ops.attention import Attention
-from atom.model_ops.base_attention import Attention
+import atom.model_ops as ops
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -179,11 +179,12 @@ class MixtralAttention(nn.Module):
             base=int(self.rope_theta),
             is_neox_style=True,
         )
-        self.attn = Attention(
+        self.attn = ops.ATTN_CLS(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
+            alibi_slopes=None,
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             quant_config=quant_config,

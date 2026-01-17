@@ -16,6 +16,7 @@ from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rm
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from atom.utils.custom_register import direct_register_custom_op
 
 from aiter import (
     QuantType,
@@ -23,8 +24,7 @@ from aiter import (
 )
 
 
-@torch_compile_guard()
-def rmsnorm2d_fwd_(
+def rmsnorm2d_fwd_impl(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
 ) -> torch.Tensor:
     ori_shape = x.shape
@@ -32,6 +32,22 @@ def rmsnorm2d_fwd_(
     return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
 
+def rmsnorm2d_fwd_fake(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="rmsnorm2d_fwd_",
+    op_func=rmsnorm2d_fwd_impl,
+    mutates_args=[],
+    fake_impl=rmsnorm2d_fwd_fake,
+)
+
+
+# TODO: use direct_register_custom_op to register the op
+# FIXME: use torch_compile_guard will lead to illegal mem access in plugin mode(vllm)
 @torch_compile_guard()
 def rmsnorm2d_fwd_with_add_(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
@@ -252,7 +268,7 @@ class RMSNorm(nn.Module):
             else:
                 if residual is None:
                     # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
-                    x = rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+                    x = torch.ops.aiter.rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
                     return x
                 else:
                     # return self.add_rms_forward(x, residual)

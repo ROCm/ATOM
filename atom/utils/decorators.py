@@ -170,7 +170,6 @@ class TorchCompileWrapperWithCustomDispatcher:
         self.__class__.forward.__code__ = self.original_code_object
 
 
-
 def support_torch_compile(
     cls: Optional[_T] = None,
     *,
@@ -232,13 +231,14 @@ def _support_torch_compile(
     def __init__(self, atom_config: Config, **kwargs):
         old_init(self, atom_config=atom_config, **kwargs)
         self.atom_config = atom_config
+        is_plugin_mode_for_sglang = self.atom_config.plugin_config is not None \
+            and self.atom_config.plugin_config.is_sglang
         # for CompilationLevel.DYNAMO_AS_IS , the upper level model runner
         # will handle the compilation, so we don't need to do anything here.
         self.do_not_compile = \
             atom_config.compilation_config.level in [
             CompilationLevel.NO_COMPILATION, CompilationLevel.DYNAMO_AS_IS
-        ] 
-        # print("self.do_not_compile",self.do_not_compile)
+        ] or is_plugin_mode_for_sglang
         if self.do_not_compile:
             return
 
@@ -248,6 +248,7 @@ def _support_torch_compile(
     cls.__init__ = __init__
 
     def __call__(self, *args, **kwargs):
+        print('[zejun] ATOM _support_torch_compile __call__,  self.do_not_compile = ', self.do_not_compile, flush=True)
         # torch.compiler.is_compiling() means we are inside the compilation
         # e.g. TPU has the compilation logic in model runner, so we don't
         # need to compile the model inside.
@@ -326,4 +327,3 @@ def _support_torch_compile(
 
     cls.__call__ = __call__
     return cls
-

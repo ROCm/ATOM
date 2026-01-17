@@ -140,6 +140,25 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             block_tables[i, : len(block_table)] = block_table
 
     def prepare_prefill(self, batch: ScheduledBatch):
+        # print('--------------------------------', flush=True)
+        # print('[zejun] ATOM, prepare_prefill', flush=True)
+        # print('[zejun] ATOM, batch.context_lens = ', batch.context_lens, flush=True)
+        # print('[zejun] ATOM, batch.num_cached_tokens = ', batch.num_cached_tokens, flush=True)
+        # print('[zejun] ATOM, batch.num_scheduled_tokens = ', batch.num_scheduled_tokens, flush=True)
+        # print('[zejun] ATOM, batch.block_tables = ', batch.block_tables, flush=True)
+        # for block_table in batch.block_tables:
+        #     print('[zejun] ATOM, block_table = ', block_table, flush=True)
+        # print('[zejun] ATOM, batch.last_block_num_tokens = ', batch.last_block_num_tokens, flush=True)
+        # # for block_num_tokens in batch.last_block_num_tokens:
+        # #     print('[zejun] ATOM, block_num_tokens shape = ', block_num_tokens.shape, flush=True)
+        # print('[zejun] ATOM, batch.total_tokens_num = ', batch.total_tokens_num, flush=True)
+        # print('[zejun] ATOM, batch.total_tokens_num_prefill = ', batch.total_tokens_num_prefill, flush=True)
+        # print('[zejun] ATOM, batch.total_tokens_num_decode = ', batch.total_tokens_num_decode, flush=True)
+        # print('[zejun] ATOM, batch.total_seqs_num = ', batch.total_seqs_num, flush=True)
+        # print('[zejun] ATOM, batch.total_seqs_num_prefill = ', batch.total_seqs_num_prefill, flush=True)
+        # print('[zejun] ATOM, batch.total_seqs_num_decode = ', batch.total_seqs_num_decode, flush=True)
+        # print('--------------------------------', flush=True)
+
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
@@ -164,18 +183,25 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             num_blocks = (
                 seqlen + self.model_runner.block_size - 1
             ) // self.model_runner.block_size
+            # print('[zejun] ATOM(server) num_blocks = ', num_blocks, flush=True)
             num_cached_blocks = (
                 cached_seqlen + self.model_runner.block_size - 1
             ) // self.model_runner.block_size
+            # print('[zejun] ATOM(server) num_cached_blocks = ', num_cached_blocks, flush=True)
             last_block_tokens = batch.last_block_num_tokens[i]
+            # print('[zejun] ATOM(server) last_block_tokens = ', last_block_tokens, flush=True)
             block_table = batch.block_tables[i]
+            # print('[zejun] ATOM(server) block_table = ', block_table, flush=True)
             for i in range(num_cached_blocks, num_blocks):
                 start = block_table[i] * self.model_runner.block_size
+                # print('[zejun] ATOM(server)[', i, '] start = ', start, flush=True)
                 if i != num_blocks - 1:
                     end = start + self.model_runner.block_size
                 else:
                     end = start + last_block_tokens
+                # print('[zejun] ATOM(server)[', i, '] end = ', end, flush=True)
                 slot_mapping.extend(list(range(start, end)))
+                # print('[zejun] ATOM(server)[', i, '] slot_mapping = ', slot_mapping, flush=True)
         if cu_seqlens_k[-1] > batch.total_tokens_num:  # prefix cache
             self.prepare_block_tables(batch)
         var["positions"].np[:sum_scheduled_tokens] = positions
@@ -207,7 +233,35 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             dropout_p=dropout_p,
             **ctx,
         )
+        # print(f"[zejun] ATOM prepare_prefill - AttentionMetaData members:", flush=True)
+        # print(f"  cu_seqlens_q: {attn_metadata.cu_seqlens_q}", flush=True)
+        # print(f"  cu_seqlens_k: {attn_metadata.cu_seqlens_k}", flush=True)
+        # print(f"  max_seqlen_q: {attn_metadata.max_seqlen_q}", flush=True)
+        # print(f"  max_seqlen_k: {attn_metadata.max_seqlen_k}", flush=True)
+        # print(f"  min_seqlen_q: {attn_metadata.min_seqlen_q}", flush=True)
+        # print(f"  slot_mapping: {attn_metadata.slot_mapping}", flush=True)
+        # print(f"  context_lens: {attn_metadata.context_lens}", flush=True)
+        # if attn_metadata.block_tables is not None:
+        #     print(f"  block_tables shape : {attn_metadata.block_tables.shape}", flush=True)
+        # print(f"  dropout_p: {attn_metadata.dropout_p}", flush=True)
+        # print(f"  max_q_len: {attn_metadata.max_q_len}", flush=True)
+        # print(f"  kv_indptr: {attn_metadata.kv_indptr}", flush=True)
+        # print(f"  kv_indices: {attn_metadata.kv_indices}", flush=True)
+        # print(f"  kv_last_page_lens: {attn_metadata.kv_last_page_lens}", flush=True)
+        # print(f"  cu_seqlen_ks: {attn_metadata.cu_seqlen_ks}", flush=True)
+        # print(f"  cu_seqlen_ke: {attn_metadata.cu_seqlen_ke}", flush=True)
+        # print(f"  sparse_kv_indptr: {attn_metadata.sparse_kv_indptr}", flush=True)
+        # print(f"  work_meta_data: {attn_metadata.work_meta_data}", flush=True)
+        # print(f"  work_indptr: {attn_metadata.work_indptr}", flush=True)
+        # print(f"  work_info_set: {attn_metadata.work_info_set}", flush=True)
+        # print(f"  reduce_indptr: {attn_metadata.reduce_indptr}", flush=True)
+        # print(f"  reduce_final_map: {attn_metadata.reduce_final_map}", flush=True)
+        # print(f"  reduce_partial_map: {attn_metadata.reduce_partial_map}", flush=True)
+        # print(f"  context: {attn_metadata.context}", flush=True)
+        # print(f"  block_tables_converted: {attn_metadata.block_tables_converted}", flush=True)
+        # print(f"  kv_indices_converted: {attn_metadata.kv_indices_converted}", flush=True)
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        # print(f"  positions: {positions}", flush=True)
 
         return attn_metadata, positions
         # return var["positions"].copy_to_gpu(sum_scheduled_tokens)

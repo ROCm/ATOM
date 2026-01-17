@@ -467,7 +467,6 @@ class VllmBackend:
         vllm_config: Config,
         prefix: str = "",
     ):
-
         # if the model is initialized with a non-empty prefix,
         # then usually it's enough to use that prefix,
         # e.g. language_model, vision_model, etc.
