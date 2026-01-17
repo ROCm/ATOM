@@ -240,7 +240,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 for pos in range(seq_len - max_q_len, seq_len)
             ]
             slot_mapping = [
-                block_table[pos // self.block_size] * self.block_size + (pos % self.block_size)
+                block_table[pos // self.model_runner.block_size] * self.model_runner.block_size + (pos % self.model_runner.block_size)
                 for block_table, seq_len in zip(batch.block_tables, context_lens)
                 for pos in range(seq_len - max_q_len, seq_len)
             ]

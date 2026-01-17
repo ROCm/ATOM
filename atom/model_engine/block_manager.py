@@ -108,13 +108,14 @@ class BlockManager:
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
-    def may_append(self, seq: Sequence):
+    def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1 or self.block_size == 1:
-            needed_blocks = (len(seq) + seq.block_size - 1) // seq.block_size
+            total_tokens = len(seq) + num_new_tokens
+            needed_blocks = (total_tokens + self.block_size - 1) // self.block_size
             while len(block_table) < needed_blocks:
-                assert last_block.hash != -1
+                # assert last_block.hash != -1
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
                 block_table.append(block_id)
@@ -133,5 +134,12 @@ class BlockManager:
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id
+            # Also allocate blocks for draft tokens if needed
+            total_tokens = len(seq) + num_new_tokens
+            needed_blocks = (total_tokens + self.block_size - 1) // self.block_size
+            while len(block_table) < needed_blocks:
+                block_id = self.free_block_ids[0]
+                block = self._allocate_block(block_id)
+                block_table.append(block_id)
         else:
             assert last_block.hash == -1

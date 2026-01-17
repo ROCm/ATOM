@@ -152,8 +152,8 @@ class Scheduler:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
 
                 num_seqs_decode += 1
-                self.block_manager.may_append(seq)
                 num_new_tokens = 1 if not self.use_spec else self.mtp_k + 1
+                self.block_manager.may_append(seq, num_new_tokens)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
