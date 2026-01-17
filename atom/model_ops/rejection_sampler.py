@@ -16,7 +16,19 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         temperatures: torch.Tensor,
     ) -> torch.Tensor:
-
+        # Ensure target_logits is contiguous. For greedy sampling, we can use
+        # logits directly (argmax is the same for logits and probs), but we
+        # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
+        target_logits = target_logits.contiguous()
+        
+        # Validate shapes match expectations
+        expected_num_tokens = len(metadata.draft_token_ids)
+        if target_logits.shape[0] != expected_num_tokens:
+            raise ValueError(
+                f"target_logits shape mismatch: expected first dimension to be "
+                f"{expected_num_tokens} (len(draft_token_ids)), but got {target_logits.shape[0]}"
+            )
+        
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,

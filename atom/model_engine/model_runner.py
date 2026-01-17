@@ -1056,10 +1056,17 @@ class ModelRunner:
 
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter"):
-                num_draft_tokens = np.zeros(bs, dtype=np.int32)
+                # Use scheduled_bs (actual number of decode sequences) instead of bs (which may be padded)
+                # to match the length of cu_seqlens_q which is based on num_scheduled_tokens
+                scheduled_bs = batch.total_seqs_num_decode
+                num_draft_tokens = np.zeros(scheduled_bs, dtype=np.int32)
                 num_draft_tokens[:] = self.drafter.mtp_k
+                # Extract decode part of cu_seqlens_q (skip prefill sequences if any)
+                # cu_seqlens_q contains cumulative sum for all sequences, we need only decode part
+                prefill_seqs = batch.total_seqs_num_prefill
+                decode_cu_seqlens_q = cu_seqlens_q[prefill_seqs:]
                 spec_decode_metadata = self._calc_spec_decode_metadata(
-                    num_draft_tokens, cu_seqlens_q, input_ids
+                    num_draft_tokens, decode_cu_seqlens_q, input_ids
                 )
 
         set_forward_context(
@@ -1121,21 +1128,54 @@ class ModelRunner:
             # logits tensor. This means any in-place operations on bonus_logits
             # won't affect the original logits tensor.
             assert logits is not None
-            bonus_logits = logits[spec_decode_metadata.bonus_logits_indices]
+            
+            # bonus_logits_indices indexes into logits_indices, which then indexes into logits
+            # So we need to use logits_indices[bonus_logits_indices] to get the actual indices
+            bonus_logits_indices_mapped = spec_decode_metadata.logits_indices[spec_decode_metadata.bonus_logits_indices]
+            target_logits_indices_mapped = spec_decode_metadata.logits_indices[spec_decode_metadata.target_logits_indices]
+            
+            # Validate indices are within bounds before indexing
+            max_bonus_idx = bonus_logits_indices_mapped.max().item() if len(bonus_logits_indices_mapped) > 0 else -1
+            max_target_idx = target_logits_indices_mapped.max().item() if len(target_logits_indices_mapped) > 0 else -1
+            if max_bonus_idx >= logits.shape[0] or max_target_idx >= logits.shape[0]:
+                raise ValueError(
+                    f"Index out of bounds: logits.shape[0]={logits.shape[0]}, "
+                    f"max_bonus_logits_indices (mapped)={max_bonus_idx}, "
+                    f"max_target_logits_indices (mapped)={max_target_idx}, "
+                    f"bonus_logits_indices={spec_decode_metadata.bonus_logits_indices.tolist()}, "
+                    f"target_logits_indices={spec_decode_metadata.target_logits_indices.tolist()}, "
+                    f"logits_indices.shape={spec_decode_metadata.logits_indices.shape}"
+                )
+            
+            bonus_logits = logits[bonus_logits_indices_mapped]
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
             )
-            # Just like `bonus_logits`, `target_logits` is a new tensor with
+            # Just like `bonus_logits`, `target_logits` is a ne w tensor with
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
-            target_logits = logits[spec_decode_metadata.target_logits_indices]
+            target_logits = logits[target_logits_indices_mapped]
+            
+            # Validate shapes match expectations
+            if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
+                raise ValueError(
+                    f"Shape mismatch: target_logits.shape[0]={target_logits.shape[0]} "
+                    f"but len(draft_token_ids)={len(spec_decode_metadata.draft_token_ids)}. "
+                    f"target_logits_indices shape={spec_decode_metadata.target_logits_indices.shape}, "
+                    f"logits.shape[0]={logits.shape[0]}"
+                )
+            
+            self.debug("postprocess 1")
+
             sampled_tokens = self.rejection_sampler(
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
                 temperatures,
             )
+            self.debug(f"postprocess{sampled_tokens=}")
+
             # Update MTP acceptance statistics
             batch_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
             num_valid_per_req = (sampled_tokens != -1).sum(dim=1)

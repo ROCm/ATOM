@@ -238,6 +238,13 @@ class EagleProposer:
             device = attn_metadata.cu_seqlens_q.device
             cu_seqlens_q_cpu = attn_metadata.cu_seqlens_q.cpu()
             context_lens_cpu = attn_metadata.context_lens.cpu()
+            
+            # Only use decode sequences' context_lens and cu_seqlens_q (num_rejected_tokens length matches decode sequences)
+            # These may contain padding, so we need to slice to match num_rejected_tokens length
+            scheduled_bs = len(num_rejected_tokens)
+            context_lens_cpu = context_lens_cpu[:scheduled_bs]
+            # cu_seqlens_q has length scheduled_bs + 1 (includes 0 at start)
+            cu_seqlens_q_cpu = cu_seqlens_q_cpu[:scheduled_bs + 1]
 
             # Calculate new sequence lengths
             new_context_lens_cpu = context_lens_cpu - num_rejected_tokens + 1
