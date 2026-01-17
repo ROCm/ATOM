@@ -652,7 +652,10 @@ class ModelRunner:
             "input_ids": self.tokenID_processor.input_ids,
             "positions": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
             "temperatures": CpuGpuBuffer(self.max_bs, **f32_kwargs),
-            "outputs": torch.empty(self.max_bs, hidden_size, dtype=hidden_type),
+            # Keep enough space for MTP decode (max_q_len > 1).
+            "outputs": torch.empty(
+                self.max_num_batched_tokens, hidden_size, dtype=hidden_type
+            ),
         }
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
@@ -939,10 +942,14 @@ class ModelRunner:
 
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter"):
-                num_draft_tokens = np.zeros(bs, dtype=np.int32)
-                num_draft_tokens[:] = self.drafter.mtp_k
+                scheduled_bs = batch.total_seqs_num_decode
+                num_draft_tokens = np.full(
+                    scheduled_bs, self.drafter.mtp_k, dtype=np.int32
+                )
+                # Use only real sequences; cudagraph padding should not affect
+                # spec decode metadata or rejection sampling.
                 spec_decode_metadata = self._calc_spec_decode_metadata(
-                    num_draft_tokens, cu_seqlens_q, input_ids
+                    num_draft_tokens, cu_seqlens_q[: scheduled_bs + 1], input_ids
                 )
 
         set_forward_context(
@@ -983,8 +990,11 @@ class ModelRunner:
             hidden_states = self.model(input_ids, positions)
         else:
             graph_bs = context.graph_bs
-            self.graphs[graph_bs].replay()
-            hidden_states = self.forward_vars["outputs"][:bs]
+            max_q_len = forward_context.attn_metadata.max_q_len
+            graph_key = (graph_bs, max_q_len)
+            self.graphs[graph_key].replay()
+            num_tokens = context.batch_size * max_q_len
+            hidden_states = self.forward_vars["outputs"][:num_tokens]
         return self.model.compute_logits(hidden_states), hidden_states
 
     def postprocess(
@@ -1217,30 +1227,40 @@ class ModelRunner:
             self.graph_bs[0] <= self.config.max_num_seqs
         ), "cudagraph capture sizes must be less than max_num_seqs."
 
-        self.forward_vars["cu_seqlens_q"].np[: self.graph_bs[0] + 1] = np.arange(
-            0, self.graph_bs[0] + 1
-        )
-        self.forward_vars["cu_seqlens_q"].copy_to_gpu(self.graph_bs[0] + 1)
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
 
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = dict()
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_pool = None
 
         with graph_capture() as gc:
             capture_range = (
                 tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
             )
+            max_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
             for bs in capture_range:
                 if self.rank == 0:
-                    capture_range.set_description(f"Capturing {bs=}")
+                    capture_range.set_description(
+                        f"Capturing {bs=}, {max_q_len=}"
+                    )
                 graph = torch.cuda.CUDAGraph()
+
+                cu_seqlens_q = np.arange(
+                    0, (bs + 1) * max_q_len, max_q_len, dtype=np.int32
+                )
+                self.forward_vars["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
+                self.forward_vars["cu_seqlens_q"].copy_to_gpu(bs + 1)
+
+                num_tokens = bs * max_q_len
+                # Use a simple, safe position pattern for capture.
+                self.forward_vars["positions"].np[:num_tokens] = (
+                    np.arange(num_tokens, dtype=np.int64) % max_q_len
+                )
 
                 attn_metadata, context = (
                     self.attn_metadata_builder.build_for_cudagraph_capture(bs)
                 )
-                num_tokens = bs
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                 num_tokens += num_pad
                 set_forward_context(
@@ -1251,13 +1271,17 @@ class ModelRunner:
                     num_tokens_across_dp=num_tokens_across_dp,
                 )
 
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
+                outputs[:num_tokens] = self.model(
+                    input_ids[:num_tokens], positions[:num_tokens]
+                )  # warmup
 
                 with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
-                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
+                    outputs[:num_tokens] = self.model(
+                        input_ids[:num_tokens], positions[:num_tokens]
+                    )  # capture
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
-                self.graphs[bs] = graph
+                self.graphs[(bs, max_q_len)] = graph
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
         return time.time() - start_time, self.graph_bs

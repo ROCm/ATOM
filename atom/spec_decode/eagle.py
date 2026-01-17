@@ -238,6 +238,11 @@ class EagleProposer:
             device = attn_metadata.cu_seqlens_q.device
             cu_seqlens_q_cpu = attn_metadata.cu_seqlens_q.cpu()
             context_lens_cpu = attn_metadata.context_lens.cpu()
+            # For cudagraph padding, only keep real sequences that have
+            # rejected-token counts.
+            num_reqs = num_rejected_tokens.shape[0]
+            context_lens_cpu = context_lens_cpu[:num_reqs]
+            cu_seqlens_q_cpu = cu_seqlens_q_cpu[: num_reqs + 1]
 
             # Calculate new sequence lengths
             new_context_lens_cpu = context_lens_cpu - num_rejected_tokens + 1

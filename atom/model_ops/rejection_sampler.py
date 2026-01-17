@@ -83,6 +83,7 @@ def rejection_sample(
     return output_token_ids
 
 @triton.jit(do_not_specialize=["max_spec_len"])
+# TODO use the same sampler as main model
 def rejection_greedy_sample_kernel(
     output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
     cu_num_draft_tokens_ptr,  # [batch_size]
