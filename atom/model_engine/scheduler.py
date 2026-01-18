@@ -250,8 +250,8 @@ class Scheduler:
                 if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
                     leave_reason = "eos"
                 elif not seq.ignore_eos and any(t in self.stop_token_ids for t in token_ids):
-                    hit_stop_token = next(t for t in token_ids if t in self.stop_token_ids)
-                    leave_reason = f"stop_{hit_stop_token}"
+                    first_stop_token = next(t for t in token_ids if t in self.stop_token_ids)
+                    leave_reason = f"stop_{first_stop_token}"
                 elif seq.num_completion_tokens >= seq.max_tokens:
                     leave_reason = "max_tokens"
             # Prepare stream output

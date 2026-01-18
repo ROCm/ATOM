@@ -62,7 +62,13 @@ support_model_arch_dict = {
 
 class tokenIDProcessor:
 
-    def __init__(self, max_num_batched_tokens: int, device: torch.device, use_spec: bool, num_speculative_tokens):
+    def __init__(
+        self,
+        max_num_batched_tokens: int,
+        device: torch.device,
+        use_spec: bool = False,
+        num_speculative_tokens: int = 0,
+    ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         # self.is_deferred_out = False
         self.is_deferred_out = True
@@ -640,9 +646,8 @@ class ModelRunner:
             is_dummy_run=True,
         )
 
-        bs = self.prepare_intputs(dummy_batch)
+        bs = self.prepare_inputs(dummy_batch)
         actual_num_tokens = dummy_batch.total_tokens_num
-
 
         # self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
         # self.tokenID_processor.input_ids.copy_to_gpu(actual_num_tokens)
@@ -651,7 +656,7 @@ class ModelRunner:
         self.forward_vars["input_ids"].gpu[:bs].zero_()
         input_ids = self.forward_vars["input_ids"].gpu[:bs]
 
-        logits = self.run_model(input_ids)
+        self.run_model(input_ids)
 
         reset_forward_context()
         logger.debug(
@@ -678,8 +683,7 @@ class ModelRunner:
             is_dummy_run=True,
         )
 
-        bs = self.prepare_intputs(dummy_batch)
-
+        bs = self.prepare_inputs(dummy_batch)
 
         # self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
         # self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
@@ -1020,7 +1024,7 @@ class ModelRunner:
         num_input_tokens += num_pad
         return num_input_tokens, num_tokens_across_dp
 
-    def prepare_intputs(self, batch: ScheduledBatch, input_ids: torch.Tensor):
+    def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = batch.num_scheduled_tokens
@@ -1062,13 +1066,13 @@ class ModelRunner:
 
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter"):
-                scheduled_bs = batch.total_seqs_num_decode
-                num_draft_tokens = np.full(
+            scheduled_bs = batch.total_seqs_num_decode
+            num_draft_tokens = np.full(
                     scheduled_bs, self.drafter.mtp_k, dtype=np.int32
                 )
-                # Use only real sequences; cudagraph padding should not affect
-                # spec decode metadata or rejection sampling.
-                spec_decode_metadata = self._calc_spec_decode_metadata(
+            # Use only real sequences; cudagraph padding should not affect
+            # spec decode metadata or rejection sampling.
+            spec_decode_metadata = self._calc_spec_decode_metadata(
                     num_draft_tokens, cu_seqlens_q[: scheduled_bs + 1], input_ids
                 )
 
@@ -1093,21 +1097,21 @@ class ModelRunner:
         assert total_tokens_num > 0
 
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        self.prepare_intputs(batch, input_ids)
+        self.prepare_inputs(batch, input_ids)
         temperatures = self.prepare_sample(batch)
         return (
             input_ids,
             temperatures,
         )
 
-    def run_model(self, input_ids: torch.Tensor):
+    def run_model(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-                hidden_states = self.model(input_ids, positions)
+            hidden_states = self.model(input_ids, positions)
         else:
             graph_bs = context.graph_bs
             max_q_len = forward_context.attn_metadata.max_q_len
@@ -1171,7 +1175,6 @@ class ModelRunner:
                     f"logits.shape[0]={logits.shape[0]}"
                 )
 
-
             sampled_tokens = self.rejection_sampler(
                 spec_decode_metadata,
                 target_logits,
@@ -1224,7 +1227,6 @@ class ModelRunner:
             draft_token_ids = self.propose_draft_token_ids(batch, input_ids, cur_sampled_tokens, hidden_states)
         reset_forward_context()
         return sampled_token_ids, draft_token_ids
-
 
     def _calc_spec_decode_metadata(
         self,
@@ -1356,7 +1358,6 @@ class ModelRunner:
             next_token_ids=next_token_ids,
         )
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
-
 
     @torch.inference_mode()
     def capture_cudagraph(self):
