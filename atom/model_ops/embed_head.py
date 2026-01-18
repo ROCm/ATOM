@@ -73,7 +73,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
         # context = get_context()
-        if context.is_prefill:
+        if context.is_prefill and not context.is_draft:
             last_indices = attn_metadata.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = tgemm.mm(x, self.weight, self.bias)

@@ -92,7 +92,7 @@ class DPMetadata:
         to determine the chunk-wise split.
         `self.local_sizes` is only valid inside the context.
         Args:
-            max_chunk_size_per_rank: The max number of tokens each rank is 
+            max_chunk_size_per_rank: The max number of tokens each rank is
                                      allowed to process in this chunk.
             chunk_idx: The index of the chunk to compute sizes for.
         """
@@ -112,6 +112,20 @@ class DPMetadata:
     def get_chunk_sizes_across_dp_rank(self) -> Optional[list[int]]:
         return self.local_sizes
 
+
+@dataclass
+class SpecDecodeMetadata:
+    draft_token_ids: torch.Tensor
+    num_draft_tokens: list[int]
+    cu_num_draft_tokens: torch.Tensor
+    target_logits_indices: torch.Tensor
+    bonus_logits_indices: torch.Tensor
+    logits_indices: torch.Tensor
+
+    def __post_init__(self):
+        self.max_spec_len = max(self.num_draft_tokens)
+
+
 @dataclass
 class Context:
     # This context is used to store the basic context of the forward.
@@ -119,6 +133,7 @@ class Context:
     is_prefill: bool = False
     batch_size: int = 0
     graph_bs: int = 0
+    is_draft: bool = False
 
     def __init__(
         self,
@@ -126,12 +141,13 @@ class Context:
         is_prefill: bool = False,
         batch_size: int = 0,
         graph_bs: int = 0,
+        is_draft: bool = False,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
         self.batch_size = batch_size
         self.graph_bs = graph_bs
-
+        self.is_draft = is_draft
 
 @dataclass
 class AttentionMetaData:
@@ -252,6 +268,8 @@ class ForwardContext:
 
     dp_metadata: Optional[DPMetadata] = None
 
+    spec_decode_metadata: Optional[SpecDecodeMetadata] = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -276,6 +294,7 @@ def set_forward_context(
     attn_metadata: AttentionMetaData, atom_config: Config, context: Context,
     num_tokens: Optional[int] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
+    spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
@@ -291,6 +310,7 @@ def set_forward_context(
         kv_cache_data=_forward_kv_cache_context.kv_cache_data,
         context=context,
         dp_metadata=dp_metadata,
+        spec_decode_metadata=spec_decode_metadata,
     )    # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)

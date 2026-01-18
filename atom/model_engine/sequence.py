@@ -60,6 +60,9 @@ class Sequence:
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
 
+        # save speculative tokens if is_deferred_output = False or prefill is inter
+        self.spec_token_ids: list[int] = []
+
         # statistics fields
         self.arrive_time = 0.0
         self.first_token_time = 0.0
