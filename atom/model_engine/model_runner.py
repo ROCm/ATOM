@@ -267,70 +267,36 @@ class tokenIDProcessor:
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         """for decode: input ids are from prev_sampled_token_ids"""
-        if self.use_spec:     # TODO: remove when finish fix for mtp
-            alive_seq_indices, num_deferred_tokens, is_all_alive = self.get_prev_alive_locations(batch)
-            if is_all_alive:
-                num_norm_tokens = total_tokens_decode - num_deferred_tokens
-                if num_norm_tokens > 0:
-                    if self.use_spec:
-                        actual_norm_tokens = num_norm_tokens // (self.num_speculative_tokens + 1)
-                        token_ids = [
-                            token
-                            for tokens, draft_tokens in zip(
-                                scheduled_tokens[
-                                    total_reqs_prefill : total_reqs_prefill + actual_norm_tokens
-                                ],
-                                batch.scheduled_spec_decode_tokens.values(),
-                            )
-                            for token in [tokens[-1]] + draft_tokens
-                        ]
-                    else:
-                        token_ids = [
-                            token
-                            for tokens in scheduled_tokens[
-                                total_reqs_prefill : total_reqs_prefill + num_norm_tokens
-                            ]
-                            for token in tokens
-                        ]
-                    self.input_ids.np[:num_norm_tokens] = token_ids
-                    self.input_ids.copy_to_gpu(num_norm_tokens)
-                # no new requests added and old requests finished
-                if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
-                    alive_prev = self.prev_token_ids[alive_seq_indices]
-                    alive_draft = self.draft_token_ids[alive_seq_indices]
-                    combined = torch.cat([
-                        alive_prev.unsqueeze(1),  # (num_alive_seqs, 1)
-                        alive_draft               # (num_alive_seqs, mtp_n_grams-1)
-                    ], dim=1).reshape(-1)         #  (num_deferred_tokens,)
-                else:
-                    # normal decode
-                    combined = self.prev_token_ids[alive_seq_indices]
-                self.input_ids.gpu[
-                    num_norm_tokens : num_norm_tokens + num_deferred_tokens
-                ] = combined
-
-            elif num_deferred_tokens == total_tokens_decode:
-                # no new requests added but some old requests finished
-                if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
-                    alive_prev = self.prev_token_ids[alive_seq_indices]  # (num_alive_seqs,)
-                    alive_draft = self.draft_token_ids[alive_seq_indices]  # (num_alive_seqs, mtp_n_grams-1)
-                    combined = torch.cat([
-                        alive_prev.unsqueeze(1),  # (num_alive_seqs, 1)
-                        alive_draft               # (num_alive_seqs, mtp_n_grams-1)
-                    ], dim=1).reshape(-1)       # (num_deferred_tokens,)
-                else:
-                    combined = self.prev_token_ids[alive_seq_indices]
-                self.input_ids.gpu[:num_deferred_tokens] = combined
-            return self.input_ids.gpu[:total_tokens]
-
         deferred_curr_indices, deferred_prev_indices, new_curr_indices, is_all_same = (
             self.get_token_locations(batch)
         )
-        num_deferred_tokens = len(deferred_curr_indices)
-        num_new_tokens = len(new_curr_indices)
+        num_deferred_seqs = len(deferred_curr_indices)
+        num_new_seqs = len(new_curr_indices)
+
+        # Calculate token counts: in MTP mode, each seq has multiple tokens
+        if self.use_spec:
+            tokens_per_seq = self.num_speculative_tokens + 1
+            num_deferred_tokens = num_deferred_seqs * tokens_per_seq
+            num_new_tokens = num_new_seqs * tokens_per_seq
+        else:
+            num_deferred_tokens = num_deferred_seqs
+            num_new_tokens = num_new_seqs
 
         if is_all_same:
-            self.input_ids.gpu[:num_deferred_tokens] = self.prev_token_ids
+            # All requests are the same, only deferred tokens
+            if self.use_spec:
+                # MTP mode: combine prev_token_ids and draft_token_ids
+                if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
+                    combined = torch.cat([
+                        self.prev_token_ids.unsqueeze(1),  # (num_seqs, 1)
+                        self.draft_token_ids               # (num_seqs, mtp_n_grams-1)
+                    ], dim=1).reshape(-1)                   # (num_deferred_tokens,)
+                else:
+                    combined = self.prev_token_ids
+                self.input_ids.gpu[:num_deferred_tokens] = combined
+            else:
+                # Non-MTP mode: only prev_token_ids
+                self.input_ids.gpu[:num_deferred_tokens] = self.prev_token_ids
         else:
             """
             (1) prev_batch=[301], cur_batch=[0..255, 301] → Layout: [301 prefill | new | deferred]
@@ -339,39 +305,95 @@ class tokenIDProcessor:
             is_prev_prefill = self.prev_batch.total_tokens_num_prefill > 0
             new_decode_front = (
                 is_prev_prefill
-                and new_curr_indices == list(range(num_new_tokens))
+                and new_curr_indices == list(range(num_new_seqs))
                 and deferred_curr_indices
-                == list(range(num_new_tokens, num_new_tokens + num_deferred_tokens))
+                == list(range(num_new_seqs, num_new_seqs + num_deferred_seqs))
             )
 
             gathered_tokens = None
             # old requests (deferred)
-            if num_deferred_tokens > 0:
-                self.input_ids_loc.np[:num_deferred_tokens] = deferred_prev_indices
-                gathered_tokens = torch.gather(
+            if num_deferred_seqs > 0:
+                self.input_ids_loc.np[:num_deferred_seqs] = deferred_prev_indices
+                deferred_indices_gpu = self.input_ids_loc.copy_to_gpu(num_deferred_seqs)
+                gathered_prev = torch.gather(
                     self.prev_token_ids,
                     0,
-                    self.input_ids_loc.copy_to_gpu(num_deferred_tokens),
+                    deferred_indices_gpu,
                 )
+                if self.use_spec:
+                    # MTP mode: combine prev_token_ids and draft_token_ids
+                    if self.draft_token_ids is not None and self.pre_num_decode_token_per_seq > 1:
+                        # draft_token_ids is 2D (num_seqs, mtp_n_grams-1), use direct indexing
+                        gathered_draft = self.draft_token_ids[deferred_indices_gpu]
+                        gathered_tokens = torch.cat([
+                            gathered_prev.unsqueeze(1),  # (num_deferred_seqs, 1)
+                            gathered_draft               # (num_deferred_seqs, mtp_n_grams-1)
+                        ], dim=1).reshape(-1)            # (num_deferred_tokens,)
+                    else:
+                        # normal decode (fallback)
+                        gathered_tokens = gathered_prev
+                else:
+                    # Non-MTP mode: only prev_token_ids
+                    gathered_tokens = gathered_prev
 
             if new_decode_front:
                 # Layout: [new | deferred]
                 if gathered_tokens is not None:
                     self.input_ids.gpu[num_new_tokens : num_new_tokens + num_deferred_tokens] = gathered_tokens
                 if num_new_tokens > 0:
-                    token_ids = [token for tokens in scheduled_tokens[:num_new_tokens] for token in tokens]
-                    self.input_ids.np[:num_new_tokens] = token_ids
-                    self.input_ids.copy_to_gpu(num_new_tokens)
+                    if self.use_spec:
+                        # MTP mode: combine scheduled_tokens and draft_tokens
+                        # new_decode_front=True means new_curr_indices == list(range(num_new_seqs))
+                        # so we can use sequential indexing
+                        token_ids = [
+                            token
+                            for tokens, draft_tokens in zip(
+                                scheduled_tokens[
+                                    total_reqs_prefill : total_reqs_prefill + num_new_seqs
+                                ],
+                                list(batch.scheduled_spec_decode_tokens.values())[:num_new_seqs],
+                            )
+                            for token in [tokens[-1]] + draft_tokens
+                        ]
+                        self.input_ids.np[:num_new_tokens] = token_ids
+                        self.input_ids.copy_to_gpu(num_new_tokens)
+                    else:
+                        # Non-MTP mode: flatten scheduled_tokens for new requests
+                        token_ids = [
+                            token
+                            for tokens in scheduled_tokens[
+                                total_reqs_prefill : total_reqs_prefill + num_new_seqs
+                            ]
+                            for token in tokens
+                        ]
+                        self.input_ids.np[:num_new_tokens] = token_ids
+                        self.input_ids.copy_to_gpu(num_new_tokens)
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
                 if gathered_tokens is not None:
                     self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
                 if num_new_tokens > 0:
-                    new_token_ids = [scheduled_tokens[idx][0] for idx in new_curr_indices]
-                    self.input_ids.np[:num_new_tokens] = new_token_ids
-                    self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
-                        self.input_ids.copy_to_gpu(num_new_tokens)
-                    )
+                    if self.use_spec:
+                        # MTP mode: combine scheduled_tokens and draft_tokens
+                        # For new_decode_front=False, use new_curr_indices to get the right sequences
+                        token_ids = []
+                        for idx in new_curr_indices:
+                            req_idx = total_reqs_prefill + idx
+                            tokens = scheduled_tokens[req_idx]
+                            req_id = batch.req_ids[idx]
+                            draft_tokens = batch.scheduled_spec_decode_tokens.get(req_id, [])
+                            token_ids.extend([tokens[-1]] + draft_tokens)
+                        self.input_ids.np[:num_new_tokens] = token_ids
+                        self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
+                            self.input_ids.copy_to_gpu(num_new_tokens)
+                        )
+                    else:
+                        # Non-MTP mode: only first token from scheduled_tokens
+                        new_token_ids = [scheduled_tokens[total_reqs_prefill + idx][0] for idx in new_curr_indices]
+                        self.input_ids.np[:num_new_tokens] = new_token_ids
+                        self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
+                            self.input_ids.copy_to_gpu(num_new_tokens)
+                        )
 
         return self.input_ids.gpu[:total_tokens]
 

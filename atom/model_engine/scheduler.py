@@ -242,7 +242,14 @@ class Scheduler:
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
                 if len(seq.token_ids) >= len(stop_seq):
-                    if seq.token_ids[-len(stop_seq) :] == stop_seq or (self.use_spec and seq.token_ids[-(len(stop_seq) + self.mtp_k) : - self.mtp_k] == stop_seq):
+                    stop_len = len(stop_seq)
+                    is_normal_stop = seq.token_ids[-stop_len:] == stop_seq
+                    is_mtp_stop = (
+                        self.use_spec
+                        and seq.token_ids[-(stop_len + self.mtp_k) : -self.mtp_k]
+                        == stop_seq
+                    )
+                    if is_normal_stop or is_mtp_stop:
                         leave_reason = "stop_sequence"
                         break
             else:
@@ -275,7 +282,6 @@ class Scheduler:
 
         if stream_output_queue is not None and stream_outputs:
             stream_output_queue.put_nowait(stream_outputs)
-
 
         if num_placeholder > 0:
             # placeholder for the each decode step
