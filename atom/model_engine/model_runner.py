@@ -173,16 +173,6 @@ class tokenIDProcessor:
 
         return token_id_dict
 
-    # TODO: remove when finish fix for mtp
-    def get_prev_alive_locations(self, batch: ScheduledBatch) -> tuple[list[int], int, bool]:
-        alive_seq_indices = [
-            i for i, seq_id in enumerate(self.prev_batch.req_ids)
-            if seq_id in batch.req_ids
-        ]
-        num_deferred_tokens = len(alive_seq_indices) * self.pre_num_decode_token_per_seq
-        is_all_alive = len(alive_seq_indices) == len(self.prev_batch.req_ids)
-        return alive_seq_indices, num_deferred_tokens, is_all_alive
-
     def get_token_locations(
         self, batch: ScheduledBatch
     ) -> tuple[list[int], list[int], list[int], list[int], bool]:
