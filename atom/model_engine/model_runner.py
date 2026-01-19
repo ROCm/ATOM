@@ -234,14 +234,14 @@ class tokenIDProcessor:
                     self.input_ids.copy_to_gpu(num_new_tokens)
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
-                if gathered_tokens is not None:
-                    self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
                 if num_new_tokens > 0:
                     new_token_ids = [scheduled_tokens[idx][0] for idx in new_curr_indices]
                     self.input_ids.np[:num_new_tokens] = new_token_ids
                     self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
                         self.input_ids.copy_to_gpu(num_new_tokens)
                     )
+                if gathered_tokens is not None:
+                    self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
 
         return self.input_ids.gpu[:total_tokens]
 
