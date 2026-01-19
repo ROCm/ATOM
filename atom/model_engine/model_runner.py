@@ -227,9 +227,15 @@ class tokenIDProcessor:
             if new_decode_front:
                 # Layout: [new | deferred]
                 if gathered_tokens is not None:
-                    self.input_ids.gpu[num_new_tokens : num_new_tokens + num_deferred_tokens] = gathered_tokens
+                    self.input_ids.gpu[
+                        num_new_tokens : num_new_tokens + num_deferred_tokens
+                    ] = gathered_tokens
                 if num_new_tokens > 0:
-                    token_ids = [token for tokens in scheduled_tokens[:num_new_tokens] for token in tokens]
+                    token_ids = [
+                        token
+                        for tokens in scheduled_tokens[:num_new_tokens]
+                        for token in tokens
+                    ]
                     self.input_ids.np[:num_new_tokens] = token_ids
                     self.input_ids.copy_to_gpu(num_new_tokens)
             else:
@@ -237,11 +243,13 @@ class tokenIDProcessor:
                 if gathered_tokens is not None:
                     self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
                 if num_new_tokens > 0:
-                    new_token_ids = [scheduled_tokens[idx][0] for idx in new_curr_indices]
+                    new_token_ids = [
+                        scheduled_tokens[idx][0] for idx in new_curr_indices
+                    ]
                     self.input_ids.np[:num_new_tokens] = new_token_ids
-                    self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
-                        self.input_ids.copy_to_gpu(num_new_tokens)
-                    )
+                    self.input_ids.gpu[
+                        num_deferred_tokens : num_deferred_tokens + num_new_tokens
+                    ] = self.input_ids.copy_to_gpu(num_new_tokens)
 
         return self.input_ids.gpu[:total_tokens]
 
@@ -468,10 +476,9 @@ class ModelRunner:
             total_seqs_num_decode=1,
             is_dummy_run=True,
         )
-        
+
         bs = self.prepare_intputs(dummy_batch)
         actual_num_tokens = dummy_batch.total_tokens_num
-
 
         # self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
         # self.tokenID_processor.input_ids.copy_to_gpu(actual_num_tokens)
@@ -496,7 +503,7 @@ class ModelRunner:
             num_tokens = 1
         seq = Sequence([0] * num_tokens, block_size=self.block_size)
         seqs = {seq.id: seq}
-        
+
         dummy_batch = ScheduledBatch(
             seqs=seqs,
             num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
@@ -509,23 +516,22 @@ class ModelRunner:
 
         bs = self.prepare_intputs(dummy_batch)
 
-        
         # self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
         # self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
         # input_ids = self.tokenID_processor.input_ids.gpu[:num_tokens]
         # input_ids= torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
         self.forward_vars["input_ids"].gpu[:bs].zero_()
         input_ids = self.forward_vars["input_ids"].gpu[:bs]
-        
+
         # not exe run_model and synchronize: acc 0.79
 
         with torch.no_grad():
             self.run_model(input_ids)
-        
+
         torch.cuda.synchronize()
-        
+
         reset_forward_context()
-        
+
         logger.info(
             f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens"
         )
@@ -859,7 +865,10 @@ class ModelRunner:
             bs = (
                 padded_scheduled_bs
                 if self.enforce_eager
-                else next((x for x in self.graph_bs if x >= padded_scheduled_bs), padded_scheduled_bs)
+                else next(
+                    (x for x in self.graph_bs if x >= padded_scheduled_bs),
+                    padded_scheduled_bs,
+                )
                 # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
             )
             assert (
@@ -869,9 +878,7 @@ class ModelRunner:
                 self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
             )
         attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
-        context_bs = (
-            batch.total_seqs_num_prefill if is_prefill else scheduled_bs
-        )
+        context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
         graph_bs = num_input_tokens if is_prefill else bs
         context = Context(
             positions=positions,
@@ -917,7 +924,7 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-                hidden_states = self.model(input_ids, positions)
+            hidden_states = self.model(input_ids, positions)
         else:
             graph_bs = context.graph_bs
             # torch.cuda.synchronize()
@@ -999,7 +1006,7 @@ class ModelRunner:
                     context=context,
                     num_tokens=num_tokens,
                     num_tokens_across_dp=num_tokens_across_dp,
-                )                
+                )
 
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
 

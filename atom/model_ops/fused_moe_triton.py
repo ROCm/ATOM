@@ -33,7 +33,6 @@ from atom.model_ops.utils import has_triton_kernels
 logger = logging.getLogger("atom")
 
 
-
 if has_triton_kernels():
     try:
         import triton_kernels.swiglu

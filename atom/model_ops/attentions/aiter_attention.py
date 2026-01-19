@@ -60,7 +60,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             var["slot_mapping"].np[:bs] = -1
         else:
             var["slot_mapping"].np[:bs] = slot_mapping
-            
+
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0

@@ -492,6 +492,7 @@ class ParallelConfig:
         # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
         # self.data_parallel_master_port = get_open_port()
 
+
 @dataclass
 class SpeculativeConfig:
     method: Optional[str] = ""
@@ -513,19 +514,24 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
             # Override to use only 1 layer if config says otherwise
             if n_predict != 1:
-                logger.warning(f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
-                             "(MTP typically uses 1 layer that gets reused)")
+                logger.warning(
+                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                    "(MTP typically uses 1 layer that gets reused)"
+                )
                 n_predict = 1
-            hf_config.update({
-                "n_predict": n_predict,
-                "num_nextn_predict_layers": n_predict,
-                "architectures": ["DeepSeekMTPModel"]
-            })
+            hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "num_nextn_predict_layers": n_predict,
+                    "architectures": ["DeepSeekMTPModel"],
+                }
+            )
 
     def __repr__(self) -> str:
         method = self.method
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {num_spec_tokens=})"
+
 
 @dataclass
 class Config:
@@ -582,7 +588,9 @@ class Config:
         self.hf_config = get_hf_config(self.model)
         self.generation_config = get_generation_config(self.model)
         if self.generation_config is not None:
-            if (eos_ids := getattr(self.generation_config, "eos_token_id", None)) is not None:
+            if (
+                eos_ids := getattr(self.generation_config, "eos_token_id", None)
+            ) is not None:
                 self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
         self.quant_config = get_quant_config(self.hf_config)
         hf_config_max_position_embeddings = getattr(

@@ -46,18 +46,25 @@ logger = logging.getLogger("atom")
 
 if use_triton_gemm():
     try:
-        from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import fused_gemm_afp4wfp4_preshuffle_split_cat
-        from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import fused_gemm_a8w8_blockscale_preshuffle_split_cat
+        from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import (
+            fused_gemm_afp4wfp4_preshuffle_split_cat,
+        )
+        from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
+            fused_gemm_a8w8_blockscale_preshuffle_split_cat,
+        )
     except ImportError as e:
         logger.warning(f"Triton fused GEMM split_cat not available: {e}")
         fused_gemm_afp4wfp4_preshuffle_split_cat = None
         fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 
+
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
-    return envs.ATOM_USE_TRITON_MXFP4_BMM  
+    return envs.ATOM_USE_TRITON_MXFP4_BMM
+
 
 if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
+
     # from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import  batched_gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
@@ -253,7 +260,10 @@ class MLAAttention(nn.Module):
         if use_triton_gemm():
             weight = self.kv_b_proj.weight
             weight_scale = self.kv_b_proj.weight_scale
-            if fused_gemm_afp4wfp4_preshuffle_split_cat is not None and weight.dtype == dtypes.fp4x2: # FP4 GEMM + split + cat
+            if (
+                fused_gemm_afp4wfp4_preshuffle_split_cat is not None
+                and weight.dtype == dtypes.fp4x2
+            ):  # FP4 GEMM + split + cat
                 m = kv_c_normed.shape[0]
                 # from aiter.ops.triton.quant import dynamic_mxfp4_quant
                 # input = kv_c_normed
@@ -278,27 +288,30 @@ class MLAAttention(nn.Module):
                     weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
                     k_rope.expand((-1, self.num_heads, -1)),
                     x_scale,
-                    weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1),
+                    weight_scale.view(torch.uint8).view(
+                        weight_scale.shape[0] // 32, -1
+                    ),
                     self.qk_nope_head_dim,
                     self.v_head_dim,
-                    output_dtype
+                    output_dtype,
                 )
-            elif fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None and weight.dtype == dtypes.fp8:  # FP8 GEMM + split + cat
+            elif (
+                fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
+                and weight.dtype == dtypes.fp8
+            ):  # FP8 GEMM + split + cat
                 weight_shuffled = weight.reshape(
-                    weight.shape[0] // 16,
-                    weight.shape[1] * 16
+                    weight.shape[0] // 16, weight.shape[1] * 16
                 )
 
                 output_dtype = kv_c_normed.dtype
 
                 quant_func = functools_partial(
-                    get_hip_quant(QuantType.per_1x128),
-                    transpose_scale=True
+                    get_hip_quant(QuantType.per_1x128), transpose_scale=True
                 )
                 q_input, x_scale = quant_func(
                     kv_c_normed,
                     quant_dtype=dtypes.fp8,
-                    scale=getattr(self.kv_b_proj, "input_scale", None)
+                    scale=getattr(self.kv_b_proj, "input_scale", None),
                 )
 
                 k, v = fused_gemm_a8w8_blockscale_preshuffle_split_cat(
@@ -309,13 +322,15 @@ class MLAAttention(nn.Module):
                     weight_scale,
                     self.qk_nope_head_dim,
                     self.v_head_dim,
-                    output_dtype
+                    output_dtype,
                 )
             else:
                 kv_nope = self.kv_b_proj(kv_c_normed).view(
                     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
                 )
-                k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+                k_nope, v = kv_nope.split(
+                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                )
 
                 k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
         else:
@@ -510,8 +525,12 @@ class MLAAttention(nn.Module):
                 kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
             else:
                 kv_cache = torch.tensor([])
-        slot_mapping_numel = attn_metadata.slot_mapping.numel() if attn_metadata.slot_mapping is not None else 0
-        is_dummy = (slot_mapping_numel == 0)
+        slot_mapping_numel = (
+            attn_metadata.slot_mapping.numel()
+            if attn_metadata.slot_mapping is not None
+            else 0
+        )
+        is_dummy = slot_mapping_numel == 0
         if is_dummy:
             # dummy run: skip real attention and return
             output_shape = list(q.shape)

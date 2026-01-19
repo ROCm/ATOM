@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
+
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.layernorm import RMSNorm
@@ -45,7 +46,10 @@ from aiter import fused_rope_rms
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
-ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
+    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+)
+
 
 class RotaryEmbeddingQKNormFused(nn.Module):
     def __init__(
@@ -71,7 +75,11 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         cache = torch.cat((cos, sin), dim=-1)
         self.cos_sin_cache: torch.Tensor
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            self.register_buffer("cos_sin_cache", cache.view(cache.size(0), self.head_size), persistent=False)
+            self.register_buffer(
+                "cos_sin_cache",
+                cache.view(cache.size(0), self.head_size),
+                persistent=False,
+            )
         else:
             self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -84,7 +92,8 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+                / self.rotary_dim
             )
         )
         return inv_freq
@@ -99,7 +108,8 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
         return cos, sin
 
-    def forward(self,
+    def forward(
+        self,
         qkv: torch.Tensor,
         q_weight: torch.Tensor,
         k_weight: torch.Tensor,
@@ -190,7 +200,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             use_grouped_topk=False,
             prefix=f"{prefix}.experts",
-            config=config)
+            config=config,
+        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -201,9 +212,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.dim() <= 2, (
-            "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
-        )
+        assert (
+            hidden_states.dim() <= 2
+        ), "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         is_input_1d = hidden_states.dim() == 1
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -214,8 +225,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits
         )
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
 
@@ -329,7 +339,6 @@ class Qwen3MoeAttention(nn.Module):
         self.kv_cache_dtype = kv_cache_dtype
         self.layer_num = layer_num
 
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -337,7 +346,9 @@ class Qwen3MoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
             attn_output = self.attn(q, k, v, positions, None, qkv)
         elif ENABLE_QK_NORM_ROPE_FUSION:
             self.rotary_emb(
@@ -349,10 +360,14 @@ class Qwen3MoeAttention(nn.Module):
                 num_kv_heads=self.num_kv_heads,
                 eps=self.q_norm.eps,
             )
-            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
             attn_output = self.attn(q, k, v)
         else:
-            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
             # Add qk-norm
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -376,8 +391,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         self.layer_idx = layer_num
@@ -402,7 +416,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
         if (self.layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0 and (self.layer_idx + 1) % config.decoder_sparse_step == 0
+            config.num_experts > 0
+            and (self.layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(
                 config, quant_config=quant_config, prefix=f"{prefix}.mlp"
@@ -453,10 +468,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
 @support_torch_compile
 class Qwen3MoeModel(nn.Module):
     def __init__(
-            self,
-            atom_config: Config,
-            prefix: str = "",
-            layer_type: type[nn.Module] = Qwen3MoeDecoderLayer,):
+        self,
+        atom_config: Config,
+        prefix: str = "",
+        layer_type: type[nn.Module] = Qwen3MoeDecoderLayer,
+    ):
         super().__init__()
 
         config = atom_config.hf_config
@@ -518,7 +534,7 @@ class Qwen3MoeModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
@@ -539,10 +555,8 @@ class Qwen3MoeModel(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-    
-class Qwen3MoeForCausalLM(
-    nn.Module
-):
+
+class Qwen3MoeForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -552,11 +566,11 @@ class Qwen3MoeForCausalLM(
     }
 
     def __init__(
-            self,
-            atom_config: Config,
-            prefix: str = "",
-            layer_type: type[nn.Module] = Qwen3MoeDecoderLayer,
-        ):
+        self,
+        atom_config: Config,
+        prefix: str = "",
+        layer_type: type[nn.Module] = Qwen3MoeDecoderLayer,
+    ):
         super().__init__()
         config = atom_config.hf_config
         quant_config = atom_config.quant_config
@@ -587,7 +601,6 @@ class Qwen3MoeForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
 
-
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
@@ -610,21 +623,19 @@ class Qwen3MoeForCausalLM(
         logits = self.lm_head(hidden_states)
         return logits
 
-
     def make_empty_intermediate_tensors(
-            self, batch_size: int, dtype: torch.dtype,
-            device: torch.device) -> IntermediateTensors:
-        return IntermediateTensors({
-            "hidden_states":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-            "residual":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-        })
-    
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+                "residual": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+            }
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

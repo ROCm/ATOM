@@ -24,7 +24,7 @@ parser.add_argument(
 
 
 def generate_cuda_graph_sizes(max_size):
-# This is for DP split batch size
+    # This is for DP split batch size
     sizes = []
     power = 1
     while power <= max_size:

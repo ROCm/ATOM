@@ -34,9 +34,9 @@ def _cached_get_attn_backend(
     # get device-specific attn_backend
     attention_cls = get_attn_backend_cls(block_size, use_mla)
     if not attention_cls:
-        raise ValueError(
-            f"Invalid attention backend for {attention_cls}")
+        raise ValueError(f"Invalid attention backend for {attention_cls}")
     return resolve_obj_by_qualname(attention_cls)
+
 
 def get_attn_backend_cls(block_size, use_mla) -> str:
     if use_mla:

@@ -13,6 +13,7 @@ from aiter import QuantType
 # Lazy import mori
 try:
     import mori
+
     MORI_AVAILABLE = True
 except ImportError:
     mori = None  # type: ignore
@@ -30,7 +31,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         use_fp8_dispatch: bool = False,
-        quant_type = None,
+        quant_type=None,
         quant_dtype: torch.dtype = None,
     ):
         if not MORI_AVAILABLE:
@@ -86,12 +87,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         - Optional dispatched expert topk IDs
         - Optional dispatched expert topk weight
         """
-        assert not apply_router_weight_on_input, (
-            "mori does not support apply_router_weight_on_input=True now."
-        )
+        assert (
+            not apply_router_weight_on_input
+        ), "mori does not support apply_router_weight_on_input=True now."
         scale = None
         if self.use_fp8_dispatch:
             from aiter import get_hip_quant
+
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
 

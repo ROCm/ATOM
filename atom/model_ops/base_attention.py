@@ -133,7 +133,7 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor]=None,
+        q_scale: Optional[torch.Tensor] = None,
         qkv: torch.Tensor = None,
     ):
         output = torch.ops.aiter.unified_attention_with_output_base(

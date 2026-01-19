@@ -23,6 +23,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Mixtral model."""
+
 from collections.abc import Iterable
 from typing import Optional, Union
 
@@ -31,6 +32,7 @@ from torch import nn
 from transformers import MixtralConfig
 
 from aiter import QuantType
+
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
 from aiter.dist.parallel_state import (
@@ -291,7 +293,11 @@ class MixtralModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix, layer_num=None: MixtralDecoderLayer(
-                config, cache_config, quant_config=quant_config, prefix=prefix, layer_num=layer_num
+                config,
+                cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+                layer_num=layer_num,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,

@@ -12,6 +12,7 @@ from torch import nn
 
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
+
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(

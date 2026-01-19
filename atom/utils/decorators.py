@@ -3,7 +3,7 @@
 
 from typing import Callable, Optional, TypeVar, Union, overload
 import inspect
-import os,sys
+import os, sys
 from types import CodeType
 from abc import abstractmethod
 from contextlib import contextmanager
@@ -15,12 +15,14 @@ import torch.nn as nn
 import time
 
 from atom.config import CompilationConfig, Config, CompilationLevel
+
 # from atom.utils import start_monitoring_torch_compile
 
 _T = TypeVar("_T", bound=type[nn.Module])
 
 context_manager = None
 torch_compile_start_time: float = 0.0
+
 
 # We remove it from utils/__init__.py to avoid circular import
 def start_monitoring_torch_compile(vllm_config: Config):
@@ -52,6 +54,7 @@ def end_monitoring_torch_compile(vllm_config: Config):
 
 def init_backend(config: Config):
     from .backends import VllmBackend
+
     return VllmBackend(config)
 
 
@@ -67,11 +70,13 @@ class TorchCompileWrapperWithCustomDispatcher:
     3. Implement the `__init__` method to determine how to call
         `torch.compile` over the forward method.
     """
-    
-    def __init__(self,
-                 vllm_config: Config,
-                 compiled_callable: Optional[Callable] = None,
-                 compilation_level: int = 0):
+
+    def __init__(
+        self,
+        vllm_config: Config,
+        compiled_callable: Optional[Callable] = None,
+        compilation_level: int = 0,
+    ):
         self.vllm_config = vllm_config
 
         if compiled_callable is None:
@@ -84,7 +89,8 @@ class TorchCompileWrapperWithCustomDispatcher:
                 # fullgraph=True,
                 backend=backend,
                 # dynamic=True,
-                options=options)
+                options=options,
+            )
 
         self.compiled_callable = compiled_callable
         self.original_code_object = self.__class__.forward.__code__
@@ -94,8 +100,9 @@ class TorchCompileWrapperWithCustomDispatcher:
         # read the env var to determine whether to use the custom dispatcher
         # subclasses can use this to switch between the custom dispatcher
         # and the default Dynamo guard mechanism.
-        self.use_custom_dispatcher: bool = \
+        self.use_custom_dispatcher: bool = (
             compilation_level >= CompilationLevel.DYNAMO_ONCE
+        )
 
     def __call__(self, *args, **kwargs):
         """Implement the dispatch logic here, beyond the torch.compile level.
@@ -106,8 +113,7 @@ class TorchCompileWrapperWithCustomDispatcher:
         return self.compiled_callable(*args, **kwargs)
 
     @abstractmethod
-    def forward(self, *args, **kwargs):
-        ...
+    def forward(self, *args, **kwargs): ...
 
     def bytecode_hook(self, old_code: CodeType, new_code: CodeType):
         """Hook to save the compiled bytecode for direct execution."""
@@ -132,8 +138,9 @@ class TorchCompileWrapperWithCustomDispatcher:
         if isinstance(debug_dump_dir, str) and debug_dump_dir != "":
             # rank = self.vllm_config.parallel_config.rank
             rank = 0
-            decompiled_file = os.path.join(debug_dump_dir, f"rank_{rank}",
-                                           "transformed_code.py")
+            decompiled_file = os.path.join(
+                debug_dump_dir, f"rank_{rank}", "transformed_code.py"
+            )
             if not os.path.exists(decompiled_file):
                 try:
                     # usually the decompilation will succeed for most models,
@@ -141,6 +148,7 @@ class TorchCompileWrapperWithCustomDispatcher:
                     # but there's no 100% guarantee, since decompliation is
                     # not a reversible process.
                     import depyf
+
                     src = depyf.decompile(new_code)
 
                     with open(decompiled_file, "w") as f:
@@ -148,11 +156,17 @@ class TorchCompileWrapperWithCustomDispatcher:
                 except Exception:
                     pass
 
-        if self.vllm_config.compilation_config.use_cudagraph and \
-            "update" in new_code.co_names:
+        if (
+            self.vllm_config.compilation_config.use_cudagraph
+            and "update" in new_code.co_names
+        ):
             import depyf
+
             src = depyf.decompile(new_code)
-            msg = "Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code. The following code contains clues about which buffer is being modified (please search for the usage of the function `update`):\n" + src  # noqa
+            msg = (
+                "Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code. The following code contains clues about which buffer is being modified (please search for the usage of the function `update`):\n"
+                + src
+            )  # noqa
             raise RuntimeError(msg)
 
     @contextmanager
@@ -164,11 +178,10 @@ class TorchCompileWrapperWithCustomDispatcher:
         the code object in the function and call it.
 
         See https://dev-discuss.pytorch.org/t/what-is-the-relationship-requirement-among-original-bytecode-transformed-bytecode-and-bytecode-returned-by-hooks-in-dynamo/1693/7 for more details.
-        """ # noqa
+        """  # noqa
         self.__class__.forward.__code__ = self.compiled_codes[index]
         yield
         self.__class__.forward.__code__ = self.original_code_object
-
 
 
 def support_torch_compile(
@@ -179,7 +192,7 @@ def support_torch_compile(
     def cls_decorator_helper(cls: _T) -> _T:
         # helper to pass `dynamic_arg_dims`` to `_support_torch_compile``
         # to avoid too much indentation for `_support_torch_compile``
-        if not hasattr(cls, 'forward'):
+        if not hasattr(cls, "forward"):
             raise TypeError("decorated class should have a forward method.")
         sig = inspect.signature(cls.forward)
         inferred_dynamic_arg_dims = dynamic_arg_dims
@@ -187,20 +200,22 @@ def support_torch_compile(
             inferred_dynamic_arg_dims = {}
             for k, v in sig.parameters.items():
                 if v.annotation in [
-                        torch.Tensor, Optional[torch.Tensor],
+                    torch.Tensor,
+                    Optional[torch.Tensor],
                 ]:
                     inferred_dynamic_arg_dims[k] = 0
-
 
         if len(inferred_dynamic_arg_dims) == 0:
             raise ValueError(
                 "No dynamic dimensions found in the forward method of "
-                f"{cls}. Please provide dynamic_arg_dims explicitly.")
+                f"{cls}. Please provide dynamic_arg_dims explicitly."
+            )
 
         for k in inferred_dynamic_arg_dims:
             if k not in sig.parameters:
                 raise ValueError(
-                    f"Argument {k} not found in the forward method of {cls}")
+                    f"Argument {k} not found in the forward method of {cls}"
+                )
         return _support_torch_compile(cls, inferred_dynamic_arg_dims)
 
     if cls is not None:
@@ -209,6 +224,7 @@ def support_torch_compile(
         return cls_decorator_helper(cls)
 
     return cls_decorator_helper
+
 
 def _support_torch_compile(
     cls: _T,
@@ -224,26 +240,28 @@ def _support_torch_compile(
     # take care of method resolution order
     # make sure super().__init__ is called on the base class
     #  other than TorchCompileWrapperWithCustomDispatcher
-    cls.__bases__ = cls.__bases__ + (TorchCompileWrapperWithCustomDispatcher, )
+    cls.__bases__ = cls.__bases__ + (TorchCompileWrapperWithCustomDispatcher,)
 
     old_init = cls.__init__
-
 
     def __init__(self, atom_config: Config, **kwargs):
         old_init(self, atom_config=atom_config, **kwargs)
         self.atom_config = atom_config
         # for CompilationLevel.DYNAMO_AS_IS , the upper level model runner
         # will handle the compilation, so we don't need to do anything here.
-        self.do_not_compile = \
-            atom_config.compilation_config.level in [
-            CompilationLevel.NO_COMPILATION, CompilationLevel.DYNAMO_AS_IS
-        ] 
+        self.do_not_compile = atom_config.compilation_config.level in [
+            CompilationLevel.NO_COMPILATION,
+            CompilationLevel.DYNAMO_AS_IS,
+        ]
         # print("self.do_not_compile",self.do_not_compile)
         if self.do_not_compile:
             return
 
         TorchCompileWrapperWithCustomDispatcher.__init__(
-            self, vllm_config=atom_config, compilation_level=atom_config.compilation_config.level)
+            self,
+            vllm_config=atom_config,
+            compilation_level=atom_config.compilation_config.level,
+        )
 
     cls.__init__ = __init__
 
@@ -266,16 +284,15 @@ def _support_torch_compile(
                     dims = [dims] if isinstance(dims, int) else dims
                     if isinstance(arg, torch.Tensor):
                         # In case dims is specified with negative indexing
-                        dims = [
-                            arg.ndim + dim if dim < 0 else dim for dim in dims
-                        ]
+                        dims = [arg.ndim + dim if dim < 0 else dim for dim in dims]
                         # print(arg.shape)
                         # print(f"torch._dynamo.mark_dynamic({arg, dims})")
                         torch._dynamo.mark_dynamic(arg, dims)
                     else:
                         raise ValueError(
                             "Unsupported dynamic dimensions"
-                            f" {dims} for argument {k} with type {type(arg)}.")
+                            f" {dims} for argument {k} with type {type(arg)}."
+                        )
             # here, it is the starting point of the `torch.compile` process
             start_monitoring_torch_compile(self.atom_config)
             # print("Start compiling function %s",
@@ -288,8 +305,7 @@ def _support_torch_compile(
             # it seems Dynamo reuse the compilation across instances,
             # while we need to make sure the compiled code is not reused.
             # we need to control all the compilation of the model.
-            torch._dynamo.eval_frame.remove_from_cache(
-                self.original_code_object)
+            torch._dynamo.eval_frame.remove_from_cache(self.original_code_object)
 
             # collect all relevant files traced by Dynamo,
             # so that the compilation cache can trigger re-compilation
@@ -297,7 +313,8 @@ def _support_torch_compile(
 
             # 1. the file containing the top-level forward function
             self.vllm_config.compilation_config.traced_files.add(
-                self.original_code_object.co_filename)
+                self.original_code_object.co_filename
+            )
 
             # 2. every time Dynamo sees a function call, it will inline
             # the function by calling InliningInstructionTranslator.inline_call
@@ -307,12 +324,12 @@ def _support_torch_compile(
 
             def patched_inline_call(parent, func, args, kwargs):
                 code = func.get_code()
-                self.vllm_config.compilation_config.traced_files.add(
-                    code.co_filename)
+                self.vllm_config.compilation_config.traced_files.add(code.co_filename)
                 return inline_call(parent, func, args, kwargs)
 
-            with patch.object(InliningInstructionTranslator, 'inline_call',
-                              patched_inline_call):
+            with patch.object(
+                InliningInstructionTranslator, "inline_call", patched_inline_call
+            ):
                 # print("self.compiled_callable to call torch compile")
                 output = self.compiled_callable(*args, **kwargs)
             return output
@@ -326,4 +343,3 @@ def _support_torch_compile(
 
     cls.__call__ = __call__
     return cls
-
