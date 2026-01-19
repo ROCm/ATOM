@@ -31,12 +31,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        baes_image:
+        base_image:
           - "rocm/pytorch:latest"
           - "rocm/pytorch-private:ROCm_7.2_atom_1216"
-        gpu_arch:
-          - "gfx942"
-          - "gfx950"
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
@@ -45,6 +42,7 @@ jobs:
       AITER_COMMIT: "HEAD"
       RCCL_REPO: "https://github.com/ROCm/rccl.git"
       RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
+      GPU_ARCH: "gfx942;gfx950"
 
     steps:
       - name: Checkout ATOM repo
@@ -67,21 +65,20 @@ jobs:
         timeout-minutes: 120
         run: |
           docker build --network=host -t atom_release:ci \
-          --build-arg BASE_IMAGE=${{ matrix.baes_image }} \
-          --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
+          --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
+          --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
           --build-arg MAX_JOBS=64 \
-          --build-arg ATOM_REPO=${{ inputs.atom_repo || env.ATOM_REPO }} \
-          --build-arg ATOM_COMMIT=${{ inputs.atom_commit || env.ATOM_COMMIT }} \
-          --build-arg AITER_REPO=${{ inputs.aiter_repo || env.AITER_REPO }} \
-          --build-arg AITER_COMMIT=${{ inputs.aiter_commit || env.AITER_COMMIT }} \
-          --build-arg RCCL_REPO=${{ inputs.rccl_repo || env.RCCL_REPO }} \
-          --build-arg RCCL_BRANCH=${{ inputs.rccl_branch || env.RCCL_BRANCH }} \
+          --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
+          --build-arg ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}" \
+          --build-arg AITER_REPO="${{ inputs.aiter_repo || env.AITER_REPO }}" \
+          --build-arg AITER_COMMIT="${{ inputs.aiter_commit || env.AITER_COMMIT }}" \
+          --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
+          --build-arg RCCL_BRANCH="${{ inputs.rccl_branch || env.RCCL_BRANCH }}" \
           -f docker/Dockerfile .
           docker inspect atom_release:ci
 
       - name: Test Docker image
         timeout-minutes: 60
-        if: ${{ matrix.gpu_arch == 'gfx950' }}
         run: |
           echo "Clean up containers..."
           docker ps -aq -f name=atom_release_ci | xargs -r docker stop | xargs -r docker rm
@@ -130,14 +127,14 @@ jobs:
       - name: Push Docker image
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
-          if [[ ${{ matrix.baes_image }} == *ROCm_7.2* ]]; then
-            TAG=nightly_rocm_7.2_preview_${{ matrix.gpu_arch }}_$(date +%Y%m%d%H%M)
-            docker tag atom_release:ci rocm/atom:rocm_7.2_preview_${{ matrix.gpu_arch }}_latest
-            docker push rocm/atom:rocm_7.2_preview_${{ matrix.gpu_arch }}_latest
+          if [[ ${{ matrix.base_image }} == *ROCm_7.2* ]]; then
+            TAG=nightly_rocm_7.2_preview_$(date +%Y%m%d%H%M)
+            docker tag atom_release:ci rocm/atom:rocm_7.2_preview_latest
+            docker push rocm/atom:rocm_7.2_preview_latest
           else
-            TAG=nightly_${{ matrix.gpu_arch }}_$(date +%Y%m%d%H%M)
-            docker tag atom_release:ci rocm/atom:${{ matrix.gpu_arch }}_latest
-            docker push rocm/atom:${{ matrix.gpu_arch }}_latest
+            TAG=nightly_$(date +%Y%m%d%H%M)
+            docker tag atom_release:ci rocm/atom:latest
+            docker push rocm/atom:latest
           fi
           docker tag atom_release:ci rocm/atom:${TAG}
           docker push rocm/atom:${TAG}
