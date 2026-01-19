@@ -80,9 +80,6 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.utils import _has_module
 
-from aiter import gemm_a8w8_blockscale_bpreshuffle
-
-from atom.model_ops.attention_mla import is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
     is_rocm_aiter_fuse_routed_scaling_factor,
