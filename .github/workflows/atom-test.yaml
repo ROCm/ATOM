@@ -111,7 +111,7 @@ jobs:
       - name: Start CI container
         run: |
           echo "Clean up containers..."
-          docker ps -aq -f name=atom_test | xargs -r docker stop | xargs -r docker rm
+          docker ps -aq -f name=atom_test | xargs -r docker stop | xargs -r docker rm || true
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
