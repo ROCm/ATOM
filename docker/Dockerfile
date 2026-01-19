@@ -21,6 +21,7 @@ RUN pip show lm-eval || true
 
 # Install MORI (Modular RDMA Interface)
 # https://github.com/ROCm/mori
+RUN apt-get update && apt --fix-broken install -y
 RUN apt-get update && apt-get install -y \
     git \
     cython3 \
