@@ -80,7 +80,6 @@ class tokenIDProcessor:
         )
         self.use_spec = use_spec
         if self.use_spec:
-            self.draft_tokens = CpuGpuBuffer((max_num_batched_tokens, num_speculative_tokens), dtype=torch.int32, device=device)
             self.num_speculative_tokens = num_speculative_tokens
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
@@ -394,10 +393,7 @@ class tokenIDProcessor:
             ret = {seq_id: token_id for seq_id, token_id in zip(req_ids, draft_token_ids)}
             ret[-1] = 0
         else:
-            # bs = draft_token_ids.shape[0]
-            self.draft_token_ids = draft_token_ids # tmp, to be removed
-            # self.draft_tokens.gpu[:bs, :self.num_speculative_tokens] = draft_token_ids
-            # self.draft_tokens.copy_to_cpu()
+            self.draft_token_ids = draft_token_ids
             self.pre_num_decode_token_per_seq = self.num_speculative_tokens + 1
             token_ids = self.recv_async_output_draft()
             self.send_to_cpu_async_draft(draft_token_ids)
@@ -1138,7 +1134,7 @@ class ModelRunner:
         batch: ScheduledBatch,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-    ) -> dict[int, list[int]]:
+    ) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
 
         if spec_decode_metadata is None:
@@ -1229,7 +1225,9 @@ class ModelRunner:
         return token_ids, sampled_tokens
 
     @torch.inference_mode()
-    def forward(self, batch: ScheduledBatch) -> dict[int, list[int]]:
+    def forward(
+        self, batch: ScheduledBatch
+    ) -> tuple[dict[int, list[int]], Optional[dict[int, list[int]]]]:
         input_ids, temperatures = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids)
         sampled_token_ids, cur_sampled_tokens = self.postprocess(batch, logits, temperatures)
