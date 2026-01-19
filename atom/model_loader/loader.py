@@ -25,8 +25,6 @@ from atom.model_ops.moe import FusedMoEMethodBase, is_rocm_aiter_fusion_shared_e
 from aiter.dist.parallel_state import get_tp_group
 from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrite_spec_layer_name
 
-from aiter import logger
-
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     if loaded_weight.numel() == param.data.numel():
         param.data.copy_(loaded_weight)

@@ -279,13 +279,13 @@ def remap_output_scale_name(name: str, params_dict: dict) -> Optional[str]:
             
             # remap
             if remapped_name not in params_dict:
-                # logger.warning_once(
-                #     "Found %s in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). %s is not loaded. Attempting to modify.",  # noqa: E501
-                #     scale_name,
-                #     name,
-                #     remapped_name,
-                #     scale_name,
-                # )
+                logger.warning_once(
+                    "Found %s in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). %s is not loaded. Attempting to modify.",  # noqa: E501
+                    scale_name,
+                    name,
+                    remapped_name,
+                    scale_name,
+                )
                 return None
             return remapped_name
 
