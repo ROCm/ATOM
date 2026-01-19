@@ -16,6 +16,7 @@ from atom.utils.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+from atom.config import get_current_atom_config
 from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
@@ -24,8 +25,12 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
 from atom.utils import envs
-ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
+    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+)
 ATOM_ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
+
 
 class Attention(nn.Module):
 
@@ -72,9 +77,15 @@ class Attention(nn.Module):
         self.q_norm = q_norm
         self.k_norm = k_norm
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            assert self.rotary_emb is not None, "rotary_emb must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
-            assert self.q_norm is not None, "q_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
-            assert self.k_norm is not None, "k_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
+            assert (
+                self.rotary_emb is not None
+            ), "rotary_emb must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
+            assert (
+                self.q_norm is not None
+            ), "q_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
+            assert (
+                self.k_norm is not None
+            ), "k_norm must be provided when enabling QK_NORM_ROPE_CACHE_QUANT_FUSION for Qwen models."
 
     def forward(
         self,
@@ -82,7 +93,7 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         position: torch.Tensor = None,
-        q_scale: torch.Tensor=None,
+        q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
     ):
 
@@ -97,10 +108,12 @@ class Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        
+
         # rope cache
-        q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(q, k, v, qkv, position, fwd_args)
-        
+        q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(
+            q, k, v, qkv, position, fwd_args
+        )
+
         attn_impl = self.dispatch_backend(fwd_args)
 
         o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args)
@@ -108,10 +121,11 @@ class Attention(nn.Module):
         o = o.view(-1, self.num_heads * self.head_dim)
 
         return o
-    
-    
-    def rope_cache(self, q, k, v, qkv, position, fwd_args: ForwardContext, flash_layout=False):
-        
+
+    def rope_cache(
+        self, q, k, v, qkv, position, fwd_args: ForwardContext, flash_layout=False
+    ):
+
         # if flash kv_cache layout, the shape of kv_cache is:
         #
         # key_cache:   [num_blocks, block_size, num_kv_heads, head_size]
@@ -121,7 +135,7 @@ class Attention(nn.Module):
         #
         # key_cache:   [num_blocks, num_kv_heads, head_size // x, block_size, x]
         # value_cache: [num_blocks, num_kv_heads, head_size, block_size]
-        # 
+        #
         # and the origin kv cache layout in fwd_args is not flash
 
         attn_metadata = fwd_args.attn_metadata
@@ -132,9 +146,7 @@ class Attention(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
-        use_triton_attn = (
-            self.sliding_window != -1 or self.head_dim != 128
-        )
+        use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
         self.use_triton_attn = use_triton_attn
 
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
@@ -153,17 +165,17 @@ class Attention(nn.Module):
                 k_cache=k_cache,
                 v_cache=v_cache,
                 slot_mapping=attn_metadata.slot_mapping,
-                kv_cache_dtype="auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype,
+                kv_cache_dtype=(
+                    "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+                ),
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
 
-            qkv = qkv.view(qkv.shape[0], 
-                           -1,
-                           self.head_dim)
-            q, k, v = qkv.split([self.num_heads,
-                                self.num_kv_heads,
-                                self.num_kv_heads], dim=1)
+            qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
+            q, k, v = qkv.split(
+                [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
+            )
         elif use_triton_attn or not ATOM_ENABLE_QK_NORM_ROPE_FUSION:
             if flash_layout:
                 k_cache = k_cache.view(
@@ -197,9 +209,10 @@ class Attention(nn.Module):
                 output_zeros=False,
             )
         else:
-            # for asm paged attention 
-            assert position is not None
-            q, k = self.rotary_emb(position, q, k)
+            # for asm paged attention
+            if self.rotary_emb is not None:
+                assert position is not None
+                q, k = self.rotary_emb(position, q, k)
             if self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
@@ -223,14 +236,15 @@ class Attention(nn.Module):
                     v_scale=None,
                     asm_layout=True,
                 )
-        
+
         return q, k, v, k_cache, v_cache, k_scale, v_scale
-        
-        
-    def paged_attention_triton(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext):
-        
+
+    def paged_attention_triton(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext
+    ):
+
         attn_metadata = fwd_args.attn_metadata
-        
+
         o = torch.empty_like(q)
         num_seqs, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
@@ -252,9 +266,7 @@ class Attention(nn.Module):
             max_context_partition_num,
             query_group_size,
         )
-        exp_sums = torch.empty(
-            intermediate_shape, dtype=torch.float32, device=q.device
-        )
+        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
         max_logits = torch.empty(
             intermediate_shape, dtype=torch.float32, device=q.device
         )
@@ -294,13 +306,14 @@ class Attention(nn.Module):
             sliding_window=self.sliding_window,
             ps=True,
         )
-        
+
         return o
 
+    def paged_attention_asm(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext
+    ):
 
-    def paged_attention_asm(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext):
-        
-        attn_metadata = fwd_args.attn_metadata        
+        attn_metadata = fwd_args.attn_metadata
         o = aiter.pa_fwd_asm(
             q,
             k_cache,
@@ -313,12 +326,51 @@ class Attention(nn.Module):
             out_=None,
             high_precision=0,
         )
-        
+
         return o
 
+    def paged_attention_persistent_asm(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext
+    ):
+        attn_metadata = fwd_args.attn_metadata
+        output = torch.empty_like(q)
 
-    def prefill_attention_asm(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext):
-        
+        # def asm_V_shuffle(VC):
+        #     # [num_blocks, num_kv_heads, head_size, block_size]
+        #     x = 16 // VC.element_size()
+        #     num_blocks, num_kv_heads, head_size, block_size = VC.shape
+        #     VC = VC.view(num_blocks, num_kv_heads, head_size, block_size // x, x)
+        #     # [num_blocks, num_kv_heads, block_size/X, head_size, X]
+        #     VC = VC.permute(0, 1, 3, 2, 4).contiguous()
+        #     return VC
+
+        aiter.pa_persistent_fwd(
+            Q=q,
+            K=k_cache,
+            V=v_cache,
+            output=output,
+            max_qlen=attn_metadata.max_q_len,
+            qo_indptr=attn_metadata.cu_seqlens_q,
+            kv_indptr=attn_metadata.kv_indptr,
+            kv_indices=attn_metadata.kv_indices,
+            context_lens=attn_metadata.context_lens,
+            K_QScale=k_scale,
+            V_QScale=v_scale,
+            work_indptr=attn_metadata.work_indptr,
+            work_info=attn_metadata.work_info_set,
+            reduce_indptr=attn_metadata.reduce_indptr,
+            reduce_final_map=attn_metadata.reduce_final_map,
+            reduce_partial_map=attn_metadata.reduce_partial_map,
+            softmax_scale=self.scale,
+            mask=1,
+        )
+
+        return output
+
+    def prefill_attention_asm(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext
+    ):
+
         # variable lenth attention use key value as input
         attn_metadata = fwd_args.attn_metadata
         sliding_window = (self.sliding_window, 0, 0) if self.sliding_window is not None else (-1, -1, 0)
@@ -337,19 +389,20 @@ class Attention(nn.Module):
             window_size=sliding_window,
             sink_ptr=self.sinks,
         )
-        
-        return o
-        
 
-    def prefill_attention_triton(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext):
-        
+        return o
+
+    def prefill_attention_triton(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext
+    ):
+
         # the unified_attention supports both prefill attention and decode attention, but it only support
         # flash-layout kv_cache.
         #
         # key_cache:   [num_blocks, block_size, num_kv_heads, head_size]
         # value_cache: [num_blocks, num_kv_heads, head_size, block_size]
         #
-        # if the paged_attention supports only non-flash-layout kv_cache and kv_cache is also cached as 
+        # if the paged_attention supports only non-flash-layout kv_cache and kv_cache is also cached as
         # non-flash-layout in rope_cache phase, the unified_attention should use key and value as kv_cache
         # with block_size 1 and fake block_table.
         #
@@ -358,16 +411,20 @@ class Attention(nn.Module):
 
         attn_metadata = fwd_args.attn_metadata
         ctx = fwd_args.context
-        
+
         block_tables = attn_metadata.block_tables
         if ctx.is_prefill:
             k_cache = k.unsqueeze(1)
             v_cache = v.unsqueeze(1)
             block_tables = attn_metadata.fake_block_tables
-        
+
         o = torch.empty_like(q)
         descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
-        sliding_window = (self.sliding_window - 1, 0) if self.sliding_window is not None else (-1, -1)
+        sliding_window = (
+            (self.sliding_window - 1, 0)
+            if self.sliding_window is not None
+            else (-1, -1)
+        )
         unified_attention(
             q,
             k_cache,
@@ -388,11 +445,11 @@ class Attention(nn.Module):
             v_descale=self.kv_scale.expand(descale_shape),
             sinks=self.sinks,
         )
-        
+
         return o
-    
+
     def dispatch_backend(self, fwd_args: ForwardContext):
-        
+
         ctx = fwd_args.context
 
         if ctx.is_prefill:
@@ -405,4 +462,10 @@ class Attention(nn.Module):
                 return self.paged_attention_triton
             else:
                 # Qwen only uses gluon pa decode when bs=64
-                return self.paged_attention_triton if ctx.batch_size == 64 else self.paged_attention_asm
+                if ctx.batch_size == 64:
+                    return self.paged_attention_triton
+                # Only use pa persistent when block_size == 1024
+                atom_config = get_current_atom_config()
+                if atom_config.kv_cache_block_size == 1024:
+                    return self.paged_attention_persistent_asm
+                return self.paged_attention_asm
