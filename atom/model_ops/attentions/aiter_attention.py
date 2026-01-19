@@ -45,7 +45,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             hf_config.num_attention_heads // get_tp_group().world_size
         )
         # For speculative decode (MTP), max_qlen = num_speculative_tokens + 1
-        if config.speculative_config is not None and config.speculative_config.num_speculative_tokens is not None:
+        if (
+            config.speculative_config is not None
+            and config.speculative_config.num_speculative_tokens is not None
+        ):
             max_qlen = config.speculative_config.num_speculative_tokens + 1
         else:
             max_qlen = 1
@@ -83,24 +86,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
             ),
             "reduce_partial_map": torch.empty(
-                reduce_partial_map_size, dtype=reduce_partial_map_type, device=self.device
+                reduce_partial_map_size,
+                dtype=reduce_partial_map_type,
+                device=self.device,
             ),
             "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq // self.block_ratio,
                 **i32_kwargs,
             ),
-
         }
         self.model_runner.forward_vars.update(pa_persistent_metadata)
-    
+
     def set_aiter_persistent_worker_buffers(self, bs: int):
         config = self.model_runner.config
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
-        num_kv_heads = max(1, hf_config.num_key_value_heads // get_tp_group().world_size)
+        num_kv_heads = max(
+            1, hf_config.num_key_value_heads // get_tp_group().world_size
+        )
         block_size = self.block_size
-
 
         var = self.model_runner.forward_vars
         max_qlen = var["max_qlen"]

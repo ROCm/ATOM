@@ -59,7 +59,12 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import Config, QuantizationConfig, get_current_atom_config, CompilationLevel
+from atom.config import (
+    Config,
+    QuantizationConfig,
+    get_current_atom_config,
+    CompilationLevel,
+)
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules, is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.base_attention import Attention
@@ -838,26 +843,28 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             if hidden_states.dtype != torch.float16:
                 final_hidden_states = self.experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits)
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
                 if not is_rocm_aiter_fuse_routed_scaling_factor():
-                    final_hidden_states = final_hidden_states * self.routed_scaling_factor
+                    final_hidden_states = (
+                        final_hidden_states * self.routed_scaling_factor
+                    )
             else:
                 final_hidden_states = self.experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits)
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
 
         current_stream.wait_stream(alt_stream)
 
         if hidden_states.dtype != torch.float16:
             final_hidden_states = final_hidden_states + shared_output
         else:
-            final_hidden_states = final_hidden_states + shared_output \
-                * (1. / self.routed_scaling_factor)
+            final_hidden_states = final_hidden_states + shared_output * (
+                1.0 / self.routed_scaling_factor
+            )
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
