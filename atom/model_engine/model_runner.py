@@ -110,7 +110,6 @@ class tokenIDProcessor:
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             self.async_copy_event.record(self.async_copy_stream)
         self.draft_token_ids_cpu.append(cpu_tensor)
-        self.draft_token_ids_gpu.append(gpu_tensor)
 
     def recv_async_output_draft(self) -> list[int]:
         self.async_copy_event.synchronize()
@@ -127,7 +126,6 @@ class tokenIDProcessor:
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
-        self.draft_token_ids_gpu: list[torch.Tensor] = []
 
     def prepare_sampled_ids(
         self, batch: ScheduledBatch, sampled_token_ids: torch.Tensor
@@ -1173,7 +1171,7 @@ class ModelRunner:
                 logits=bonus_logits,
                 temperatures=temperatures,
             )
-            # Just like `bonus_logits`, `target_logits` is a ne w tensor with
+            # Just like `bonus_logits`, `target_logits` is a new tensor with
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
             target_logits = logits[target_logits_indices_mapped]
@@ -1191,7 +1189,6 @@ class ModelRunner:
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
-                temperatures,
             )
 
             # Update MTP acceptance statistics

@@ -202,7 +202,7 @@ class Scheduler:
         finished_seqs = []
         stream_outputs = []
         if is_deferred_out and self.use_spec:
-            num_placeholder = 2 * self.mtp_k
+            num_placeholder = self.mtp_k + 1
         elif is_deferred_out:
             num_placeholder = 1
         elif self.use_spec:
