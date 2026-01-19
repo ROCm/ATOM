@@ -32,8 +32,6 @@ from atom.utils import (
     resolve_obj_by_qualname,
 )
 from atom.utils.selector import get_attn_backend
-
-logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -42,6 +40,8 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+
+logger = logging.getLogger("atom")
 
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
