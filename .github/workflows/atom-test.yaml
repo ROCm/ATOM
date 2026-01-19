@@ -12,7 +12,14 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  pre-checks:
+    uses: ./.github/workflows/pre-checks.yaml
+    with:
+      black: true
+      ruff: true
+
   atom:
+    if: ${{ github.event.pull_request.draft == false }}
     name: ATOM Test
     strategy:
       fail-fast: false
