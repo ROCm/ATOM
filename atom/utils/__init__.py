@@ -20,8 +20,6 @@ from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence, Union
 from urllib.parse import urlparse
 from uuid import uuid4
-from typing import Any, Union
-
 from packaging import version
 from packaging.version import Version
 
