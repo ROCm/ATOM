@@ -3,6 +3,7 @@
 
 from typing import List, Tuple, Optional, Union
 import torch
+from atom.config import QuantizationConfig
 from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
@@ -15,6 +16,12 @@ from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rm
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
+
+from aiter import (
+    QuantType,
+    dtypes,
+)
+
 
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
@@ -84,14 +91,69 @@ def fused_add_rmsnorm_pad_(
     return fused_add_rmsnorm_pad(x, weight, epsilon, res, x_pad_to_multiple)
 
 
-class RMSNorm(nn.Module):
+def mxfp4_rms_quant_fuse_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    shuffle: bool = False,
+    res1: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    M, N = x.shape
+    out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    SCALE_N_valid = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    use_scale_shuffle_padding = shuffle
+    if use_scale_shuffle_padding:
+        SCALE_M = ((M + 255) // 256) * 256
+        SCALE_N = ((SCALE_N_valid + 7) // 8) * 8
+    else:
+        SCALE_M = M
+        SCALE_N = SCALE_N_valid
+    scale = torch.empty(
+        (SCALE_M, SCALE_N),
+        dtype=torch.float8_e8m0fnu,
+        device=x.device,
+    )
 
+    if res1 is None:
+        return (out, scale, None)
+    else:
+        res = torch.empty_like(res1)
+        return (out, scale, res)
+
+
+# It's important to use mutates_args=[] to avoid functionized_v2 op generation
+@torch_compile_guard(gen_fake=mxfp4_rms_quant_fuse_fake, mutates_args=[])
+def mxfp4_rms_quant_fuse(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    shuffle: bool = False,
+    res1: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_mxfp4_quant import (
+        fused_rms_mxfp4_quant,
+    )
+
+    if res1 is None:
+        (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, weight, eps, shuffle=True)
+        return (x, x_scale, None)
+    else:
+        (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(
+            x, weight, eps, shuffle=True, res1=res1
+        )
+        return (x, x_scale, residual)
+
+
+class RMSNorm(nn.Module):
     def __init__(
         self,
         dim: int,
         eps: float = 1e-6,
         x_pad_to_multiple: int = 0,
         fused_allreduce: bool = False,
+        fused_quant: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -99,38 +161,105 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
+        self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
+
+        if quant_config is None:
+            quant_config = QuantizationConfig()
+        quant_type = quant_config["quant_type"]
+        params_dtype = quant_config["quant_dtype"]
+        self.quant_type = quant_type
+        self.params_dtype = params_dtype
 
     def forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
-            assert not self.fused_allreduce, "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
+            assert (
+                not self.fused_allreduce
+            ), "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
             if residual is None:
-                return fused_rmsnorm_pad_(
-                    x, self.weight, self.eps, self.x_pad_to_multiple
-                )
+                x = fused_rmsnorm_pad_(x, self.weight, self.eps, self.x_pad_to_multiple)
+                return x
             else:
-                return fused_add_rmsnorm_pad_(
+                x, residual = fused_add_rmsnorm_pad_(
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
-                )      
-        if self.fused_allreduce and self.tp_size > 1:
-            assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
-            return tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, 
-                residual, 
-                self.weight, 
-                self.eps,
                 )
+                return x, residual
+        if self.fused_allreduce and self.tp_size > 1:
+            assert (
+                residual is not None
+            ), "fused_allreduce_rmsnorm requires residual input!"
+            x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
+                x,
+                residual,
+                self.weight,
+                self.eps,
+            )
+            return x, residual
         else:
-            if residual is None:
-                # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
-                return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+            if x_scale is not None and self.use_fused_quant:
+                from aiter.ops.triton.fused_fp8_quant import (
+                    fused_rms_fp8_per_tensor_static_quant,
+                )
+                import aiter as rocm_aiter
+
+                rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
+                # static FP8 quantization
+                if residual is None:
+                    x, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
+                        x,
+                        self.weight,
+                        self.eps,
+                        x_scale,
+                        None,
+                        None,
+                        self.eps,
+                        dtype_quant=rocm_aiter_fp8_dtype,
+                        res1=None,
+                    )
+                    return (x, x_scale)
+                else:
+                    x, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
+                        x,
+                        self.weight,
+                        self.eps,
+                        x_scale,
+                        None,
+                        None,
+                        self.eps,
+                        dtype_quant=rocm_aiter_fp8_dtype,
+                        res1=residual,
+                    )
+                    return (x, x_scale), residual
+            elif self.use_fused_quant and (
+                x_scale is None and self.quant_type.value == QuantType.per_1x32.value
+            ):
+                if residual is None:
+                    x, x_scale, _ = mxfp4_rms_quant_fuse(
+                        x, self.weight, self.eps, shuffle=True
+                    )
+                    return x, x_scale
+                else:
+                    x, x_scale, residual = mxfp4_rms_quant_fuse(
+                        x, self.weight, self.eps, shuffle=True, res1=residual
+                    )
+                    return (x, x_scale), residual
             else:
-                # return self.add_rms_forward(x, residual)
-                return rmsnorm2d_fwd_with_add_(x, self.weight, residual, self.eps, self.dim)
+                if residual is None:
+                    # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
+                    x = rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+                    return x
+                else:
+                    # return self.add_rms_forward(x, residual)
+                    x, residual = rmsnorm2d_fwd_with_add_(
+                        x, self.weight, residual, self.eps, self.dim
+                    )
+                    return x, residual
 
 
 @torch_compile_guard()
@@ -160,7 +289,6 @@ def layernorm2d_fwd_with_add_(
 
 
 class LayerNorm(nn.Module):
-
     def __init__(
         self,
         dim: int,
