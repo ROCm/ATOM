@@ -253,6 +253,8 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
+          if [[ ${{ matrix.runner }} == atom-mi355-8gpu.predownload ]]; then
+            docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
+          fi
           docker stop atom_test || true
           docker rm atom_test || true
