@@ -1043,20 +1043,22 @@ class ModelRunner:
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
-            # For decode, graph_bs should be based on batch size (number of sequences), not token count
-            if self.enforce_eager:
-                bs = scheduled_bs
-            else:
-                # Find the smallest graph_bs that is >= scheduled_bs
-                # This ensures we use a graph that was captured
-                # If no graph_bs >= scheduled_bs, use the largest available graph_bs
-                bs = next((x for x in self.graph_bs if x >= scheduled_bs), None)
-                if bs is None:
-                    # Use the largest available graph_bs (self.graph_bs is sorted in reverse)
-                    bs = self.graph_bs[0] if self.graph_bs else scheduled_bs
+            # num_pad, num_tokens_across_dp = self.get_dp_padding(scheduled_bs)
+            # padded_scheduled_bs = scheduled_bs + num_pad
+            #TODO rename num_input_tokens to actual bs in currrent rank?
+            padded_scheduled_bs = num_input_tokens
+            # for MTP, we need to divide by (mtp_k + 1) to get the actual batch size
+            if hasattr(self, "drafter"):
+                padded_scheduled_bs = padded_scheduled_bs // (self.drafter.mtp_k + 1)
+            bs = (
+                padded_scheduled_bs
+                if self.enforce_eager
+                else next((x for x in self.graph_bs if x >= padded_scheduled_bs), padded_scheduled_bs)
+                # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
+            )
             assert (
-                bs >= scheduled_bs or bs == self.graph_bs[0] if self.graph_bs else True
-            ), f"current decode {scheduled_bs=} > max graph_bs{bs}"
+                bs >= padded_scheduled_bs
+            ), f"current decode {padded_scheduled_bs=} > max graph_bs{bs}"
             self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
                 self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
             )
