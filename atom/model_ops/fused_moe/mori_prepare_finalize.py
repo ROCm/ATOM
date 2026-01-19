@@ -7,6 +7,7 @@ import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.utils.forward_context import get_forward_context
 from aiter import dtypes
 from aiter import QuantType
 
@@ -96,6 +97,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
+        context = get_forward_context().context
+        if context.is_prefill:
+            block_num = 128
+            warp_per_block = 16
+        else:
+            block_num = 64
+            warp_per_block = 4
 
         (
             dispatch_a1,
@@ -103,7 +111,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_scale,
             dispatch_ids,
             dispatch_recv_token_num,
-        ) = self.mori_op.dispatch(a1, topk_weights, scale, topk_ids)
+        ) = self.mori_op.dispatch(
+            a1, topk_weights, scale, topk_ids, block_num, warp_per_block
+        )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=dispatch_recv_token_num, expert_num_tokens_cpu=None
@@ -126,10 +136,20 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         # weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
+        context = get_forward_context().context
+        if context.is_prefill:
+            block_num = 128
+            warp_per_block = 16
+        else:
+            block_num = 64
+            warp_per_block = 4
+
         num_token = output.shape[0]
         result = self.mori_op.combine(
             fused_expert_output,
             None,
             topk_ids,
+            block_num,
+            warp_per_block,
         )[0]
         output.copy_(result[:num_token])
