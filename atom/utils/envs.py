@@ -14,7 +14,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     "ATOM_ENFORCE_EAGER": lambda: os.getenv("ATOM_ENFORCE_EAGER", "0") == "1",
     "ATOM_ENABLE_QK_NORM_ROPE_FUSION": lambda: os.getenv(
-        "ATOM_ENABLE_QK_NORM_ROPE_FUSION", "1"
+        "ATOM_ENABLE_QK_NORM_ROPE_FUSION", "0"
     )
     == "1",
     # add qk-norm-rope-cache-quant fusion for Qwen3-Moe model, default disabled,

@@ -3,7 +3,10 @@
 
 import logging
 from functools import partial as functools_partial
-from typing import Callable, Optional
+from typing import Callable, Optional, cast
+from collections.abc import Iterable, Mapping
+from types import MappingProxyType
+import re
 
 import torch
 import torch.nn.functional as F
@@ -163,6 +166,93 @@ def gemm_a4w4_quant(
 
     return y[:m, ...]
 
+def _is_equal_or_regex_match(
+    value: str, target: str, check_contains: bool = False
+) -> bool:
+    """
+    Checks whether a value is exactly equal or a regex match for target
+    if target starts with 're:'. If check_contains is set to True,
+    additionally checks if the target string is contained within the value.
+    """
+
+    if target.startswith("re:"):
+        pattern = target[3:]
+        if re.match(pattern, value):
+            return True
+    elif check_contains:
+        if target.lower() in value.lower():
+            return True
+    elif target == value:
+        return True
+    return False
+
+def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
+    """
+    Checks whether a layer_name is exactly equal or a regex match for
+    if target starts with 're:' to any target in list.
+    """
+    return any(_is_equal_or_regex_match(layer_name, target) for target in targets)
+
+def should_ignore_layer(
+    layer_name: str | None,
+    ignore: Iterable[str],
+    fused_mapping: Mapping[str, list[str]] = MappingProxyType({}),
+) -> bool:
+    if layer_name is None:
+        return False
+
+    do_dump = "qkv_proj" in layer_name
+
+    # layer_name = model.layers.0.self_attn.qkv_proj
+    # proj_name = qkv_proj
+    proj_name = layer_name.split(".")[-1]
+    print("proj_name:", proj_name, flush=True)
+
+    # Fused layers like gate_up_proj or qkv_proj will not be fused
+    # in the safetensors checkpoint. So, we convert the name
+    # from the fused version to unfused + check to make sure that
+    # each shard of the fused layer has the same scheme.
+    if proj_name in fused_mapping:
+        shard_proj_names = fused_mapping[proj_name]
+
+        # Convert fused_name --> [shard_names]
+        shard_names = [
+            layer_name.replace(proj_name, shard_proj_name)
+            for shard_proj_name in shard_proj_names
+        ]
+
+        # Layer should be ignored if shards are ignored.
+        should_ignore_layer = None
+        for shard_name in shard_names:
+            # print("shard_name:", shard_name, flush=True)
+            should_ignore_shard = check_equal_or_regex_match(
+                layer_name=shard_name, targets=ignore
+            )
+            print("shard_name:", shard_name, "should_ignore_shard:", should_ignore_shard, flush=True)
+
+            # If shard_idx=0, set layer ignore to match shard.
+            if should_ignore_layer is None:
+                should_ignore_layer = should_ignore_shard
+
+            # If shard_idx=1+ confirm scheme matches prior shards.
+            elif should_ignore_shard != should_ignore_layer:
+                raise ValueError(
+                    f"Found a different quantization schemes for "
+                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    "requires all to use the same scheme."
+                )
+
+    # Unfused layers like down_proj and o_proj will match
+    # the safetensors checkpoint already.
+    else:
+        print("proj name", proj_name, " not in fused_mapping", flush=True)
+        should_ignore_layer = check_equal_or_regex_match(
+            layer_name=layer_name, targets=ignore
+        )
+
+    assert should_ignore_layer is not None
+    return should_ignore_layer
+
 
 def gemm_a8w8_blockscale_preshuffle_fake(
     x: torch.Tensor,
@@ -202,12 +292,33 @@ class LinearBase(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = False,
         source_quant_dtype: torch.dtype | None = None,
+        prefix: str = "",
     ):
         if quant_config is None:
             quant_config = QuantizationConfig()
         self.source_quant_dtype = source_quant_dtype
         quant_type = quant_config["quant_type"]
         params_dtype = quant_config["quant_dtype"]
+        # Consider exclude layers
+        exclude_layers = cast(list[str], quant_config.get("exclude"))
+        # currently, set packed modules mapping to none
+        # self.packed_modules_mapping = None
+
+        should_ignore =should_ignore_layer(prefix, ignore=exclude_layers, fused_mapping=quant_config.packed_modules_mapping)
+        if prefix:
+            if "qkv" in prefix:
+                print("prefix: ", prefix, "should_ignore:", should_ignore, "params dtype:", params_dtype, quant_config.packed_modules_mapping)
+            pass
+        else:
+            print("prefix is NONE, traceback:")
+            import traceback
+            traceback.print_stack()
+
+        if should_ignore_layer(
+            prefix, ignore=exclude_layers, fused_mapping=quant_config.packed_modules_mapping
+        ):
+            quant_type = QuantType.No
+            params_dtype = dtypes.bf16 # TODO: query from model..
         super().__init__()
         self.reduce_results = reduce_results
         self.input_size = input_size
@@ -316,7 +427,16 @@ class LinearBase(nn.Module):
             and param.data.element_size() == loaded_weight.element_size()
         ):
             param.data = param.data.view(loaded_weight.dtype)
-        param.data.copy_(post_process_func(loaded_weight))
+        if param.dtype == torch.float4_e2m1fn_x2:
+            param_view = param.data.view(torch.uint8)
+            loaded_view = post_process_func(loaded_weight).view(torch.uint8)
+            try:
+                param_view.copy_(loaded_view)
+            except RuntimeError:
+                print("param:", param.shape, " dtype:", param.dtype, "loaded_weight:", loaded_weight.shape, " dtype:", loaded_weight.dtype, flush=True)
+                raise
+        else:
+            param.data.copy_(post_process_func(loaded_weight))
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -453,6 +573,7 @@ class ReplicatedLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         super().__init__(
@@ -461,6 +582,7 @@ class ReplicatedLinear(LinearBase):
             tp_dim=None,
             bias=bias,
             quant_config=quant_config,
+            prefix=prefix,
             source_quant_dtype=source_quant_dtype,
         )
 
@@ -477,6 +599,7 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.tp_dim = 0
@@ -486,6 +609,7 @@ class ColumnParallelLinear(LinearBase):
             self.tp_dim,
             bias,
             quant_config=quant_config,
+            prefix = prefix,
             source_quant_dtype=source_quant_dtype,
         )
 
@@ -504,6 +628,7 @@ class MergedColumnParallelLinear(LinearBase):
         output_sizes: list[int],
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
         source_quant_dtype: torch.dtype = None,
         **kwargs,
     ):
@@ -514,6 +639,7 @@ class MergedColumnParallelLinear(LinearBase):
             tp_dim=0,
             bias=bias,
             quant_config=quant_config,
+            prefix = prefix,
             source_quant_dtype=source_quant_dtype,
         )
 
@@ -549,6 +675,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.head_size = head_size
@@ -579,6 +706,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             output_sizes,
             bias=bias,
             quant_config=quant_config,
+            prefix=prefix,
             source_quant_dtype=source_quant_dtype,
         )
 
@@ -627,6 +755,7 @@ class RowParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
@@ -637,6 +766,7 @@ class RowParallelLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            prefix=prefix,
             source_quant_dtype=source_quant_dtype,
         )
 
@@ -664,6 +794,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.output_sizes = output_size
@@ -672,6 +803,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
             sum(output_size),  # ？
             bias=bias,
             quant_config=quant_config,
+            prefix=prefix,
             source_quant_dtype=source_quant_dtype,
         )
 
