@@ -12,6 +12,7 @@ from atom.utils.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+from atom.config import get_current_atom_config
 from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
@@ -201,8 +202,9 @@ class Attention(nn.Module):
             )
         else:
             # for asm paged attention
-            assert position is not None
-            q, k = self.rotary_emb(position, q, k)
+            if self.rotary_emb is not None:
+                assert position is not None
+                q, k = self.rotary_emb(position, q, k)
             if self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
@@ -322,6 +324,44 @@ class Attention(nn.Module):
 
         return o
 
+    def paged_attention_persistent_asm(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext
+    ):
+        attn_metadata = fwd_args.attn_metadata
+        output = torch.empty_like(q)
+
+        # def asm_V_shuffle(VC):
+        #     # [num_blocks, num_kv_heads, head_size, block_size]
+        #     x = 16 // VC.element_size()
+        #     num_blocks, num_kv_heads, head_size, block_size = VC.shape
+        #     VC = VC.view(num_blocks, num_kv_heads, head_size, block_size // x, x)
+        #     # [num_blocks, num_kv_heads, block_size/X, head_size, X]
+        #     VC = VC.permute(0, 1, 3, 2, 4).contiguous()
+        #     return VC
+
+        aiter.pa_persistent_fwd(
+            Q=q,
+            K=k_cache,
+            V=v_cache,
+            output=output,
+            max_qlen=attn_metadata.max_q_len,
+            qo_indptr=attn_metadata.cu_seqlens_q,
+            kv_indptr=attn_metadata.kv_indptr,
+            kv_indices=attn_metadata.kv_indices,
+            context_lens=attn_metadata.context_lens,
+            K_QScale=k_scale,
+            V_QScale=v_scale,
+            work_indptr=attn_metadata.work_indptr,
+            work_info=attn_metadata.work_info_set,
+            reduce_indptr=attn_metadata.reduce_indptr,
+            reduce_final_map=attn_metadata.reduce_final_map,
+            reduce_partial_map=attn_metadata.reduce_partial_map,
+            softmax_scale=self.scale,
+            mask=1,
+        )
+
+        return output
+
     def prefill_attention_asm(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext
     ):
@@ -421,8 +461,10 @@ class Attention(nn.Module):
                 return self.paged_attention_triton
             else:
                 # Qwen only uses gluon pa decode when bs=64
-                return (
-                    self.paged_attention_triton
-                    if ctx.batch_size == 64
-                    else self.paged_attention_asm
-                )
+                if ctx.batch_size == 64:
+                    return self.paged_attention_triton
+                # Only use pa persistent when block_size == 1024
+                atom_config = get_current_atom_config()
+                if atom_config.kv_cache_block_size == 1024:
+                    return self.paged_attention_persistent_asm
+                return self.paged_attention_asm
