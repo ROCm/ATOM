@@ -29,12 +29,9 @@ import copy
 import dataclasses
 import importlib
 from contextlib import contextmanager
-from typing import Any, Union
 
-import torch
 from packaging import version
 from packaging.version import Version
-
 
 if TYPE_CHECKING:
     from atom.config import Config
