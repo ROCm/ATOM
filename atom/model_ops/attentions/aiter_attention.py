@@ -207,8 +207,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if self.has_sliding_window:
             vars_used.append(("cu_seqlens_q", bs + 1))
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
-        ctx.update(ctx_pa_ps)
+        if self.block_size == 1024:
+            ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
+            ctx.update(ctx_pa_ps)
         if self.block_ratio > 1 and "block_tables" in ctx:
             block_table_convert_triton(
                 var["block_tables"].gpu[:bs],
@@ -230,7 +231,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
-        ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
+        if self.block_size == 1024:
+            ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
+        else:
+            ctx_pa_ps = {}
         attn_metadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
