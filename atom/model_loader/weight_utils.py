@@ -3,7 +3,7 @@
 
 # This code is adapted from https://github.com/ROCm/vllm/blob/main/vllm/model_executor/model_loader/weight_utils.py
 
-from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub import HfFileSystem, snapshot_download
 import huggingface_hub.constants
 import logging
 from tqdm.auto import tqdm
@@ -15,7 +15,7 @@ import hashlib
 import fnmatch
 import torch
 from pathlib import Path
-from typing import Any, Callable, Optional, Union, List
+from typing import Any, Optional, Union, List
 import json
 
 logger = logging.getLogger(__name__)

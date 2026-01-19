@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List, Tuple, Optional, Union
+from typing import Tuple, Optional
 import torch
 from atom.config import QuantizationConfig
 from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
     rmsnorm2d_fwd_with_add,
-    rms_norm,
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
 )
@@ -19,7 +18,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from aiter import (
     QuantType,
-    dtypes,
 )
 
 

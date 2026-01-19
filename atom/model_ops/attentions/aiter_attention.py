@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from dataclasses import dataclass
-from typing import Optional, Type
+from typing import Type
 
-import numpy as np
-import torch
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
 from atom.utils.block_convert import block_table_convert_triton

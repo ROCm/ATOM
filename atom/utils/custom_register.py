@@ -4,7 +4,6 @@
 import torch
 from torch.library import Library
 from typing import Callable, Optional
-from aiter import logger
 
 aiter_lib = Library("aiter", "FRAGMENT")
 

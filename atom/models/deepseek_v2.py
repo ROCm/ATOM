@@ -24,17 +24,13 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
-import aiter
 import torch
 from aiter import (
     QuantType,
-    concat_and_cache_mla,
     cp_gather_indexer_k_quant_cache,
     dtypes,
-    flash_attn_varlen_func,
-    gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
@@ -45,7 +41,6 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -59,7 +54,6 @@ from aiter.ops.triton.fused_mxfp4_quant import (
 )
 from aiter.ops.triton.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
-    deepgemm_fp8_paged_mqa_logits_stage1,
 )
 from aiter.rotary_embedding import get_rope
 from torch import nn

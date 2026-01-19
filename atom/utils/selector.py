@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from abc import ABC, abstractmethod
 from functools import cache
-from typing import List, Optional, Tuple, Type
+from typing import Type
 
-import torch
 from atom.model_ops.attentions.backends import AttentionBackend
 from atom.utils import resolve_obj_by_qualname
 

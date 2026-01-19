@@ -3,7 +3,6 @@
 
 import argparse
 
-import torch
 from transformers import AutoTokenizer
 
 from atom import SamplingParams

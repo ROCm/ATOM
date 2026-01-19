@@ -2,15 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # from flash_attn import flash_attn_with_kvcache
-from dataclasses import dataclass
 from typing import Optional
 
-import aiter
 import torch
-import triton
-import triton.language as tl
 from torch import nn
-from typing import Optional
 
 
 from atom.utils import mark_spliting_op

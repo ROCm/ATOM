@@ -5,7 +5,7 @@ import concurrent.futures
 import os
 import re
 from glob import glob
-from typing import Generator, List, Tuple
+from typing import Generator, Tuple
 
 import safetensors
 import torch

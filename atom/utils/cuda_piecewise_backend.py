@@ -10,7 +10,6 @@ import torch.fx as fx
 from atom.utils.backends import VllmBackend
 from atom.utils.decorators import end_monitoring_torch_compile
 from atom.config import Config
-from aiter import logger
 
 
 @dataclasses.dataclass

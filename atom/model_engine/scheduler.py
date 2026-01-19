@@ -5,7 +5,6 @@ import logging
 import time
 from collections import deque
 
-import numpy as np
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput

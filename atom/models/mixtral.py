@@ -24,23 +24,19 @@
 # limitations under the License.
 """Inference-only Mixtral model."""
 
-from collections.abc import Iterable
 from typing import Optional, Union
 
 import torch
 from torch import nn
 from transformers import MixtralConfig
 
-from aiter import QuantType
 
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
 from aiter.dist.parallel_state import (
     get_pp_group,
-    get_tp_group,
     get_tensor_model_parallel_world_size,
 )
-from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import QKVParallelLinear, RowParallelLinear, ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -50,8 +46,6 @@ from atom.config import QuantizationConfig, Config
 from atom.utils.decorators import support_torch_compile
 
 from atom.models.utils import (
-    PPMissingLayer,
-    extract_layer_index,
     IntermediateTensors,
     make_empty_intermediate_tensors_factory,
     make_layers,

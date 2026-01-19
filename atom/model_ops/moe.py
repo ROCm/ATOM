@@ -3,11 +3,9 @@
 
 from abc import abstractmethod
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Callable, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
@@ -46,9 +44,8 @@ from atom.model_ops.utils import (
     per_tensor_dequantize,
     shuffle_weights,
 )
-from atom.utils import envs, mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils.forward_context import ForwardContext, get_forward_context
+from atom.utils.forward_context import get_forward_context
 
 
 @dataclass

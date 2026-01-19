@@ -5,7 +5,7 @@ import argparse
 import random
 from transformers import AutoTokenizer
 
-from atom import LLMEngine, SamplingParams
+from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 
 parser = argparse.ArgumentParser(

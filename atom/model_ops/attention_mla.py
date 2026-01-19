@@ -3,7 +3,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 from functools import partial as functools_partial
 
 import torch
@@ -13,9 +13,7 @@ from aiter import (
     flash_attn_varlen_func,
 )
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-from aiter.rotary_embedding import RotaryEmbedding
 from torch import nn
-from tqdm import tqdm
 
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils.forward_context import (

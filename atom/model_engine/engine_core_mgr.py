@@ -6,9 +6,6 @@ import logging
 import multiprocessing
 import pickle
 import queue
-import signal
-import sys
-import time
 import weakref
 from threading import Thread
 from typing import List
@@ -19,13 +16,11 @@ import zmq.asyncio
 from atom.config import Config
 from atom.model_engine.engine_core import EngineCore, EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.request import RequestOutput
 from atom.utils import (
     get_open_zmq_inproc_path,
     get_open_zmq_ipc_path,
     make_zmq_socket,
     set_device_control_env_var,
-    shutdown_all_processes,
 )
 
 logger = logging.getLogger("atom")

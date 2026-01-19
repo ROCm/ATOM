@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Set, Dict, Union
+from typing import Any, Optional, Set, Dict, Union
 from atom.config import Config, KVCacheTensor
 import torch
-from abc import ABC, abstractmethod
-from atom.config import Config, ParallelConfig
+from atom.config import ParallelConfig
 
 
 def _compute_chunked_local_num_tokens(

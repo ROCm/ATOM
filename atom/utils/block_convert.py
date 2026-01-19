@@ -137,7 +137,6 @@ def kv_indices_convert_triton(
 
 if __name__ == "__main__":
     # Example usage and test
-    import numpy as np
 
     block_table = torch.tensor(
         [[0, 1, 2, -1], [3, 4, -1, -1], [5, 6, 7, 8]], dtype=torch.int32

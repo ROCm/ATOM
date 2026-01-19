@@ -2,13 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # from flash_attn import flash_attn_with_kvcache
-from dataclasses import dataclass
 
 import aiter
 import torch
-import triton
-import triton.language as tl
-from aiter.paged_attn import PagedAttention
 from torch import nn
 from typing import Optional
 
@@ -18,7 +14,6 @@ from atom.utils.forward_context import (
 )
 from .attention_mla import MLAModules
 from aiter.ops.triton.unified_attention import unified_attention
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits

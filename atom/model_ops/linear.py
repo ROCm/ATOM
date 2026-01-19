@@ -6,7 +6,6 @@ from functools import partial as functools_partial
 from typing import Callable, Optional
 
 import torch
-import torch.nn.functional as F
 from aiter import (
     QuantType,
     dtypes,
@@ -15,8 +14,6 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
     get_hip_quant,
-    get_torch_quant,
-    get_triton_quant,
 )
 from torch import nn
 
@@ -24,7 +21,6 @@ from atom.config import QuantizationConfig
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 
 logger = logging.getLogger("atom")
-from aiter import gemm_a4w4, per_1x32_f4_quant_hip
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group

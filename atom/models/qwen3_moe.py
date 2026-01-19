@@ -1,11 +1,9 @@
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 # import torch.distributed as dist
-from aiter.dist.parallel_state import get_tp_group
-from typing import Optional
 from transformers import Qwen3Config
 from transformers import PretrainedConfig
 from atom.config import QuantizationConfig, Config
@@ -31,7 +29,6 @@ from atom.model_ops.moe import FusedMoE
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
 )
 from atom.models.utils import (
     IntermediateTensors,

@@ -4,7 +4,7 @@
 import logging
 import os
 import time
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -35,7 +35,6 @@ from atom.utils.selector import get_attn_backend
 
 logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
-    AttentionMetaData,
     Context,
     DPMetadata,
     get_forward_context,

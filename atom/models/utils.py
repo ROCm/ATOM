@@ -1,20 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
-    Callable,
     Dict,
-    Iterable,
     List,
-    Literal,
-    Mapping,
-    Optional,
     Protocol,
-    Set,
     Tuple,
     Union,
-    overload,
 )
 
 import torch

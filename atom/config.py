@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 from atom.utils import envs, get_open_port
@@ -16,7 +16,6 @@ from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, PretrainedConfig, GenerationConfig
 
 from aiter import QuantType
-from aiter.dist.parallel_state import get_dp_group
 from aiter.utility.dtypes import d_dtypes
 
 logger = logging.getLogger("atom")

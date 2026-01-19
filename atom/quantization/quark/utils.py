@@ -4,10 +4,7 @@
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from typing import Any, Optional
-import torch
 import regex as re
-from torch import nn
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
 
 def deep_compare(dict1: Any, dict2: Any) -> bool:

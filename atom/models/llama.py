@@ -24,7 +24,6 @@
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 import torch
@@ -36,7 +35,6 @@ from atom.model_ops.base_attention import Attention
 
 from aiter.dist.parallel_state import (
     get_pp_group,
-    get_tp_group,
     get_tensor_model_parallel_world_size,
 )
 from atom.model_ops.activation import SiluAndMul

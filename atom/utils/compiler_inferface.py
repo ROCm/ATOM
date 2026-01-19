@@ -8,7 +8,6 @@ import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
-import copy
 from atom.utils import compilation_counter
 import torch
 import torch._inductor.compile_fx
