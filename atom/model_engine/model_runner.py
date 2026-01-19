@@ -244,9 +244,9 @@ class tokenIDProcessor:
                         scheduled_tokens[idx][0] for idx in new_curr_indices
                     ]
                     self.input_ids.np[:num_new_tokens] = new_token_ids
-                    self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens].copy_(
-                        self.input_ids.cpu[:num_new_tokens], non_blocking=True
-                    )
+                    self.input_ids.gpu[
+                        num_deferred_tokens : num_deferred_tokens + num_new_tokens
+                    ].copy_(self.input_ids.cpu[:num_new_tokens], non_blocking=True)
                 if gathered_tokens is not None:
                     self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
 
