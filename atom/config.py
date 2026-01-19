@@ -19,6 +19,8 @@ from aiter import QuantType
 from aiter.dist.parallel_state import get_dp_group
 from aiter.utility.dtypes import d_dtypes
 
+from inspect import getframeinfo, currentframe
+
 logger = logging.getLogger("atom")
 
 
@@ -256,6 +258,7 @@ class QuantizationConfig(dict):
         is_dynamic=True,
         quant_name="",
         quant_method=None,
+        exclude=None,
     ):
         super().__init__()
         self["quant_type"] = quant_type if quant_type is not None else QuantType.No
@@ -263,6 +266,7 @@ class QuantizationConfig(dict):
         self["quant_name"] = quant_name
         self["is_dynamic"] = is_dynamic
         self["quant_method"] = quant_method
+        self["exclude"] = exclude
 
     def get_name(self):
         return self["quant_name"]
@@ -349,8 +353,11 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
         is_dynamic = False
     else:
         is_dynamic = True
+
+    exclude_layers = orig_quant_config.get("exclude")
+
     return QuantizationConfig(
-        quant_type, quant_dtype, is_dynamic, quant_method=quant_method
+        quant_type, quant_dtype, is_dynamic, quant_method=quant_method, exclude=exclude_layers
     )
 
 

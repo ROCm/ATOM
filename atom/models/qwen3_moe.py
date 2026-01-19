@@ -196,7 +196,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )
 
@@ -234,6 +234,7 @@ class Qwen3MoeAttention(nn.Module):
         rope_scaling: tuple | None = None,
         kv_cache_dtype: str = "fp16",
         layer_num: int = 0,
+        prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -263,6 +264,7 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
 
         self.o_proj = RowParallelLinear(
@@ -271,6 +273,7 @@ class Qwen3MoeAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            prefix=f"{prefix}.o_proj",
         )
 
         if ENABLE_QK_NORM_ROPE_FUSION or ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
@@ -304,6 +307,8 @@ class Qwen3MoeAttention(nn.Module):
                 rotary_emb=self.rotary_emb,
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
             )
         elif ENABLE_QK_NORM_ROPE_FUSION:
             self.attn = Attention(
@@ -314,6 +319,8 @@ class Qwen3MoeAttention(nn.Module):
                 kv_cache_dtype=kv_cache_dtype,
                 layer_num=layer_num,
                 use_mla=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
             )
         else:
             self.attn = Attention(
@@ -325,6 +332,8 @@ class Qwen3MoeAttention(nn.Module):
                 layer_num=layer_num,
                 use_mla=False,
                 rotary_emb=self.rotary_emb,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
             )
         self.kv_cache_dtype = kv_cache_dtype
         self.layer_num = layer_num
@@ -350,14 +359,14 @@ class Qwen3MoeAttention(nn.Module):
                 eps=self.q_norm.eps,
             )
             q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-            attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v, positions)
         else:
             q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
             # Add qk-norm
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-            attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output
 
@@ -395,6 +404,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
 
         # `mlp_only_layers` in the config.
@@ -551,6 +561,14 @@ class Qwen3MoeForCausalLM(
         "up_proj": ("gate_up_proj", 1),
     }
 
+    quant_packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ]
+    }
+
     def __init__(
             self,
             atom_config: Config,
@@ -565,6 +583,9 @@ class Qwen3MoeForCausalLM(
         # Only perform the following mapping when Qwen3MoeMLP exists
         if getattr(config, "mlp_only_layers", []):
             self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        atom_config.quant_config.packed_modules_mapping=self.quant_packed_modules_mapping
+        quant_config = atom_config.quant_config
+        self.quant_config = quant_config
         self.model = Qwen3MoeModel(
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "model"),

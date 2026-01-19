@@ -19,6 +19,7 @@ from atom.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
+from atom.config import QuantizationConfig
 from atom.model_ops.moe import FusedMoEMethodBase, is_rocm_aiter_fusion_shared_expert_enabled
 from aiter.dist.parallel_state import get_tp_group
 from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrite_spec_layer_name
@@ -70,6 +71,38 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
 
 
+def get_cache_scale(name: str) -> str | None:
+    """
+    Check whether the param name matches the format for k/v cache scales
+    in quark. If this is the case, return its equivalent param name
+    expected by vLLM
+    :param name: param name
+    :return: matching param name for KV cache scale in vLLM
+    """
+    if name.endswith(".output_scale") and ".k_proj" in name:
+        return name.replace(".k_proj.output_scale", ".attn.k_scale")
+    if name.endswith(".output_scale") and ".v_proj" in name:
+        return name.replace(".v_proj.output_scale", ".attn.v_scale")
+    if name.endswith(".output_scale") and ".q_proj" in name:
+        return name.replace(".q_proj.output_scale", ".attn.q_scale")
+    if name.endswith("self_attn.prob_output_scale"):
+        return name.replace(".prob_output_scale", ".attn.prob_scale")
+
+    # If no matches, return None
+    return None
+
+
+def convert_layers_to_bracket(name: str) -> str:
+    """
+    Convert only 'layers.数字.' to 'layers[数字].'.
+    Example: model.layers.31.attn.scale -> model.layers[31].attn.scale
+    
+    :param name: parameter name
+    :return: converted parameter name
+    """
+    return re.sub(r'\.layers\.(\d+)\.', r'.layers[\1].', name)
+
+
 def load_model(
     model: nn.Module,
     model_name_or_path: str,
@@ -83,6 +116,11 @@ def load_model(
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         for name, weight_tensor in safetensors_weights_iterator(model_name_or_path):
+            if model.quant_config is not None and (
+                scale_name := get_cache_scale(name)
+            ):
+                setattr(model, convert_layers_to_bracket(scale_name), weight_tensor)
+                continue
             if load_dummy:
                 continue
             if name.endswith("kv_scale"):
