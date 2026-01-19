@@ -172,7 +172,7 @@ jobs:
           echo "========== Running test =========="
 
           if [ -d "/it-share/models" ]; then
-            model_path="/it-share/models/${{ matrix.model_path }}"
+            model_path="/models/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
           fi
