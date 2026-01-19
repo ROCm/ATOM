@@ -89,6 +89,7 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
@@ -112,7 +113,6 @@ if use_triton_gemm():
         gemm_a16wfp4_preshuffle = None
         gemm_a8w8_blockscale_preshuffle = None
         gemm_a16w8_blockscale_preshuffle = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION

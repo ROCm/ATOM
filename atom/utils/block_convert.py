@@ -57,7 +57,9 @@ def block_table_convert_triton(block_table, block_table_convert, context_lens, r
 
     n_input_elements = block_table.numel()
     n_cols = block_table.shape[1]
-    grid = lambda meta: (triton.cdiv(n_input_elements, meta["BLOCK_SIZE"]),)
+
+    def grid(meta):
+        return (triton.cdiv(n_input_elements, meta["BLOCK_SIZE"]),)
 
     block_table_convert_kernel[grid](
         block_table,
@@ -119,7 +121,9 @@ def kv_indices_convert_triton(
     ori_block_size = block_size * ratio
     bs = kv_indptr_convert.shape[0] - 1
     n_input_elements = kv_indices.numel()
-    grid = lambda meta: (triton.cdiv(n_input_elements, meta["BLOCK_SIZE"]),)
+
+    def grid(meta):
+        return (triton.cdiv(n_input_elements, meta["BLOCK_SIZE"]),)
 
     kv_indices_convert_kernel[grid](
         kv_indices,

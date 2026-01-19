@@ -2,6 +2,7 @@ import logging
 from typing import Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
 import torch
+from triton_kernels.matmul_ogs import PrecisionConfig
 
 if TYPE_CHECKING:
     from atom.model_ops.moe import FusedMoEParallelConfig

@@ -20,8 +20,6 @@ from torch import nn
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 
-logger = logging.getLogger("atom")
-
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -31,6 +29,8 @@ from aiter.utility import fp4_utils
 from atom.model_ops.utils import shuffle_weights
 from atom.utils import envs
 
+logger = logging.getLogger("atom")
+
 
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
@@ -38,7 +38,9 @@ def use_triton_gemm() -> bool:
 
 if use_triton_gemm():
     try:
-        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+        from aiter.ops.triton.gemm_afp4wfp4 import (
+            gemm_afp4wfp4_preshuffle,
+        )  # noqa: E402
 
         # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
         # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton

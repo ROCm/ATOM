@@ -305,7 +305,10 @@ def sample_hf_requests(
     assert (
         "conversations" in dataset.features
     ), "HF Dataset must have 'conversations' column."
-    filter_func = lambda x: len(x["conversations"]) >= 2
+
+    def filter_func(x):
+        return len(x["conversations"]) >= 2
+
     filtered_dataset = dataset.shuffle(seed=random_seed).filter(filter_func)
     sampled_requests: List[Tuple[str, int, int, Dict[str, Collection[str]]]] = []
     for data in filtered_dataset:
