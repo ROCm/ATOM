@@ -2,7 +2,6 @@ import logging
 from typing import Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
 import torch
-from triton_kernels.matmul_ogs import PrecisionConfig
 
 if TYPE_CHECKING:
     from atom.model_ops.moe import FusedMoEParallelConfig
@@ -86,7 +85,7 @@ class FusedMoEQuantDesc:
     shape: GroupShape | None = None
 
     # Quantization scales.
-    scale: Union[torch.Tensor, "PrecisionConfig", None] = None
+    scale: Union[torch.Tensor, "PrecisionConfig", None] = None # noqa: F821
 
     # Quantization alphas or gscales, used for nvfp4 types.
     alpha_or_gscale: torch.Tensor | None = None
@@ -174,8 +173,8 @@ class FusedMoEQuantConfig:
         quant_dtype: torch.dtype | str | None = None,
         per_act_token_quant: bool = False,
         block_shape: list[int] | None = None,
-        w1_scale: Union[torch.Tensor, "PrecisionConfig", None] = None,
-        w2_scale: Union[torch.Tensor, "PrecisionConfig", None] = None,
+        w1_scale: Union[torch.Tensor, "PrecisionConfig", None] = None, # noqa: F821
+        w2_scale: Union[torch.Tensor, "PrecisionConfig", None] = None, # noqa: F821
         a1_scale: torch.Tensor | None = None,
         a2_scale: torch.Tensor | None = None,
         w1_bias: torch.Tensor | None = None,
@@ -227,8 +226,8 @@ def biased_moe_quant_config(
 
 
 def mxfp4_w4a16_moe_quant_config(
-    w1_scale: Union[torch.Tensor, "PrecisionConfig"],
-    w2_scale: Union[torch.Tensor, "PrecisionConfig"],
+    w1_scale: Union[torch.Tensor, "PrecisionConfig"], # noqa: F821
+    w2_scale: Union[torch.Tensor, "PrecisionConfig"], # noqa: F821
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig:
