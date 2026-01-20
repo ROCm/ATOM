@@ -18,10 +18,6 @@ from torch import nn
 
 from .attention_mla import MLAModules
 
-ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
-    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
-)
-
 
 class Attention(nn.Module):
 
@@ -236,10 +232,10 @@ class Attention(nn.Module):
             device=q.device,
         )
 
-        per_tensor = k_scale.numel() == 1
-        if not per_tensor:
-            k_scale = k_scale.unsqueeze(-1)
-            v_scale = v_scale.unsqueeze(-1)
+        if k_scale is not None and k_scale.numel() > 1:
+          k_scale = k_scale.unsqueeze(-1)
+          v_scale = v_scale.unsqueeze(-1)
+
         compute_type = (
             torch.bfloat16
             if self.kv_cache_dtype == "bf16"  # or per_tensor
