@@ -193,7 +193,7 @@ class Scheduler:
     def postprocess(
         self,
         seqs: list[Sequence],
-        prev_token_ids: dict[int, list[int]],
+        prev_token_ids: dict[int, tuple[int, ...]],
         draft_token_ids: Optional[dict[int, list[int]]],
         stream_output_queue=None,
     ) -> list[Sequence]:
@@ -263,9 +263,10 @@ class Scheduler:
                     leave_reason = "max_tokens"
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:
+                output_tokens_list = list(new_tokens) if isinstance(new_tokens, tuple) else new_tokens.copy()
                 request_output = RequestOutput(
                     request_id=seq.id,
-                    output_tokens=new_tokens.copy(),
+                    output_tokens=output_tokens_list,
                     finished=(leave_reason is not None),
                     finish_reason=leave_reason,
                 )

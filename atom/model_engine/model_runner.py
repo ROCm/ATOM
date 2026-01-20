@@ -96,11 +96,11 @@ class tokenIDProcessor:
         self.token_ids_cpu.append(cpu_tensor)
 
     def recv_async_output(self) -> list[int]:
-        for _ in self.token_ids_cpu:
-            self.async_copy_event.synchronize()
-            token_ids = self.token_ids_cpu.pop(0).tolist()
-            return token_ids
-        return []
+        if not self.token_ids_cpu:
+            return []
+        self.async_copy_event.synchronize()
+        token_ids = self.token_ids_cpu.pop(0).tolist()
+        return token_ids
 
     def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
         default_stream = torch.cuda.current_stream()
@@ -111,11 +111,11 @@ class tokenIDProcessor:
         self.draft_token_ids_cpu.append(cpu_tensor)
 
     def recv_async_output_draft(self) -> list[int]:
+        if not self.draft_token_ids_cpu:
+            return []
         self.async_copy_event.synchronize()
-        for _ in self.draft_token_ids_cpu:
-            token_ids = self.draft_token_ids_cpu.pop(0).tolist()
-            return token_ids
-        return []
+        token_ids = self.draft_token_ids_cpu.pop(0).tolist()
+        return token_ids
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -126,22 +126,32 @@ class tokenIDProcessor:
         self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
 
+    def _process_token_id(self, token_id) -> tuple[int, ...]:
+        """Helper function: process a single token_id, handling list and non-list cases.
+
+        Optimized: eliminates double traversal (removed 'in' check before 'index').
+        Returns tuple for better performance and immutability.
+        """
+        if isinstance(token_id, list):
+            try:
+                idx = token_id.index(-1)
+                return tuple(token_id[:idx])
+            except ValueError:
+                # No -1 found, return the entire list as tuple
+                return tuple(token_id)
+        else:
+            return (token_id,)
+
     def prepare_sampled_ids(
         self, batch: ScheduledBatch, sampled_token_ids: torch.Tensor
-    ) -> dict[int, list[int]]:
+    ) -> dict[int, tuple[int, ...]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
-            ret = {}
-            for seq_id, token_id in zip(req_ids, token_ids):
-                if isinstance(token_id, list):
-                    if -1 in token_id:
-                        idx = token_id.index(-1)
-                        ret[seq_id] = token_id[:idx]
-                    else:
-                        ret[seq_id] = token_id
-                else:
-                    ret[seq_id] = [token_id]
+            ret = {
+                seq_id: self._process_token_id(token_id)
+                for seq_id, token_id in zip(req_ids, token_ids)
+            }
             ret[-1] = 0  # is_deferred_out flag
             return ret
 
@@ -151,15 +161,10 @@ class tokenIDProcessor:
         self.prev_req_ids = None
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
-            for seq_id, token_id in zip(self.prev_req_ids, token_ids):
-                if isinstance(token_id, list):
-                    if -1 in token_id:
-                        idx = token_id.index(-1)
-                        token_id_dict[seq_id] = token_id[:idx]
-                    else:
-                        token_id_dict[seq_id] = token_id
-                else:
-                    token_id_dict[seq_id] = [token_id]
+            token_id_dict = {
+                seq_id: self._process_token_id(token_id)
+                for seq_id, token_id in zip(self.prev_req_ids, token_ids)
+            }
         else:
             # first time, no previous tokens
             token_ids = {}
@@ -1134,7 +1139,7 @@ class ModelRunner:
         batch: ScheduledBatch,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-    ) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[int]]]:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
 
         if spec_decode_metadata is None:
@@ -1227,7 +1232,7 @@ class ModelRunner:
     @torch.inference_mode()
     def forward(
         self, batch: ScheduledBatch
-    ) -> tuple[dict[int, list[int]], Optional[dict[int, list[int]]]]:
+    ) -> tuple[dict[int, tuple[int, ...]], Optional[dict[int, list[int]]]]:
         input_ids, temperatures = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids)
         sampled_token_ids, cur_sampled_tokens = self.postprocess(batch, logits, temperatures)
@@ -1318,7 +1323,7 @@ class ModelRunner:
         self,
         batch: ScheduledBatch,
         input_ids: torch.Tensor,
-        sampled_token_ids: dict[int, list[int]],
+        sampled_token_ids: dict[int, tuple[int, ...]],
         hidden_states: torch.Tensor,
     ):
         num_scheduled_tokens = batch.total_tokens_num
