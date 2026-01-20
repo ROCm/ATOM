@@ -428,12 +428,15 @@ class ModelRunner:
         """
         if self.profiler_dir is not None and self.profiler is None:
             enable_detailed_profiling = os.environ.get("ATOM_PROFILER_MORE", "0") == "1"
+            enable_shapes = os.environ.get("ATOM_PROFILER_SHAPES", "0") == "1"
+            enable_shapes_profiling = enable_shapes or enable_detailed_profiling
+
             self.profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=enable_detailed_profiling,
+                record_shapes=enable_shapes_profiling,
                 with_stack=enable_detailed_profiling,
                 profile_memory=enable_detailed_profiling,
                 on_trace_ready=torch_profiler.tensorboard_trace_handler(
@@ -916,13 +919,20 @@ class ModelRunner:
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
-        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-                hidden_states = self.model(input_ids, positions)
-        else:
-            graph_bs = context.graph_bs
-            # torch.cuda.synchronize()
-            self.graphs[graph_bs].replay()
-            hidden_states = self.forward_vars["outputs"][:bs]
+        # Add profiler markers to distinguish prefill vs decode in traces
+        phase_name = "PREFILL_PHASE" if is_prefill else "DECODE_PHASE"
+        with torch_profiler.record_function(phase_name):
+            if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
+                # Mark model forward pass
+                with torch_profiler.record_function(f"{phase_name}_model_forward"):
+                    hidden_states = self.model(input_ids, positions)
+            else:
+                # Mark CUDA graph replay for decode
+                graph_bs = context.graph_bs
+                # torch.cuda.synchronize() to ensure the graph is captured
+                with torch_profiler.record_function(f"{phase_name}_cudagraph_replay_bs{graph_bs}"):
+                    self.graphs[graph_bs].replay()
+                hidden_states = self.forward_vars["outputs"][:bs]
         return self.model.compute_logits(hidden_states)
 
     def postprocess(
@@ -942,8 +952,13 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> dict[int, int]:
-        input_ids, temperatures = self.prepare_model(batch)
-        logits = self.run_model(input_ids)
+        # Add top-level marker for the entire forward pass
+        is_prefill = batch.total_tokens_num_prefill > 0
+        phase_marker = "PREFILL" if is_prefill else "DECODE"
+        
+        with torch_profiler.record_function(f"forward_pass_{phase_marker}"):
+            input_ids, temperatures = self.prepare_model(batch)
+            logits = self.run_model(input_ids)
         reset_forward_context()
         return self.postprocess(batch, logits, temperatures)
 
