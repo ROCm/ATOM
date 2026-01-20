@@ -233,8 +233,8 @@ class Attention(nn.Module):
         )
 
         if k_scale is not None and k_scale.numel() > 1:
-          k_scale = k_scale.unsqueeze(-1)
-          v_scale = v_scale.unsqueeze(-1)
+            k_scale = k_scale.unsqueeze(-1)
+            v_scale = v_scale.unsqueeze(-1)
 
         compute_type = (
             torch.bfloat16
