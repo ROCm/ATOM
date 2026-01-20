@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
+from torch.profiler import record_function
 from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -23,6 +24,7 @@ from atom.utils import (
     resolve_obj_by_qualname,
 )
 from atom.utils.selector import get_attn_backend
+from atom.utils.graph_marker import set_graph_marker_enabled
 
 from aiter import destroy_dist_env, dtypes, init_dist_env
 from aiter.dist.parallel_state import (
@@ -214,6 +216,7 @@ class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
         self.config = config
+        set_graph_marker_enabled(getattr(config, "mark_trace", False))
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
@@ -845,9 +848,10 @@ class ModelRunner:
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             hidden_states = self.model(input_ids, positions)
         else:
-            graph_bs = context.graph_bs
-            self.graphs[graph_bs].replay()
-            hidden_states = self.forward_vars["outputs"][:bs]
+            with record_function("decode_step"):
+                graph_bs = context.graph_bs
+                self.graphs[graph_bs].replay()
+                hidden_states = self.forward_vars["outputs"][:bs]
         return self.model.compute_logits(hidden_states)
 
     def postprocess(
