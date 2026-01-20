@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
 from dataclasses import dataclass
 from typing import Optional, Type
-import itertools
 
-from atom.utils import CpuGpuBuffer
+import aiter
 import numpy as np
 import torch
-import aiter
+from aiter import dtypes
+from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
+from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData, Context
-from aiter.dist.parallel_state import get_tp_group
-from aiter import dtypes
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -155,7 +155,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
         dropout_p = 0.0
-        max_q_len = 1
+        max_seqlen_q = 1
         min_seqlen_q = 0
 
         context_lens = batch.context_lens
@@ -225,8 +225,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
-            max_q_len=max_q_len,
-            max_seqlen_q=max_q_len,
+            max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             min_seqlen_q=min_seqlen_q,
             **ctx,
@@ -244,7 +243,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
-            max_q_len=var["max_qlen"],
+            max_seqlen_q=var["max_qlen"],
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],

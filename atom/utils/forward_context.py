@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Any, Optional, Set, Dict, Union
-from atom.config import Config, KVCacheTensor
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Set, Union
+
 import torch
-from atom.config import ParallelConfig
+from atom.config import Config, KVCacheTensor, ParallelConfig
 
 
 def _compute_chunked_local_num_tokens(
@@ -43,8 +45,8 @@ class DPMetadata:
         num_tokens_tensor = torch.tensor(
             num_tokens_across_dp, device="cpu", dtype=torch.int32
         )
-        from aiter.dist.parallel_state import get_dp_group
         import torch.distributed as dist
+        from aiter.dist.parallel_state import get_dp_group
 
         dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
         return num_tokens_tensor
@@ -154,7 +156,6 @@ class AttentionMetaData:
     fake_block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
-    max_q_len: Optional[int] = None
     kv_indptr: Optional[torch.Tensor] = None
     kv_indices: Optional[torch.Tensor] = None
     kv_last_page_lens: Optional[torch.Tensor] = None
@@ -183,7 +184,6 @@ class AttentionMetaData:
         context_lens: Optional[torch.Tensor] = None,
         block_tables: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
-        max_q_len: Optional[int] = None,
         kv_indptr: Optional[torch.Tensor] = None,
         kv_indices: Optional[torch.Tensor] = None,
         kv_last_page_lens: Optional[torch.Tensor] = None,
@@ -210,7 +210,6 @@ class AttentionMetaData:
         self.context_lens = context_lens
         self.block_tables = block_tables
         self.dropout_p = dropout_p
-        self.max_q_len = max_q_len
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
         self.kv_last_page_lens = kv_last_page_lens
