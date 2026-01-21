@@ -36,6 +36,11 @@ class EagleProposer:
         self.block_size = self.config.kv_cache_block_size
         self.max_num_tokens = self.config.max_num_batched_tokens
         self.token_arange_np = np.arange(self.max_num_tokens)
+        self.token_arange_gpu = torch.arange(
+            self.max_num_tokens,
+            device=device,
+            dtype=torch.int32,
+        )
         self.use_cuda_graph = (self.config.compilation_config.level == CompilationLevel.PIECEWISE
                                and not self.config.enforce_eager)
         self.cudagraph_batch_sizes = list(
@@ -170,41 +175,11 @@ class EagleProposer:
         if self.mtp_k == 1:
             # [batch_size, 1]
             return draft_token_ids.view(-1, 1)
-
-        # Generate the remaining draft tokens.
-        draft_token_ids_list = [draft_token_ids]
-
-        # attn_metadata.cu_seqlens_q = self.arange[:bs + 1]
-        # attn_metadata.max_q_len = 1
-
-        # for i in range(self.mtp_k - 1):
-        #     input_ids = draft_token_ids_list[-1].int()
-        #     positions += 1
-        #     forward_context.context.is_prefill = False
-
-        #     attn_metadata, pos = self.runner.attn_metadata_builder.build_for_drafting(batch, bs, i+1)
-        #     print(f"{attn_metadata.max_q_len=}")
-        #     print(f"{attn_metadata.slot_mapping=}")
-        #     print(f"{attn_metadata.context_lens=}")
-        #     print(f"{attn_metadata.block_tables=}")
-        #     print(f"{attn_metadata.kv_indices=}")
-        #     print(f"{attn_metadata.kv_last_page_lens=}")
-        #     print(f"{attn_metadata.kv_indptr=}")
-        #     print(f"{pos=}")
-
-        #     hidden_states = self.model(
-        #         input_ids=input_ids,
-        #         positions=positions,
-        #         hidden_states=hidden_states,
-        #         inputs_embeds=None,
-        #     )
-        #     logits = self.model.compute_logits(hidden_states)
-        #     draft_token_ids = logits.argmax(dim=-1)
-        #     draft_token_ids_list.append(draft_token_ids)
-
-        # [batch_size, num_speculative_tokens]
-        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        return draft_token_ids
+        else:
+            raise ValueError(
+                f"num_speculative_tokens={self.mtp_k} is not supported. "
+                f"Only num_speculative_tokens=1 is currently supported."
+            )
 
     def prepare_inputs(
             self,
@@ -236,60 +211,61 @@ class EagleProposer:
             attn_metadata = forward_context.attn_metadata
 
             device = attn_metadata.cu_seqlens_q.device
-            cu_seqlens_q_cpu = attn_metadata.cu_seqlens_q.cpu()
-            context_lens_cpu = attn_metadata.context_lens.cpu()
+            # Ensure num_rejected_tokens is on the correct device
+            if num_rejected_tokens.device != device:
+                num_rejected_tokens = num_rejected_tokens.to(device, non_blocking=True)
+
+            cu_seqlens_q = attn_metadata.cu_seqlens_q
+            context_lens = attn_metadata.context_lens
 
             # Only use decode sequences' context_lens and cu_seqlens_q (num_rejected_tokens length matches decode sequences)
             # These may contain padding, so we need to slice to match num_rejected_tokens length
             scheduled_bs = len(num_rejected_tokens)
-            context_lens_cpu = context_lens_cpu[:scheduled_bs]
+            context_lens = context_lens[:scheduled_bs]
             # cu_seqlens_q has length scheduled_bs + 1 (includes 0 at start)
-            cu_seqlens_q_cpu = cu_seqlens_q_cpu[:scheduled_bs + 1]
+            cu_seqlens_q = cu_seqlens_q[:scheduled_bs + 1]
 
             # Calculate new sequence lengths
-            new_context_lens_cpu = context_lens_cpu - num_rejected_tokens + 1
+            new_context_lens = context_lens - num_rejected_tokens + 1
 
             # [0, q1, q1 + q2, q1 + q2 + q3] -> [q1, q2, q3]
-            new_query_len_per_req = (cu_seqlens_q_cpu[1:] - cu_seqlens_q_cpu[:-1])
+            new_query_len_per_req = (cu_seqlens_q[1:] - cu_seqlens_q[:-1])
             # [q1, q2, q3] -> [q1 - n1, q2 - n2, q3 - n3]
             new_num_tokens_per_req = new_query_len_per_req - num_rejected_tokens
-            new_num_tokens_per_req_np = new_num_tokens_per_req.numpy()
 
             # [q1 - n1, q2 - n2, q3 - n3] ->
             # [0, q1 - n1, q1 + q2 - n1 - n2, q1 + q2 + q3 - n1 - n2 - n3]
-            new_cu_seqlens_q_cpu = torch.zeros(
-                cu_seqlens_q_cpu.shape,
-                dtype=torch.int32)
-            new_cu_seqlens_q_np = new_cu_seqlens_q_cpu.numpy()
-            np.cumsum(new_num_tokens_per_req_np, out=new_cu_seqlens_q_np[1:])
+            new_cu_seqlens_q = torch.zeros(
+                cu_seqlens_q.shape,
+                dtype=torch.int32,
+                device=device)
+            new_cu_seqlens_q[1:] = torch.cumsum(new_num_tokens_per_req, dim=0)
 
-            total_num_tokens = new_cu_seqlens_q_np[-1]
+            total_num_tokens = new_cu_seqlens_q[-1].item()
 
             # Create expanded query start locations for token indexing
-            new_cu_seqlens_q_expanded = np.repeat(new_cu_seqlens_q_np[:-1],
-                                                new_num_tokens_per_req_np)
+            new_cu_seqlens_q_expanded = torch.repeat_interleave(
+                new_cu_seqlens_q[:-1], new_num_tokens_per_req)
 
             # Create token offsets within each request
-            token_offsets = self.token_arange_np[:total_num_tokens] - new_cu_seqlens_q_expanded
+            token_offsets = self.token_arange_gpu[:total_num_tokens] - new_cu_seqlens_q_expanded
 
             # Expand old starting positions to match token pattern
-            old_cu_seqlens_q_expanded = np.repeat(
-                cu_seqlens_q_cpu[:-1].numpy(), new_num_tokens_per_req_np)
+            old_cu_seqlens_q_expanded = torch.repeat_interleave(
+                cu_seqlens_q[:-1], new_num_tokens_per_req)
 
             # Final token indices
-            token_indices_np = token_offsets + old_cu_seqlens_q_expanded
-            token_indices = torch.from_numpy(token_indices_np).to(
-                device, non_blocking=True)
+            token_indices = token_offsets + old_cu_seqlens_q_expanded
 
             # Create new attention metadata
             spec_common_attn_metadata = AttentionMetaData(
-                cu_seqlens_q=new_cu_seqlens_q_cpu.to(device, non_blocking=True),
+                cu_seqlens_q=new_cu_seqlens_q,
                 cu_seqlens_k=attn_metadata.cu_seqlens_k,
                 max_seqlen_q=new_num_tokens_per_req.max().item(),
                 max_seqlen_k=attn_metadata.max_seqlen_k,
                 min_seqlen_q=new_num_tokens_per_req.min().item(),
                 slot_mapping=attn_metadata.slot_mapping[token_indices],
-                context_lens=new_context_lens_cpu.to(device, non_blocking=True),
+                context_lens=new_context_lens,
                 block_tables=attn_metadata.block_tables,
                 dropout_p=attn_metadata.dropout_p,
                 max_q_len=new_num_tokens_per_req.max().item(),
