@@ -1686,6 +1686,11 @@ class DeepseekV2Model(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+        # Cache PP group info to avoid calling get_pp_group() in forward (which breaks torch.compile)
+        pp_group = get_pp_group()
+        self.is_first_pp_rank = pp_group.is_first_rank
+        self.is_last_pp_rank = pp_group.is_last_rank
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1696,7 +1701,7 @@ class DeepseekV2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        if get_pp_group().is_first_rank:
+        if self.is_first_pp_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -1710,7 +1715,7 @@ class DeepseekV2Model(nn.Module):
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states, residual = layer(positions, hidden_states, residual)
 
-        if not get_pp_group().is_last_rank:
+        if not self.is_last_pp_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
