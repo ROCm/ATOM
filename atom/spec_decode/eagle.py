@@ -296,6 +296,19 @@ class EagleProposer:
                 kv_indptr=attn_metadata.kv_indptr,
                 kv_indices=attn_metadata.kv_indices,
                 kv_last_page_lens=attn_metadata.kv_last_page_lens,
+                cu_seqlen_ks=attn_metadata.cu_seqlen_ks,
+                cu_seqlen_ke=attn_metadata.cu_seqlen_ke,
+                sparse_kv_indptr=attn_metadata.sparse_kv_indptr,
+                work_meta_data=attn_metadata.work_meta_data,
+                work_indptr=attn_metadata.work_indptr,
+                work_info_set=attn_metadata.work_info_set,
+                reduce_indptr=attn_metadata.reduce_indptr,
+                reduce_final_map=attn_metadata.reduce_final_map,
+                reduce_partial_map=attn_metadata.reduce_partial_map,
+                block_tables_converted=attn_metadata.block_tables_converted,
+                kv_indices_converted=attn_metadata.kv_indices_converted,
+                sparse_cu_seqlens_q=attn_metadata.sparse_cu_seqlens_q,
+                token_to_seq_idxs=attn_metadata.token_to_seq_idxs,
             )
 
             # Update the forward context
