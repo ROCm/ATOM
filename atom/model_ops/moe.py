@@ -84,11 +84,21 @@ class FusedMoEParallelConfig:
             tp_rank = dp_rank * tp_size_ + tp_rank
             return tp_size, tp_rank
 
+        # Only flatten DP into TP/EP when enable_dp_attention is True.
+        # Otherwise, use pure DP for MoE.
+        enable_dp_attention = parallel_config.enable_dp_attention
+
         use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
-        tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
+
+        if enable_dp_attention:
+            tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
+        else:
+            tp_size = tp_size_
+            tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
+
         atom_config = get_current_atom_config()
 
         if not use_ep:
@@ -1929,9 +1939,13 @@ class FusedMoE(torch.nn.Module):
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
+        # There are three mode
+        # 1. Pure DP mode: only DP is used
+        # 2. DP attention + EP mori Moe
+        # 3. DP attention + TP All_gahter/reduce Moe
         original_hidden_size = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
-        if self.dp_size > 1 and not self.moe_parallel_config.use_all2all_kernels:
+        if self.dp_size > 1 and not self.moe_parallel_config.use_all2all_kernels and get_current_atom_config().enable_dp_attention:
             hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
             router_logits, _ = all_gather_with_padding(router_logits)
 
@@ -1955,7 +1969,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
-        if self.dp_size > 1 and not self.moe_parallel_config.use_all2all_kernels:
+        if self.dp_size > 1 and not self.moe_parallel_config.use_all2all_kernels and get_current_atom_config().enable_dp_attention:
             final_hidden_states = reduce_scatter_with_unpadding(
                 final_hidden_states, original_hidden_size
             )
