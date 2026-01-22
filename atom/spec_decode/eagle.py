@@ -1,17 +1,15 @@
+import logging
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-
+from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils.forward_context import AttentionMetaData, get_forward_context
 from atom.model_loader.loader import load_model
 from atom.models.deepseek_mtp import DeepSeekMTP
+from atom.utils.forward_context import AttentionMetaData, get_forward_context
 
-from aiter.dist.parallel_state import get_pp_group
-
-
-import logging
 logger = logging.getLogger("atom")
 
 
@@ -268,7 +266,6 @@ class EagleProposer:
                 context_lens=new_context_lens,
                 block_tables=attn_metadata.block_tables,
                 dropout_p=attn_metadata.dropout_p,
-                max_q_len=new_num_tokens_per_req.max().item(),
                 kv_indptr=attn_metadata.kv_indptr,
                 kv_indices=attn_metadata.kv_indices,
                 kv_last_page_lens=attn_metadata.kv_last_page_lens,

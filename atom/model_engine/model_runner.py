@@ -18,13 +18,12 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
-
 from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
-from atom.model_ops.sampler import Sampler
 from atom.model_ops.rejection_sampler import RejectionSampler
+from atom.model_ops.sampler import Sampler
 from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
@@ -362,30 +361,26 @@ class tokenIDProcessor:
                         self.input_ids.copy_to_gpu(num_new_tokens)
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
-                if gathered_tokens is not None:
-                    self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
                 if num_new_tokens > 0:
                     if self.use_spec:
                         # MTP mode: combine scheduled_tokens and draft_tokens
                         # For new_decode_front=False, use new_curr_indices to get the right sequences
-                        token_ids = []
+                        new_token_ids = []
                         for idx in new_curr_indices:
                             req_idx = total_reqs_prefill + idx
                             tokens = scheduled_tokens[req_idx]
                             req_id = batch.req_ids[idx]
                             draft_tokens = batch.scheduled_spec_decode_tokens.get(req_id, [])
-                            token_ids.extend([tokens[-1]] + draft_tokens)
-                        self.input_ids.np[:num_new_tokens] = token_ids
-                        self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
-                            self.input_ids.copy_to_gpu(num_new_tokens)
-                        )
+                            new_token_ids.extend([tokens[-1]] + draft_tokens)
                     else:
                         # Non-MTP mode: only first token from scheduled_tokens
-                        new_token_ids = [scheduled_tokens[total_reqs_prefill + idx][0] for idx in new_curr_indices]
-                        self.input_ids.np[:num_new_tokens] = new_token_ids
-                        self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
-                            self.input_ids.copy_to_gpu(num_new_tokens)
-                        )
+                        new_token_ids = [scheduled_tokens[idx][0] for idx in new_curr_indices]
+                    self.input_ids.np[:num_new_tokens] = new_token_ids
+                    self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens].copy_(
+                        self.input_ids.cpu[:num_new_tokens], non_blocking=True
+                    )
+                if gathered_tokens is not None:
+                    self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
 
         return self.input_ids.gpu[:total_tokens]
 
@@ -1046,7 +1041,7 @@ class ModelRunner:
             scheduled_bs = batch.total_seqs_num_decode
             # num_pad, num_tokens_across_dp = self.get_dp_padding(scheduled_bs)
             # padded_scheduled_bs = scheduled_bs + num_pad
-            #TODO rename num_input_tokens to actual bs in currrent rank?
+            # TODO rename num_input_tokens to actual bs in currrent rank?
             padded_scheduled_bs = num_input_tokens
             # for MTP, we need to divide by (mtp_k + 1) to get the actual batch size
             if hasattr(self, "drafter"):
@@ -1127,7 +1122,7 @@ class ModelRunner:
             hidden_states = self.model(input_ids, positions)
         else:
             graph_bs = context.graph_bs
-            max_q_len = forward_context.attn_metadata.max_q_len
+            max_q_len = forward_context.attn_metadata.max_seqlen_q
             graph_key = (graph_bs, max_q_len)
             self.graphs[graph_key].replay()
             num_tokens = context.batch_size * max_q_len

@@ -1,26 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Set, Dict, Union
-from atom.config import Config, KVCacheTensor
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Set, Union
+
 import torch
-from abc import ABC, abstractmethod
-from atom.config import Config, ParallelConfig
+from atom.config import Config, KVCacheTensor, ParallelConfig
 
 
-def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
-                                      max_num_tokens: int,
-                                      chunk_idx: int) -> list[int]:
+def _compute_chunked_local_num_tokens(
+    num_tokens_across_dp_cpu: list[int], max_num_tokens: int, chunk_idx: int
+) -> list[int]:
     dp_size = len(num_tokens_across_dp_cpu)
 
     local_size = [-1] * dp_size
     for i in range(dp_size):
         dp_tokens = num_tokens_across_dp_cpu[i]
-        local_size[i] = min(max_num_tokens,
-                            dp_tokens - (max_num_tokens * chunk_idx))
+        local_size[i] = min(max_num_tokens, dp_tokens - (max_num_tokens * chunk_idx))
         if local_size[i] <= 0:
             local_size[i] = 1  # ensure lockstep even if done
     return local_size
@@ -34,28 +33,30 @@ class DPMetadata:
     local_sizes: Optional[list[int]] = None
 
     @staticmethod
-    def num_tokens_across_dp(num_tokens: int, dp_size: int,
-                             dp_rank: int) -> torch.Tensor:
+    def num_tokens_across_dp(
+        num_tokens: int, dp_size: int, dp_rank: int
+    ) -> torch.Tensor:
         """
         Gather the num_tokens across all DP ranks and return results in a
         CPU tensor of size dp_size.
         """
         num_tokens_across_dp = [0] * dp_size
         num_tokens_across_dp[dp_rank] = num_tokens
-        num_tokens_tensor = torch.tensor(num_tokens_across_dp,
-                                         device="cpu",
-                                         dtype=torch.int32)
-        from aiter.dist.parallel_state import get_dp_group
+        num_tokens_tensor = torch.tensor(
+            num_tokens_across_dp, device="cpu", dtype=torch.int32
+        )
         import torch.distributed as dist
+        from aiter.dist.parallel_state import get_dp_group
+
         dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
         return num_tokens_tensor
 
     @staticmethod
     def make(
-            parallel_config: ParallelConfig,
-            # attn_metadata: Any,
-            num_tokens: int,
-            num_tokens_across_dp: Optional[torch.Tensor] = None
+        parallel_config: ParallelConfig,
+        # attn_metadata: Any,
+        num_tokens: int,
+        num_tokens_across_dp: Optional[torch.Tensor] = None,
     ) -> "DPMetadata":
 
         assert parallel_config.data_parallel_size > 1
@@ -65,15 +66,21 @@ class DPMetadata:
 
         # If num_tokens_across_dp is None, it will be computed by all_reduce
         # Otherwise, num_tokens_across_dp[dp_rank] should be equal to batchsize
-        assert (num_tokens_across_dp is None
-                or num_tokens_across_dp[dp_rank] == batchsize)
+        assert (
+            num_tokens_across_dp is None or num_tokens_across_dp[dp_rank] == batchsize
+        )
         if num_tokens_across_dp is None:
             num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
-                batchsize, dp_size, dp_rank)
+                batchsize, dp_size, dp_rank
+            )
         max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp)
         cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_across_dp, dim=0)
-        max_tokens_across_dp = max_tokens_across_dp_cpu.item()  # Pre-compute int for cudagraph
-        return DPMetadata(max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu, max_tokens_across_dp)
+        max_tokens_across_dp = (
+            max_tokens_across_dp_cpu.item()
+        )  # Pre-compute int for cudagraph
+        return DPMetadata(
+            max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu, max_tokens_across_dp
+        )
 
     @contextmanager
     def chunked_sizes(self, max_chunk_size_per_rank: int, chunk_idx: int):
@@ -98,12 +105,12 @@ class DPMetadata:
         """
         cu_sizes = self.cu_tokens_across_dp_cpu
         num_tokens_across_dp_cpu = [
-            (cu_sizes[i] -
-             cu_sizes[i - 1]).item() if i > 0 else cu_sizes[0].item()
+            (cu_sizes[i] - cu_sizes[i - 1]).item() if i > 0 else cu_sizes[0].item()
             for i in range(len(cu_sizes))
         ]
         self.local_sizes = _compute_chunked_local_num_tokens(
-            num_tokens_across_dp_cpu, max_chunk_size_per_rank, chunk_idx)
+            num_tokens_across_dp_cpu, max_chunk_size_per_rank, chunk_idx
+        )
         try:
             yield self.local_sizes
         finally:
@@ -149,6 +156,7 @@ class Context:
         self.graph_bs = graph_bs
         self.is_draft = is_draft
 
+
 @dataclass
 class AttentionMetaData:
     """Attention metadata for prefill and decode batched together."""
@@ -164,7 +172,6 @@ class AttentionMetaData:
     fake_block_tables: Optional[torch.Tensor] = None
     dropout_p: float = 0.0
 
-    max_q_len: Optional[int] = None
     kv_indptr: Optional[torch.Tensor] = None
     kv_indices: Optional[torch.Tensor] = None
     kv_last_page_lens: Optional[torch.Tensor] = None
@@ -193,7 +200,6 @@ class AttentionMetaData:
         context_lens: Optional[torch.Tensor] = None,
         block_tables: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
-        max_q_len: Optional[int] = None,
         kv_indptr: Optional[torch.Tensor] = None,
         kv_indices: Optional[torch.Tensor] = None,
         kv_last_page_lens: Optional[torch.Tensor] = None,
@@ -220,7 +226,6 @@ class AttentionMetaData:
         self.context_lens = context_lens
         self.block_tables = block_tables
         self.dropout_p = dropout_p
-        self.max_q_len = max_q_len
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
         self.kv_last_page_lens = kv_last_page_lens
@@ -291,7 +296,9 @@ def get_forward_context() -> ForwardContext:
 
 
 def set_forward_context(
-    attn_metadata: AttentionMetaData, atom_config: Config, context: Context,
+    attn_metadata: AttentionMetaData,
+    atom_config: Config,
+    context: Context,
     num_tokens: Optional[int] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
@@ -299,10 +306,12 @@ def set_forward_context(
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
     if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
-        dp_metadata = DPMetadata.make(atom_config.parallel_config,
-                                      # attn_metadata,
-                                      num_tokens or 0,
-                                      num_tokens_across_dp)
+        dp_metadata = DPMetadata.make(
+            atom_config.parallel_config,
+            # attn_metadata,
+            num_tokens or 0,
+            num_tokens_across_dp,
+        )
 
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,
@@ -311,7 +320,7 @@ def set_forward_context(
         context=context,
         dp_metadata=dp_metadata,
         spec_decode_metadata=spec_decode_metadata,
-    )    # _forward_context.attn_metadata = attn_metadata
+    )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
 
