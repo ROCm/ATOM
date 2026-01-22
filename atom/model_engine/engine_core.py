@@ -71,10 +71,9 @@ class EngineCore:
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
         )
         self.output_thread.start()
-        self.input_thread = threading.Thread(
-            target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        )
-        self.input_thread.start()
+        # Don't start input thread yet - wait until after model initialization to avoid
+        # race condition where other requests arrive before READY signal
+        self.input_thread = None
 
         self.profile_enbaled = config.torch_profiler_dir is not None
         init_exit_handler(self)
@@ -113,19 +112,16 @@ class EngineCore:
 
         self.scheduler = Scheduler(config)
 
-        # Start input thread AFTER model is loaded so the "ready" signal
-        # is sent only when the engine is truly ready to accept requests
-        # self.input_thread = threading.Thread(
-        #     target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        # )
-        # self.input_thread.start()
-
-        # We can not start input thread here since dp need to sync with other ranks,
-        # Otherwise, DP will hang always.
-        # Thus we add new signal READY to notify CoreManager
-
+        # Send READY signal before starting input thread to avoid race condition
+        # This ensures CoreManager receives READY before any other requests
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+        # Start the input thread after READY signal is sent
+        self.input_thread = threading.Thread(
+            target=self.process_input_sockets, args=(self.input_address,), daemon=True
+        )
+        self.input_thread.start()
 
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", None))
