@@ -1942,7 +1942,11 @@ class FusedMoE(torch.nn.Module):
         # 3. DP attention + TP All_gahter/reduce Moe
         original_hidden_size = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
-        if self.dp_size > 1 and not self.moe_parallel_config.use_all2all_kernels and get_current_atom_config().enable_dp_attention:
+        if (
+            self.dp_size > 1
+            and not self.moe_parallel_config.use_all2all_kernels
+            and get_current_atom_config().enable_dp_attention
+        ):
             hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
             router_logits, _ = all_gather_with_padding(router_logits)
 
@@ -1966,7 +1970,11 @@ class FusedMoE(torch.nn.Module):
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
-        if self.dp_size > 1 and not self.moe_parallel_config.use_all2all_kernels and get_current_atom_config().enable_dp_attention:
+        if (
+            self.dp_size > 1
+            and not self.moe_parallel_config.use_all2all_kernels
+            and get_current_atom_config().enable_dp_attention
+        ):
             final_hidden_states = reduce_scatter_with_unpadding(
                 final_hidden_states, original_hidden_size
             )
