@@ -953,11 +953,8 @@ class ModelRunner:
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> dict[int, int]:
         # Add top-level marker for the entire forward pass
-        forward_context = get_forward_context()
-        context = forward_context.context
-        is_prefill = context.is_prefill
-        phase_name = "PREFILL" if is_prefill else "DECODE"
-        
+        is_prefill = batch.total_tokens_num_prefill > 0
+        phase_name = "PREFILL" if is_prefill else "DECODE"      
         with torch_profiler.record_function(f"forward_pass_{phase_name}"):
             input_ids, temperatures = self.prepare_model(batch)
             logits = self.run_model(input_ids)
