@@ -920,17 +920,17 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
         # Add profiler markers to distinguish prefill vs decode in traces
-        phase_name = "PREFILL_PHASE" if is_prefill else "DECODE_PHASE"
+        phase_name = "PREFILL" if is_prefill else "DECODE"
         with torch_profiler.record_function(phase_name):
             if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
                 # Mark model forward pass
-                with torch_profiler.record_function(f"{phase_name}_model_forward"):
+                with torch_profiler.record_function(f"model_forward_{phase_name}"):
                     hidden_states = self.model(input_ids, positions)
             else:
                 # Mark CUDA graph replay for decode
                 graph_bs = context.graph_bs
                 # torch.cuda.synchronize() to ensure the graph is captured
-                with torch_profiler.record_function(f"{phase_name}_cudagraph_replay_bs{graph_bs}"):
+                with torch_profiler.record_function(f"cudagraph_replay_bs{graph_bs}_{phase_name}"):
                     self.graphs[graph_bs].replay()
                 hidden_states = self.forward_vars["outputs"][:bs]
         return self.model.compute_logits(hidden_states)
@@ -953,10 +953,12 @@ class ModelRunner:
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> dict[int, int]:
         # Add top-level marker for the entire forward pass
-        is_prefill = batch.total_tokens_num_prefill > 0
-        phase_marker = "PREFILL" if is_prefill else "DECODE"
+        forward_context = get_forward_context()
+        context = forward_context.context
+        is_prefill = context.is_prefill
+        phase_name = "PREFILL" if is_prefill else "DECODE"
         
-        with torch_profiler.record_function(f"forward_pass_{phase_marker}"):
+        with torch_profiler.record_function(f"forward_pass_{phase_name}"):
             input_ids, temperatures = self.prepare_model(batch)
             logits = self.run_model(input_ids)
         reset_forward_context()
