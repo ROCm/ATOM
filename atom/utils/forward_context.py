@@ -5,10 +5,31 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Set, Dict, Union
-from atom.config import Config, KVCacheTensor
+from atom.config import CUDAGraphMode, Config, KVCacheTensor, get_current_atom_config
+from atom.utils.cuda_graph import BatchDescriptor
 import torch
 from abc import ABC, abstractmethod
 from atom.config import Config, ParallelConfig
+
+from typing import TypeAlias
+
+@dataclass
+class UBatchSlice:
+    request_slice: slice
+    token_slice: slice
+
+    def is_empty(self) -> bool:
+        return (
+            self.request_slice.start == self.request_slice.stop
+            or self.token_slice.start == self.token_slice.stop
+        )
+
+    @property
+    def num_tokens(self) -> int:
+        return self.token_slice.stop - self.token_slice.start
+
+
+UBatchSlices: TypeAlias = list[UBatchSlice]
 
 
 def _compute_chunked_local_num_tokens(num_tokens_across_dp_cpu: list[int],
@@ -243,7 +264,7 @@ class ForwardContext:
     no_compile_layers: dict[int, Any] = field(default_factory=dict)
 
     attn_metadata: Optional[
-        Union["AttentionMetaData", dict[str, "AttentionMetaData"]]
+        Union["AttentionMetaData", list[AttentionMetaData]]
     ] = None
 
     kv_cache_data: dict[str, KVCacheTensor] = None
@@ -251,6 +272,10 @@ class ForwardContext:
     context: Optional[Context] = None
 
     dp_metadata: Optional[DPMetadata] = None
+
+    batch_descriptor: BatchDescriptor | None = None
+
+    ubatch_slices: UBatchSlices | None = None
 
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
@@ -274,6 +299,8 @@ def get_forward_context() -> ForwardContext:
 
 def set_forward_context(
     attn_metadata: AttentionMetaData, atom_config: Config, context: Context,
+    ubatch_slices: UBatchSlices = None,
+    batch_descriptor: BatchDescriptor | None = None,
     num_tokens: Optional[int] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
 ) -> None:
@@ -284,6 +311,11 @@ def set_forward_context(
                                       # attn_metadata,
                                       num_tokens or 0,
                                       num_tokens_across_dp)
+    # Convenience: if cudagraph is used and num_tokens is given, we can just
+    # create a batch descriptor here if not given (there's no harm since if it
+    # doesn't match in the wrapper it'll fall through).
+    if get_current_atom_config().compilation_config.cudagraph_mode != CUDAGraphMode.NONE and batch_descriptor is None:
+        batch_descriptor = batch_descriptor or BatchDescriptor(num_tokens=num_tokens)
 
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,
@@ -291,9 +323,39 @@ def set_forward_context(
         kv_cache_data=_forward_kv_cache_context.kv_cache_data,
         context=context,
         dp_metadata=dp_metadata,
+        ubatch_slices=ubatch_slices,
     )    # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)
+
+@contextmanager
+def override_forward_context(forward_context: ForwardContext | None):
+    global _forward_context
+    prev_context = _forward_context
+    _forward_context = forward_context
+    try:
+        yield
+    finally:
+        _forward_context = prev_context
+
+def create_forward_context(
+    attn_metadata: Any,
+    atom_config: Config,
+    context: Context,
+    batch_descriptor: BatchDescriptor | None = None,
+    dp_metadata: DPMetadata | None = None,
+    ubatch_slices: UBatchSlices | None = None,
+):
+    return ForwardContext(
+        no_compile_layers=atom_config.compilation_config.static_forward_context,
+        attn_metadata=attn_metadata,
+        context=context,
+        batch_descriptor=batch_descriptor,
+        kv_cache_data=_forward_kv_cache_context.kv_cache_data,
+        dp_metadata=dp_metadata,
+        ubatch_slices=ubatch_slices,
+    )
+
 
 
 def reset_forward_context() -> None:

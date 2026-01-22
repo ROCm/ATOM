@@ -43,6 +43,7 @@ class EngineArgs:
     enable_dp_attention: bool = False
     method: Optional[str] = None
     num_speculative_tokens: int = 1
+    enable_dbo: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -156,7 +157,11 @@ class EngineArgs:
             default=0.9,
             help="GPU memory utilization (0.0 to 1.0)",
         )
-
+        parser.add_argument(
+            "--enable-dbo",
+            action="store_true",
+            help="Enable microbatched execution.",
+        )
         return parser
 
     @classmethod

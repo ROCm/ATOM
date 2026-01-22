@@ -107,6 +107,7 @@ class CUDAGraphWrapper:
         # only investigate this when we use multiple streams
 
         # self.graph_pool = current_platform.get_global_graph_pool()
+        self.graph_pool = None # ATOM uses default graph pool
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -128,12 +129,14 @@ class CUDAGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
+        from atom.utils.forward_context import get_forward_context
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
-        cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+        # cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
-        if cudagraph_runtime_mode == CUDAGraphMode.NONE or \
-                            cudagraph_runtime_mode != self.runtime_mode:
+        # if cudagraph_runtime_mode == CUDAGraphMode.NONE or \
+        #                     cudagraph_runtime_mode != self.runtime_mode:
+        if self.runtime_mode == CUDAGraphMode.NONE:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
             # running without cudagraphs.
             # We do not trigger capture/replay if the runtime mode is not
@@ -155,8 +158,8 @@ class CUDAGraphWrapper:
                 # capturing is fast, we don't need to log it for every
                 # shape. E.g. we only log it for the first subgraph in
                 # piecewise mode.
-                logger.info("Capturing a cudagraph on (%s,%s)",
-                             self.runtime_mode.name, entry.batch_descriptor)
+                logger.info("Capturing a cudagraph on (%s)",
+                             entry.batch_descriptor)
             # validate that cudagraph capturing is legal at this point.
             # ================= TODO lirong ========================
             # validate_cudagraph_capturing_enabled()

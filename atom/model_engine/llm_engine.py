@@ -27,6 +27,13 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get('data_parallel_size', 1)
+        tensor_parallel_size = kwargs.get('tensor_parallel_size', 1)
+        enable_expert_parallel = kwargs.get('enable_expert_parallel', False)
+        enable_dbo = kwargs.get('enable_dbo', False)
+
+        # temporary disable DBO for single  rank
+        enable_dbo = enable_dbo and max(data_parallel_size, tensor_parallel_size) > 1 and enable_expert_parallel
+        print(f"enable_dbo: {enable_dbo}")
         config = Config(model, **config_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.bos_token_id = self.tokenizer.bos_token_id
@@ -37,6 +44,7 @@ class LLMEngine:
         config.stop_token_ids = list(stop_token_ids)
         # Set data parallel size in config
         config.parallel_config.data_parallel_size = data_parallel_size
+        config.parallel_config.enable_dbo = enable_dbo
         self.data_parallel_size = data_parallel_size
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(

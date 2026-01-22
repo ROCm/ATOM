@@ -31,6 +31,8 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
+from atom.utils.dbo.gpu_ubatch_wrapper import UBatchWrapper
+from atom.utils.dbo.utils import split_attn_metadata, _pad_out_ubatch_slices
 from atom.utils.selector import get_attn_backend
 
 logger = logging.getLogger("atom")
@@ -38,6 +40,8 @@ from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
     DPMetadata,
+    UBatchSlice,
+    UBatchSlices,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
@@ -239,10 +243,12 @@ class tokenIDProcessor:
                 if num_new_tokens > 0:
                     new_token_ids = [scheduled_tokens[idx][0] for idx in new_curr_indices]
                     self.input_ids.np[:num_new_tokens] = new_token_ids
+                    # self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens].copy_(
+                    #     self.input_ids.cpu[:num_new_tokens], non_blocking=True
+                    # )
                     self.input_ids.gpu[num_deferred_tokens : num_deferred_tokens + num_new_tokens] = (
                         self.input_ids.copy_to_gpu(num_new_tokens)
                     )
-
         return self.input_ids.gpu[:total_tokens]
 
 
@@ -351,6 +357,10 @@ class ModelRunner:
         self.allocate_forward_vars()
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
         self.physical_block_size = self.attn_metadata_builder.block_size
+        if self.config.parallel_config.enable_dbo:
+            print("use DBO 000000000000000")
+            graph_mode = config.compilation_config.cudagraph_mode
+            self.model = UBatchWrapper(self.model, config, graph_mode, self.device)
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
@@ -448,6 +458,52 @@ class ModelRunner:
             self.profiler.__exit__(None, None, None)
             self.profiler = None
         return True
+
+
+    def get_ubatch_slices(self, batch: ScheduledBatch):
+        tokens = batch.num_scheduled_tokens
+
+        # need padding?
+        num_reqs_padded = batch.total_seqs_num
+        num_tokens_padded = batch.total_tokens_num
+
+        num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+        cu_num_tokens = np.zeros(len(num_scheduled_tokens_np) + 1, dtype=np.int32)
+
+        np.cumsum(num_scheduled_tokens_np, dtype=np.int32, out=cu_num_tokens[1:])
+        total_tokens_num = batch.total_tokens_num
+        # num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens_unpadded)
+        split_point = int(total_tokens_num) // 2
+
+        first_ubatch_token_slice = slice(0, split_point)
+        second_ubatch_token_slice = slice(split_point, cu_num_tokens[-1])
+
+        # First ubatch includes requests whose tokens overlap [0, split_point)
+        first_ubatch_req_stop = int(
+            np.searchsorted(cu_num_tokens, split_point, side="left")
+        )
+        first_ubatch_req_slice = slice(0, first_ubatch_req_stop)
+
+        # Second ubatch starts at the request that contains the split_point
+        # or the request starting exactly at split_point (if on boundary)
+        second_ubatch_req_start = int(
+            np.searchsorted(cu_num_tokens, split_point, side="right") - 1
+        )
+        second_ubatch_req_slice = slice(second_ubatch_req_start, len(cu_num_tokens) - 1)
+
+        ubatch_slices = [
+            UBatchSlice(first_ubatch_req_slice, first_ubatch_token_slice),
+            UBatchSlice(second_ubatch_req_slice, second_ubatch_token_slice),
+        ]
+
+        ubatch_slices_padded = _pad_out_ubatch_slices(
+            ubatch_slices, num_tokens_padded, num_reqs_padded
+        )
+
+        assert sum(s.num_tokens for s in ubatch_slices_padded) == num_tokens_padded
+
+        return ubatch_slices, ubatch_slices_padded
+
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
@@ -844,6 +900,18 @@ class ModelRunner:
         num_input_tokens += num_pad
         return num_input_tokens, num_tokens_across_dp
 
+    def _build_attention_metadata(
+        self,
+        attn_metadata: AttentionMetaData,
+        ubatch_slices: UBatchSlices | None = None,
+        is_prefill: bool = False,
+    ):
+        if ubatch_slices is not None:
+            attn_metadata_list = split_attn_metadata(ubatch_slices, attn_metadata, is_prefill)
+            # print("This is build_attention_metadata", attn_metadata_list)
+        
+        return attn_metadata_list
+
     def prepare_intputs(self, batch: ScheduledBatch):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
@@ -873,6 +941,35 @@ class ModelRunner:
             batch.total_seqs_num_prefill if is_prefill else scheduled_bs
         )
         graph_bs = num_input_tokens if is_prefill else bs
+
+        # DBO requires at least 2 tokens to split into non-empty ubatches
+        # For DP: all ranks must agree on whether to enable DBO to avoid deadlock
+        # (mori dispatch/combine are collective operations)
+        local_can_dbo = self.config.parallel_config.enable_dbo and batch.total_tokens_num >= 2
+        dp_size = self.config.parallel_config.data_parallel_size
+        if dp_size > 1 and self.config.parallel_config.enable_dbo:
+            # Sync DBO enable state across all DP ranks using MIN reduction
+            # DBO is only enabled if ALL ranks can enable it
+            # Use CPU tensor and cpu_group for the all_reduce
+            can_dbo_tensor = torch.tensor(
+                [1 if local_can_dbo else 0], dtype=torch.int64, device="cpu"
+            )
+            torch.distributed.all_reduce(
+                can_dbo_tensor, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
+            )
+            enable_dbo = can_dbo_tensor.item() == 1
+        else:
+            enable_dbo = local_can_dbo
+
+        if enable_dbo:
+            ubatch_slices, ubatch_slices_padded = self.get_ubatch_slices(batch)
+            # Save original attn_metadata for compute_logits (which runs after ubatch wrapper)
+            self._original_attn_metadata = attn_metadata
+            attn_metadata = self._build_attention_metadata(attn_metadata, ubatch_slices, is_prefill)
+        else:
+            ubatch_slices = None
+            self._original_attn_metadata = None
+
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -886,6 +983,7 @@ class ModelRunner:
             context=context,
             num_tokens=actual_num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
+            ubatch_slices=ubatch_slices,
         )
         return graph_bs
 
@@ -923,6 +1021,9 @@ class ModelRunner:
             # torch.cuda.synchronize()
             self.graphs[graph_bs].replay()
             hidden_states = self.forward_vars["outputs"][:bs]
+        # Restore original attn_metadata for compute_logits (DBO case)
+        if self._original_attn_metadata is not None:
+            forward_context.attn_metadata = self._original_attn_metadata
         return self.model.compute_logits(hidden_states)
 
     def postprocess(

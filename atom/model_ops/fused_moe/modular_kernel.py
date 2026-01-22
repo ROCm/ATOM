@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
 from atom.utils import envs
-from atom.utils.dbo.ubatching import dbo_enabled
+from atom.utils.dbo.ubatching import dbo_current_ubatch_id, dbo_enabled, dbo_maybe_run_recv_hook, dbo_register_recv_hook, dbo_yield
 from atom.utils.forward_context import get_forward_context
 import torch
 from math import prod
@@ -180,6 +180,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         if not self.prepare_finalize.supports_async():
             # TODO: enable dbo
             assert not dbo_enabled()
+            # print("This is not self.prepare_finalize.supports_async case")
 
             (
                 a1q,
@@ -198,7 +199,61 @@ class FusedMoEModularKernel(torch.nn.Module):
                 quant_type,
             )
         else:
-            assert False, "Now DBO async is not supported"
+            # print("This is self.prepare_finalize.supports_async case")
+            dbo_maybe_run_recv_hook()
+            prepare_ret = self.prepare_finalize.prepare_async(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                global_num_experts,
+                expert_map,
+                apply_router_weight_on_input,
+                self.quant_config,
+                quant_type,
+            )
+
+            # Handle different return types from prepare_async:
+            # 1. Direct result tuple (5 elements): (a1q, scale, meta, ids, weights)
+            # 2. Callable (receiver): call it to get the result
+            # 3. (hook, receiver) tuple: run hook then call receiver
+            if isinstance(prepare_ret, tuple) and len(prepare_ret) == 5:
+                # Direct result tuple - check if first element is a tensor
+                if isinstance(prepare_ret[0], torch.Tensor):
+                    (
+                        a1q,
+                        a1q_scale,
+                        expert_tokens_meta,
+                        _expert_topk_ids,
+                        _expert_topk_weights,
+                    ) = prepare_ret
+                else:
+                    # (hook, receiver) tuple
+                    hook, receiver = prepare_ret
+                    if hook is not None:
+                        if dbo_enabled():
+                            dbo_register_recv_hook(hook)
+                            dbo_yield()
+                        else:
+                            hook()
+                    (
+                        a1q,
+                        a1q_scale,
+                        expert_tokens_meta,
+                        _expert_topk_ids,
+                        _expert_topk_weights,
+                    ) = receiver()
+            elif callable(prepare_ret):
+                # Callable receiver
+                (
+                    a1q,
+                    a1q_scale,
+                    expert_tokens_meta,
+                    _expert_topk_ids,
+                    _expert_topk_weights,
+                ) = prepare_ret()
+            else:
+                raise ValueError(f"Unexpected prepare_async return type: {type(prepare_ret)}")
+
 
         # Maybe prepare gathered topk_ids and topk_weights from other EP ranks.
         topk_ids = topk_ids if _expert_topk_ids is None else _expert_topk_ids
@@ -237,7 +292,33 @@ class FusedMoEModularKernel(torch.nn.Module):
             # if self.shared_experts is not None:
             #     shared_output = self.shared_experts(hidden_states)
         else:
-            assert False, "Now DBO async is not supported"
+            finalize_ret = self.prepare_finalize.finalize_async(
+                output,
+                fused_out,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+            )
+            # Handle different return types from finalize_async:
+            # 1. None: finalize already completed (sglang-style two-phase design)
+            # 2. Callable (receiver): call it to complete finalize
+            # 3. (hook, receiver) tuple: run hook then call receiver
+            if finalize_ret is None:
+                # Finalize already completed in finalize_async
+                pass
+            elif isinstance(finalize_ret, tuple):
+                hook, receiver = finalize_ret
+                if hook is not None:
+                    if dbo_enabled():
+                        dbo_register_recv_hook(hook)
+                        dbo_yield()
+                    else:
+                        hook()
+                receiver()
+            elif callable(finalize_ret):
+                finalize_ret()
+
+        # print(f"after finalize ubatch {dbo_current_ubatch_id()}")
         return output
 
         # Now mori now supported shared expert
@@ -293,7 +374,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             apply_router_weight_on_input,
             quant_type,
         )
-
+        # print(f"after prepare ubatch {dbo_current_ubatch_id()}")
         # optimize fused_moe hidden_states
         # mori dispatch expands buffer to (max_tokens * world_size, hidden_dim)
         # but actual valid tokens = graph_bs * topk * dp_size
@@ -308,7 +389,6 @@ class FusedMoEModularKernel(torch.nn.Module):
             dispatch_weights = dispatch_weights[:total_valid_tokens]
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
-
         fused_out = fused_moe(
             dispatch_a1,
             w1,
@@ -330,6 +410,8 @@ class FusedMoEModularKernel(torch.nn.Module):
             bias2=bias2,
             dtype=hidden_states.dtype,
         )
+
+        # print(f"after fused_moe ubatch {dbo_current_ubatch_id()}")
         return self._finalize(
             output,
             fused_out,
