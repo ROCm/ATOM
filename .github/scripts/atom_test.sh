@@ -51,7 +51,7 @@ fi
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
   echo "========== Cloning bench_serving =========="
-  git clone https://github.com/kimbochen/bench_serving.git
+  git clone https://github.com/kimbochen/bench_serving.git && chmod +x bench_serving/benchmark_serving.py
   echo "========== Running benchmark test =========="
   bench_serving/benchmark_serving.py \
     --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000/v1/completions" \
