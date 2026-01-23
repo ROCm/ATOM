@@ -123,6 +123,8 @@ class EngineCore:
         )
         self.input_thread.start()
 
+        assert self.input_thread.is_alive(), "Input thread failed to start"
+
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", None))
 
