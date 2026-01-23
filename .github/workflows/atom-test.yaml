@@ -186,9 +186,9 @@ jobs:
             model_path="${{ matrix.model_path }}"
           fi
           echo "Model path: $model_path"
-          ls -la $model_path || true
           docker exec atom_test bash -lc "
             set -euo pipefail
+            ls -la \"$model_path\" || echo \"Model path does not exist yet (will be downloaded by HuggingFace)\"
             python3 -m atom.examples.simple_inference \
               --model \"$model_path\" \
               ${{ matrix.extraArgs }} \
