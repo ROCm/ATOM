@@ -7,12 +7,14 @@ import torch
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.utils.forward_context import get_forward_context
 from aiter import dtypes
 from aiter import QuantType
 
 # Lazy import mori
 try:
     import mori
+
     MORI_AVAILABLE = True
 except ImportError:
     mori = None  # type: ignore
@@ -30,7 +32,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         use_fp8_dispatch: bool = False,
-        quant_type = None,
+        quant_type=None,
         quant_dtype: torch.dtype = None,
     ):
         if not MORI_AVAILABLE:
@@ -86,14 +88,22 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         - Optional dispatched expert topk IDs
         - Optional dispatched expert topk weight
         """
-        assert not apply_router_weight_on_input, (
-            "mori does not support apply_router_weight_on_input=True now."
-        )
+        assert (
+            not apply_router_weight_on_input
+        ), "mori does not support apply_router_weight_on_input=True now."
         scale = None
         if self.use_fp8_dispatch:
             from aiter import get_hip_quant
+
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
+        context = get_forward_context().context
+        if context.is_prefill:
+            block_num = 128
+            warp_per_block = 16
+        else:
+            block_num = 64
+            warp_per_block = 4
 
         (
             dispatch_a1,
@@ -101,7 +111,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_scale,
             dispatch_ids,
             dispatch_recv_token_num,
-        ) = self.mori_op.dispatch(a1, topk_weights, scale, topk_ids)
+        ) = self.mori_op.dispatch(
+            a1, topk_weights, scale, topk_ids, block_num, warp_per_block
+        )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=dispatch_recv_token_num, expert_num_tokens_cpu=None
@@ -124,10 +136,20 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         # weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
+        context = get_forward_context().context
+        if context.is_prefill:
+            block_num = 128
+            warp_per_block = 16
+        else:
+            block_num = 64
+            warp_per_block = 4
+
         num_token = output.shape[0]
         result = self.mori_op.combine(
             fused_expert_output,
             None,
             topk_ids,
+            block_num,
+            warp_per_block,
         )[0]
         output.copy_(result[:num_token])

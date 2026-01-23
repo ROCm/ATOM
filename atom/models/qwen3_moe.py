@@ -44,7 +44,6 @@ from atom.utils import envs
 from aiter import fused_rope_rms
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
-ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 
 class RotaryEmbeddingQKNormFused(nn.Module):
@@ -273,7 +272,7 @@ class Qwen3MoeAttention(nn.Module):
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
-        if ENABLE_QK_NORM_ROPE_FUSION or ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             self.rotary_emb = RotaryEmbeddingQKNormFused(
                 head_size=self.head_dim,
                 rotary_dim=self.head_dim,
@@ -305,16 +304,6 @@ class Qwen3MoeAttention(nn.Module):
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
             )
-        elif ENABLE_QK_NORM_ROPE_FUSION:
-            self.attn = Attention(
-                self.num_heads,
-                self.head_dim,
-                self.scaling,
-                self.num_kv_heads,
-                kv_cache_dtype=kv_cache_dtype,
-                layer_num=layer_num,
-                use_mla=False,
-            )
         else:
             self.attn = Attention(
                 self.num_heads,
@@ -339,25 +328,13 @@ class Qwen3MoeAttention(nn.Module):
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
             attn_output = self.attn(q, k, v, positions, None, qkv)
-        elif ENABLE_QK_NORM_ROPE_FUSION:
-            self.rotary_emb(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                positions,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                eps=self.q_norm.eps,
-            )
-            q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-            attn_output = self.attn(q, k, v)
         else:
             q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
             # Add qk-norm
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-            attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output
 

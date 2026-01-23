@@ -7,6 +7,8 @@ from typing import Optional, Type
 
 import numpy as np
 import torch
+from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from atom.config import KVCacheConfig, KVCacheTensor
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
@@ -16,9 +18,6 @@ from atom.utils.block_convert import (
     kv_indices_convert_triton,
 )
 from atom.utils.forward_context import AttentionMetaData, Context
-
-from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
-from aiter.dist.parallel_state import get_tp_group, get_dp_group
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -40,10 +39,8 @@ class AiterMLABackend(AttentionBackend):
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
-        super().__init__(
-            model_runner,
-        )
-        assert self.block_size == 1, "AITER MLA requires only block size 1."
+        self.block_size = 1
+        super().__init__(model_runner)
         config = model_runner.config
         hf_config = config.hf_config
         self.num_attention_heads = (
@@ -229,7 +226,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
-        max_q_len = 1
+        max_seqlen_q = 1
 
         context_lens = batch.context_lens
         positions = [i - 1 for i in context_lens]
@@ -318,7 +315,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
-            max_q_len=max_q_len,
+            max_seqlen_q=max_seqlen_q,
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
@@ -335,7 +332,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
-            max_q_len=1,
+            max_seqlen_q=1,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],
