@@ -126,3 +126,14 @@ jobs:
           docker exec atom-benchmark bash -lc "
             .github/scripts/atom_test.sh benchmark $model_path ${{ matrix.extraArgs }}
           "
+    
+      - name: Clean Up
+        if: always()
+        run: |
+          # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
+          # We should use non-root user to run the test to avoid this issue.
+          set -x
+          echo "========== Cleaning up workspace =========="
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
+          docker stop atom-benchmark || true
+          docker rm atom-benchmark || true
