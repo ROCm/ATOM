@@ -3,13 +3,14 @@ name: ATOM Benchmark
 on:
   workflow_dispatch:
     inputs:
-      model_name:
-        description: "Model name to benchmark"
-        type: choice
-        options:
-          - deepseek-ai/DeepSeek-R1-0528
-          - openai/gpt-oss-120b
-        required: true
+      deepseek-r1-0528:
+        description: "Benchmark DeepSeek-R1-0528"
+        type: boolean
+        default: true
+      gpt-oss-120b:
+        description: "Benchmark gpt-oss-120b"
+        type: boolean
+        default: false
       args:
         description: "Arguments to pass to the ATOM server (default: --kv_cache_dtype fp8)"
         type: string
@@ -31,21 +32,33 @@ jobs:
           extraArgs: "--kv_cache_dtype fp8"
           env_vars: ""
           runner: atom-mi355-8gpu.predownload
+          enabled: ${{ inputs.deepseek-r1-0528 }}
         - model_name: "gpt-oss-120b"
           model_path: "openai/gpt-oss-120b"
           extraArgs: "--kv_cache_dtype fp8"
           env_vars: |
             ATOM_GPT_OSS_MODEL=1
           runner: atom-mi355-1gpu
+          enabled: ${{ inputs.gpt-oss-120b }}
 
     runs-on: ${{ matrix.runner }}
     steps:
+      - name: Check if benchmark is enabled
+        run: |
+          if ${{ matrix.enabled }} == true; then
+            echo "Benchmark is enabled"
+          else
+            echo "Benchmark is disabled"
+            exit 0
+          fi
+
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
 
       - name: Print environment variables
         run: |
-          echo "MODEL_NAME: ${{ matrix.model_name }}"
+          echo "DeepSeek-R1-0528: ${{ inputs.deepseek-r1-0528 }}"
+          echo "gpt-oss-120b: ${{ inputs.gpt-oss-120b }}"
           echo "ARGS: ${{ matrix.extraArgs }}"
           echo "ATOM_IMAGE: ${{ inputs.image }}"
 
