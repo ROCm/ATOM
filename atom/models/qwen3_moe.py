@@ -4,7 +4,7 @@ import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 
-# from atom.model_ops.rotary_embedding import get_rope
+#from atom.model_ops.rotary_embedding import get_rope
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
