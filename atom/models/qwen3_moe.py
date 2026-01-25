@@ -23,7 +23,7 @@ from atom.model_ops.linear import (
 from atom.utils.decorators import support_torch_compile
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 
-# from atom.model_ops.rotary_embedding import get_rope
+#from atom.model_ops.rotary_embedding import get_rope
 from aiter.rotary_embedding import get_rope
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_ops.moe import FusedMoE

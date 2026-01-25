@@ -13,6 +13,7 @@ from atom.utils import resolve_obj_by_qualname
 def get_attn_backend(
     block_size: int,
     use_mla: bool = False,
+    use_gdn: bool = False,
 ) -> Type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
     # Accessing envs.* behind an @lru_cache decorator can cause the wrong
@@ -22,6 +23,7 @@ def get_attn_backend(
     return _cached_get_attn_backend(
         block_size=block_size,
         use_mla=use_mla,
+        use_gdn=use_gdn,
     )
 
 
@@ -29,16 +31,17 @@ def get_attn_backend(
 def _cached_get_attn_backend(
     block_size: int,
     use_mla: bool = False,
+    use_gdn: bool = False,
 ) -> Type[AttentionBackend]:
 
     # get device-specific attn_backend
-    attention_cls = get_attn_backend_cls(block_size, use_mla)
+    attention_cls = get_attn_backend_cls(block_size, use_mla, use_gdn)
     if not attention_cls:
         raise ValueError(
             f"Invalid attention backend for {attention_cls}")
     return resolve_obj_by_qualname(attention_cls)
 
-def get_attn_backend_cls(block_size, use_mla) -> str:
+def get_attn_backend_cls(block_size, use_mla, use_gdn) -> str:
     if use_mla:
         # if block_size == 1:
         return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"  # noqa: E501
@@ -47,5 +50,6 @@ def get_attn_backend_cls(block_size, use_mla) -> str:
         #         f" The selected backend"
         #         f"does not support block size {block_size}."
         #         "(currently only supports block size 1)")
-
+    if use_gdn:
+        return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501
