@@ -47,3 +47,20 @@ if [ "$TYPE" == "accuracy" ]; then
           --tasks gsm8k \
           --num_fewshot 3
 fi
+
+if [ "$TYPE" == "benchmark" ]; then
+  echo ""
+  echo "========== Cloning bench_serving =========="
+  git clone https://github.com/kimbochen/bench_serving.git
+  echo "========== Running benchmark test =========="
+  bench_serving/benchmark_serving.py \
+    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000/v1/completions" \
+    --dataset-name=random \
+    --random-input-len=1024 --random-output-len=1024 --random-range-ratio=0.8 \
+    --num-prompts=1000 \
+    --max-concurrency=1 \
+    --trust-remote-code \
+    --request-rate=inf --ignore-eos \
+    --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
+    --result-dir=. --result-filename=result.json
+fi
