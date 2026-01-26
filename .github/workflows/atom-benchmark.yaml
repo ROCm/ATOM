@@ -19,6 +19,32 @@ on:
         description: "Image to use for the benchmark"
         type: string
         default: "rocm/atom:latest"
+      isl:
+        description: "Input length"
+        type: string
+        default: "1024"
+      osl:
+        description: "Output length"
+        type: string
+        default: "1024"
+      conc:
+        description: "Concurrency"
+        type: string
+        default: "128"
+      num_prompts:
+        description: "Number of prompts"
+        type: string
+        default: "1280"
+      random_range_ratio:
+        description: "Random range ratio"
+        type: string
+        default: "0.8"
+env:
+  ISL: ${{ inputs.isl }}
+  OSL: ${{ inputs.osl }}
+  CONC: ${{ inputs.conc }}
+  NUM_PROMPTS: ${{ inputs.num_prompts }}
+  RANDOM_RANGE_RATIO: ${{ inputs.random_range_ratio }}
 
 jobs:
   atom-benchmark:
@@ -59,6 +85,11 @@ jobs:
         run: |
           echo "DeepSeek-R1-0528: ${{ inputs.deepseek-r1-0528 }}"
           echo "gpt-oss-120b: ${{ inputs.gpt-oss-120b }}"
+          echo "ISL: ${{ inputs.isl }}"
+          echo "OSL: ${{ inputs.osl }}"
+          echo "CONC: ${{ inputs.conc }}"
+          echo "NUM_PROMPTS: ${{ inputs.num_prompts }}"
+          echo "RANDOM_RANGE_RATIO: ${{ inputs.random_range_ratio }}"
           echo "ARGS: ${{ matrix.extraArgs }}"
           echo "ATOM_IMAGE: ${{ inputs.image }}"
 

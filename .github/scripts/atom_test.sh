@@ -56,9 +56,9 @@ if [ "$TYPE" == "benchmark" ]; then
   python bench_serving/benchmark_serving.py \
     --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
     --dataset-name=random \
-    --random-input-len=1024 --random-output-len=1024 --random-range-ratio=0.8 \
-    --num-prompts=1280 \
-    --max-concurrency=128 \
+    --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
+    --num-prompts=$NUM_PROMPTS \
+    --max-concurrency=$CONC \
     --trust-remote-code \
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
