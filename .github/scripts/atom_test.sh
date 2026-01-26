@@ -54,7 +54,7 @@ if [ "$TYPE" == "benchmark" ]; then
   git clone https://github.com/kimbochen/bench_serving.git && chmod +x bench_serving/benchmark_serving.py
   echo "========== Running benchmark test =========="
   python bench_serving/benchmark_serving.py \
-    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000/v1/completions" \
+    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
     --dataset-name=random \
     --random-input-len=1024 --random-output-len=1024 --random-range-ratio=0.8 \
     --num-prompts=1280 \
