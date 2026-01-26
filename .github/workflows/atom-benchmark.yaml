@@ -132,6 +132,11 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
+          -e ISL=${{ inputs.isl }} \
+          -e OSL=${{ inputs.osl }} \
+          -e CONC=${{ inputs.conc }} \
+          -e NUM_PROMPTS=${{ inputs.num_prompts }} \
+          -e RANDOM_RANGE_RATIO=${{ inputs.random_range_ratio }} \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
