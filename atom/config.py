@@ -531,6 +531,7 @@ class SpeculativeConfig:
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
+    scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9

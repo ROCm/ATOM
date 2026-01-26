@@ -33,6 +33,7 @@ class EngineArgs:
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
+    scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
@@ -155,6 +156,13 @@ class EngineArgs:
             type=float,
             default=0.9,
             help="GPU memory utilization (0.0 to 1.0)",
+        )
+        parser.add_argument(
+            '--scheduler-delay-factor',
+            type=float,
+            default=0.0,
+            help='Apply a delay (of delay factor multiplied by previous'
+            'prompt latency) before scheduling next prompt.'
         )
 
         return parser

@@ -73,6 +73,13 @@ class Scheduler:
         self.block_manager = BlockManager(config)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # Time at previous scheduling step
+        self.prev_time = 0.0
+        # Did we schedule a prompt at previous step?
+        self.prev_prompt = False
+        # Latency of the last prompt step
+        self.last_prompt_latency = 0.0
+        self.delay_factor = config.scheduler_delay_factor
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -95,7 +102,27 @@ class Scheduler:
             # self.block_manager.reset()
             return None
 
-        while self.waiting and num_seqs_prefill < self.max_num_seqs:
+        # num_waiting_prefill_seqs = len(self.waiting)
+        # num_running_decode_seqs = len(self.running)
+
+        # total_waiting_prefill_tokens = 0
+        # for seq in self.waiting:
+        #     total_waiting_prefill_tokens += (seq.num_tokens - seq.num_cached_tokens)
+
+        # skip_schedule_prefill = self.running and (total_waiting_prefill_tokens < self.min_num_batched_tokens)
+        
+        # if total_waiting_prefill_tokens < self.max_num_batched_tokens * 0.8:
+        #     continue_decode = True
+        # if self.peak_conc - num_running_decode_seqs >= num_waiting_prefill_seqs + 10:
+        #     continue_decode = False
+        # if not self.running:
+        #     continue_decode = False
+
+        # logger.info(
+        #     f"DDDEBUG num_waiting_prefill_seqs: {num_waiting_prefill_seqs}, num_running_decode_seqs: {num_running_decode_seqs}, total_waiting_prefill_tokens: {total_waiting_prefill_tokens}, max_num_batched_tokens * 0.8: {self.max_num_batched_tokens*0.8}, self.peak_conc = {self.peak_conc}, continue_decode = {continue_decode}"
+        # )
+
+        while self._passed_delay(time.time()) and self.waiting and num_seqs_prefill < self.max_num_seqs:
             seq = self.waiting[0]
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
@@ -118,8 +145,9 @@ class Scheduler:
 
         if num_seqs_prefill > 0:
             logger.info(
-                f"scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens"
+                f"DDEBUG scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens"
             )
+            self.prev_prompt = True
             # lip: TODO for prefill/decode mixed batch
             return (
                 ScheduledBatch(
@@ -156,9 +184,9 @@ class Scheduler:
 
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs.values()))
-        # logger.info(
-        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens"
-        # )
+        logger.info(
+            f"DDEBUG scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens"
+        )
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -284,3 +312,18 @@ class Scheduler:
         else:
             # No requests
             return (False, 0)
+
+    def _passed_delay(self, now: float) -> bool:
+        if self.prev_prompt:
+            self.last_prompt_latency = now - self.prev_time
+        self.prev_time, self.prev_prompt = now, False
+        # Delay scheduling prompts to let waiting queue fill up
+        if self.delay_factor > 0 and self.waiting:
+            earliest_arrival_time = min(
+                [seq.arrive_time for seq in self.waiting])
+            passed_delay = ((now - earliest_arrival_time)
+                            > (self.delay_factor *
+                            self.last_prompt_latency) or not self.running)
+        else:
+            passed_delay = True
+        return passed_delay
