@@ -127,6 +127,8 @@ jobs:
           docker exec atom-benchmark bash -lc "
             .github/scripts/atom_test.sh benchmark $model_path ${{ matrix.extraArgs }}
           "
+          echo "========== Showing benchmark test output =========="
+          cat result.json
     
       - name: Clean Up
         if: always()
