@@ -57,8 +57,8 @@ if [ "$TYPE" == "benchmark" ]; then
     --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000/v1/completions" \
     --dataset-name=random \
     --random-input-len=1024 --random-output-len=1024 --random-range-ratio=0.8 \
-    --num-prompts=1000 \
-    --max-concurrency=1 \
+    --num-prompts=1280 \
+    --max-concurrency=128 \
     --trust-remote-code \
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
