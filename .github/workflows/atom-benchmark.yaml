@@ -161,7 +161,7 @@ jobs:
           "
           echo "========== Running benchmark test =========="
           docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ matrix.model_name }}.json .github/scripts/atom_test.sh benchmark $model_path
+          RESULT_FILENAME=${{ matrix.model_name }} .github/scripts/atom_test.sh benchmark $model_path
           ls -all .
           "
           echo "========== Processing benchmark test result =========="
