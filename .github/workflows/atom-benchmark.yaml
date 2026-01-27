@@ -163,14 +163,8 @@ jobs:
           docker exec atom-benchmark bash -lc "
           RESULT_FILENAME=${{ matrix.model_name }}.json .github/scripts/atom_test.sh benchmark $model_path
           "
-          echo "========== Showing benchmark test output =========="
-          RESULT_FILENAME=${{ matrix.model_name }}.json .github/scripts/process_result.py 
-          cat agg_${{ matrix.model_name }}.json
-      
-      - name: Collect and summarize results
-        run: |
-          .github/scripts/collect_results.py ${{ github.workspace }} ${{ matrix.model_name }}
-          .github/scripts/summarize.py ${{ github.workspace }}
+          echo "========== Processing benchmark test result =========="
+          .github/scripts/summarize.py ${{ github.workspace }}/${{ matrix.model_name }}.json >> $GITHUB_STEP_SUMMARY
 
       - name: Clean Up
         if: always()
