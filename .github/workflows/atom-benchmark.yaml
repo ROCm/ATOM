@@ -159,7 +159,7 @@ jobs:
           docker exec atom-benchmark bash -lc "
             .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
           "
-          echo "========== Showing benchmark test output =========="
+          echo "========== Running benchmark test =========="
           docker exec atom-benchmark bash -lc "
             .github/scripts/atom_test.sh benchmark $model_path ${{ matrix.extraArgs }}
           "
