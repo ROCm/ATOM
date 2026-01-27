@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import itertools
+import logging
 from dataclasses import dataclass
 from typing import Optional, Type
 
@@ -20,6 +21,8 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+
+logger = logging.getLogger("atom")
 
 
 class AiterMLABackend(AttentionBackend):
@@ -340,8 +343,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+
+        # if str(positions.device)=='cuda:0':
         #     for el, var in ctx.items():
-        #         print(f"{el}: {var}")
+        #         if 'work_' in el or 'reduce_' in el:
+        #             continue
+        #         logger.info(f"{el}: {var}")
+        #     logger.info(f"{positions=}")
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:

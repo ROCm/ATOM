@@ -62,6 +62,7 @@ class Sequence:
 
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: list[int] = []
+        self.num_placeholder = 0
 
         # statistics fields
         self.arrive_time = 0.0

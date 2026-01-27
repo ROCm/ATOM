@@ -5,18 +5,16 @@ import asyncio
 import itertools
 import logging
 import time
-import asyncio
 from dataclasses import fields
-from typing import List, Union, AsyncGenerator, Dict, Optional
+from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import torch.multiprocessing as mp
-from tqdm.auto import tqdm
-from transformers import AutoTokenizer
-
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer
 
 logger = logging.getLogger("atom")
 
@@ -142,7 +140,7 @@ class InputOutputProcessor:
             if isinstance(prompt_or_tokens, str)
             else prompt_or_tokens
         )
-        
+
         stop_token_sequences = []
         if sampling_params.stop_strings:
             stops = [sampling_params.stop_strings] if isinstance(sampling_params.stop_strings, str) else sampling_params.stop_strings
@@ -151,7 +149,7 @@ class InputOutputProcessor:
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
-        
+
         seq = Sequence(tokens, self.block_size, sampling_params, stop_token_sequences, stream_callback=stream_callback)
         seq.arrive_time = time.time()
         self.requests[seq.id] = seq
@@ -169,7 +167,7 @@ class InputOutputProcessor:
             self.requests.pop(req.id)
             output_str = self.tokenizer.decode(req.completion_token_ids)
             req.leave_time = time.time()
-            
+
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
             ttft = 0.0
             tpot = 0.0
@@ -178,12 +176,13 @@ class InputOutputProcessor:
                 # Calculate TPOT only if there are multiple output tokens
                 if req.num_completion_tokens > 1:
                     tpot = (req.leave_time - req.first_token_time) / (req.num_completion_tokens - 1)
-            
+
             print(
                 f"Request {req.id} finished with reason {req.leave_reason}. "
                 f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
                 f"latency: {req.leave_time - req.arrive_time:.2f}s, "
                 f"TTFT: {ttft:.3f}s, TPOT: {tpot:.3f}s"
+                # f"{req.completion_token_ids}"
             )
             outputs[req.id] = {
                 "text": output_str,

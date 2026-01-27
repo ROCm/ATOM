@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Set, Union
 
+import numpy as np
 import torch
 from atom.config import Config, KVCacheTensor, ParallelConfig
 
@@ -123,15 +124,12 @@ class DPMetadata:
 @dataclass
 class SpecDecodeMetadata:
     draft_token_ids: torch.Tensor
-    num_draft_tokens: list[int]
+    num_spec_steps: int
+    num_draft_tokens_np: np.ndarray
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
     logits_indices: torch.Tensor
-
-    def __post_init__(self):
-        self.max_spec_len = max(self.num_draft_tokens)
-
 
 @dataclass
 class Context:

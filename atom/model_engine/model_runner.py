@@ -176,7 +176,7 @@ class tokenIDProcessor:
 
     def get_token_locations(
         self, batch: ScheduledBatch
-    ) -> tuple[list[int], list[int], list[int], list[int], bool]:
+    ) -> tuple[list[int], list[int], list[int], bool]:
         prev_req_ids = self.prev_batch.req_ids
         cur_req_ids = batch.req_ids
         prev_id_to_idx = {req_id: i for i, req_id in enumerate(prev_req_ids)}
@@ -1081,8 +1081,11 @@ class ModelRunner:
             # Use only real sequences; cudagraph padding should not affect
             # spec decode metadata or rejection sampling.
             spec_decode_metadata = self._calc_spec_decode_metadata(
-                    num_draft_tokens, cu_seqlens_q[: scheduled_bs + 1], input_ids
-                )
+                self.drafter.mtp_k,
+                num_draft_tokens,
+                cu_seqlens_q[: scheduled_bs + 1],
+                input_ids,
+            )
 
         set_forward_context(
             attn_metadata=attn_metadata,
@@ -1146,25 +1149,31 @@ class ModelRunner:
             # won't affect the original logits tensor.
             assert logits is not None
 
-            # bonus_logits_indices indexes into logits_indices, which then indexes into logits
-            # So we need to use logits_indices[bonus_logits_indices] to get the actual indices
-            bonus_logits_indices_mapped = spec_decode_metadata.logits_indices[spec_decode_metadata.bonus_logits_indices]
-            target_logits_indices_mapped = spec_decode_metadata.logits_indices[spec_decode_metadata.target_logits_indices]
+            # # bonus_logits_indices indexes into logits_indices, which then indexes into logits
+            # # So we need to use logits_indices[bonus_logits_indices] to get the actual indices
+            # bonus_logits_indices_mapped = spec_decode_metadata.logits_indices[spec_decode_metadata.bonus_logits_indices]
+            # target_logits_indices_mapped = spec_decode_metadata.logits_indices[spec_decode_metadata.target_logits_indices]
+            # self.debug(f"{spec_decode_metadata.bonus_logits_indices=}")
+            # self.debug(f"{spec_decode_metadata.target_logits_indices=}")
+            # self.debug(f"{bonus_logits_indices_mapped=}")
+            # self.debug(f"{target_logits_indices_mapped=}")
 
-            # Validate indices are within bounds before indexing
-            max_bonus_idx = bonus_logits_indices_mapped.max().item() if len(bonus_logits_indices_mapped) > 0 else -1
-            max_target_idx = target_logits_indices_mapped.max().item() if len(target_logits_indices_mapped) > 0 else -1
-            if max_bonus_idx >= logits.shape[0] or max_target_idx >= logits.shape[0]:
-                raise ValueError(
-                    f"Index out of bounds: logits.shape[0]={logits.shape[0]}, "
-                    f"max_bonus_logits_indices (mapped)={max_bonus_idx}, "
-                    f"max_target_logits_indices (mapped)={max_target_idx}, "
-                    f"bonus_logits_indices={spec_decode_metadata.bonus_logits_indices.tolist()}, "
-                    f"target_logits_indices={spec_decode_metadata.target_logits_indices.tolist()}, "
-                    f"logits_indices.shape={spec_decode_metadata.logits_indices.shape}"
-                )
+            # # Validate indices are within bounds before indexing
+            # max_bonus_idx = bonus_logits_indices_mapped.max().item() if len(bonus_logits_indices_mapped) > 0 else -1
+            # max_target_idx = target_logits_indices_mapped.max().item() if len(target_logits_indices_mapped) > 0 else -1
+            # if max_bonus_idx >= logits.shape[0] or max_target_idx >= logits.shape[0]:
+            #     raise ValueError(
+            #         f"Index out of bounds: logits.shape[0]={logits.shape[0]}, "
+            #         f"max_bonus_logits_indices (mapped)={max_bonus_idx}, "
+            #         f"max_target_logits_indices (mapped)={max_target_idx}, "
+            #         f"bonus_logits_indices={spec_decode_metadata.bonus_logits_indices.tolist()}, "
+            #         f"target_logits_indices={spec_decode_metadata.target_logits_indices.tolist()}, "
+            #         f"logits_indices.shape={spec_decode_metadata.logits_indices.shape}"
+            #     )
+            bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
+            target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            bonus_logits = logits[bonus_logits_indices_mapped]
+            bonus_logits = logits[bonus_logits_indices]
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
@@ -1172,7 +1181,7 @@ class ModelRunner:
             # Just like `bonus_logits`, `target_logits` is a new tensor with
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
-            target_logits = logits[target_logits_indices_mapped]
+            target_logits = logits[target_logits_indices]
 
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -1183,29 +1192,29 @@ class ModelRunner:
                     f"logits.shape[0]={logits.shape[0]}"
                 )
 
-            sampled_tokens = self.rejection_sampler(
+            sampled_tokens, num_bonus_tokens = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
             )
 
-            # Update MTP acceptance statistics
-            batch_draft_tokens = sum(spec_decode_metadata.num_draft_tokens)
-            num_valid_per_req = (sampled_tokens != -1).sum(dim=1)
-            # accepted = num_valid - 1 for each request (subtract the corrected/bonus token)
-            batch_accepted_tokens = (num_valid_per_req - 1).sum().item()
-            self.mtp_total_draft_tokens += batch_draft_tokens
-            self.mtp_total_accepted_tokens += batch_accepted_tokens
+            # # Update MTP acceptance statistics
+            # batch_draft_tokens = spec_decode_metadata.num_draft_tokens_np.sum()
+            # num_valid_per_req = (sampled_tokens != -1).sum(dim=1)
+            # # accepted = num_valid - 1 for each request (subtract the corrected/bonus token)
+            # batch_accepted_tokens = (num_valid_per_req - 1).sum().item()
+            # self.mtp_total_draft_tokens += batch_draft_tokens
+            # self.mtp_total_accepted_tokens += batch_accepted_tokens
 
-            # Log MTP acceptance statistics periodically
-            if self.mtp_total_draft_tokens > 0 and \
-               self.mtp_total_draft_tokens % 1000 < batch_draft_tokens:
-                acceptance_rate = self.mtp_total_accepted_tokens / self.mtp_total_draft_tokens
-                logger.info(
-                    f"[MTP Stats] Total draft tokens: {self.mtp_total_draft_tokens}, "
-                    f"Accepted: {self.mtp_total_accepted_tokens}, "
-                    f"Acceptance rate: {acceptance_rate:.2%}"
-                )
+            # # Log MTP acceptance statistics periodically
+            # if self.mtp_total_draft_tokens > 0 and \
+            #    self.mtp_total_draft_tokens % 1000 < batch_draft_tokens:
+            #     acceptance_rate = self.mtp_total_accepted_tokens / self.mtp_total_draft_tokens
+            #     logger.info(
+            #         f"[MTP Stats] Total draft tokens: {self.mtp_total_draft_tokens}, "
+            #         f"Accepted: {self.mtp_total_accepted_tokens}, "
+            #         f"Acceptance rate: {acceptance_rate:.2%}"
+            #     )
 
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
@@ -1219,7 +1228,14 @@ class ModelRunner:
                 num_accepted = (sampled_tokens != -1).sum(dim=1)
                 last_indices = num_accepted - 1
                 bs = len(batch.req_ids)
-                next_token_ids = sampled_tokens[torch.arange(bs, device=sampled_tokens.device), last_indices]
+                # self.debug(f"{num_accepted=}")
+                # self.debug(f"{num_bonus_tokens=}")
+                # self.debug(f"{last_indices=}")
+                # self.debug(f"{sampled_tokens=}")
+                next_token_ids = sampled_tokens[
+                    torch.arange(bs, device=sampled_tokens.device), last_indices
+                ]
+                # self.debug(f"{next_token_ids=}")
                 self.tokenID_processor.prev_token_ids = next_token_ids
 
         return token_ids, sampled_tokens
@@ -1239,6 +1255,7 @@ class ModelRunner:
 
     def _calc_spec_decode_metadata(
         self,
+        num_spec_steps: int,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         input_ids: torch.Tensor,
@@ -1255,6 +1272,9 @@ class ModelRunner:
 
         # Compute the logits indices.
         # [4, 1, 3, 1, 2]
+        # self.debug(f"{num_draft_tokens=}")
+        # self.debug(f"{cu_num_scheduled_tokens=}")
+        # self.debug(f"{input_ids=}")
         num_sampled_tokens = num_draft_tokens + 1
 
         # Step 1. cu_num_sampled_tokens: [4, 5, 8, 9, 11]
@@ -1268,6 +1288,7 @@ class ModelRunner:
         )
         # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
         logits_indices += arange
+        # self.debug(f"{logits_indices=}")
 
         # Compute the bonus logits indices.
         bonus_logits_indices = cu_num_sampled_tokens - 1
@@ -1284,6 +1305,7 @@ class ModelRunner:
         )
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
+        # self.debug(f"{target_logits_indices=}")
 
         # TODO: Optimize the CPU -> GPU copy.
         cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
@@ -1301,12 +1323,13 @@ class ModelRunner:
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = input_ids[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        # draft_token_ids = input_ids[logits_indices]
+        draft_token_ids = input_ids[bonus_logits_indices]
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
-            num_draft_tokens=num_draft_tokens.tolist(),
+            num_spec_steps=num_spec_steps,
+            num_draft_tokens_np=num_draft_tokens,
             cu_num_draft_tokens=cu_num_draft_tokens,
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
@@ -1346,7 +1369,7 @@ class ModelRunner:
             target_positions = positions[:num_scheduled_tokens]
             target_hidden_states = hidden_states[:num_scheduled_tokens]
         else:
-            num_draft_tokens = spec_decode_metadata.num_draft_tokens
+            num_draft_tokens = spec_decode_metadata.num_draft_tokens_np
             num_rejected_tokens = [
                 n + 1 - len(sampled_token_ids[i]) if n > 0 else 0
                 for i, n in enumerate(num_draft_tokens)

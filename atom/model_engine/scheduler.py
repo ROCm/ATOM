@@ -65,6 +65,12 @@ class ScheduledBatch:
 
         self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
 
+        # logger.info(f"{self.num_scheduled_tokens=}")
+        # logger.info(f"{self.context_lens=}")
+        # logger.info(f"{[len(blk)*16 for blk in self.block_tables]=}")
+        # logger.info(f"{self.block_tables=}")
+        # logger.info(f"{[seq.num_placeholder for seq in seqs.values()]=}")
+
 
 class Scheduler:
 
@@ -79,8 +85,9 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
 
         self.use_spec = config.speculative_config is not None
-        if self.use_spec:
-            self.mtp_k = config.speculative_config.num_speculative_tokens
+        self.mtp_k: int = (
+            config.speculative_config.num_speculative_tokens if self.use_spec else 0
+        )  # type: ignore
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -117,6 +124,7 @@ class Scheduler:
             num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
+            seq.num_placeholder = self.mtp_k + 1
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs[seq.id] = seq
@@ -155,10 +163,10 @@ class Scheduler:
             else:
                 if seq.spec_token_ids:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
-
                 num_seqs_decode += 1
-                num_new_tokens = 1 if not self.use_spec else self.mtp_k + 1
-                self.block_manager.may_append(seq, num_new_tokens)
+                num_new_tokens = self.mtp_k + 1
+                # self.block_manager.may_append(seq, num_new_tokens)
+                self.block_manager.may_append(seq, seq.num_placeholder)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
@@ -201,37 +209,46 @@ class Scheduler:
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
+
+        need_placeholder = is_deferred_out or self.use_spec
+        num_placeholder = 0
         if is_deferred_out and self.use_spec:
             num_placeholder = self.mtp_k + 1
         elif is_deferred_out:
             num_placeholder = 1
         elif self.use_spec:
             num_placeholder = self.mtp_k
-        else:
-            num_placeholder = 0
+
         for seq in self.running:
             if seq.id not in prev_token_ids:
                 continue
             token_ids = prev_token_ids[seq.id]
-            new_tokens = []
-            if is_deferred_out or (self.use_spec and self.eos_token_id == seq.token_ids[-1]):
-                seq.token_ids[-num_placeholder:] = token_ids
+            num_accepted_token = len(token_ids)
+            if is_deferred_out or (
+                self.use_spec and self.eos_token_id == seq.token_ids[-1]
+            ):
+                for i, el in enumerate(token_ids):
+                    seq.token_ids[-num_placeholder + i] = el
+                    seq.output_tokens[-num_placeholder + i] = el
                 # update the number of tokens in the sequence if draft token is rejected
-                seq.num_tokens = len(seq.token_ids)
+                # seq.token_ids[-num_placeholder:] = token_ids
+                # seq.num_tokens = len(seq.token_ids)
+                # seq.output_tokens[-num_placeholder:] = token_ids
 
-                if seq.output_tokens:
-                    seq.output_tokens[-num_placeholder:] = token_ids
-
-                else:
-                    seq.output_tokens.extend(token_ids)
-
-                new_tokens = token_ids
+                # if seq.output_tokens:
+                #     seq.output_tokens[-num_placeholder:] = token_ids
+                # else:
+                #     seq.output_tokens.extend(token_ids)
             else:
                 for token_id in token_ids:
                     seq.append_token(token_id)
-
             new_tokens = token_ids
 
+            # if need_placeholder:
+            #     # reuse the rejected kvcache slot
+            #     logger.info(f"{num_accepted_token=} {token_ids=}")
+            #     logger.info(f"{seq.output_tokens=}")
+            #     seq.num_placeholder = num_accepted_token
             if draft_token_ids and seq.id in draft_token_ids:
                 seq.spec_token_ids = draft_token_ids[seq.id]
 
@@ -256,14 +273,22 @@ class Scheduler:
                 # Check the last token in the list for EOS
                 if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
                     leave_reason = "eos"
-                elif not seq.ignore_eos and any(t in self.stop_token_ids for t in token_ids):
-                    first_stop_token = next(t for t in token_ids if t in self.stop_token_ids)
+                elif not seq.ignore_eos and any(
+                    t in self.stop_token_ids for t in token_ids
+                ):
+                    first_stop_token = next(
+                        t for t in token_ids if t in self.stop_token_ids
+                    )
                     leave_reason = f"stop_{first_stop_token}"
                 elif seq.num_completion_tokens >= seq.max_tokens:
                     leave_reason = "max_tokens"
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:
-                output_tokens_list = list(new_tokens) if isinstance(new_tokens, tuple) else new_tokens.copy()
+                output_tokens_list = (
+                    list(new_tokens)
+                    if isinstance(new_tokens, tuple)
+                    else new_tokens.copy()
+                )
                 request_output = RequestOutput(
                     request_id=seq.id,
                     output_tokens=output_tokens_list,
@@ -284,11 +309,12 @@ class Scheduler:
         if stream_output_queue is not None and stream_outputs:
             stream_output_queue.put_nowait(stream_outputs)
 
-        if num_placeholder > 0:
+        if need_placeholder:
             # placeholder for the each decode step
             for seq in seqs:
                 if seq.status == SequenceStatus.RUNNING:
-                    for _ in range(num_placeholder):
+                    # for _ in range(num_placeholder):
+                    for _ in range(seq.num_placeholder):
                         seq.append_token(self.eos_token_id)
         for seq in finished_seqs:
             self.block_manager.deallocate(seq)
@@ -298,6 +324,7 @@ class Scheduler:
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
+
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
 
