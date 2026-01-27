@@ -12,6 +12,8 @@ def to_str(v):
         return "null"
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, float):
+        return f"{v:.2f}"
     return str(v)
 
 def json_to_md_table(data):
@@ -38,7 +40,7 @@ def json_to_md_table(data):
 def main():
     # Usage: python .github/scripts/summarize.py input.json
     if len(sys.argv) < 2:
-        print("Usage: python .github/scripts/summarize.py <input.json>", file=sys. stderr)
+        print("Usage: python .github/scripts/summarize.py <input.json>", file=sys.stderr)
         sys.exit(1)
 
     in_path = Path(sys.argv[1])
