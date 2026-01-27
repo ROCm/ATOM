@@ -7,7 +7,7 @@ from pathlib import Path
 
 results = []
 results_dir = Path(sys.argv[1])
-for result_path in results_dir.rglob(f'*.json'):
+for result_path in results_dir.rglob(f'agg_*.json'):
     with open(result_path) as f:
         result = json.load(f)
     results.append(result)
