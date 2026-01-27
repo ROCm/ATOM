@@ -770,7 +770,8 @@ class DeepseekV2MoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
-            quant_config=None if should_ignore_layer(quant_config, prefix=f"{prefix}.gate") else quant_config,
+            # MoE gate normally remains unquantized, but may not declare as ignore layers in quantization_config
+            quant_config=None,
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
@@ -812,10 +813,6 @@ class DeepseekV2MoE(nn.Module):
                 self._use_dual_stream = True
                 self.alt_stream = DeepseekV2MoE._get_shared_stream()
 
-            # if not is_rocm_aiter_fusion_shared_expert_enabled() or (
-            #     should_ignore_layer(quant_config, prefix=f"{prefix}.shared_experts")
-            #     != should_ignore_layer(quant_config, prefix=f"{prefix}.experts")
-            # ):
             if not is_rocm_aiter_fusion_shared_expert_enabled():
                 intermediate_size = (
                     config.moe_intermediate_size * config.n_shared_experts

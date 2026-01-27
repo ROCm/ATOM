@@ -270,12 +270,15 @@ def should_ignore_layer(quantization_config: Optional[QuantizationConfig], prefi
     exclude_layers: List[str] = quantization_config["exclude_layers"]
     for exclude_layer in exclude_layers:
         if exclude_layer.startswith("re"):
-            # remove the 're:' prefix
+            # case "re:model.layers.*self_attn.*", remove the 're:' prefix
             regex_pattern = exclude_layer[3:]
             if re.search(regex_pattern, prefix):
                 return True
+        elif exclude_layer.startswith(prefix):
+            # case "model.layers.0.self_attn.q_a_proj"
+            return True
         else:
-            # e.g., lm_head
+            # case "lm_head". Common practice won't quant lm_head, however.
             if prefix.split(".")[-1] == exclude_layer:
                 return True
     return False
