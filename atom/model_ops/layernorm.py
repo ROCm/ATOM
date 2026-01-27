@@ -97,13 +97,11 @@ def mxfp4_rms_quant_fuse_fake(
     eps: float,
     shuffle: bool = False,
     res1: Optional[torch.Tensor] = None,
-):
-    M, N1 = x.shape
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
     MXFP4_QUANT_BLOCK_SIZE = 32
-    
-    out1_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=x.device)
-    
-    SCALE_N_valid = (N1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    SCALE_N_valid = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
     use_scale_shuffle_padding = shuffle
     if use_scale_shuffle_padding:
         SCALE_M = ((M + 255) // 256) * 256
@@ -111,13 +109,15 @@ def mxfp4_rms_quant_fuse_fake(
     else:
         SCALE_M = M
         SCALE_N = SCALE_N_valid
-    out1_bs = torch.empty((SCALE_M, SCALE_N), dtype=torch.uint8, device=x.device)
-    
+    scale = torch.empty(
+        (SCALE_M, SCALE_N),
+        dtype=torch.float8_e8m0fnu,
+        device=x.device,
+    )
     out_res1 = None
     if res1 is not None:
-        out_res1 = torch.empty_like(x)
-    
-    return out1_fp4, out1_bs, out_res1
+        out_res1 = torch.empty_like(res1)
+    return (out, scale, out_res1)
 
 
 # It's important to use mutates_args=[] to avoid functionized_v2 op generation
