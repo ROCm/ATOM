@@ -168,7 +168,7 @@ jobs:
       
       - name: Collect result
         run: |
-          python .github/scripts/collect_results.py result.json ${{ matrix.model_name }}
+          .github/scripts/collect_results.py result.json ${{ matrix.model_name }}
           cat agg_${{ matrix.model_name }}.json
 
       - name: Clean Up
