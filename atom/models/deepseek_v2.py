@@ -96,6 +96,7 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.models.utils import should_ignore_layer
 
 # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
@@ -711,14 +712,14 @@ class DeepseekV2MLP(nn.Module):
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if should_ignore_layer(quant_config, prefix=f"{prefix}.gate_up_proj") else quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if should_ignore_layer(quant_config, prefix=f"{prefix}.down_proj") else quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
@@ -769,7 +770,7 @@ class DeepseekV2MoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
-            quant_config=None,
+            quant_config=None if should_ignore_layer(quant_config, prefix=f"{prefix}.gate") else quant_config,
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
@@ -786,7 +787,7 @@ class DeepseekV2MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
             renormalize=config.norm_topk_prob,
-            quant_config=quant_config,
+            quant_config=None if should_ignore_layer(quant_config, prefix=f"{prefix}.experts") else quant_config,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
@@ -811,6 +812,10 @@ class DeepseekV2MoE(nn.Module):
                 self._use_dual_stream = True
                 self.alt_stream = DeepseekV2MoE._get_shared_stream()
 
+            # if not is_rocm_aiter_fusion_shared_expert_enabled() or (
+            #     should_ignore_layer(quant_config, prefix=f"{prefix}.shared_experts")
+            #     != should_ignore_layer(quant_config, prefix=f"{prefix}.experts")
+            # ):
             if not is_rocm_aiter_fusion_shared_expert_enabled():
                 intermediate_size = (
                     config.moe_intermediate_size * config.n_shared_experts
@@ -1255,8 +1260,12 @@ class DeepseekV2MLAAttention(nn.Module):
         # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains AITER BF16 GEMMs,
         # For FP8 and use_triton_gemm(), fused_qkv_a_proj is AITER-Triton FP8 GEMMs while others remain AITER FP8 GEMMs
         if quant_config["quant_dtype"] == dtypes.fp4x2:
-            if not use_triton_gemm():
-                # TODO use ignore layer for mxfp4 attention
+            # normally linear layers in attn share the same quant config
+            if should_ignore_layer(quant_config, prefix):
+                source_quant_dtype = None
+                quant_config = None
+                base_quant_config = None
+            elif not use_triton_gemm():
                 source_quant_dtype = None
                 quant_config = None
                 base_quant_config = None

@@ -19,6 +19,9 @@ from typing import (
 
 import torch
 import os
+import re
+
+from atom.config import QuantizationConfig
 
 import logging
 
@@ -261,3 +264,18 @@ def fast_topk(values, topk, dim):
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
+
+
+def should_ignore_layer(quantization_config: Optional[QuantizationConfig], prefix: str) -> bool:
+    exclude_layers: List[str] = quantization_config["exclude_layers"]
+    for exclude_layer in exclude_layers:
+        if exclude_layer.startswith("re"):
+            # remove the 're:' prefix
+            regex_pattern = exclude_layer[3:]
+            if re.search(regex_pattern, prefix):
+                return True
+        else:
+            # e.g., lm_head
+            if prefix.split(".")[-1] == exclude_layer:
+                return True
+    return False
