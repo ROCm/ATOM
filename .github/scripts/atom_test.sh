@@ -62,5 +62,5 @@ if [ "$TYPE" == "benchmark" ]; then
     --trust-remote-code \
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
-    --result-dir=. --result-filename=result.json
+    --result-dir=. --result-filename=${RESULT_FILENAME}.json
 fi
