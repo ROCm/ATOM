@@ -165,6 +165,11 @@ jobs:
           "
           echo "========== Showing benchmark test output =========="
           cat result.json
+      
+      - name: Collect result
+        run: |
+          python .github/scripts/collect_results.py result.json ${{ matrix.model_name }}
+          cat agg_${{ matrix.model_name }}.json
 
       - name: Clean Up
         if: always()
