@@ -164,7 +164,7 @@ jobs:
           RESULT_FILENAME=${{ matrix.model_name }}.json .github/scripts/atom_test.sh benchmark $model_path
           "
           echo "========== Processing benchmark test result =========="
-          .github/scripts/summarize.py ${{ github.workspace }}/${{ matrix.model_name }}.json >> $GITHUB_STEP_SUMMARY
+          .github/scripts/summarize.py ${{ matrix.model_name }}.json >> $GITHUB_STEP_SUMMARY
 
       - name: Clean Up
         if: always()
