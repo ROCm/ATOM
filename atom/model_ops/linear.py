@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -323,6 +324,20 @@ class LinearBase(nn.Module):
         param.weight_loader_process(param_data, loaded_weight)
 
     def process_weights_after_loading(self):
+        # Optional: enable bpreshuffle for non-quantized Linear so that aiter can
+        # choose bpreshuffle-capable backends (and optionally FlyDSL GEMM when
+        # integrated in aiter and enabled via env vars).
+        if self.quant_type == QuantType.No:
+            use_flydsl = os.environ.get("AITER_USE_FLYDSL_GEMM", "0") in (
+                "1",
+                "true",
+                "True",
+                "YES",
+                "yes",
+            )
+            if use_flydsl and not getattr(self.weight, "is_shuffled", False):
+                shuffle_weights(self.weight)
+
         if (
             self.quant_type == QuantType.per_Tensor
             and len(self.output_partition_sizes) > 1

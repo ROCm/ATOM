@@ -178,10 +178,21 @@ class EngineArgs:
         
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
-        kwargs["compilation_config"] = CompilationConfig(
-            level=kwargs.pop("level"),
-            cudagraph_capture_sizes=parse_size_list(kwargs.pop("cudagraph_capture_sizes")) if self.cudagraph_capture_sizes else None,
+        level = kwargs.pop("level")
+        cudagraph_capture_sizes = (
+            parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
+            if self.cudagraph_capture_sizes
+            else None
         )
+        kwargs["compilation_config"] = CompilationConfig(
+            level=level,
+            cudagraph_capture_sizes=cudagraph_capture_sizes,
+        )
+        # When eager execution (or no compilation) is requested, disable cudagraph capture.
+        # This avoids capturing backends that are not capture-safe (e.g. optional FlyDSL GEMM).
+        if kwargs.get("enforce_eager", False) or level == 0 or cudagraph_capture_sizes == []:
+            kwargs["compilation_config"].use_cudagraph = False
+            kwargs["compilation_config"].cudagraph_mode = None
         if self.method:
             kwargs["speculative_config"] = SpeculativeConfig(
                 method=kwargs.pop("method"),
