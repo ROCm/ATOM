@@ -173,6 +173,6 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
