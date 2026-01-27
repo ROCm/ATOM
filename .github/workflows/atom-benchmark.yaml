@@ -1,0 +1,115 @@
+name: ATOM Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: "Model name to benchmark"
+        type: choice
+        options:
+          - deepseek-ai/DeepSeek-R1-0528
+          - openai/gpt-oss-120b
+        required: true
+      args:
+        description: "Arguments to pass to the ATOM server (default: --kv_cache_dtype fp8)"
+        type: string
+        default: "--kv_cache_dtype fp8"
+      image:
+        description: "Image to use for the benchmark"
+        type: string
+        default: "rocm/atom:latest"
+
+jobs:
+  atom-benchmark:
+    name: ATOM Benchmark
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - model_name: "DeepSeek-R1-0528"
+          model_path: "deepseek-ai/DeepSeek-R1-0528"
+          extraArgs: "--kv_cache_dtype fp8"
+          env_vars: ""
+          runner: atom-mi355-8gpu.predownload
+        - model_name: "gpt-oss-120b"
+          model_path: "openai/gpt-oss-120b"
+          extraArgs: "--kv_cache_dtype fp8"
+          env_vars: |
+            ATOM_GPT_OSS_MODEL=1
+          runner: atom-mi355-1gpu
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+
+      - name: Print environment variables
+        run: |
+          echo "MODEL_NAME: ${{ matrix.model_name }}"
+          echo "ARGS: ${{ matrix.extraArgs }}"
+          echo "ATOM_IMAGE: ${{ inputs.image }}"
+
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom-benchmark | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          if [ -d "/models" ]; then
+            MODEL_MOUNT="-v /models:/models"
+          else
+            echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
+            MODEL_MOUNT=""
+          fi
+
+          cat > /tmp/env_file.txt << 'EOF'
+          ${{ matrix.env_vars }}
+          EOF
+
+          echo "Starting container: atom-benchmark"
+          echo "Model-specific environment variables for ${{ matrix.model_name }}:"
+          cat /tmp/env_file.txt
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          $MODEL_MOUNT \
+          -w /workspace \
+          --ipc=host --group-add video \
+          --shm-size=16G \
+          --privileged \
+          --cap-add=SYS_PTRACE \
+          -e HF_TOKEN="${HF_TOKEN:-}" \
+          --env-file /tmp/env_file.txt \
+          --security-opt seccomp=unconfined \
+          --ulimit memlock=-1 \
+          --ulimit stack=67108864 \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name atom-benchmark \
+          ${{ inputs.image }}
+
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Run benchmark
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========== Launching ATOM server =========="
+          if [ -d "/models" ]; then
+            model_path="/models/${{ matrix.model_path }}"
+          else
+            model_path="${{ matrix.model_path }}"
+          fi
+          docker exec atom-benchmark bash -lc "
+            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
+          "
+          echo "========== Showing benchmark test output =========="
+          docker exec atom-benchmark bash -lc "
+            .github/scripts/atom_test.sh benchmark $model_path ${{ matrix.extraArgs }}
+          "
