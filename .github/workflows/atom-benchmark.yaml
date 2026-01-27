@@ -166,10 +166,11 @@ jobs:
           echo "========== Showing benchmark test output =========="
           cat result.json
       
-      - name: Collect result
+      - name: Collect and summarize results
         run: |
           .github/scripts/collect_results.py ${{ github.workspace }} ${{ matrix.model_name }}
           cat agg_${{ matrix.model_name }}.json
+          .github/scripts/summarize.py ${{ github.workspace }}
 
       - name: Clean Up
         if: always()
