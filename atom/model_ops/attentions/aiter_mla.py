@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import itertools
+import logging
 from dataclasses import dataclass
 from typing import Optional, Type
 
@@ -20,6 +21,8 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+
+logger = logging.getLogger("atom")
 
 
 class AiterMLABackend(AttentionBackend):
@@ -127,11 +130,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.model_runner.forward_vars.update(mla_metadata)
 
-    def set_mla_persistent_worker_buffers(self, bs: int):
+    def set_mla_persistent_worker_buffers(self, bs: int, max_q_len: int):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
-            "max_seqlen_qo": 1,
-            "uni_seqlen_qo": 1,
+            "max_seqlen_qo": max_q_len,
+            "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
             "max_split_per_batch": 16,
         }
@@ -226,24 +229,45 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
-        max_seqlen_q = 1
-
-        context_lens = batch.context_lens
-        positions = [i - 1 for i in context_lens]
-        slot_mapping = [
-            block_table[-1] * self.model_runner.block_size + last_block_num - 1
-            for block_table, last_block_num in zip(
-                batch.block_tables, batch.last_block_num_tokens
-            )
-        ]
+        max_seqlen_q = batch.total_tokens_num_decode // scheduled_bs
 
         var = self.model_runner.forward_vars
+
+        if max_seqlen_q > 1:
+            context_lens = batch.context_lens
+            positions = [
+                pos
+                for seq_len in context_lens
+                for pos in range(seq_len - max_seqlen_q, seq_len)
+            ]
+            # if self.model_runner.rank == 0:
+            #     print(f"{batch.block_tables=}")
+            #     print(f"{positions=}")
+            slot_mapping = [
+                block_table[pos // self.model_runner.block_size]
+                * self.model_runner.block_size
+                + (pos % self.model_runner.block_size)
+                for block_table, seq_len in zip(batch.block_tables, context_lens)
+                for pos in range(seq_len - max_seqlen_q, seq_len)
+            ]
+            # if self.model_runner.rank == 0:
+            #     print(f"{slot_mapping=}")
+        else:
+            context_lens = batch.context_lens
+            positions = [i - 1 for i in context_lens]
+            slot_mapping = [
+                block_table[-1] * self.model_runner.block_size + last_block_num - 1
+                for block_table, last_block_num in zip(
+                    batch.block_tables, batch.last_block_num_tokens
+                )
+            ]
+
         sum_scheduled_tokens = batch.total_tokens_num_decode
         if batch.is_dummy_run:
-            var["slot_mapping"].np[:bs] = -1
+            var["slot_mapping"].np[: bs * max_seqlen_q] = -1
         else:
-            var["slot_mapping"].np[:scheduled_bs] = slot_mapping
-            var["slot_mapping"].np[scheduled_bs:bs] = -1
+            var["slot_mapping"].np[: scheduled_bs * max_seqlen_q] = slot_mapping
+            var["slot_mapping"].np[scheduled_bs * max_seqlen_q : bs * max_seqlen_q] = -1
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         # var["context_lens"].np[scheduled_bs:bs] = 0
@@ -272,7 +296,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
         vars_used = [
-            ("slot_mapping", bs),  # TODO: MTP support
+            ("slot_mapping", bs * max_seqlen_q),
             ("context_lens", bs),
             ("cu_seqlens_q", bs + 1),
             ("kv_indptr", bs + 1),
@@ -293,7 +317,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             vars_used.append(("sparse_kv_indptr", bs + 1))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
-        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs)
+        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
         ctx.update(ctx_mla_ps)
         if self.block_ratio > 1:
             kv_indices_convert_triton(
@@ -319,20 +343,25 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
-        # if str(positions.device) == "cuda:0":
+
+        # if str(positions.device)=='cuda:0':
         #     for el, var in ctx.items():
-        #         print(f"{el}: {var}")
+        #         if 'work_' in el or 'reduce_' in el:
+        #             continue
+        #         logger.info(f"{el}: {var}")
+        #     logger.info(f"{positions=}")
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
-        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs)
+        max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
+        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
         attn_matadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
-            max_seqlen_q=1,
+            max_seqlen_q=max_q_len,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],
@@ -350,7 +379,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
             **ctx_mla_ps,
         )
-        positions = var["positions"].copy_to_gpu(bs)
+        positions = var["positions"].copy_to_gpu(bs * max_q_len)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )

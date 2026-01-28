@@ -611,6 +611,13 @@ class Config:
             else torch.bfloat16
         )
 
+        if self.speculative_config is not None:
+            if self.speculative_config.num_speculative_tokens != 1:
+                raise ValueError(
+                    f"num_speculative_tokens must be 1, got {self.speculative_config.num_speculative_tokens}. "
+                    "Only num_speculative_tokens=1 is currently supported."
+                )
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
