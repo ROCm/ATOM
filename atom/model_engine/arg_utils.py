@@ -24,6 +24,7 @@ class EngineArgs:
     """Arguments for configuring the LLM Engine."""
 
     model: str = "Qwen/Qwen3-0.6B"
+    trust_remote_code: bool = False
     tensor_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
@@ -50,6 +51,11 @@ class EngineArgs:
         # Model configuration
         parser.add_argument(
             "--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path."
+        )
+        parser.add_argument(
+            "--trust-remote-code",
+            action="store_true",
+            help="Trust remote code when loading model.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
