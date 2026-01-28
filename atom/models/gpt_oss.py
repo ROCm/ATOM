@@ -287,6 +287,10 @@ class GptOssModel(nn.Module):
         )
         self.aux_hidden_state_layers = tuple[int, ...]()
 
+        # Cache PP group info to avoid calling get_pp_group() in forward (which breaks torch.compile)
+        pp_group = get_pp_group()
+        self.is_first_pp_rank = pp_group.is_first_rank
+        self.is_last_pp_rank = pp_group.is_last_rank
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embedding(input_ids)
 
@@ -297,7 +301,7 @@ class GptOssModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        if self.is_first_pp_rank:
             if inputs_embeds is not None:
                 x = inputs_embeds
             else:
@@ -315,7 +319,7 @@ class GptOssModel(nn.Module):
             if i in self.aux_hidden_state_layers:
                 aux_hidden_states.append(x if residual is None else x + residual)
             x, residual = layer(x, positions, residual)
-        if not get_pp_group().is_last_rank:
+        if not self.is_last_pp_rank:
             return IntermediateTensors({"hidden_states": x, "residual": residual})
         x, _ = self.norm(x, residual)
 

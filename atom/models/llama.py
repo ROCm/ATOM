@@ -405,6 +405,11 @@ class LlamaModel(nn.Module):
 
         self.aux_hidden_state_layers: tuple[int] = tuple()
 
+        # Cache PP group info to avoid calling get_pp_group() in forward (which breaks torch.compile)
+        pp_group = get_pp_group()
+        self.is_first_pp_rank = pp_group.is_first_rank
+        self.is_last_pp_rank = pp_group.is_last_rank
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -421,7 +426,7 @@ class LlamaModel(nn.Module):
     ) -> Union[
         torch.Tensor, IntermediateTensors, tuple[torch.Tensor, list[torch.Tensor]]
     ]:
-        if get_pp_group().is_first_rank:
+        if self.is_first_pp_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -438,7 +443,7 @@ class LlamaModel(nn.Module):
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
 
-        if not get_pp_group().is_last_rank:
+        if not self.is_last_pp_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
