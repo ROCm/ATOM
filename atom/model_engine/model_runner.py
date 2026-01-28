@@ -142,7 +142,10 @@ class tokenIDProcessor:
             return (token_id,)
 
     def prepare_sampled_ids(
-        self, batch: ScheduledBatch, sampled_token_ids: torch.Tensor
+        self,
+        batch: ScheduledBatch,
+        sampled_token_ids: torch.Tensor,
+        num_bonus_tokens: Optional[torch.Tensor] = None,
     ) -> dict[int, tuple[int, ...]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
@@ -171,6 +174,14 @@ class tokenIDProcessor:
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
         token_id_dict[-1] = 1
+
+        if num_bonus_tokens is not None:
+            bonus_list = num_bonus_tokens.to("cpu").tolist()
+            if isinstance(bonus_list, int):
+                bonus_list = [bonus_list]
+            token_id_dict[-2] = {seq_id: int(n) for seq_id, n in zip(batch.req_ids, bonus_list)}
+        else:
+            token_id_dict[-2] = {}
 
         return token_id_dict
 
@@ -1139,6 +1150,7 @@ class ModelRunner:
         temperatures: torch.Tensor,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[int]]]:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
+        num_bonus_tokens = None
 
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(logits, temperatures)
@@ -1221,6 +1233,7 @@ class ModelRunner:
         token_ids = self.tokenID_processor.prepare_sampled_ids(
             batch,
             sampled_tokens,
+            num_bonus_tokens=num_bonus_tokens,
         )
 
         if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):

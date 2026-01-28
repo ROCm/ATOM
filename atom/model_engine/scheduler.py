@@ -206,6 +206,8 @@ class Scheduler:
         stream_output_queue=None,
     ) -> list[Sequence]:
         is_deferred_out = prev_token_ids.get(-1, False)
+        # bonus tokens count for current round
+        num_bonus_tokens = prev_token_ids.get(-2, {})
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
@@ -242,13 +244,17 @@ class Scheduler:
             else:
                 for token_id in token_ids:
                     seq.append_token(token_id)
+            
+            # update the number of tokens in the sequence and caclulate the number of accepted tokens for next round
+            seq.num_tokens = len(seq.token_ids) + num_bonus_tokens.get(seq.id, 0) - 1
+
             new_tokens = token_ids
 
-            # if need_placeholder:
-            #     # reuse the rejected kvcache slot
-            #     logger.info(f"{num_accepted_token=} {token_ids=}")
-            #     logger.info(f"{seq.output_tokens=}")
-            #     seq.num_placeholder = num_accepted_token
+            if need_placeholder:
+                # reuse the rejected kvcache slot
+                # logger.info(f"{num_accepted_token=} {token_ids=}")
+                # logger.info(f"{seq.output_tokens=}")
+                seq.num_placeholder = num_accepted_token
             if draft_token_ids and seq.id in draft_token_ids:
                 seq.spec_token_ids = draft_token_ids[seq.id]
 
