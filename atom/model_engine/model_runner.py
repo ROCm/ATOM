@@ -754,8 +754,40 @@ class ModelRunner:
                         )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, layer_id]
-                            module.v_scale = self.kv_scale[1, layer_id]
+                            # static scales
+                            loaded_k_scale = getattr(module, 'k_scale', None)
+                            loaded_v_scale = getattr(module, 'v_scale', None)
+                            
+                            if (loaded_k_scale is not None and loaded_v_scale is not None and
+                                isinstance(loaded_k_scale, torch.Tensor) and isinstance(loaded_v_scale, torch.Tensor)):
+                                static_k_scale = loaded_k_scale.flatten()[0].item()
+                                static_v_scale = loaded_v_scale.flatten()[0].item()
+                                # Fill the per-token scale buffers with the static scale value
+                                self.kv_scale[0, layer_id].fill_(static_k_scale)
+                                self.kv_scale[1, layer_id].fill_(static_v_scale)
+                                module.k_scale = self.kv_scale[0, layer_id]
+                                module.v_scale = self.kv_scale[1, layer_id]
+                            else:
+                                # No static scales - use dynamic per-token scale buffers
+                                module.k_scale = self.kv_scale[0, layer_id]
+                                module.v_scale = self.kv_scale[1, layer_id]
+                        else:
+                            # static scales. same as kv_cache fp8
+                            loaded_k_scale = getattr(module, 'k_scale', None)
+                            loaded_v_scale = getattr(module, 'v_scale', None)
+
+                            if (loaded_k_scale is not None and loaded_v_scale is not None and
+                                isinstance(loaded_k_scale, torch.Tensor) and isinstance(loaded_v_scale, torch.Tensor)):
+                                static_k_scale = loaded_k_scale.flatten()[0].item()
+                                static_v_scale = loaded_v_scale.flatten()[0].item()
+                                self.kv_scale[0, layer_id].fill_(static_k_scale)
+                                self.kv_scale[1, layer_id].fill_(static_v_scale)
+                                module.k_scale = self.kv_scale[0, layer_id]
+                                module.v_scale = self.kv_scale[1, layer_id]
+                            else:
+                                # No static scales - use dynamic per-token scale buffers
+                                module.k_scale = self.kv_scale[0, layer_id]
+                                module.v_scale = self.kv_scale[1, layer_id]
 
                         k_scale = module.k_scale
                         v_scale = module.v_scale

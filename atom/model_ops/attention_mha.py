@@ -45,7 +45,12 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
-        self.k_scale = self.v_scale = None
+        # Load kv scales as parameters with invalid value -1.0 to show weights that are not loaded yet.
+        # Will be loaded properly in model loader. Parameter required for proper model.named_parameters() recognition.
+        self.k_scale = torch.nn.Parameter(torch.tensor(-1.0),
+                                           requires_grad=False)
+        self.v_scale = torch.nn.Parameter(torch.tensor(-1.0),
+                                           requires_grad=False)
         self.layer_num = layer_num
         self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
