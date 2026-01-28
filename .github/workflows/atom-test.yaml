@@ -77,7 +77,10 @@ jobs:
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
-
+          RUN pip install -U lm-eval[api]
+          RUN pip show lm-eval || true
+          RUN pip install hf_transfer
+          RUN pip show hf_transfer || true
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
           RUN pip uninstall -y amd-aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
