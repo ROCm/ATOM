@@ -42,6 +42,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1"
     )
     == "1",
+    # Enable fused attention output + residual + RMSNorm kernel for GPT-OSS
+    # This fuses 3 operations into 1 kernel for better performance
+    "ATOM_ENABLE_FUSED_ATTN_OUTPUT_RMSNORM": lambda: os.getenv(
+        "ATOM_ENABLE_FUSED_ATTN_OUTPUT_RMSNORM", "0"
+    )
+    == "1",
 }
 
 
