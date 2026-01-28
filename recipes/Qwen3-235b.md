@@ -21,7 +21,7 @@ Here we consider the parallelism of TP8 + EP8 as an example.
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 
-python -m atom.entrypoints.openai_server --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 -tp 8 --kv_cache_dtype fp8 --enable-expert-parallel --max-model-len 16384 --max-num-batched-tokens 20000
+python -m atom.entrypoints.openai_server --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 -tp 8 --kv_cache_dtype fp8 --enable-expert-parallel --max-model-len 16384 --max-num-batched-tokens 20000 --cudagraph-capture-sizes "[1,2,4,8,16,32,48,64,128,256,512]"
 ```
 Tips on server configuration:
 - We suggest always using fp8 kv cache for better memory efficiency.
@@ -29,6 +29,7 @@ Tips on server configuration:
 - QK norm + rope + cache quant are fused into one kernel by enabling ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1.
 - The max-model-len is set to secure the performance of gluon pa decode kernel, which will be used when bs=64.
 - The max-num-batched-tokens is set based on our benchmark settings, i.e., ISL is selected from [1000,4000,10000]. This argument will affect TTFT and users can adjust it according to the scenarios.
+- Set cudagraph capture sizes accordindly to make sure that the max size is greater or equal than the max concurrency during benchmarking.
 
 
 
