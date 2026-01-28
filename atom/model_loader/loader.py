@@ -87,6 +87,9 @@ def load_model(
                 continue
             if name.endswith("kv_scale"):
                 continue
+            # only for our simple trained model engram demo can running
+            if ".causal_mask" in name or ".offsets" in name:
+                continue
             if spec_decode:
                 spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
                 if spec_layer is None:
