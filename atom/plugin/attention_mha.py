@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 from atom.utils import envs
 
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
-ATOM_ENABLE_QK_NORM_ROPE_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_FUSION
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
@@ -67,12 +66,14 @@ class PagedAttentionImplPluginModeMethods:
 
         attn_metadata = attention_metadata
 
-        use_triton_attn = (
-            self.sliding_window != -1 or self.head_dim != 128
-        )
+        use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
         self.use_triton_attn = use_triton_attn
 
-        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if (
+            self.rotary_emb is not None
+            and self.q_norm is not None
+            and self.k_norm is not None
+        ):
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
                 num_heads_q=self.num_heads,
@@ -88,31 +89,19 @@ class PagedAttentionImplPluginModeMethods:
                 k_cache=k_cache,
                 v_cache=v_cache,
                 slot_mapping=attn_metadata.slot_mapping,
-                kv_cache_dtype="auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype,
+                kv_cache_dtype=(
+                    "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+                ),
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
 
-            qkv = qkv.view(qkv.shape[0], 
-                        -1,
-                        self.head_dim)
-            q, k, v = qkv.split([self.num_heads,
-                                self.num_kv_heads,
-                                self.num_kv_heads], dim=1)
-        # elif use_triton_attn or not ATOM_ENABLE_QK_NORM_ROPE_FUSION:
-        elif 0:
-            if flash_layout:
-                k_cache = k_cache.view(
-                    k_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                )
-                v_cache = v_cache.view(
-                    v_cache.shape[0], -1, self.num_kv_heads, self.head_dim
-                )
-
-            # TODO: if kv_scale has value, do not use one scale here.
+            qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
+            q, k, v = qkv.split(
+                [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1)
+        elif use_triton_attn and self.rotary_emb is not None:
             k_scale = v_scale = self.kv_scale
 
-            # TODO: run here
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
@@ -135,9 +124,13 @@ class PagedAttentionImplPluginModeMethods:
             )
         else:
             # for asm paged attention 
-            assert position is not None, "position should not be None when not using any fusion"
-            assert self.rotary_emb is not None, "rotary_emb is None"
-            q, k = self.rotary_emb(position, q, k)
+            if self.rotary_emb is not None:
+                assert position is not None
+                q, k = self.rotary_emb(position, q, k)
+            if self.q_norm is not None:
+                q = self.q_norm(q)
+            if self.k_norm is not None:
+                k = self.k_norm(k)
             if self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
