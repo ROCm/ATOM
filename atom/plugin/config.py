@@ -156,12 +156,6 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # sglang uses the atom parallel config
     sgl_parallel_config = ParallelConfig(
         data_parallel_size=server_args.dp_size,
-        # world_size=int(server_args.pp_size * server_args.tp_size),
-        # data_parallel_master_ip=server_args.master_addr,
-        # data_parallel_master_port=,
-        # data_parallel_size_local=server_args.data_parallel_size_local,
-        # data_parallel_rank=server_args.data_parallel_rank,
-        # data_parallel_rank_local=server_args.data_parallel_rank_local,
     )
 
     # create the compilation config static_forward_context for sglang

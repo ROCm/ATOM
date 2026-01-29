@@ -89,7 +89,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     def __init__(self, model_runner):
-        print('[zejun] ATOM CommonAttentionBuilder init', flush=True)
         self.model_runner = model_runner
         assert model_runner.block_size % self.block_size == 0
         self.block_ratio = model_runner.block_size // self.block_size

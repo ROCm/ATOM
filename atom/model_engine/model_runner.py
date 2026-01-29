@@ -711,8 +711,6 @@ class ModelRunner:
                 dtype=dtypes.d_dtypes[config.kv_cache_dtype],
                 device="cuda",
             )
-            print("[zejun] ATOM, kv cache shape: ", self.kv_cache.shape, '. Mem use = ', \
-                self.kv_cache.numel() * self.kv_cache.element_size() / 1024.0 / 1024.0 / 1024.0, ' GB', flush=True)
 
             self.kv_scale = torch.zeros(
                 2,

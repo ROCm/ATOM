@@ -267,7 +267,6 @@ def _split_judge_func(node: fx.Node) -> bool:
     # as unified_attention
     from atom.plugin import is_vllm
     if is_vllm() and "unified_attention" in node.name:
-        print(f"[zejun] ATOM split_graph, split, unified_attention in node.name = {node.name}")
         return True
 
     return False
