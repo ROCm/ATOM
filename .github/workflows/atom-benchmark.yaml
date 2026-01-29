@@ -76,7 +76,6 @@ jobs:
       ISL: ${{ matrix.config.input_length }}
       OSL: ${{ matrix.config.output_length }}
       CONC: ${{ matrix.config.concurrency }}
-      NUM_PROMPTS: ${{ matrix.config.concurrency }} * 10
       RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
 
     runs-on: atom-mi355-8gpu.predownload
@@ -126,7 +125,7 @@ jobs:
           -e ISL=${{ env.ISL }}
           -e OSL=${{ env.OSL }}
           -e CONC=${{ env.CONC }}
-          -e NUM_PROMPTS=${{ env.NUM_PROMPTS }}
+          -e NUM_PROMPTS=$(( ${{ env.CONC }} * 10 ))
           -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
@@ -184,7 +183,6 @@ jobs:
       ISL: ${{ matrix.config.input_length }}
       OSL: ${{ matrix.config.output_length }}
       CONC: ${{ matrix.config.concurrency }}
-      NUM_PROMPTS: ${{ matrix.config.concurrency }} * 10
       RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
 
     runs-on: atom-mi355-8gpu.predownload
@@ -234,7 +232,7 @@ jobs:
           -e ISL=${{ env.ISL }}
           -e OSL=${{ env.OSL }}
           -e CONC=${{ env.CONC }}
-          -e NUM_PROMPTS=${{ env.NUM_PROMPTS }}
+          -e NUM_PROMPTS=$(( ${{ env.CONC }} * 10 ))
           -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
           -e ATOM_GPT_OSS_MODEL=1
           -v "${{ github.workspace }}:/workspace" \
