@@ -8,7 +8,6 @@ This module provides a FastAPI-based server that implements OpenAI-compatible
 endpoints for chat completions and text completions.
 """
 
-
 import argparse
 import asyncio
 import json

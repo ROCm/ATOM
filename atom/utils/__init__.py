@@ -25,6 +25,14 @@ import zmq.asyncio
 from atom.utils.custom_register import direct_register_custom_op
 from transformers import PretrainedConfig
 
+import copy
+import dataclasses
+import importlib
+from contextlib import contextmanager
+
+from packaging import version
+from packaging.version import Version
+
 if TYPE_CHECKING:
     from atom.config import Config
 
@@ -439,17 +447,6 @@ class CpuGpuBuffer:
             return self.cpu.copy_(self.gpu, non_blocking=True)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
 
-
-import copy
-import dataclasses
-import importlib
-import time
-from contextlib import contextmanager
-from typing import Any, Union
-
-import torch
-from packaging import version
-from packaging.version import Version
 
 context_manager = None
 torch_compile_start_time: float = 0.0

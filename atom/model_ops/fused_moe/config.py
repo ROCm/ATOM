@@ -1,9 +1,6 @@
 import logging
-from typing import Optional, Union, NamedTuple, ClassVar, TYPE_CHECKING
+from typing import Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
-from atom.model_ops.fused_moe.utils import cdiv
-from atom.model_ops.utils import has_triton_kernels
-from atom.utils import envs
 import torch
 
 if TYPE_CHECKING:
@@ -15,6 +12,7 @@ logger = logging.getLogger("atom")
 class _GroupShape(NamedTuple):
     row: int
     col: int
+
 
 class GroupShape(_GroupShape):
     """
@@ -38,6 +36,7 @@ class GroupShape(_GroupShape):
 
 GroupShape.PER_TENSOR = GroupShape(-1, -1)
 GroupShape.PER_TOKEN = GroupShape(1, -1)
+
 
 def _quant_flags_to_group_shape(
     quant_dtype: torch.dtype | str | None,
@@ -65,7 +64,6 @@ def _quant_flags_to_group_shape(
     return a_shape, w_shape
 
 
-
 @dataclass
 class FusedMoEQuantDesc:
     """
@@ -87,7 +85,7 @@ class FusedMoEQuantDesc:
     shape: GroupShape | None = None
 
     # Quantization scales.
-    scale: Union[torch.Tensor, "PrecisionConfig", None] = None
+    scale: Union[torch.Tensor, "PrecisionConfig", None] = None  # noqa: F821
 
     # Quantization alphas or gscales, used for nvfp4 types.
     alpha_or_gscale: torch.Tensor | None = None
@@ -105,15 +103,16 @@ class FusedMoEQuantConfig:
     Simplified FusedMoEQuantConfig for MoE quantization parameters.
     Contains activation and weight quantization descriptors.
     """
+
     _a1: FusedMoEQuantDesc
     _a2: FusedMoEQuantDesc
     _w1: FusedMoEQuantDesc
     _w2: FusedMoEQuantDesc
 
     def __post_init__(self):
-        assert not self.per_act_token_quant or self.block_shape is None, (
-            "illegal quantization"
-        )
+        assert (
+            not self.per_act_token_quant or self.block_shape is None
+        ), "illegal quantization"
 
     # === Core properties ===
 
@@ -174,8 +173,8 @@ class FusedMoEQuantConfig:
         quant_dtype: torch.dtype | str | None = None,
         per_act_token_quant: bool = False,
         block_shape: list[int] | None = None,
-        w1_scale: Union[torch.Tensor, "PrecisionConfig", None] = None,
-        w2_scale: Union[torch.Tensor, "PrecisionConfig", None] = None,
+        w1_scale: Union[torch.Tensor, "PrecisionConfig", None] = None,  # noqa: F821
+        w2_scale: Union[torch.Tensor, "PrecisionConfig", None] = None,  # noqa: F821
         a1_scale: torch.Tensor | None = None,
         a2_scale: torch.Tensor | None = None,
         w1_bias: torch.Tensor | None = None,
@@ -184,18 +183,22 @@ class FusedMoEQuantConfig:
     ) -> "FusedMoEQuantConfig":
         """Builder function for FusedMoEQuantConfig."""
         assert not isinstance(quant_dtype, str) or quant_dtype in {
-            "nvfp4", "mxfp4", "mxfp6_e3m2", "mxfp6_e2m3",
+            "nvfp4",
+            "mxfp4",
+            "mxfp6_e3m2",
+            "mxfp6_e2m3",
         }
         assert not isinstance(weight_dtype, str) or weight_dtype in {
-            "nvfp4", "mxfp4", "mxfp6_e3m2", "mxfp6_e2m3",
+            "nvfp4",
+            "mxfp4",
+            "mxfp6_e3m2",
+            "mxfp6_e2m3",
         }
 
         if weight_dtype is None:
             weight_dtype = quant_dtype
 
-        a_shape, w_shape = _quant_flags_to_group_shape(
-            quant_dtype, False, block_shape
-        )
+        a_shape, w_shape = _quant_flags_to_group_shape(quant_dtype, False, block_shape)
         quant_config = FusedMoEQuantConfig(
             _a1=FusedMoEQuantDesc(quant_dtype, a_shape, a1_scale),
             _a2=FusedMoEQuantDesc(quant_dtype, a_shape, a2_scale),
@@ -205,6 +208,7 @@ class FusedMoEQuantConfig:
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.block_shape == block_shape
         return quant_config
+
 
 def biased_moe_quant_config(
     w1_bias: torch.Tensor | None,
@@ -220,9 +224,10 @@ def biased_moe_quant_config(
         _w2=FusedMoEQuantDesc(bias=w2_bias),
     )
 
+
 def mxfp4_w4a16_moe_quant_config(
-    w1_scale: Union[torch.Tensor, "PrecisionConfig"],
-    w2_scale: Union[torch.Tensor, "PrecisionConfig"],
+    w1_scale: Union[torch.Tensor, "PrecisionConfig"],  # noqa: F821
+    w2_scale: Union[torch.Tensor, "PrecisionConfig"],  # noqa: F821
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig:
@@ -258,6 +263,7 @@ def fp8_w8a8_moe_quant_config(
         block_shape=block_shape,
     )
 
+
 FUSED_MOE_UNQUANTIZED_CONFIG: FusedMoEQuantConfig = FusedMoEQuantConfig.make()
 
 
@@ -283,9 +289,7 @@ class FusedMoEConfig:
 
     def __post_init__(self):
         if self.dp_size > 1:
-            logger.debug(
-                "Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens
-            )
+            logger.debug("Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens)
 
         assert self.max_num_tokens > 0
 
@@ -320,7 +324,3 @@ class FusedMoEConfig:
     @property
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
-    
-
-
-

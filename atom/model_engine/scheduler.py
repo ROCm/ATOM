@@ -5,7 +5,6 @@ import logging
 import time
 from collections import deque
 
-import numpy as np
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
@@ -266,6 +265,7 @@ class Scheduler:
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
+
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
 

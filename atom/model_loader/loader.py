@@ -5,7 +5,7 @@ import concurrent.futures
 import os
 import re
 from glob import glob
-from typing import Generator, List, Tuple
+from typing import Generator, Tuple
 
 import safetensors
 import torch
@@ -19,9 +19,15 @@ from atom.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.moe import FusedMoEMethodBase, is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.moe import (
+    FusedMoEMethodBase,
+    is_rocm_aiter_fusion_shared_expert_enabled,
+)
 from aiter.dist.parallel_state import get_tp_group
-from atom.models.deepseek_mtp import get_spec_layer_idx_from_weight_name, rewrite_spec_layer_name
+from atom.models.deepseek_mtp import (
+    get_spec_layer_idx_from_weight_name,
+    rewrite_spec_layer_name,
+)
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -100,7 +106,11 @@ def load_model(
 
             layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
             layerId = int(layerId_.group(1)) if layerId_ else 0
-            if hf_config.num_hidden_layers and layerId >= hf_config.num_hidden_layers and not spec_decode:
+            if (
+                hf_config.num_hidden_layers
+                and layerId >= hf_config.num_hidden_layers
+                and not spec_decode
+            ):
                 # print(f"Skipping loading {name} as layerId {layerId} >= num_hidden_layers {hf_config.num_hidden_layers}")
                 continue
             if (
@@ -118,13 +128,15 @@ def load_model(
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
                     param_name = name.replace(k, v)
-                    #FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
-                    if ("output_scale" not in param_name):
+                    # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
+                    if "output_scale" not in param_name:
                         param = model.get_parameter(param_name)
                         weight_loader = getattr(param, "weight_loader")
                         # weight_loader(param, weight_tensor, shard_id)
                         futures.append(
-                            executor.submit(weight_loader, param, weight_tensor, shard_id)
+                            executor.submit(
+                                weight_loader, param, weight_tensor, shard_id
+                            )
                         )
                     break
             else:

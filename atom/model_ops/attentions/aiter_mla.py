@@ -2,8 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import itertools
-from dataclasses import dataclass
-from typing import Optional, Type
+from typing import Type
 
 import numpy as np
 import torch

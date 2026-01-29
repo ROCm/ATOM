@@ -5,30 +5,20 @@ import enum
 import logging
 import pickle
 import queue
-import signal
 import threading
-import time
-import weakref
 from contextlib import ExitStack
-from multiprocessing.shared_memory import SharedMemory
-from typing import Any, List, Optional
+from typing import List
 
 import torch
 import zmq
 import zmq.asyncio
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
-from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import (
-    close_sockets,
-    get_engine_client_zmq_addr,
-    get_mp_context,
     init_exit_handler,
     make_zmq_socket,
-    shutdown_all_processes,
-    zmq_socket_ctx,
 )
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,

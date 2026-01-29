@@ -77,9 +77,9 @@ class EngineArgs:
             help="Enable prefix caching.",
         )
         parser.add_argument(
-            "--port", 
-            type=int, 
-            default=8006, 
+            "--port",
+            type=int,
+            default=8006,
             help="Engine internal port",
         )
         parser.add_argument(
@@ -178,17 +178,23 @@ class EngineArgs:
 
     def _get_engine_kwargs(self) -> dict:
         """Get common engine initialization kwargs.
-        
+
         Most fields are directly passed through with the same name.
         Only handles special cases that need transformation.
         """
-        kwargs = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "model"}
-        
+        kwargs = {
+            f.name: getattr(self, f.name) for f in fields(self) if f.name != "model"
+        }
+
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
-            cudagraph_capture_sizes=parse_size_list(kwargs.pop("cudagraph_capture_sizes")) if self.cudagraph_capture_sizes else None,
+            cudagraph_capture_sizes=(
+                parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
+                if self.cudagraph_capture_sizes
+                else None
+            ),
         )
         if self.method:
             kwargs["speculative_config"] = SpeculativeConfig(
@@ -200,7 +206,7 @@ class EngineArgs:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs["speculative_config"] = None
-        
+
         return kwargs
 
     def create_engine(self) -> LLMEngine:
