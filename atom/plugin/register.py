@@ -67,7 +67,7 @@ def set_attn_cls() -> None:
         logger.info('Set ATTN_CLS to RadixAttention for SGLang')
 
 
-def init_aiter_dist(config: Config) -> None:
+def init_aiter_dist(atom_config: Config) -> None:
     '''
     Initialize aiter dist for using aiter custom collective op
     '''
@@ -76,6 +76,7 @@ def init_aiter_dist(config: Config) -> None:
     from aiter import init_dist_env
     from aiter.dist.utils import get_distributed_init_method
 
+    config = atom_config
     rank = config.plugin_config.rank
     tensor_parallel_size = config.tensor_parallel_size
 

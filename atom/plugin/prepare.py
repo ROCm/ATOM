@@ -82,4 +82,4 @@ def prepare_model(config: Any, framework: str):
     # init aiter dist for using aiter custom collective ops
     init_aiter_dist(config=atom_config)
 
-    return model_cls(config=atom_config)
+    return model_cls(atom_config=atom_config)
