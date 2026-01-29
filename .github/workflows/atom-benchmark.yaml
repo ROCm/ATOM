@@ -39,7 +39,7 @@ jobs:
         id: parse-param-lists
         run: |
           IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
-          MATRIX_JSON="{["
+          MATRIX_JSON="["
           SEP=""
           for SET in "${SETS[@]}"; do
             IFS=',' read -ra PARAMS <<< "$SET"
@@ -50,7 +50,7 @@ jobs:
             MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
             SEP=","
           done
-          MATRIX_JSON="${MATRIX_JSON}]}"
+          MATRIX_JSON="${MATRIX_JSON}]"
           echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
       
       - name: Print matrix JSON
