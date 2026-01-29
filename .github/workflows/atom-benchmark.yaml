@@ -10,11 +10,10 @@ on:
       gpt-oss-120b:
         description: "Benchmark gpt-oss-120b"
         type: boolean
-        default: false
-      args:
-        description: "Arguments to pass to the ATOM server (default: --kv_cache_dtype fp8)"
+        default: true
+      extra_args:
+        description: "Extra arguments to pass to the ATOM server"
         type: string
-        default: "--kv_cache_dtype fp8"
       image:
         description: "Image to use for the benchmark"
         type: string
@@ -40,7 +39,7 @@ jobs:
         id: parse-param-lists
         run: |
           IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
-          MATRIX_JSON="{\"include\":["
+          MATRIX_JSON="{["
           SEP=""
           for SET in "${SETS[@]}"; do
             IFS=',' read -ra PARAMS <<< "$SET"
@@ -58,38 +57,21 @@ jobs:
         run: |
           echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
-  atom-benchmark:
-    name: ATOM Benchmark
+  deepseek-r1-0528-benchmark:
+    if: ${{ inputs.deepseek-r1-0528 }}
+    name: DeepSeek-R1-0528 Benchmark
     needs: [parse-param-lists]
     strategy:
       fail-fast: false
       matrix:
-        include:
-        - model_name: "DeepSeek-R1-0528"
-          model_path: "deepseek-ai/DeepSeek-R1-0528"
-          extraArgs: "-tp 8"
-          env_vars: ""
-          runner: atom-mi355-8gpu.predownload
-          enabled: ${{ inputs.deepseek-r1-0528 }}
-        - model_name: "gpt-oss-120b"
-          model_path: "openai/gpt-oss-120b"
-          extraArgs: ""
-          env_vars: |
-            ATOM_GPT_OSS_MODEL=1
-          runner: atom-mi355-1gpu
-          enabled: ${{ inputs.gpt-oss-120b }}
+        config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
+    
+    env:
+      MODEL_PATH: "deepseek-ai/DeepSeek-R1-0528"
+      ARGS: "--kv_cache_dtype fp8 -tp 8"
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: atom-mi355-8gpu.predownload
     steps:
-      - name: Check if benchmark is enabled
-        run: |
-          if ${{ matrix.enabled }} == true; then
-            echo "Benchmark is enabled"
-          else
-            echo "Benchmark is disabled"
-            exit 0
-          fi
-
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
       
@@ -112,11 +94,11 @@ jobs:
           fi
 
           cat > /tmp/env_file.txt << 'EOF'
-          ${{ matrix.env_vars }}
+          ${{ inputs.extra_args }}
           EOF
 
           echo "Starting container: atom-benchmark"
-          echo "Model-specific environment variables for ${{ matrix.model_name }}:"
+          echo "Model-specific environment variables for ${{ env.MODEL_PATH }}:"
           cat /tmp/env_file.txt
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
@@ -147,20 +129,20 @@ jobs:
           echo ""
           echo "========== Launching ATOM server =========="
           if [ -d "/models" ]; then
-            model_path="/models/${{ matrix.model_path }}"
+            model_path="/models/${{ env.MODEL_PATH }}"
           else
-            model_path="${{ matrix.model_path }}"
+            model_path="${{ env.MODEL_PATH }}"
           fi
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ inputs.args }} ${{ matrix.extraArgs }}
+            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
           "
           echo "========== Running benchmark test =========="
           docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ matrix.model_name }} .github/scripts/atom_test.sh benchmark $model_path
+          RESULT_FILENAME=deepseek-r1-0528 .github/scripts/atom_test.sh benchmark $model_path
           ls -all .
           "
           echo "========== Processing benchmark test result =========="
-          .github/scripts/summarize.py ${{ matrix.model_name }}.json >> $GITHUB_STEP_SUMMARY
+          .github/scripts/summarize.py deepseek-r1-0528.json >> $GITHUB_STEP_SUMMARY
 
       - name: Clean Up
         if: always()
