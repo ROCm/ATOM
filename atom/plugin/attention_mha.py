@@ -52,6 +52,29 @@ class PagedAttentionImplPluginModeMethods:
                                k_scale: torch.Tensor,
                                v_scale: torch.Tensor,
                                flash_layout: bool = False):
+
+        num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
+
+        if not flash_layout:
+            x = 16 // k_cache.element_size()
+            k_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, head_size // x, block_size, x],
+                dtype=k_cache.dtype,
+                device="meta",
+            )
+            # ATOM: [num_blocks, num_kv_heads, head_size, block_size],
+            # vLLM: [num_blocks, num_kv_heads, block_size // x, head_size, x],
+            v_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                dtype=v_cache.dtype,
+                device="meta",
+            )
+            new_key_cache = k_cache.view_as(k_cache_template)
+            new_value_cache = v_cache.view_as(v_cache_template)
+        else:
+            new_key_cache = k_cache
+            new_value_cache = v_cache
+
         # if flash kv_cache layout, the shape of kv_cache is:
         #
         # key_cache:   [num_blocks, block_size, num_kv_heads, head_size]
@@ -86,8 +109,8 @@ class PagedAttentionImplPluginModeMethods:
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 is_neox_style=self.rotary_emb.is_neox_style,
                 pos_ids=position,
-                k_cache=k_cache,
-                v_cache=v_cache,
+                k_cache=new_key_cache,
+                v_cache=new_value_cache,
                 slot_mapping=attn_metadata.slot_mapping,
                 kv_cache_dtype=(
                     "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
@@ -106,8 +129,8 @@ class PagedAttentionImplPluginModeMethods:
                 q,
                 k,
                 v,
-                k_cache,
-                v_cache,
+                new_key_cache,
+                new_value_cache,
                 attn_metadata.slot_mapping,
                 position,
                 self.rotary_emb.cos_cache,
@@ -135,8 +158,8 @@ class PagedAttentionImplPluginModeMethods:
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
                     v,
-                    k_cache,
-                    v_cache,
+                    new_key_cache,
+                    new_value_cache,
                     k_scale,
                     v_scale,
                     attn_metadata.slot_mapping,
@@ -146,8 +169,8 @@ class PagedAttentionImplPluginModeMethods:
                 aiter.reshape_and_cache(
                     k,
                     v,
-                    k_cache,
-                    v_cache,
+                    new_key_cache,
+                    new_value_cache,
                     attn_metadata.slot_mapping,
                     kv_cache_dtype="auto",
                     k_scale=None,
@@ -259,14 +282,29 @@ class PagedAttentionImplPluginModeMethods:
                                         num_decode_tokens: int,
                                         attn_metadata: "AttentionMetaData",
                                         out: torch.Tensor):
-
+        num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
+        x = 16 // k_cache.element_size()
+        k_cache_template = torch.empty(
+            [num_blocks, num_kv_heads, head_size // x, block_size, x],
+            dtype=k_cache.dtype,
+            device="meta",
+        )
+        v_cache_template = torch.empty(
+            [num_blocks, num_kv_heads, block_size // x, head_size, x],
+            dtype=v_cache.dtype,
+            device="meta",
+        )
+        new_key_cache = k_cache.view_as(k_cache_template)
+        new_value_cache = v_cache.view_as(v_cache_template)
         aiter.pa_fwd_asm(
             Q=q,
-            K=k_cache,
-            V=v_cache,
+            K=new_key_cache,
+            V=new_value_cache,
             block_tables=attn_metadata.plugin_metadata.block_table[:num_decodes],
             context_lens=attn_metadata.plugin_metadata.seq_lens[:num_decodes],
-            block_tables_stride0=attn_metadata.plugin_metadata.block_table[:num_decodes].stride(0),
+            block_tables_stride0=attn_metadata.plugin_metadata.block_table[
+                :num_decodes
+            ].stride(0),
             K_QScale=k_scale,
             V_QScale=v_scale,
             out_=out[:num_decode_tokens],
@@ -304,12 +342,12 @@ class PagedAttentionImplPluginModeMethods:
         )
 
         from vllm.v1.attention.backends.rocm_aiter_fa import cp_mha_gather_cache
-        key_cache_for_gather, value_cache_for_gather, _ = (
-            self._get_cp_mha_gather_cache_views(key_cache, value_cache)
-        )
+        # key_cache_for_gather, value_cache_for_gather, _ = (
+        #     self._get_cp_mha_gather_cache_views(key_cache, value_cache)
+        # )
         cp_mha_gather_cache(
-            key_cache=key_cache_for_gather,
-            value_cache=value_cache_for_gather,
+            key_cache=key_cache,
+            value_cache=value_cache,
             key=key_fetched,
             value=value_fetched,
             block_tables=block_table,
@@ -319,7 +357,7 @@ class PagedAttentionImplPluginModeMethods:
             token_to_batch=swa_token_to_batch,
             seq_starts=swa_seq_starts,
             dequant=self.kv_cache_dtype.startswith("fp8"),
-            kv_cache_layout="SHUFFLE",
+            kv_cache_layout="NHD",
             total_tokens=swa_total_tokens,
         )
 
@@ -404,13 +442,13 @@ class PagedAttentionImplPluginModeMethods:
         key_fetched, value_fetched = workspace[0], workspace[1]
         chunked_output = None
         chunked_lse = None
-        key_cache_for_gather, value_cache_for_gather, _ = (
-            self._get_cp_mha_gather_cache_views(key_cache, value_cache)
-        )
+        # key_cache_for_gather, value_cache_for_gather, _ = (
+        #     self._get_cp_mha_gather_cache_views(key_cache, value_cache)
+        # )
         for chunk_idx in range(num_chunks):
             cp_mha_gather_cache(
-                key_cache=key_cache_for_gather,
-                value_cache=value_cache_for_gather,
+                key_cache=key_cache,
+                value_cache=value_cache,
                 key=key_fetched,
                 value=value_fetched,
                 block_tables=block_table,
@@ -514,8 +552,13 @@ class PagedAttentionImplPluginModeMethods:
         output = output.view(-1, self.num_heads, self.head_dim)
 
         num_actual_tokens = attn_metadata.plugin_metadata.num_actual_tokens
-        original_k_cache, original_v_cache = kv_cache.unbind(0)
-        num_blocks, block_size, num_kv_heads, head_size = original_k_cache.shape
+        k_cache, v_cache = kv_cache.unbind(0)
+        num_blocks, block_size, num_kv_heads, _ = k_cache.shape
+
+        if self.kv_cache_dtype == "fp8":
+            target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
+            k_cache = k_cache.view(target_dtype)
+            v_cache = v_cache.view(target_dtype)
 
         # create kv scale according to the num_blocks
         # usually it is created when cuda graph capture for decode phase
@@ -534,34 +577,6 @@ class PagedAttentionImplPluginModeMethods:
             self.v_scale = self.kv_scale[1]
             layer.k_scale = self.k_scale
             layer.v_scale = self.v_scale
-
-        # shuffle the kv cache layout anyway, which aligns with the ATOM server mode
-        # here do 2 things:
-        # 1. change the kv cache layout, which is required by the asm kernel 
-        # and the cache flash kernel
-        # 2. use meta tensor to make sure the kv cache tensor, 
-        # passed into following kernel, has the same data ptr as 
-        # the originial one. It means they share the same storage impl
-        x = 16 // original_k_cache.element_size()
-        k_cache_template = torch.empty(
-            [num_blocks, num_kv_heads, head_size // x, block_size, x],
-            dtype=original_k_cache.dtype,
-            device="meta",
-        )
-        # ATOM: [num_blocks, num_kv_heads, head_size, block_size],
-        # vLLM: [num_blocks, num_kv_heads, block_size // x, head_size, x],
-        v_cache_template = torch.empty(
-            [num_blocks, num_kv_heads, block_size // x, head_size, x],
-            dtype=original_v_cache.dtype,
-            device="meta",
-        )
-        k_cache = original_k_cache.view_as(k_cache_template)
-        v_cache = original_v_cache.view_as(v_cache_template)
-
-        if self.kv_cache_dtype == "fp8":
-            target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
-            k_cache = k_cache.view(target_dtype)
-            v_cache = v_cache.view(target_dtype)
 
         # rope and cache flush fusion
         result = self.rope_cache_plugin_mode(q=query,
