@@ -57,8 +57,8 @@ if [ "$TYPE" == "benchmark" ]; then
     --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
     --dataset-name=random \
     --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
-    --num-prompts=$NUM_PROMPTS \
     --max-concurrency=$CONC \
+    --num-prompts=$(( $CONC * 10 )) \
     --trust-remote-code \
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
