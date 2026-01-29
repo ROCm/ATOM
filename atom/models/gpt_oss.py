@@ -17,8 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Iterable
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from typing import Optional
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -29,12 +28,9 @@ from aiter import (
 
 from atom.model_ops.base_attention import Attention
 from atom.utils.decorators import support_torch_compile
-from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.config import Config, QuantizationConfig
 from aiter.dist.parallel_state import (
-    get_dp_group,
-    get_ep_group,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_gather

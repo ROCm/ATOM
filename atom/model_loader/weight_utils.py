@@ -3,7 +3,7 @@
 
 # This code is adapted from https://github.com/ROCm/vllm/blob/main/vllm/model_executor/model_loader/weight_utils.py
 
-from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub import HfFileSystem, snapshot_download
 import huggingface_hub.constants
 import logging
 from tqdm.auto import tqdm
@@ -15,7 +15,7 @@ import hashlib
 import fnmatch
 import torch
 from pathlib import Path
-from typing import Any, Callable, Optional, Union, List
+from typing import Any, Optional, Union, List
 import json
 
 logger = logging.getLogger(__name__)
@@ -28,12 +28,12 @@ temp_dir = tempfile.gettempdir()
 
 
 def enable_hf_transfer():
-    """automatically activates hf_transfer
-    """
+    """automatically activates hf_transfer"""
     if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
         try:
             # enable hf hub transfer if available
             import hf_transfer  # type: ignore # noqa
+
             huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
         except ImportError:
             pass
@@ -47,8 +47,8 @@ class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, disable=True)
 
-def get_lock(model_name_or_path: Union[str, Path],
-             cache_dir: Optional[str] = None):
+
+def get_lock(model_name_or_path: Union[str, Path], cache_dir: Optional[str] = None):
     lock_dir = cache_dir or temp_dir
     model_name_or_path = str(model_name_or_path)
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
@@ -57,8 +57,7 @@ def get_lock(model_name_or_path: Union[str, Path],
     # add hash to avoid conflict with old users' lock files
     lock_file_name = hash_name + model_name + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name),
-                             mode=0o666)
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
 
 
@@ -115,8 +114,11 @@ def download_weights_from_hf(
         )
         time_taken = time.perf_counter() - start_time
         if time_taken > 0.5:
-            logger.info("Time spent downloading weights for %s: %.6f seconds",
-                        model_name_or_path, time_taken)
+            logger.info(
+                "Time spent downloading weights for %s: %.6f seconds",
+                model_name_or_path,
+                time_taken,
+            )
     return hf_folder
 
 
@@ -136,8 +138,7 @@ def set_weight_attrs(
     if weight_attrs is None:
         return
     for key, value in weight_attrs.items():
-        assert not hasattr(
-            weight, key), (f"Overwriting existing tensor attribute: {key}")
+        assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
 
         # NOTE(woosuk): During weight loading, we often do something like:
         # narrowed_tensor = param.data.narrow(0, offset, len)
@@ -151,9 +152,9 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
-def filter_duplicate_safetensors_files(hf_weights_files: List[str],
-                                       hf_folder: str,
-                                       index_file: str) -> List[str]:
+def filter_duplicate_safetensors_files(
+    hf_weights_files: List[str], hf_folder: str, index_file: str
+) -> List[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, index_file)
@@ -166,10 +167,7 @@ def filter_duplicate_safetensors_files(hf_weights_files: List[str],
         weight_map = json.load(f)["weight_map"]
     weight_files_in_index = set()
     for weight_name in weight_map:
-        weight_files_in_index.add(
-            os.path.join(hf_folder, weight_map[weight_name]))
+        weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
     # Filter out any fields that are not found in the index file.
-    hf_weights_files = [
-        f for f in hf_weights_files if f in weight_files_in_index
-    ]
+    hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files

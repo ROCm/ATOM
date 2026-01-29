@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from abc import ABC, abstractmethod
 from functools import cache
-from typing import List, Optional, Tuple, Type
+from typing import Type
 
-import torch
 from atom.model_ops.attentions.backends import AttentionBackend
 from atom.utils import resolve_obj_by_qualname
 
@@ -34,9 +32,9 @@ def _cached_get_attn_backend(
     # get device-specific attn_backend
     attention_cls = get_attn_backend_cls(block_size, use_mla)
     if not attention_cls:
-        raise ValueError(
-            f"Invalid attention backend for {attention_cls}")
+        raise ValueError(f"Invalid attention backend for {attention_cls}")
     return resolve_obj_by_qualname(attention_cls)
+
 
 def get_attn_backend_cls(block_size, use_mla) -> str:
     if use_mla:

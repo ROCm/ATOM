@@ -2,9 +2,12 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ipaddress
-from torch.distributed.distributed_c10d import (Backend, PrefixStore,
-                                                _get_default_timeout,
-                                                _unregister_process_group)
+from torch.distributed.distributed_c10d import (
+    Backend,
+    PrefixStore,
+    _get_default_timeout,
+    _unregister_process_group,
+)
 from torch.distributed import ProcessGroup
 from torch.distributed.rendezvous import rendezvous
 import torch
@@ -29,11 +32,15 @@ def get_tcp_uri(ip: str, port: int) -> str:
         return f"tcp://{ip}:{port}"
 
 
-def init_gloo_process_group(backend: Backend, prefix_store: PrefixStore,
-                            group_rank: int, group_size: int,
-                            timeout: timedelta) -> ProcessGroup:
+def init_gloo_process_group(
+    backend: Backend,
+    prefix_store: PrefixStore,
+    group_rank: int,
+    group_size: int,
+    timeout: timedelta,
+) -> ProcessGroup:
     """
-    Stateless init ProcessGroup with gloo backend compatible with 
+    Stateless init ProcessGroup with gloo backend compatible with
     different torch versions.
     """
     if is_torch_equal_or_newer("2.6"):
@@ -51,10 +58,10 @@ def init_gloo_process_group(backend: Backend, prefix_store: PrefixStore,
             options,
         )
     from torch.distributed.distributed_c10d import ProcessGroupGloo
-    backend_class = ProcessGroupGloo(prefix_store,
-                                     group_rank,
-                                     group_size,
-                                     timeout=timeout)
+
+    backend_class = ProcessGroupGloo(
+        prefix_store, group_rank, group_size, timeout=timeout
+    )
     backend_type = ProcessGroup.BackendType.GLOO
     device = torch.device("cpu")
     if is_torch_equal_or_newer("2.6"):
@@ -67,8 +74,8 @@ def init_gloo_process_group(backend: Backend, prefix_store: PrefixStore,
 
 
 def stateless_init_torch_distributed_process_group(
-        host: str, port: int, rank: int, world_size: int,
-        backend: str) -> ProcessGroup:
+    host: str, port: int, rank: int, world_size: int, backend: str
+) -> ProcessGroup:
     """
     A replacement for `torch.distributed.init_process_group` that does not
     pollute the global state. The created ProcessGroup object can be used for
@@ -105,7 +112,8 @@ def stateless_init_torch_distributed_process_group(
     timeout = _get_default_timeout(backend)
 
     store, rank, world_size = next(
-        rendezvous(init_method, rank, world_size, timeout=timeout))
+        rendezvous(init_method, rank, world_size, timeout=timeout)
+    )
     store.set_timeout(timeout)
     group_rank = rank
     group_size = world_size
@@ -114,17 +122,18 @@ def stateless_init_torch_distributed_process_group(
     # different systems (e.g. RPC) in case the store is multi-tenant.
     prefix_store = PrefixStore(init_method, store)
     if backend == "gloo":
-        return init_gloo_process_group(backend=backend,
-                                       prefix_store=prefix_store,
-                                       group_rank=group_rank,
-                                       group_size=group_size,
-                                       timeout=timeout)
+        return init_gloo_process_group(
+            backend=backend,
+            prefix_store=prefix_store,
+            group_rank=group_rank,
+            group_size=group_size,
+            timeout=timeout,
+        )
     else:
         raise ValueError(f"Unsupported backend: {backend}")
 
 
-def stateless_destroy_torch_distributed_process_group(
-        pg: ProcessGroup) -> None:
+def stateless_destroy_torch_distributed_process_group(pg: ProcessGroup) -> None:
     """
     Destroy ProcessGroup returned by
         stateless_init_torch_distributed_process_group().
@@ -134,6 +143,7 @@ def stateless_destroy_torch_distributed_process_group(
     else:
         # Lazy import for non-CUDA backends.
         from torch.distributed.distributed_c10d import _shutdown_backend
+
         _shutdown_backend(pg)
 
     _unregister_process_group(pg.group_name)

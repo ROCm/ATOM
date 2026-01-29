@@ -34,6 +34,7 @@ from transformers import Qwen3Config
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
+
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.layernorm import RMSNorm
@@ -229,7 +230,10 @@ class Qwen3Model(nn.Module):
         self.layers = nn.ModuleList(
             [
                 Qwen3DecoderLayer(
-                    config, cache_config=cache_config, quant_config=quant_config, layer_num = layer_num
+                    config,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    layer_num=layer_num,
                 )
                 for layer_num in range(config.num_hidden_layers)
             ]

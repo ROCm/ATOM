@@ -32,7 +32,6 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 
-
 torch.set_printoptions(threshold=10_000)
 
 logger = logging.getLogger("atom")
@@ -235,8 +234,10 @@ class MLAAttention(nn.Module):
                 q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
             )
         return ql_nope, q_pe
-    
-    def fused_kv_bmm(self, x, x_scale, k_nope, k_rope, positions, kv_cache, attn_metadata):
+
+    def fused_kv_bmm(
+        self, x, x_scale, k_nope, k_rope, positions, kv_cache, attn_metadata
+    ):
         q_nope, q_pe = (
             self.q_proj(x, x_scale)
             .view(-1, self.num_heads, self.qk_head_dim)
@@ -246,13 +247,15 @@ class MLAAttention(nn.Module):
         q_nope = q_nope.transpose(0, 1)
 
         if is_rocm_aiter_fp4bmm_enabled():
-            from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import fused_fp4_bmm_rope_cat_and_cache_mla
+            from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+                fused_fp4_bmm_rope_cat_and_cache_mla,
+            )
 
             result, _, _, _ = fused_fp4_bmm_rope_cat_and_cache_mla(
-                q_nope,                 
+                q_nope,
                 self.W_K,
                 self.W_K_scale,
-                q_pe,                   
+                q_pe,
                 k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
                 k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
                 kv_cache,
@@ -269,14 +272,16 @@ class MLAAttention(nn.Module):
                 q_out_dtype=kv_cache.dtype,
                 num_decode_toks_for_zeros=0,
             )
-        else: 
-            from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import fused_fp8_bmm_rope_cat_and_cache_mla
+        else:
+            from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+                fused_fp8_bmm_rope_cat_and_cache_mla,
+            )
 
             result, _, _, _ = fused_fp8_bmm_rope_cat_and_cache_mla(
-                q_nope,                 
-                self.W_K,               
-                self.W_K_scale,         
-                q_pe,                   
+                q_nope,
+                self.W_K,
+                self.W_K_scale,
+                q_pe,
                 k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
                 k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
                 kv_cache,
@@ -612,7 +617,9 @@ class MLAAttention(nn.Module):
             )
         else:
             if kv_cache.numel() > 0:
-                q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
+                q_out = self.fused_kv_bmm(
+                    q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata
+                )
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)

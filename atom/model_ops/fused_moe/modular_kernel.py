@@ -3,11 +3,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
-from atom.utils import envs
 from atom.utils.dbo.ubatching import dbo_enabled
 from atom.utils.forward_context import get_forward_context
 import torch
-from math import prod
 from typing import Callable, Optional, final
 from enum import Enum
 from aiter import ActivationType, QuantType

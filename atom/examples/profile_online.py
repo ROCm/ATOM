@@ -27,7 +27,9 @@ def stop_profiling(base_url: str):
 
 def send_completion_request(base_url: str, prompt: str, max_tokens: int):
     """Send a completion request to the server"""
-    print(f"Sending completion request with {len(prompt.split())} words, max_tokens={max_tokens}")
+    print(
+        f"Sending completion request with {len(prompt.split())} words, max_tokens={max_tokens}"
+    )
     response = requests.post(
         f"{base_url}/v1/completions",
         json={
@@ -35,7 +37,7 @@ def send_completion_request(base_url: str, prompt: str, max_tokens: int):
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0.7,
-        }
+        },
     )
     if response.status_code == 200:
         return response.json()
@@ -44,17 +46,17 @@ def send_completion_request(base_url: str, prompt: str, max_tokens: int):
 
 def send_chat_request(base_url: str, message: str, max_tokens: int):
     """Send a chat completion request to the server"""
-    print(f"Sending chat request with {len(message.split())} words, max_tokens={max_tokens}")
+    print(
+        f"Sending chat request with {len(message.split())} words, max_tokens={max_tokens}"
+    )
     response = requests.post(
         f"{base_url}/v1/chat/completions",
         json={
             "model": "test",
-            "messages": [
-                {"role": "user", "content": message}
-            ],
+            "messages": [{"role": "user", "content": message}],
             "max_tokens": max_tokens,
             "temperature": 0.7,
-        }
+        },
     )
     return response.status_code == 200
 
@@ -82,19 +84,13 @@ def main():
         "--output-length",
         type=int,
         default=32,
-        help="Number of output tokens to generate (max_tokens) (default: 32)"
+        help="Number of output tokens to generate (max_tokens) (default: 32)",
     )
     parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Server port (default: 8000)"
+        "--port", type=int, default=8000, help="Server port (default: 8000)"
     )
     parser.add_argument(
-        "--host",
-        type=str,
-        default="localhost",
-        help="Server host (default: localhost)"
+        "--host", type=str, default="localhost", help="Server host (default: localhost)"
     )
     parser.add_argument(
         "--random-input",
@@ -112,15 +108,15 @@ def main():
         default=1,
         help="Batch size (number of concurrent requests to send)",
     )
-    
+
     args = parser.parse_args()
-    
+
     base_url = f"http://{args.host}:{args.port}"
-    
+
     print("=" * 60)
     print("Atom OpenAI Server Profiling Example")
     print("=" * 60)
-    
+
     # Prepare input prompt
     if args.random_input:
         if not args.model:
@@ -133,18 +129,18 @@ def main():
     else:
         input_prompt = "hello, who are you?"
         print(f"Using predefined prompt: {input_prompt}")
-    
+
     # Start profiling
     if not start_profiling(base_url):
         print("Failed to start profiling!")
         return
 
     time.sleep(2)
-    
+
     # Send concurrent requests based on batch size
     print(f"\nSending {args.bs} concurrent request(s)...")
     results = []
-    
+
     if args.bs == 1:
         # Single request
         result = send_completion_request(base_url, input_prompt, args.output_length)
@@ -156,28 +152,33 @@ def main():
         with ThreadPoolExecutor(max_workers=args.bs) as executor:
             # Submit all requests and track their indices
             future_to_index = {
-                executor.submit(send_completion_request, base_url, input_prompt, args.output_length): i + 1
+                executor.submit(
+                    send_completion_request, base_url, input_prompt, args.output_length
+                ): i
+                + 1
                 for i in range(args.bs)
             }
-            
+
             # Process results as they complete
             for future in as_completed(future_to_index):
                 index = future_to_index[future]
                 result = future.result()
                 if result is None:
-                    print(f"Warning: Request {index}/{args.bs} failed or returned no result")
+                    print(
+                        f"Warning: Request {index}/{args.bs} failed or returned no result"
+                    )
                 else:
                     print(f"Request {index}/{args.bs} completed")
                 results.append(result)
-    
+
     time.sleep(2)
-    
+
     # Stop profiling
     print("\n" + "=" * 60)
     if not stop_profiling(base_url):
         print("Failed to stop profiling!")
         return
-    
+
     # Print output results for non-random input
     if not args.random_input and results:
         print("\n" + "=" * 60)
@@ -195,4 +196,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
