@@ -63,7 +63,7 @@ jobs:
 
   deepseek-r1-0528-benchmark:
     if: ${{ inputs.deepseek-r1-0528 }}
-    name: DeepSeek-R1-0528 Benchmark (${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }})
+    name: DeepSeek-R1-0528 Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
     needs: [parse-param-lists]
     strategy:
       fail-fast: false
