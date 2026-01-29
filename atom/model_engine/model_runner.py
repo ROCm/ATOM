@@ -6,6 +6,7 @@ import os
 import time
 from typing import Optional, Union
 
+from atom.model_ops.engram import EngramOp
 import numpy as np
 import torch
 import torch.profiler as torch_profiler
@@ -51,6 +52,7 @@ support_model_arch_dict = {
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
+    "EngramForCausalLM": "atom.models.engram.EngramForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -72,15 +74,23 @@ class tokenIDProcessor:
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_event = torch.cuda.Event()
         self.async_copy_stream = torch.cuda.Stream()
+        self.engram_ops = []
         self.clean()
 
-    def send_to_cpu_async(self, gpu_tensor: torch.Tensor):
+    def send_to_cpu_async(self, gpu_tensor: torch.Tensor, batch: Optional[ScheduledBatch] = None):
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.async_copy_stream):
             self.async_copy_stream.wait_stream(default_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             self.async_copy_event.record(self.async_copy_stream)
         self.token_ids_cpu.append(cpu_tensor)
+        
+        if batch is not None:
+            current_token_ids = gpu_tensor.tolist()
+            req_ids = batch.req_ids
+            current_token_dict = {seq_id: token_id for seq_id, token_id in zip(req_ids, current_token_ids)}
+            # We compute engram hash after token_ids send to cpu
+            self._prefetch_engram_hash(batch, current_token_dict)
 
     def recv_async_output(self) -> list[int]:
         for _ in self.token_ids_cpu:
@@ -94,6 +104,36 @@ class tokenIDProcessor:
 
         self.prev_batch: Optional[ScheduledBatch] = None
 
+    def _prefetch_engram_hash(self, batch: ScheduledBatch, token_ids: dict[int, int]):
+        try:
+            engram_ops = self.engram_ops
+            if not engram_ops:
+                return 
+            
+            import threading
+            hash_mapping = engram_ops[0].hash_mapping            
+            next_input_ids_list = []
+            valid_seq_ids = []
+            
+            for seq_id in batch.req_ids:
+                if seq_id in token_ids:
+                    next_input_ids_list.append(token_ids[seq_id])
+                    valid_seq_ids.append(seq_id)
+            
+            if not next_input_ids_list:
+                return
+            
+            next_input_ids = np.array([next_input_ids_list], dtype=np.int32)
+            
+            def compute_and_cache_batch_hash():
+                hash_results = hash_mapping.hash(next_input_ids)
+                hash_mapping.cache_batch_hash_results(hash_results, valid_seq_ids)
+            
+            threading.Thread(target=compute_and_cache_batch_hash, daemon=True).start()
+            
+        except Exception as e:
+            logger.warning(e)
+
     def prepare_sampled_ids(
         self, batch: ScheduledBatch, sampled_token_ids: torch.Tensor
     ) -> dict[int, int]:
@@ -101,10 +141,11 @@ class tokenIDProcessor:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
             ret = {seq_id: token_id for seq_id, token_id in zip(req_ids, token_ids)}
+            self._prefetch_engram_hash(batch, ret)
             ret[-1] = 0
             return ret
         token_ids = self.recv_async_output()
-        self.send_to_cpu_async(sampled_token_ids)
+        self.send_to_cpu_async(sampled_token_ids, batch)
 
         if self.prev_batch is not None:
             req_ids = self.prev_batch.req_ids
@@ -333,6 +374,8 @@ class ModelRunner:
             self.config.max_num_batched_tokens, self.device
         )
         self.sampler = Sampler()
+        
+        self.engram_hash_buffers = {}
         if self.config.speculative_config and get_pp_group().is_last_rank:
             self.drafter = EagleProposer(self.config, self.device, self)
         self.arange_np = np.arange(
@@ -363,9 +406,50 @@ class ModelRunner:
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        self.tokenID_processor.engram_ops = self.get_engram_op()
+        
+        self._init_engram_hash_buffers()
 
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
+    
+    def get_engram_op(self) -> list[EngramOp]:
+        from atom.model_ops.engram import EngramOp
+        engram_ops = []
+        for module in self.model.modules():
+            if isinstance(module, EngramOp):
+                engram_ops.append(module)
+        return engram_ops
+    
+    def _init_engram_hash_buffers(self):
+        engram_ops = self.get_engram_op()
+        if not engram_ops:
+            return
+        
+        try:
+            hash_mapping = engram_ops[0].hash_mapping
+            max_tokens = self.config.max_num_batched_tokens
+            
+            num_hash_heads = (hash_mapping.max_ngram_size - 1) * hash_mapping.n_head_per_ngram
+            
+            for layer_id in hash_mapping.layer_ids:
+                # Max Buffer size: max_tokens x num_hash_heads
+                hash_buffer = CpuGpuBuffer(
+                    max_tokens * num_hash_heads,
+                    dtype=torch.long,
+                    device=self.device
+                )
+                self.engram_hash_buffers[layer_id] = hash_buffer
+
+            if not hasattr(self, 'engram_hash_stream'):
+                self.engram_hash_stream = torch.cuda.Stream()
+            for engram_op in engram_ops:
+                hash_buffer = self.engram_hash_buffers[engram_op.layer_id]
+                engram_op.hash_buffer = hash_buffer.gpu.reshape(max_tokens, num_hash_heads)
+                engram_op.hash_stream = self.engram_hash_stream
+
+        except Exception as e:
+            logger.warning(e)
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -900,6 +984,63 @@ class ModelRunner:
         buffer = self.forward_vars["temperatures"]
         buffer.np[:bs] = batch.temperatures
         return buffer.copy_to_gpu(bs)
+    
+    def prepare_engram_hash_to_gpu(self, batch: ScheduledBatch):
+        if not self.engram_hash_buffers:
+            return
+        
+        try:
+            engram_ops = self.get_engram_op()
+            if not engram_ops:
+                return
+            
+            req_ids = batch.req_ids
+            hash_mapping = engram_ops[0].hash_mapping
+            
+            cached_hashes_per_layer = {layer_id: [] for layer_id in hash_mapping.layer_ids}
+            
+            for seq_id in req_ids:
+                seq_hashes = {}
+                for layer_id in hash_mapping.layer_ids:
+                    cached_hash = hash_mapping.get_cached_hash(layer_id, seq_id)
+                    if cached_hash is not None:
+                        seq_hashes[layer_id] = cached_hash
+                
+                if len(seq_hashes) == len(hash_mapping.layer_ids):
+                    for layer_id in hash_mapping.layer_ids:
+                        # cached_hash shape: [1, 1, num_heads] -> [1, num_heads]
+                        cached_hashes_per_layer[layer_id].append(seq_hashes[layer_id][0])
+            # print("cached_hashes_per_layer: ", cached_hashes_per_layer)
+            if not cached_hashes_per_layer[hash_mapping.layer_ids[0]]:
+                return
+            
+            if not hasattr(self, 'engram_hash_stream'):
+                self.engram_hash_stream = torch.cuda.Stream()
+            
+            total_tokens = sum(h.shape[0] for h in cached_hashes_per_layer[hash_mapping.layer_ids[0]])
+            default_stream = torch.cuda.current_stream()
+            
+            with torch.cuda.stream(self.engram_hash_stream):
+                self.engram_hash_stream.wait_stream(default_stream)
+                
+                for layer_id in hash_mapping.layer_ids:
+                    if layer_id not in self.engram_hash_buffers:
+                        continue
+                    
+                    if not cached_hashes_per_layer[layer_id]:
+                        continue
+                    
+                    hash_ids_flat_np = np.concatenate(cached_hashes_per_layer[layer_id], axis=0)
+                    
+                    # Write to CPU buffer and copy to GPU asynchronously
+                    hash_buffer = self.engram_hash_buffers[layer_id]
+                    num_hash_heads = hash_ids_flat_np.shape[1]
+                    hash_buffer.np[:total_tokens * num_hash_heads] = hash_ids_flat_np.flatten()
+                    hash_buffer.copy_to_gpu(total_tokens * num_hash_heads)
+            
+        except Exception as e:
+            logger.warning(e)
+        
 
     def prepare_model(self, batch: ScheduledBatch):
         total_tokens_num = batch.total_tokens_num
@@ -908,7 +1049,7 @@ class ModelRunner:
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         # if self.rank == 0:
         #     print(f"input_ids: {input_ids}")
-
+        self.prepare_engram_hash_to_gpu(batch)
         self.prepare_intputs(batch)
         temperatures = self.prepare_sample(batch)
         return (
