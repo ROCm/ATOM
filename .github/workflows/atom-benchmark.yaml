@@ -73,19 +73,17 @@ jobs:
     env:
       MODEL_PATH: "deepseek-ai/DeepSeek-R1-0528"
       ARGS: "--kv_cache_dtype fp8 -tp 8"
+      ISL: ${{ matrix.config.input_length }}
+      OSL: ${{ matrix.config.output_length }}
+      CONC: ${{ matrix.config.concurrency }}
+      NUM_PROMPTS: ${{ matrix.config.concurrency }} * 10
+      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
 
     runs-on: atom-mi355-8gpu.predownload
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
       
-      - name: Show config
-        run: |
-          echo "Input length: ${{ matrix.config.input_length }}"
-          echo "Output length: ${{ matrix.config.output_length }}"
-          echo "Concurrency: ${{ matrix.config.concurrency }}"
-          echo "Random range ratio: ${{ matrix.config.random_range_ratio }}"
-
       - name: Start CI container
         run: |
           echo "Clean up containers..."
@@ -125,11 +123,11 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
-          -e ISL=${{ matrix.config.input_length }}
-          -e OSL=${{ matrix.config.output_length }}
-          -e CONC=${{ matrix.config.concurrency }}
-          -e NUM_PROMPTS=$(( ${{ matrix.config.concurrency }} * 10 ))
-          -e RANDOM_RANGE_RATIO=${{ matrix.config.random_range_ratio }}
+          -e ISL=${{ env.ISL }}
+          -e OSL=${{ env.OSL }}
+          -e CONC=${{ env.CONC }}
+          -e NUM_PROMPTS=${{ env.NUM_PROMPTS }}
+          -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
@@ -154,11 +152,11 @@ jobs:
           "
           echo "========== Running benchmark test =========="
           docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=deepseek-r1-0528 .github/scripts/atom_test.sh benchmark $model_path
+          RESULT_FILENAME=deepseek-r1-0528-${{ env.ISL }}-${{ env.OSL }}-${{ env.CONC }}-${{ env.RANDOM_RANGE_RATIO }} .github/scripts/atom_test.sh benchmark $model_path
           ls -all .
           "
           echo "========== Processing benchmark test result =========="
-          .github/scripts/summarize.py deepseek-r1-0528.json >> $GITHUB_STEP_SUMMARY
+          .github/scripts/summarize.py $RESULT_FILENAME.json >> $GITHUB_STEP_SUMMARY
 
       - name: Clean Up
         if: always()
@@ -183,19 +181,17 @@ jobs:
     env:
       MODEL_PATH: "openai/gpt-oss-120b"
       ARGS: "--kv_cache_dtype fp8"
+      ISL: ${{ matrix.config.input_length }}
+      OSL: ${{ matrix.config.output_length }}
+      CONC: ${{ matrix.config.concurrency }}
+      NUM_PROMPTS: ${{ matrix.config.concurrency }} * 10
+      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
 
     runs-on: atom-mi355-8gpu.predownload
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
       
-      - name: Show config
-        run: |
-          echo "Input length: ${{ matrix.config.input_length }}"
-          echo "Output length: ${{ matrix.config.output_length }}"
-          echo "Concurrency: ${{ matrix.config.concurrency }}"
-          echo "Random range ratio: ${{ matrix.config.random_range_ratio }}"
-
       - name: Start CI container
         run: |
           echo "Clean up containers..."
@@ -235,11 +231,11 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
-          -e ISL=${{ matrix.config.input_length }}
-          -e OSL=${{ matrix.config.output_length }}
-          -e CONC=${{ matrix.config.concurrency }}
-          -e NUM_PROMPTS=$(( ${{ matrix.config.concurrency }} * 10 ))
-          -e RANDOM_RANGE_RATIO=${{ matrix.config.random_range_ratio }}
+          -e ISL=${{ env.ISL }}
+          -e OSL=${{ env.OSL }}
+          -e CONC=${{ env.CONC }}
+          -e NUM_PROMPTS=${{ env.NUM_PROMPTS }}
+          -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
           -e ATOM_GPT_OSS_MODEL=1
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
@@ -265,11 +261,11 @@ jobs:
           "
           echo "========== Running benchmark test =========="
           docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=gpt-oss-120b .github/scripts/atom_test.sh benchmark $model_path
+          RESULT_FILENAME=gpt-oss-120b-${{ env.ISL }}-${{ env.OSL }}-${{ env.CONC }}-${{ env.RANDOM_RANGE_RATIO }} .github/scripts/atom_test.sh benchmark $model_path
           ls -all .
           "
           echo "========== Processing benchmark test result =========="
-          .github/scripts/summarize.py gpt-oss-120b.json >> $GITHUB_STEP_SUMMARY
+          .github/scripts/summarize.py $RESULT_FILENAME.json >> $GITHUB_STEP_SUMMARY
 
       - name: Clean Up
         if: always()
