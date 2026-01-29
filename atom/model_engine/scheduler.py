@@ -102,7 +102,7 @@ class Scheduler:
             return None
 
         while (
-            self._passed_delay(time.time())
+            (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
         ):
