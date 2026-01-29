@@ -122,11 +122,11 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
-          -e ISL=${{ env.ISL }}
-          -e OSL=${{ env.OSL }}
-          -e CONC=${{ env.CONC }}
-          -e NUM_PROMPTS=$(( ${{ env.CONC }} * 10 ))
-          -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
+          -e ISL=${{ env.ISL }} \
+          -e OSL=${{ env.OSL }} \
+          -e CONC=${{ env.CONC }} \
+          -e NUM_PROMPTS=$(( ${{ env.CONC }} * 10 )) \
+          -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
@@ -229,12 +229,12 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
-          -e ISL=${{ env.ISL }}
-          -e OSL=${{ env.OSL }}
-          -e CONC=${{ env.CONC }}
-          -e NUM_PROMPTS=$(( ${{ env.CONC }} * 10 ))
-          -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
-          -e ATOM_GPT_OSS_MODEL=1
+          -e ISL=${{ env.ISL }} \
+          -e OSL=${{ env.OSL }} \
+          -e CONC=${{ env.CONC }} \
+          -e NUM_PROMPTS=$(( ${{ env.CONC }} * 10 )) \
+          -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
+          -e ATOM_GPT_OSS_MODEL=1 \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
