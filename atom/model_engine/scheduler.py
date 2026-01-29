@@ -102,26 +102,6 @@ class Scheduler:
             # self.block_manager.reset()
             return None
 
-        # num_waiting_prefill_seqs = len(self.waiting)
-        # num_running_decode_seqs = len(self.running)
-
-        # total_waiting_prefill_tokens = 0
-        # for seq in self.waiting:
-        #     total_waiting_prefill_tokens += (seq.num_tokens - seq.num_cached_tokens)
-
-        # skip_schedule_prefill = self.running and (total_waiting_prefill_tokens < self.min_num_batched_tokens)
-        
-        # if total_waiting_prefill_tokens < self.max_num_batched_tokens * 0.8:
-        #     continue_decode = True
-        # if self.peak_conc - num_running_decode_seqs >= num_waiting_prefill_seqs + 10:
-        #     continue_decode = False
-        # if not self.running:
-        #     continue_decode = False
-
-        # logger.info(
-        #     f"DDDEBUG num_waiting_prefill_seqs: {num_waiting_prefill_seqs}, num_running_decode_seqs: {num_running_decode_seqs}, total_waiting_prefill_tokens: {total_waiting_prefill_tokens}, max_num_batched_tokens * 0.8: {self.max_num_batched_tokens*0.8}, self.peak_conc = {self.peak_conc}, continue_decode = {continue_decode}"
-        # )
-
         while self._passed_delay(time.time()) and self.waiting and num_seqs_prefill < self.max_num_seqs:
             seq = self.waiting[0]
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
@@ -145,7 +125,7 @@ class Scheduler:
 
         if num_seqs_prefill > 0:
             logger.info(
-                f"DDEBUG scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens"
+                f"scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens"
             )
             self.prev_prompt = True
             # lip: TODO for prefill/decode mixed batch
@@ -184,9 +164,9 @@ class Scheduler:
 
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs.values()))
-        logger.info(
-            f"DDEBUG scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens"
-        )
+        # logger.info(
+        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens"
+        # )
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
