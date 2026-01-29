@@ -19,32 +19,15 @@ on:
         description: "Image to use for the benchmark"
         type: string
         default: "rocm/atom:latest"
-      isl:
-        description: "Input length"
+      param_lists:
+        description: |
+          "Benchmark parameter lists. 
+          Input as a single or multiple sets (comma-separated, semicolon between sets), 
+          format: input_length,output_length,concurrency,random_range_ratio.
+          Example (single set): 1024,1024,128,0.8
+          Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
         type: string
-        default: "1024"
-      osl:
-        description: "Output length"
-        type: string
-        default: "1024"
-      conc:
-        description: "Concurrency"
-        type: string
-        default: "128"
-      num_prompts:
-        description: "Number of prompts"
-        type: string
-        default: "1280"
-      random_range_ratio:
-        description: "Random range ratio"
-        type: string
-        default: "0.8"
-env:
-  ISL: ${{ inputs.isl }}
-  OSL: ${{ inputs.osl }}
-  CONC: ${{ inputs.conc }}
-  NUM_PROMPTS: ${{ inputs.num_prompts }}
-  RANDOM_RANGE_RATIO: ${{ inputs.random_range_ratio }}
+        default: "1024,1024,128,0.8"
 
 jobs:
   atom-benchmark:
@@ -80,19 +63,26 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
-
-      - name: Print environment variables
+      
+      - name: Parse parameter lists
         run: |
-          echo "DeepSeek-R1-0528: ${{ inputs.deepseek-r1-0528 }}"
-          echo "gpt-oss-120b: ${{ inputs.gpt-oss-120b }}"
-          echo "ISL: ${{ inputs.isl }}"
-          echo "OSL: ${{ inputs.osl }}"
-          echo "CONC: ${{ inputs.conc }}"
-          echo "NUM_PROMPTS: ${{ inputs.num_prompts }}"
-          echo "RANDOM_RANGE_RATIO: ${{ inputs.random_range_ratio }}"
-          echo "ARGS: ${{ matrix.extraArgs }}"
-          echo "ATOM_IMAGE: ${{ inputs.image }}"
-
+          # Split the parameter lists into sets and convert output to json file
+          IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
+          PARAM_LIST_JSON="["
+          SEP=""
+          for SET in "${SETS[@]}"; do
+            IFS=',' read -ra PARAMS <<< "$SET"
+            INPUT_LEN="${PARAMS[0]}"
+            OUTPUT_LEN="${PARAMS[1]}"
+            CONCURRENCY="${PARAMS[2]}"
+            RANDOM_RANGE_RATIO="${PARAMS[3]}"
+            PARAM_LIST_JSON="${PARAM_LIST_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
+            SEP=","
+          done
+          PARAM_LIST_JSON="${PARAM_LIST_JSON}]"
+          echo "${PARAM_LIST_JSON}" > param_lists.json
+          cat param_lists.json
+      
       - name: Start CI container
         run: |
           echo "Clean up containers..."
@@ -132,11 +122,6 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
-          -e ISL=${{ inputs.isl }} \
-          -e OSL=${{ inputs.osl }} \
-          -e CONC=${{ inputs.conc }} \
-          -e NUM_PROMPTS=${{ inputs.num_prompts }} \
-          -e RANDOM_RANGE_RATIO=${{ inputs.random_range_ratio }} \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
