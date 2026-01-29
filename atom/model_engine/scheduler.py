@@ -101,7 +101,11 @@ class Scheduler:
             # self.block_manager.reset()
             return None
 
-        while self._passed_delay(time.time()) and self.waiting and num_seqs_prefill < self.max_num_seqs:
+        while (
+            self._passed_delay(time.time())
+            and self.waiting
+            and num_seqs_prefill < self.max_num_seqs
+        ):
             seq = self.waiting[0]
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
@@ -299,11 +303,10 @@ class Scheduler:
         self.prev_time, self.prev_prompt = now, False
         # Delay scheduling prompts to let waiting queue fill up
         if self.delay_factor > 0 and self.waiting:
-            earliest_arrival_time = min(
-                [seq.arrive_time for seq in self.waiting])
-            passed_delay = ((now - earliest_arrival_time)
-                            > (self.delay_factor *
-                            self.last_prompt_latency) or not self.running)
+            earliest_arrival_time = min([seq.arrive_time for seq in self.waiting])
+            passed_delay = (now - earliest_arrival_time) > (
+                self.delay_factor * self.last_prompt_latency
+            ) or not self.running
         else:
             passed_delay = True
         return passed_delay

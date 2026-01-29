@@ -158,11 +158,11 @@ class EngineArgs:
             help="GPU memory utilization (0.0 to 1.0)",
         )
         parser.add_argument(
-            '--scheduler-delay-factor',
+            "--scheduler-delay-factor",
             type=float,
             default=0.0,
-            help='Apply a delay (of delay factor multiplied by previous'
-            'prompt latency) before scheduling next prompt.'
+            help="Apply a delay (of delay factor multiplied by previous"
+            "prompt latency) before scheduling next prompt.",
         )
 
         return parser
