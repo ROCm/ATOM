@@ -547,7 +547,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         layer_type: type[nn.Module] = Qwen3MoeDecoderLayer,
     ):
         super().__init__()
-        self.atom_config = config
+        self.atom_config = atom_config
         self.config = self.atom_config.hf_config
 
         # Only perform the following mapping when Qwen3MoeMLP exists
