@@ -1,5 +1,9 @@
 name: ATOM Benchmark
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  
 on:
   workflow_dispatch:
     inputs:
@@ -59,7 +63,7 @@ jobs:
 
   deepseek-r1-0528-benchmark:
     if: ${{ inputs.deepseek-r1-0528 }}
-    name: DeepSeek-R1-0528 Benchmark
+    name: DeepSeek-R1-0528 Benchmark (${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }})
     needs: [parse-param-lists]
     strategy:
       fail-fast: false
@@ -75,6 +79,10 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
       
+      - name: Show config
+        run: |
+          echo "Config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}"
+
       - name: Start CI container
         run: |
           echo "Clean up containers..."
