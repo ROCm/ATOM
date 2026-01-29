@@ -165,8 +165,8 @@ class Scheduler:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
                 num_new_tokens = self.mtp_k + 1
-                # self.block_manager.may_append(seq, num_new_tokens)
-                self.block_manager.may_append(seq, seq.num_placeholder)
+                self.block_manager.may_append(seq, num_new_tokens)
+                # self.block_manager.may_append(seq, seq.num_placeholder)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
@@ -227,13 +227,13 @@ class Scheduler:
             if is_deferred_out or (
                 self.use_spec and self.eos_token_id == seq.token_ids[-1]
             ):
-                for i, el in enumerate(token_ids):
-                    seq.token_ids[-num_placeholder + i] = el
-                    seq.output_tokens[-num_placeholder + i] = el
+                # for i, el in enumerate(token_ids):
+                #     seq.token_ids[-num_placeholder + i] = el
+                #     seq.output_tokens[-num_placeholder + i] = el
                 # update the number of tokens in the sequence if draft token is rejected
-                # seq.token_ids[-num_placeholder:] = token_ids
-                # seq.num_tokens = len(seq.token_ids)
-                # seq.output_tokens[-num_placeholder:] = token_ids
+                seq.token_ids[-num_placeholder:] = token_ids
+                seq.num_tokens = len(seq.token_ids)
+                seq.output_tokens[-num_placeholder:] = token_ids
 
                 # if seq.output_tokens:
                 #     seq.output_tokens[-num_placeholder:] = token_ids
@@ -313,8 +313,8 @@ class Scheduler:
             # placeholder for the each decode step
             for seq in seqs:
                 if seq.status == SequenceStatus.RUNNING:
-                    # for _ in range(num_placeholder):
-                    for _ in range(seq.num_placeholder):
+                    for _ in range(num_placeholder):
+                    # for _ in range(seq.num_placeholder):
                         seq.append_token(self.eos_token_id)
         for seq in finished_seqs:
             self.block_manager.deallocate(seq)

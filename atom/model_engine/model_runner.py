@@ -116,6 +116,21 @@ class tokenIDProcessor:
         token_ids = self.draft_token_ids_cpu.pop(0).tolist()
         return token_ids
 
+    def send_bonus_to_cpu_async(self, gpu_tensor: torch.Tensor):
+        default_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(self.async_copy_stream):
+            self.async_copy_stream.wait_stream(default_stream)
+            cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            self.async_copy_event.record(self.async_copy_stream)
+        self.bonus_tokens_cpu.append(cpu_tensor)
+
+    def recv_bonus_async(self) -> Optional[list[int]]:
+        if not self.bonus_tokens_cpu:
+            return None
+        self.async_copy_event.synchronize()
+        bonus_list = self.bonus_tokens_cpu.pop(0).tolist()
+        return bonus_list
+
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
 
@@ -124,6 +139,8 @@ class tokenIDProcessor:
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
+        self.bonus_tokens_cpu: list[torch.Tensor] = []  # Async queue for num_bonus_tokens
+        self.mapped_bonus_list: Optional[list[int]] = None  # Mapped to current batch order
 
     def _process_token_id(self, token_id) -> tuple[int, ...]:
         """Helper function: process a single token_id, handling list and non-list cases.
@@ -270,8 +287,22 @@ class tokenIDProcessor:
             num_deferred_tokens = num_deferred_seqs * tokens_per_seq
             num_new_tokens = num_new_seqs * tokens_per_seq
         else:
+            tokens_per_seq = 1
             num_deferred_tokens = num_deferred_seqs
             num_new_tokens = num_new_seqs
+
+        # Receive and map bonus_list to current batch order
+        prev_bonus_list = self.recv_bonus_async()
+        total_seqs = num_deferred_seqs + num_new_seqs
+        if prev_bonus_list is not None and num_deferred_seqs > 0:
+            # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
+            # New seqs get default value (tokens_per_seq - 1)
+            self.mapped_bonus_list = [tokens_per_seq - 1] * total_seqs
+            for curr_idx, prev_idx in zip(deferred_curr_indices, deferred_prev_indices):
+                if prev_idx < len(prev_bonus_list):
+                    self.mapped_bonus_list[curr_idx] = prev_bonus_list[prev_idx]
+        else:
+            self.mapped_bonus_list = None
 
         if is_all_same:
             # All requests are the same, only deferred tokens
@@ -1139,7 +1170,7 @@ class ModelRunner:
         temperatures: torch.Tensor,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[int]]]:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
-
+        num_bonus_tokens = None
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(logits, temperatures)
         else:
@@ -1237,6 +1268,7 @@ class ModelRunner:
                 ]
                 # self.debug(f"{next_token_ids=}")
                 self.tokenID_processor.prev_token_ids = next_token_ids
+                self.tokenID_processor.send_bonus_to_cpu_async(num_bonus_tokens)  # Async copy to CPU
 
         return token_ids, sampled_tokens
 
