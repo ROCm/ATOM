@@ -30,6 +30,28 @@ on:
         default: "1024,1024,128,0.8"
 
 jobs:
+  parse-param-lists:
+    name: Parse parameter lists
+    runs-on: atom-mi355-1gpu
+    steps:
+      - name: Parse parameter lists
+        run: |
+          IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
+          MATRIX_JSON="{\"include\":["
+          SEP=""
+          for SET in "${SETS[@]}"; do
+            IFS=',' read -ra PARAMS <<< "$SET"
+            INPUT_LEN="${PARAMS[0]}"
+            OUTPUT_LEN="${PARAMS[1]}"
+            CONCURRENCY="${PARAMS[2]}"
+            RANDOM_RANGE_RATIO="${PARAMS[3]}"
+            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
+            SEP=","
+          done
+          MATRIX_JSON="${MATRIX_JSON}]}"
+          echo "${MATRIX_JSON}" > matrix.json
+          cat matrix.json
+
   atom-benchmark:
     name: ATOM Benchmark
     strategy:
@@ -63,25 +85,6 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
-      
-      - name: Parse parameter lists
-        run: |
-          # Split the parameter lists into sets and convert output to json file
-          IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
-          PARAM_LIST_JSON="["
-          SEP=""
-          for SET in "${SETS[@]}"; do
-            IFS=',' read -ra PARAMS <<< "$SET"
-            INPUT_LEN="${PARAMS[0]}"
-            OUTPUT_LEN="${PARAMS[1]}"
-            CONCURRENCY="${PARAMS[2]}"
-            RANDOM_RANGE_RATIO="${PARAMS[3]}"
-            PARAM_LIST_JSON="${PARAM_LIST_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
-            SEP=","
-          done
-          PARAM_LIST_JSON="${PARAM_LIST_JSON}]"
-          echo "${PARAM_LIST_JSON}" > param_lists.json
-          cat param_lists.json
       
       - name: Start CI container
         run: |
