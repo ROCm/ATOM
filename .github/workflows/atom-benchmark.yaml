@@ -81,7 +81,10 @@ jobs:
       
       - name: Show config
         run: |
-          echo "Config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}"
+          echo "Input length: ${{ matrix.config.input_length }}"
+          echo "Output length: ${{ matrix.config.output_length }}"
+          echo "Concurrency: ${{ matrix.config.concurrency }}"
+          echo "Random range ratio: ${{ matrix.config.random_range_ratio }}"
 
       - name: Start CI container
         run: |
@@ -122,6 +125,11 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
+          -e ISL=${{ matrix.config.input_length }}
+          -e OSL=${{ matrix.config.output_length }}
+          -e CONC=${{ matrix.config.concurrency }}
+          -e NUM_PROMPTS=$(( ${{ matrix.config.concurrency }} * 10 ))
+          -e RANDOM_RANGE_RATIO=${{ matrix.config.random_range_ratio }}
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
