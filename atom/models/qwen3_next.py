@@ -291,11 +291,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 class Qwen3NextAttention(nn.Module):
     def __init__(
         self,
-        config: Qwen3NextConfig,
+        atom_config,
         quant_config = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        config = atom_config.hf_config
         self.config = config
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -340,9 +341,12 @@ class Qwen3NextAttention(nn.Module):
         )
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        
+        rotary_dim = int(self.head_dim * partial_rotary_factor)
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            rotary_dim=self.head_dim,
+            rotary_dim=rotary_dim,
             max_position=config.max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
@@ -355,14 +359,10 @@ class Qwen3NextAttention(nn.Module):
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
+            kv_cache_dtype=atom_config.kv_cache_dtype,
             quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            **{
-                "layer_idx": extract_layer_index(prefix),
-                "dual_chunk_attention_config": self.dual_chunk_attention_config,
-            }
-            if self.dual_chunk_attention_config
-            else {},
+            use_mla=False,
+            layer_num=extract_layer_index(prefix),
         )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -712,10 +712,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         
+        non_spec_state_indices_tensor = non_spec_state_indices_tensor + ((self.layer_idx + 1) % 4 - 1)
+        
         kv_cache_data = forward_context.kv_cache_data
 
         conv_state = self.mamba_k_cache.transpose(-1, -2)
         ssm_state = self.mamba_v_cache
+        
+        # if conv_state.device.index==0:
+        #     print(f"prefix: {self.prefix} conv_state ptr {conv_state.data_ptr()}, ssm_state ptr {ssm_state.data_ptr()}, block table {non_spec_state_indices_tensor}")
+        
+        # if self.prefix=="model.layers.0.linear_attn" and conv_state.device.index==0:
+        #     print(f"conv_state sum {conv_state.sum()}, ssm_state sum {ssm_state.sum()}", flush=True)
         # self_kv_cache = self.kv_cache[forward_context.virtual_engine]
         # conv_state = self_kv_cache[0].transpose(-1, -2)
         # ssm_state = self_kv_cache[1]
@@ -860,7 +868,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 ssm_state.dtype
             )
         elif attn_metadata.num_decodes > 0:
-            print("aaa")
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_recurrent_gated_delta_rule(
                     q=query_non_spec,
@@ -881,6 +888,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             core_attn_out_non_spec, last_recurrent_state = None, None
 
         # 3. Merge core attention output
+        if conv_state.device.index==0:
+           print(f"prefix: {self.prefix} conv_state sum {conv_state.sum()}, ssm_state sum {ssm_state.sum()}")
+        
+        # if self.layer_idx==4:
+        #    print("aaaa")
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             merged_out = torch.empty(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
@@ -919,7 +931,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
-                config,
+                atom_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
             )
@@ -992,6 +1004,12 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        if hidden_states.device.index==0:
+            print(f"layer {self.layer_idx} before attn mean: {hidden_states.mean()}, std: {hidden_states.std()}")
+        
+        if hidden_states.shape[0]==1:
+            print("decode")
+        
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
             self.linear_attn(
@@ -1007,7 +1025,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
-
+        if hidden_states.device.index==0:
+            print(f"layer {self.layer_idx} after attn mean: {hidden_states.mean()}, std: {hidden_states.std()}")
+        
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -1020,8 +1040,15 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
+        if hidden_states.device.index==0:
+            print(f"layer {self.layer_idx} after norm mean: {hidden_states.mean()}, std: {hidden_states.std()}")
+        
         hidden_states = self.mlp(hidden_states)
 
+        if hidden_states.device.index==0:
+            print(f"layer {self.layer_idx} after mlp mean: {hidden_states.mean()}, std: {hidden_states.std()}")
+        
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
