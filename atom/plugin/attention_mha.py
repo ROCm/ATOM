@@ -282,24 +282,10 @@ class PagedAttentionImplPluginModeMethods:
                                         num_decode_tokens: int,
                                         attn_metadata: "AttentionMetaData",
                                         out: torch.Tensor):
-        num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
-        x = 16 // k_cache.element_size()
-        k_cache_template = torch.empty(
-            [num_blocks, num_kv_heads, head_size // x, block_size, x],
-            dtype=k_cache.dtype,
-            device="meta",
-        )
-        v_cache_template = torch.empty(
-            [num_blocks, num_kv_heads, block_size // x, head_size, x],
-            dtype=v_cache.dtype,
-            device="meta",
-        )
-        new_key_cache = k_cache.view_as(k_cache_template)
-        new_value_cache = v_cache.view_as(v_cache_template)
         aiter.pa_fwd_asm(
             Q=q,
-            K=new_key_cache,
-            V=new_value_cache,
+            K=k_cache,
+            V=v_cache,
             block_tables=attn_metadata.plugin_metadata.block_table[:num_decodes],
             context_lens=attn_metadata.plugin_metadata.seq_lens[:num_decodes],
             block_tables_stride0=attn_metadata.plugin_metadata.block_table[
@@ -674,11 +660,26 @@ class PagedAttentionImplPluginModeMethods:
         if num_decodes > 0:
             assert attn_metadata.plugin_metadata.decode_metadata is not None
 
+            num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
+            x = 16 // k_cache.element_size()
+            k_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, head_size // x, block_size, x],
+                dtype=k_cache.dtype,
+                device="meta",
+            )
+            v_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                dtype=v_cache.dtype,
+                device="meta",
+            )
+            new_key_cache = k_cache.view_as(k_cache_template)
+            new_value_cache = v_cache.view_as(v_cache_template)
+
             if self.use_triton_attn:
                 self.paged_attention_triton_plugin_mode(
                     q=query[:num_decode_tokens],
-                    k=k_cache,
-                    v=v_cache,
+                    k=new_key_cache,
+                    v=new_value_cache,
                     k_scale=k_scale,
                     v_scale=v_scale,
                     out=output_actual_tokens[:num_decode_tokens],
@@ -689,8 +690,8 @@ class PagedAttentionImplPluginModeMethods:
                 if num_decodes == 64:
                     self.paged_attention_triton_plugin_mode(
                         q=query[:num_decode_tokens],
-                        k_cache=k_cache,
-                        v_cache=v_cache,
+                        k_cache=new_key_cache,
+                        v_cache=new_value_cache,
                         k_scale=k_scale,
                         v_scale=v_scale,
                         out=output_actual_tokens[:num_decode_tokens],
@@ -699,8 +700,8 @@ class PagedAttentionImplPluginModeMethods:
                 else:
                     self.paged_attention_asm_plugin_mode(
                         q=query[:num_decode_tokens],
-                        k_cache=k_cache,
-                        v_cache=v_cache,
+                        k_cache=new_key_cache,
+                        v_cache=new_value_cache,
                         k_scale=k_scale,
                         v_scale=v_scale,
                         num_decodes=num_decodes,
