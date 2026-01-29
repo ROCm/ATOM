@@ -32,9 +32,12 @@ on:
 jobs:
   parse-param-lists:
     name: Parse parameter lists
-    runs-on: atom-mi355-1gpu
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
     steps:
       - name: Parse parameter lists
+        id: parse-param-lists
         run: |
           IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
           MATRIX_JSON="{\"include\":["
@@ -49,11 +52,15 @@ jobs:
             SEP=","
           done
           MATRIX_JSON="${MATRIX_JSON}]}"
-          echo "${MATRIX_JSON}" > matrix.json
-          cat matrix.json
+          echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+      
+      - name: Print matrix JSON
+        run: |
+          echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
   atom-benchmark:
     name: ATOM Benchmark
+    needs: [parse-param-lists]
     strategy:
       fail-fast: false
       matrix:
