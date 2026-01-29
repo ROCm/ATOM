@@ -51,6 +51,8 @@ support_model_arch_dict = {
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
+    # Diffusion Transformer models (NOTE: requires diffusion-specific inference pipeline)
+    "FluxTransformer2DModel": "atom.models.flux.FluxForImageGeneration",
 }
 # seed = 34567
 # np.random.seed(seed)
