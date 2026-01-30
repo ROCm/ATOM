@@ -167,3 +167,7 @@ lm_eval --model local-completions \
 ```
 ## Acknowledgements
 This project was adapted from nano-vllm (https://github.com/GeeeekExplorer/nano-vllm)
+
+## Support & Reporting Issues 
+
+We welcome issues and contributions!  Please use the GitHub Issues page to report bugs or request features: https://github.com/ROCm/ATOM/issues
