@@ -943,7 +943,7 @@ class ModelRunner:
             # full attention bytes
             block_bytes = (
                 2
-                * self.num_full_attn
+                * hf_config.num_hidden_layers
                 * self.physical_block_size
                 * num_kv_heads
                 * hf_config.head_dim
@@ -1037,7 +1037,7 @@ class ModelRunner:
 
             self.kv_cache = torch.zeros(
                 2,
-                self.num_full_attn,
+                hf_config.num_hidden_layers,
                 self.num_physical_kvcache_blocks,
                 self.physical_block_size,
                 num_kv_heads,
@@ -1048,7 +1048,7 @@ class ModelRunner:
 
             self.kv_scale = torch.zeros(
                 2,
-                self.num_full_attn,
+                hf_config.num_hidden_layers,
                 self.num_physical_kvcache_blocks,
                 num_kv_heads,
                 self.physical_block_size,
@@ -1119,12 +1119,12 @@ class ModelRunner:
                     if hasattr(module, "use_mla") and not module.use_mla:
                         # Non-MLA attention
                         attn_idx = layer_id
-                        if self.is_qwen_next:
-                            # layer_id 0 : gdn layer 0
-                            # layer_id 1 : gdn layer 1
-                            # layer_id 2 : gdn layer 2
-                            # layer_id 3 : attn layer 0
-                            attn_idx = (layer_id + 1) // 4 - 1
+                        # if self.is_qwen_next:
+                        #     # layer_id 0 : gdn layer 0
+                        #     # layer_id 1 : gdn layer 1
+                        #     # layer_id 2 : gdn layer 2
+                        #     # layer_id 3 : attn layer 0
+                        #     attn_idx = (layer_id + 1) // 4 - 1
                         k_cache = self.kv_cache[0, attn_idx].view(
                             self.num_physical_kvcache_blocks,
                             num_kv_heads,

@@ -388,7 +388,10 @@ class Qwen3NextAttention(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
+        
+        if q.device.index==0:
+            print(f"befor norm q mean {q.mean()}, std {q.std()}, k mean {k.mean()} k std {k.std()}")
+        
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
         )
@@ -396,10 +399,19 @@ class Qwen3NextAttention(nn.Module):
             -1, self.num_kv_heads * self.head_dim
         )
 
+        if q.device.index==0:
+            print(f"q mean {q.mean()}, std {q.std()}, k mean {k.mean()} k std {k.std()}")
+
         q, k = self.rotary_emb(positions, q, k)
+        
+        if q.device.index==0:
+            print(f"after rope q mean {q.mean()}, std {q.std()}, k mean {k.mean()} k std {k.std()}")
 
         attn_output = self.attn(q, k, v)
-
+        
+        if q.device.index==0:
+            print(f"attn_output {attn_output.mean()}")
+    
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
