@@ -125,7 +125,7 @@ jobs:
           fi
 
       - name: Push Docker image
-        if: always()
+        if: ${{ success() }}
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
           if [[ ${{ matrix.base_image }} == *ROCm_7.2* ]]; then
