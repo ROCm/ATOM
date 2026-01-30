@@ -229,7 +229,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
-        max_seqlen_q = batch.total_tokens_num_decode // scheduled_bs
+        max_seqlen_q = batch.num_spec_step + 1
         # Get mapped_bonus_list (already mapped to current batch order in prepare_input_ids)
         bonus_list = self.model_runner.tokenID_processor.mapped_bonus_list
 
@@ -238,7 +238,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if max_seqlen_q > 1:
             if bonus_list is not None:
                 context_lens = [
-                    c + bonus_list[i] - 1
+                    c + bonus_list[i] - batch.num_spec_step
                     for i, c in enumerate(batch.context_lens)
                 ]
             else:

@@ -27,6 +27,7 @@ class ScheduledBatch:
         total_seqs_num_prefill: int = 0,
         total_seqs_num_decode: int = 0,
         is_dummy_run: bool = False,
+        num_spec_step: int = 0,
         scheduled_spec_decode_tokens: dict[int, list[int]] = {},
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
@@ -63,6 +64,7 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
 
+        self.num_spec_step = num_spec_step
         self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
 
         # logger.info(f"{self.num_scheduled_tokens=}")
@@ -88,6 +90,8 @@ class Scheduler:
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
+        self.total_draft_tokens = 0
+        self.total_accepted_tokens = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -188,6 +192,7 @@ class Scheduler:
                 total_seqs_num=num_seqs_prefill + num_seqs_decode,
                 total_seqs_num_prefill=num_seqs_prefill,
                 total_seqs_num_decode=num_seqs_decode,
+                num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             ),
             scheduled_seqs,
@@ -197,6 +202,19 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
+
+    def update_spec_stats(self, num_accepted_tokens):
+        self.total_draft_tokens += self.mtp_k
+        self.total_accepted_tokens += num_accepted_tokens - self.mtp_k
+
+        # Log MTP acceptance statistics periodically
+        if self.total_draft_tokens > 0 and self.total_draft_tokens % 1000 == 0:
+            acceptance_rate = self.total_accepted_tokens / self.total_draft_tokens
+            logger.info(
+                f"[MTP Stats] Total draft tokens: {self.total_draft_tokens}, "
+                f"Accepted: {self.total_accepted_tokens}, "
+                f"Acceptance rate: {acceptance_rate:.2%}"
+            )
 
     def postprocess(
         self,
@@ -224,6 +242,7 @@ class Scheduler:
                 continue
             token_ids = prev_token_ids[seq.id]
             num_accepted_token = len(token_ids)
+            self.update_spec_stats(num_accepted_token)
             if is_deferred_out or (
                 self.use_spec and self.eos_token_id == seq.token_ids[-1]
             ):
@@ -314,7 +333,7 @@ class Scheduler:
             for seq in seqs:
                 if seq.status == SequenceStatus.RUNNING:
                     for _ in range(num_placeholder):
-                    # for _ in range(seq.num_placeholder):
+                        # for _ in range(seq.num_placeholder):
                         seq.append_token(self.eos_token_id)
         for seq in finished_seqs:
             self.block_manager.deallocate(seq)

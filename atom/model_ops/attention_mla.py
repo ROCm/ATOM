@@ -235,8 +235,10 @@ class MLAAttention(nn.Module):
                 q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
             )
         return ql_nope, q_pe
-    
-    def fused_kv_bmm(self, x, x_scale, k_nope, k_rope, positions, kv_cache, attn_metadata):
+
+    def fused_kv_bmm(
+        self, x, x_scale, k_nope, k_rope, positions, kv_cache, attn_metadata
+    ):
         q_nope, q_pe = (
             self.q_proj(x, x_scale)
             .view(-1, self.num_heads, self.qk_head_dim)
@@ -246,13 +248,15 @@ class MLAAttention(nn.Module):
         q_nope = q_nope.transpose(0, 1)
 
         if is_rocm_aiter_fp4bmm_enabled():
-            from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import fused_fp4_bmm_rope_cat_and_cache_mla
+            from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+                fused_fp4_bmm_rope_cat_and_cache_mla,
+            )
 
             result, _, _, _ = fused_fp4_bmm_rope_cat_and_cache_mla(
-                q_nope,                 
+                q_nope,
                 self.W_K,
                 self.W_K_scale,
-                q_pe,                   
+                q_pe,
                 k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
                 k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
                 kv_cache,
@@ -269,14 +273,16 @@ class MLAAttention(nn.Module):
                 q_out_dtype=kv_cache.dtype,
                 num_decode_toks_for_zeros=0,
             )
-        else: 
-            from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import fused_fp8_bmm_rope_cat_and_cache_mla
+        else:
+            from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+                fused_fp8_bmm_rope_cat_and_cache_mla,
+            )
 
             result, _, _, _ = fused_fp8_bmm_rope_cat_and_cache_mla(
-                q_nope,                 
-                self.W_K,               
-                self.W_K_scale,         
-                q_pe,                   
+                q_nope,
+                self.W_K,
+                self.W_K_scale,
+                q_pe,
                 k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
                 k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
                 kv_cache,
@@ -611,8 +617,39 @@ class MLAAttention(nn.Module):
                 prefill_q, k_nope, k_rope, kv_cache, attn_metadata
             )
         else:
+            q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
+
+            q_out = torch.empty(
+                (
+                    q_nope.shape[0],
+                    self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=(
+                    dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
+                ),
+                device=q_nope.device,
+            )
             if kv_cache.numel() > 0:
-                q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
+                fused_qk_rope_concat_and_cache_mla(
+                    q_nope,
+                    q_rope,
+                    k_nope,
+                    k_rope,
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
+                    q_out,
+                    attn_metadata.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
+                    positions,
+                    self.rotary_emb.cos_cache,
+                    self.rotary_emb.sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    is_nope_first=True,
+                )
+                # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
