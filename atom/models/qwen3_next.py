@@ -377,6 +377,9 @@ class Qwen3NextAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
 
+        if qkv.device.index==0:
+            print(f"qkv mean {qkv.double().mean()}, std {qkv.double().std()}")
+
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -390,7 +393,7 @@ class Qwen3NextAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         
         if q.device.index==0:
-            print(f"befor norm q mean {q.mean()}, std {q.std()}, k mean {k.mean()} k std {k.std()}")
+            print(f"befor norm q mean {q.double().mean()}, std {q.double().std()}, k mean {k.double().mean()} k std {k.double().std()}")
         
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
@@ -400,17 +403,17 @@ class Qwen3NextAttention(nn.Module):
         )
 
         if q.device.index==0:
-            print(f"q mean {q.mean()}, std {q.std()}, k mean {k.mean()} k std {k.std()}")
+            print(f"q mean {q.double().mean()}, std {q.double().std()}, k mean {k.double().mean()} k std {k.double().std()}")
 
         q, k = self.rotary_emb(positions, q, k)
         
         if q.device.index==0:
-            print(f"after rope q mean {q.mean()}, std {q.std()}, k mean {k.mean()} k std {k.std()}")
+            print(f"after rope q mean {q.double().mean()}, std {q.double().std()}, k mean {k.double().mean()} k std {k.double().std()} v mean {v.double().mean()} std {v.double().std()}")
 
         attn_output = self.attn(q, k, v)
         
         if q.device.index==0:
-            print(f"attn_output {attn_output.mean()}")
+            print(f"attn_output {attn_output.double().mean()}, {attn_output.double().std()}")
     
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -731,8 +734,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_state = self.mamba_k_cache.transpose(-1, -2)
         ssm_state = self.mamba_v_cache
         
-        # if conv_state.device.index==0:
-        #     print(f"prefix: {self.prefix} conv_state ptr {conv_state.data_ptr()}, ssm_state ptr {ssm_state.data_ptr()}, block table {non_spec_state_indices_tensor}")
+        if conv_state.device.index==0:
+            print(f"prefix: {self.prefix} conv_state ptr {conv_state.data_ptr()}, ssm_state ptr {ssm_state.data_ptr()}, block table {non_spec_state_indices_tensor}")
         
         # if self.prefix=="model.layers.0.linear_attn" and conv_state.device.index==0:
         #     print(f"conv_state sum {conv_state.sum()}, ssm_state sum {ssm_state.sum()}", flush=True)

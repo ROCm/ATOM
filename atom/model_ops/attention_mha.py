@@ -159,6 +159,9 @@ class Attention(nn.Module):
             )
         else:
             # for asm paged attention
+            asm_layout=False
+            if k_cache.dim()==5 and v_cache.dim()==5():
+                asm_layout=True
             if self.rotary_emb is not None:
                 assert position is not None
                 q, k = self.rotary_emb(position, q, k)
@@ -175,7 +178,7 @@ class Attention(nn.Module):
                     k_scale,
                     v_scale,
                     attn_metadata.slot_mapping,
-                    asm_layout=True,
+                    asm_layout=asm_layout,
                 )
             else:
                 aiter.reshape_and_cache(
@@ -187,7 +190,7 @@ class Attention(nn.Module):
                     kv_cache_dtype="auto",
                     k_scale=None,
                     v_scale=None,
-                    asm_layout=True,
+                    asm_layout=asm_layout,
                 )
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale

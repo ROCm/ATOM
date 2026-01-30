@@ -317,7 +317,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         spec_token_indx = None
         non_spec_token_indx = None
         spec_state_indices_tensor = None
-        non_spec_state_indices_tensor = torch.Tensor(batch.block_tables).int().cuda()[:,0]
+        # non_spec_state_indices_tensor = torch.Tensor(batch.block_tables).int().cuda()[:,0]
         
         non_spec_state_indices_tensor = torch.Tensor([1]).cuda().int()
         spec_query_start_loc = None
