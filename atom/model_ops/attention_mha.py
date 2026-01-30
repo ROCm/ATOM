@@ -160,7 +160,7 @@ class Attention(nn.Module):
         else:
             # for asm paged attention
             asm_layout=False
-            if k_cache.dim()==5 and v_cache.dim()==5():
+            if k_cache.dim()==5 and v_cache.dim()==5:
                 asm_layout=True
             if self.rotary_emb is not None:
                 assert position is not None
