@@ -176,8 +176,8 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         spec_token_indx = None
         non_spec_token_indx = None
         spec_state_indices_tensor = None
-        # non_spec_state_indices_tensor = torch.Tensor(batch.block_tables)[:,0]
-        non_spec_state_indices_tensor = torch.Tensor([1]).cuda().int()
+        non_spec_state_indices_tensor = torch.Tensor(batch.block_tables).cuda().int()[:,0]
+        # non_spec_state_indices_tensor = torch.Tensor([1]).cuda().int()
         # non_spec_state_indices_tensor = torch.tensor([1], dtype=torch.int).cuda()
         spec_query_start_loc = None
         non_spec_query_start_loc = query_start_loc
@@ -317,9 +317,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         spec_token_indx = None
         non_spec_token_indx = None
         spec_state_indices_tensor = None
-        # non_spec_state_indices_tensor = torch.Tensor(batch.block_tables).int().cuda()[:,0]
+        non_spec_state_indices_tensor = torch.Tensor(batch.block_tables).int().cuda()[:,0]
         
-        non_spec_state_indices_tensor = torch.Tensor([1]).cuda().int()
+        # non_spec_state_indices_tensor = torch.Tensor([1]).cuda().int()
         spec_query_start_loc = None
         non_spec_query_start_loc = query_start_loc
         num_accepted_tokens = None
