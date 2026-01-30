@@ -1,5 +1,5 @@
 # Model Impl Backend of vLLM and SGLang
-ATOM can work as model implementation backend of popular framework, like vLLM and SGLang. The users can launch vLLM and SGLang server like before and specify an extra argument to enable ATOM, where the optimized implementation of the required target model will be provided to vLLM and SGLang to execute. When ATOM working under this mode, both framework-level features from vLLM/SGLang and latest model-level fusion kernels from ATOM/AITER can be combined together to achieve the competitive performance.
+ATOM can work as model implementation backend of popular framework, like vLLM and SGLang. The users can launch vLLM and SGLang server like before and specify an extra argument to enable the ATOM model backend, where the optimized implementation of the required target model will be provided to vLLM and SGLang to execute. When ATOM working under this mode, both framework-level features from vLLM/SGLang and latest model-level fusion kernels from ATOM/AITER can be combined together to achieve the competitive performance. Here is a detailed design slide for this feature: https://amdcloud-my.sharepoint.com/:p:/g/personal/zejchen_amd_com/IQCFdvmEeLTWT7ysApmZv_hVAfw2nTo8iesJZGblHS0evqQ?e=hjnIDM
 
 ## Preparing environment for vLLM with ATOM model backend
 Pull the latest docker from vLLM official nightly docker for ROCm https://hub.docker.com/r/rocm/vllm-dev/tags
@@ -62,6 +62,7 @@ vllm serve $model_path \
     --model-impl atom \
     2>&1 | tee log.serve.log &
 ```
+
 ### Launching client for validating the accuracy
 ```bash
 addr=localhost
@@ -76,6 +77,14 @@ lm_eval --model local-completions \
         2>&1 | tee log.lmeval.log
 ```
 
+### Results for accuracy validation
+
+
+
+### Known Limitations
+There are limitations for now:
+- Only Qwen-Dense and Qwen-MoE family models are supported
+- Only TP and EP are supported
 
 ## Preparing environment for SGLang with ATOM model backend
 TODO
