@@ -21,3 +21,4 @@ alias cc='bash ./curl.sh'
 #             ps -eo pid,comm | grep -E '^( *[0-9]+ +(python3|tee|VLLM::))' | awk '{print $1}' | xargs kill -9
 
 pip install --upgrade triton
+pip install hf_transfer

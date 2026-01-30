@@ -3,7 +3,10 @@ echo "run sgl"
 
 rm -rf /root/.cache/
 
-# export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
+
+# quick allreduce
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
 model_path=/data/models/Qwen3-235B-A22B-Instruct-2507-FP8
 
