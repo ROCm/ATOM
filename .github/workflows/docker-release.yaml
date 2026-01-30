@@ -33,7 +33,6 @@ jobs:
       matrix:
         base_image:
           - "rocm/pytorch:latest"
-          # - "rocm/pytorch-private:ROCm_7.2_atom_1216"
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
