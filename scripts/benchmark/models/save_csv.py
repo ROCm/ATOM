@@ -176,7 +176,7 @@ def print_csv_repeating_format(results):
     sorted_keys = sorted(grouped_results.keys())
     
     print("\n" + "=" * 60)
-    print("DEEPSEEK-V3.2 BENCHMARK RESULTS")
+    print("BENCHMARK RESULTS")
     print("=" * 60)
     
     # Print independent table for each ISL/OSL combination

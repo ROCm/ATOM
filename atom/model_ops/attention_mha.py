@@ -132,7 +132,7 @@ class Attention(nn.Module):
         use_triton_attn = (
             self.sliding_window != -1 or self.head_dim != 128
         )
-        self.use_triton_attn = use_triton_attn
+        self.use_triton_attn = True
 
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             fused_qk_norm_rope_cache_quant_shuffle(
@@ -297,7 +297,7 @@ class Attention(nn.Module):
 
     def paged_attention_asm(self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_args: ForwardContext):
         
-        attn_metadata = fwd_args.attn_metadata        
+        attn_metadata = fwd_args.attn_metadata
         o = aiter.pa_fwd_asm(
             q,
             k_cache,

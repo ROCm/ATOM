@@ -449,14 +449,21 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        #torch.cuda.synchronize()
+        #print(f"after norm device {hidden_states.device.index}")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
-
+        #torch.cuda.synchronize()
+        #print(f"after attn device {hidden_states.device.index}")
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        #torch.cuda.synchronize()
+        #print(f"after post norm device {hidden_states.device.index}")
         hidden_states = self.mlp(hidden_states)
+        #torch.cuda.synchronize()
+        #print(f"after mlp device {hidden_states.device.index}")
         return hidden_states, residual
 
 
@@ -527,9 +534,14 @@ class Qwen3MoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-
+        self.count = 0
         for layer in self.layers[self.start_layer:self.end_layer]:
+            #if self.count>=8 and hidden_states.shape[0]==1:
+            #    print("aaaa")
+            #print(f"the {self.count} decode layer, device {hidden_states.device.index}", flush=True)
             hidden_states, residual = layer(positions, hidden_states, residual)
+            #torch.cuda.synchronize()
+            self.count = self.count + 1
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

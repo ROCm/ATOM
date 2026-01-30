@@ -206,7 +206,7 @@ def should_ignore_layer(
     # layer_name = model.layers.0.self_attn.qkv_proj
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
-    print("proj_name:", proj_name, flush=True)
+    # print("proj_name:", proj_name, flush=True)
 
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
@@ -228,7 +228,7 @@ def should_ignore_layer(
             should_ignore_shard = check_equal_or_regex_match(
                 layer_name=shard_name, targets=ignore
             )
-            print("shard_name:", shard_name, "should_ignore_shard:", should_ignore_shard, flush=True)
+            # print("shard_name:", shard_name, "should_ignore_shard:", should_ignore_shard, flush=True)
 
             # If shard_idx=0, set layer ignore to match shard.
             if should_ignore_layer is None:
@@ -245,7 +245,7 @@ def should_ignore_layer(
     # Unfused layers like down_proj and o_proj will match
     # the safetensors checkpoint already.
     else:
-        print("proj name", proj_name, " not in fused_mapping", flush=True)
+        # print("proj name", proj_name, " not in fused_mapping", flush=True)
         should_ignore_layer = check_equal_or_regex_match(
             layer_name=layer_name, targets=ignore
         )
@@ -305,14 +305,14 @@ class LinearBase(nn.Module):
         # self.packed_modules_mapping = None
 
         should_ignore =should_ignore_layer(prefix, ignore=exclude_layers, fused_mapping=quant_config.packed_modules_mapping)
-        if prefix:
-            if "qkv" in prefix:
-                print("prefix: ", prefix, "should_ignore:", should_ignore, "params dtype:", params_dtype, quant_config.packed_modules_mapping)
-            pass
-        else:
-            print("prefix is NONE, traceback:")
-            import traceback
-            traceback.print_stack()
+        # if prefix:
+        #     if "qkv" in prefix:
+        #         #print("prefix: ", prefix, "should_ignore:", should_ignore, "params dtype:", params_dtype, quant_config.packed_modules_mapping)
+        #         pass
+        # else:
+        #     print("prefix is NONE, traceback:")
+        #     import traceback
+        #     traceback.print_stack()
 
         if should_ignore_layer(
             prefix, ignore=exclude_layers, fused_mapping=quant_config.packed_modules_mapping
@@ -430,11 +430,7 @@ class LinearBase(nn.Module):
         if param.dtype == torch.float4_e2m1fn_x2:
             param_view = param.data.view(torch.uint8)
             loaded_view = post_process_func(loaded_weight).view(torch.uint8)
-            try:
-                param_view.copy_(loaded_view)
-            except RuntimeError:
-                print("param:", param.shape, " dtype:", param.dtype, "loaded_weight:", loaded_weight.shape, " dtype:", loaded_weight.dtype, flush=True)
-                raise
+            param_view.copy_(loaded_view)
         else:
             param.data.copy_(post_process_func(loaded_weight))
 
