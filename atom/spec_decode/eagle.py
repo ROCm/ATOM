@@ -120,11 +120,9 @@ class EagleProposer:
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
     ) -> torch.Tensor:
-        num_tokens = target_token_ids.shape[0]
 
         forward_context = get_forward_context()
         forward_context.context.is_draft = True
-        attn_metadata = forward_context.attn_metadata
 
         assert self.runner is not None
         input_ids = target_token_ids
@@ -137,7 +135,7 @@ class EagleProposer:
             inputs_embeds=None,
         )
         last_hidden_states = ret_hidden_states
-        hidden_states = last_hidden_states
+        # hidden_states = last_hidden_states
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)

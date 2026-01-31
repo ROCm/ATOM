@@ -3,10 +3,9 @@
 
 import argparse
 
-from transformers import AutoTokenizer
-
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from transformers import AutoTokenizer
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -79,6 +78,7 @@ def main():
         print(f"Completion: {output['text']!r}")
 
     llm.print_mtp_statistics()
+
 
 if __name__ == "__main__":
     main()

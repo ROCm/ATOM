@@ -127,7 +127,9 @@ class BlockManager:
                     block_table.append(block_id)
                     token_ids = [seq[-1]]
                     prefix = (
-                        self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                        self.blocks[block_table[-2]].hash
+                        if len(block_table) > 1
+                        else -1
                     )
                     h = self.compute_hash(token_ids, prefix)
                     block.update(h, token_ids)
@@ -144,7 +146,9 @@ class BlockManager:
             # TODO: fix hash
             token_ids = seq.block(seq.num_blocks - 1)
             if len(token_ids) == self.block_size:
-                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                prefix = (
+                    self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                )
                 h = self.compute_hash(token_ids, prefix)
                 last_block.update(h, token_ids)
                 self.hash_to_block_id[h] = last_block.block_id

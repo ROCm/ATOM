@@ -129,6 +129,7 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     logits_indices: torch.Tensor
 
+
 @dataclass
 class Context:
     # This context is used to store the basic context of the forward.

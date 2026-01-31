@@ -11,15 +11,11 @@ from typing import List
 
 import torch
 import zmq
-import zmq.asyncio
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import (
-    init_exit_handler,
-    make_zmq_socket,
-)
+from atom.utils import init_exit_handler, make_zmq_socket
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -168,7 +164,9 @@ class EngineCore:
         scheduled_batch, seqs = self.scheduler.schedule()
         # if scheduled_batch is None:
         #     return False
-        out, draft = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        out, draft = self.runner_mgr.call_func(
+            "forward", scheduled_batch, wait_out=True
+        )
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
@@ -308,7 +306,9 @@ class EngineCore:
             print(f"  Acceptance rate:    {stats['acceptance_rate']:.2%}")
             print(f"{'='*50}\n")
         else:
-            print("\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n")
+            print(
+                "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"
+            )
 
 
 class DPEngineCoreProc(EngineCore):
