@@ -7,12 +7,10 @@ import time
 from dataclasses import fields
 from typing import List, Union
 
-import torch.multiprocessing as mp
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
-from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 logger = logging.getLogger("atom")

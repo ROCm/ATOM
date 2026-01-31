@@ -11,12 +11,12 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import filelock
 import huggingface_hub.constants
 import torch
-from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub import HfFileSystem, snapshot_download
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)

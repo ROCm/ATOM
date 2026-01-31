@@ -1,14 +1,12 @@
 import logging
 
-import numpy as np
 import torch
 import torch.nn as nn
 from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_loader.loader import load_model
 from atom.models.deepseek_mtp import DeepSeekMTP
-from atom.utils.forward_context import AttentionMetaData, get_forward_context
+from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
