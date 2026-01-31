@@ -71,7 +71,7 @@ class tokenIDProcessor:
         # self.is_deferred_out = False
         self.is_deferred_out = True
         self.input_ids = CpuGpuBuffer(
-            max_num_batched_tokens, dtype=torch.int32, device=device
+            max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
         self.input_ids_loc = CpuGpuBuffer(
             max_num_batched_tokens, dtype=torch.int64, device=device
@@ -105,15 +105,16 @@ class tokenIDProcessor:
         with torch.cuda.stream(self.async_copy_stream):
             self.async_copy_stream.wait_stream(default_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
-            self.async_copy_event.record(self.async_copy_stream)
-        self.draft_token_ids_cpu.append(cpu_tensor)
+            event = torch.cuda.Event()
+            event.record(self.async_copy_stream)
+        self.draft_token_ids_cpu.append((cpu_tensor, event))
 
     def recv_async_output_draft(self) -> list[int]:
         if not self.draft_token_ids_cpu:
             return []
-        self.async_copy_event.synchronize()
-        token_ids = self.draft_token_ids_cpu.pop(0).tolist()
-        return token_ids
+        token_ids, event = self.draft_token_ids_cpu.pop(0)
+        event.synchronize()
+        return token_ids.tolist()
 
     def send_bonus_to_cpu_async(self, gpu_tensor: torch.Tensor):
         default_stream = torch.cuda.current_stream()
@@ -1213,7 +1214,6 @@ class ModelRunner:
         logits: torch.Tensor,
         temperatures: torch.Tensor,
         # following for draft
-        input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> tuple[dict[int, tuple[int, ...]], Optional[torch.Tensor]]:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
@@ -1278,7 +1278,10 @@ class ModelRunner:
                     num_bonus_tokens
                 )  # Async copy to CPU
             draft_token_ids = self.propose_draft_token_ids(
-                batch, input_ids, hidden_states, next_token_ids
+                batch,
+                self.tokenID_processor.input_ids.gpu[1 : batch.total_tokens_num + 1],
+                hidden_states,
+                next_token_ids,
             )
 
         return token_ids, draft_token_ids
@@ -1293,7 +1296,6 @@ class ModelRunner:
             batch,
             logits,
             temperatures,
-            input_ids,
             hidden_states,
         )
         reset_forward_context()

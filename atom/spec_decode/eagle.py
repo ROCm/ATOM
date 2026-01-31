@@ -50,23 +50,11 @@ class EagleProposer:
 
         self.hidden_size = getattr(self.config.hf_config, "hidden_size", 7168)
         # persistent buffers for cuda graph
-        self.input_ids = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device=device
-        )
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
         )
         self.hidden_states = torch.zeros(
             (self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device
-        )
-
-        max_batch_size = self.config.max_num_seqs
-        self.arange = torch.arange(
-            # We need +1 here because the arange is used to set query_start_loc,
-            # which has one more element than batch_size.
-            max_batch_size + 1,
-            device=device,
-            dtype=torch.int32,
         )
 
         self.inputs_embeds = torch.zeros(
@@ -113,8 +101,6 @@ class EagleProposer:
         input_ids: torch.Tensor,
         num_tokens: int,
     ) -> None:
-        input_ids = self.input_ids[:num_tokens]
-
         self.model(
             input_ids=input_ids,
             positions=self.positions[:num_tokens],
@@ -141,19 +127,13 @@ class EagleProposer:
         attn_metadata = forward_context.attn_metadata
 
         assert self.runner is not None
-
-        # copy inputs to buffer for cudagraph
-        self.input_ids[: num_tokens - 1] = target_token_ids[1:]
-        self.input_ids[last_token_indices] = next_token_ids
-        self.positions[:num_tokens] = target_positions
-        self.hidden_states[:num_tokens] = target_hidden_states
-
-        input_ids = self.input_ids[:num_tokens]
+        input_ids = target_token_ids
+        input_ids[last_token_indices] = next_token_ids
 
         ret_hidden_states = self.model(
             input_ids=input_ids,
-            positions=self.positions[:num_tokens],
-            hidden_states=self.hidden_states[:num_tokens],
+            positions=target_positions,
+            hidden_states=target_hidden_states,
             inputs_embeds=None,
         )
         last_hidden_states = ret_hidden_states
@@ -197,7 +177,6 @@ class EagleProposer:
         # Calculate new sequence lengths
         context_lens += 1
 
-        # TODO only work for mtp=1
         token_indices = cu_seqlens_q[1:] - (1 + self.mtp_k - num_bonus_tokens)
 
         return token_indices
