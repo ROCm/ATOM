@@ -64,7 +64,7 @@ vllm serve $model_path \
     --kv-cache-dtype fp8 \
     --max-num-batched-tokens 18432 \
     --max-model-len 16384 \
-    --enable-prefix-caching \
+    --no-enable-prefix-caching \
     --model-impl atom \
     2>&1 | tee log.serve.log &
 ```
