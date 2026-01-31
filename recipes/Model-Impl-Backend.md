@@ -1,7 +1,10 @@
 # Model Impl Backend of vLLM and SGLang
 ATOM can work as model implementation backend of popular framework, like vLLM and SGLang. The users can launch vLLM and SGLang server like before and specify an extra argument to enable the ATOM model backend, where the optimized implementation of the required target model will be provided to vLLM and SGLang to execute. When ATOM working under this mode, both framework-level features from vLLM/SGLang and latest model-level fusion kernels from ATOM/AITER can be combined together to achieve the competitive performance.
+
 Here is a detailed design slide for this feature: https://amdcloud-my.sharepoint.com/:p:/g/personal/zejchen_amd_com/IQCFdvmEeLTWT7ysApmZv_hVAfw2nTo8iesJZGblHS0evqQ?e=hjnIDM
+
 Here is the RFC to introduce the ATOM as model impl backend into vLLM: TODO
+
 Here is the RFC to introduce the ATOM as model impl backend into SGLang: TODO
 
 ## Preparing environment for vLLM with ATOM model backend
