@@ -1,0 +1,309 @@
+name: ATOM Benchmark
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      deepseek-r1-0528:
+        description: "Benchmark DeepSeek-R1-0528"
+        type: boolean
+        default: true
+      gpt-oss-120b:
+        description: "Benchmark gpt-oss-120b"
+        type: boolean
+        default: true
+      extra_args:
+        description: "Extra arguments to pass to the ATOM server"
+        type: string
+      image:
+        description: "Image to use for the benchmark"
+        type: string
+        default: "rocm/atom:latest"
+      param_lists:
+        description: |
+          "Benchmark parameter lists. 
+          Input as a single or multiple sets (comma-separated, semicolon between sets), 
+          format: input_length,output_length,concurrency,random_range_ratio.
+          Example (single set): 1024,1024,128,0.8
+          Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
+        type: string
+        default: "1024,1024,128,0.8"
+
+jobs:
+  parse-param-lists:
+    name: Parse parameter lists
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
+    steps:
+      - name: Parse parameter lists
+        id: parse-param-lists
+        run: |
+          IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
+          MATRIX_JSON="["
+          SEP=""
+          for SET in "${SETS[@]}"; do
+            IFS=',' read -ra PARAMS <<< "$SET"
+            INPUT_LEN="${PARAMS[0]}"
+            OUTPUT_LEN="${PARAMS[1]}"
+            CONCURRENCY="${PARAMS[2]}"
+            RANDOM_RANGE_RATIO="${PARAMS[3]}"
+            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
+            SEP=","
+          done
+          MATRIX_JSON="${MATRIX_JSON}]"
+          echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+      
+      - name: Print matrix JSON
+        run: |
+          echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
+
+  deepseek-r1-0528-benchmark:
+    if: ${{ inputs.deepseek-r1-0528 }}
+    name: DeepSeek-R1-0528 Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
+    needs: [parse-param-lists]
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
+    
+    env:
+      MODEL_PATH: "deepseek-ai/DeepSeek-R1-0528"
+      ARGS: "--kv_cache_dtype fp8 -tp 8"
+      ISL: ${{ matrix.config.input_length }}
+      OSL: ${{ matrix.config.output_length }}
+      CONC: ${{ matrix.config.concurrency }}
+      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
+      RESULT_FILENAME: deepseek-r1-0528-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
+
+    runs-on: atom-mi355-8gpu.predownload
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+      
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom-benchmark | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          if [ -d "/models" ]; then
+            MODEL_MOUNT="-v /models:/models"
+          else
+            echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
+            MODEL_MOUNT=""
+          fi
+
+          cat > /tmp/env_file.txt << 'EOF'
+          ${{ inputs.extra_args }}
+          EOF
+
+          echo "Starting container: atom-benchmark"
+          echo "Model-specific environment variables for ${{ env.MODEL_PATH }}:"
+          cat /tmp/env_file.txt
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          $MODEL_MOUNT \
+          -w /workspace \
+          --ipc=host --group-add video \
+          --shm-size=16G \
+          --privileged \
+          --cap-add=SYS_PTRACE \
+          -e HF_TOKEN="${HF_TOKEN:-}" \
+          --env-file /tmp/env_file.txt \
+          --security-opt seccomp=unconfined \
+          --ulimit memlock=-1 \
+          --ulimit stack=67108864 \
+          -e ISL=${{ env.ISL }} \
+          -e OSL=${{ env.OSL }} \
+          -e CONC=${{ env.CONC }} \
+          -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name atom-benchmark \
+          ${{ inputs.image }}
+
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Run benchmark
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========== Launching ATOM server =========="
+          if [ -d "/models" ]; then
+            model_path="/models/${{ env.MODEL_PATH }}"
+          else
+            model_path="${{ env.MODEL_PATH }}"
+          fi
+          docker exec atom-benchmark bash -lc "
+            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
+          "
+          echo "========== Running benchmark test =========="
+          docker exec atom-benchmark bash -lc "
+          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+          ls -all .
+          "
+      
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RESULT_FILENAME }}
+          path: ${{ env.RESULT_FILENAME }}.json
+
+      - name: Clean Up
+        if: always()
+        run: |
+          # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
+          # We should use non-root user to run the test to avoid this issue.
+          set -x
+          echo "========== Cleaning up workspace =========="
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker stop atom-benchmark || true
+          docker rm atom-benchmark || true
+
+  gpt-oss-120b-benchmark:
+    if: ${{ inputs.gpt-oss-120b }}
+    name: GPT-OSS-120b Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
+    needs: [parse-param-lists]
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
+    
+    env:
+      MODEL_PATH: "openai/gpt-oss-120b"
+      ARGS: "--kv_cache_dtype fp8"
+      ISL: ${{ matrix.config.input_length }}
+      OSL: ${{ matrix.config.output_length }}
+      CONC: ${{ matrix.config.concurrency }}
+      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
+      RESULT_FILENAME: gpt-oss-120b-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
+
+    runs-on: atom-mi355-8gpu.predownload
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+      
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom-benchmark | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          if [ -d "/models" ]; then
+            MODEL_MOUNT="-v /models:/models"
+          else
+            echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
+            MODEL_MOUNT=""
+          fi
+
+          cat > /tmp/env_file.txt << 'EOF'
+          ${{ inputs.extra_args }}
+          EOF
+
+          echo "Starting container: atom-benchmark"
+          echo "Model-specific environment variables for ${{ env.MODEL_PATH }}:"
+          cat /tmp/env_file.txt
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          $MODEL_MOUNT \
+          -w /workspace \
+          --ipc=host --group-add video \
+          --shm-size=16G \
+          --privileged \
+          --cap-add=SYS_PTRACE \
+          -e HF_TOKEN="${HF_TOKEN:-}" \
+          --env-file /tmp/env_file.txt \
+          --security-opt seccomp=unconfined \
+          --ulimit memlock=-1 \
+          --ulimit stack=67108864 \
+          -e ISL=${{ env.ISL }} \
+          -e OSL=${{ env.OSL }} \
+          -e CONC=${{ env.CONC }} \
+          -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
+          -e ATOM_GPT_OSS_MODEL=1 \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name atom-benchmark \
+          ${{ inputs.image }}
+
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Run benchmark
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========== Launching ATOM server =========="
+          if [ -d "/models" ]; then
+            model_path="/models/${{ env.MODEL_PATH }}"
+          else
+            model_path="${{ env.MODEL_PATH }}"
+          fi
+          docker exec atom-benchmark bash -lc "
+            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
+          "
+          echo "========== Running benchmark test =========="
+          docker exec atom-benchmark bash -lc "
+          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+          ls -all .
+          "
+      
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RESULT_FILENAME }}
+          path: ${{ env.RESULT_FILENAME }}.json
+
+      - name: Clean Up
+        if: always()
+        run: |
+          # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
+          # We should use non-root user to run the test to avoid this issue.
+          set -x
+          echo "========== Cleaning up workspace =========="
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker stop atom-benchmark || true
+          docker rm atom-benchmark || true
+
+  summarize-benchmark-result:
+    if: always()
+    name: Summarize benchmark result
+    needs: [deepseek-r1-0528-benchmark, gpt-oss-120b-benchmark]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+        
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v4
+        with: 
+          pattern: '*'
+          merge-multiple: true
+          path: .
+      
+      - name: List all benchmark results
+        run: |
+          ls -all .
+      
+      - name: Summarize benchmark result
+        run: |
+          .github/scripts/summarize.py . >> $GITHUB_STEP_SUMMARY

@@ -1,20 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
-    Callable,
     Dict,
-    Iterable,
     List,
-    Literal,
-    Mapping,
-    Optional,
     Protocol,
-    Set,
     Tuple,
     Union,
-    overload,
 )
 
 import torch
@@ -26,8 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class LayerFn(Protocol):
-    def __call__(self, prefix: str) -> torch.nn.Module:
-        ...
+    def __call__(self, prefix: str) -> torch.nn.Module: ...
 
 
 class PPMissingLayer(torch.nn.Identity):
@@ -47,6 +38,7 @@ class PPMissingLayer(torch.nn.Identity):
         """
         input = args[0] if args else next(iter(kwargs.values()))
         return (input,) if self.return_tuple else input
+
 
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int

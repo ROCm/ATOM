@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import asyncio
 import itertools
 import logging
 import time
 from dataclasses import fields
-from typing import AsyncGenerator, Dict, List, Optional, Union
+from typing import List, Union
 
 import torch.multiprocessing as mp
 from atom.config import Config
@@ -24,7 +23,7 @@ class LLMEngine:
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        data_parallel_size = kwargs.get('data_parallel_size', 1)
+        data_parallel_size = kwargs.get("data_parallel_size", 1)
         config = Config(model, **config_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.bos_token_id = self.tokenizer.bos_token_id
@@ -43,13 +42,15 @@ class LLMEngine:
         self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
-        logger.info(f"LLMEngine init with {self.data_parallel_size} data parallel ranks")
+        logger.info(
+            f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
+        )
 
     def add_request(
-        self, 
-        prompt_or_tokens_list: List[Union[str, List[int]]], 
+        self,
+        prompt_or_tokens_list: List[Union[str, List[int]]],
         sampling_params_list: SamplingParams | List[SamplingParams],
-        stream_callback=None
+        stream_callback=None,
     ):
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
@@ -62,7 +63,7 @@ class LLMEngine:
                     f"{len(prompt_or_tokens_list)=} vs {len(sampling_params_list)=}"
                 )
             sampling_params_iter = sampling_params_list
-        
+
         # Handle stream_callback
         if stream_callback is not None and not isinstance(stream_callback, list):
             stream_callback_iter = itertools.repeat(stream_callback)
@@ -75,10 +76,14 @@ class LLMEngine:
             stream_callback_iter = stream_callback
         else:
             stream_callback_iter = itertools.repeat(None)
-        
+
         reqs = []
-        for prompt, sampling_param, callback in zip(prompt_or_tokens_list, sampling_params_iter, stream_callback_iter):
-            req = self.io_processor.preprocess(prompt, sampling_param, stream_callback=callback)
+        for prompt, sampling_param, callback in zip(
+            prompt_or_tokens_list, sampling_params_iter, stream_callback_iter
+        ):
+            req = self.io_processor.preprocess(
+                prompt, sampling_param, stream_callback=callback
+            )
             reqs.append(req)
         self.core_mgr.add_request(reqs)
 
@@ -97,7 +102,7 @@ class LLMEngine:
     ) -> list[str]:
         # Reset round-robin counter to ensure consistent DP not core dump
         self.core_mgr._rr_counter = 0
-        
+
         self.add_request(prompts, sampling_params)
         outputs = {}
         while not self.is_finished() and (
@@ -113,11 +118,11 @@ class LLMEngine:
     def start_profile(self):
         self.core_mgr.send_utility_command("start_profile")
         logger.info("Profiling started")
-    
+
     def stop_profile(self):
         self.core_mgr.send_utility_command("stop_profile")
         logger.info("Profiling stopped. Trace files should be generated.")
-    
+
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
 
@@ -130,7 +135,10 @@ class InputOutputProcessor:
         self.requests = {}
 
     def preprocess(
-        self, prompt_or_tokens: str | list[int], sampling_params: SamplingParams, stream_callback=None
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        stream_callback=None,
     ):
         """responsible for:
         1) Tokenize
@@ -143,14 +151,24 @@ class InputOutputProcessor:
 
         stop_token_sequences = []
         if sampling_params.stop_strings:
-            stops = [sampling_params.stop_strings] if isinstance(sampling_params.stop_strings, str) else sampling_params.stop_strings
+            stops = (
+                [sampling_params.stop_strings]
+                if isinstance(sampling_params.stop_strings, str)
+                else sampling_params.stop_strings
+            )
             for stop_str in stops:
                 # Encode the full stop string as a sequence of tokens
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
 
-        seq = Sequence(tokens, self.block_size, sampling_params, stop_token_sequences, stream_callback=stream_callback)
+        seq = Sequence(
+            tokens,
+            self.block_size,
+            sampling_params,
+            stop_token_sequences,
+            stream_callback=stream_callback,
+        )
         seq.arrive_time = time.time()
         self.requests[seq.id] = seq
         print(
@@ -175,7 +193,9 @@ class InputOutputProcessor:
                 ttft = req.first_token_time - req.arrive_time
                 # Calculate TPOT only if there are multiple output tokens
                 if req.num_completion_tokens > 1:
-                    tpot = (req.leave_time - req.first_token_time) / (req.num_completion_tokens - 1)
+                    tpot = (req.leave_time - req.first_token_time) / (
+                        req.num_completion_tokens - 1
+                    )
 
             print(
                 f"Request {req.id} finished with reason {req.leave_reason}. "

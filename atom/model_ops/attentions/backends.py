@@ -2,12 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, List, Optional, Tuple, Type, TypeVar
+from typing import Any, Dict, Generic, Optional, Type, TypeVar
 
-import numpy as np
 import torch
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.sequence import Sequence
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import block_table_convert_triton

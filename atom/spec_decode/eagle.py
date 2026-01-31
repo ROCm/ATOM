@@ -34,12 +34,6 @@ class EagleProposer:
         self.max_model_len = self.config.max_model_len
         self.block_size = self.config.kv_cache_block_size
         self.max_num_tokens = self.config.max_num_batched_tokens
-        self.token_arange_np = np.arange(self.max_num_tokens)
-        self.token_arange_gpu = torch.arange(
-            self.max_num_tokens,
-            device=device,
-            dtype=torch.int32,
-        )
         self.use_cuda_graph = (
             self.config.compilation_config.level == CompilationLevel.PIECEWISE
             and not self.config.enforce_eager

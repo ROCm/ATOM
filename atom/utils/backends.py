@@ -17,7 +17,6 @@ from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.utils import (
     compilation_counter,
     is_torch_equal_or_newer,
-    resolve_obj_by_qualname,
 )
 from torch._dispatch.python import enable_python_dispatcher
 
@@ -373,7 +372,6 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 )
             )
             # Lazy import here to avoid circular import
-            from .cuda_graph import CUDAGraphOptions
             from .cuda_piecewise_backend import PiecewiseBackend
 
             piecewise_backend = PiecewiseBackend(

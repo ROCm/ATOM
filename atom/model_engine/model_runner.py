@@ -31,11 +31,7 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.utils.selector import get_attn_backend
-
-logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
-    AttentionMetaData,
     Context,
     DPMetadata,
     SpecDecodeMetadata,
@@ -44,6 +40,9 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+from atom.utils.selector import get_attn_backend
+
+logger = logging.getLogger("atom")
 
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
@@ -728,7 +727,7 @@ class ModelRunner:
             is_dummy_run=True,
         )
 
-        bs = self.prepare_inputs(dummy_batch)
+        bs = self.prepare_intputs(dummy_batch)
         actual_num_tokens = dummy_batch.total_tokens_num
 
         # self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
@@ -1139,6 +1138,7 @@ class ModelRunner:
             )
         attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+
         # graph_bs should be batch size (number of sequences), not token count
         graph_bs = num_input_tokens if is_prefill else bs
         context = Context(
