@@ -47,6 +47,7 @@ class DisabledTqdm(tqdm):
         kwargs["disable"] = True
         super().__init__(*args, **kwargs)
 
+
 def get_lock(model_name_or_path: Union[str, Path], cache_dir: Optional[str] = None):
     lock_dir = cache_dir or temp_dir
     model_name_or_path = str(model_name_or_path)

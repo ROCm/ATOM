@@ -1,8 +1,6 @@
 name: Nightly Docker Release
 
 on:
-  pull_request:
-    branches: [main] # for testing
   schedule:
     - cron: '0 1 * * *'  # Every day at 09:00 Beijing Time (UTC+8)
   workflow_dispatch:
@@ -38,7 +36,7 @@ jobs:
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
-      ATOM_COMMIT: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+      ATOM_COMMIT: "HEAD"
       AITER_REPO: "https://github.com/ROCm/aiter.git"
       AITER_COMMIT: "HEAD"
       RCCL_REPO: "https://github.com/ROCm/rccl.git"
