@@ -26,7 +26,7 @@ from aiter import (
     ActivationType,
 )
 
-from atom.model_ops.base_attention import Attention
+import atom.model_ops as ops
 from atom.utils.decorators import support_torch_compile
 from atom.config import Config, QuantizationConfig
 from aiter.dist.parallel_state import (
@@ -125,11 +125,12 @@ class OAIAttention(nn.Module):
 
         # Only apply sliding window to every other layer
         sliding_window = config.sliding_window if self.layer_idx % 2 == 0 else None
-        self.attn = Attention(
+        self.attn = ops.ATTN_CLS(
             self.num_local_attention_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_local_key_value_heads,
+            alibi_slopes=None,
             kv_cache_dtype=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
