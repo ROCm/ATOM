@@ -179,7 +179,10 @@ class InputOutputProcessor:
         outputs = {}
         for req in reqs:
             self.requests.pop(req.id)
-            output_str = self.tokenizer.decode(req.completion_token_ids)
+            # this is for our simple trained model engram demo can running
+            valid_ids = [t for t in req.completion_token_ids if t >= 0]
+            output_str = self.tokenizer.decode(valid_ids)
+            # output_str = self.tokenizer.decode(req.completion_token_ids)
             req.leave_time = time.time()
 
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)

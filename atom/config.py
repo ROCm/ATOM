@@ -358,6 +358,38 @@ _CONFIG_REGISTRY: dict[str, str] = {
 }
 
 
+class EngramConfig(PretrainedConfig):
+    model_type = "engram_lm"
+    
+    def __init__(
+        self,
+        vocab_size: int = 128,
+        hidden_size: int = 128,
+        num_hidden_layers: int = 4,
+        num_attention_heads: int = 4,
+        max_position_embeddings: int = 512,
+        tie_word_embeddings: bool = True,
+        engram_config: dict = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.max_position_embeddings = max_position_embeddings
+        self.tie_word_embeddings = tie_word_embeddings
+        self.engram_config = engram_config or {}
+        
+        model_config = kwargs.get("model_config", {})
+        if model_config:
+            self.vocab_size = model_config.get("vocab_size", self.vocab_size)
+            self.hidden_size = model_config.get("hidden_size", self.hidden_size)
+            self.num_hidden_layers = model_config.get("num_layers", self.num_hidden_layers)
+            self.num_attention_heads = model_config.get("num_heads", self.num_attention_heads)
+            self.max_position_embeddings = model_config.get("max_seq_len", self.max_position_embeddings)
+
+
 def get_hf_config(model: str) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
@@ -370,6 +402,10 @@ def get_hf_config(model: str) -> PretrainedConfig:
             return token
         return None
 
+    # Since we don't has config on huggingface, we need to load for our own config
+    if model_type == "engram_lm":
+        return EngramConfig.from_pretrained(model)
+    
     if model_type in _CONFIG_REGISTRY:
         config_class = AutoConfig.for_model(_CONFIG_REGISTRY[model_type])
         return config_class.from_pretrained(
