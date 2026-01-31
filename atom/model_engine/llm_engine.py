@@ -7,12 +7,11 @@ import time
 from dataclasses import fields
 from typing import List, Union
 
-from transformers import AutoTokenizer
-
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from transformers import AutoTokenizer
 
 logger = logging.getLogger("atom")
 
@@ -122,6 +121,9 @@ class LLMEngine:
         self.core_mgr.send_utility_command("stop_profile")
         logger.info("Profiling stopped. Trace files should be generated.")
 
+    def print_mtp_statistics(self):
+        self.core_mgr.send_utility_command("get_mtp_stats")
+
 
 class InputOutputProcessor:
 
@@ -198,6 +200,7 @@ class InputOutputProcessor:
                 f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
                 f"latency: {req.leave_time - req.arrive_time:.2f}s, "
                 f"TTFT: {ttft:.3f}s, TPOT: {tpot:.3f}s"
+                # f"{req.completion_token_ids}"
             )
             outputs[req.id] = {
                 "text": output_str,

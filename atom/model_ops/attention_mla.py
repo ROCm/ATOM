@@ -12,6 +12,7 @@ from aiter import (
     concat_and_cache_mla,
     dtypes,
     flash_attn_varlen_func,
+    fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
 )
 from aiter.dist.parallel_state import get_dp_group
@@ -615,10 +616,39 @@ class MLAAttention(nn.Module):
                 prefill_q, k_nope, k_rope, kv_cache, attn_metadata
             )
         else:
+            q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
+
+            q_out = torch.empty(
+                (
+                    q_nope.shape[0],
+                    self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=(
+                    dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
+                ),
+                device=q_nope.device,
+            )
             if kv_cache.numel() > 0:
-                q_out = self.fused_kv_bmm(
-                    q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata
+                fused_qk_rope_concat_and_cache_mla(
+                    q_nope,
+                    q_rope,
+                    k_nope,
+                    k_rope,
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
+                    q_out,
+                    attn_metadata.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
+                    positions,
+                    self.rotary_emb.cos_cache,
+                    self.rotary_emb.sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    is_nope_first=True,
                 )
+                # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
