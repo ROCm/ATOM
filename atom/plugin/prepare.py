@@ -39,16 +39,16 @@ def _set_framework_backbone(framework: str) -> None:
     _CURRENT_FRAMEWORK = framework
 
 
-def prepare_model(config: Any, framework: str):
+def prepare_model(config: Any, engine: str):
     '''
     Prepare the model to upper framework, including
     register custom ops and init aiter dist
     '''
-    logging.info(f'Prepare model for plugin mode, the upper framework is {framework}')
+    logging.info(f'Prepare model for plugin mode, the upper engine is {engine}')
 
-    _set_framework_backbone(framework)
+    _set_framework_backbone(engine)
 
-    # different framework passed different config
+    # different engine passed different config
     if is_vllm():
         model_arch = config.model_config.architectures[0]
     elif is_sglang():
