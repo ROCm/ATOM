@@ -19,7 +19,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, KVCacheTensor, set_current_atom_config
-from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.rejection_sampler import RejectionSampler
@@ -1284,22 +1284,20 @@ class ModelRunner:
                 next_token_ids,
             )
 
-        return token_ids, draft_token_ids
+        return ScheduledBatchOutput(token_ids, draft_token_ids)
 
     @torch.inference_mode()
-    def forward(
-        self, batch: ScheduledBatch
-    ) -> tuple[dict[int, tuple[int, ...]], Optional[dict[int, list[int]]]]:
+    def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         input_ids, temperatures = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids)
-        sampled_token_ids, draft_token_ids = self.postprocess(
+        fwd_output = self.postprocess(
             batch,
             logits,
             temperatures,
             hidden_states,
         )
         reset_forward_context()
-        return sampled_token_ids, draft_token_ids
+        return fwd_output
 
     def _calc_spec_decode_metadata(
         self,
@@ -1393,19 +1391,22 @@ class ModelRunner:
         next_token_ids: torch.Tensor,
     ):
         num_scheduled_tokens = batch.total_tokens_num
-        if not get_forward_context().attn_metadata.slot_mapping.numel():
+        forward_context = get_forward_context()
+        if not forward_context.attn_metadata.slot_mapping.numel():
             return self.drafter.dummy_run(input_ids, num_scheduled_tokens)
 
-        positions = get_forward_context().context.positions
-        spec_decode_metadata = get_forward_context().spec_decode_metadata
+        positions = forward_context.context.positions
+        spec_decode_metadata = forward_context.spec_decode_metadata
+        if spec_decode_metadata is None:
+            last_token_offset = 1
+        else:
+            num_bonus_tokens = self.tokenID_processor.num_bonus_tokens
+            last_token_offset = 1 + self.drafter.mtp_k - num_bonus_tokens
 
         assert isinstance(self.drafter, EagleProposer)
 
-        num_bonus_tokens = 0
-        if spec_decode_metadata is not None:
-            num_bonus_tokens = self.tokenID_processor.num_bonus_tokens
         last_token_indices = self.drafter.prepare_inputs(
-            batch.total_seqs_num, num_bonus_tokens
+            batch.total_seqs_num, last_token_offset
         )
 
         draft_token = self.drafter.propose(

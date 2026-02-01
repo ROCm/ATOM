@@ -73,6 +73,21 @@ class ScheduledBatch:
         # logger.info(f"{[seq.num_placeholder for seq in seqs.values()]=}")
 
 
+class ScheduledBatchOutput:
+
+    def __init__(
+        self,
+        token_ids: dict[int, tuple[int, ...]],
+        draft_token_ids,
+        # num_bonus_tokens
+    ):
+        # TODO need refine
+        self.req_ids = list(token_ids.keys())
+        self.token_ids = token_ids
+        self.draft_token_ids = draft_token_ids
+        # self.num_bonus_tokens = num_bonus_tokens  # num per req
+
+
 class Scheduler:
 
     def __init__(self, config: Config):
@@ -127,7 +142,6 @@ class Scheduler:
             num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
-            seq.num_placeholder = self.mtp_k + 1
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs[seq.id] = seq
@@ -218,10 +232,13 @@ class Scheduler:
     def postprocess(
         self,
         seqs: list[Sequence],
-        prev_token_ids: dict[int, tuple[int, ...]],
-        draft_token_ids: Optional[dict[int, list[int]]],
+        fwd_output: ScheduledBatchOutput,
+        # prev_token_ids: dict[int, tuple[int, ...]],
+        # draft_token_ids: Optional[dict[int, list[int]]],
         stream_output_queue=None,
     ) -> list[Sequence]:
+        prev_token_ids = fwd_output.token_ids
+        draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = prev_token_ids.get(-1, False)
         # update token_ids with the actual sampled token ids
         finished_seqs = []
@@ -237,7 +254,8 @@ class Scheduler:
             num_placeholder = self.mtp_k
 
         for seq in self.running:
-            if seq.id not in prev_token_ids:
+            if seq.id not in fwd_output.req_ids:
+                seq.num_placeholder = num_placeholder
                 continue
             token_ids = prev_token_ids[seq.id]
             num_accepted_token = len(token_ids)
@@ -249,24 +267,29 @@ class Scheduler:
                 #     seq.token_ids[-num_placeholder + i] = el
                 #     seq.output_tokens[-num_placeholder + i] = el
                 # update the number of tokens in the sequence if draft token is rejected
-                seq.token_ids[-num_placeholder:] = token_ids
+                seq.token_ids[-num_accepted_token:] = token_ids
                 seq.num_tokens = len(seq.token_ids)
-                seq.output_tokens[-num_placeholder:] = token_ids
+                seq.output_tokens[-num_accepted_token:] = token_ids
 
-                # if seq.output_tokens:
-                #     seq.output_tokens[-num_placeholder:] = token_ids
-                # else:
-                #     seq.output_tokens.extend(token_ids)
             else:
                 for token_id in token_ids:
                     seq.append_token(token_id)
             new_tokens = token_ids
 
-            # if need_placeholder:
-            #     # reuse the rejected kvcache slot
-            #     logger.info(f"{num_accepted_token=} {token_ids=}")
-            #     logger.info(f"{seq.output_tokens=}")
-            #     seq.num_placeholder = num_accepted_token
+            if need_placeholder:
+                seq.num_placeholder = 1 + self.mtp_k
+                # idx = fwd_output.req_ids.index(seq.id)
+                # # reuse the rejected kvcache slot
+                # # logger.info(f"{num_accepted_token=} {token_ids=}")
+                # # logger.info(f"{seq.output_tokens=}")
+                # logger.info(f"{fwd_output.req_ids=}")
+                # logger.info(f"{fwd_output.token_ids=}")
+                # logger.info(f"{fwd_output.token_ids=}")
+                # logger.info(f"{fwd_output.num_bonus_tokens=}")
+                # logger.info(f"{fwd_output.draft_token_ids=}")
+                # logger.info(f"{idx=}")
+                # logger.info(f"{seq.id=}")
+                # seq.num_placeholder = 1+fwd_output.num_bonus_tokens[idx]
             if draft_token_ids and seq.id in draft_token_ids:
                 seq.spec_token_ids = draft_token_ids[seq.id]
 
@@ -331,8 +354,7 @@ class Scheduler:
             # placeholder for the each decode step
             for seq in seqs:
                 if seq.status == SequenceStatus.RUNNING:
-                    for _ in range(num_placeholder):
-                        # for _ in range(seq.num_placeholder):
+                    for _ in range(seq.num_placeholder):
                         seq.append_token(self.eos_token_id)
         for seq in finished_seqs:
             self.block_manager.deallocate(seq)

@@ -164,13 +164,11 @@ class EngineCore:
         scheduled_batch, seqs = self.scheduler.schedule()
         # if scheduled_batch is None:
         #     return False
-        out, draft = self.runner_mgr.call_func(
-            "forward", scheduled_batch, wait_out=True
-        )
+        fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
-            seqs, out, draft, stream_output_queue=self.stream_output_queue
+            seqs, fwd_out, stream_output_queue=self.stream_output_queue
         )
 
         # Send stream outputs to main process via output_queue

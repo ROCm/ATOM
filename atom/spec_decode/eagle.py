@@ -25,7 +25,7 @@ class EagleProposer:
     ):
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
-        self.mtp_k = self.speculative_config.num_speculative_tokens
+        self.mtp_k: int = self.speculative_config.num_speculative_tokens or 0
 
         self.runner = runner
         self.dtype = self.config.hf_config.torch_dtype
@@ -120,43 +120,44 @@ class EagleProposer:
     ) -> torch.Tensor:
 
         forward_context = get_forward_context()
-        forward_context.context.is_draft = True
+        context = forward_context.context
+        context.is_draft = True
+        bs = context.batch_size
 
         assert self.runner is not None
         input_ids = target_token_ids
         input_ids[last_token_indices] = next_token_ids
+        positions = target_positions
+        hidden_states = target_hidden_states
 
-        ret_hidden_states = self.model(
-            input_ids=input_ids,
-            positions=target_positions,
-            hidden_states=target_hidden_states,
-            inputs_embeds=None,
+        draft_token_ids = torch.empty(
+            bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
-        last_hidden_states = ret_hidden_states
-        # hidden_states = last_hidden_states
-
-        sample_hidden_states = last_hidden_states[last_token_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
-        # positions = target_positions[last_token_indices]
-        # hidden_states = hidden_states[last_token_indices]
-
-        draft_token_ids = logits.argmax(dim=-1)
-
-        # Early exit if there is only one draft token to be generated.
-        if self.mtp_k == 1:
-            # [batch_size, 1]
-            return draft_token_ids.view(-1, 1)
-        else:
-            raise ValueError(
-                f"num_speculative_tokens={self.mtp_k} is not supported. "
-                f"Only num_speculative_tokens=1 is currently supported."
+        for i in range(self.mtp_k):
+            ret_hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
             )
+            sample_hidden_states = ret_hidden_states[last_token_indices]
+            logits = self.model.compute_logits(sample_hidden_states)
+            new_draft_ids = logits.argmax(dim=-1)
+            draft_token_ids[:, i] = new_draft_ids
+
+            if i < self.mtp_k - 1:
+                # update metadata
+                input_ids = new_draft_ids
+                positions = positions[last_token_indices] + 1
+                hidden_states = sample_hidden_states
+
+        # [batch_size, mtp_k]
+        return draft_token_ids
 
     def prepare_inputs(
         self,
         scheduled_bs: int,
         # [batch_size]
-        num_bonus_tokens: torch.Tensor,
+        last_token_offset: int | torch.Tensor,
     ) -> torch.Tensor:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -173,6 +174,6 @@ class EagleProposer:
         # Calculate new sequence lengths
         context_lens += 1
 
-        token_indices = cu_seqlens_q[1:] - (1 + self.mtp_k - num_bonus_tokens)
+        token_indices = cu_seqlens_q[1:] - last_token_offset
 
         return token_indices
