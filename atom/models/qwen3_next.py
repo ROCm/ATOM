@@ -377,8 +377,6 @@ class Qwen3NextAttention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
 
-        if qkv.device.index==0:
-            print(f"qkv mean {qkv.double().mean()}, std {qkv.double().std()}")
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -392,8 +390,6 @@ class Qwen3NextAttention(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         
-        if q.device.index==0:
-            print(f"befor norm q mean {q.double().mean()}, std {q.double().std()}, k mean {k.double().mean()} k std {k.double().std()}")
         
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
@@ -402,18 +398,9 @@ class Qwen3NextAttention(nn.Module):
             -1, self.num_kv_heads * self.head_dim
         )
 
-        if q.device.index==0:
-            print(f"q mean {q.double().mean()}, std {q.double().std()}, k mean {k.double().mean()} k std {k.double().std()}")
-
         q, k = self.rotary_emb(positions, q, k)
-        
-        if q.device.index==0:
-            print(f"after rope q mean {q.double().mean()}, std {q.double().std()}, k mean {k.double().mean()} k std {k.double().std()} v mean {v.double().mean()} std {v.double().std()}")
 
         attn_output = self.attn(q, k, v)
-        
-        if q.device.index==0:
-            print(f"attn_output {attn_output.double().mean()}, {attn_output.double().std()}")
     
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -558,6 +545,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        
 
         # compilation_config = get_current_vllm_config().compilation_config
         # if prefix in compilation_config.static_forward_context:
@@ -734,8 +722,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         conv_state = self.mamba_k_cache.transpose(-1, -2)
         ssm_state = self.mamba_v_cache
         
-        if conv_state.device.index==0:
-            print(f"prefix: {self.prefix} conv_state ptr {conv_state.data_ptr()}, ssm_state ptr {ssm_state.data_ptr()}, block table {non_spec_state_indices_tensor}")
         
         # if self.prefix=="model.layers.0.linear_attn" and conv_state.device.index==0:
         #     print(f"conv_state sum {conv_state.sum()}, ssm_state sum {ssm_state.sum()}", flush=True)
@@ -903,8 +889,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             core_attn_out_non_spec, last_recurrent_state = None, None
 
         # 3. Merge core attention output
-        if conv_state.device.index==0:
-           print(f"prefix: {self.prefix} conv_state sum {conv_state.sum()}, ssm_state sum {ssm_state.sum()}")
         
         # if self.layer_idx==4:
         #    print("aaaa")
@@ -1019,12 +1003,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if hidden_states.device.index==0:
-            print(f"layer {self.layer_idx} before attn mean: {hidden_states.mean()}, std: {hidden_states.std()}")
-        
-        if hidden_states.shape[0]==1:
-            print("decode")
-        
+
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
             self.linear_attn(
@@ -1040,8 +1019,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
-        if hidden_states.device.index==0:
-            print(f"layer {self.layer_idx} after attn mean: {hidden_states.mean()}, std: {hidden_states.std()}")
         
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -1056,13 +1033,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         
-        if hidden_states.device.index==0:
-            print(f"layer {self.layer_idx} after norm mean: {hidden_states.mean()}, std: {hidden_states.std()}")
-        
         hidden_states = self.mlp(hidden_states)
 
-        if hidden_states.device.index==0:
-            print(f"layer {self.layer_idx} after mlp mean: {hidden_states.mean()}, std: {hidden_states.std()}")
         
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
