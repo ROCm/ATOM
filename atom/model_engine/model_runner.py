@@ -728,7 +728,7 @@ class ModelRunner:
             is_dummy_run=True,
         )
 
-        bs = self.prepare_intputs(dummy_batch)
+        bs = self.prepare_inputs(dummy_batch)
         actual_num_tokens = dummy_batch.total_tokens_num
 
         # self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
