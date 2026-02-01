@@ -2,13 +2,11 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import itertools
-from dataclasses import dataclass
-from typing import Optional, Type
+from typing import Type
 
 import aiter
 import numpy as np
 import torch
-from aiter import dtypes
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention

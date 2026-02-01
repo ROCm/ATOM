@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from aiter import (
@@ -12,7 +12,6 @@ from aiter import (
     concat_and_cache_mla,
     dtypes,
     flash_attn_varlen_func,
-    fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
 )
 from aiter.dist.parallel_state import get_dp_group

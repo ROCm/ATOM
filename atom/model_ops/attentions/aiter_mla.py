@@ -7,8 +7,7 @@ from typing import Type
 import numpy as np
 import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
-from atom.config import KVCacheConfig, KVCacheTensor
+from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import CpuGpuBuffer
