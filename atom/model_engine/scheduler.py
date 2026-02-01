@@ -4,7 +4,6 @@
 import logging
 import time
 from collections import deque
-from typing import Optional
 
 from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
