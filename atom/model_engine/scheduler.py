@@ -298,6 +298,10 @@ class Scheduler:
             return (False, 0)
 
     def _passed_delay(self, now: float) -> bool:
+        # borrowed from https://github.com/vllm-project/vllm/pull/3279
+        # if the earliest arrived request has waited long enough,
+        # i.e., > delay_factor * last_prompt_latency (the latency of last prefill in unit of seconds),
+        # new prefill should be scheduled immediately
         if self.prev_prompt:
             self.last_prompt_latency = now - self.prev_time
         self.prev_time, self.prev_prompt = now, False
