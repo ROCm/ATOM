@@ -551,9 +551,12 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
 
         # record original decorated cls methods
         for key, value in cls.__dict__.items():
-            if (
-                not key.startswith("__")
-                or key in ("__annotations__", "__init__", "__module__", "__qualname__", "__doc__")
+            if not key.startswith("__") or key in (
+                "__annotations__",
+                "__init__",
+                "__module__",
+                "__qualname__",
+                "__doc__",
             ):
                 class_dict[key] = value
 

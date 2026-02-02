@@ -344,6 +344,7 @@ class PagedAttentionImplPluginModeMethods:
         )
 
         from vllm.v1.attention.backends.rocm_aiter_fa import cp_mha_gather_cache
+
         cp_mha_gather_cache(
             key_cache=key_cache,
             value_cache=value_cache,
