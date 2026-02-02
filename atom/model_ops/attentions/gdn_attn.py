@@ -11,7 +11,7 @@ import torch
 from aiter import dtypes
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mha import Attention
+from atom.model_ops.attention_gdn import GatedDetlaNet
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData, Context
@@ -29,8 +29,8 @@ class GDNAttentionBackend(AiterBackend):
         return GDNAttentionMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["Attention"]:
-        return Attention
+    def get_impl_cls() -> Type["GatedDetlaNet"]:
+        return GatedDetlaNet
 
 @dataclass
 class GDNAttentionMetadata:
@@ -233,31 +233,59 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions
 
-
     def build_for_cudagraph_capture(
         self, bs: int
     ):
-        """
-        This method builds the metadata for full cudagraph capture.
-        Currently, only decode is supported for full cudagraphs with Mamba.
-        """
-        m = common_attn_metadata
-
-        assert (
-            m.num_reqs <= self.max_bs
-            and m.num_actual_tokens <= self.max_bs
-        ), (
-            f"GDN only supports decode-only full CUDAGraph capture. "
-            f"Make sure batch size ({m.num_reqs}) <= "
-            f"cudagraph capture sizes ({self.max_bs}), "
-            f"and number of tokens ({m.num_actual_tokens}) <= "
-            f"cudagraph capture sizes ({self.max_bs})."
+        var = self.model_runner.forward_vars
+        if self.block_size == 1024:
+            ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
+        else:
+            ctx_pa_ps = {}
+        attn_metadata = AttentionMetaData(
+            slot_mapping=var["slot_mapping"].gpu[:bs],
+            context_lens=var["context_lens"].gpu[:bs],
+            block_tables=var["block_tables"].gpu[:bs],
+            max_seqlen_q=var["max_qlen"],
+            cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
+            kv_indptr=var["kv_indptr"].gpu[: bs + 1],
+            kv_indices=var["kv_indices"].gpu[:],
+            max_seqlen_k=self.model_runner.config.max_model_len,
+            block_tables_converted=(
+                var["block_tables_converted"].gpu[:bs]
+                if "block_tables_converted" in var
+                else None
+            ),
+            **ctx_pa_ps,
         )
+        gdn_metadata = GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=bs,
+            num_decode_tokens=bs,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=bs,
+            has_initial_state=None,
+            spec_query_start_loc=None,
+            non_spec_query_start_loc=var["cu_seqlens_q"].gpu[: bs + 1],
+            spec_state_indices_tensor=None,
+            non_spec_state_indices_tensor=var["non_spec_state_indices"],
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            num_accepted_tokens=None,
+            nums_dict=None,
+            batch_ptr=None,
+            token_chunk_offset_ptr=None,
+        )
+        attn_metadata.gdn_metadata = gdn_metadata
 
-        num_accepted_tokens = torch.diff(m.query_start_loc)
-        num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
+        positions = var["positions"].copy_to_gpu(bs)
+        context = Context(
+            positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
+        )
+        return attn_metadata, context
 
-        return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
 
 PAD_SLOT_ID = -1
 def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):

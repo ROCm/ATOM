@@ -644,10 +644,11 @@ class ModelRunner:
                     * aligned_index_dim
                     * dtypes.fp8.itemsize
                 )
-        elif self.is_qwen_next:
-            
-            self.num_full_attn = hf_config.num_hidden_layers // 4
-            self.num_gdn_attn_state = hf_config.num_hidden_layers // 4
+        elif self.is_qwen_next():
+            self.full_attention_interval = hf_config.full_attention_interval
+            self.num_full_attn = hf_config.num_hidden_layers // self.full_attention_interval
+            self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
+
             # full attention bytes
             block_bytes = (
                 2
@@ -657,7 +658,7 @@ class ModelRunner:
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-            
+
             # gdn attn bytes
             mamba_shape = self.gated_delta_net_state_shape(
                 get_tp_group().world_size,
@@ -668,7 +669,7 @@ class ModelRunner:
                 hf_config.linear_conv_kernel_dim,
                 0, # self.num_spec,
             )
-            
+
             one_layer_byte = sum(math.prod(subtuple) for subtuple in mamba_shape) * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             block_bytes = block_bytes + self.num_gdn_attn_state * one_layer_byte
         else:
@@ -680,7 +681,7 @@ class ModelRunner:
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-                
+
         num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
             // block_bytes
@@ -740,7 +741,7 @@ class ModelRunner:
 
             self.kv_cache = torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                self.num_full_attn,
                 self.num_physical_kvcache_blocks,
                 self.physical_block_size,
                 num_kv_heads,
@@ -751,7 +752,7 @@ class ModelRunner:
 
             self.kv_scale = torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                self.num_full_attn,
                 self.num_physical_kvcache_blocks,
                 num_kv_heads,
                 self.physical_block_size,
@@ -774,9 +775,6 @@ class ModelRunner:
             self.mamba_v_cache = torch.zeros((self.num_gdn_attn_state, self.num_physical_kvcache_blocks) + mamba_shape[1],
                                            dtype=dtypes.d_dtypes[config.kv_cache_dtype],
                                             device="cuda")
-            # self.kv_cache.mamba_k_cache = self.mamba_k_cache
-            # self.kv_cache.mamba_v_cache = self.mamba_v_cache
-            
         else:
             self.kv_cache = torch.zeros(
                 2,
@@ -821,13 +819,10 @@ class ModelRunner:
                 if hasattr(module, "base_attention"):
                     if hasattr(module, "use_mla") and not module.use_mla:
                         # Non-MLA attention
-                        attn_idx = layer_id
-                        # if self.is_qwen_next:
-                        #     # layer_id 0 : gdn layer 0
-                        #     # layer_id 1 : gdn layer 1
-                        #     # layer_id 2 : gdn layer 2
-                        #     # layer_id 3 : attn layer 0
-                        #     attn_idx = (layer_id + 1) // 4 - 1
+                        if self.is_qwen_next():
+                            attn_idx = layer_id // self.full_attention_interval
+                        else:
+                            attn_idx = layer_id
                         k_cache = self.kv_cache[0, attn_idx].view(
                             self.num_physical_kvcache_blocks,
                             num_kv_heads,
@@ -894,26 +889,19 @@ class ModelRunner:
                         module.kv_cache = kv_cache
                         module.max_model_len = self.config.max_model_len
                         layer_id += 1
-                elif hasattr(module, "in_proj_ba"):
-                    # GDN in qwen-next has "in_proj_ba" attr 
-                    # layer_id 0 : gdn layer 0
-                    # layer_id 1 : gdn layer 1
-                    # layer_id 2 : gdn layer 2
-                    # layer_id 3 : attn layer 0
-                    # layer_id 4 : gdn layer 3
-                    # layer_id 5 : gdn layer 4
-                    gdn_idx = (layer_id + 1) // 4
+                elif hasattr(module, "base_linear_attention"):
+                    gdn_idx = layer_id // self.full_attention_interval * (self.full_attention_interval -1) + layer_id % self.full_attention_interval
+                    mamba_k_cache = self.mamba_k_cache[gdn_idx]
+                    mamba_v_cache = self.mamba_v_cache[gdn_idx]
                     kv_cache_tensor = KVCacheTensor(
                         layer_num=layer_id,
-                        k_cache=self.mamba_k_cache[gdn_idx],
-                        v_cache=self.mamba_v_cache[gdn_idx],
+                        k_cache=mamba_k_cache,
+                        v_cache=mamba_v_cache,
                         k_scale=None,
                         v_scale=None,
                     )
                     kv_cache_tensors.append(kv_cache_tensor)
-                    module.mamba_k_cache = self.mamba_k_cache[gdn_idx]
-                    module.mamba_v_cache = self.mamba_v_cache[gdn_idx]
-                    layer_id = layer_id + 1
+                    layer_id += 1
 
         # Store KVCacheConfig
         kv_cache_data = {
