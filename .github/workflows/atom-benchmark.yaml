@@ -21,7 +21,7 @@ on:
       image:
         description: "Image to use for the benchmark"
         type: string
-        default: "rocm/atom:latest"
+        default: "rocm/atom-dev:latest"
       param_lists:
         description: |
           "Benchmark parameter lists. 
