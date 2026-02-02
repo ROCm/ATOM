@@ -116,16 +116,17 @@ class CompressedTokenizer:
 @dataclass
 class EngramConfig:
     """Configuration for Engram module."""
-    engram_vocab_size: List[int] = field(default_factory=lambda: [5000, 5000])
+    engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     max_ngram_size: int = 3
-    n_embed_per_ngram: int = 64
-    n_head_per_ngram: int = 4
+    n_embed_per_ngram: int = 512
+    n_head_per_ngram: int = 8
     layer_ids: List[int] = field(default_factory=lambda: [1, 3])
     pad_id: int = 0
     seed: int = 42
     kernel_size: int = 4
     tokenizer_name_or_path: Optional[str] = None  # For CompressedTokenizer
-    
+    kernel_size: int = 4
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "EngramConfig":
         valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
@@ -165,10 +166,6 @@ class NgramHashMapping:
         )            
         self.tokenizer_vocab_size = len(self.compressed_tokenizer)
         
-        # if tokenizer_name_or_path is not None and self.compressed_tokenizer.lookup_table:
-        #     if self.pad_id in self.compressed_tokenizer.lookup_table:
-        #         self.pad_id = int(self.compressed_tokenizer.lookup_table[self.pad_id])
-
         max_long = np.iinfo(np.int64).max
         M_max = int(max_long // max(self.tokenizer_vocab_size, 1))
         half_bound = max(1, M_max // 2)
@@ -268,37 +265,37 @@ class NgramHashMapping:
         input_ids = self.compressed_tokenizer(input_ids)
         return self._get_ngram_hashes(input_ids, layer_id)
     
-    def cache_batch_hash_results(self, hash_results: Dict[int, np.ndarray], seq_ids: List[int]):
-        global _global_prefetch_cache, _global_cache_lock
-        with _global_cache_lock:
-            for i, seq_id in enumerate(seq_ids):
-                if seq_id not in _global_prefetch_cache:
-                    _global_prefetch_cache[seq_id] = {}
-                for layer_id in self.layer_ids:
-                    # Extract hash for token i: [1, 1, num_heads]
-                    token_hash = hash_results[layer_id][:, i:i+1, :]
-                    _global_prefetch_cache[seq_id][layer_id] = token_hash
+    # def cache_batch_hash_results(self, hash_results: Dict[int, np.ndarray], seq_ids: List[int]):
+    #     global _global_prefetch_cache, _global_cache_lock
+    #     with _global_cache_lock:
+    #         for i, seq_id in enumerate(seq_ids):
+    #             if seq_id not in _global_prefetch_cache:
+    #                 _global_prefetch_cache[seq_id] = {}
+    #             for layer_id in self.layer_ids:
+    #                 # Extract hash for token i: [1, 1, num_heads]
+    #                 token_hash = hash_results[layer_id][:, i:i+1, :]
+    #                 _global_prefetch_cache[seq_id][layer_id] = token_hash
     
-    def get_cached_hash(self, layer_id: int, seq_id: int) -> Optional[np.ndarray]:
-        global _global_prefetch_cache, _global_cache_lock
-        with _global_cache_lock:
-            if seq_id in _global_prefetch_cache and layer_id in _global_prefetch_cache[seq_id]:
-                hash_result = _global_prefetch_cache[seq_id][layer_id]
-                # Remove from cache after use
-                del _global_prefetch_cache[seq_id][layer_id]
-                if not _global_prefetch_cache[seq_id]:
-                    del _global_prefetch_cache[seq_id]
-                return hash_result
-        return None
+    # def get_cached_hash(self, layer_id: int, seq_id: int) -> Optional[np.ndarray]:
+    #     global _global_prefetch_cache, _global_cache_lock
+    #     with _global_cache_lock:
+    #         if seq_id in _global_prefetch_cache and layer_id in _global_prefetch_cache[seq_id]:
+    #             hash_result = _global_prefetch_cache[seq_id][layer_id]
+    #             # Remove from cache after use
+    #             del _global_prefetch_cache[seq_id][layer_id]
+    #             if not _global_prefetch_cache[seq_id]:
+    #                 del _global_prefetch_cache[seq_id]
+    #             return hash_result
+    #     return None
     
-    def clear_cache(self, seq_id: Optional[int] = None):
-        """Clear global cache"""
-        global _global_prefetch_cache, _global_cache_lock
-        with _global_cache_lock:
-            if seq_id is not None:
-                _global_prefetch_cache.pop(seq_id, None)
-            else:
-                _global_prefetch_cache.clear()
+    # def clear_cache(self, seq_id: Optional[int] = None):
+    #     """Clear global cache"""
+    #     global _global_prefetch_cache, _global_cache_lock
+    #     with _global_cache_lock:
+    #         if seq_id is not None:
+    #             _global_prefetch_cache.pop(seq_id, None)
+    #         else:
+    #             _global_prefetch_cache.clear()
 
 
 class MultiHeadEmbedding(nn.Module):
@@ -317,11 +314,45 @@ class MultiHeadEmbedding(nn.Module):
         self.embedding = nn.Embedding(total_vocab, D)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
     
+    def init_cpu_embedding(self):
+        self.cpu_embedding = self.embedding.weight.detach().cpu().to(torch.float32).numpy()
+        self.cpu_offsets = self.offsets.cpu().numpy()
+    
+    def forward_on_cpu(self, hash_ids: np.ndarray) -> np.ndarray:
+        shifted_ids = hash_ids + self.cpu_offsets[None, None, :]
+        # shifted_ids = np.clip(shifted_ids, 0, self.embedding.num_embeddings - 1)
+        embeddings = self.cpu_embedding[shifted_ids]
+        return embeddings.astype(np.float32)
+    
     def forward(self, hash_ids: torch.Tensor) -> torch.Tensor:
         shifted_ids = hash_ids + self.offsets
-        shifted_ids = shifted_ids.clamp(0, self.embedding.num_embeddings - 1)
+        # TODO: remove clamp in real model
+        # shifted_ids = shifted_ids.clamp(0, self.embedding.num_embeddings - 1)
         return self.embedding(shifted_ids)
-
+    
+    def save_embedding_results(self, embeddings: np.ndarray, seq_ids: List[int], layer_ids: List[int]):
+        global _global_prefetch_cache, _global_cache_lock
+        with _global_cache_lock:
+            for i, seq_id in enumerate(seq_ids):
+                if seq_id not in _global_prefetch_cache:
+                    _global_prefetch_cache[seq_id] = {}
+                for layer_id in layer_ids:
+                    # embeddings[layer_id] shape: [B, T, num_heads, D]
+                    # (B, T, 16, 64), 16 = 8 + 8 for 2 gram + 3 gram
+                    # Extract i-th sequence: [1, T, num_heads, D]
+                    seq_embedding = embeddings[layer_id][i:i+1]
+                    _global_prefetch_cache[seq_id][layer_id] = seq_embedding
+    
+    def get_cached_embedding(self, layer_id: int, seq_id: int) -> Optional[np.ndarray]:
+        global _global_prefetch_cache, _global_cache_lock
+        with _global_cache_lock:
+            if seq_id in _global_prefetch_cache and layer_id in _global_prefetch_cache[seq_id]:
+                embedding = _global_prefetch_cache[seq_id][layer_id]
+                # Remove batch dimension: [1, T, num_heads, D] -> [T, num_heads, D]
+                if embedding.ndim == 4 and embedding.shape[0] == 1:
+                    embedding = embedding[0]
+                return embedding
+        return None
 
 class ShortConv(nn.Module):
     def __init__(
@@ -472,32 +503,39 @@ class EngramOp(nn.Module):
         Returns:
             output: [B, T, D]
         """
-        if hasattr(self, 'hash_buffer') and self.hash_buffer is not None:
-            # Use two-stream pattern: current stream waits for hash stream
-            if hasattr(self, 'hash_stream') and self.hash_stream is not None:
+        B, T = input_ids.shape
+        num_tokens = B * T
+                
+        if (hasattr(self, 'embedding_buffer') and self.embedding_buffer is not None):
+            if hasattr(self, 'embedding_stream') and self.embedding_stream is not None:
                 current_stream = torch.cuda.current_stream()
-                current_stream.wait_stream(self.hash_stream)
+                current_stream.wait_stream(self.embedding_stream)
             
-            # hidden_states shape: [B, T, D], input_ids shape: [B, T]
-            B, T = input_ids.shape
-            num_tokens = B * T  # Total number of tokens
-            hash_ids = self.hash_buffer[:num_tokens]
-            # Reshape to [B, T, num_heads]
-            hash_ids = hash_ids.reshape(B, T, -1)
-            # print(f"self.hash_buffer from buffer: {self.hash_buffer}")
-            # print(f"hash_ids111: {hash_ids}")
+            # embedding_buffer shape: [max_tokens, num_heads, D]
+            embeddings_from_buffer = self.embedding_buffer[:num_tokens]
+            num_heads = embeddings_from_buffer.shape[1]
+            embed_dim = embeddings_from_buffer.shape[2]
+            # Reshape to [B, T, num_heads, D]
+            embeddings_from_buffer = embeddings_from_buffer.reshape(B, T, num_heads, embed_dim)
+            # Flatten to [B, T, num_heads * D]
+            embeddings = embeddings_from_buffer.flatten(start_dim=-2)
+            embeddings = embeddings.to(hidden_states.dtype)
+            
+            # print("input_ids in engram: ", input_ids)
             # input_ids_np = input_ids.cpu().numpy()
-            # # print(f"input_ids_np: {input_ids_np}")
             # hash_ids_np = self.hash_mapping.hash(input_ids_np)[self.layer_id]
-            # hash_ids_check = torch.from_numpy(hash_ids_np).to(hidden_states.device)
-            # print(f"hash_ids222: {hash_ids_np}")
-            # print(f"hash match: {torch.allclose(hash_ids, hash_ids_check)}")
+            # hash_ids = torch.from_numpy(hash_ids_np).to(hidden_states.device)
+            # embeddings2 = self.multi_head_embedding(hash_ids).flatten(start_dim=-2)
+            
+            # print(f"hash_ids: {hash_ids}")
+            # print(f"if same: {torch.allclose(embeddings, embeddings2)}")
+            # print(f"diff: {embeddings - embeddings2}")
+
         else:
             input_ids_np = input_ids.cpu().numpy()
             hash_ids_np = self.hash_mapping.hash(input_ids_np)[self.layer_id]
             hash_ids = torch.from_numpy(hash_ids_np).to(hidden_states.device)
-        
-        embeddings = self.multi_head_embedding(hash_ids).flatten(start_dim=-2)
+            embeddings = self.multi_head_embedding(hash_ids).flatten(start_dim=-2)
         
         key = self.key_norm(self.key_proj(embeddings))
         value = self.value_proj(embeddings)

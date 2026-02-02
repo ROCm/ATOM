@@ -77,6 +77,34 @@ class tokenIDProcessor:
         self.async_copy_stream = torch.cuda.Stream()
         self.engram_ops = []
         self.clean()
+    
+    @staticmethod
+    def compute_engram_embeddings(
+        input_ids_np: np.ndarray,
+        engram_ops: list,
+        layer_id_to_engram_op: dict = None
+    ) -> dict[int, np.ndarray]:
+        if not engram_ops:
+            return {}
+        
+        if layer_id_to_engram_op is None:
+            layer_id_to_engram_op = {op.layer_id: op for op in engram_ops}
+        
+        hash_mapping = engram_ops[0].hash_mapping
+        
+        hash_results = hash_mapping.hash(input_ids_np)
+        
+        embedding_results = {}
+        for engram_op in engram_ops:
+            layer_id = engram_op.layer_id
+            hash_ids = hash_results[layer_id]
+            embeddings = engram_op.multi_head_embedding.forward_on_cpu(hash_ids)
+            # Remove batch dimension if batch size is 1: [1, T, num_heads, D] -> [T, num_heads, D]
+            if embeddings.ndim == 4 and embeddings.shape[0] == 1:
+                embeddings = embeddings[0]
+            embedding_results[layer_id] = embeddings
+        
+        return embedding_results
 
     def send_to_cpu_async(self, gpu_tensor: torch.Tensor, batch: Optional[ScheduledBatch] = None):
         default_stream = torch.cuda.current_stream()
@@ -126,11 +154,17 @@ class tokenIDProcessor:
             
             next_input_ids = np.array([next_input_ids_list], dtype=np.int32)
             
-            def compute_and_cache_batch_hash():
-                hash_results = hash_mapping.hash(next_input_ids)
-                hash_mapping.cache_batch_hash_results(hash_results, valid_seq_ids)
+            def compute_and_cache_batch_hash_and_embedding():
+                embedding_results = tokenIDProcessor.compute_engram_embeddings(
+                    next_input_ids, engram_ops
+                )
+                
+                if engram_ops and embedding_results:
+                    engram_ops[0].multi_head_embedding.save_embedding_results(
+                        embedding_results, valid_seq_ids, hash_mapping.layer_ids
+                    )
             
-            threading.Thread(target=compute_and_cache_batch_hash, daemon=True).start()
+            threading.Thread(target=compute_and_cache_batch_hash_and_embedding, daemon=True).start()
             
         except Exception as e:
             logger.warning(e)
@@ -368,7 +402,7 @@ class ModelRunner:
         )
         self.sampler = Sampler()
         
-        self.engram_hash_buffers = {}
+        self.engram_buffers = {}
         if self.config.speculative_config and get_pp_group().is_last_rank:
             self.drafter = EagleProposer(self.config, self.device, self)
         self.arange_np = np.arange(
@@ -401,7 +435,7 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
         self.tokenID_processor.engram_ops = self.get_engram_op()
         
-        self._init_engram_hash_buffers()
+        self._init_engram_buffers()
 
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
@@ -414,32 +448,36 @@ class ModelRunner:
                 engram_ops.append(module)
         return engram_ops
     
-    def _init_engram_hash_buffers(self):
+    def _init_engram_buffers(self):
         engram_ops = self.get_engram_op()
         if not engram_ops:
             return
+        
+        for engram_op in engram_ops:
+            engram_op.multi_head_embedding.init_cpu_embedding()
         
         try:
             hash_mapping = engram_ops[0].hash_mapping
             max_tokens = self.config.max_num_batched_tokens
             
             num_hash_heads = (hash_mapping.max_ngram_size - 1) * hash_mapping.n_head_per_ngram
-            
+            embed_dim = hash_mapping.n_embed_per_ngram // hash_mapping.n_head_per_ngram
+                        
             for layer_id in hash_mapping.layer_ids:
-                # Max Buffer size: max_tokens x num_hash_heads
-                hash_buffer = CpuGpuBuffer(
-                    max_tokens * num_hash_heads,
-                    dtype=torch.long,
-                    device=self.device
+                embedding_buffer = CpuGpuBuffer(
+                    max_tokens * num_hash_heads * embed_dim,
+                    dtype=torch.float32,
+                    device=self.device,
+                    with_numpy=True
                 )
-                self.engram_hash_buffers[layer_id] = hash_buffer
+                self.engram_buffers[layer_id] = embedding_buffer
 
-            if not hasattr(self, 'engram_hash_stream'):
-                self.engram_hash_stream = torch.cuda.Stream()
+            if not hasattr(self, 'engram_embedding_stream'):
+                self.engram_embedding_stream = torch.cuda.Stream()
             for engram_op in engram_ops:
-                hash_buffer = self.engram_hash_buffers[engram_op.layer_id]
-                engram_op.hash_buffer = hash_buffer.gpu.reshape(max_tokens, num_hash_heads)
-                engram_op.hash_stream = self.engram_hash_stream
+                embedding_buffer = self.engram_buffers[engram_op.layer_id]
+                engram_op.embedding_buffer = embedding_buffer.gpu.reshape(max_tokens, num_hash_heads, embed_dim)
+                engram_op.embedding_stream = self.engram_embedding_stream
 
         except Exception as e:
             logger.warning(e)
@@ -979,8 +1017,10 @@ class ModelRunner:
         buffer.np[:bs] = batch.temperatures
         return buffer.copy_to_gpu(bs)
     
-    def prepare_engram_hash_to_gpu(self, batch: ScheduledBatch):
-        if not self.engram_hash_buffers:
+    def prepare_engram_embeddings_to_gpu(self, batch: ScheduledBatch):
+        """Transfer precomputed embeddings to GPU.
+        """
+        if not self.engram_buffers:
             return
         
         try:
@@ -991,46 +1031,87 @@ class ModelRunner:
             req_ids = batch.req_ids
             hash_mapping = engram_ops[0].hash_mapping
             
-            cached_hashes_per_layer = {layer_id: [] for layer_id in hash_mapping.layer_ids}
+            layer_id_to_engram_op = {op.layer_id: op for op in engram_ops}
+            
+            cached_embeddings_per_layer = {layer_id: [] for layer_id in hash_mapping.layer_ids}
+            seqs_need_compute = []
             
             for seq_id in req_ids:
-                seq_hashes = {}
-                for layer_id in hash_mapping.layer_ids:
-                    cached_hash = hash_mapping.get_cached_hash(layer_id, seq_id)
-                    if cached_hash is not None:
-                        seq_hashes[layer_id] = cached_hash
+                seq_embeddings = {}
                 
-                if len(seq_hashes) == len(hash_mapping.layer_ids):
+                for layer_id in hash_mapping.layer_ids:
+                    engram_op = layer_id_to_engram_op.get(layer_id)
+                    if engram_op is None:
+                        continue
+                    
+                    cached_embedding = engram_op.multi_head_embedding.get_cached_embedding(layer_id, seq_id)
+
+                    # print(f"cached_embedding: {cached_embedding.shape}")
+                    if cached_embedding is not None and cached_embedding.size > 0:
+                        seq_embeddings[layer_id] = cached_embedding
+                
+                if len(seq_embeddings) == len(hash_mapping.layer_ids):
                     for layer_id in hash_mapping.layer_ids:
-                        # cached_hash shape: [1, 1, num_heads] -> [1, num_heads]
-                        cached_hashes_per_layer[layer_id].append(seq_hashes[layer_id][0])
-            # print("cached_hashes_per_layer: ", cached_hashes_per_layer)
-            if not cached_hashes_per_layer[hash_mapping.layer_ids[0]]:
+                        embedding = seq_embeddings[layer_id]
+                        cached_embeddings_per_layer[layer_id].append(embedding)
+                else:
+                    seqs_need_compute.append(seq_id)
+            
+            # It means has no prev batch to precompute, it's new prefill case, compute here
+            if seqs_need_compute:
+                # Use cpu input_ids to avoid GPU->CPU copy
+                total_tokens = batch.total_tokens_num
+                input_ids_np = self.tokenID_processor.input_ids.np[:total_tokens].reshape(1, -1)
+                
+                embedding_results = tokenIDProcessor.compute_engram_embeddings(
+                    input_ids_np, engram_ops, layer_id_to_engram_op
+                )
+                
+                for layer_id in hash_mapping.layer_ids:
+                    if layer_id not in embedding_results:
+                        continue
+                    
+                    embeddings = embedding_results[layer_id]
+                    cached_embeddings_per_layer[layer_id].append(embeddings)
+            
+            first_layer_embeddings = cached_embeddings_per_layer[hash_mapping.layer_ids[0]]
+            if not first_layer_embeddings or len(first_layer_embeddings) == 0:
                 return
             
-            if not hasattr(self, 'engram_hash_stream'):
-                self.engram_hash_stream = torch.cuda.Stream()
+            for emb in first_layer_embeddings:
+                if emb is None or emb.size == 0:
+                    return
             
-            total_tokens = sum(h.shape[0] for h in cached_hashes_per_layer[hash_mapping.layer_ids[0]])
             default_stream = torch.cuda.current_stream()
+            total_tokens = sum(e.shape[0] for e in first_layer_embeddings)
             
-            with torch.cuda.stream(self.engram_hash_stream):
-                self.engram_hash_stream.wait_stream(default_stream)
+            if total_tokens == 0:
+                return
+            
+            with torch.cuda.stream(self.engram_embedding_stream):
+                self.engram_embedding_stream.wait_stream(default_stream)
                 
                 for layer_id in hash_mapping.layer_ids:
-                    if layer_id not in self.engram_hash_buffers:
+                    if layer_id not in self.engram_buffers:
                         continue
                     
-                    if not cached_hashes_per_layer[layer_id]:
+                    layer_embeddings = cached_embeddings_per_layer[layer_id]
+                    if not layer_embeddings or len(layer_embeddings) == 0:
                         continue
                     
-                    hash_ids_flat_np = np.concatenate(cached_hashes_per_layer[layer_id], axis=0)
+                    valid_embeddings = [e for e in layer_embeddings if e is not None and e.size > 0]
+                    if not valid_embeddings:
+                        continue
+                    
+                    embeddings_np = np.concatenate(valid_embeddings, axis=0)
                     
                     # Write to CPU buffer and copy to GPU asynchronously
-                    hash_buffer = self.engram_hash_buffers[layer_id]
-                    num_hash_heads = hash_ids_flat_np.shape[1]
-                    hash_buffer.np[:total_tokens * num_hash_heads] = hash_ids_flat_np.flatten()
-                    hash_buffer.copy_to_gpu(total_tokens * num_hash_heads)
+                    embedding_buffer = self.engram_buffers[layer_id]
+                    num_hash_heads = embeddings_np.shape[1]
+                    embed_dim = embeddings_np.shape[2]
+                    total_elements = total_tokens * num_hash_heads * embed_dim
+                    embedding_buffer.np[:total_elements] = embeddings_np.flatten()
+                    embedding_buffer.copy_to_gpu(total_elements)
             
         except Exception as e:
             logger.warning(e)
@@ -1043,7 +1124,8 @@ class ModelRunner:
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         # if self.rank == 0:
         #     print(f"input_ids: {input_ids}")
-        self.prepare_engram_hash_to_gpu(batch)
+        # Prepare engram embeddings using CPU-side input_ids
+        self.prepare_engram_embeddings_to_gpu(batch)
         self.prepare_intputs(batch)
         temperatures = self.prepare_sample(batch)
         return (
