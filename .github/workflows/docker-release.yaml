@@ -127,17 +127,11 @@ jobs:
         if: ${{ success() }}
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
-          if [[ ${{ matrix.base_image }} == *ROCm_7.2* ]]; then
-            TAG=nightly_rocm_7.2_preview_$(date +%Y%m%d%H%M)
-            docker tag atom_release:ci rocm/atom:rocm_7.2_preview_latest
-            docker push rocm/atom:rocm_7.2_preview_latest
-          else
-            TAG=nightly_$(date +%Y%m%d%H%M)
-            docker tag atom_release:ci rocm/atom:latest
-            docker push rocm/atom:latest
-          fi
-          docker tag atom_release:ci rocm/atom:${TAG}
-          docker push rocm/atom:${TAG}
+          TAG=nightly_$(date +%Y%m%d%H%M)
+          docker tag atom_release:ci rocm/atom-dev:latest
+          docker push rocm/atom-dev:latest
+          docker tag atom_release:ci rocm/atom-dev:${TAG}
+          docker push rocm/atom-dev:${TAG}
 
       - name: Clean Up
         if: always()
