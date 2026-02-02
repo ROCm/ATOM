@@ -111,7 +111,6 @@ jobs:
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
-          --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
@@ -214,7 +213,6 @@ jobs:
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
-          --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
