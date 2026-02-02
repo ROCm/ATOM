@@ -713,7 +713,8 @@ class PagedAttentionImplPluginModeMethods:
                 )
             else:
                 # Qwen only uses gluon pa decode when bs=64
-                if num_decodes == 64:
+                QWEN_GLUON_PA_DECODE_BS = 64
+                if num_decodes == QWEN_GLUON_PA_DECODE_BS:
                     self.paged_attention_triton_plugin_mode(
                         q=query[:num_decode_tokens],
                         k_cache=new_key_cache,

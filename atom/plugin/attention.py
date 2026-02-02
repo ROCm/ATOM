@@ -479,7 +479,7 @@ class vllmAttentionMetadataBuilderMethods:
 
         num_actual_kv_tokens = torch.sum(seq_lens).item()
 
-        use_cascade = common_prefix_len > 0
+        use_cascade = False
 
         context_batch_size = 0
         has_prefill = bool(num_prefills > 0 or num_extends > 0)

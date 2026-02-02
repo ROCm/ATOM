@@ -69,13 +69,12 @@ def set_attn_cls() -> None:
     Set the attention class for constructing the model based on the framework
     """
     import atom.model_ops as ops
-    from atom.model_ops import PagedAttention, RadixAttention
 
     if is_vllm():
-        ops.ATTN_CLS = PagedAttention
+        ops.ATTN_CLS = ops.PagedAttention
         logger.info("Set ATTN_CLS to PagedAttention for vLLM")
     elif is_sglang():
-        ops.ATTN_CLS = RadixAttention
+        ops.ATTN_CLS = ops.RadixAttention
         logger.info("Set ATTN_CLS to RadixAttention for SGLang")
 
 
