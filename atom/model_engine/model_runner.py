@@ -1389,7 +1389,7 @@ class ModelRunner:
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
     ):
-        num_scheduled_tokens = batch.total_tokens_num
+        # num_scheduled_tokens = batch.total_tokens_num
         forward_context = get_forward_context()
 
         positions = forward_context.context.positions
