@@ -102,14 +102,6 @@ jobs:
             MODEL_MOUNT=""
           fi
 
-          cat > /tmp/env_file.txt << 'EOF'
-          ${{ inputs.extra_args }}
-          EOF
-
-          echo "Starting container: atom-benchmark"
-          echo "Model-specific environment variables for ${{ env.MODEL_PATH }}:"
-          cat /tmp/env_file.txt
-
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           $MODEL_MOUNT \
@@ -212,14 +204,6 @@ jobs:
             echo "Warning: /models directory not found on runner; skipping /models mount and disabling model pre-download optimization."
             MODEL_MOUNT=""
           fi
-
-          cat > /tmp/env_file.txt << 'EOF'
-          ${{ inputs.extra_args }}
-          EOF
-
-          echo "Starting container: atom-benchmark"
-          echo "Model-specific environment variables for ${{ env.MODEL_PATH }}:"
-          cat /tmp/env_file.txt
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
