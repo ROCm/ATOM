@@ -150,7 +150,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if self.is_sparse
                 else var["kv_indptr"].gpu[: bs + 1]
             ),
-            # var["kv_last_page_lens"].gpu[:bs],
+            var["kv_last_page_lens"].gpu[:bs],
             self.num_attention_heads,
             1,  # nhead_kv,
             True,
@@ -160,7 +160,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            # page_size=self.block_size,
+            page_size=self.block_size,
             **split_params,
         )
         return {

@@ -568,7 +568,6 @@ class ModelRunner:
             ),
             dtype=np.int64,
         )
-        self.async_output_copy_stream = torch.cuda.Stream()
 
         model_class = resolve_obj_by_qualname(support_model_arch_dict[hf_config.architectures[0]])  # type: ignore
         self.model = model_class(config)
@@ -819,7 +818,7 @@ class ModelRunner:
         seqs = {seq.id: seq for seq in seqs}
 
         num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
-        total_tokens_num = num_scheduled_tokens.sum()
+        total_tokens_num = int(num_scheduled_tokens.sum())
 
         dummy_batch = ScheduledBatch(
             seqs=seqs,
@@ -1392,8 +1391,6 @@ class ModelRunner:
     ):
         num_scheduled_tokens = batch.total_tokens_num
         forward_context = get_forward_context()
-        if not forward_context.attn_metadata.slot_mapping.numel():
-            return self.drafter.dummy_run(input_ids, num_scheduled_tokens)
 
         positions = forward_context.context.positions
         spec_decode_metadata = forward_context.spec_decode_metadata

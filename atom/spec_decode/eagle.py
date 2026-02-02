@@ -93,19 +93,6 @@ class EagleProposer:
             logger.info("Loading EAGLE LM head weights from the target model.")
             self.model.lm_head = target_model.lm_head
 
-    @torch.inference_mode()
-    def dummy_run(
-        self,
-        input_ids: torch.Tensor,
-        num_tokens: int,
-    ) -> None:
-        self.model(
-            input_ids=input_ids,
-            positions=self.positions[:num_tokens],
-            hidden_states=self.hidden_states[:num_tokens],
-            inputs_embeds=None,
-        )
-
     def propose(
         self,
         # [num_tokens]
