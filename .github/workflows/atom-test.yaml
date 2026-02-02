@@ -61,7 +61,7 @@ jobs:
             runner: atom-mi355-8gpu.predownload
     runs-on: ${{ matrix.runner }}
     env:
-      ATOM_BASE_NIGTHLY_IMAGE: rocm/atom:latest
+      ATOM_BASE_NIGTHLY_IMAGE: rocm/atom-dev:latest
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
