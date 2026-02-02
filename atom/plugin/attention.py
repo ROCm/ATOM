@@ -97,17 +97,11 @@ class MetadataForPluginMode:
     prefill_metadata: Optional[AiterFlashAttentionPrefillMetadata] = None
     extend_metadata: Optional[AiterFlashAttentionChunkPrefillMetadata] = None
 
-    # For cascade attention.
-    use_cascade: bool
-    common_prefix_len: int
-    total_tokens: int
+    use_cascade: bool = False
+    common_prefix_len: int = 0
+    total_tokens: int = 0
 
     context: Optional[Context] = None
-
-    # # Only for fp8 shuffle layout kv cache, we allocate kv_scale for each layer
-    # # since we might integrate per token quant for kv cache in the future.
-    # k_scale: dict[str, torch.Tensor] | None
-    # v_scale: dict[str, torch.Tensor] | None
 
 
 class vllmAiterBackendMethods:
