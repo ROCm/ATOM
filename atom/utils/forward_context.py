@@ -3,7 +3,7 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Union
 
 import numpy as np
 import torch
