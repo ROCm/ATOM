@@ -19,19 +19,13 @@
 # limitations under the License.
 
 import torch
-import triton
-import triton.language as tl
-import importlib.util
 from typing import Any
-from functools import cache
 import logging
 from math import prod
 from aiter.jit.utils.chip_info import get_gfx
-from aiter import dtypes
 from atom.model_ops.utils import has_triton_kernels
 
 logger = logging.getLogger("atom")
-
 
 
 if has_triton_kernels():
@@ -53,7 +47,6 @@ def _swizzle_mxfp4(quant_tensor, scale):
     assert has_triton_kernels()
     from triton_kernels.numerics import InFlexData
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-    from triton_kernels.tensor_details import layout
     from triton_kernels.tensor_details.layout import StridedLayout
 
     value_layout_opts: dict[str, Any] = {}

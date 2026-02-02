@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List, Tuple, Optional, Union
+from typing import Tuple, Optional
 import torch
 from torch import Tensor
 from torch.overrides import (
@@ -13,7 +13,6 @@ from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
     rmsnorm2d_fwd_with_add,
-    rms_norm,
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
 )
@@ -24,7 +23,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from aiter import (
     QuantType,
-    dtypes,
 )
 
 
@@ -127,7 +125,7 @@ def mxfp4_rms_quant_fuse_fake(
     eps: float,
     shuffle: bool = False,
     res1: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, N = x.shape
     out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -144,12 +142,10 @@ def mxfp4_rms_quant_fuse_fake(
         dtype=torch.float8_e8m0fnu,
         device=x.device,
     )
-
-    if res1 is None:
-        return (out, scale, None)
-    else:
-        res = torch.empty_like(res1)
-        return (out, scale, res)
+    out_res1 = None
+    if res1 is not None:
+        out_res1 = torch.empty_like(res1)
+    return (out, scale, out_res1)
 
 
 # It's important to use mutates_args=[] to avoid functionized_v2 op generation
@@ -160,19 +156,16 @@ def mxfp4_rms_quant_fuse(
     eps: float,
     shuffle: bool = False,
     res1: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.fused_mxfp4_quant import (
         fused_rms_mxfp4_quant,
     )
 
-    if res1 is None:
-        (x, x_scale), _, _, _ = fused_rms_mxfp4_quant(x, weight, eps, shuffle=True)
-        return (x, x_scale, None)
-    else:
-        (x, x_scale), _, _, residual = fused_rms_mxfp4_quant(
-            x, weight, eps, shuffle=True, res1=res1
-        )
-        return (x, x_scale, residual)
+    (x_quant, x_scale), _, _, residual_out = fused_rms_mxfp4_quant(
+        x, weight, eps, shuffle=shuffle, res1=res1
+    )
+
+    return x_quant, x_scale, residual_out
 
 
 class RMSNorm(nn.Module):

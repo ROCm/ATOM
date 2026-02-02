@@ -8,6 +8,7 @@ import aiter
 from aiter import dtypes
 from typing import Union, Optional
 
+
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -106,7 +107,7 @@ class RotaryEmbedding(nn.Module):
         else:
             query_ = query[..., -self.rotary_dim :]
             key_ = key[..., -self.rotary_dim :] if key is not None else None
-        
+
         aiter.rope_cached_positions_2c_fwd_inplace(
             query_,
             key_,

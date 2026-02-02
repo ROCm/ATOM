@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from functools import cache, lru_cache
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -15,7 +15,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 def is_rocm_aiter_fusion_shared_expert_enabled() -> bool:
     config = get_current_atom_config()
     dp_size = config.parallel_config.data_parallel_size
-    if dp_size > 1 and _has_module("mori"):
+    if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
         return False
     return True
 

@@ -22,18 +22,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
-import logging
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
-import aiter
+import logging
+from typing import Any, Dict, Optional, Tuple, Union
+
 import torch
 from aiter import (
     QuantType,
-    concat_and_cache_mla,
     cp_gather_indexer_k_quant_cache,
     dtypes,
-    flash_attn_varlen_func,
-    gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
@@ -41,11 +38,7 @@ from aiter import (
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-)
+from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import (
@@ -56,15 +49,14 @@ from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
     fused_rms_mxfp4_quant,
 )
-from aiter.ops.triton.pa_mqa_logits import (
-    deepgemm_fp8_paged_mqa_logits,
-    deepgemm_fp8_paged_mqa_logits_stage1,
-)
+from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.rotary_embedding import get_rope
-from torch import nn
-from transformers import PretrainedConfig
-
-from atom.config import Config, QuantizationConfig, get_current_atom_config, CompilationLevel
+from atom.config import (
+    CompilationLevel,
+    Config,
+    QuantizationConfig,
+    get_current_atom_config,
+)
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules, is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.base_attention import Attention
@@ -78,13 +70,12 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     use_triton_gemm,
 )
-from atom.model_ops.utils import _has_module
-
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
     is_rocm_aiter_fuse_routed_scaling_factor,
     is_rocm_aiter_fusion_shared_expert_enabled,
 )
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, _has_module
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -96,6 +87,8 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from torch import nn
+from transformers import PretrainedConfig
 
 # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
@@ -119,7 +112,6 @@ if use_triton_gemm():
         gemm_a16wfp4_preshuffle = None
         gemm_a8w8_blockscale_preshuffle = None
         gemm_a16w8_blockscale_preshuffle = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
@@ -843,26 +835,28 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             if hidden_states.dtype != torch.float16:
                 final_hidden_states = self.experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits)
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
                 if not is_rocm_aiter_fuse_routed_scaling_factor():
-                    final_hidden_states = final_hidden_states * self.routed_scaling_factor
+                    final_hidden_states = (
+                        final_hidden_states * self.routed_scaling_factor
+                    )
             else:
                 final_hidden_states = self.experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits)
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
 
         current_stream.wait_stream(alt_stream)
 
         if hidden_states.dtype != torch.float16:
             final_hidden_states = final_hidden_states + shared_output
         else:
-            final_hidden_states = final_hidden_states + shared_output \
-                * (1. / self.routed_scaling_factor)
+            final_hidden_states = final_hidden_states + shared_output * (
+                1.0 / self.routed_scaling_factor
+            )
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1518,6 +1512,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         cache_config: str = "bf16",
         quant_config: Optional[QuantizationConfig] = None,
         layer_num: int = 0,
+        is_mtp_block: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1598,7 +1593,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=self.fuse_ar_input_norm and self.layer_idx > 0,
+            fused_allreduce=self.fuse_ar_input_norm
+            and self.layer_idx > 0
+            and not is_mtp_block,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,

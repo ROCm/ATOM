@@ -33,6 +33,7 @@ class EngineArgs:
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
+    scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
@@ -76,9 +77,9 @@ class EngineArgs:
             help="Enable prefix caching.",
         )
         parser.add_argument(
-            "--port", 
-            type=int, 
-            default=8006, 
+            "--port",
+            type=int,
+            default=8006,
             help="Engine internal port",
         )
         parser.add_argument(
@@ -156,6 +157,13 @@ class EngineArgs:
             default=0.9,
             help="GPU memory utilization (0.0 to 1.0)",
         )
+        parser.add_argument(
+            "--scheduler-delay-factor",
+            type=float,
+            default=0.0,
+            help="Apply a delay (of delay factor multiplied by previous"
+            "prompt latency) before scheduling next prompt.",
+        )
 
         return parser
 
@@ -170,17 +178,23 @@ class EngineArgs:
 
     def _get_engine_kwargs(self) -> dict:
         """Get common engine initialization kwargs.
-        
+
         Most fields are directly passed through with the same name.
         Only handles special cases that need transformation.
         """
-        kwargs = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "model"}
-        
+        kwargs = {
+            f.name: getattr(self, f.name) for f in fields(self) if f.name != "model"
+        }
+
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
-            cudagraph_capture_sizes=parse_size_list(kwargs.pop("cudagraph_capture_sizes")) if self.cudagraph_capture_sizes else None,
+            cudagraph_capture_sizes=(
+                parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
+                if self.cudagraph_capture_sizes
+                else None
+            ),
         )
         if self.method:
             kwargs["speculative_config"] = SpeculativeConfig(
@@ -192,7 +206,7 @@ class EngineArgs:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs["speculative_config"] = None
-        
+
         return kwargs
 
     def create_engine(self) -> LLMEngine:
