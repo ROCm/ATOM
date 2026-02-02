@@ -16,7 +16,7 @@ from atom.config import QuantizationConfig, Config
 from atom.model_loader.loader import mamba_v2_sharded_weight_loader
 from atom.model_ops.activation import SiluAndMul
 # from atom.model_ops.attention import Attention
-from atom.model_ops.base_attention import Attention
+from atom.model_ops.base_attention import Attention, LinearAttention
 from atom.model_ops.layernorm import RMSNorm, RMSNormGated, GemmaRMSNorm
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
 from atom.model_ops.linear import (
@@ -526,9 +526,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         )
 
-        # set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        # set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
-
         self.norm = RMSNormGated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
@@ -546,11 +543,21 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             prefix=f"{prefix}.out_proj",
         )
         
+        self.attn = LinearAttention(
+            self.hidden_size,
+            self.num_v_heads,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.key_dim,
+            self.value_dim,
+            dt_bias=self.dt_bias,
+            A_log=self.A_log,
+            conv1d=self.conv1d,
+            activation=self.activation,
+            layer_num=extract_layer_index(self.prefix),
+        )
 
-        # compilation_config = get_current_vllm_config().compilation_config
-        # if prefix in compilation_config.static_forward_context:
-        #     raise ValueError(f"Duplicate layer name: {prefix}")
-        # compilation_config.static_forward_context[prefix] = self
 
     def fix_query_key_value_ordering(
         self,
@@ -659,20 +666,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             device=hidden_states.device,
         )
 
-        # torch.ops.vllm.gdn_attention_core(
-        #     mixed_qkv,
-        #     b,
-        #     a,
-        #     core_attn_out,
-        #     self.prefix,
-        # )
-        
-        self._forward_core(
-            mixed_qkv,
-            b,
-            a,
-            core_attn_out,
-        )
+        self.attn(mixed_qkv, b, a, core_attn_out)
 
         # ============================================================
         # Part 3: Output Projection
