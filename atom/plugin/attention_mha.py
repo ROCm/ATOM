@@ -146,7 +146,6 @@ class PagedAttentionImplPluginModeMethods:
                 output_zeros=False,
             )
         else:
-            # for asm paged attention 
             if self.rotary_emb is not None:
                 assert position is not None
                 q, k = self.rotary_emb(position, q, k)
@@ -428,9 +427,6 @@ class PagedAttentionImplPluginModeMethods:
         key_fetched, value_fetched = workspace[0], workspace[1]
         chunked_output = None
         chunked_lse = None
-        # key_cache_for_gather, value_cache_for_gather, _ = (
-        #     self._get_cp_mha_gather_cache_views(key_cache, value_cache)
-        # )
         for chunk_idx in range(num_chunks):
             cp_mha_gather_cache(
                 key_cache=key_cache,
@@ -564,7 +560,7 @@ class PagedAttentionImplPluginModeMethods:
             layer.k_scale = self.k_scale
             layer.v_scale = self.v_scale
 
-        # rope and cache flush fusion
+        # rope and cache flush fusion. ATOM always use shuffle layout for kv cache
         result = self.rope_cache_plugin_mode(q=query,
                                              k=key,
                                              v=value,

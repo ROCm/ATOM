@@ -78,13 +78,13 @@ def safetensors_weights_iterator(
 
 
 # when plugin mode, model loader method is bind to model implementation
-# thus call this interface to load the model, which leverags the load_model
+# thus call this interface to load the model, which leverages the load_model
 # method
 def load_model_in_plugin_mode(
     model,
     config,
     prefix: str = "",
-) -> set[str] | None:
+) -> set[str]:
 
     # during loading model, the outplace operation may consume more
     # GPU mem, which cached in torch caching allocator, here actively
@@ -127,7 +127,7 @@ def load_model(
 ):
     # need to record the loaded weight name for vllm load check
     # it is only used in plugin mode for vllm
-    loaded_weights_record = set[str]()
+    loaded_weights_record: set[str] = set()
 
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})

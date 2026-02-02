@@ -1,5 +1,4 @@
 import os
-from sre_parse import MAX_UNTIL
 import sys
 
 from typing import Any, Optional
@@ -225,8 +224,10 @@ def generate_atom_config_for_plugin_mode(config: Any = None):
     elif is_sglang():
         atom_config = _generate_atom_config_from_sglang_config(config)
     else:
-        raise ValueError("Make sure ATOM is running in plugin mode, \
-            the function generate_atom_config_for_plugin_mode should be called in plugin mode")
+        raise ValueError(
+            "Make sure ATOM is running in plugin mode; "
+            "generate_atom_config_for_plugin_mode should be called in plugin mode."
+        )
 
     # set the current atom config for the custom model
     set_current_atom_config(atom_config)

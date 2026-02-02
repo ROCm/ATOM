@@ -17,7 +17,7 @@ def _apply_moe_decoration(original_cls: Type[T]) -> Type[T]:
     """
     is_vllm_mode = is_vllm()
     if is_vllm_mode:
-        # rename this class because the vllm will call the modular 
+        # Rename this class because vLLM will call the modular 
         # kernel init method for all modules of the model, whose name is FusedMoE,
         # to init the inside kernel, while for plugin mode, the atom maintains
         # the kernel lifecycle by itself, so there is no need to call init on
@@ -44,9 +44,7 @@ def FusedMoEDecoratorForPluginMode(cls: Type[T]) -> Type[T]:
         return decorated
 
     class LazyMoEWrapper(original_cls):
-        """Wrapper that defers decoration until first instantiation."""
-
-        def __new__(cls_wrapper, *args, **kwargs):
+        def __new__(cls, *args, **kwargs):
             decorated_cls = get_decorated_class()
             return decorated_cls(*args, **kwargs)
 
@@ -56,5 +54,4 @@ def FusedMoEDecoratorForPluginMode(cls: Type[T]) -> Type[T]:
     LazyMoEWrapper.__module__ = original_cls.__module__
 
     logger.info(f'Create lazy wrapper for FusedMoE to change the naming')
-
     return LazyMoEWrapper

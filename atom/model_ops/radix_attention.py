@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import aiter
 import torch
 from torch import nn
 from typing import Optional
@@ -68,7 +67,7 @@ class RadixAttention(BaseAttention):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
-        position: torch.Tensor = None,
+        positions: torch.Tensor = None,
         q_scale: torch.Tensor=None,
         **kwargs,
     ):
@@ -81,15 +80,16 @@ class RadixAttention(BaseAttention):
                              v=value,
                              forward_batch=forward_batch)
         else:
-            raise NotImplementedError("RadixAttention is only supported \
-                for plugin mode for sglang for now")
+            raise NotImplementedError(
+                "RadixAttention is only supported for plugin mode for sglang for now"
+            )
 
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        position: torch.Tensor = None,
+        positions: torch.Tensor = None,
         q_scale: Optional[torch.Tensor]=None,
         **kwargs,
     ):
@@ -97,10 +97,11 @@ class RadixAttention(BaseAttention):
             o = self.forward_impl_plugin_mode(query=query,
                                               key=key,
                                               value=value,
-                                              position=position,
+                                              positions=positions,
                                               q_scale=q_scale,
                                               **kwargs)
         else:
-            raise NotImplementedError("RadixAttention is not supported for server \
-                mode for now")
+            raise NotImplementedError(
+                "RadixAttention is not supported for server mode for now"
+            )
         return o

@@ -1,4 +1,3 @@
-import torch
 import logging
 
 from atom.models.qwen3 import Qwen3ForCausalLM

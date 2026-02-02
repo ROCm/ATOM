@@ -74,6 +74,8 @@ class PagedAttentionImpl(nn.Module):
         if is_vllm():
             self.supports_quant_query_input = False
 
+    # this method will just be called by vLLM and there is no logic in this method
+    # as ATOM handle the process after loading weights for all ops by itself
     def process_weights_after_loading(self, act_dtype: torch.dtype = torch.bfloat16):
         pass
 

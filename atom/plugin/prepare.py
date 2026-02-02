@@ -15,15 +15,11 @@ _CURRENT_FRAMEWORK = "atom"
 
 def is_sglang() -> bool:
     global _CURRENT_FRAMEWORK
-    if _CURRENT_FRAMEWORK is None:
-        raise ValueError("_CURRENT_FRAMEWORK must be set before use")
     return bool(_CURRENT_FRAMEWORK.lower() in ["sglang", "sgl"])
 
 
 def is_vllm() -> bool:
     global _CURRENT_FRAMEWORK
-    if _CURRENT_FRAMEWORK is None:
-        raise ValueError("_CURRENT_FRAMEWORK must be set before use")
     return bool(_CURRENT_FRAMEWORK.lower() in ["vllm"])
 
 
@@ -64,7 +60,11 @@ def prepare_model(config: Any, engine: str):
     )
 
     if model_arch not in _ATOM_SUPPORTED_MODELS:
-        logger.warning(f"ATOM does not support the required model architecture: {model_arch}")
+        supported_archs = list(_ATOM_SUPPORTED_MODELS.keys())
+        raise ValueError(
+            f"ATOM does not support the required model architecture: {model_arch}. "
+            f"For now supported model architectures: {supported_archs}"
+        )
 
     from atom.plugin.config import generate_atom_config_for_plugin_mode
     atom_config = generate_atom_config_for_plugin_mode(config)

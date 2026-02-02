@@ -1,4 +1,4 @@
-from typing import Any, Type, Optional
+from typing import Optional
 import logging
 
 from dataclasses import dataclass
@@ -53,7 +53,7 @@ class AiterChunkContextMetadata:
     seq_lens: torch.Tensor
     num_chunks: int
     total_token_per_batch: list[int]
-    swa_metadata: AiterChunkSlidingWindowMetadata | None
+    swa_metadata: Optional[AiterChunkSlidingWindowMetadata] = None
 
 
 @dataclass
@@ -84,7 +84,7 @@ class MetadataForPluginMode:
     slot_mapping: torch.Tensor
     block_table: torch.Tensor
 
-    # prefill and deocde split
+    # prefill and decode split
     num_decodes: int
     num_decode_tokens: int
     num_prefills: int
@@ -92,9 +92,9 @@ class MetadataForPluginMode:
     num_extends: int
     num_extend_tokens: int
 
-    decode_metadata: AiterFlashAttentionDecodeMetadata | None
-    prefill_metadata: AiterFlashAttentionPrefillMetadata | None
-    extend_metadata: AiterFlashAttentionChunkPrefillMetadata | None
+    decode_metadata: Optional[AiterFlashAttentionDecodeMetadata] = None
+    prefill_metadata: Optional[AiterFlashAttentionPrefillMetadata] = None
+    extend_metadata: Optional[AiterFlashAttentionChunkPrefillMetadata] = None
 
     # For cascade attention.
     use_cascade: bool
@@ -211,7 +211,7 @@ def create_attn_metadata_builder_init_method(base_class):
         self.head_dim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
 
-        self.aot_sliding_window: tuple[int, int] | None = None
+        self.aot_sliding_window: Optional[tuple[int, int]] = None
         self.total_tokens: int = 0
 
         self.scheduler_config = config.scheduler_config
@@ -520,15 +520,6 @@ class vllmAttentionMetadataBuilderMethods:
             slot_mapping=common_attn_metadata.slot_mapping,
             plugin_metadata=attn_metadata_for_plugin_mode,
         )
-
-        # TODO: set the forward context
-        # set_forward_context(
-        #     attn_metadata=attn_metadata,
-        #     atom_config=self.config,
-        #     context=context,
-        #     num_tokens=num_tokens,
-        #     num_tokens_across_dp=num_tokens_across_dp,
-        # )
 
         return attn_metadata
 

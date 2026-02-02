@@ -246,12 +246,10 @@ class AttentionMetaData:
             self.block_tables = block_tables_converted
         if kv_indices_converted is not None:
             self.kv_indices = kv_indices_converted
-        if plugin_metadata is not None:
-            from atom.plugin.prepare import is_plugin_mode
-            assert is_plugin_mode(), "plugin_metadata is only supported for plugin mode"
-            self.plugin_metadata = plugin_metadata
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
+        if plugin_metadata is not None:
+            self.plugin_metadata = plugin_metadata
 
     def asdict_zerocopy(self, skip_fields: Optional[Set[str]] = None) -> Dict[str, Any]:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
