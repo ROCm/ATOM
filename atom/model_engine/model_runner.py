@@ -91,6 +91,7 @@ class tokenIDProcessor:
         self.default_num_rejected_tokens = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
+        self.prev_prefills = torch.zeros(max_num_batched_tokens, dtype=torch.bool, device=device)
         self.clean()
 
     def send_to_cpu_async(
@@ -310,6 +311,7 @@ class tokenIDProcessor:
             self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
                 deferred_prev_indices
             ]
+            
 
         if is_all_same:
             # All requests are the same, only deferred tokens
@@ -526,12 +528,12 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
-        num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
             hasattr(self, "drafter"),
-            num_spec_tokens,
+            self.num_spec_tokens,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(
@@ -563,8 +565,8 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.config.compilation_config.level == 1:
-            self.model = torch.compile(self.model, fullgraph=True, backend="eager")
+        # if self.config.compilation_config.level == 1:
+        #     self.model = torch.compile(self.model, fullgraph=True, backend="eager")
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -588,7 +590,7 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("qwen3_next",):
+        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
             return True
         return False
 
@@ -840,6 +842,9 @@ class ModelRunner:
         }
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
+            self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs
+            )
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -898,9 +903,9 @@ class ModelRunner:
                 hf_config.linear_num_key_heads,
                 hf_config.linear_num_value_heads,
                 hf_config.linear_key_head_dim,
-                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0,  # self.num_spec,
+                self.num_spec_tokens,
             )
 
             one_layer_byte = (
@@ -946,6 +951,7 @@ class ModelRunner:
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
+        num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
             # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
@@ -982,7 +988,7 @@ class ModelRunner:
 
             self.kv_cache = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 self.physical_block_size,
                 num_kv_heads,
@@ -993,7 +999,7 @@ class ModelRunner:
 
             self.kv_scale = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 num_kv_heads,
                 self.physical_block_size,
@@ -1008,7 +1014,7 @@ class ModelRunner:
                 hf_config.linear_key_head_dim,
                 hf_config.linear_key_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0,  # self.num_spec,
+                self.num_spec_tokens,  # self.num_spec,
             )
             self.mamba_k_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
@@ -1334,8 +1340,10 @@ class ModelRunner:
             sampled_tokens = self.sampler(logits, temperatures)
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
+            is_prefill = {req_id: True for req_id in batch.req_ids}
         else:
             assert logits is not None
+            is_prefill = {req_id: False for req_id in batch.req_ids}
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
@@ -1359,6 +1367,8 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
             )
+            # print("sampled tokens: ", sampled_tokens, flush=True)
+            # print("num bonus tokens: ", num_bonus_tokens, flush=True)
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 
@@ -1399,6 +1409,7 @@ class ModelRunner:
             draft_token_ids=draft_token_ids,
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
+            is_prev_prefill=is_prefill,
         )
 
     @torch.inference_mode()
