@@ -90,7 +90,9 @@ def load_model(
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false") == "true"
-        for name, weight_tensor in safetensors_weights_iterator(model_name_or_path, disable_mmap=disable_mmap):
+        for name, weight_tensor in safetensors_weights_iterator(
+            model_name_or_path, disable_mmap=disable_mmap
+        ):
             if load_dummy:
                 continue
             if name.endswith("kv_scale"):
