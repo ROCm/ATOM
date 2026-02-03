@@ -548,7 +548,9 @@ class ModelRunner:
             use_mla=self.use_mla,
         )
         if self.config.speculative_config and get_pp_group().is_last_rank:
-            self.drafter = EagleProposer(self.config, self.device, self)
+            from atom.utils.backends import set_model_tag
+            with set_model_tag("drafter"):
+                self.drafter = EagleProposer(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
