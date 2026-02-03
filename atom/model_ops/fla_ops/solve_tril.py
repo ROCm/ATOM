@@ -21,9 +21,9 @@ from .utils import input_guard, is_amd, is_tma_supported
 
 FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
 ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32x3"]
-assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
-    f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
-)
+assert (
+    FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS
+), f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})

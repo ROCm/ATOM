@@ -14,6 +14,7 @@ import torch.nn as nn
 
 import triton
 import triton.language as tl
+
 # from vllm.utils.math_utils import cdiv, next_power_of_2
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -28,6 +29,7 @@ from .utils import is_amd
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
 
+
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
@@ -38,6 +40,7 @@ def next_power_of_2(n: int) -> int:
     if n < 1:
         return 1
     return 1 << (n - 1).bit_length()
+
 
 def fused_recurrent_kda_fwd(
     q: torch.Tensor,

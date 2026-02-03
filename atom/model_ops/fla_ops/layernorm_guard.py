@@ -25,6 +25,7 @@ import triton.language as tl
 
 from .utils import input_guard
 
+
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
@@ -35,6 +36,7 @@ def next_power_of_2(n: int) -> int:
     if n < 1:
         return 1
     return 1 << (n - 1).bit_length()
+
 
 def rms_norm_ref(
     x,

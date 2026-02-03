@@ -453,10 +453,7 @@ def _chunk_state_varlen_kernel(
     # If HAS_INITSTATES==True need to consider two possibilities
     # - if start_idx < pid_c * chunk_size, then we need to take the past_states_ptrs
     # - if state_idx >= pid * chunk_size, then we need to insert initstates
-    if (
-        (start_idx < pid_c * chunk_size)  # first chunk
-        or (HAS_INITSTATES)
-    ):
+    if (start_idx < pid_c * chunk_size) or (HAS_INITSTATES):  # first chunk
         dA_cs_boundary = 0.0  # default
 
         if not HAS_INITSTATES:
