@@ -42,9 +42,10 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 def safetensors_weights_iterator(
     model_name_or_path: str,
-    disable_mmap: bool = True,
+    disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
+    print(f"DEBUG: disable_mmap: {disable_mmap}")
     path = (
         model_name_or_path
         if os.path.isdir(model_name_or_path)
@@ -88,7 +89,8 @@ def load_model(
     params_dict = dict(model.named_parameters())
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
-        for name, weight_tensor in safetensors_weights_iterator(model_name_or_path):
+        disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false") == "true"
+        for name, weight_tensor in safetensors_weights_iterator(model_name_or_path, disable_mmap=disable_mmap):
             if load_dummy:
                 continue
             if name.endswith("kv_scale"):
