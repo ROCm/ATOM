@@ -32,6 +32,7 @@ from atom.models.deepseek_mtp import (
 
 logger = logging.getLogger("atom")
 
+
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     if loaded_weight.numel() == param.data.numel():
         param.data.copy_(loaded_weight)
