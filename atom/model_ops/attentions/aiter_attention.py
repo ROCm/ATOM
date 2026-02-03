@@ -153,28 +153,53 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
         dropout_p = 0.0
-        max_seqlen_q = 1
+        max_seqlen_q = batch.num_spec_step + 1
         min_seqlen_q = 0
 
-        context_lens = batch.context_lens
-        max_seqlen_k = max(context_lens)
-        positions = [i - 1 for i in context_lens]
-        slot_mapping = [
-            block_table[-1] * self.model_runner.block_size + last_block_num - 1
-            for block_table, last_block_num in zip(
-                batch.block_tables, batch.last_block_num_tokens
-            )
-        ]
-        slot_mapping.extend([-1] * (bs - scheduled_bs))
+        bonus_list = self.model_runner.tokenID_processor.mapped_bonus_list
+
+        if max_seqlen_q > 1:
+            context_lens = batch.context_lens
+            if bonus_list is not None:
+                context_lens = [
+                    context_len - batch.num_spec_step + bonus_list[i]
+                    for i, context_len in enumerate(context_lens)
+                ]
+            positions = [
+                pos
+                for seq_len in context_lens
+                for pos in range(seq_len - max_seqlen_q, seq_len)
+            ]
+
+            slot_mapping = [
+                block_table[pos // self.model_runner.block_size] 
+                * self.model_runner.block_size
+                + (pos % self.model_runner.block_size)
+                for block_table, seq_len in zip(batch.block_tables, context_lens)
+                for pos in range(seq_len - max_seqlen_q, seq_len)
+            ]
+            max_seqlen_k = max(context_lens)
+        else:
+            context_lens = batch.context_lens
+            max_seqlen_k = max(context_lens)
+            positions = [i - 1 for i in context_lens]
+            slot_mapping = [
+                block_table[-1] * self.model_runner.block_size + last_block_num - 1
+                for block_table, last_block_num in zip(
+                    batch.block_tables, batch.last_block_num_tokens
+                )
+            ]
+            slot_mapping.extend([-1] * (bs - scheduled_bs))
 
         self.prepare_block_tables(batch)
 
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
         if batch.is_dummy_run:
-            var["slot_mapping"].np[:bs] = -1
+            var["slot_mapping"].np[:bs * max_seqlen_q] = -1
         else:
-            var["slot_mapping"].np[:bs] = slot_mapping
+            var["slot_mapping"].np[:scheduled_bs * max_seqlen_q] = slot_mapping[:scheduled_bs * max_seqlen_q]
+            var["slot_mapping"].np[scheduled_bs * max_seqlen_q : bs * max_seqlen_q] = -1
 
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
@@ -201,14 +226,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
 
         vars_used = [
-            ("slot_mapping", bs),  # TODO: MTP support
+            ("slot_mapping", bs * max_seqlen_q),
             ("context_lens", bs),
+            ("cu_seqlens_q", bs + 1),
             ("block_tables", bs),
             ("kv_indptr", bs + 1),
             ("kv_indices", sum_blocks_before_converted),
         ]
-        if self.has_sliding_window:
-            vars_used.append(("cu_seqlens_q", bs + 1))
+        # if self.has_sliding_window:
+        #     vars_used.append(("cu_seqlens_q", bs + 1))
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         if self.block_size == 1024:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)

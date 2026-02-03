@@ -38,9 +38,16 @@ class ScheduledBatch:
         # print(f"{num_scheduled_tokens=}")
         # print(f"{self.scheduled_tokens=}")
         self.temperatures = [seq.temperature for seq in seqs.values()]
+        # print("update context lens: ")
+        # print("tokens is: ", [seq.token_ids for seq in seqs.values()], flush=True)
+        # print("context lens: ", [seq.num_tokens for seq in seqs.values()], flush=True)
+
         self.context_lens = [seq.num_tokens for seq in seqs.values()]
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
+        ]
+        self.mamba_block_tables = [
+            seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table
         ]
         self.last_block_num_tokens = [
             seq.last_block_num_tokens for seq in seqs.values()
@@ -64,6 +71,8 @@ class ScheduledBatch:
 
         self.num_spec_step = num_spec_step
         self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
+        # the num accepted tokens should be lists of gpu tensors of size 1 or scalar zero
+        self.num_bonus_tokens = [seq.num_bonus_tokens for seq in seqs.values()]
 
         # logger.info(f"{self.num_scheduled_tokens=}")
         # logger.info(f"{self.context_lens=}")
@@ -78,7 +87,6 @@ class ScheduledBatchOutput:
         self,
         token_ids: dict[int, tuple[int, ...]],
         draft_token_ids,
-        # num_bonus_tokens
     ):
         # TODO need refine
         self.req_ids = list(token_ids.keys())
@@ -98,6 +106,7 @@ class Scheduler:
         self.block_manager = BlockManager(config)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # print("stop token ids: ", self.stop_token_ids, flush=True)
         # Time at previous scheduling step
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
@@ -250,6 +259,8 @@ class Scheduler:
     ) -> list[Sequence]:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
+        num_bonus_tokens = fwd_output.num_bonus_tokens
+        # print("num bonus tokens in scheduler:", num_bonus_tokens, flush=True)
         is_deferred_out = prev_token_ids.get(-1, False)
         # update token_ids with the actual sampled token ids
         finished_seqs = []
@@ -264,6 +275,7 @@ class Scheduler:
         elif self.use_spec:
             num_placeholder = self.mtp_k
 
+        # print("before post process the seqs in running: ", )
         for seq in self.running:
             if seq.id not in fwd_output.req_ids:
                 seq.num_placeholder = num_placeholder
@@ -274,14 +286,17 @@ class Scheduler:
             if is_deferred_out or (
                 self.use_spec and self.eos_token_id == seq.token_ids[-1]
             ):
+                # print("before update seq token ids: ", seq.token_ids, flush=True)
+                # print("accepted token ids: ", token_ids, flush=True)
                 # for i, el in enumerate(token_ids):
                 #     seq.token_ids[-num_placeholder + i] = el
                 #     seq.output_tokens[-num_placeholder + i] = el
                 # update the number of tokens in the sequence if draft token is rejected
-                seq.token_ids[-num_accepted_token:] = token_ids
+                seq.token_ids[-seq.num_placeholder:] = token_ids
                 seq.num_tokens = len(seq.token_ids)
-                seq.output_tokens[-num_accepted_token:] = token_ids
-
+                seq.output_tokens[-seq.num_placeholder:] = token_ids
+                # print("after update seq token ids: ", seq.token_ids, flush=True)
+                # print("newly generated token: ", seq.output_tokens, flush=True)
             else:
                 for token_id in token_ids:
                     seq.append_token(token_id)
@@ -303,6 +318,10 @@ class Scheduler:
                 # seq.num_placeholder = 1+fwd_output.num_bonus_tokens[idx]
             if draft_token_ids and seq.id in draft_token_ids:
                 seq.spec_token_ids = draft_token_ids[seq.id]
+            
+            # if num_bonus_tokens:
+            #     print("update seq id: ", seq.id, flush=True)
+            #     seq.num_bonus_tokens = num_bonus_tokens[seq.id]
 
             if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
@@ -310,6 +329,7 @@ class Scheduler:
             leave_reason = None
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
+                # if len(new_tokens) >= len(stop_seq):
                 if len(seq.token_ids) >= len(stop_seq):
                     stop_len = len(stop_seq)
                     is_normal_stop = seq.token_ids[-stop_len:] == stop_seq
@@ -318,6 +338,9 @@ class Scheduler:
                         and seq.token_ids[-(stop_len + self.mtp_k) : -self.mtp_k]
                         == stop_seq
                     )
+                    # print("stop reqs is: ", -(stop_len + self.mtp_k), -self.mtp_k, flush=True)
+                    # print(f"normal stop {is_normal_stop}, mtp stop {is_mtp_stop} for stop seq {stop_seq} with token id: {seq.token_ids}", flush=True)
+                    # is_mtp_stop = False
                     if is_normal_stop or is_mtp_stop:
                         leave_reason = "stop_sequence"
                         break
@@ -356,6 +379,7 @@ class Scheduler:
             if leave_reason is not None:
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                # print(f"seq {seq.id} finished with reason: {leave_reason}", flush=True)
                 finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:

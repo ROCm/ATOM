@@ -63,7 +63,7 @@ class BlockManager:
         # self.free_block_ids.appendleft(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        return len(self.free_block_ids) >= seq.num_blocks + seq.num_mamba_blocks
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
@@ -96,6 +96,18 @@ class BlockManager:
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
 
+        # handle mamba-like model
+        if seq.mamba_enabled:
+            print("allocate for mamba blocks", flush=True)
+            # For mamba, we need to ensure the last block is always allocated
+            # even if it has less than block_size tokens
+            for i in range(seq.num_mamba_blocks):
+                block_id = self.free_block_ids[0]
+                print("mamba block allocated: ", block_id, flush=True)
+                self._allocate_block(block_id)
+                # No prefix caching support for mamba arch
+                seq.mamba_block_table.append(block_id)
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
@@ -104,6 +116,14 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        if seq.mamba_enabled:
+            for block_id in reversed(seq.mamba_block_table):
+                block = self.blocks[block_id]
+                # just in case
+                block.ref_count = 0
+                self._deallocate_block(block_id)
+            seq.mamba_block_table.clear()
+
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
