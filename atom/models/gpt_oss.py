@@ -73,20 +73,54 @@ class OAIAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.hidden_size = config.hidden_size
 
+        # here is used to make compatible with both transformers < 5 and transformers 5.0+
+        rope_params = getattr(config, "rope_parameters", None)
+        if rope_params is not None:
+            if not isinstance(rope_params, dict):
+                raise TypeError(
+                    f"Expected `rope_parameters` to be a dict, got {type(rope_params)}"
+                )
+            rope_theta = rope_params.get("rope_theta")
+            if rope_theta is None:
+                raise ValueError(
+                    "GPT-OSS config has `rope_parameters` but is missing "
+                    "`rope_parameters.rope_theta`."
+                )
+            rope_scaling = {
+                k: rope_params[k]
+                for k in (
+                    "rope_type",
+                    "factor",
+                    "original_max_position_embeddings",
+                    "beta_fast",
+                    "beta_slow",
+                )
+                if k in rope_params
+            }
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000)
+            rope_scaling = getattr(config, "rope_scaling", None)
+
+        if rope_scaling is None:
+            raise ValueError(
+                "GPT-OSS config is missing RoPE scaling parameters. Expected either "
+                "`rope_scaling` (transformers < 5) or `rope_parameters` (transformers 5+)."
+            )
+
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=rope_theta,
             dtype=torch.bfloat16,
             rope_scaling={
-                "rope_type": "yarn",
-                "factor": config.rope_scaling["factor"],
-                "original_max_position_embeddings": config.rope_scaling[
+                "rope_type": rope_scaling.get("rope_type", "yarn"),
+                "factor": rope_scaling["factor"],
+                "original_max_position_embeddings": rope_scaling[
                     "original_max_position_embeddings"
                 ],
-                "beta_fast": config.rope_scaling["beta_fast"],
-                "beta_slow": config.rope_scaling["beta_slow"],
+                "beta_fast": rope_scaling["beta_fast"],
+                "beta_slow": rope_scaling["beta_slow"],
             },
             is_neox_style=True,
         )
@@ -100,7 +134,7 @@ class OAIAttention(nn.Module):
         self.q_size = self.num_attention_heads * self.head_dim // tp_size
         self.kv_size = self.num_key_value_heads * self.head_dim // tp_size
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = config.rope_theta
+        self.rope_theta = rope_theta
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=self.hidden_size,
