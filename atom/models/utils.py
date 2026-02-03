@@ -326,3 +326,22 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
             else int_vals[0]
         )
         return layer_index
+
+
+def cast_overflow_tensors(
+    tensors: torch.Tensor,
+    offset: float = 1000,
+) -> torch.Tensor:
+    if tensors.isinf().any() or tensors.isnan().any():
+        clamp_value = torch.finfo(tensors.dtype).max - offset
+        tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
+    return tensors
+
+
+def fast_topk(values, topk, dim):
+    if topk == 1:
+        # Use max along the specified dimension to get both value and index
+        return torch.max(values, dim=dim, keepdim=True)
+    else:
+        # Use topk for efficiency with larger k values
+        return torch.topk(values, topk, dim=dim)

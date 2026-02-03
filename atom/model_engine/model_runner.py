@@ -1034,7 +1034,7 @@ class ModelRunner:
                     dtype=dtypes.fp8,
                     device="cuda",
                 )
-        elif self.is_qwen_next:
+        elif self.is_qwen_next():
 
             self.kv_cache = torch.zeros(
                 2,
