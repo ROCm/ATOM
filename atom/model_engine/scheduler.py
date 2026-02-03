@@ -243,14 +243,10 @@ class Scheduler:
         finished_seqs = []
         stream_outputs = []
 
-        need_placeholder = is_deferred_out or self.use_spec
+        need_placeholder = is_deferred_out
         num_placeholder = 0
-        if is_deferred_out and self.use_spec:
-            num_placeholder = self.mtp_k + 1
-        elif is_deferred_out:
+        if is_deferred_out:
             num_placeholder = 1
-        elif self.use_spec:
-            num_placeholder = self.mtp_k
 
         for seq in self.running:
             if seq.id not in fwd_output.req_ids:
@@ -276,20 +272,10 @@ class Scheduler:
             new_tokens = token_ids
 
             if need_placeholder:
-                seq.num_placeholder = 1 + self.mtp_k
-                # idx = fwd_output.req_ids.index(seq.id)
-                # # reuse the rejected kvcache slot
-                # # logger.info(f"{num_accepted_token=} {token_ids=}")
-                # # logger.info(f"{seq.output_tokens=}")
-                # logger.info(f"{fwd_output.req_ids=}")
-                # logger.info(f"{fwd_output.token_ids=}")
-                # logger.info(f"{fwd_output.token_ids=}")
-                # logger.info(f"{fwd_output.num_bonus_tokens=}")
-                # logger.info(f"{fwd_output.draft_token_ids=}")
-                # logger.info(f"{idx=}")
-                # logger.info(f"{seq.id=}")
-                # seq.num_placeholder = 1+fwd_output.num_bonus_tokens[idx]
-            if draft_token_ids and seq.id in draft_token_ids:
+                seq.num_placeholder = 1
+
+            is_draft_deferred_here = draft_token_ids.get(-1, False) if draft_token_ids else False
+            if draft_token_ids and seq.id in draft_token_ids and not is_draft_deferred_here:
                 seq.spec_token_ids = draft_token_ids[seq.id]
 
             if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:
@@ -348,6 +334,12 @@ class Scheduler:
 
         if stream_output_queue is not None and stream_outputs:
             stream_output_queue.put_nowait(stream_outputs)
+
+        is_draft_deferred = draft_token_ids.get(-1, False) if draft_token_ids else False
+        if is_draft_deferred and draft_token_ids:
+            for seq in self.running:
+                if seq.id in draft_token_ids:
+                    seq.spec_token_ids = draft_token_ids[seq.id]
 
         if need_placeholder:
             # placeholder for the each decode step

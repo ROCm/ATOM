@@ -174,17 +174,22 @@ class tokenIDProcessor:
             }
             ret[-1] = 0  # is_deferred_out flag
             return ret
+        
+        if self.use_spec:
+            token_ids = None
+        else:
+            token_ids = self.recv_async_output()
 
-        token_ids = self.recv_async_output()
         self.send_to_cpu_async(sampled_token_ids)
         token_id_dict = {}
         self.prev_req_ids = None
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
-            token_id_dict = {
-                seq_id: self._process_token_id(token_id)
-                for seq_id, token_id in zip(self.prev_req_ids, token_ids)
-            }
+            if not self.use_spec:
+                token_id_dict = {
+                    seq_id: self._process_token_id(token_id)
+                    for seq_id, token_id in zip(self.prev_req_ids, token_ids)
+                }
         else:
             # first time, no previous tokens
             token_ids = {}
@@ -1257,33 +1262,32 @@ class ModelRunner:
         )
 
         draft_token_ids: Optional[torch.Tensor] = None
-        if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
+        if hasattr(self, "drafter"):
             if spec_decode_metadata is None:
                 next_token_ids = sampled_tokens
             else:
-                # num_accepted = (sampled_tokens != -1).sum(dim=1)
-                # last_indices = num_accepted - 1
+                # decode
                 bs = batch.total_seqs_num_decode
-                # self.debug(f"{num_accepted=}")
-                # self.debug(f"{num_bonus_tokens=}")
-                # self.debug(f"{last_indices=}")
-                # self.debug(f"{sampled_tokens=}")
                 next_token_ids = sampled_tokens[
                     torch.arange(bs, device=sampled_tokens.device), num_bonus_tokens
                 ]
-                # self.debug(f"{next_token_ids=}")
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 self.tokenID_processor.num_bonus_tokens = num_bonus_tokens
-                self.tokenID_processor.send_bonus_to_cpu_async(
-                    num_bonus_tokens
-                )  # Async copy to CPU
+
             draft_token_ids = self.propose_draft_token_ids(
                 batch,
                 self.tokenID_processor.input_ids.gpu[1 : batch.total_tokens_num + 1],
                 hidden_states,
                 next_token_ids,
             )
-
+            # get current round sampled token ids on cpu
+            sampled_token_ids = self.tokenID_processor.recv_async_output()
+            req_ids = batch.req_ids
+            token_ids = {
+                seq_id: self.tokenID_processor._process_token_id(token_id)
+                for seq_id, token_id in zip(req_ids, sampled_token_ids)
+            }
+            token_ids[-1] = 0
         return ScheduledBatchOutput(token_ids, draft_token_ids)
 
     @torch.inference_mode()
