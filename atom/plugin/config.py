@@ -99,7 +99,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         max_model_len=max_model_len,
         gpu_memory_utilization=vllm_cache_config.gpu_memory_utilization,
         tensor_parallel_size=vllm_parallel_config.tensor_parallel_size,
-        enforce_eager=True, # disable using atom cuda graph
+        enforce_eager=True,  # disable using atom cuda graph
         parallel_config=vllm_parallel_config,
         kv_cache_block_size=vllm_cache_config.block_size,
         num_kvcache_blocks=vllm_cache_config.num_gpu_blocks,
@@ -188,7 +188,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         sglang_port_args=PortArgs.init_new(server_args),
     )
 
-    # force max num batched tokens to 16K because sgl doesn't have 
+    # force max num batched tokens to 16K because sgl doesn't have
     # concept for max num batched tokens
     return Config(
         model=None,
@@ -197,7 +197,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         max_model_len=server_args.context_length,
         gpu_memory_utilization=server_args.mem_fraction_static,
         tensor_parallel_size=server_args.tp_size,
-        enforce_eager=True, # disable using atom cuda graph
+        enforce_eager=True,  # disable using atom cuda graph
         parallel_config=sgl_parallel_config,
         kv_cache_dtype=server_args.kv_cache_dtype,
         enable_prefix_caching=False,

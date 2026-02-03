@@ -348,7 +348,9 @@ class Qwen3MoeAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-            attn_output = self.attn(query=q, key=k, value=v, **model_kwargs)
+            attn_output = self.attn(
+                query=q, key=k, value=v, positions=positions, **model_kwargs
+            )
         output = self.o_proj(attn_output)
         return output
 

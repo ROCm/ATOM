@@ -28,7 +28,7 @@ from atom.models.deepseek_mtp import (
     get_spec_layer_idx_from_weight_name,
     rewrite_spec_layer_name,
 )
-from atom.plugin.prepare import is_vllm
+from atom.plugin.prepare import is_vllm, is_sglang
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -257,7 +257,9 @@ def load_model(
             else:
                 module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
-        if isinstance(quant_method, QuantizeMethodBase):
+        # when running plugin mode for sglang, don't do the post process here
+        # since sglang will call this func automatically after finishing loading
+        if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
             quant_method.process_weights_after_loading(module)
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)

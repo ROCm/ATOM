@@ -47,6 +47,7 @@ class RadixAttention(BaseAttention):
             prefix=prefix,
             **kwargs,
         )
+        self.rotary_emb = rotary_emb
 
         if is_sglang():
             from sglang.srt.layers.radix_attention import RadixAttention
@@ -81,6 +82,9 @@ class RadixAttention(BaseAttention):
             # for sglang, forward_batch is required
             forward_batch = kwargs.get("forward_batch", None)
             assert forward_batch is not None, "forward_batch is required for sglang"
+            if self.rotary_emb is not None:
+                assert positions is not None, "positions is required for ROPE"
+                query, key = self.rotary_emb(positions, query, key)
             return self.attn(q=query, k=key, v=value, forward_batch=forward_batch)
         else:
             raise NotImplementedError(
