@@ -3,6 +3,7 @@
 
 import concurrent.futures
 import os
+import logging
 import re
 from glob import glob
 from typing import Generator, Tuple
@@ -29,6 +30,8 @@ from atom.models.deepseek_mtp import (
     rewrite_spec_layer_name,
 )
 
+logger = logging.getLogger("atom")
+
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     if loaded_weight.numel() == param.data.numel():
@@ -45,6 +48,7 @@ def safetensors_weights_iterator(
     disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
+    logger.info(f"disable_mmap: {disable_mmap}")
     path = (
         model_name_or_path
         if os.path.isdir(model_name_or_path)
@@ -88,7 +92,10 @@ def load_model(
     params_dict = dict(model.named_parameters())
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
-        for name, weight_tensor in safetensors_weights_iterator(model_name_or_path):
+        disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false").lower() == "true"
+        for name, weight_tensor in safetensors_weights_iterator(
+            model_name_or_path, disable_mmap=disable_mmap
+        ):
             if load_dummy:
                 continue
             if name.endswith("kv_scale"):
