@@ -40,6 +40,8 @@ class Sequence:
         stop_token_sequences: list[list[int]] = None,
         stream_callback: Optional[Callable[[Any], None]] = None,
         id=None,
+        num_speculative_tokens: int = 0,
+        mamba_enabled: bool = False,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -47,16 +49,20 @@ class Sequence:
         self.type = SequenceType.DUMMY
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
+        self.num_speculative_tokens = num_speculative_tokens
+        self.mamba_enabled = mamba_enabled
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
         self.block_table = []
+        self.mamba_block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
+        self.prev_prefill = True
 
         # stream callback
         self.stream_callback = stream_callback
@@ -70,6 +76,10 @@ class Sequence:
         self.first_token_time = 0.0
         self.leave_time = 0.0
         self.leave_reason = ""
+
+        # accepted tokens for spec decode
+        self.num_bonus_tokens = 0
+        self.num_draft_tokens = 0
 
     def __len__(self):
         return self._num_tokens
@@ -86,6 +96,11 @@ class Sequence:
     def num_tokens(self, value):
         self._num_tokens = value
         self.num_blocks = (value + self.block_size - 1) // self.block_size
+        # for mamba-like arch, we need to make sure there are always 1 + spec number of blocks
+        if self.mamba_enabled:
+            self.num_mamba_blocks = 1 + self.num_speculative_tokens
+        else:
+            self.num_mamba_blocks = 0
         self.last_block_num_tokens = (
             self._num_tokens - (self.num_blocks - 1) * self.block_size
         )
