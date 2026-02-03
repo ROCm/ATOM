@@ -6,6 +6,7 @@ from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config
 from atom.model_loader.loader import load_model
 from atom.models.deepseek_mtp import DeepSeekMTP
+from atom.models.qwen3_next_mtp import Qwen3NextMTP
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -13,6 +14,7 @@ logger = logging.getLogger("atom")
 
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": DeepSeekMTP,
+    "Qwen3NextMTPModel": Qwen3NextMTP,
 }
 
 
@@ -61,6 +63,7 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
 
+        print("draft model load: ", self.model)
         load_model(
             self.model,
             self.config.model,
@@ -134,6 +137,10 @@ class EagleProposer:
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
         for i in range(self.mtp_k):
+            print(f"for mtp {i}, we have: ")
+            print("input_ids: ", input_ids.shape, flush=True)
+            print("positions: ", positions, flush=True)
+            print("hidden states: ", hidden_states.shape, flush=True)
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,

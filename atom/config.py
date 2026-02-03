@@ -508,6 +508,9 @@ class SpeculativeConfig:
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         if hf_config.model_type == "deepseek_v3":
             hf_config.model_type = "deepseek_mtp"
+        if hf_config.model_type == "qwen3_next":
+            hf_config.model_type = "qwen3_next_mtp"
+
         if hf_config.model_type == "deepseek_mtp":
             # DeepSeek MTP typically uses only 1 layer that gets reused
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
@@ -525,6 +528,18 @@ class SpeculativeConfig:
                     "architectures": ["DeepSeekMTPModel"],
                 }
             )
+        if hf_config.model_type == "qwen3_next_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            if n_predict != 1:
+                logger.warning(
+                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                    "(MTP typically uses 1 layer that gets reused)"
+                )
+                n_predict = 1
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Qwen3NextMTPModel"]}
+            )
+        print("hf config is: ", hf_config, flush=True)
 
     def __repr__(self) -> str:
         method = self.method

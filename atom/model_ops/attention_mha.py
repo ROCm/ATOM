@@ -280,9 +280,11 @@ class Attention(nn.Module):
             attn_metadata.block_tables,
             attn_metadata.context_lens,
             attn_metadata.block_tables.stride(0),
+            max_qlen=attn_metadata.max_seqlen_q,
             K_QScale=k_scale,
             V_QScale=v_scale,
             out_=None,
+            qo_indptr=attn_metadata.cu_seqlens_q,
             high_precision=0,
         )
 

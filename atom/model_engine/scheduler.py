@@ -42,6 +42,9 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
+        self.mamba_block_tables = [
+            seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table
+        ]
         self.last_block_num_tokens = [
             seq.last_block_num_tokens for seq in seqs.values()
         ]

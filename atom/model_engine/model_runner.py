@@ -620,6 +620,7 @@ class ModelRunner:
             return False
         elif self.hf_text_config.model_type in (
             "qwen3_next",
+            "qwen3_next_mtp"
         ):
             return True
         return False
@@ -872,6 +873,8 @@ class ModelRunner:
         }
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
+            self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs)
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -929,7 +932,7 @@ class ModelRunner:
                 hf_config.linear_key_head_dim,
                 hf_config.linear_key_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0, # self.num_spec,
+                self.drafter.mtp_k,
             )
 
             one_layer_byte = sum(math.prod(subtuple) for subtuple in mamba_shape) * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
@@ -967,6 +970,7 @@ class ModelRunner:
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
+        num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
             # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
@@ -1003,7 +1007,7 @@ class ModelRunner:
 
             self.kv_cache = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 self.physical_block_size,
                 num_kv_heads,
@@ -1014,7 +1018,7 @@ class ModelRunner:
 
             self.kv_scale = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 num_kv_heads,
                 self.physical_block_size,
@@ -1029,7 +1033,7 @@ class ModelRunner:
                 hf_config.linear_key_head_dim,
                 hf_config.linear_key_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0, # self.num_spec,
+                self.drafter.mtp_k, # self.num_spec,
             )
             self.mamba_k_cache = torch.zeros((self.num_gdn_attn_state, self.num_physical_kvcache_blocks) + mamba_shape[0],
                                            dtype=dtypes.d_dtypes[config.kv_cache_dtype],
@@ -1083,8 +1087,10 @@ class ModelRunner:
                         # Non-MLA attention
                         if self.is_qwen_next():
                             attn_idx = layer_id // self.full_attention_interval
+                            print("qwen3 attn idx: ", attn_idx, flush=True)
                         else:
                             attn_idx = layer_id
+                            print("non qwen3 attn idx: ", attn_idx, flush=True)
                         k_cache = self.kv_cache[0, attn_idx].view(
                             self.num_physical_kvcache_blocks,
                             num_kv_heads,
@@ -1370,6 +1376,9 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
             )
+            print("sampled tokens: ", sampled_tokens)
+            print("num bonus tokens: ", num_bonus_tokens, flush=True)
+            # self._update_states_after_model_execute(sampled_tokens)
 
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
@@ -1377,6 +1386,7 @@ class ModelRunner:
             batch,
             sampled_tokens,
         )
+        print("is defered out: ", self.tokenID_processor.is_deferred_out, flush=True)
 
         draft_token_ids: Optional[torch.Tensor] = None
         if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
@@ -1420,6 +1430,49 @@ class ModelRunner:
         )
         reset_forward_context()
         return fwd_output
+
+
+    def _update_states_after_model_execute(
+        self, output_token_ids: torch.Tensor
+    ) -> None:
+        """Update the cached states after model execution.
+
+        This is used for MTP/EAGLE for hybrid models, as in linear attention,
+        only the last token's state is kept. In MTP/EAGLE, for draft tokens
+        the state are kept util we decide how many tokens are accepted for
+        each sequence, and a shifting is done during the next iteration
+        based on the number of accepted tokens.
+        """
+        if not self.is_qwen_next():
+            return
+
+        # Find the number of accepted tokens for each sequence.
+        num_accepted_tokens = (
+            (
+                torch.cat(
+                    [
+                        output_token_ids,
+                        torch.full(
+                            (output_token_ids.size(0), 1),
+                            -1,
+                            device=output_token_ids.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+                == -1
+            )
+            .int()
+            .argmax(-1)
+            .cpu()
+            .numpy()
+        )
+        for i, num_tokens in enumerate(num_accepted_tokens):
+            self.forward_vars["num_accepted_tokens"].cpu[i] = num_tokens
+
+        # transfer to gpu 
+        self.forward_vars["num_accepted_tokens"].copy_to_gpu(len(num_accepted_tokens))
+
 
     def _calc_spec_decode_metadata(
         self,
@@ -1531,6 +1584,11 @@ class ModelRunner:
             batch.total_seqs_num, last_token_offset
         )
 
+        print("before propose: ")
+        print("target token ids: ", input_ids, flush=True)
+        print("target positions: ", positions, flush=True)
+        print("next_token_ids: ", next_token_ids)
+        print("last token indices: ", last_token_indices, flush=True)
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,
             target_positions=positions,
@@ -1538,6 +1596,7 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
         )
+        print("draft token is: ", draft_token, flush=True)
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     @torch.inference_mode()
