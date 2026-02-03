@@ -585,12 +585,12 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
-        num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
         self.tokenID_processor = tokenIDProcessor(
             self.config.max_num_batched_tokens,
             self.device,
             hasattr(self, "drafter"),
-            num_speculative_tokens,
+            self.num_speculative_tokens,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(
@@ -624,6 +624,8 @@ class ModelRunner:
 
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
+            if hasattr(self, "drafter"):
+                self.drafter.model = torch.compile(self.drafter.model, fullgraph=True, backend="eager")
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -647,7 +649,10 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("qwen3_next",):
+        elif self.hf_text_config.model_type in (
+            "qwen3_next",
+            "qwen3_next_mtp"
+        ):
             return True
         return False
 
@@ -899,6 +904,8 @@ class ModelRunner:
         }
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
+            self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs)
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -959,7 +966,7 @@ class ModelRunner:
                 hf_config.linear_key_head_dim,
                 hf_config.linear_key_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0,  # self.num_spec,
+                self.num_speculative_tokens,
             )
 
             one_layer_byte = (
@@ -1005,6 +1012,7 @@ class ModelRunner:
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
+        num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
             # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
@@ -1041,7 +1049,7 @@ class ModelRunner:
 
             self.kv_cache = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 self.physical_block_size,
                 num_kv_heads,
@@ -1052,7 +1060,7 @@ class ModelRunner:
 
             self.kv_scale = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 num_kv_heads,
                 self.physical_block_size,
@@ -1067,7 +1075,7 @@ class ModelRunner:
                 hf_config.linear_key_head_dim,
                 hf_config.linear_key_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0,  # self.num_spec,
+                self.num_speculative_tokens, # self.num_spec,
             )
             self.mamba_k_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
@@ -1387,6 +1395,7 @@ class ModelRunner:
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
+        num_bonus_tokens: Optional[torch.Tensor] = None
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(logits, temperatures)
         else:
@@ -1422,7 +1431,6 @@ class ModelRunner:
         token_ids = self.tokenID_processor.prepare_sampled_ids(
             batch, sampled_tokens, self.forward_done_event
         )
-
         draft_token_ids: Optional[torch.Tensor] = None
         if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
             if spec_decode_metadata is None:
@@ -1439,6 +1447,7 @@ class ModelRunner:
                 self.tokenID_processor.send_bonus_to_cpu_async(
                     num_bonus_tokens
                 )  # Async copy to CPU
+
             draft_token_ids = self.propose_draft_token_ids(
                 batch,
                 self.tokenID_processor.input_ids.gpu[1 : batch.total_tokens_num + 1],
@@ -1464,6 +1473,7 @@ class ModelRunner:
         )
         reset_forward_context()
         return fwd_output
+
 
     def _calc_spec_decode_metadata(
         self,
@@ -1554,6 +1564,11 @@ class ModelRunner:
             batch.total_seqs_num, last_token_offset
         )
 
+        # print("before propose: ")
+        # print("target token ids: ", input_ids, flush=True)
+        # print("target positions: ", positions, flush=True)
+        # print("next_token_ids: ", next_token_ids)
+        # print("last token indices: ", last_token_indices, flush=True)
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,
             target_positions=positions,
@@ -1561,6 +1576,7 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
         )
+        # print("draft token is: ", draft_token, flush=True)
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     @torch.inference_mode()

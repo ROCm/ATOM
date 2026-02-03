@@ -37,7 +37,7 @@ class LLMEngine:
         self.data_parallel_size = data_parallel_size
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
-            self.tokenizer, config.kv_cache_block_size
+            config, self.tokenizer, config.kv_cache_block_size
         )
         self.core_mgr = CoreManager(config)
         self._step_lock = None
@@ -128,10 +128,20 @@ class LLMEngine:
 
 class InputOutputProcessor:
 
-    def __init__(self, tokenizer, block_size):
+    def __init__(self, config, tokenizer, block_size):
+        self.config = config
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        self.mamba_enabled = False
+        print("the model type is ", self.config.hf_config.model_type)
+        self.num_speculative_tokens = 0
+        if hasattr(self.config, "speculative_config") and self.config.speculative_config is not None:
+            self.num_speculative_tokens = self.config.speculative_config.num_speculative_tokens
+
+        if self.config.hf_config.model_type == "qwen3_next":
+            print("enable mamba", flush=True)
+            self.mamba_enabled = True
 
     def preprocess(
         self,
@@ -167,6 +177,8 @@ class InputOutputProcessor:
             sampling_params,
             stop_token_sequences,
             stream_callback=stream_callback,
+            num_speculative_tokens=self.num_speculative_tokens,
+            mamba_enabled=self.mamba_enabled,
         )
         seq.arrive_time = time.time()
         self.requests[seq.id] = seq

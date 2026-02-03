@@ -6,10 +6,14 @@ import torch.nn.functional as F
 from einops import rearrange
 
 # import torch.distributed as dist
+from aiter.dist.parallel_state import get_tp_group, get_tensor_model_parallel_rank
+from typing import Optional
+from transformers import Qwen3Config
+from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 from atom.config import QuantizationConfig, Config
 
-from atom.model_loader.loader import mamba_v2_sharded_weight_loader
+# from atom.model_loader.loader import mamba_v2_sharded_weight_loader
 from atom.model_ops.activation import SiluAndMul
 
 # from atom.model_ops.attention import Attention
@@ -50,9 +54,143 @@ from atom.models.utils import (
 from atom.utils import envs
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
-ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
-    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
-)
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+
+def mamba_v2_sharded_weight_loader(
+    shard_spec: list[tuple[int, int, float]],
+    tp_size: int,
+    tp_rank: int,
+):
+    """Create a weight loader for mamba v2. This ensures that the projections
+    are correctly sharded so that they can be split into x, B, C. It also
+    ensures that all the groups corresponding to a head shard is placed
+    together with it.
+    """
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        # - track boundary of (sharded) param, and loaded_weight, respectively
+        boundary, loaded_boundary = 0, 0
+
+        # - iterate over the shard specs
+        for full_dim, extra, duplicate_groups in shard_spec:
+            # - full dim is the model dim (before TP).
+            # - extra > 0, means there is expected overall increase
+            #   of dimensions. This is so because of replication.
+            # - ratio is used map the tp_rank to the actual shard
+            #   rank. This is useful when there is replication of
+            #   groups to accompany head shards.
+
+            # - size of the loaded shard
+            shard_size = full_dim // tp_size
+
+            # - compute the rank into the loaded shard.
+            # - if there is replication, different TP shards will
+            #   take from the same rank.
+            # NOTE: currently we only support duplication
+            # in the case where num_groups == 1
+            rank = 0 if duplicate_groups else tp_rank
+
+            # - leftmost boundary index into loaded weight.
+            loaded_skip = rank * shard_size
+            loaded_start_idx = loaded_boundary + loaded_skip
+
+            # - take these many dims from the loaded weight.
+            take = min(shard_size, full_dim - extra - loaded_skip)
+
+            # - always shard on dim 0
+            # - the ignore is for a mundane mypy error as it does not
+            #   seem to handle slices well.
+            # https://github.com/python/mypy/issues/2410
+            param.data[
+                boundary : (boundary + take), ...  # type: ignore[misc]
+            ] = loaded_weight[
+                loaded_start_idx : (
+                    loaded_start_idx + take
+                )  # type: ignore[misc]
+            ]  # type: ignore[misc]
+
+            # move indexing boundaries
+            boundary += shard_size
+            loaded_boundary += full_dim - extra
+
+    return loader
+
+class RotaryEmbeddingQKNormFused(nn.Module):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+
+        cos, sin = self._compute_cos_sin_cache()
+        cos = cos.to(dtype)
+        sin = sin.to(dtype)
+        cache = torch.cat((cos, sin), dim=-1)
+        self.cos_sin_cache: torch.Tensor
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            self.register_buffer("cos_sin_cache", cache.view(cache.size(0), self.head_size), persistent=False)
+        else:
+            self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        """Compute the inverse frequency."""
+        # NOTE(woosuk): To exactly match the HF implementation, we need to
+        # use CPU to compute the cache and then move it to GPU. However, we
+        # create the cache on GPU for faster initialization. This may cause
+        # a slight numerical difference between the HF implementation and ours.
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim
+            )
+        )
+        return inv_freq
+
+    def _compute_cos_sin_cache(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the cos and sin cache."""
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
+
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos().unsqueeze(-2).unsqueeze(-2)
+        sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
+        return cos, sin
+
+    def forward(self,
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        positions: torch.Tensor,
+        num_heads: int,
+        num_kv_heads: int,
+        eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = positions.shape[-1]
+        fused_rope_rms(
+            qkv,
+            q_weight,
+            k_weight,
+            self.cos_sin_cache,
+            positions,
+            num_tokens=num_tokens,
+            num_heads_q=num_heads,
+            num_heads_k=num_kv_heads,
+            num_heads_v=num_kv_heads,
+            head_size=self.head_size,
+            is_neox_style=self.is_neox_style,
+            eps=eps,
+        )
 
 
 class Qwen3NextMLP(nn.Module):
@@ -764,7 +902,10 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            # if get_tensor_model_parallel_rank() == 0:
+            #     print("for layer idx: ", layer.layer_idx, flush=True)
+            #     print(hidden_states[:, :10], flush=True)
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
@@ -864,3 +1005,108 @@ class Qwen3NextForCausalLM(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+def gdn_attention_core(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """
+    Custom op for the core attention computation.
+    Only handles the convolution + recurrent attention part.
+    Input/output projections are handled outside this op.
+    """
+    # forward_context: ForwardContext = get_forward_context()
+    # self = forward_context.no_compile_layers[layer_name]
+    self._forward_core(
+        mixed_qkv=mixed_qkv,
+        b=b,
+        a=a,
+        core_attn_out=core_attn_out,
+    )
+
+
+def gdn_attention_core_fake(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Fake implementation for torch.compile."""
+    return
+
+
+@triton.jit
+def fused_gdn_gating_kernel(
+    g,
+    beta_output,
+    A_log,
+    a,
+    b,
+    dt_bias,
+    seq_len,
+    NUM_HEADS: tl.constexpr,
+    beta: tl.constexpr,
+    threshold: tl.constexpr,
+    BLK_HEADS: tl.constexpr,
+):
+    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
+    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    mask = head_off < NUM_HEADS
+    blk_A_log = tl.load(A_log + head_off, mask=mask)
+    blk_a = tl.load(a + off, mask=mask)
+    blk_b = tl.load(b + off, mask=mask)
+    blk_bias = tl.load(dt_bias + head_off, mask=mask)
+    # If the model is loaded in fp16, without the .float() here, A might be -inf
+    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
+    softplus_x = tl.where(
+        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+    )
+    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
+    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # compute beta_output = sigmoid(b)
+    blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
+    tl.store(
+        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
+    )
+
+
+def fused_gdn_gating(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused computation of g and beta for Gated Delta Net.
+    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    beta_output = b.sigmoid()
+    TODO maybe use torch.compile to replace this triton kernel
+    """
+    batch, num_heads = a.shape
+    seq_len = 1
+    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
+    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
+    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    fused_gdn_gating_kernel[grid](
+        g,
+        beta_output,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        seq_len,
+        num_heads,
+        beta,
+        threshold,
+        8,
+        num_warps=1,
+    )
+    return g, beta_output
+

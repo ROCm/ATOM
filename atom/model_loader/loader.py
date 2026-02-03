@@ -29,6 +29,7 @@ from atom.models.deepseek_mtp import (
     get_spec_layer_idx_from_weight_name,
     rewrite_spec_layer_name,
 )
+from atom.models.qwen3_next_mtp import remap_mtp_weight_name
 
 logger = logging.getLogger("atom")
 
@@ -41,64 +42,6 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         tp_rank_start = loaded_weight_per_rank * get_tp_group().rank
         tp_rank_end = tp_rank_start + loaded_weight_per_rank
         param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
-
-
-def mamba_v2_sharded_weight_loader(
-    shard_spec: list[tuple[int, int, float]],
-    tp_size: int,
-    tp_rank: int,
-):
-    """Create a weight loader for mamba v2. This ensures that the projections
-    are correctly sharded so that they can be split into x, B, C. It also
-    ensures that all the groups corresponding to a head shard is placed
-    together with it.
-    """
-
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        # - track boundary of (sharded) param, and loaded_weight, respectively
-        boundary, loaded_boundary = 0, 0
-
-        # - iterate over the shard specs
-        for full_dim, extra, duplicate_groups in shard_spec:
-            # - full dim is the model dim (before TP).
-            # - extra > 0, means there is expected overall increase
-            #   of dimensions. This is so because of replication.
-            # - ratio is used map the tp_rank to the actual shard
-            #   rank. This is useful when there is replication of
-            #   groups to accompany head shards.
-
-            # - size of the loaded shard
-            shard_size = full_dim // tp_size
-
-            # - compute the rank into the loaded shard.
-            # - if there is replication, different TP shards will
-            #   take from the same rank.
-            # NOTE: currently we only support duplication
-            # in the case where num_groups == 1
-            rank = 0 if duplicate_groups else tp_rank
-
-            # - leftmost boundary index into loaded weight.
-            loaded_skip = rank * shard_size
-            loaded_start_idx = loaded_boundary + loaded_skip
-
-            # - take these many dims from the loaded weight.
-            take = min(shard_size, full_dim - extra - loaded_skip)
-
-            # - always shard on dim 0
-            # - the ignore is for a mundane mypy error as it does not
-            #   seem to handle slices well.
-            # https://github.com/python/mypy/issues/2410
-            param.data[
-                boundary : (boundary + take), ...  # type: ignore[misc]
-            ] = loaded_weight[
-                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
-            ]  # type: ignore[misc]
-
-            # move indexing boundaries
-            boundary += shard_size
-            loaded_boundary += full_dim - extra
-
-    return loader
 
 
 def safetensors_weights_iterator(
@@ -159,10 +102,15 @@ def load_model(
             if name.endswith("kv_scale"):
                 continue
             if spec_decode:
-                spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
-                if spec_layer is None:
+                # spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
+                # if spec_layer is None:
+                #     continue
+                # name = rewrite_spec_layer_name(spec_layer, name)
+                remapped_name = remap_mtp_weight_name(name)
+                if remapped_name is None:
                     continue
-                name = rewrite_spec_layer_name(spec_layer, name)
+                name = remapped_name
+            # print("name: ", name, flush=True)
             name_suffix = name.split(".")[-1]
             if name_suffix in weights_mapping.keys():
                 name = name.replace(name_suffix, weights_mapping[name_suffix])
@@ -171,6 +119,7 @@ def load_model(
 
             layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
             layerId = int(layerId_.group(1)) if layerId_ else 0
+            # print("layerId: ", layerId, flush=True)
             if (
                 hf_config.num_hidden_layers
                 and layerId >= hf_config.num_hidden_layers
@@ -253,6 +202,7 @@ def load_model(
                         # weight_loader(param, weight_tensor)
                 else:
                     # Model doesn't have expert mapping, use generic loading
+                    # print("name to load: ", name, flush=True)
                     param = model.get_parameter(name)
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

@@ -199,36 +199,34 @@ class GatedDetlaNet(nn.Module):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
 
-        # if spec_sequence_masks is not None:
-        #     if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
-        #         mixed_qkv_spec = mixed_qkv
-        #         mixed_qkv_non_spec = None
-        #     else:
-        #         mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
-        #         mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
-        # else:
-        #     mixed_qkv_spec = None
-        #     mixed_qkv_non_spec = mixed_qkv
+        if spec_sequence_masks is not None:
+            if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
+                mixed_qkv_spec = mixed_qkv
+                mixed_qkv_non_spec = None
+            else:
+                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+        else:
+            mixed_qkv_spec = None
+            mixed_qkv_non_spec = mixed_qkv
 
         # # 1.1: Process the multi-query part
-        # if spec_sequence_masks is not None:
-        #     mixed_qkv_spec = causal_conv1d_update(
-        #         mixed_qkv_spec,
-        #         conv_state,
-        #         conv_weights,
-        #         self.conv1d.bias,
-        #         self.activation,
-        #         conv_state_indices=spec_state_indices_tensor[:, 0][
-        #             : gdn_metadata.num_spec_decodes
-        #         ],
-        #         num_accepted_tokens=num_accepted_tokens,
-        #         query_start_loc=spec_query_start_loc,
-        #         max_query_len=spec_state_indices_tensor.size(-1),
-        #         validate_data=False,
-        #     )
+        if spec_sequence_masks is not None:
+            mixed_qkv_spec = causal_conv1d_update(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor[:, 0][
+                    : gdn_metadata.num_spec_decodes
+                ],
+                num_accepted_tokens=num_accepted_tokens,
+                query_start_loc=spec_query_start_loc,
+                max_query_len=spec_state_indices_tensor.size(-1),
+                validate_data=False,
+            )
 
-        mixed_qkv_spec = None
-        mixed_qkv_non_spec = mixed_qkv
         # 1.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
