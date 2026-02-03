@@ -12,6 +12,7 @@ from aiter.ops.triton.unified_attention import unified_attention
 from atom.config import get_current_atom_config
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
+from aiter.dist.parallel_state import get_tp_group
 
 from .attention_mla import MLAModules
 
@@ -202,9 +203,12 @@ class Attention(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
 
         o = torch.empty_like(q)
-        num_seqs, num_q_heads_total, head_size = q.shape
+        num_seqs = attn_metadata.context_lens.shape[0]
+        # print("num seqs: ", num_seqs, flush=True)
+        _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        query_group_size = num_q_heads_total // num_kv_heads
+        # assuem all query have same length
+        query_group_size = attn_metadata.max_seqlen_q * (num_q_heads_total // num_kv_heads)
         assert num_q_heads_total % num_kv_heads == 0
 
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
@@ -241,7 +245,21 @@ class Attention(nn.Module):
             if self.kv_cache_dtype == "bf16"  # or per_tensor
             else aiter.dtypes.fp8
         )
-
+        # if get_tp_group().rank_in_group == 0:
+        #     torch.save(q, "query.pt")
+        #     torch.save(k_cache, "key_cache.pt")
+        #     torch.save(v_cache, "value_cache.pt")
+        #     torch.save(attn_metadata.context_lens, "context_lens.pt")
+        #     torch.save(attn_metadata.block_tables, "block_tables.pt")
+        #     torch.save(exp_sums, "exp_sum.pt")
+        #     torch.save(max_logits, "max_logits.pt")
+        #     torch.save(temporary_output, "temporary_output.pt")
+        #     print("scale: ", self.scale)
+        #     print("max seqlen_q: ", attn_metadata.max_seqlen_q)
+        #     print("max_context_partition_num: ", max_context_partition_num)
+        #     print("context_partition_size: ", context_partition_size)
+        #     print("self.sink: ", self.sinks)
+        #     print("sekf.sliding_window: ", self.sliding_window, flush=True)
         torch.ops.aiter.pa_decode_gluon(
             o,
             q,
@@ -265,7 +283,10 @@ class Attention(nn.Module):
             sliding_window=self.sliding_window,
             ps=True,
         )
-
+        # if get_tp_group().rank_in_group == 0:
+        #     torch.cuda.synchronize()
+        #     import os
+        #     os.abort()
         return o
 
     def paged_attention_asm(
@@ -280,9 +301,11 @@ class Attention(nn.Module):
             attn_metadata.block_tables,
             attn_metadata.context_lens,
             attn_metadata.block_tables.stride(0),
+            max_qlen=attn_metadata.max_seqlen_q,
             K_QScale=k_scale,
             V_QScale=v_scale,
             out_=None,
+            qo_indptr=attn_metadata.cu_seqlens_q,
             high_precision=0,
         )
 
