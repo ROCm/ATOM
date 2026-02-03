@@ -469,6 +469,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
+            routed_scaling_factor=layer.routed_scaling_factor,
         )
         if self.fused_experts:
             return self.fused_experts(

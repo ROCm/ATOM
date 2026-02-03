@@ -52,6 +52,7 @@ support_model_arch_dict = {
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
+    "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
