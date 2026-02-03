@@ -42,7 +42,7 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 def safetensors_weights_iterator(
     model_name_or_path: str,
-    disable_mmap: bool = False,
+    disable_mmap: bool = True,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     path = (
