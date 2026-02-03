@@ -92,7 +92,7 @@ def load_model(
     params_dict = dict(model.named_parameters())
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
-        disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false") == "true"
+        disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false").lower() == "true"
         for name, weight_tensor in safetensors_weights_iterator(
             model_name_or_path, disable_mmap=disable_mmap
         ):
