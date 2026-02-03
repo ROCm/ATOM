@@ -171,9 +171,9 @@ def chunk_local_cumsum_scalar(
         B, H, T = g.shape
     else:
         B, T, H = g.shape
-    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
-        "chunk_size must be a power of 2"
-    )
+    assert chunk_size == 2 ** (
+        chunk_size.bit_length() - 1
+    ), "chunk_size must be a power of 2"
     BT = chunk_size
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
@@ -215,9 +215,9 @@ def chunk_local_cumsum_vector(
         else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
-        "chunk_size must be a power of 2"
-    )
+    assert chunk_size == 2 ** (
+        chunk_size.bit_length() - 1
+    ), "chunk_size must be a power of 2"
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
@@ -262,9 +262,9 @@ def chunk_local_cumsum(
             stacklevel=2,
         )
     if cu_seqlens is not None:
-        assert g.shape[0] == 1, (
-            "Only batch size 1 is supported when cu_seqlens are provided"
-        )
+        assert (
+            g.shape[0] == 1
+        ), "Only batch size 1 is supported when cu_seqlens are provided"
     if len(g.shape) == 3:
         return chunk_local_cumsum_scalar(
             g, chunk_size, reverse, cu_seqlens, head_first, output_dtype

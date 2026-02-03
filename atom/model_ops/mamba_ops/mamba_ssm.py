@@ -5,7 +5,6 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
 import torch
-from packaging import version
 
 # from vllm import _custom_ops as ops
 # from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -21,6 +20,7 @@ if TRITON3:
     def softplus(dt):
         dt = tl.where(dt <= 20.0, tl.math.log(tl.math.exp(dt) + 1), dt)
         return dt
+
 else:
 
     @triton.jit
@@ -270,6 +270,7 @@ def _selective_scan_update_kernel(
     if not IS_SPEC_DECODING:
         tl.store(dst_state_ptrs, state.to(dst_state_ptrs.dtype.element_ty), mask=mask)
 
+PAD_SLOT_ID = -1
 
 def selective_state_update(
     state,

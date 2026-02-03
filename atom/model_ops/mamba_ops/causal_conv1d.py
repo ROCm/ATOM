@@ -10,9 +10,11 @@ import torch
 
 import triton
 import triton.language as tl
-#from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
-PAD_SLOT_ID=-1
+# from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+PAD_SLOT_ID = -1
+
 
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
@@ -228,9 +230,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 conv_states_ptr
                 + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
                 + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (  # [BLOCK_N,]
+            )[
+                None, :
+            ] + (  # [BLOCK_N,]
                 idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
+            )[
+                :, None
+            ]
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
@@ -352,7 +358,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 last_full_block_token_index
                 - (n_block_to_fill - chunk_offset) * B_size
                 - state_len
-            ) + tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+            ) + tl.arange(
+                0, NP2_STATELEN
+            )  # [BLOCK_M]
             x_ptrs = (
                 x_ptr
                 + (idx_tokens_last * stride_x_token)[:, None]
@@ -377,9 +385,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 conv_states_ptr
                 + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
                 + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (  # [BLOCK_N,]
+            )[
+                None, :
+            ] + (  # [BLOCK_N,]
                 idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
+            )[
+                :, None
+            ]
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
@@ -614,16 +626,16 @@ def causal_conv1d_fn(
             assert padded_batch == cache_indices.size(0)
         if has_initial_state is not None:
             assert has_initial_state.size() == (padded_batch,)
-            assert conv_states is not None, (
-                "ERROR: `has_initial_state` is used, which needs also `conv_states`"
-            )
+            assert (
+                conv_states is not None
+            ), "ERROR: `has_initial_state` is used, which needs also `conv_states`"
         assert weight.stride(1) == 1
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
         if block_size_to_align is not None and block_size_to_align > 0:
-            assert (block_size_to_align % BLOCK_M) == 0, (
-                "The mamba block size needs to be divisible by the BLOCK_M"
-            )
+            assert (
+                block_size_to_align % BLOCK_M
+            ) == 0, "The mamba block size needs to be divisible by the BLOCK_M"
         else:
             block_size_to_align = BLOCK_M
 
@@ -662,6 +674,7 @@ def causal_conv1d_fn(
                 META["x_ptr"].device
             )
             return tot
+
     else:
 
         def num_program(META, nums_dict):
@@ -928,9 +941,13 @@ def _causal_conv1d_update_kernel(
         conv_state_ptr
         + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
         + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [BLOCK_N,]
+    )[
+        None, :
+    ] + (  # [BLOCK_N,]
         idx_tokens * stride_conv_state_tok
-    )[:, None]
+    )[
+        :, None
+    ]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
@@ -1148,9 +1165,9 @@ def causal_conv1d_update(
 
     if validate_data:
         assert dim == weight.size(0)
-        assert conv_state.stride(-2) == 1, (
-            f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
-        )
+        assert (
+            conv_state.stride(-2) == 1
+        ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
         assert state_len >= width - 1
         # when above happens, we don't shift-left to keep any records in conv_state
         assert dim == conv_state.size(1)

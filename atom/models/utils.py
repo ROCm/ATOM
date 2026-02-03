@@ -318,7 +318,7 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
         return int_vals[0]
     else:
         assert len(int_vals) <= 2, (
-            f"layer name {layer_name} should contain most two integers"
+            f"layer name {layer_name} should contain at most two integers"
         )
         layer_index = (
             int_vals[0] * num_attn_module + int_vals[1]

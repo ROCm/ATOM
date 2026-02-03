@@ -42,6 +42,7 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         tp_rank_end = tp_rank_start + loaded_weight_per_rank
         param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
 
+
 def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
     tp_size: int,
@@ -90,9 +91,7 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (
-                    loaded_start_idx + take
-                )  # type: ignore[misc]
+                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries
@@ -259,7 +258,7 @@ def load_model(
                     #     param, "weight_loader", default_weight_loader
                     # )
                     weight_loader(param, weight_tensor)
-                    #futures.append(executor.submit(weight_loader, param, weight_tensor))
+                    # futures.append(executor.submit(weight_loader, param, weight_tensor))
         # Wait for all tasks to complete and raise any exceptions.
         for future in concurrent.futures.as_completed(futures):
             future.result()

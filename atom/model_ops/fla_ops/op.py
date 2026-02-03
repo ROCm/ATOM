@@ -7,7 +7,6 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import os
 
 # from vllm.triton_utils import tl, tldevice, triton
 import triton
@@ -38,6 +37,7 @@ if not is_gather_supported:
         Just to make triton compiler happy.
         """
         return None
+
 else:
     gather = tl.gather
 
