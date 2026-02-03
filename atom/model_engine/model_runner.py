@@ -549,6 +549,7 @@ class ModelRunner:
         )
         if self.config.speculative_config and get_pp_group().is_last_rank:
             from atom.utils.backends import set_model_tag
+
             with set_model_tag("drafter"):
                 self.drafter = EagleProposer(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler()
