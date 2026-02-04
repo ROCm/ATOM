@@ -17,7 +17,7 @@ from aiter import (
 )
 from torch import nn
 
-from atom.config import QuantizationConfig
+from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 
 # import torch.distributed as dist
@@ -243,8 +243,9 @@ class LinearBase(nn.Module):
                 requires_grad=False,
             )
         if bias:
+            output_type = get_current_atom_config().torch_dtype
             self.bias = nn.Parameter(
-                torch.empty(self.output_size, dtype=params_dtype), requires_grad=False
+                torch.empty(self.output_size, dtype=output_type), requires_grad=False
             )
             self.bias.weight_loader_process = self.weight_loader_process
         else:
