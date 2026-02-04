@@ -283,7 +283,12 @@ def should_ignore_layer(
                 return True
     return False
 
+
 def get_quant_config_for_layer(
-    quantization_config: Optional[QuantizationConfig], prefix: str    
+    quantization_config: Optional[QuantizationConfig], prefix: str
 ) -> Optional[QuantizationConfig]:
-    return None if should_ignore_layer(quantization_config, prefix) else quantization_config
+    return (
+        None
+        if should_ignore_layer(quantization_config, prefix)
+        else quantization_config
+    )
