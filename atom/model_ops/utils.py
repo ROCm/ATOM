@@ -3,14 +3,11 @@
 
 import importlib.util
 import logging
-from collections.abc import Iterable, Mapping
 from functools import cache
-from types import MappingProxyType
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
-import regex as re
 import torch
-from aiter import QuantType, dtypes, per_tensor_quant
+from aiter import QuantType, per_tensor_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32

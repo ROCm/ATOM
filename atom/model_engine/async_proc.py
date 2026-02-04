@@ -5,12 +5,10 @@ import logging
 import multiprocessing
 import pickle
 import queue
-import signal
 import threading
 import weakref
 from contextlib import ExitStack
 from threading import Thread
-from typing import List
 
 import zmq
 import zmq.asyncio

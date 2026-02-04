@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from abc import ABC, abstractmethod
-from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Set, Union
+from typing import Any, Dict, Optional, Set, Union
 
+import numpy as np
 import torch
 from atom.config import Config, KVCacheTensor, ParallelConfig
 
@@ -121,12 +120,24 @@ class DPMetadata:
 
 
 @dataclass
+class SpecDecodeMetadata:
+    draft_token_ids: torch.Tensor
+    num_spec_steps: int
+    num_draft_tokens_np: np.ndarray
+    cu_num_draft_tokens: torch.Tensor
+    target_logits_indices: torch.Tensor
+    bonus_logits_indices: torch.Tensor
+    logits_indices: torch.Tensor
+
+
+@dataclass
 class Context:
     # This context is used to store the basic context of the forward.
     positions: torch.Tensor
     is_prefill: bool = False
     batch_size: int = 0
     graph_bs: int = 0
+    is_draft: bool = False
 
     def __init__(
         self,
@@ -134,11 +145,13 @@ class Context:
         is_prefill: bool = False,
         batch_size: int = 0,
         graph_bs: int = 0,
+        is_draft: bool = False,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
         self.batch_size = batch_size
         self.graph_bs = graph_bs
+        self.is_draft = is_draft
 
 
 @dataclass
@@ -257,6 +270,8 @@ class ForwardContext:
 
     dp_metadata: Optional[DPMetadata] = None
 
+    spec_decode_metadata: Optional[SpecDecodeMetadata] = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -283,6 +298,7 @@ def set_forward_context(
     context: Context,
     num_tokens: Optional[int] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
+    spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
@@ -300,6 +316,7 @@ def set_forward_context(
         kv_cache_data=_forward_kv_cache_context.kv_cache_data,
         context=context,
         dp_metadata=dp_metadata,
+        spec_decode_metadata=spec_decode_metadata,
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)

@@ -3,11 +3,9 @@
 
 import argparse
 
-import torch
-from transformers import AutoTokenizer
-
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from transformers import AutoTokenizer
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -24,7 +22,7 @@ parser.add_argument(
 
 
 def generate_cuda_graph_sizes(max_size):
-# This is for DP split batch size
+    # This is for DP split batch size
     sizes = []
     power = 1
     while power <= max_size:
@@ -78,6 +76,8 @@ def main():
         print("\n")
         print(f"Prompt: {prompt!r}")
         print(f"Completion: {output['text']!r}")
+
+    llm.print_mtp_statistics()
 
 
 if __name__ == "__main__":

@@ -5,14 +5,11 @@ from typing import Optional
 
 import aiter
 import torch
-import triton
-import triton.language as tl
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
 from atom.config import get_current_atom_config
-from atom.utils import envs
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 
@@ -233,8 +230,8 @@ class Attention(nn.Module):
         )
 
         if k_scale is not None and k_scale.numel() > 1:
-          k_scale = k_scale.unsqueeze(-1)
-          v_scale = v_scale.unsqueeze(-1)
+            k_scale = k_scale.unsqueeze(-1)
+            v_scale = v_scale.unsqueeze(-1)
 
         compute_type = (
             torch.bfloat16

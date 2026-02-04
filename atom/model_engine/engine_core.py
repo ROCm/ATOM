@@ -5,31 +5,17 @@ import enum
 import logging
 import pickle
 import queue
-import signal
 import threading
-import time
-import weakref
 from contextlib import ExitStack
-from multiprocessing.shared_memory import SharedMemory
-from typing import Any, List, Optional
+from typing import List
 
 import torch
 import zmq
-import zmq.asyncio
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
-from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.utils import (
-    close_sockets,
-    get_engine_client_zmq_addr,
-    get_mp_context,
-    init_exit_handler,
-    make_zmq_socket,
-    shutdown_all_processes,
-    zmq_socket_ctx,
-)
+from atom.utils import init_exit_handler, make_zmq_socket
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -178,11 +164,11 @@ class EngineCore:
         scheduled_batch, seqs = self.scheduler.schedule()
         # if scheduled_batch is None:
         #     return False
-        out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
-            seqs, out, stream_output_queue=self.stream_output_queue
+            seqs, fwd_out, stream_output_queue=self.stream_output_queue
         )
 
         # Send stream outputs to main process via output_queue
@@ -246,6 +232,8 @@ class EngineCore:
                             self.start_profiler()
                         elif cmd == "stop_profile":
                             self.stop_profiler()
+                        elif cmd == "get_mtp_stats":
+                            self.print_mtp_statistics()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
@@ -305,6 +293,20 @@ class EngineCore:
             print("Stopping profiler...")
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
             print("Profiler stopped.")
+
+    def print_mtp_statistics(self):
+        stats = self.runner_mgr.call_func("get_mtp_statistics", wait_out=True)
+        if stats and stats.get("total_draft_tokens", 0) > 0:
+            print(f"\n{'='*50}")
+            print("MTP (Multi-Token Prediction) Statistics:")
+            print(f"  Total draft tokens: {stats['total_draft_tokens']}")
+            print(f"  Accepted tokens:    {stats['total_accepted_tokens']}")
+            print(f"  Acceptance rate:    {stats['acceptance_rate']:.2%}")
+            print(f"{'='*50}\n")
+        else:
+            print(
+                "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"
+            )
 
 
 class DPEngineCoreProc(EngineCore):

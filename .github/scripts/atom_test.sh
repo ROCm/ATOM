@@ -14,7 +14,7 @@ if [ "$TYPE" == "launch" ]; then
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
-  max_retries=60
+  max_retries=30
   retry_interval=60
   for ((i=1; i<=max_retries; i++)); do
       if curl -s http://localhost:8000/v1/completions -o /dev/null; then
@@ -51,16 +51,16 @@ fi
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
   echo "========== Cloning bench_serving =========="
-  git clone https://github.com/kimbochen/bench_serving.git
+  git clone https://github.com/kimbochen/bench_serving.git && chmod +x bench_serving/benchmark_serving.py
   echo "========== Running benchmark test =========="
-  bench_serving/benchmark_serving.py \
-    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000/v1/completions" \
+  python bench_serving/benchmark_serving.py \
+    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
     --dataset-name=random \
-    --random-input-len=1024 --random-output-len=1024 --random-range-ratio=0.8 \
-    --num-prompts=1000 \
-    --max-concurrency=1 \
+    --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
+    --max-concurrency=$CONC \
+    --num-prompts=$(( $CONC * 10 )) \
     --trust-remote-code \
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
-    --result-dir=. --result-filename=result.json
+    --result-dir=. --result-filename=${RESULT_FILENAME}.json
 fi

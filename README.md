@@ -73,19 +73,11 @@ Or profile offline with custom input length
 python -m atom.examples.profile_offline --model Qwen/Qwen3-0.6B --kv_cache_dtype fp8 --random-input --input-length 1024 --output-length 32
 ```
 
-Profile online inference, after starting the server
-```bash
-python -m atom.examples.profile_online 
-```
-Or profile online with custom input length
-```bash
-python -m atom.examples.profile_online --model Qwen/Qwen3-0.6B --random-input --input-length 1024 --output-length 32
-```
-
-Or directly send start profile and stop profile reuqest
+Profile online inference
 ```bash
 curl -s -S -X POST http://127.0.0.1:8000/start_profile
 ```
+Run your task
 ```bash
 curl -s -S -X POST http://127.0.0.1:8000/stop_profile
 ```
@@ -121,27 +113,13 @@ python -m atom.benchmarks.benchmark_serving \
 ```
 
 
-## 📊 Performance Comparison
+## 📊 Performance
 
-ATOM demonstrates significant performance improvements over vLLM:
+### Online serving throughput
 
-| Model | Framework | Tokens | Time | Throughput |
-|-------|-----------|--------|------|------------|
-| **Qwen3-0.6B** | ATOM | 4096 | 0.25s | **16,643.74 tok/s** |
-| Qwen3-0.6B | vLLM | 4096 | 0.63s | 6,543.06 tok/s |
-| **Llama-3.1-8B-Instruct-FP8-KV** | ATOM | 4096 | 0.68s | **5,983.37 tok/s** |
-| Llama-3.1-8B-Instruct-FP8-KV | vLLM | 4096 | 1.68s | 2,432.62 tok/s |
+![DS R1 Performance](./docs/ds_r1_performance.png)
 
-
-### Online serving throughput:
-
-Deepseek-V3
-| concurrency | IPS/QPS | prompts num | vLLM Throughput | ATOM Throughput |
-|-------------|---------|-------------|-----------------|-----------------|
-| 16 | 1024/1024 | 128 | 423.68 tok/s | **922.03 tok/s** |
-| 32 | 1024/1024 | 128 | 629.06 tok/s | **1488.52 tok/s** |
-| 64 | 1024/1024 | 128 | 760.22 tok/s | **2221.25 tok/s** |
-| 128 | 1024/1024 | 128 | 1107.93 tok/s | **2254.88 tok/s** |
+For more information, visit [InferenceMAX](https://inferencemax.semianalysis.com/).
 
 ### Accuracy Benchmarking
 
@@ -163,7 +141,11 @@ Finally, run the evaluation by choosing your datasets:
 lm_eval --model local-completions \
         --model_args model=meta-llama/Meta-Llama-3-8B,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
         --tasks gsm8k \
-        --num_fewshot 3
+        --num_fewshot 5
 ```
 ## Acknowledgements
 This project was adapted from nano-vllm (https://github.com/GeeeekExplorer/nano-vllm)
+
+## Support & Reporting Issues 
+
+We welcome issues and contributions!  Please use the GitHub Issues page to report bugs or request features: https://github.com/ROCm/ATOM/issues
