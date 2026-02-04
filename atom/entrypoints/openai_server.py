@@ -901,7 +901,9 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading tokenizer from {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=args.trust_remote_code
+    )
     model_name = args.model
 
     print(f"Initializing engine with model {args.model}...")

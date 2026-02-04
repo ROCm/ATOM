@@ -258,7 +258,9 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
-def should_ignore_layer(quantization_config: Optional[QuantizationConfig], prefix: str) -> bool:
+def should_ignore_layer(
+    quantization_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
     exclude_layers: List[str] = quantization_config["exclude_layers"]
     for exclude_layer in exclude_layers:
         if exclude_layer.startswith("re"):

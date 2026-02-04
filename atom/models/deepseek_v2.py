@@ -704,14 +704,22 @@ class DeepseekV2MLP(nn.Module):
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            quant_config=None if should_ignore_layer(quant_config, prefix=f"{prefix}.gate_up_proj") else quant_config,
+            quant_config=(
+                None
+                if should_ignore_layer(quant_config, prefix=f"{prefix}.gate_up_proj")
+                else quant_config
+            ),
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
-            quant_config=None if should_ignore_layer(quant_config, prefix=f"{prefix}.down_proj") else quant_config,
+            quant_config=(
+                None
+                if should_ignore_layer(quant_config, prefix=f"{prefix}.down_proj")
+                else quant_config
+            ),
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
@@ -780,7 +788,11 @@ class DeepseekV2MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
             renormalize=config.norm_topk_prob,
-            quant_config=None if should_ignore_layer(quant_config, prefix=f"{prefix}.experts") else quant_config,
+            quant_config=(
+                None
+                if should_ignore_layer(quant_config, prefix=f"{prefix}.experts")
+                else quant_config
+            ),
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,

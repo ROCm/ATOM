@@ -355,12 +355,18 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
     elif quant_method == "quark":
         exclude_layers_key = "exclude"
     else:
-        logger.warning(f"Using 'ignore' as key for exclude layers with quant_method {quant_method}, \
-                       please double check the quantization config.")
+        logger.warning(
+            f"Using 'ignore' as key for exclude layers with quant_method {quant_method}, \
+                       please double check the quantization config."
+        )
         exclude_layers_key = "ignore"
     exclude_layers = orig_quant_config.get(exclude_layers_key, None)
     return QuantizationConfig(
-        quant_type, quant_dtype, is_dynamic, quant_method=quant_method, exclude_layers=exclude_layers
+        quant_type,
+        quant_dtype,
+        is_dynamic,
+        quant_method=quant_method,
+        exclude_layers=exclude_layers,
     )
 
 
