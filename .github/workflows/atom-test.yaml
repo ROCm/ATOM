@@ -41,6 +41,21 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             runner: atom-mi355-8gpu.predownload
+          - model_name: "DeepSeek-R1-0528 MTP"
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
+            extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
+            env_vars: ""
+            runner: atom-mi355-8gpu.predownload
+          - model_name: "DeepSeek-R1-0528-FP4"
+            model_path: "amd/DeepSeek-R1-0528-MXFP4"
+            extraArgs: "--kv_cache_dtype fp8 -tp 8"
+            env_vars: ""
+            runner: atom-mi355-8gpu.predownload
+          - model_name: "DeepSeek-R1-0528-FP4 MTP"
+            model_path: "amd/DeepSeek-R1-0528-MXFP4"
+            extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
+            env_vars: ""
+            runner: atom-mi355-8gpu.predownload
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8"
