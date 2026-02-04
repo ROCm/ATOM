@@ -7,6 +7,7 @@ from typing import (
     Protocol,
     Tuple,
     Union,
+    Optional,
 )
 
 import torch
@@ -261,18 +262,28 @@ def fast_topk(values, topk, dim):
 def should_ignore_layer(
     quantization_config: Optional[QuantizationConfig], prefix: str
 ) -> bool:
-    exclude_layers: List[str] = quantization_config["exclude_layers"]
+    if quantization_config is None:
+        return True
+    exclude_layers: List[str] = quantization_config.get("exclude_layers", [])
+    if not exclude_layers:
+        return False
     for exclude_layer in exclude_layers:
         if exclude_layer.startswith("re"):
             # case "re:model.layers.*self_attn.*", remove the 're:' prefix
             regex_pattern = exclude_layer[3:]
             if re.search(regex_pattern, prefix):
                 return True
-        elif exclude_layer.startswith(prefix):
-            # case "model.layers.0.self_attn.q_a_proj"
+        elif prefix in exclude_layer:
+            # case exclude_layer like "model.layers.0.self_attn.q_a_proj"
+            # a common prefix for linear layers in attn like "model.layers.0.self_attn"
             return True
         else:
             # case "lm_head". Common practice won't quant lm_head, however.
             if prefix.split(".")[-1] == exclude_layer:
                 return True
     return False
+
+def get_quant_config_for_layer(
+    quantization_config: Optional[QuantizationConfig], prefix: str    
+) -> Optional[QuantizationConfig]:
+    return None if should_ignore_layer(quantization_config, prefix) else quantization_config
