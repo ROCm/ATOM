@@ -39,6 +39,10 @@ from atom.model_ops.moe import FusedMoE
 # from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import QKVParallelLinear, RowParallelLinear, ReplicatedLinear
+from atom.utils import envs
+
+# Check if fused attention output + RMSNorm is enabled
+ATOM_ENABLE_FUSED_ATTN_OUTPUT_RMSNORM = envs.ATOM_ENABLE_FUSED_ATTN_OUTPUT_RMSNORM
 
 # from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from aiter.rotary_embedding import get_rope
@@ -263,6 +267,17 @@ class TransformerBlock(torch.nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=1e-5, x_pad_to_multiple=256
         )
+        
+        # Enable fused attention output + RMSNorm if available
+        self.use_fused_attn_rmsnorm = ATOM_ENABLE_FUSED_ATTN_OUTPUT_RMSNORM
+        if self.use_fused_attn_rmsnorm:
+            try:
+                from aiter.ops.triton.fusions.fused_attn_output_rmsnorm import (
+                    fused_attn_output_rmsnorm,
+                )
+                self._fused_attn_output_rmsnorm = fused_attn_output_rmsnorm
+            except ImportError:
+                self.use_fused_attn_rmsnorm = False
 
     def forward(
         self,
@@ -278,8 +293,19 @@ class TransformerBlock(torch.nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(hidden_states, positions)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # Fully Connected - use fused kernel if enabled
+        if self.use_fused_attn_rmsnorm:
+            # Fused: attention_output + residual + RMSNorm in one kernel
+            # Supports x_pad_to_multiple=256 for MoE compatibility
+            hidden_states, residual = self._fused_attn_output_rmsnorm(
+                hidden_states,
+                self.post_attention_layernorm.weight,
+                epsilon=self.post_attention_layernorm.eps,
+                residual=residual,
+                x_pad_to_multiple=self.post_attention_layernorm.x_pad_to_multiple,
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         output = self.mlp(hidden_states)[:, : self.hidden_size]
         return output, residual
 
