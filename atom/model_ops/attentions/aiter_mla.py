@@ -7,6 +7,7 @@ from typing import Type
 
 import numpy as np
 import torch
+import triton
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
@@ -234,64 +235,57 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         bonus_list = self.model_runner.tokenID_processor.mapped_bonus_list
 
         var = self.model_runner.forward_vars
-
+        context_lens = batch.context_lens
+        block_tables = batch.block_tables
+        positions = [
+            pos
+            for seq_len in context_lens
+            for pos in range(seq_len - max_seqlen_q, seq_len)
+        ]
         if max_seqlen_q > 1:
-            context_lens = batch.context_lens
             if bonus_list is not None:
                 context_lens = [
-                    c + bonus_list[i] - batch.num_spec_step
-                    for i, c in enumerate(batch.context_lens)
+                    c + b - batch.num_spec_step
+                    for c, b in zip(context_lens, bonus_list)
+                ]
+                block_tables = [
+                    block_table[: triton.cdiv(seq_len, self.model_runner.block_size)]
+                    for block_table, seq_len in zip(block_tables, context_lens)
                 ]
 
-            positions = [
-                pos
-                for seq_len in context_lens
-                for pos in range(seq_len - max_seqlen_q, seq_len)
-            ]
-            # if self.model_runner.rank == 0:
-            #     print(f"{batch.block_tables=}")
-            #     print(f"{positions=}")
             slot_mapping = [
                 block_table[pos // self.model_runner.block_size]
                 * self.model_runner.block_size
                 + (pos % self.model_runner.block_size)
-                for block_table, seq_len in zip(batch.block_tables, context_lens)
+                for block_table, seq_len in zip(block_tables, context_lens)
                 for pos in range(seq_len - max_seqlen_q, seq_len)
             ]
-            # if self.model_runner.rank == 0:
-            #     print(f"{slot_mapping=}")
         else:
-            context_lens = batch.context_lens
-            positions = [i - 1 for i in context_lens]
             slot_mapping = [
                 block_table[-1] * self.model_runner.block_size + last_block_num - 1
                 for block_table, last_block_num in zip(
-                    batch.block_tables, batch.last_block_num_tokens
+                    block_tables, batch.last_block_num_tokens
                 )
             ]
 
         sum_scheduled_tokens = batch.total_tokens_num_decode
-        if batch.is_dummy_run:
-            var["slot_mapping"].np[: bs * max_seqlen_q] = -1
-        else:
-            var["slot_mapping"].np[: scheduled_bs * max_seqlen_q] = slot_mapping
-            var["slot_mapping"].np[scheduled_bs * max_seqlen_q : bs * max_seqlen_q] = -1
+        var["slot_mapping"].np[: bs * max_seqlen_q] = -1
+        if not batch.is_dummy_run:
+            var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         # var["context_lens"].np[scheduled_bs:bs] = 0
 
-        num_blocks_per_seq = [
-            (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
-        ]
+        num_blocks_per_seq = [triton.cdiv(ctx, self.block_size) for ctx in context_lens]
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1]
         sum_blocks_before_converted = sum(
-            [(i + self.block_ratio - 1) // self.block_ratio for i in num_blocks_per_seq]
+            [triton.cdiv(i, self.block_ratio) for i in num_blocks_per_seq]
         )
 
         def prepare_kv_indices():
             var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
-                itertools.chain.from_iterable(batch.block_tables),
+                itertools.chain.from_iterable(block_tables),
                 dtype=np.int32,
                 count=sum_blocks_before_converted,
             )
