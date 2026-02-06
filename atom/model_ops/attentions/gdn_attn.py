@@ -1,19 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import itertools
 from dataclasses import dataclass
-from typing import Optional, Type
+from typing import Type
 
-import aiter
 import numpy as np
 import torch
-from aiter import dtypes
-from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_gdn import GatedDetlaNet
-from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_attention import AiterBackend, AiterAttentionMetadataBuilder

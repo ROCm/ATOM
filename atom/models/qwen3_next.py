@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -6,10 +6,6 @@ import torch.nn.functional as F
 from einops import rearrange
 
 # import torch.distributed as dist
-from aiter.dist.parallel_state import get_tp_group
-from typing import Optional
-from transformers import Qwen3Config
-from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 from atom.config import QuantizationConfig, Config
 
@@ -18,7 +14,7 @@ from atom.model_ops.activation import SiluAndMul
 
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention, LinearAttention
-from atom.model_ops.layernorm import RMSNorm, RMSNormGated, GemmaRMSNorm
+from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
 from atom.model_ops.linear import (
     QKVParallelLinear,
@@ -27,19 +23,8 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     ColumnParallelLinear,
 )
-from atom.model_ops.fla_ops import (
-    chunk_gated_delta_rule,
-    fused_recurrent_gated_delta_rule,
-)
-from atom.model_ops.mamba_ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
 from atom.model_config.qwen3_next import Qwen3NextConfig
-from atom.utils.forward_context import ForwardContext, get_forward_context
 
-import triton
-import triton.language as tl
 
 from atom.utils.decorators import support_torch_compile
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -52,7 +37,6 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
-    get_tp_group,
     get_ep_group,
 )
 from atom.models.utils import (
