@@ -63,7 +63,10 @@ def linear_attention_with_output_base_fask(
 ) -> torch.Tensor:
     return
 
-@mark_spliting_op(is_custom=True, gen_fake=linear_attention_with_output_base_fask, mutates_args=[])
+
+@mark_spliting_op(
+    is_custom=True, gen_fake=linear_attention_with_output_base_fask, mutates_args=[]
+)
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,
@@ -169,11 +172,11 @@ class LinearAttention(nn.Module):
         head_v_dim,
         key_dim,
         value_dim,
-        dt_bias = None,
-        A_log = None,
-        conv1d = None,
-        activation = None,
-        layer_num = 0,
+        dt_bias=None,
+        A_log=None,
+        conv1d=None,
+        activation=None,
+        layer_num=0,
         prefix: Optional[str] = None,
         **kwargs,
     ):
@@ -222,7 +225,6 @@ class LinearAttention(nn.Module):
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer: {}".format(self.layer_name))
         compilation_config.static_forward_context[self.layer_name] = self
-
 
     def forward(
         self,

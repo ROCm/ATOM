@@ -32,6 +32,7 @@ class GDNAttentionBackend(AiterBackend):
     def get_impl_cls() -> Type["GatedDetlaNet"]:
         return GatedDetlaNet
 
+
 @dataclass
 class GDNAttentionMetadata:
     num_prefills: int
@@ -132,7 +133,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         }
         self.model_runner.forward_vars.update(gdn_metadata)
 
-    
     def prepare_gdn_metadata(
         self,
         batch: ScheduledBatch,
@@ -146,7 +146,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         num_reqs = batch.total_seqs_num
         self.prepare_block_tables(batch)
 
-        block_tables = self.model_runner.forward_vars["block_tables"].copy_to_gpu(num_reqs)
+        block_tables = self.model_runner.forward_vars["block_tables"].copy_to_gpu(
+            num_reqs
+        )
 
         context_lens_tensor = attn_metadata.context_lens
         query_start_loc = attn_metadata.cu_seqlens_q
@@ -206,8 +208,8 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
     ) -> GDNAttentionMetadata:
 
         attn_metadata, positions = super().prepare_prefill(batch)
-        if batch.block_tables==[]:
-            attn_metadata.gdn_metadata=None
+        if batch.block_tables == []:
+            attn_metadata.gdn_metadata = None
             return attn_metadata, positions
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata)
 
@@ -224,18 +226,24 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         attn_metadata, positions = super().prepare_decode(batch, bs)
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata)
         # transfer data to ps buffer
-        self.model_runner.forward_vars["cu_seqlens_q"].cpu[bs:] = batch.total_tokens_num_decode
-        gdn_metadata.non_spec_query_start_loc = self.model_runner.forward_vars["cu_seqlens_q"].copy_to_gpu(bs + 1)
-        self.non_spec_state_indices_tensor[:num_decodes].copy_(gdn_metadata.non_spec_state_indices_tensor, non_blocking=True)
+        self.model_runner.forward_vars["cu_seqlens_q"].cpu[
+            bs:
+        ] = batch.total_tokens_num_decode
+        gdn_metadata.non_spec_query_start_loc = self.model_runner.forward_vars[
+            "cu_seqlens_q"
+        ].copy_to_gpu(bs + 1)
+        self.non_spec_state_indices_tensor[:num_decodes].copy_(
+            gdn_metadata.non_spec_state_indices_tensor, non_blocking=True
+        )
         self.non_spec_state_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
-        gdn_metadata.non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[:num_decodes]
+        gdn_metadata.non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
+            :num_decodes
+        ]
         # print("gdn metadata decode: ", gdn_metadata, flush=True)
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions
 
-    def build_for_cudagraph_capture(
-        self, bs: int
-    ):
+    def build_for_cudagraph_capture(self, bs: int):
         var = self.model_runner.forward_vars
         if self.block_size == 1024:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
@@ -288,6 +296,8 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
 
 PAD_SLOT_ID = -1
+
+
 def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
     # Needed for causal_conv1d
     seqlens = query_start_loc_p.diff().to("cpu")
@@ -322,14 +332,12 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
         else:
             if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
                 batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
-                token_chunk_offset_ptr.resize_(  # type: ignore
-                    MAX_NUM_PROGRAMS
-                ).fill_(PAD_SLOT_ID)
+                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(  # type: ignore
+                    PAD_SLOT_ID
+                )
 
         batch_ptr[0:mlist_len].copy_(mlist)
-        token_chunk_offset_ptr[  # type: ignore
-            0:mlist_len
-        ].copy_(offsetlist)
+        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist)  # type: ignore
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
 

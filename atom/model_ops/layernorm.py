@@ -372,7 +372,7 @@ class RMSNormGated(nn.Module):
     def forward_cuda(
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
-        
+
         if torch.compiler.is_compiling():
             return self.forward_native(x, z)
         return self.forward_native(x, z)
@@ -388,12 +388,11 @@ class RMSNormGated(nn.Module):
         #     group_size=self.group_size,
         #     norm_before_gate=self.norm_before_gate,
         # )
-    
-    def forward(
-        self, x: torch.Tensor, z: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
+
         return self.forward_cuda(x, z)
+
 
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
@@ -455,12 +454,10 @@ class GemmaRMSNorm(nn.Module):
             return self.forward_native(x, residual)
 
         if not getattr(self, "_is_compiled", False):
-            self.forward_static = torch.compile(  # type: ignore
-                self.forward_static
-            )
+            self.forward_static = torch.compile(self.forward_static)  # type: ignore
             self._is_compiled = True
         return self.forward_native(x, residual)
-    
+
     def forward(
         self,
         x: torch.Tensor,
