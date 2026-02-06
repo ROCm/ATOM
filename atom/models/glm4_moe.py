@@ -1,9 +1,7 @@
-import typing
-from collections.abc import Callable, Iterable
 from itertools import islice
 
 from aiter.dist.parallel_state import get_tp_group, get_pp_group, get_ep_group
-from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.config import Config, QuantizationConfig
 
 # from atom.model_ops.fused_moe.shared_fused_moe import SharedFusedMoE
 from atom.model_ops.linear import (
@@ -27,7 +25,6 @@ from atom.utils.decorators import support_torch_compile
 from .utils import (
     IntermediateTensors,
     PPMissingLayer,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -313,7 +310,20 @@ class Glm4MoeDecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
-        rope_theta = getattr(config, "rope_theta", 10000)
+        # Compatible with both transformers < 5 and 5.0+; also robust when
+        rope_params = getattr(config, "rope_parameters", None)
+        if rope_params is not None:
+            if not isinstance(rope_params, dict):
+                raise TypeError(
+                    f"Expected `rope_parameters` to be a dict, got {type(rope_params)}"
+                )
+            rope_theta = rope_params.get("rope_theta", 1000000)
+        else:
+            rope_theta = getattr(config, "rope_theta", None)
+            if rope_theta is None:
+                rope_theta = config.__dict__.get("rope_theta", 1000000)
+            if rope_theta is None:
+                rope_theta = 1000000
 
         self.self_attn = Glm4MoeAttention(
             config=config,
