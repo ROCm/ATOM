@@ -21,7 +21,6 @@ from torch import nn
 from aiter.dist.parallel_state import get_tp_group
 
 
-
 @triton.jit
 def fused_gdn_gating_kernel(
     g,

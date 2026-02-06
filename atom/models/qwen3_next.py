@@ -406,22 +406,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def mamba_type(self) -> str:
         return "gdn_attention"
 
-    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
-        )
-
-    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            self.tp_size,
-            self.num_k_heads,
-            self.num_v_heads,
-            self.head_k_dim,
-            self.head_v_dim,
-            self.conv_kernel_size,
-            self.num_spec,
-        )
-
     def __init__(
         self,
         config: Qwen3NextConfig,
