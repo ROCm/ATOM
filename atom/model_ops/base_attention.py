@@ -196,7 +196,6 @@ class LinearAttention(nn.Module):
         self.base_linear_attention = None
 
         atom_config = get_current_atom_config()
-        dtype = atom_config.torch_dtype
         block_size = atom_config.kv_cache_block_size
         self.attn_backend = get_attn_backend(
             block_size,

@@ -69,8 +69,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         model_runner,
     ):
         super().__init__(model_runner)
-        config = model_runner.config
-        hf_config = config.hf_config
         self.num_spec = 0
         self.use_spec_decode = self.num_spec > 0
 
@@ -145,7 +143,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         )
 
         context_lens_tensor = attn_metadata.context_lens
-        query_start_loc = attn_metadata.cu_seqlens_q
         context_lens_tensor = torch.zeros((batch.total_seqs_num_prefill)).cuda()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode:
