@@ -24,30 +24,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import torch
-from torch import nn
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
-from typing import Optional
-from transformers import Qwen3Config
-from atom.config import QuantizationConfig, Config
-
+from aiter.rotary_embedding import get_rope
+from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
-    QKVParallelLinear,
     MergedColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from atom.utils.decorators import support_torch_compile
-
-# from atom.model_ops.rotary_embedding import get_rope
-from aiter.rotary_embedding import get_rope
-from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
+from torch import nn
+from transformers import Qwen3Config
 
 
 class Qwen3Attention(nn.Module):
@@ -174,6 +172,7 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_num = layer_num
+        rope_params = config.rope_parameters
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -182,8 +181,8 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", False),
             head_dim=getattr(config, "head_dim", None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_theta=rope_params["rope_theta"],
+            rope_scaling=rope_params,
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             quant_config=quant_config,

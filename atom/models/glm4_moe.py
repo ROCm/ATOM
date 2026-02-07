@@ -1,7 +1,14 @@
 from itertools import islice
 
-from aiter.dist.parallel_state import get_tp_group, get_pp_group, get_ep_group
+import torch
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.parallel_state import get_ep_group, get_pp_group, get_tp_group
+from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig
+from atom.model_ops.activation import SiluAndMul
+from atom.model_ops.base_attention import Attention
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.layernorm import RMSNorm
 
 # from atom.model_ops.fused_moe.shared_fused_moe import SharedFusedMoE
 from atom.model_ops.linear import (
@@ -14,14 +21,10 @@ from atom.model_ops.topK import (
     is_rocm_aiter_fuse_routed_scaling_factor,
     is_rocm_aiter_fusion_shared_expert_enabled,
 )
-import torch
+from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
-from atom.model_ops.activation import SiluAndMul
-from aiter.rotary_embedding import get_rope
-from atom.model_ops.layernorm import RMSNorm
-from atom.model_ops.base_attention import Attention
-from atom.utils.decorators import support_torch_compile
+
 from .utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -29,11 +32,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.model_ops.embed_head import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 
 
 class Glm4MoeMLP(nn.Module):
@@ -310,20 +308,8 @@ class Glm4MoeDecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
-        # Compatible with both transformers < 5 and 5.0+; also robust when
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            if not isinstance(rope_params, dict):
-                raise TypeError(
-                    f"Expected `rope_parameters` to be a dict, got {type(rope_params)}"
-                )
-            rope_theta = rope_params.get("rope_theta", 1000000)
-        else:
-            rope_theta = getattr(config, "rope_theta", None)
-            if rope_theta is None:
-                rope_theta = config.__dict__.get("rope_theta", 1000000)
-            if rope_theta is None:
-                rope_theta = 1000000
+        rope_params = config.rope_parameters
+        rope_theta = rope_params["rope_theta"]
 
         self.self_attn = Glm4MoeAttention(
             config=config,
