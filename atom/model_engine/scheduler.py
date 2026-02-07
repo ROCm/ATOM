@@ -278,9 +278,9 @@ class Scheduler:
                 #     seq.token_ids[-num_placeholder + i] = el
                 #     seq.output_tokens[-num_placeholder + i] = el
                 # update the number of tokens in the sequence if draft token is rejected
-                seq.token_ids[-num_accepted_token:] = token_ids
+                seq.token_ids[-num_placeholder:] = token_ids
                 seq.num_tokens = len(seq.token_ids)
-                seq.output_tokens[-num_accepted_token:] = token_ids
+                seq.output_tokens[-num_placeholder:] = token_ids
 
             else:
                 for token_id in token_ids:
