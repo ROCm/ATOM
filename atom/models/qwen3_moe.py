@@ -200,6 +200,15 @@ class Qwen3MoeAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            cos, sin = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
+            joint_cache = torch.cat((cos, sin), dim=-1)
+            self.rotary_emb.register_buffer(
+                "cos_sin_cache",
+                joint_cache.view(joint_cache.size(0), self.head_dim),
+                persistent=False,
+            )
+
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
