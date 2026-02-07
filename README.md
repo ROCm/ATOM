@@ -1,5 +1,5 @@
 <div align="center" id="logo">
-<img src="docs/atom_logo.png" alt="logo" width="400" margin="10px"></img>
+<img src="docs/assets/atom_logo.png" alt="logo" width="400" margin="10px"></img>
 </div>
 
 --------------------------------------------------------------------------------
@@ -117,7 +117,7 @@ python -m atom.benchmarks.benchmark_serving \
 
 ### Online serving throughput
 
-![DS R1 Performance](./docs/ds_r1_performance.png)
+![DS R1 Performance](./docs/assets/ds_r1_performance.png)
 
 For more information, visit [InferenceMAX](https://inferencemax.semianalysis.com/).
 
