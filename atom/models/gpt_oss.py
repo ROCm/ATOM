@@ -18,31 +18,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Optional
+
 import torch
 import torch.distributed as dist
-from torch import nn
-from transformers import GptOssConfig
-from aiter import (
-    ActivationType,
-)
-
-from atom.model_ops.base_attention import Attention
-from atom.utils.decorators import support_torch_compile
-from atom.config import Config, QuantizationConfig
-from aiter.dist.parallel_state import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+from aiter import ActivationType
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
-from atom.model_ops.moe import FusedMoE
-
-# from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
-from atom.model_ops.layernorm import RMSNorm
-from atom.model_ops.linear import QKVParallelLinear, RowParallelLinear, ReplicatedLinear
+from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 
 # from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from aiter.rotary_embedding import get_rope
+from atom.config import Config, QuantizationConfig
+from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+
+# from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
+from atom.model_ops.moe import FusedMoE
 
 # from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from atom.models.utils import (
@@ -51,6 +43,9 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils.decorators import support_torch_compile
+from torch import nn
+from transformers import GptOssConfig
 
 
 def cdiv(x, y):
@@ -73,35 +68,10 @@ class OAIAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.hidden_size = config.hidden_size
 
-        # here is used to make compatible with both transformers < 5 and transformers 5.0+
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            if not isinstance(rope_params, dict):
-                raise TypeError(
-                    f"Expected `rope_parameters` to be a dict, got {type(rope_params)}"
-                )
-            rope_theta = rope_params.get("rope_theta")
-            if rope_theta is None:
-                raise ValueError(
-                    "GPT-OSS config has `rope_parameters` but is missing "
-                    "`rope_parameters.rope_theta`."
-                )
-            rope_scaling = {
-                k: rope_params[k]
-                for k in (
-                    "rope_type",
-                    "factor",
-                    "original_max_position_embeddings",
-                    "beta_fast",
-                    "beta_slow",
-                )
-                if k in rope_params
-            }
-        else:
-            rope_theta = getattr(config, "rope_theta", 10000)
-            rope_scaling = getattr(config, "rope_scaling", None)
+        rope_params = config.rope_parameters
+        rope_theta = rope_params["rope_theta"]
 
-        if rope_scaling is None:
+        if rope_params is None:
             raise ValueError(
                 "GPT-OSS config is missing RoPE scaling parameters. Expected either "
                 "`rope_scaling` (transformers < 5) or `rope_parameters` (transformers 5+)."
@@ -113,15 +83,7 @@ class OAIAttention(nn.Module):
             max_position=config.max_position_embeddings,
             base=rope_theta,
             dtype=torch.bfloat16,
-            rope_scaling={
-                "rope_type": rope_scaling.get("rope_type", "yarn"),
-                "factor": rope_scaling["factor"],
-                "original_max_position_embeddings": rope_scaling[
-                    "original_max_position_embeddings"
-                ],
-                "beta_fast": rope_scaling["beta_fast"],
-                "beta_slow": rope_scaling["beta_slow"],
-            },
+            rope_scaling=rope_params,
             is_neox_style=True,
         )
 
