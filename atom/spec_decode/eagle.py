@@ -6,10 +6,12 @@ from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config
 from atom.model_loader.loader import load_model
 from atom.models.deepseek_mtp import DeepSeekMTP
-from atom.utils.forward_context import get_forward_context
+from atom.model_engine.scheduler import ScheduledBatch
+from atom.utils.forward_context import get_forward_context, AttentionMetaData
 
 logger = logging.getLogger("atom")
-
+import numpy as np
+import itertools
 
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": DeepSeekMTP,
@@ -104,6 +106,7 @@ class EagleProposer:
         # [batch]
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
+        batch: ScheduledBatch,
     ) -> torch.Tensor:
 
         forward_context = get_forward_context()
@@ -121,6 +124,11 @@ class EagleProposer:
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
         for i in range(self.mtp_k):
+            if str(positions.device)=='cuda:0':
+                print(f"breaking point {i}")
+                print(f"{input_ids=}")
+                print(f"{positions=}")
+                print(f"{hidden_states.shape=}")
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -131,11 +139,102 @@ class EagleProposer:
             new_draft_ids = logits.argmax(dim=-1)
             draft_token_ids[:, i] = new_draft_ids
 
-            if i < self.mtp_k - 1:
+            if i < self.mtp_k - 1 and not batch.is_dummy_run:
                 # update metadata
                 input_ids = new_draft_ids
                 positions = positions[last_token_indices] + 1
                 hidden_states = sample_hidden_states
+
+                max_seqlen_q = 1
+                context.positions = positions
+                context.is_prefill = False
+
+                context_lens = positions + 1
+                slot_mapping = [
+                    block_table[pos // self.runner.block_size]
+                    * self.runner.block_size
+                    + (pos % self.runner.block_size)
+                    for block_table, seq_len in zip(batch.block_tables, context_lens)
+                    for pos in range(seq_len - max_seqlen_q, seq_len)
+                ]
+                if self.runner.rank == 0:
+                    print(f"{slot_mapping=}")
+                    print(f"{context_lens=}")
+                    print(f"{positions=}")
+                var = self.runner.forward_vars
+
+                scheduled_bs = batch.total_seqs_num
+                var["slot_mapping"].np[: scheduled_bs * max_seqlen_q] = slot_mapping
+                var["slot_mapping"].np[scheduled_bs * max_seqlen_q : bs * max_seqlen_q] = -1
+
+                block_size = self.runner.attn_metadata_builder.block_size
+                block_ratio = self.runner.attn_metadata_builder.block_ratio
+
+                num_blocks_per_seq = [
+                    (ctx + block_size - 1) // block_size for ctx in context_lens.tolist()
+                ]
+                kv_indptr = np.cumsum(num_blocks_per_seq)
+                sum_blocks = kv_indptr[-1]
+                sum_blocks_before_converted = sum(
+                    [(i + block_ratio - 1) // block_ratio for i in num_blocks_per_seq]
+                )
+                def prepare_kv_indices():
+                    var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
+                        itertools.chain.from_iterable(batch.block_tables),
+                        dtype=np.int32,
+                        count=sum_blocks_before_converted,
+                    )
+
+                prepare_kv_indices()
+                var["kv_indptr"].np[0] = 0
+                var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
+                var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
+                var["kv_last_page_lens"].np[:scheduled_bs] = (
+                    batch.last_block_num_tokens if self.block_size != 1 else 1
+                )
+                var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
+
+                # Set cu_seqlens_q for decode mode (1 query token per sequence)
+                # cu_seqlens_q should be [0, 1, 2, 3, ..., bs]
+                var["cu_seqlens_q"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+
+                vars_used = [
+                    ("slot_mapping", bs * max_seqlen_q),
+                    ("cu_seqlens_q", bs + 1),
+                    ("kv_indptr", bs + 1),
+                    ("kv_indices", sum_blocks),
+                    ("kv_last_page_lens", bs),
+                ]
+                ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+                ctx_mla_ps = \
+                    self.runner.attn_metadata_builder.set_mla_persistent_worker_buffers(
+                    bs, 1
+                )
+                ctx.update(ctx_mla_ps)
+
+                attn_metadata = AttentionMetaData(
+                    dropout_p=0.0,
+                    max_seqlen_q=max_seqlen_q,
+                    context_lens=context_lens,
+                    **ctx,
+                )
+                forward_context.attn_metadata = attn_metadata
+                if str(positions.device)=='cuda:0':
+                    print("printing ctx")
+                    # for el, var in ctx.items():
+                    #     if 'work_' in el or 'reduce_' in el:
+                    #         continue
+                    #     logger.info(f"{el}: {var}")
+                    # logger.info(f"{positions=}")
+                    print(f"{forward_context.attn_metadata.cu_seqlens_q=}")
+                    print(f"{forward_context.attn_metadata.max_seqlen_q=}")
+                    print(f"{forward_context.attn_metadata.slot_mapping=}")
+                    print(f"{forward_context.attn_metadata.kv_indptr=}")
+                    print(f"{forward_context.attn_metadata.kv_indices=}")
+                    print(f"{forward_context.attn_metadata.slot_mapping=}")
+                    print(f"{forward_context.context.positions=}")
+                    print(f"{forward_context.context.is_prefill=}")
+                    print(f"{forward_context.attn_metadata.context_lens=}")
 
         # [batch_size, mtp_k]
         return draft_token_ids

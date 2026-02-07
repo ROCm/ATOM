@@ -1416,6 +1416,7 @@ class ModelRunner:
             target_hidden_states=hidden_states,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
+            batch=batch,
         )
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
