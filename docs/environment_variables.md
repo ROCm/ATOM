@@ -63,23 +63,6 @@ This document describes the environment variables used in the ATOM project.
 
 ---
 
-## Model Loading
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **ATOM_DISABLE_MMAP** | bool | false | If set to `true`, disable memory-mapped file loading for model weights. |
-| **HF_TOKEN** | str | — | Hugging Face token for accessing gated models. |
-
----
-
-## Pipeline Parallelism
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **VLLM_PP_LAYER_PARTITION** | str | — | Comma-separated list of layer counts per pipeline partition (e.g., `"10,20,10"`). Overrides automatic layer distribution. Must sum to `num_hidden_layers` and have length equal to `pp_size`. |
-
----
-
 ## Profiling & Debugging
 
 | Variable | Type | Default | Description |
@@ -106,8 +89,6 @@ The following variables are set internally by ATOM; users typically do not need 
 
 | Variable | Description |
 |----------|-------------|
-| **MASTER_ADDR** | Set from config `master_addr` for distributed init. |
-| **MASTER_PORT** | Set from config `port` for distributed init. |
 | **AITER_QUICK_REDUCE_QUANTIZATION** | Set to `INT4` for Llama models with bf16/fp16. |
 | **TORCHINDUCTOR_CACHE_DIR** | Set by compiler interface for inductor cache. |
 | **TRITON_CACHE_DIR** | Set by compiler interface for Triton cache. |
