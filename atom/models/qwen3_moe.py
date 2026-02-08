@@ -1,35 +1,25 @@
 from typing import Optional, Union
 
 import torch
-from torch import nn
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 
-# import torch.distributed as dist
-from transformers import Qwen3Config
-from transformers import PretrainedConfig
-from atom.config import QuantizationConfig, Config
-
+# from atom.model_ops.rotary_embedding import get_rope
+from aiter.rotary_embedding import get_rope
+from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
-    QKVParallelLinear,
     MergedColumnParallelLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.utils.decorators import support_torch_compile
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-
-# from atom.model_ops.rotary_embedding import get_rope
-from aiter.rotary_embedding import get_rope
-from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_ops.moe import FusedMoE
-from aiter.dist.parallel_state import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -38,6 +28,11 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
+from atom.utils.decorators import support_torch_compile
+from torch import nn
+
+# import torch.distributed as dist
+from transformers import PretrainedConfig, Qwen3Config
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
@@ -259,8 +254,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         super().__init__()
 
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_params = config.rope_parameters
+        rope_theta = rope_params["rope_theta"]
+        rope_scaling = rope_params
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.

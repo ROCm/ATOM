@@ -79,15 +79,16 @@ from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, _has_module
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
+    get_quant_config_for_layer,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    should_ignore_layer,
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.models.utils import should_ignore_layer, get_quant_config_for_layer
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1225,8 +1226,6 @@ class DeepseekV2MLAAttention(nn.Module):
         v_head_dim: int,
         q_lora_rank: Optional[int],
         kv_lora_rank: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         cache_config: str = "bf16",
         quant_config: Optional[QuantizationConfig] = None,
@@ -1250,7 +1249,6 @@ class DeepseekV2MLAAttention(nn.Module):
         self.num_local_heads = num_heads // tp_size
 
         self.scaling = self.qk_head_dim**-0.5
-        self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
 
@@ -1336,8 +1334,10 @@ class DeepseekV2MLAAttention(nn.Module):
             source_quant_dtype=None,
         )
 
-        if rope_scaling:
-            rope_scaling["rope_type"] = "deepseek_yarn"
+        rope_params = config.rope_parameters
+        rope_params["rope_type"] = "deepseek_yarn"
+        rope_theta = rope_params["rope_theta"]
+        rope_scaling = rope_params
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
@@ -1346,9 +1346,9 @@ class DeepseekV2MLAAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=False,
         )
-        if rope_scaling:
-            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-            scaling_factor = rope_scaling["factor"]
+        if rope_params:
+            mscale_all_dim = rope_params.get("mscale_all_dim", False)
+            scaling_factor = rope_params["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
@@ -1528,8 +1528,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
@@ -1545,8 +1543,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank if hasattr(config, "q_lora_rank") else None,
             kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,

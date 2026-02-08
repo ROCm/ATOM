@@ -10,13 +10,12 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 import torch
+from aiter import QuantType
+from aiter.utility.dtypes import d_dtypes
 from atom.utils import envs, get_open_port
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
-from transformers import AutoConfig, PretrainedConfig, GenerationConfig
-
-from aiter import QuantType
-from aiter.utility.dtypes import d_dtypes
+from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 logger = logging.getLogger("atom")
 
@@ -604,6 +603,12 @@ class Config:
         ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(self.model)
+        if not hasattr(self.hf_config, "rope_parameters"):
+            # Compatible with both transformers < 5
+            rope_params = getattr(self.hf_config, "rope_scaling", {})
+            rope_params["rope_theta"] = self.hf_config.rope_theta
+            self.hf_config.rope_parameters = rope_params
+
         self.generation_config = get_generation_config(self.model)
         if self.generation_config is not None:
             if (

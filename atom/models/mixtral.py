@@ -27,29 +27,25 @@
 from typing import Optional, Union
 
 import torch
-from torch import nn
-from transformers import MixtralConfig
+from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
+from aiter.rotary_embedding import get_rope
+from atom.config import Config, QuantizationConfig
 
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
-from aiter.dist.parallel_state import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
-from atom.model_ops.linear import QKVParallelLinear, RowParallelLinear, ReplicatedLinear
+from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.moe import FusedMoE
-from aiter.rotary_embedding import get_rope
-from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
-from atom.config import QuantizationConfig, Config
-from atom.utils.decorators import support_torch_compile
-
 from atom.models.utils import (
     IntermediateTensors,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+from atom.utils.decorators import support_torch_compile
+from torch import nn
+from transformers import MixtralConfig
 
 
 class MixtralMoE(nn.Module):
@@ -210,8 +206,8 @@ class MixtralDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_params = config.rope_parameters
+        rope_theta = rope_params["rope_theta"]
         self.self_attn = MixtralAttention(
             config=config,
             hidden_size=self.hidden_size,
