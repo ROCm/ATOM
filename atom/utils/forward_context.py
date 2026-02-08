@@ -127,7 +127,6 @@ class SpecDecodeMetadata:
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
-    logits_indices: torch.Tensor
 
 
 @dataclass
