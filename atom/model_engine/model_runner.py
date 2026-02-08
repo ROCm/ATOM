@@ -908,7 +908,7 @@ class ModelRunner:
         if self.use_mla:
             block_bytes = (
                 hf_config.num_hidden_layers
-                * self.physical_block_size
+                * self.block_size
                 * 576
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
@@ -917,7 +917,7 @@ class ModelRunner:
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
                 block_bytes += (
                     hf_config.num_hidden_layers
-                    * self.physical_block_size
+                    * self.block_size
                     * aligned_index_dim
                     * dtypes.fp8.itemsize
                 )
@@ -925,7 +925,7 @@ class ModelRunner:
             block_bytes = (
                 2
                 * hf_config.num_hidden_layers
-                * self.physical_block_size
+                * self.block_size
                 * num_kv_heads
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
@@ -933,10 +933,14 @@ class ModelRunner:
         num_kvcache_blocks = (
             int(total * config.gpu_memory_utilization - used - peak + current)
             // block_bytes
-        ) // self.attn_metadata_builder.block_ratio
-        assert (
-            num_kvcache_blocks > 0
-        ), f"need at least {block_bytes}B for KV cache, but available memory is {free}B (total: {total}B, used: {used}B, peak: {peak}B, current: {current}B)"
+        )
+        assert num_kvcache_blocks > 0, (
+            f"Not enough memory for KV cache with block size({self.block_size}). "
+            f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
+            f"but available memory is {free / (1 << 20):.2f}MB "
+            f"(total: {total / (1 << 30):.2f}GB, used: {used / (1 << 30):.2f}GB, "
+            f"peak: {peak / (1 << 30):.2f}GB, current: {current / (1 << 30):.2f}GB)"
+        )
         return num_kvcache_blocks
 
     def allocate_kv_cache(self, num_kvcache_blocks):
