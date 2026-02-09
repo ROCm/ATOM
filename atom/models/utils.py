@@ -218,28 +218,6 @@ def maybe_prefix(prefix: str, name: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
-def extract_layer_index(layer_name: str) -> int:
-    """
-    Extract the layer index from the module name.
-    Examples:
-    - "encoder.layers.0" -> 0
-    - "encoder.layers.1.self_attn" -> 1
-    - "2.self_attn" -> 2
-    - "model.encoder.layers.0.sub.1" -> ValueError
-    """
-    subnames = layer_name.split(".")
-    int_vals: List[int] = []
-    for subname in subnames:
-        try:
-            int_vals.append(int(subname))
-        except ValueError:
-            continue
-    assert len(int_vals) == 1, (
-        f"layer name {layer_name} should" " only contain one integer"
-    )
-    return int_vals[0]
-
-
 def cast_overflow_tensors(
     tensors: torch.Tensor,
     offset: float = 1000,
@@ -326,22 +304,3 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
             else int_vals[0]
         )
         return layer_index
-
-
-def cast_overflow_tensors(
-    tensors: torch.Tensor,
-    offset: float = 1000,
-) -> torch.Tensor:
-    if tensors.isinf().any() or tensors.isnan().any():
-        clamp_value = torch.finfo(tensors.dtype).max - offset
-        tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
-    return tensors
-
-
-def fast_topk(values, topk, dim):
-    if topk == 1:
-        # Use max along the specified dimension to get both value and index
-        return torch.max(values, dim=dim, keepdim=True)
-    else:
-        # Use topk for efficiency with larger k values
-        return torch.topk(values, topk, dim=dim)

@@ -606,7 +606,9 @@ class Config:
         if not hasattr(self.hf_config, "rope_parameters"):
             # Compatible with both transformers < 5
             rope_params = getattr(self.hf_config, "rope_scaling", {})
-            rope_params["rope_theta"] = self.hf_config.rope_theta
+            if rope_params is None:
+                rope_params = {}
+            rope_params["rope_theta"] = getattr(self.hf_config, "rope_theta", None)
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)

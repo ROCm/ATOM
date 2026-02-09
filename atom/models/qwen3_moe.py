@@ -4,7 +4,7 @@ import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 
-#from atom.model_ops.rotary_embedding import get_rope
+# from atom.model_ops.rotary_embedding import get_rope
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
@@ -21,11 +21,8 @@ from atom.model_ops.linear import (
 )
 
 from atom.utils.decorators import support_torch_compile
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 
 # from atom.model_ops.rotary_embedding import get_rope
-from aiter.rotary_embedding import get_rope
-from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import (
     IntermediateTensors,
@@ -35,7 +32,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
-from atom.utils.decorators import support_torch_compile
 from torch import nn
 
 # import torch.distributed as dist
