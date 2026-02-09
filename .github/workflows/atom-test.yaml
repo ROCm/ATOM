@@ -30,12 +30,12 @@ jobs:
             model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: ""
-            runner: atom-mi355-1gpu
+            runner: linux-atom-mi355-1
           - model_name: "Llama-3.3-70B-Instruct-MXFP4-Preview"
             model_path: "amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: ""
-            runner: atom-mi355-1gpu
+            runner: linux-atom-mi355-1
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
@@ -61,13 +61,13 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
-            runner: atom-mi355-1gpu
+            runner: linux-atom-mi355-1
           - model_name: "gpt-oss-120b (2 GPUs)"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
-            runner: atom-mi355-4gpu
+            runner: linux-atom-mi355-4
           - model_name: "Qwen3-235B-A22B-Instruct-2507-FP8"
             model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
