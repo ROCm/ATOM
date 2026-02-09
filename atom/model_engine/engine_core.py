@@ -272,10 +272,10 @@ class EngineCore:
                 valid_seqs = [
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
-                serialized_obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
-                socket.send(serialized_obj)
                 num_valid = len(valid_seqs)
                 if num_valid > 0:
+                    serialized_obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
+                    socket.send(serialized_obj)
                     logger.info(f"{self.label}: output send {num_valid} reqs")
                 if len(valid_seqs) != len(seqs):
                     socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
@@ -290,7 +290,7 @@ class EngineCore:
 
     def stop_profiler(self):
         if self.profile_enbaled:
-            logger.info("Profiler stoping...")
+            logger.info("Profiler stopping...")
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
             logger.info("Profiler stopped.")
 

@@ -12,7 +12,6 @@ from typing import List
 
 import zmq
 import zmq.asyncio
-
 from atom.config import Config
 from atom.model_engine.engine_core import EngineCore, EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
@@ -184,6 +183,10 @@ class CoreManager:
                     )
                     ready_received[dp_rank] = True
                     remaining -= 1
+                elif request_type == EngineCoreRequestType.SHUTDOWN:
+                    raise RuntimeError(
+                        f"{self.label}: Received unexpected SHUTDOWN signal from DP rank {dp_rank} during initialization"
+                    )
                 else:
                     raise RuntimeError(
                         f"{self.label}: Expected READY signal from DP rank {dp_rank}, but got {request_type}"

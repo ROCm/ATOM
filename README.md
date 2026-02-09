@@ -64,7 +64,7 @@ docker run -it --network=host \
 
 ```bash
 pip install amd-aiter
-git clone https://github.com/ROCm/ATOM.git; cd ./ATOM; pip install .
+git clone https://github.com/ROCm/ATOM.git; pip install ./ATOM
 ```
 
 ## 📚 Documentation
