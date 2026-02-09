@@ -254,9 +254,9 @@ def load_model(
                 else:
                     # Model doesn't have expert mapping, use generic loading
                     param = model.get_parameter(name)
-                    # # weight_loader = getattr(
-                    # #     param, "weight_loader", default_weight_loader
-                    # # )
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     # weight_loader(param, weight_tensor)
                     futures.append(executor.submit(weight_loader, param, weight_tensor))
         # Wait for all tasks to complete and raise any exceptions.
