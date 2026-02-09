@@ -49,3 +49,16 @@ __pycache__
 debug
 aiter_logs
 *.log
+
+# Claude Code configuration - DO NOT COMMIT TO PROJECT
+.claude/
+CLAUDE.md
+.codex/
+atom_profile/
+profiling_run_*/
+
+# GPU core dumps and test artifacts
+gpucore.*
+*.tar.bz2
+mtp_pts/
+no_mtp_pts/

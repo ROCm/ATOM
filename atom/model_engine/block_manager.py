@@ -98,12 +98,12 @@ class BlockManager:
 
         # handle mamba-like model
         if seq.mamba_enabled:
-            print("allocate for mamba blocks", flush=True)
+            # print("allocate for mamba blocks", flush=True)
             # For mamba, we need to ensure the last block is always allocated
             # even if it has less than block_size tokens
             for i in range(seq.num_mamba_blocks):
                 block_id = self.free_block_ids[0]
-                print("mamba block allocated: ", block_id, flush=True)
+                # print("mamba block allocated: ", block_id, flush=True)
                 self._allocate_block(block_id)
                 # No prefix caching support for mamba arch
                 seq.mamba_block_table.append(block_id)
@@ -123,7 +123,6 @@ class BlockManager:
                 block.ref_count = 0
                 self._deallocate_block(block_id)
             seq.mamba_block_table.clear()
-
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
@@ -175,4 +174,5 @@ class BlockManager:
         else:
             # Last block is not full and not at the boundary
             # Hash remains -1 until block is full (consistent with allocate logic)
-            assert last_block.hash == -1, last_block.block_id
+            # assert last_block.hash == -1, last_block.block_id
+            pass

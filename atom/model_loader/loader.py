@@ -3,7 +3,6 @@
 
 import concurrent.futures
 import os
-import logging
 import re
 from glob import glob
 from typing import Generator, Tuple
@@ -29,8 +28,6 @@ from atom.models.deepseek_mtp import (
     get_spec_layer_idx_from_weight_name,
     rewrite_spec_layer_name,
 )
-
-logger = logging.getLogger("atom")
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -106,7 +103,6 @@ def safetensors_weights_iterator(
     disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
-    logger.info(f"disable_mmap: {disable_mmap}")
     path = (
         model_name_or_path
         if os.path.isdir(model_name_or_path)
@@ -150,10 +146,7 @@ def load_model(
     params_dict = dict(model.named_parameters())
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
-        disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false").lower() == "true"
-        for name, weight_tensor in safetensors_weights_iterator(
-            model_name_or_path, disable_mmap=disable_mmap
-        ):
+        for name, weight_tensor in safetensors_weights_iterator(model_name_or_path):
             if load_dummy:
                 continue
             if name.endswith("kv_scale"):
@@ -190,7 +183,7 @@ def load_model(
                 # We handle the experts below in expert_params_mapping
                 if "mlp.experts." in name and name not in params_dict:
                     continue
-                if "mtp" in name and not spec_decode:
+                if "mtp" in name and name not in params_dict:
                     continue
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
@@ -218,7 +211,7 @@ def load_model(
                             name.endswith(".bias") or name.endswith("_bias")
                         ) and name not in dict(model.named_parameters()):
                             continue
-                        if "mtp" in name and not spec_decode:
+                        if "mtp" in name and not hasattr(model, "mtp"):
                             continue
                         param = model.get_parameter(name)
                         weight_loader = getattr(param, "weight_loader")
@@ -241,24 +234,24 @@ def load_model(
                         # )
                         break
                     else:
-                        if "mtp" in name and not spec_decode:
+                        if "mtp" in name and not hasattr(model, "mtp"):
                             continue
                         param = model.get_parameter(name)
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        futures.append(
-                            executor.submit(weight_loader, param, weight_tensor)
-                        )
-                        # weight_loader(param, weight_tensor)
+                        # futures.append(
+                        #     executor.submit(weight_loader, param, weight_tensor)
+                        # )
+                        weight_loader(param, weight_tensor)
                 else:
                     # Model doesn't have expert mapping, use generic loading
                     param = model.get_parameter(name)
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    # weight_loader(param, weight_tensor)
-                    futures.append(executor.submit(weight_loader, param, weight_tensor))
+                    # weight_loader = getattr(
+                    #     param, "weight_loader", default_weight_loader
+                    # )
+                    weight_loader(param, weight_tensor)
+                    # futures.append(executor.submit(weight_loader, param, weight_tensor))
         # Wait for all tasks to complete and raise any exceptions.
         for future in concurrent.futures.as_completed(futures):
             future.result()

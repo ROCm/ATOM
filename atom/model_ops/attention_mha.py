@@ -12,7 +12,6 @@ from aiter.ops.triton.unified_attention import unified_attention
 from atom.config import get_current_atom_config
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
-from aiter.dist.parallel_state import get_tp_group
 
 from .attention_mla import MLAModules
 
@@ -208,7 +207,9 @@ class Attention(nn.Module):
         _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
         # assuem all query have same length
-        query_group_size = attn_metadata.max_seqlen_q * (num_q_heads_total // num_kv_heads)
+        query_group_size = attn_metadata.max_seqlen_q * (
+            num_q_heads_total // num_kv_heads
+        )
         assert num_q_heads_total % num_kv_heads == 0
 
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
