@@ -54,7 +54,7 @@ def unified_attention_with_output_base(
     return self.impl.forward(q, k, v, positions, q_scale, qkv)
 
 
-def linear_attention_with_output_base_fask(
+def linear_attention_with_output_base_fake(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,
     a: torch.Tensor,
@@ -65,7 +65,7 @@ def linear_attention_with_output_base_fask(
 
 
 @mark_spliting_op(
-    is_custom=True, gen_fake=linear_attention_with_output_base_fask, mutates_args=[]
+    is_custom=True, gen_fake=linear_attention_with_output_base_fake, mutates_args=[]
 )
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
