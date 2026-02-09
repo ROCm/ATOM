@@ -180,7 +180,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         num_reqs = batch.total_seqs_num
         self.prepare_block_tables(batch)
         block_tables = self.model_runner.forward_vars["block_tables"].copy_to_gpu(num_reqs)
-        print('bonus tokens in this round: ', self.model_runner.tokenID_processor.mapped_bonus_list, flush=True)
+        # print('bonus tokens in this round: ', self.model_runner.tokenID_processor.mapped_bonus_list, flush=True)
 
         # block_tables = attn_metadata.block_tables
         context_lens_tensor = attn_metadata.context_lens
@@ -288,7 +288,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
     ) -> GDNAttentionMetadata:
         # print("prepare decode", flush=True)
         num_decodes = batch.total_seqs_num_decode
-        print("num decodes: ", num_decodes, flush=True)
+        # print("num decodes: ", num_decodes, flush=True)
         attn_metadata, positions = super().prepare_decode(batch, bs)
         self.model_runner.forward_vars["cu_seqlens_q"].cpu[bs:] = batch.total_tokens_num_decode
         # we fill the attn_metadata cu_seqlens_q here since aiter attn won't calc it for decode
@@ -342,7 +342,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
         attn_metadata.gdn_metadata = gdn_metadata
         # print("gdn attn metadata: ", gdn_metadata)
-        print("attn metadata: ", attn_metadata, flush=True)
+        # print("attn metadata: ", attn_metadata, flush=True)
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(
@@ -416,8 +416,8 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
                 token_chunk_offset_ptr=None,
             )
         attn_metadata.gdn_metadata = gdn_metadata
-        print("gdn attn metadata for cudagraph capture: ", gdn_metadata, flush=True)
-        print("attn metadata for cudagraph capture: ", attn_metadata, flush=True)
+        # print("gdn attn metadata for cudagraph capture: ", gdn_metadata, flush=True)
+        # print("attn metadata for cudagraph capture: ", attn_metadata, flush=True)
 
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(
