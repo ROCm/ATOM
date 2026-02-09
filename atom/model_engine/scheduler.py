@@ -259,8 +259,6 @@ class Scheduler:
     ) -> list[Sequence]:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
-        num_bonus_tokens = fwd_output.num_bonus_tokens
-        # print("num bonus tokens in scheduler:", num_bonus_tokens, flush=True)
         is_deferred_out = prev_token_ids.get(-1, False)
         # update token_ids with the actual sampled token ids
         finished_seqs = []
