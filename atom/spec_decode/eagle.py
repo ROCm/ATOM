@@ -9,6 +9,10 @@ from atom.model_loader.loader import load_model
 from atom.models.deepseek_mtp import DeepSeekMTP
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils.forward_context import get_forward_context, AttentionMetaData
+from atom.utils.block_convert import (
+    block_table_convert_triton,
+    kv_indices_convert_triton,
+)
 
 logger = logging.getLogger("atom")
 
@@ -184,20 +188,18 @@ class EagleProposer:
                 )
 
                 def prepare_kv_indices():
-                    var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
-                        itertools.chain.from_iterable(batch.block_tables),
-                        dtype=np.int32,
-                        count=sum_blocks_before_converted,
-                    )
+                    dst = var["kv_indices"].np
+                    offset = 0
+                    for bt in batch.block_tables:
+                        n = len(bt)
+                        dst[offset : offset + n] = bt
+                        offset += n
 
                 prepare_kv_indices()
-                var["kv_indptr"].np[0] = 0
                 var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
                 var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
-                var["kv_last_page_lens"].np[:scheduled_bs] = (
-                    batch.last_block_num_tokens if self.block_size != 1 else 1
-                )
-                var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
+                var["kv_last_page_lens"].np[: scheduled_bs] = 1
+                var["kv_last_page_lens"].np[scheduled_bs : bs] = 0
 
                 # Set cu_seqlens_q for decode mode (1 query token per sequence)
                 # cu_seqlens_q should be [0, 1, 2, 3, ..., bs]
@@ -217,6 +219,24 @@ class EagleProposer:
                     )
                 )
                 ctx.update(ctx_mla_ps)
+                if block_ratio > 1:
+                    kv_indices_convert_triton(
+                        var["kv_indices"].gpu[:sum_blocks_before_converted],
+                        var["kv_indices_converted"].gpu[:sum_blocks],
+                        var["kv_indptr"].gpu[: bs + 1],
+                        block_ratio,
+                        block_size,
+                    )
+                    ctx["kv_indices_converted"] = var["kv_indices_converted"].gpu[:sum_blocks]
+
+                    if "block_tables" in ctx:
+                        block_table_convert_triton(
+                            var["block_tables"].gpu[:bs],
+                            var["block_tables_converted"].gpu[:bs],
+                            var["context_lens"].gpu[:bs],
+                            block_ratio,
+                        )
+                        ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
 
                 attn_metadata = AttentionMetaData(
                     dropout_p=0.0,
