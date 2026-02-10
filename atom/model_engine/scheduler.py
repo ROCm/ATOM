@@ -229,16 +229,25 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def update_spec_stats(self, num_accepted_tokens):
+        # num_accepted_tokens = len(accepted tokens before first -1). The last token
+        # is either the target's correction (when rejected) or the bonus token
+        # (when all accepted); it is never a draft. So num_draft_accepted =
+        # num_accepted_tokens - 1. E.g. mtp_k=2: reject@0 -> len=1, draft_accepted=0;
+        # reject@1 -> len=2, draft_accepted=1; accept all -> len=3, draft_accepted=2.
         self.total_draft_tokens += self.mtp_k
-        self.total_accepted_tokens += num_accepted_tokens - self.mtp_k
+        self.total_accepted_tokens += max(0, num_accepted_tokens - 1)
 
         # Log MTP acceptance statistics periodically
+        # Avg tokens/step = 1 (target decode) + draft_accepted per step
         if self.total_draft_tokens > 0 and self.total_draft_tokens % 1000 == 0:
-            acceptance_rate = self.total_accepted_tokens / self.total_draft_tokens
+            num_steps = self.total_draft_tokens // self.mtp_k
+            avg_tokens_per_step = (
+                1.0 + self.total_accepted_tokens / num_steps if num_steps > 0 else 1.0
+            )
             logger.info(
                 f"[MTP Stats] Total draft tokens: {self.total_draft_tokens}, "
                 f"Accepted: {self.total_accepted_tokens}, "
-                f"Acceptance rate: {acceptance_rate:.2%}"
+                f"Avg tokens/step: {avg_tokens_per_step:.2f}"
             )
 
     def postprocess(

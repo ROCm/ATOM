@@ -102,6 +102,8 @@ class BlockManager:
         assert not seq.block_table
         total_tokens = seq.num_tokens + num_additional_tokens
         num_blocks = (total_tokens + self.block_size - 1) // self.block_size
+        min_blocks = (seq.num_tokens + self.block_size - 1) // self.block_size
+        num_blocks = max(num_blocks, min_blocks)
         for i in range(num_blocks):
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
