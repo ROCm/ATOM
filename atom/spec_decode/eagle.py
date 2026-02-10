@@ -1,6 +1,5 @@
 import logging
 import numpy as np
-import itertools
 import torch
 import torch.nn as nn
 from aiter.dist.parallel_state import get_pp_group
@@ -198,8 +197,8 @@ class EagleProposer:
                 prepare_kv_indices()
                 var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
                 var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
-                var["kv_last_page_lens"].np[: scheduled_bs] = 1
-                var["kv_last_page_lens"].np[scheduled_bs : bs] = 0
+                var["kv_last_page_lens"].np[:scheduled_bs] = 1
+                var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
 
                 # Set cu_seqlens_q for decode mode (1 query token per sequence)
                 # cu_seqlens_q should be [0, 1, 2, 3, ..., bs]
@@ -227,7 +226,9 @@ class EagleProposer:
                         block_ratio,
                         block_size,
                     )
-                    ctx["kv_indices_converted"] = var["kv_indices_converted"].gpu[:sum_blocks]
+                    ctx["kv_indices_converted"] = var["kv_indices_converted"].gpu[
+                        :sum_blocks
+                    ]
 
                     if "block_tables" in ctx:
                         block_table_convert_triton(
@@ -236,7 +237,9 @@ class EagleProposer:
                             var["context_lens"].gpu[:bs],
                             block_ratio,
                         )
-                        ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
+                        ctx["block_tables_converted"] = var[
+                            "block_tables_converted"
+                        ].gpu[:bs]
 
                 attn_metadata = AttentionMetaData(
                     dropout_p=0.0,
