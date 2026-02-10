@@ -148,7 +148,8 @@ class Scheduler:
             ):
                 break
             num_seqs_prefill += 1
-            self.block_manager.allocate(seq)
+            num_additional_tokens = self.mtp_k - 1
+            self.block_manager.allocate(seq, num_additional_tokens)
             num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL

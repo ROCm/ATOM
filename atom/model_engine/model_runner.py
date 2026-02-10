@@ -1377,7 +1377,7 @@ class ModelRunner:
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = torch.index_select(input_ids, 0, bonus_logits_indices)
+        draft_token_ids = torch.index_select(input_ids, 0, target_logits_indices + 1)
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -1419,6 +1419,7 @@ class ModelRunner:
             target_hidden_states=hidden_states,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
+            batch=batch,
         )
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
