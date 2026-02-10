@@ -28,7 +28,7 @@ from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_wo
 # from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig
-from atom.model_ops.base_attention import Attention
+import atom.model_ops as ops
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 
 # from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
@@ -121,11 +121,12 @@ class OAIAttention(nn.Module):
 
         # Only apply sliding window to every other layer
         sliding_window = config.sliding_window if self.layer_idx % 2 == 0 else None
-        self.attn = Attention(
+        self.attn = ops.ATTN_CLS(
             self.num_local_attention_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_local_key_value_heads,
+            alibi_slopes=None,
             kv_cache_dtype=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,

@@ -255,6 +255,24 @@ class SplitItem:
     graph: fx.GraphModule
 
 
+# used to judge whether the node should be split or not
+def _split_judge_func(node: fx.Node) -> bool:
+    # ATOM use mark_spliting_op to mark the attn as splitting op
+    if node.op == "call_function" and (
+        hasattr(node.target, "spliting_op") and (node.target.spliting_op)
+    ):
+        return True
+
+    # When plugin mode(vLLM), the attention impl op is registered
+    # as unified_attention
+    from atom.plugin import is_vllm
+
+    if is_vllm() and "unified_attention" in node.name:
+        return True
+
+    return False
+
+
 def split_graph(
     graph: fx.GraphModule, ops: list[str]
 ) -> tuple[fx.GraphModule, list[SplitItem]]:
@@ -265,9 +283,7 @@ def split_graph(
     for node in graph.graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
-        if node.op == "call_function" and (
-            hasattr(node.target, "spliting_op") and (node.target.spliting_op)
-        ):
+        if _split_judge_func(node):
             subgraph_id += 1
             node_to_subgraph_id[node] = subgraph_id
             split_op_graphs.append(subgraph_id)

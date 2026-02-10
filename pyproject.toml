@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=61", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "atom"
@@ -24,3 +25,15 @@ fallback_version = "0.1.0"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["atom*"]
+
+[project.entry-points."vllm.platform_plugins"]
+# by default the entry-points will be installed anyway
+# but the plugin mode for platforms can be disabled by 
+# ATOM_DISABLE_VLLM_PLUGIN=1
+atom = "atom.plugin.vllm.register:register_platform"
+
+[project.entry-points."vllm.general_plugins"]
+# by default the entry-points will be installed anyway
+# but the plugin mode for models can be disabled by 
+# ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+atom_model_registry = "atom.plugin.vllm.register:register_model"
