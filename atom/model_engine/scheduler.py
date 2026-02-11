@@ -79,8 +79,10 @@ class ScheduledBatchOutput:
         token_ids: dict[int, tuple[int, ...]],
         draft_token_ids,
         # num_bonus_tokens
+        is_deferred_out=False,
     ):
         # TODO need refine
+        self.is_deferred_out = is_deferred_out
         self.req_ids = list(token_ids.keys())
         self.token_ids = token_ids
         self.draft_token_ids = draft_token_ids
@@ -250,7 +252,7 @@ class Scheduler:
     ) -> list[Sequence]:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
-        is_deferred_out = prev_token_ids.get(-1, False)
+        is_deferred_out = fwd_output.is_deferred_out
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
