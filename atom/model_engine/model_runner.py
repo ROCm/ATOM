@@ -899,7 +899,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        planed = int(total * config.gpu_memory_utilization)
+        planned = int(total * config.gpu_memory_utilization)
         torch.set_default_device("cpu")
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
@@ -932,13 +932,13 @@ class ModelRunner:
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-        available_for_kv = min((planed - max(peak, current)), free)
+        available_for_kv = min((planned - max(peak, current)), free)
         num_kvcache_blocks = available_for_kv // block_bytes
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
             f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
             f"but available memory is {free / (1 << 20):.2f}MB "
-            f"(planed: {planed / (1 << 30):.2f}GB ({total/ (1 << 30):.2f}GB*{config.gpu_memory_utilization}), "
+            f"(planned: {planned / (1 << 30):.2f}GB ({total/ (1 << 30):.2f}GB*{config.gpu_memory_utilization}), "
             f"used: {used / (1 << 30):.2f}GB, "
             f"peak: {peak / (1 << 30):.2f}GB, "
             f"current: {current / (1 << 30):.2f}GB)"
