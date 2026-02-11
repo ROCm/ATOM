@@ -1031,6 +1031,8 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
+        if isinstance(self.compilation_config, dict):
+            self.compilation_config = CompilationConfig(**self.compilation_config)
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
