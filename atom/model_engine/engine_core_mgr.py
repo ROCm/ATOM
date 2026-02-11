@@ -25,10 +25,72 @@ from atom.utils import (
 logger = logging.getLogger("atom")
 
 
+def _cleanup_core_manager_resources(
+    label: str,
+    engine_core_processes: list,
+    input_sockets: list,
+    output_sockets: list,
+    shutdown_paths: list,
+    output_threads: list,
+    ctx,
+    closed_flag: list,
+):
+    """
+    Static cleanup function for CoreManager resources.
+    Used by weakref.finalize to ensure cleanup happens even on abnormal exit.
+    
+    Args:
+        label: Label for logging
+        engine_core_processes: List of engine core processes to terminate
+        input_sockets: List of ZMQ input sockets to close
+        output_sockets: List of ZMQ output sockets to close
+        shutdown_paths: List of shutdown signal paths
+        output_threads: List of output threads to join
+        ctx: ZMQ context
+        closed_flag: Single-element list used as mutable flag [is_closed]
+    """
+    if closed_flag[0]:
+        return
+    closed_flag[0] = True
+
+    logger.info(f"{label}: Cleaning up resources (finalizer triggered)")
+
+    # 1. Close input sockets
+    for input_socket in input_sockets:
+        try:
+            if not input_socket.closed:
+                input_socket.close()
+        except Exception as e:
+            logger.debug(f"{label}: Error closing input socket: {e}")
+
+    # 2. Signal output threads to shutdown
+    for shutdown_path in shutdown_paths:
+        if shutdown_path:
+            try:
+                with ctx.socket(zmq.PAIR) as shutdown_sender:
+                    shutdown_sender.connect(shutdown_path)
+                    shutdown_sender.send(b"")
+            except Exception as e:
+                logger.debug(f"{label}: Error sending shutdown signal: {e}")
+
+    # 3. Wait for output threads to finish (with short timeout)
+    for thread in output_threads:
+        if thread and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    # 4. Force terminate any remaining engine core processes
+    # This is the critical step to prevent zombie processes
+    if engine_core_processes:
+        shutdown_all_processes(engine_core_processes, allowed_seconds=3)
+
+    logger.info(f"{label}: Resource cleanup completed")
+
+
 class CoreManager:
     def __init__(self, config: Config):
         self.label = "Engine Core Mgr"
-        self._closed = False  # Track whether already closed
+        # Use a mutable container so the static cleanup function can modify it
+        self._closed_flag = [False]
         if config.enable_dp_attention:
             self.local_engine_count = (
                 config.tensor_parallel_size * config.parallel_config.data_parallel_size
@@ -43,6 +105,7 @@ class CoreManager:
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[List[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
+        self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
         self.engine_core_processes = []
         self.input_sockets = []
@@ -56,6 +119,22 @@ class CoreManager:
 
         if torch.multiprocessing.get_start_method(allow_none=True) is None:
             torch.multiprocessing.set_start_method("spawn", force=False)
+
+        # Register finalizer EARLY (before starting processes) to ensure cleanup
+        # happens even if process startup fails. This follows vLLM's pattern.
+        # Important: Use static function (not bound method) to avoid preventing GC.
+        self._finalizer = weakref.finalize(
+            self,
+            _cleanup_core_manager_resources,
+            self.label,
+            self.engine_core_processes,
+            self.input_sockets,
+            self.output_sockets,
+            self.shutdown_paths,
+            self.output_threads,
+            self.ctx,
+            self._closed_flag,
+        )
 
         processes_info = []
         local_dp_ranks = []
@@ -132,12 +211,14 @@ class CoreManager:
                     self.output_threads.append(output_thread)
 
             finally:
-                if self.finished_procs():
+                # Check if any processes failed during startup
+                finished = self.finished_procs()
+                if finished:
                     logger.error(
-                        f"{self.label}: Some processes failed to start, shutting down all"
+                        f"{self.label}: Some processes failed to start: {finished}, shutting down all"
                     )
                     self.close()
-                    raise RuntimeError("Failed to start all EngineCore processes")
+                    raise RuntimeError(f"Failed to start EngineCore processes: {finished}")
 
         except Exception as e:
             logger.error(
@@ -149,7 +230,7 @@ class CoreManager:
         logger.info(
             f"{self.label}: All {self.local_engine_count} EngineCores initialized and ready"
         )
-        self._finalizer = weakref.finalize(self, self.close)
+        
         self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
         self._output_handler_task = None
         self._asyncio_mode = config.asyncio_mode
@@ -184,8 +265,10 @@ class CoreManager:
                     ready_received[dp_rank] = True
                     remaining -= 1
                 elif request_type == EngineCoreRequestType.SHUTDOWN:
+                    # Engine core failed during initialization
                     raise RuntimeError(
-                        f"{self.label}: Received unexpected SHUTDOWN signal from DP rank {dp_rank} during initialization"
+                        f"{self.label}: DP rank {dp_rank} failed to initialize (received SHUTDOWN signal). "
+                        "Check GPU memory availability and model configuration."
                     )
                 else:
                     raise RuntimeError(
@@ -251,6 +334,8 @@ class CoreManager:
                                 logger.debug(
                                     f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                 )
+                    elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
+                        self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:
                         # logger.info(f"Engine core output sequence id: {seq.id}")
                         seqs = data
@@ -308,33 +393,24 @@ class CoreManager:
         return seqs
 
     def close(self):
-        if self._closed:
+        if self._closed_flag[0]:
             return
-        self._closed = True
 
         logger.info(
             f"{self.label}: Shutting down all {self.local_engine_count} EngineCores"
         )
 
+        # Send graceful shutdown signals to all engine cores first
+        # This gives them a chance to cleanup before we force terminate
         for dp_rank in range(self.local_engine_count):
             self._shutdown_engine_core_rank(dp_rank)
 
-        for input_socket in self.input_sockets:
-            if not input_socket.closed:
-                input_socket.close()
-
-        for shutdown_path in self.shutdown_paths:
-            if shutdown_path:
-                try:
-                    with self.ctx.socket(zmq.PAIR) as shutdown_sender:
-                        shutdown_sender.connect(shutdown_path)
-                        shutdown_sender.send(b"")
-                except Exception as e:
-                    logger.debug(f"{self.label}: Error sending shutdown signal: {e}")
-
-        for thread in self.output_threads:
-            if thread and thread.is_alive():
-                thread.join(timeout=5.0)
+        # Trigger the finalizer to cleanup resources
+        # This handles socket closing, thread joining, and process termination
+        self._finalizer()
+        
+        # Clear the process list after cleanup
+        self.engine_core_processes = []
 
         logger.info(f"{self.label}: All EngineCores shut down")
 
@@ -410,12 +486,52 @@ class CoreManager:
                 copy=False,
             )
 
+    def broadcast_utility_command(self, cmd: str, **kwargs):
+        payload = {"cmd": cmd, **kwargs}
+        # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
+        serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
+        for rank in range(self.local_engine_count):
+            logger.debug(
+                f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
+            )
+            self.input_sockets[rank].send_multipart(
+                [
+                    self.engine_core_identities[rank],
+                    serialized_payload,
+                ],
+                copy=True,  # Use copy=True since we're reusing the same buffer
+            )
+
+    def broadcast_utility_command_sync(self, cmd: str, timeout: float = 300.0, **kwargs):
+        # Drain any stale responses that might be left over
+        while not self.utility_response_queue.empty():
+            try:
+                self.utility_response_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.broadcast_utility_command(cmd, **kwargs)
+
+        # Collect one response per DP rank
+        responses = []
+        for _ in range(self.local_engine_count):
+            try:
+                resp = self.utility_response_queue.get(timeout=timeout)
+                responses.append(resp)
+            except queue.Empty:
+                raise TimeoutError(
+                    f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
+                    f"for command '{cmd}' (timeout={timeout}s)"
+                )
+        return responses
+
     def _shutdown_engine_core_rank(self, dp_rank: int):
         if dp_rank >= len(self.engine_core_processes):
             return
 
         process = self.engine_core_processes[dp_rank]
         if process is not None and process.is_alive():
+            # Send graceful shutdown message
             try:
                 input_socket = self.input_sockets[dp_rank]
                 if not input_socket.closed:
@@ -446,11 +562,17 @@ class CoreManager:
             proc is not None and proc.is_alive() for proc in self.engine_core_processes
         )
 
-    def finished_procs(self):
-        return any(
-            proc is not None and not proc.is_alive()
+    def finished_procs(self) -> dict[str, int]:
+        """Returns dict of proc name -> exit code for any finished procs.
+        
+        This follows vLLM's pattern and provides better debugging info
+        than a simple boolean.
+        """
+        return {
+            proc.name: proc.exitcode
             for proc in self.engine_core_processes
-        )
+            if proc is not None and proc.exitcode is not None
+        }
 
 
 def launch_engine_core(config: Config, dp_rank: int = 0):
