@@ -121,7 +121,6 @@ class LLMEngine:
 
     def stop_profile(self):
         self.core_mgr.send_utility_command("stop_profile")
-        logger.info("Profiling stopped. Trace files should be generated.")
 
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")

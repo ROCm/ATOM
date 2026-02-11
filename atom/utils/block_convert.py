@@ -74,15 +74,15 @@ def block_table_convert_triton(block_table, block_table_convert, context_lens, r
     return block_table_convert
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_input_elements"])
 def kv_indices_convert_kernel(
     kv_indices_ptr,
     output_ptr,
     kv_indptr_convert_ptr,
-    ratio: tl.constexpr,
-    ori_block_size,
-    bs,
     n_input_elements,
+    ratio: tl.constexpr,
+    ori_block_size: tl.constexpr,
+    bs: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -129,10 +129,10 @@ def kv_indices_convert_triton(
         kv_indices,
         kv_indices_convert,
         kv_indptr_convert,
+        n_input_elements,
         ratio,
         ori_block_size,
         bs,
-        n_input_elements,
         BLOCK_SIZE=256,
     )
 

@@ -113,7 +113,8 @@ class EagleProposer:
 
         assert self.runner is not None
         input_ids = target_token_ids
-        input_ids[last_token_indices] = next_token_ids
+        # input_ids[last_token_indices] = next_token_ids
+        input_ids.scatter_(0, last_token_indices, next_token_ids)
         positions = target_positions
         hidden_states = target_hidden_states
 

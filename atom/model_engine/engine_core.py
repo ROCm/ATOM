@@ -290,21 +290,21 @@ class EngineCore:
 
     def stop_profiler(self):
         if self.profile_enbaled:
-            print("Stopping profiler...")
+            logger.info("Profiler stoping...")
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
-            print("Profiler stopped.")
+            logger.info("Profiler stopped.")
 
     def print_mtp_statistics(self):
         stats = self.runner_mgr.call_func("get_mtp_statistics", wait_out=True)
         if stats and stats.get("total_draft_tokens", 0) > 0:
-            print(f"\n{'='*50}")
-            print("MTP (Multi-Token Prediction) Statistics:")
-            print(f"  Total draft tokens: {stats['total_draft_tokens']}")
-            print(f"  Accepted tokens:    {stats['total_accepted_tokens']}")
-            print(f"  Acceptance rate:    {stats['acceptance_rate']:.2%}")
-            print(f"{'='*50}\n")
+            logger.info(f"\n{'='*50}")
+            logger.info("MTP (Multi-Token Prediction) Statistics:")
+            logger.info(f"  Total draft tokens: {stats['total_draft_tokens']}")
+            logger.info(f"  Accepted tokens:    {stats['total_accepted_tokens']}")
+            logger.info(f"  Acceptance rate:    {stats['acceptance_rate']:.2%}")
+            logger.info(f"{'='*50}\n")
         else:
-            print(
+            logger.info(
                 "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"
             )
 
