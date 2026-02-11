@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 
 @dataclass
@@ -11,3 +11,4 @@ class SamplingParams:
     max_tokens: int = 64
     ignore_eos: bool = False
     stop_strings: Optional[list[str]] = None
+    logprobs: Optional[Union[bool, int]] = None
