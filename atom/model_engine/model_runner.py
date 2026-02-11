@@ -508,9 +508,10 @@ class ModelRunner:
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
-        if self.hf_text_config.model_type in [
-            "llama"
-        ] and self.hf_text_config.torch_dtype in [torch.bfloat16, torch.float16]:
+        if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
+            torch.bfloat16,
+            torch.float16,
+        ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.is_deepseek_v32 = (
@@ -868,7 +869,7 @@ class ModelRunner:
     def allocate_forward_vars(self):
         config = self.config
         hidden_size = config.hf_config.hidden_size
-        hidden_type = config.hf_config.torch_dtype
+        hidden_type = config.torch_dtype
         self.max_bs = self.config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
@@ -898,6 +899,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        planed = int(total * config.gpu_memory_utilization)
         torch.set_default_device("cpu")
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
@@ -930,16 +932,16 @@ class ModelRunner:
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-        num_kvcache_blocks = (
-            int(total * config.gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        )
+        available_for_kv = min((planed - max(peak, current)), free)
+        num_kvcache_blocks = available_for_kv // block_bytes
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
             f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
             f"but available memory is {free / (1 << 20):.2f}MB "
-            f"(total: {total / (1 << 30):.2f}GB, used: {used / (1 << 30):.2f}GB, "
-            f"peak: {peak / (1 << 30):.2f}GB, current: {current / (1 << 30):.2f}GB)"
+            f"(planed: {planed / (1 << 30):.2f}GB ({total/ (1 << 30):.2f}GB*{config.gpu_memory_utilization}), "
+            f"used: {used / (1 << 30):.2f}GB, "
+            f"peak: {peak / (1 << 30):.2f}GB, "
+            f"current: {current / (1 << 30):.2f}GB)"
         )
         return num_kvcache_blocks
 
@@ -1248,7 +1250,7 @@ class ModelRunner:
         temperatures: torch.Tensor,
         # following for draft
         hidden_states: torch.Tensor,
-    ) -> tuple[dict[int, tuple[int, ...]], Optional[torch.Tensor]]:
+    ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(logits, temperatures)
@@ -1309,7 +1311,11 @@ class ModelRunner:
                 next_token_ids,
             )
 
-        return ScheduledBatchOutput(token_ids, draft_token_ids)
+        return ScheduledBatchOutput(
+            token_ids,
+            draft_token_ids,
+            is_deferred_out=self.tokenID_processor.is_deferred_out,
+        )
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:

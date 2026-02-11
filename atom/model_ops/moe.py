@@ -14,9 +14,6 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
-from torch import nn
-from transformers import PretrainedConfig
-
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
@@ -47,6 +44,8 @@ from atom.model_ops.utils import (
 )
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
+from torch import nn
+from transformers import PretrainedConfig
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -521,8 +520,8 @@ def rocm_asm_moe_impl(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    from aiter.fused_moe_bf16_asm import asm_moe
     from aiter import ActivationType, QuantType
+    from aiter.fused_moe_bf16_asm import asm_moe
 
     activation_ = ActivationType(activation)
     quant_type_ = QuantType(quant_type)
@@ -753,9 +752,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
         if self.use_triton:
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
-
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
+            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
@@ -1843,7 +1841,7 @@ class FusedMoE(torch.nn.Module):
         )
         self.routed_scaling_factor = (
             getattr(config, "routed_scaling_factor", 1.0)
-            if config is not None and config.torch_dtype != torch.float16
+            if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
         self.expert_mask = None

@@ -291,7 +291,7 @@ class QuantizationConfig(dict):
 
 
 def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
-    torch_dtype = getattr(config, "torch_dtype", "bf16")
+    torch_dtype = getattr(config, "dtype", "bf16")
     orig_quant_config = getattr(config, "quantization_config", None)
     if orig_quant_config is None:
         return QuantizationConfig(
@@ -637,8 +637,8 @@ class Config:
             self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             self.compilation_config.init_with_cudagraph_sizes()
         self.torch_dtype = (
-            self.hf_config.torch_dtype
-            if getattr(self.hf_config, "torch_dtype", None) is not None
+            self.hf_config.dtype
+            if getattr(self.hf_config, "dtype", None) is not None
             else torch.bfloat16
         )
 

@@ -28,7 +28,7 @@ class EagleProposer:
         self.mtp_k: int = self.speculative_config.num_speculative_tokens or 0
 
         self.runner = runner
-        self.dtype = self.config.hf_config.torch_dtype
+        self.dtype = self.config.torch_dtype
         self.max_model_len = self.config.max_model_len
         self.block_size = self.config.kv_cache_block_size
         self.max_num_tokens = self.config.max_num_batched_tokens
