@@ -116,13 +116,20 @@ class tokenIDProcessor:
         cpu_tensor_handle,
         data_ready: torch.cuda.Event,
         copy_done: Optional[torch.cuda.Event] = None,
+        gpu_logprobs: Optional[torch.Tensor] = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            cpu_logprobs = (
+                gpu_logprobs.to("cpu", non_blocking=True)
+                if gpu_logprobs is not None
+                else None
+            )
             copy_done.record(self.async_copy_stream)
         cpu_tensor_handle.append((cpu_tensor, copy_done))
+        self.logprobs_cpu.append(cpu_logprobs)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
@@ -130,6 +137,17 @@ class tokenIDProcessor:
         cpu_tensor, event = cpu_tensor_handle.pop(0)
         event.synchronize()
         return cpu_tensor
+
+    def recv_logprobs(self) -> Optional[list[float]]:
+        """Pop and return the earliest logprobs from the async copy queue.
+        Must be called after recv_async_output (which synchronizes the event).
+        """
+        if not self.logprobs_cpu:
+            return None
+        logprob_tensor = self.logprobs_cpu.pop(0)
+        if logprob_tensor is not None:
+            return logprob_tensor.tolist()
+        return None
 
     def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
         default_stream = torch.cuda.current_stream()
@@ -184,6 +202,7 @@ class tokenIDProcessor:
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
+        self.logprobs_cpu: list[Optional[torch.Tensor]] = []
 
         self.prev_batch: Optional[ScheduledBatch] = None
         self.prev_token_ids: Optional[torch.Tensor] = None
@@ -229,33 +248,53 @@ class tokenIDProcessor:
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-    ) -> tuple[list[int], list[tuple[int, ...]]]:
+        sampled_logprobs: Optional[torch.Tensor] = None,
+    ) -> tuple[dict[int, tuple[int, ...]], Optional[dict[int, float]]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
-            if token_ids and isinstance(token_ids[0], list):
-                processed = self._batch_process_token_ids(token_ids)
-            else:
-                processed = [(tid,) for tid in token_ids]
-            return req_ids, processed
+            ret = {
+                seq_id: self._process_token_id(token_id)
+                for seq_id, token_id in zip(req_ids, token_ids)
+            }
+            ret[-1] = 0  # is_deferred_out flag
+            logprobs_map = None
+            if sampled_logprobs is not None:
+                logprobs = sampled_logprobs.tolist()
+                logprobs_map = {
+                    seq_id: logprob for seq_id, logprob in zip(req_ids, logprobs)
+                }
+            return ret, logprobs_map
 
-        token_ids = self.recv_async_output(self.token_ids_cpu).tolist()
-        self.send_to_cpu_async(sampled_token_ids, self.token_ids_cpu, sync_event)
-        req_ids_out: list[int] = []
-        processed_out: list[tuple[int, ...]] = []
+        token_ids = self.recv_async_output(self.token_ids_cpu)
+        logprobs = self.recv_logprobs()
+        self.send_to_cpu_async(
+            sampled_token_ids, self.token_ids_cpu, sync_event,
+            gpu_logprobs=sampled_logprobs,
+        )
+        token_id_dict = {}
+        logprobs_map = None
         self.prev_req_ids = None
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
-            req_ids_out = self.prev_req_ids
-            if token_ids and isinstance(token_ids[0], list):
-                processed_out = self._batch_process_token_ids(token_ids)
-            else:
-                processed_out = [(tid,) for tid in token_ids]
+            token_id_dict = {
+                seq_id: self._process_token_id(token_id)
+                for seq_id, token_id in zip(self.prev_req_ids, token_ids)
+            }
+            if logprobs is not None:
+                logprobs_map = {
+                    seq_id: logprob
+                    for seq_id, logprob in zip(self.prev_req_ids, logprobs)
+                }
+        else:
+            # first time, no previous tokens
+            token_ids = {}
+            logprobs_map = None
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
-
-        return req_ids_out, processed_out
+        token_id_dict[-1] = 1
+        return token_id_dict, logprobs_map
 
     def get_token_locations(
         self, batch: ScheduledBatch
@@ -1961,12 +2000,29 @@ class ModelRunner:
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
+        # Compute logprobs if any sequence requested them
+        need_logprobs = any(batch.return_logprobs)
+        sampled_logprobs = None
+        if need_logprobs:
+            logits_fp32 = logits.float()
+            safe_temps = torch.where(temperatures <= 0, torch.ones_like(temperatures), temperatures)
+            scaled_logits = logits_fp32 / safe_temps.view(-1, 1)
+            log_probs = torch.log_softmax(scaled_logits, dim=-1)
+            sampled_logprobs = log_probs.gather(
+                -1, sampled_tokens.to(torch.long).unsqueeze(-1)
+            ).squeeze(-1)
+            if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
+                sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
+
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
-        req_ids_out, token_ids_out = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event
+        token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
+            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
         )
+        # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
+        req_ids_out = [k for k in token_id_dict if k != -1]
+        token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
         draft_token_ids: Optional[np.ndarray] = None
         if self.tokenID_processor.is_deferred_out:
@@ -2011,6 +2067,7 @@ class ModelRunner:
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
             num_bonus=prev_bonus_num,
+            logprobs=logprobs_map,
         )
 
     @torch.inference_mode()
