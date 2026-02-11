@@ -5,11 +5,12 @@ import itertools
 import logging
 import time
 from dataclasses import fields
-from typing import List, Union
+from typing import List, Optional, Union
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.weight_sync import load_weights_via_shm
 from atom.sampling_params import SamplingParams
 from transformers import AutoTokenizer
 
@@ -21,10 +22,13 @@ class LLMEngine:
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        data_parallel_size = kwargs.get("data_parallel_size", 1)
+        data_parallel_size = kwargs.get('data_parallel_size', 1)
+        trust_remote_code = kwargs.get('trust_remote_code', False)
         config = Config(model, **config_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(
-            config.model, use_fast=True, trust_remote_code=config.trust_remote_code
+            config.model, 
+            use_fast=True,
+            trust_remote_code=trust_remote_code
         )
         config.bos_token_id = self.tokenizer.bos_token_id
         config.eos_token_id = self.tokenizer.eos_token_id
@@ -51,6 +55,7 @@ class LLMEngine:
         prompt_or_tokens_list: List[Union[str, List[int]]],
         sampling_params_list: SamplingParams | List[SamplingParams],
         stream_callback=None,
+        request_ids: Optional[list[str]] = None,
     ):
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
@@ -77,12 +82,26 @@ class LLMEngine:
         else:
             stream_callback_iter = itertools.repeat(None)
 
+        # Handle request_ids
+        if request_ids is not None:
+            if len(request_ids) != len(prompt_or_tokens_list):
+                raise ValueError(
+                    "number of elements in prompt_or_tokens_list and request_ids is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(request_ids)=}"
+                )
+            request_id_iter = iter(request_ids)
+        else:
+            request_id_iter = itertools.repeat(None)
+        
         reqs = []
-        for prompt, sampling_param, callback in zip(
-            prompt_or_tokens_list, sampling_params_iter, stream_callback_iter
+        for prompt, sampling_param, callback, request_id in zip(
+            prompt_or_tokens_list, sampling_params_iter, stream_callback_iter, request_id_iter
         ):
             req = self.io_processor.preprocess(
-                prompt, sampling_param, stream_callback=callback
+                prompt,
+                sampling_param,
+                stream_callback=callback,
+                request_id=request_id,
             )
             reqs.append(req)
         self.core_mgr.add_request(reqs)
@@ -99,11 +118,12 @@ class LLMEngine:
         # prompts: list[str] | list[list[int]],
         prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
+        request_ids: Optional[list[str]] = None,
     ) -> list[str]:
         # Reset round-robin counter to ensure consistent DP not core dump
         self.core_mgr._rr_counter = 0
-
-        self.add_request(prompts, sampling_params)
+        
+        self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -126,18 +146,50 @@ class LLMEngine:
         self.core_mgr.send_utility_command("get_mtp_stats")
 
 
+    def wake_up(self, tags: List[str] = None):
+        """
+        Resume resources in GPU memory.
+        """
+        if tags is None:
+            tags = ["weights", "kv_cache"]
+        
+        logger.info(f"LLMEngine wake_up: tags={tags}")
+        self.core_mgr.broadcast_utility_command("resume_memory", tags=tags)
+
+    def sleep(self, level: int = 1):
+        """
+        Release resources to free GPU memory.
+        """
+        logger.info(f"LLMEngine sleep: level={level}")
+        
+        if level >= 1:
+            self.core_mgr.broadcast_utility_command(
+                "release_memory", tags=["kv_cache"]
+            )
+        if level >= 2:
+            self.core_mgr.broadcast_utility_command(
+                "release_memory", tags=["weights"]
+            )
+
+    def load_weights(self, weights, bucket_size_mb: int = 2048):
+        load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
+
+
 class InputOutputProcessor:
 
     def __init__(self, tokenizer, block_size):
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        self._external_to_internal: dict[str, int] = {}
+        self._internal_to_external: dict[int, str] = {}
 
     def preprocess(
         self,
         prompt_or_tokens: str | list[int],
         sampling_params: SamplingParams,
         stream_callback=None,
+        request_id: Optional[str] = None,
     ):
         """responsible for:
         1) Tokenize
@@ -160,16 +212,20 @@ class InputOutputProcessor:
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
-
+        
         seq = Sequence(
             tokens,
             self.block_size,
             sampling_params,
             stop_token_sequences,
             stream_callback=stream_callback,
+            request_id=request_id,
         )
         seq.arrive_time = time.time()
         self.requests[seq.id] = seq
+        if request_id is not None:
+            self._external_to_internal[request_id] = seq.id
+            self._internal_to_external[seq.id] = request_id
         print(
             f"Request {seq.id} arrived, input tokens: {len(tokens)}, pending requests: {len(self.requests)}"
         )
@@ -182,6 +238,9 @@ class InputOutputProcessor:
         outputs = {}
         for req in reqs:
             self.requests.pop(req.id)
+            external_request_id = self._internal_to_external.pop(req.id, None)
+            if external_request_id is not None:
+                self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
             req.leave_time = time.time()
 
@@ -206,6 +265,7 @@ class InputOutputProcessor:
             outputs[req.id] = {
                 "text": output_str,
                 "token_ids": req.completion_token_ids,
+                "logprobs": req.logprobs if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,
                 "num_tokens_input": req.num_prompt_tokens,
