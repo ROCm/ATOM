@@ -131,8 +131,9 @@ class AsyncIOProcManager:
         self.mp_ctx = ctx
         self.runner_label = runner.split(".")[-1]
         self.label = f"AsyncIOProcManager({self.runner_label})"
+        max_chunks = max(proc_num, 8)
         self.rpc_broadcast_mq = MessageQueue(
-            proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024
+            proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024, max_chunks=max_chunks
         )
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         self.still_running = True

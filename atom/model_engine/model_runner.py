@@ -553,17 +553,29 @@ class ModelRunner:
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
-        # Calculate local device rank considering both TP and DP
-        # When data parallelism is enabled on the same node, different DP ranks
-        # need to use different sets of GPUs
-        dp_rank_local = config.parallel_config.data_parallel_rank_local
-        if dp_rank_local is None:
-            dp_rank_local = 0
-        local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+        # Resolve DP isolation: when set_device_control_env_var restricts
+        # CUDA_VISIBLE_DEVICES per DP rank, each subprocess only sees its own GPUs.
+        dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         num_gpus = torch.cuda.device_count()
+        dp_isolated = (
+            os.environ.get("VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER") is not None
+            and num_gpus == config.tensor_parallel_size
+        )
+
+        if dp_isolated:
+            local_device_rank = rank
+            dp_port = config.parallel_config.data_parallel_base_port + dp_rank_local * 100
+            effective_dp_rank, effective_dp_size = 0, 1
+        else:
+            local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+            dp_port = config.parallel_config.data_parallel_base_port
+            effective_dp_rank = config.parallel_config.data_parallel_rank
+            effective_dp_size = config.parallel_config.data_parallel_size
+
         if local_device_rank >= num_gpus:
             raise ValueError(
-                f"Calculated local_device_rank={local_device_rank} exceeds available GPUs ({num_gpus}). "
+                f"local_device_rank={local_device_rank} exceeds available GPUs ({num_gpus}), "
+                f"dp_isolated={dp_isolated}, dp_rank_local={dp_rank_local}, tp_rank={rank}"
             )
 
         device = torch.device(f"cuda:{local_device_rank}")
@@ -590,16 +602,15 @@ class ModelRunner:
         os.environ["MASTER_ADDR"] = self.config.master_addr
         os.environ["MASTER_PORT"] = str(self.config.port)
         distributed_init_method = get_distributed_init_method(
-            config.parallel_config.data_parallel_master_ip,
-            config.parallel_config.data_parallel_base_port,
+            config.parallel_config.data_parallel_master_ip, dp_port
         )
         init_dist_env(
             config.tensor_parallel_size,
             rankID=rank,
             backend="nccl",
             distributed_init_method=distributed_init_method,
-            data_parallel_size=config.parallel_config.data_parallel_size,
-            data_parallel_rank=config.parallel_config.data_parallel_rank,
+            data_parallel_size=effective_dp_size,
+            data_parallel_rank=effective_dp_rank,
         )
         init_exit_handler(self)
         default_dtype = self.config.torch_dtype
@@ -656,6 +667,32 @@ class ModelRunner:
 
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
+        
+        # Cache for parameter name to module mapping (lazily initialized)
+        # Used by update_weights() to avoid rebuilding the mapping every time
+        self._param_to_module: Optional[dict[str, tuple]] = None
+
+    def _get_param_to_module_mapping(self) -> dict[str, tuple]:
+        """
+        Get or build the parameter name to module mapping.
+        
+        This mapping is cached after the first call to avoid expensive
+        rebuilding on every weight update.
+        
+        Returns:
+            Dict mapping parameter full name to (module, param_name, param) tuple
+        """
+        if self._param_to_module is None:
+            self._param_to_module = {}
+            for module_name, module in self.model.named_modules():
+                for param_name, param in module.named_parameters(recurse=False):
+                    full_name = f"{module_name}.{param_name}" if module_name else param_name
+                    self._param_to_module[full_name] = (module, param_name, param)
+            logger.debug(
+                f"{self.label}: Built param_to_module mapping with "
+                f"{len(self._param_to_module)} parameters"
+            )
+        return self._param_to_module
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -968,16 +1005,19 @@ class ModelRunner:
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-        available_for_kv = min((planned - max(peak, current)), free)
-        num_kvcache_blocks = available_for_kv // block_bytes
+        # Estimate KV cache budget based on current free memory and utilization
+        # to avoid over-penalizing with historical peak allocations.
+        budget = int(total * config.gpu_memory_utilization)
+        available = budget - used
+        num_kvcache_blocks = (
+            max(0, available) // block_bytes
+        ) // self.attn_metadata_builder.block_ratio
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
             f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
-            f"but available memory is {free / (1 << 20):.2f}MB "
-            f"(planned: {planned / (1 << 30):.2f}GB ({total/ (1 << 30):.2f}GB*{config.gpu_memory_utilization}), "
-            f"used: {used / (1 << 30):.2f}GB, "
-            f"peak: {peak / (1 << 30):.2f}GB, "
-            f"current: {current / (1 << 30):.2f}GB)"
+            f"but available memory is {available / (1 << 20):.2f}MB "
+            f"(budget: {budget / (1 << 30):.2f}GB ({total / (1 << 30):.2f}GB*{config.gpu_memory_utilization}), "
+            f"used: {used / (1 << 30):.2f}GB)"
         )
         return num_kvcache_blocks
 
@@ -1555,3 +1595,347 @@ class ModelRunner:
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
         return time.time() - start_time, self.graph_bs
+
+    def update_weights(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+        clear_kv_cache: bool = True
+    ) -> int:
+        """
+        Update model weights from named tensors.
+        
+        Called by RLHF frameworks (e.g., verl) after each training step to
+        synchronize weights from training engine to inference engine.
+        
+        This method supports tensor parallel (TP) weight sharding by utilizing
+        each module's weight_loader method when available.
+        
+        Args:
+            named_tensors: List of (parameter_name, tensor) tuples.
+                           Tensors should be full (unsharded) weights.
+            clear_kv_cache: Whether to clear KV cache after update
+        
+        Returns:
+            Number of parameters successfully updated
+        """
+        # Use cached mapping (built once, reused for all updates)
+        param_to_module = self._get_param_to_module_mapping()
+        
+        updated = 0
+        skipped = 0
+        
+        for name, tensor in named_tensors:
+            if name not in param_to_module:
+                logger.debug(f"{self.label}: Parameter {name} not found in model")
+                skipped += 1
+                continue
+            
+            module, param_name, param = param_to_module[name]
+            
+            # Check if this module has a weight_loader for handling TP sharding
+            weight_loader = getattr(module, 'weight_loader', None)
+            
+            if tensor.shape == param.shape:
+                # Shapes match - direct copy (no sharding needed)
+                tensor = tensor.to(device=self.device, dtype=param.dtype)
+                param.data.copy_(tensor)
+                updated += 1
+            elif weight_loader is not None and callable(weight_loader):
+                # Use module's weight_loader for TP sharding
+                try:
+                    tensor = tensor.to(device=self.device)
+                    weight_loader(param, tensor)
+                    updated += 1
+                except Exception as e:
+                    logger.warning(
+                        f"{self.label}: weight_loader failed for {name}: {e}"
+                    )
+                    skipped += 1
+            else:
+                # No weight_loader and shapes don't match - try default sharding
+                # This handles cases where the loaded weight is the full tensor
+                # and needs to be sliced based on TP rank
+                tp_size = self.world_size
+                tp_rank = self.rank
+                
+                if tp_size > 1 and self._try_shard_weight(param, tensor, tp_rank, tp_size):
+                    updated += 1
+                else:
+                    logger.warning(
+                        f"{self.label}: Shape mismatch for {name}: "
+                        f"expected {param.shape}, got {tensor.shape}"
+                    )
+                    skipped += 1
+        
+        # Clear KV cache to avoid using stale cached values
+        if clear_kv_cache:
+            self.clear_kv_cache()
+        
+        logger.info(
+            f"{self.label}: Weight update complete - "
+            f"updated={updated}, skipped={skipped}"
+        )
+        return updated
+    
+    def update_weights_from_shm(
+        self,
+        shm_name: str,
+        bucket_meta: dict,
+        is_last: bool = True,
+    ) -> int:
+        """
+        Update model weights by reading tensor data from POSIX shared memory.
+
+        Only lightweight metadata (shm_name, bucket_meta) is transmitted through
+        the control path (EngineCore -> MessageQueue).  The heavy tensor payload
+        resides in ``/dev/shm/<shm_name>`` and each ModelRunner maps it directly.
+
+        Args:
+            shm_name: Name of the POSIX shared-memory segment created by the
+                       caller (LLMEngine).
+            bucket_meta: ``{param_name: {"shape": tuple, "dtype": str,
+                       "offset": int, "nbytes": int}}``.
+            is_last: If ``True``, clear the KV cache after applying the weights
+                     (last bucket in a multi-bucket transfer).
+
+        Returns:
+            Number of parameters successfully updated in this bucket.
+        """
+        from multiprocessing import shared_memory as _shm_mod
+        from unittest.mock import patch
+
+        # Open the existing shared-memory segment (do NOT unlink – caller owns it)
+        with patch(
+            "multiprocessing.resource_tracker.register",
+            lambda *args, **kwargs: None,
+        ):
+            shm = _shm_mod.SharedMemory(name=shm_name)
+
+        try:
+            buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
+            param_to_module = self._get_param_to_module_mapping()
+
+            updated = 0
+            skipped = 0
+
+            for name, meta in bucket_meta.items():
+                if name not in param_to_module:
+                    logger.debug(f"{self.label}: Parameter {name} not found in model")
+                    skipped += 1
+                    continue
+
+                module, param_name, param = param_to_module[name]
+
+                # Reconstruct a CPU tensor view from shared memory
+                dtype_str = meta["dtype"]
+                # Handle both "torch.float32" and "float32" formats
+                dtype_str = dtype_str.replace("torch.", "")
+                dtype = getattr(torch, dtype_str)
+                offset = meta["offset"]
+                nbytes = meta["nbytes"]
+                tensor = (
+                    buffer[offset : offset + nbytes]
+                    .view(dtype=dtype)
+                    .view(meta["shape"])
+                )
+
+                # ---- TP sharding logic (same as update_weights) ----
+                weight_loader = getattr(module, "weight_loader", None)
+
+                if tensor.shape == param.shape:
+                    tensor = tensor.to(device=self.device, dtype=param.dtype)
+                    param.data.copy_(tensor)
+                    updated += 1
+                elif weight_loader is not None and callable(weight_loader):
+                    try:
+                        tensor = tensor.to(device=self.device)
+                        weight_loader(param, tensor)
+                        updated += 1
+                    except Exception as e:
+                        logger.warning(
+                            f"{self.label}: weight_loader failed for {name}: {e}"
+                        )
+                        skipped += 1
+                else:
+                    tp_size = self.world_size
+                    tp_rank = self.rank
+                    if tp_size > 1 and self._try_shard_weight(
+                        param, tensor, tp_rank, tp_size
+                    ):
+                        updated += 1
+                    else:
+                        logger.warning(
+                            f"{self.label}: Shape mismatch for {name}: "
+                            f"expected {param.shape}, got {tensor.shape}"
+                        )
+                        skipped += 1
+
+            if is_last:
+                self.clear_kv_cache()
+
+            logger.info(
+                f"{self.label}: SHM weight update bucket done - "
+                f"updated={updated}, skipped={skipped}, is_last={is_last}"
+            )
+            return updated
+        finally:
+            shm.close()
+
+    def _try_shard_weight(
+        self,
+        param: torch.nn.Parameter,
+        tensor: torch.Tensor,
+        tp_rank: int,
+        tp_size: int
+    ) -> bool:
+        """
+        Try to shard a weight tensor for tensor parallel.
+        
+        Attempts to determine the sharding dimension by comparing shapes
+        and applies the appropriate slice for this TP rank.
+        
+        Returns:
+            True if sharding was successful, False otherwise
+        """
+        param_shape = param.shape
+        tensor_shape = tensor.shape
+        
+        if len(param_shape) != len(tensor_shape):
+            return False
+        
+        # Find which dimension needs sharding
+        shard_dim = None
+        for dim in range(len(param_shape)):
+            if tensor_shape[dim] == param_shape[dim] * tp_size:
+                shard_dim = dim
+                break
+            elif tensor_shape[dim] != param_shape[dim]:
+                # Dimension mismatch but not by tp_size factor
+                return False
+        
+        if shard_dim is None:
+            # No dimension needs sharding but shapes don't match
+            return False
+        
+        # Shard the tensor along the identified dimension
+        shard_size = param_shape[shard_dim]
+        start_idx = tp_rank * shard_size
+        
+        tensor = tensor.to(device=self.device, dtype=param.dtype)
+        sharded_tensor = tensor.narrow(shard_dim, start_idx, shard_size)
+        param.data.copy_(sharded_tensor)
+        
+        return True
+
+    def release_memory(self, tags: Optional[list[str]] = None) -> bool:
+        """
+        Release GPU memory by offloading to CPU.
+        
+        Called by RLHF frameworks in HYBRID mode before training to free
+        GPU memory for the training engine.
+        
+        Args:
+            tags: List of components to release:
+                  - "weights": Offload model weights to CPU
+                  - "kv_cache": Release KV cache
+                  If None, releases all components.
+        
+        Returns:
+            True if successful
+        """
+        if tags is None:
+            tags = ["weights", "kv_cache"]
+        
+        # Synchronize ALL GPU streams before releasing memory to prevent
+        # use-after-free: the tokenIDProcessor.async_copy_stream may have
+        # pending async D2H copies, and clear_kv_cache's zero_() kernel
+        # may still be running on the default stream.
+        torch.cuda.synchronize()
+        
+        # Clean up tokenIDProcessor deferred output state to remove
+        # stale GPU tensor references (prev_token_ids, etc.)
+        if hasattr(self, 'tokenID_processor'):
+            self.tokenID_processor.clean()
+        
+        if "weights" in tags:
+            self._release_weights()
+        
+        if "kv_cache" in tags:
+            self._release_kv_cache()
+        
+        # Synchronize again and empty CUDA cache to return freed blocks
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        
+        logger.info(f"{self.label}: GPU memory released, tags={tags}")
+        return True
+
+    def resume_memory(self, tags: Optional[list[str]] = None) -> bool:
+        """
+        Resume GPU memory by reloading from CPU.
+        
+        Called by RLHF frameworks in HYBRID mode before inference to restore
+        GPU memory for the inference engine.
+        
+        Args:
+            tags: List of components to resume:
+                  - "weights": Reload model weights to GPU
+                  - "kv_cache": Restore KV cache
+                  If None, resumes all components.
+        
+        Returns:
+            True if successful
+        """
+        if tags is None:
+            tags = ["weights", "kv_cache"]
+        
+        if "weights" in tags:
+            self._resume_weights()
+        
+        if "kv_cache" in tags:
+            self._resume_kv_cache()
+        
+        logger.info(f"{self.label}: GPU memory resumed, tags={tags}")
+        return True
+
+    def _release_weights(self) -> None:
+        """No-op: keep weights on GPU during sleep phase.
+        
+        Freeing all weight GPU blocks via empty_cache() causes GPU Hang because
+        aiter's SHM-based MessageQueue background thread may still hold pointers
+        to the freed VRAM region. Since FSDP training runs in a separate process
+        with param/optimizer offloading, it needs very little GPU memory (~2-3 GiB)
+        and the remaining ~25 GiB is sufficient. The stale weights on GPU will be
+        overwritten in-place by update_weights_from_shm during wake_up.
+        """
+        logger.debug(f"{self.label}: Weight release skipped (preserved on GPU for stability)")
+
+    def _resume_weights(self) -> None:
+        """No-op: weights were never offloaded, already on GPU."""
+        logger.debug(f"{self.label}: Weight resume skipped (was never released)")
+
+    def _release_kv_cache(self) -> None:
+        """Release KV cache reference (original behavior)."""
+        if not hasattr(self, 'kv_cache') or self.kv_cache is None:
+            return
+        self._kv_cache_backup = self.kv_cache
+        self.kv_cache = None
+        logger.debug(f"{self.label}: KV cache released")
+
+    def _resume_kv_cache(self) -> None:
+        """Restore KV cache reference (original behavior)."""
+        if not hasattr(self, '_kv_cache_backup') or self._kv_cache_backup is None:
+            logger.debug(f"{self.label}: No KV cache backup to resume from")
+            return
+        self.kv_cache = self._kv_cache_backup
+        self._kv_cache_backup = None
+        logger.debug(f"{self.label}: KV cache restored")
+
+    def clear_kv_cache(self) -> bool:
+        """Zero out KV cache to avoid stale cached values."""
+        if not hasattr(self, 'kv_cache') or self.kv_cache is None:
+            return True
+        self.kv_cache.zero_()
+        torch.cuda.synchronize()
+        logger.debug(f"{self.label}: KV cache cleared")
+        return True
