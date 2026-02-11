@@ -323,11 +323,15 @@ class Scheduler:
                 if len(seq.token_ids) >= len(stop_seq):
                     stop_len = len(stop_seq)
                     is_normal_stop = seq.token_ids[-stop_len:] == stop_seq
-                    is_mtp_stop = (
-                        self.use_spec
-                        and seq.token_ids[-(stop_len + self.mtp_k) : -self.mtp_k]
-                        == stop_seq
-                    )
+                    is_mtp_stop = False
+                    if self.use_spec:
+                        for i in range(1, self.mtp_k + 1):
+                            if (
+                                len(seq.token_ids) >= stop_len + i
+                                and seq.token_ids[-(stop_len + i) : -i] == stop_seq
+                            ):
+                                is_mtp_stop = True
+                                break
                     if is_normal_stop or is_mtp_stop:
                         leave_reason = "stop_sequence"
                         break
