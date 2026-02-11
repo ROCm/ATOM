@@ -11,6 +11,9 @@ from atom.model_ops.attention_gdn import GatedDetlaNet
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_attention import AiterBackend, AiterAttentionMetadataBuilder
+from atom.utils import (
+    CpuGpuBuffer
+)
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -146,7 +149,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         for idx, mamba_block_table in enumerate(batch.mamba_block_tables):
             non_spec_state_indices[idx] = 0
             spec_state_indices[idx] = 0
-            # print("mamba block table in seq: ", mamba_block_table, flush=True)
+
             if not with_spec:
                 non_spec_state_indices[idx] = mamba_block_table[0]
             else:
@@ -157,7 +160,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         if self.model_runner.tokenID_processor.mapped_bonus_list is None:
             return 
         for idx, num_bonus_tokens in enumerate(self.model_runner.tokenID_processor.mapped_bonus_list):
-            self.num_accepted_tokens[idx] = num_bonus_tokens + 1
+            self.num_accepted_tokens[idx] = 1 if num_bonus_tokens == -1 else num_bonus_tokens + 1
 
     def prepare_gdn_metadata(
         self,
@@ -171,11 +174,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         num_decode_tokens = batch.total_tokens_num_decode
         num_prefill_tokens = batch.total_tokens_num_prefill
         num_reqs = batch.total_seqs_num
+        query_start_loc = attn_metadata.cu_seqlens_q
         self.prepare_block_tables(batch)
-        block_tables = self.model_runner.forward_vars["block_tables"].copy_to_gpu(num_reqs)
-        # print('bonus tokens in this round: ', self.model_runner.tokenID_processor.mapped_bonus_list, flush=True)
 
-        # block_tables = attn_metadata.block_tables
         context_lens_tensor = attn_metadata.context_lens
         context_lens_tensor = torch.zeros((batch.total_seqs_num_prefill)).cuda()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
@@ -333,8 +334,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             gdn_metadata.non_spec_query_start_loc = self.non_spec_query_start_loc[: num_decodes + 1]
 
         attn_metadata.gdn_metadata = gdn_metadata
-        # print("gdn attn metadata: ", gdn_metadata)
-        # print("attn metadata: ", attn_metadata, flush=True)
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int):
