@@ -118,8 +118,9 @@ class tokenIDProcessor:
         event.synchronize()
         return token_ids.tolist()
 
-    def send_bonus_to_cpu_async(self, gpu_tensor: torch.Tensor):
+    def send_bonus_to_cpu_async(self, gpu_tensor: torch.Tensor, req_ids: list[int]):
         default_stream = torch.cuda.current_stream()
+        self.bonus_req_ids.append(req_ids)
         with torch.cuda.stream(self.async_copy_stream):
             self.async_copy_stream.wait_stream(default_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
@@ -131,7 +132,10 @@ class tokenIDProcessor:
             return None
         self.async_copy_event.synchronize()
         bonus_list = self.bonus_tokens_cpu.pop(0).tolist()
-        return bonus_list
+        req_ids = self.bonus_req_ids.pop(0)
+        for i, req_id in enumerate(req_ids):
+            self.bonus_tokens_map[req_id] = bonus_list[i]
+        return self.bonus_tokens_map
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -144,6 +148,8 @@ class tokenIDProcessor:
         self.bonus_tokens_cpu: list[torch.Tensor] = (
             []
         )  # Async queue for num_bonus_tokens
+        self.bonus_tokens_map: map[int, list[int]] = {}
+        self.bonus_req_ids: list[list[int]] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -298,15 +304,18 @@ class tokenIDProcessor:
             num_new_tokens = num_new_seqs
 
         # Receive and map bonus_list to current batch order
-        prev_bonus_list = self.recv_bonus_async()
+        prev_bonus_map = self.recv_bonus_async()
         total_seqs = num_deferred_seqs + num_new_seqs
-        if prev_bonus_list is not None and num_deferred_seqs > 0:
+        if prev_bonus_map is not None and num_deferred_seqs > 0:
             # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
             # New seqs get default value (tokens_per_seq - 1)
-            self.mapped_bonus_list = [tokens_per_seq - 1] * total_seqs
-            for curr_idx, prev_idx in zip(deferred_curr_indices, deferred_prev_indices):
-                if prev_idx < len(prev_bonus_list):
-                    self.mapped_bonus_list[curr_idx] = prev_bonus_list[prev_idx]
+
+            # -1 means this seq do not have prev bonus which means its prefill
+            # otherwise, all seq should have prev bonus result
+            self.mapped_bonus_list = [-1] * total_seqs
+            for i, req_id in enumerate(batch.req_ids):
+                if req_id in prev_bonus_map:
+                    self.mapped_bonus_list[i] = prev_bonus_map.pop(req_id)
         else:
             self.mapped_bonus_list = None
 
@@ -393,16 +402,8 @@ class tokenIDProcessor:
                         # so we can use sequential indexing
                         token_ids = [
                             token
-                            for tokens, draft_tokens in zip(
-                                scheduled_tokens[
-                                    total_reqs_prefill : total_reqs_prefill
-                                    + num_new_seqs
-                                ],
-                                list(batch.scheduled_spec_decode_tokens.values())[
-                                    :num_new_seqs
-                                ],
-                            )
-                            for token in [tokens[-1]] + draft_tokens
+                            for tokens in scheduled_tokens[total_reqs_prefill : total_reqs_prefill + num_new_seqs]
+                            for token in tokens
                         ]
                         self.input_ids.np[:num_new_tokens] = token_ids
                         self.input_ids.copy_to_gpu(num_new_tokens)
@@ -427,11 +428,11 @@ class tokenIDProcessor:
                         for idx in new_curr_indices:
                             req_idx = total_reqs_prefill + idx
                             tokens = scheduled_tokens[req_idx]
-                            req_id = batch.req_ids[idx]
-                            draft_tokens = batch.scheduled_spec_decode_tokens.get(
-                                req_id, []
-                            )
-                            new_token_ids.extend([tokens[-1]] + draft_tokens)
+                            # req_id = batch.req_ids[idx]
+                            # draft_tokens = batch.scheduled_spec_decode_tokens.get(
+                            #     req_id, []
+                            # )
+                            new_token_ids.extend(tokens)
                     else:
                         # Non-MTP mode: only first token from scheduled_tokens
                         new_token_ids = [
@@ -1403,7 +1404,8 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 self.tokenID_processor.num_bonus_tokens = num_bonus_tokens
                 self.tokenID_processor.send_bonus_to_cpu_async(
-                    num_bonus_tokens
+                    num_bonus_tokens,
+                    batch.req_ids,
                 )  # Async copy to CPU
 
             draft_token_ids = self.propose_draft_token_ids(

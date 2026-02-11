@@ -280,6 +280,14 @@ class Scheduler:
                 continue
             token_ids = prev_token_ids[seq.id]
             num_accepted_token = len(token_ids)
+            num_draft_tokens = 0
+            if self.use_spec:
+                # Put the draft token into sequence to make sure it get scheduled in scheduler
+                draft_ids = draft_token_ids[seq.id] if seq.id in draft_token_ids else []
+                num_draft_tokens = len(draft_ids)
+                token_ids_w_draft = (*token_ids, *draft_ids)
+            else:
+                token_ids_w_draft = token_ids
             self.update_spec_stats(num_accepted_token)
             if is_deferred_out or (
                 self.use_spec and self.eos_token_id == seq.token_ids[-1]
@@ -290,7 +298,7 @@ class Scheduler:
                 #     seq.token_ids[-num_placeholder + i] = el
                 #     seq.output_tokens[-num_placeholder + i] = el
                 # update the number of tokens in the sequence if draft token is rejected
-                seq.token_ids[-seq.num_placeholder:] = token_ids
+                seq.token_ids[-seq.num_placeholder-seq.num_draft_tokens:] = token_ids_w_draft
                 seq.num_tokens = len(seq.token_ids)
                 seq.output_tokens[-seq.num_placeholder:] = token_ids
                 # print("after update seq token ids: ", seq.token_ids, flush=True)
@@ -298,6 +306,7 @@ class Scheduler:
             else:
                 for token_id in token_ids:
                     seq.append_token(token_id)
+            seq.num_draft_tokens = num_draft_tokens
             new_tokens = token_ids
 
             if need_placeholder:

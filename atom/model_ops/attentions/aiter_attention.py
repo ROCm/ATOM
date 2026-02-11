@@ -7,6 +7,7 @@ from typing import Type
 import aiter
 import numpy as np
 import torch
+import triton
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
@@ -157,13 +158,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         min_seqlen_q = 0
 
         bonus_list = self.model_runner.tokenID_processor.mapped_bonus_list
+        context_lens = batch.context_lens
+        block_tables = batch.block_tables
+
 
         if max_seqlen_q > 1:
-            context_lens = batch.context_lens
             if bonus_list is not None:
                 context_lens = [
-                    context_len - batch.num_spec_step + bonus_list[i]
+                    context_len - batch.num_spec_step + bonus_list[i] if bonus_list[i] > 0 else context_len
                     for i, context_len in enumerate(context_lens)
+                ]
+                block_tables = [
+                    block_table[: triton.cdiv(seq_len, self.model_runner.block_size)]
+                    for block_table, seq_len in zip(block_tables, context_lens)
                 ]
             positions = [
                 pos
@@ -175,7 +182,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_table[pos // self.model_runner.block_size] 
                 * self.model_runner.block_size
                 + (pos % self.model_runner.block_size)
-                for block_table, seq_len in zip(batch.block_tables, context_lens)
+                for block_table, seq_len in zip(block_tables, context_lens)
                 for pos in range(seq_len - max_seqlen_q, seq_len)
             ]
             max_seqlen_k = max(context_lens)
@@ -186,7 +193,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             slot_mapping = [
                 block_table[-1] * self.model_runner.block_size + last_block_num - 1
                 for block_table, last_block_num in zip(
-                    batch.block_tables, batch.last_block_num_tokens
+                    block_tables, batch.last_block_num_tokens
                 )
             ]
             slot_mapping.extend([-1] * (bs - scheduled_bs))
@@ -195,11 +202,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
-        if batch.is_dummy_run:
-            var["slot_mapping"].np[:bs * max_seqlen_q] = -1
-        else:
-            var["slot_mapping"].np[:scheduled_bs * max_seqlen_q] = slot_mapping[:scheduled_bs * max_seqlen_q]
-            var["slot_mapping"].np[scheduled_bs * max_seqlen_q : bs * max_seqlen_q] = -1
+        var["slot_mapping"].np[: bs * max_seqlen_q] = -1
+        if not batch.is_dummy_run:
+            var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping[:sum_scheduled_tokens]
 
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
@@ -208,16 +213,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # Prepare kv_indptr and kv_indices for persistent attention
         block_size = self.model_runner.block_size
         num_blocks_per_seq = [
-            (ctx_len + block_size - 1) // block_size for ctx_len in context_lens
+            triton.cdiv(ctx_len, self.block_size) for ctx_len in context_lens
         ]
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1] if len(kv_indptr) > 0 else 0
         sum_blocks_before_converted = sum(
-            [(i + self.block_ratio - 1) // self.block_ratio for i in num_blocks_per_seq]
+            [triton.cdiv(i, self.block_ratio) for i in num_blocks_per_seq]
         )
 
         var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
-            itertools.chain.from_iterable(batch.block_tables),
+            itertools.chain.from_iterable(block_tables),
             dtype=np.int32,
             count=sum_blocks_before_converted,
         )

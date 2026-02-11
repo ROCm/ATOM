@@ -1164,9 +1164,6 @@ class Qwen3NextModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         for layer in self.layers[self.start_layer:self.end_layer]:
-            # if get_tensor_model_parallel_rank() == 0:
-            #     print("for layer idx: ", layer.layer_idx, flush=True)
-            #     print(hidden_states[:, :10], flush=True)
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
