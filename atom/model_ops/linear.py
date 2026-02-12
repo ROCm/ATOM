@@ -504,11 +504,11 @@ class MergedColumnParallelLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
-        prefix: Optional[str] = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.output_sizes = output_sizes
-        if quant_config is not None and prefix is not None:
+        if quant_config is not None and prefix:
             quant_config = get_quant_config_for_layer(quant_config, prefix)
         super().__init__(
             input_size,

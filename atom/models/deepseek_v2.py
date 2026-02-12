@@ -79,7 +79,6 @@ from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, _has_module
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
-    get_quant_config_for_layer,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -781,9 +780,7 @@ class DeepseekV2MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
             renormalize=config.norm_topk_prob,
-            quant_config=get_quant_config_for_layer(
-                quant_config, prefix=f"{prefix}.experts"
-            ),
+            quant_config=quant_config,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,

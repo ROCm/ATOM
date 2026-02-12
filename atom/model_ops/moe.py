@@ -15,6 +15,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.models.utils import get_quant_config_for_layer
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
@@ -1920,6 +1921,9 @@ class FusedMoE(torch.nn.Module):
             is_lora_enabled=False,
         )
         self.moe_config = moe
+
+        if quant_config is not None and prefix:
+            quant_config = get_quant_config_for_layer(quant_config, prefix)
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
