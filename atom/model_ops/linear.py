@@ -315,8 +315,7 @@ class LinearBase(nn.Module):
             and param.data.element_size() == loaded_weight.element_size()
         ):
             param.data = param.data.view(loaded_weight.dtype)
-        to_copy = post_process_func(loaded_weight)
-        copy_weight(param.data, to_copy)
+        param.data.copy_(post_process_func(loaded_weight))
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
