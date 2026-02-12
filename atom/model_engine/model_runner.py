@@ -596,8 +596,6 @@ class ModelRunner:
 
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
-            if hasattr(self, "drafter"):
-                self.drafter.model = torch.compile(self.drafter.model, fullgraph=True, backend="eager")
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
