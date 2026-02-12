@@ -20,6 +20,7 @@ from atom.utils import (
     get_open_zmq_ipc_path,
     make_zmq_socket,
     set_device_control_env_var,
+    shutdown_all_processes,
 )
 
 logger = logging.getLogger("atom")

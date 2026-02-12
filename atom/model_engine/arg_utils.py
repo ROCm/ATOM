@@ -45,7 +45,6 @@ class EngineArgs:
     enable_dp_attention: bool = False
     method: Optional[str] = None
     num_speculative_tokens: int = 1
-    trust_remote_code: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -170,12 +169,6 @@ class EngineArgs:
             default=0.0,
             help="Apply a delay (of delay factor multiplied by previous"
             "prompt latency) before scheduling next prompt.",
-        )
-
-        parser.add_argument(
-            "--trust-remote-code",
-            action="store_true",
-            help="Trust remote code when loading models from HuggingFace.",
         )
 
         return parser
