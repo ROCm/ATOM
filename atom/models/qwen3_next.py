@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -49,96 +49,10 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 
-from aiter import fused_rope_rms
-
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
-
-
-class RotaryEmbeddingQKNormFused(nn.Module):
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: int,
-        is_neox_style: bool,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.head_size = head_size
-        self.rotary_dim = rotary_dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        self.is_neox_style = is_neox_style
-        self.dtype = dtype
-
-        cos, sin = self._compute_cos_sin_cache()
-        cos = cos.to(dtype)
-        sin = sin.to(dtype)
-        cache = torch.cat((cos, sin), dim=-1)
-        self.cos_sin_cache: torch.Tensor
-        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            self.register_buffer(
-                "cos_sin_cache",
-                cache.view(cache.size(0), self.head_size),
-                persistent=False,
-            )
-        else:
-            self.register_buffer("cos_sin_cache", cache, persistent=False)
-
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
-        """Compute the inverse frequency."""
-        # NOTE(woosuk): To exactly match the HF implementation, we need to
-        # use CPU to compute the cache and then move it to GPU. However, we
-        # create the cache on GPU for faster initialization. This may cause
-        # a slight numerical difference between the HF implementation and ours.
-        inv_freq = 1.0 / (
-            base
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
-                / self.rotary_dim
-            )
-        )
-        return inv_freq
-
-    def _compute_cos_sin_cache(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute the cos and sin cache."""
-        inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
-
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos().unsqueeze(-2).unsqueeze(-2)
-        sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
-        return cos, sin
-
-    def forward(
-        self,
-        qkv: torch.Tensor,
-        q_weight: torch.Tensor,
-        k_weight: torch.Tensor,
-        positions: torch.Tensor,
-        num_heads: int,
-        num_kv_heads: int,
-        eps: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        num_tokens = positions.shape[-1]
-        fused_rope_rms(
-            qkv,
-            q_weight,
-            k_weight,
-            self.cos_sin_cache,
-            positions,
-            num_tokens=num_tokens,
-            num_heads_q=num_heads,
-            num_heads_k=num_kv_heads,
-            num_heads_v=num_kv_heads,
-            head_size=self.head_size,
-            is_neox_style=self.is_neox_style,
-            eps=eps,
-        )
 
 
 class Qwen3NextMLP(nn.Module):
