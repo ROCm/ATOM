@@ -208,11 +208,12 @@ jobs:
           echo "Model path: $model_path"
           ls -la $model_path || true
           # Print debug logs
-          sudo rocm-smi --showmemuse
-          sudo rocm-smi --showpids
+          echo "========= Runner debug logs ==============="
+          rocm-smi --showmemuse
+          rocm-smi --showpids
           ps aux
           docker ps -a
-          
+          echo "========= End runner debug logs ==============="
           docker exec atom_test bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
