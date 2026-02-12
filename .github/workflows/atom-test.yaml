@@ -196,6 +196,7 @@ jobs:
         run: |
           # Run the inference and capture output
           set -euo pipefail
+          
           echo ""
           echo "========== Running test =========="
 
@@ -206,6 +207,12 @@ jobs:
           fi
           echo "Model path: $model_path"
           ls -la $model_path || true
+          # Print debug logs
+          sudo rocm-smi --showmemuse
+          sudo rocm-smi --showpids
+          ps aux
+          docker ps -a
+          
           docker exec atom_test bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
