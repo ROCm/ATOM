@@ -2085,10 +2085,10 @@ class FusedMoE(torch.nn.Module):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-        # if expert_data.dtype != dtypes.fp4x2:
-        #     expert_data.copy_(loaded_weight)
-        # else:
-        #     expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+        if expert_data.dtype != dtypes.fp4x2:
+            expert_data.copy_(loaded_weight)
+        else:
+            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
 
     def _load_w2(
         self,
