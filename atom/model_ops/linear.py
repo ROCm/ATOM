@@ -18,7 +18,12 @@ from aiter import (
 from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
-from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
+from atom.model_ops.utils import (
+    copy_weight,
+    normalize_e4m3fn_to_e4m3fnuz,
+    requantize_with_max_scale,
+)
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
@@ -309,13 +314,13 @@ class LinearBase(nn.Module):
         loaded_weight: torch.Tensor,
         post_process_func: Callable = lambda a: a,
     ):
-        # assert not (param.data.dtype == torch.float4_e2m1fn_x2 and loaded_weight.dtype == torch.bfloat16)
         if (
             param.data.dtype != loaded_weight.dtype
             and param.data.element_size() == loaded_weight.element_size()
         ):
             param.data = param.data.view(loaded_weight.dtype)
-        param.data.copy_(post_process_func(loaded_weight))
+        to_copy = post_process_func(loaded_weight)
+        copy_weight(param.data, to_copy)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data

@@ -14,6 +14,9 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
@@ -519,8 +522,8 @@ def rocm_asm_moe_impl(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    from aiter import ActivationType, QuantType
     from aiter.fused_moe_bf16_asm import asm_moe
+    from aiter import ActivationType, QuantType
 
     activation_ = ActivationType(activation)
     quant_type_ = QuantType(quant_type)
@@ -763,8 +766,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
         if self.use_triton:
-            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
@@ -825,7 +829,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
+            # shuffle_weights(layer.w13_weight, layer.w2_weight)
             s0, s1, _ = layer.w13_weight_scale.shape
             w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
             w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
@@ -987,7 +991,7 @@ class QuarkOCP_MX_MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        params_dtype = torch.uint8
+        # params_dtype = torch.uint8
         self.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
@@ -1078,64 +1082,16 @@ class QuarkOCP_MX_MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
-        # Pre-shuffle weight scales only (no weight shuffle), then view weight to fp4.
-        # Use weight shape as source of truth so scale layout matches kernel expectation;
-        # use numel() for last dim so view is valid even if e8m0_shuffle changes size.
-        s0_w, s1_w = layer.w13_weight.shape[:2]
-        s01_w = s0_w * s1_w
-
-        w13_weight_scale = layer.w13_weight_scale
-        total_before = w13_weight_scale.numel()
-        if total_before % s01_w == 0:
-            s0, s1 = s0_w, s1_w
-        else:
-            s0, s1, _ = layer.w13_weight_scale.shape
-        s01 = s0 * s1
-        w13_weight_scale = w13_weight_scale.view(s01, -1)
+        # Pre-shuffle weight scales only (no weight shuffle), then view weight to fp4
+        s0, s1, _ = layer.w13_weight_scale.shape
+        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
         w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
-        total_after = w13_weight_scale.numel()
-        if total_after % s01 != 0:
-            # e8m0_shuffle may pad; use pre-shuffle size if divisible and total_after >= total_before
-            if total_before % s01 == 0 and total_after >= total_before:
-                w13_weight_scale = w13_weight_scale.flatten()[:total_before].view(
-                    s0, s1, total_before // s01
-                )
-            else:
-                raise RuntimeError(
-                    f"QuarkOCP_MX w13_weight_scale: after e8m0_shuffle numel={total_after} "
-                    f"not divisible by s0*s1={s01} (scale shape was ({s0},{s1},_), weight shape[:2]=({s0_w},{s1_w})). "
-                    "Checkpoint may not match this model (e.g. wrong num_experts or hidden/intermediate size)."
-                )
-        else:
-            w13_weight_scale = w13_weight_scale.view(s0, s1, total_after // s01)
-        layer.w13_weight_scale.data = w13_weight_scale
+        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
-        w2_weight_scale = layer.w2_weight_scale
-        total_before = w2_weight_scale.numel()
-        s0_w2, s1_w2 = layer.w2_weight.shape[:2]
-        s01_w2 = s0_w2 * s1_w2
-        if total_before % s01_w2 == 0:
-            s0, s1 = s0_w2, s1_w2
-        else:
-            s0, s1, _ = layer.w2_weight_scale.shape
-        s01 = s0 * s1
-        w2_weight_scale = w2_weight_scale.view(s01, -1)
+        s0, s1, _ = layer.w2_weight_scale.shape
+        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
         w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
-        total_after = w2_weight_scale.numel()
-        if total_after % s01 != 0:
-            if total_before % s01 == 0 and total_after >= total_before:
-                w2_weight_scale = w2_weight_scale.flatten()[:total_before].view(
-                    s0, s1, total_before // s01
-                )
-            else:
-                raise RuntimeError(
-                    f"QuarkOCP_MX w2_weight_scale: after e8m0_shuffle numel={total_after} "
-                    f"not divisible by s0*s1={s01} (scale shape was ({s0},{s1},_), weight shape[:2]=({s0_w2},{s1_w2})). "
-                    "Checkpoint may not match this model."
-                )
-        else:
-            w2_weight_scale = w2_weight_scale.view(s0, s1, total_after // s01)
-        layer.w2_weight_scale.data = w2_weight_scale
+        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
         if self.fp4_dtype is not None:
             layer.w13_weight = nn.Parameter(
@@ -1146,8 +1102,6 @@ class QuarkOCP_MX_MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.view(self.fp4_dtype),
                 requires_grad=layer.w2_weight.requires_grad,
             )
-
-        torch.cuda.empty_cache()
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1602,6 +1556,25 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
+                doweight_stage1=apply_router_weight_on_input,
+            )
+            # print("x", x)
+            # print("layer.w13_weight", layer.w13_weight)
+            # print("layer.w2_weight", layer.w2_weight)
+
+            return torch.ops.aiter.rocm_aiter_fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                expert_mask=expert_map,
+                activation=activation.value,
+                quant_type=self.quant_type.value,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
                 doweight_stage1=apply_router_weight_on_input,
             )
 
@@ -2113,7 +2086,7 @@ class FusedMoE(torch.nn.Module):
         )
         self.routed_scaling_factor = (
             getattr(config, "routed_scaling_factor", 1.0)
-            if config is not None and atom_config.torch_dtype != torch.float16
+            if config is not None and config.torch_dtype != torch.float16
             else 1.0
         )
         self.expert_mask = None
@@ -2387,11 +2360,11 @@ class FusedMoE(torch.nn.Module):
                 shard_dim, shard_size * tp_rank, shard_size
             )
         # w2, down_proj: Load into only logical weight of w2.
-        if expert_data.dtype != dtypes.fp4x2:
-            expert_data.copy_(loaded_weight)
-        else:
-            expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
-        # copy_weight(expert_data, loaded_weight)
+        # if expert_data.dtype != dtypes.fp4x2:
+        #     expert_data.copy_(loaded_weight)
+        # else:
+        #     expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+        copy_weight(expert_data, loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
