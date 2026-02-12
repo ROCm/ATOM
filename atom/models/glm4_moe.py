@@ -9,6 +9,7 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
+from aiter import QuantType
 
 # from atom.model_ops.fused_moe.shared_fused_moe import SharedFusedMoE
 from atom.model_ops.linear import (
@@ -310,6 +311,15 @@ class Glm4MoeDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         rope_params = config.rope_parameters
         rope_theta = rope_params["rope_theta"]
+        # refer vLLM: when using per_1x32 (MXFP4), only quantize MoE experts, to avoid missing weight_scale.
+        linear_quant_config = (
+            None
+            if (
+                quant_config is not None
+                and quant_config.get("quant_type") == QuantType.per_1x32
+            )
+            else quant_config
+        )
 
         self.self_attn = Glm4MoeAttention(
             config=config,
@@ -321,7 +331,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=config.attention_bias,
             cache_config=cache_config,
-            quant_config=quant_config,
+            quant_config=linear_quant_config,
             prefix=f"{prefix}.self_attn",
             use_qk_norm=config.use_qk_norm,
             rope_theta=rope_theta,
@@ -343,7 +353,7 @@ class Glm4MoeDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=linear_quant_config,
                 prefix=f"{prefix}.mlp",
             )
 

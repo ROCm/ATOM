@@ -15,10 +15,28 @@ import os
 import re
 
 from atom.config import QuantizationConfig
+from aiter import dtypes
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+MXFP4_QUANT_BLOCK_SIZE = 32
+
+
+def copy_weight(dest: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy src into dest. Non-FP4: direct copy; FP4: view as uint8, align, then copy."""
+    if dest.dtype != dtypes.fp4x2:
+        dest.copy_(src)
+    else:
+        du8 = dest.view(torch.uint8)
+        su8 = src.view(torch.uint8)
+        for d in range(min(du8.dim(), su8.dim())):
+            if du8.shape[d] != su8.shape[d]:
+                n = min(du8.shape[d], su8.shape[d])
+                du8 = du8.narrow(d, 0, n)
+                su8 = su8.narrow(d, 0, n)
+        du8.copy_(su8)
 
 
 class LayerFn(Protocol):
