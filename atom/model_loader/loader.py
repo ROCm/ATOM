@@ -190,7 +190,7 @@ def load_model(
                 # We handle the experts below in expert_params_mapping
                 if "mlp.experts." in name and name not in params_dict:
                     continue
-                if "mtp" in name and name not in params_dict:
+                if "mtp" in name and not spec_decode:
                     continue
                 if k in name:
                     v, shard_id = packed_modules_mapping[k]
@@ -218,7 +218,7 @@ def load_model(
                             name.endswith(".bias") or name.endswith("_bias")
                         ) and name not in dict(model.named_parameters()):
                             continue
-                        if "mtp" in name and not hasattr(model, "mtp"):
+                        if "mtp" in name and not spec_decode:
                             continue
                         param = model.get_parameter(name)
                         weight_loader = getattr(param, "weight_loader")
@@ -241,7 +241,7 @@ def load_model(
                         # )
                         break
                     else:
-                        if "mtp" in name and not hasattr(model, "mtp"):
+                        if "mtp" in name and not spec_decode:
                             continue
                         param = model.get_parameter(name)
                         weight_loader = getattr(
