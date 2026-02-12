@@ -629,11 +629,11 @@ class RowParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         source_quant_dtype: torch.dtype = None,
-        prefix: Optional[str] = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
-        if quant_config is not None and prefix is not None:
+        if quant_config is not None and prefix:
             quant_config = get_quant_config_for_layer(quant_config, prefix)
         super().__init__(
             input_size,
