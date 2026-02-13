@@ -48,7 +48,7 @@ if [ "$TYPE" == "accuracy" ]; then
           --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False \
           --tasks gsm8k \
           --num_fewshot 3 \
-          --output_path ${RESULT_FILENAME}
+          --output_path "${RESULT_FILENAME}"
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
   chmod -R 777 accuracy_test_results
 fi
