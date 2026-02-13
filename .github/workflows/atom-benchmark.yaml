@@ -81,9 +81,26 @@ jobs:
 
     runs-on: atom-mi355-8gpu.predownload
     steps:
+      - name: Kill all Docker containers
+        run: |
+          echo "=== Cleaning up containers on $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+
+      - name: Show Docker containers
+        run: docker ps -a
+
+      - name: Show ROCm memory usage
+        run: rocm-smi --showmemuse
+
+      - name: Show ROCm GPU processes
+        run: rocm-smi --showpidgpus
+
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
-      
+
       - name: Start CI container
         run: |
           echo "Clean up containers..."
@@ -145,7 +162,7 @@ jobs:
           RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
           ls -all .
           "
-      
+
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4
         with:
@@ -183,9 +200,26 @@ jobs:
 
     runs-on: atom-mi355-8gpu.predownload
     steps:
+      - name: Kill all Docker containers
+        run: |
+          echo "=== Cleaning up containers on $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+
+      - name: Show Docker containers
+        run: docker ps -a
+
+      - name: Show ROCm memory usage
+        run: rocm-smi --showmemuse
+
+      - name: Show ROCm GPU processes
+        run: rocm-smi --showpidgpus
+
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
-      
+
       - name: Start CI container
         run: |
           echo "Clean up containers..."
