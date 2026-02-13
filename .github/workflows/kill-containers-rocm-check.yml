@@ -1,0 +1,31 @@
+name: Kill Docker Containers and Check ROCm
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: atom-mi355-8gpu.predownload
+    strategy:
+      matrix:
+        node: [1, 2, 3]
+      max-parallel: 3
+      fail-fast: false
+    steps:
+      - name: Kill all Docker containers
+        run: |
+          echo "=== Node ${{ matrix.node }} - $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            echo "Killing running containers..."
+            docker kill $containers
+            echo "Containers killed."
+          else
+            echo "No running containers found."
+          fi
+
+      - name: Show ROCm memory usage
+        run: rocm-smi --showmemuse
+
+      - name: Show ROCm PIDs
+        run: rocm-smi --showpids
