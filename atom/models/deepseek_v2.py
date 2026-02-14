@@ -1262,7 +1262,12 @@ class DeepseekV2MLAAttention(nn.Module):
                 base_quant_config = None
         else:
             source_quant_dtype = None
-            base_quant_config = quant_config
+            # Check exclude patterns (e.g. W4A8 checkpoints exclude attention)
+            if should_ignore_layer(quant_config, prefix):
+                quant_config = None
+                base_quant_config = None
+            else:
+                base_quant_config = quant_config
 
         if self.q_lora_rank is not None:
             # self.q_a_proj = ReplicatedLinear(self.hidden_size,

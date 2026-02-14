@@ -54,6 +54,7 @@ support_model_arch_dict = {
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
+    "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -629,6 +630,7 @@ class ModelRunner:
             "deepseek_v3",
             "deepseek_v32",
             "deepseek_mtp",
+            "kimi_k2",
         ):
             return self.hf_text_config.kv_lora_rank is not None
         elif self.hf_text_config.model_type == "eagle":
