@@ -1276,6 +1276,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 source_quant_dtype=source_quant_dtype,
+                prefix=f"{prefix}.q_a_proj",
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(

@@ -26,6 +26,7 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
+from atom.utils.decorators import mark_trace
 
 from atom.model_ops.utils import shuffle_weights
 from atom.utils import envs
@@ -191,6 +192,7 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     return y
 
 
+@mark_trace
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -201,6 +203,7 @@ class LinearBase(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = False,
         source_quant_dtype: torch.dtype | None = None,
+        prefix: str = "",
     ):
         if quant_config is None:
             quant_config = QuantizationConfig()
@@ -208,6 +211,7 @@ class LinearBase(nn.Module):
         quant_type = quant_config["quant_type"]
         params_dtype = quant_config["quant_dtype"]
         super().__init__()
+        self.prefix = prefix
         self.reduce_results = reduce_results
         self.input_size = input_size
         self.output_size = (
@@ -461,6 +465,7 @@ class ReplicatedLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=kwargs.get("prefix", ""),
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -486,6 +491,7 @@ class ColumnParallelLinear(LinearBase):
             bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=kwargs.get("prefix", ""),
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -517,6 +523,7 @@ class MergedColumnParallelLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=kwargs.get("prefix", ""),
         )
 
     def weight_loader(
@@ -582,6 +589,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=kwargs.get("prefix", ""),
         )
 
     def weight_loader(
@@ -643,6 +651,7 @@ class RowParallelLinear(LinearBase):
             quant_config=quant_config,
             reduce_results=reduce_results,
             source_quant_dtype=source_quant_dtype,
+            prefix=kwargs.get("prefix", ""),
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -678,6 +687,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=kwargs.get("prefix", ""),
         )
 
     def weight_loader(

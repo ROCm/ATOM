@@ -6,6 +6,8 @@ from typing import Optional
 
 import torch
 from torch import nn
+from typing import Optional
+from torch.profiler import record_function
 
 
 from atom.utils import mark_spliting_op
@@ -49,9 +51,13 @@ def unified_attention_with_output_base(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    atom_config = get_current_atom_config()
-    self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.impl.forward(q, k, v, positions, q_scale, qkv)
+    with record_function(f"{layer_name}"):
+        atom_config = get_current_atom_config()
+        self = atom_config.compilation_config.static_forward_context[layer_name]
+        return self.impl.forward(q, k, v, positions, q_scale, qkv)
+        # atom_config = get_current_atom_config()
+        # self = atom_config.compilation_config.static_forward_context[layer_name]
+        # return self.impl.forward(q, k, v, positions, q_scale, qkv)
 
 
 def linear_attention_with_output_base_fake(

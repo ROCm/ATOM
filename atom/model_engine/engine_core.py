@@ -83,6 +83,9 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
+                # Start profiler before cudagraph capture if profiling is enabled
+                if self.profile_enbaled:
+                    self.runner_mgr.call_func("start_profiler", wait_out=True)
                 cap_cost, bs = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
@@ -284,7 +287,7 @@ class EngineCore:
 
     def start_profiler(self):
         if self.profile_enbaled:
-            self.runner_mgr.call_func("start_profiler")
+            self.runner_mgr.call_func("start_profiler", wait_out=True)
 
     def stop_profiler(self):
         if self.profile_enbaled:
