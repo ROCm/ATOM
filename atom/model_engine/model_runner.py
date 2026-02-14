@@ -6,6 +6,7 @@ import os
 import time
 from itertools import chain, islice
 from typing import Any, Optional, Union
+import math
 
 import numpy as np
 import torch
@@ -54,6 +55,7 @@ support_model_arch_dict = {
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
+    "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -514,6 +516,7 @@ class ModelRunner:
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
+        self.use_gdn = self.is_qwen_next()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -572,6 +575,7 @@ class ModelRunner:
         self.attn_backend = get_attn_backend(
             self.block_size,
             use_mla=self.use_mla,
+            use_gdn=self.use_gdn,
         )
         if self.config.speculative_config and get_pp_group().is_last_rank:
             from atom.utils.backends import set_model_tag
@@ -638,6 +642,13 @@ class ModelRunner:
                 self.hf_text_config.model.model_type in ("deepseek_v2", "deepseek_v3")
                 and self.hf_text_config.kv_lora_rank is not None
             )
+        return False
+
+    def is_qwen_next(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        elif self.hf_text_config.model_type in ("qwen3_next",):
+            return True
         return False
 
     def get_mtp_statistics(self) -> dict:
@@ -923,6 +934,39 @@ class ModelRunner:
                     * aligned_index_dim
                     * dtypes.fp8.itemsize
                 )
+        elif self.is_qwen_next():
+            self.full_attention_interval = hf_config.full_attention_interval
+            self.num_full_attn = (
+                hf_config.num_hidden_layers // self.full_attention_interval
+            )
+            self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
+
+            # full attention bytes
+            block_bytes = (
+                2
+                * hf_config.num_hidden_layers
+                * self.physical_block_size
+                * num_kv_heads
+                * hf_config.head_dim
+                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+            )
+
+            # gdn attn bytes
+            mamba_shape = self.gated_delta_net_state_shape(
+                get_tp_group().world_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_conv_kernel_dim,
+                0,  # self.num_spec,
+            )
+
+            one_layer_byte = (
+                sum(math.prod(subtuple) for subtuple in mamba_shape)
+                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+            )
+            block_bytes = block_bytes + self.num_gdn_attn_state * one_layer_byte
         else:
             block_bytes = (
                 2
@@ -993,6 +1037,50 @@ class ModelRunner:
                     dtype=dtypes.fp8,
                     device="cuda",
                 )
+        elif self.is_qwen_next():
+
+            self.kv_cache = torch.zeros(
+                2,
+                self.num_full_attn,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
+                num_kv_heads,
+                hf_config.head_dim,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+
+            self.kv_scale = torch.zeros(
+                2,
+                self.num_full_attn,
+                self.num_physical_kvcache_blocks,
+                num_kv_heads,
+                self.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            )
+
+            mamba_shape = self.gated_delta_net_state_shape(
+                get_tp_group().world_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_conv_kernel_dim,
+                0,  # self.num_spec,
+            )
+            self.mamba_k_cache = torch.zeros(
+                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
+                + mamba_shape[0],
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+            self.mamba_v_cache = torch.zeros(
+                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
+                + mamba_shape[1],
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
         else:
             self.kv_cache = torch.zeros(
                 2,
@@ -1037,14 +1125,18 @@ class ModelRunner:
                 if hasattr(module, "base_attention"):
                     if hasattr(module, "use_mla") and not module.use_mla:
                         # Non-MLA attention
-                        k_cache = self.kv_cache[0, layer_id].view(
+                        if self.is_qwen_next():
+                            attn_idx = layer_id // self.full_attention_interval
+                        else:
+                            attn_idx = layer_id
+                        k_cache = self.kv_cache[0, attn_idx].view(
                             self.num_physical_kvcache_blocks,
                             num_kv_heads,
                             hf_config.head_dim // x,
                             self.physical_block_size,
                             x,
                         )
-                        v_cache = self.kv_cache[1, layer_id].view(
+                        v_cache = self.kv_cache[1, attn_idx].view(
                             self.num_physical_kvcache_blocks,
                             num_kv_heads,
                             hf_config.head_dim,
@@ -1052,8 +1144,8 @@ class ModelRunner:
                         )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, layer_id]
-                            module.v_scale = self.kv_scale[1, layer_id]
+                            module.k_scale = self.kv_scale[0, attn_idx]
+                            module.v_scale = self.kv_scale[1, attn_idx]
 
                         k_scale = module.k_scale
                         v_scale = module.v_scale
@@ -1103,6 +1195,24 @@ class ModelRunner:
                         module.kv_cache = kv_cache
                         module.max_model_len = self.config.max_model_len
                         layer_id += 1
+                elif hasattr(module, "base_linear_attention"):
+                    gdn_idx = (
+                        layer_id
+                        // self.full_attention_interval
+                        * (self.full_attention_interval - 1)
+                        + layer_id % self.full_attention_interval
+                    )
+                    mamba_k_cache = self.mamba_k_cache[gdn_idx]
+                    mamba_v_cache = self.mamba_v_cache[gdn_idx]
+                    kv_cache_tensor = KVCacheTensor(
+                        layer_num=layer_id,
+                        k_cache=mamba_k_cache,
+                        v_cache=mamba_v_cache,
+                        k_scale=None,
+                        v_scale=None,
+                    )
+                    kv_cache_tensors.append(kv_cache_tensor)
+                    layer_id += 1
 
         # Store KVCacheConfig
         kv_cache_data = {
@@ -1114,6 +1224,31 @@ class ModelRunner:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
+
+    def gated_delta_net_state_shape(
+        self,
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_kernel_size: int,
+        num_spec: int = 0,
+    ):
+        conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
+        conv_state_shape = (
+            conv_dim // tp_world_size,
+            conv_kernel_size - 1 + num_spec,
+        )
+
+        conv_state_shape = conv_state_shape[1], conv_state_shape[0]
+
+        temporal_state_shape = (
+            num_v_heads // tp_world_size,
+            head_k_dim,
+            head_v_dim,
+        )
+        return conv_state_shape, temporal_state_shape
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
         dp_size = self.config.parallel_config.data_parallel_size

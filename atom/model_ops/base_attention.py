@@ -54,6 +54,31 @@ def unified_attention_with_output_base(
     return self.impl.forward(q, k, v, positions, q_scale, qkv)
 
 
+def linear_attention_with_output_base_fake(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return
+
+
+@mark_spliting_op(
+    is_custom=True, gen_fake=linear_attention_with_output_base_fake, mutates_args=[]
+)
+def linear_attention_with_output_base(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    return self.impl.forward(mixed_qkv, b, a, core_attn_out)
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -133,5 +158,81 @@ class Attention(nn.Module):
     ):
         output = torch.ops.aiter.unified_attention_with_output_base(
             q, q_scale, k, v, positions, self.layer_name, self.use_mla, qkv
+        )
+        return output
+
+
+class LinearAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        num_v_heads,
+        num_k_heads,
+        head_k_dim,
+        head_v_dim,
+        key_dim,
+        value_dim,
+        dt_bias=None,
+        A_log=None,
+        conv1d=None,
+        activation=None,
+        layer_num=0,
+        prefix: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_v_heads = num_v_heads
+        self.num_k_heads = num_k_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.key_dim = key_dim
+        self.value_dim = value_dim
+        self.dt_bias = dt_bias
+        self.A_log = A_log
+        self.conv1d = conv1d
+        self.activation = activation
+        self.layer_num = layer_num
+        self.base_linear_attention = None
+
+        atom_config = get_current_atom_config()
+        block_size = atom_config.kv_cache_block_size
+        self.attn_backend = get_attn_backend(
+            block_size,
+            use_gdn=True,
+        )
+        impl_cls = self.attn_backend.get_impl_cls()
+        self.impl = impl_cls(
+            self.hidden_size,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.key_dim,
+            self.value_dim,
+            dt_bias,
+            A_log,
+            conv1d,
+            activation,
+            layer_num,
+            **kwargs,
+        )
+
+        compilation_config = atom_config.compilation_config
+        default_name = f"Linear_{layer_num}"
+        self.layer_name = prefix if prefix is not None else default_name
+        if self.layer_name in compilation_config.static_forward_context:
+            raise ValueError("Duplicate layer: {}".format(self.layer_name))
+        compilation_config.static_forward_context[self.layer_name] = self
+
+    def forward(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ):
+        output = torch.ops.aiter.linear_attention_with_output_base(
+            mixed_qkv, b, a, core_attn_out, self.layer_name
         )
         return output

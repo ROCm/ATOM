@@ -19,6 +19,10 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+
+from atom.utils.decorators import support_torch_compile
+
+# from atom.model_ops.rotary_embedding import get_rope
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import (
     IntermediateTensors,
@@ -28,7 +32,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
-from atom.utils.decorators import support_torch_compile
 from torch import nn
 
 # import torch.distributed as dist
