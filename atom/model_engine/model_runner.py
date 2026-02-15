@@ -1367,6 +1367,7 @@ class ModelRunner:
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             hidden_states = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states)
         else:
             graph_bs = context.graph_bs
             max_q_len = forward_context.attn_metadata.max_seqlen_q
@@ -1374,7 +1375,7 @@ class ModelRunner:
             self.graphs[graph_key].replay()
             num_tokens = context.batch_size * max_q_len
             hidden_states = self.forward_vars["outputs"][:num_tokens]
-        logits = self.model.compute_logits(hidden_states)
+            logits = self.graph_logits[graph_key][:num_tokens]
 
         return logits, hidden_states
 
@@ -1588,6 +1589,7 @@ class ModelRunner:
         outputs = self.forward_vars["outputs"]
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
+        self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
         self.graph_pool = None
 
         with graph_capture() as gc:
@@ -1625,17 +1627,23 @@ class ModelRunner:
                     num_tokens_across_dp=num_tokens_across_dp,
                 )
 
+                # Warmup: run model forward + compute_logits
                 outputs[:num_tokens] = self.model(
                     input_ids[:num_tokens], positions[:num_tokens]
-                )  # warmup
+                )
+                self.model.compute_logits(outputs[:num_tokens])
 
+                # Capture: include compute_logits in the graph to avoid
+                # eager execution overhead during decode replay.
                 with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
                     outputs[:num_tokens] = self.model(
                         input_ids[:num_tokens], positions[:num_tokens]
-                    )  # capture
+                    )
+                    graph_logits = self.model.compute_logits(outputs[:num_tokens])
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
                 self.graphs[(bs, max_q_len)] = graph
+                self.graph_logits[(bs, max_q_len)] = graph_logits
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
         return time.time() - start_time, self.graph_bs
