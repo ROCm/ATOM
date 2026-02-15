@@ -21,6 +21,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from aiter import ActivationType
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_gather,
@@ -120,6 +121,7 @@ class OAIAttention(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.o_proj",
             bias=True,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
         self.num_local_attention_heads = config.num_attention_heads // tp_size
@@ -192,12 +194,29 @@ class MLPBlock(torch.nn.Module):
             activation=ActivationType.Swiglu,
             config=config,
         )
+        # Detect MXFP4 MoE GEMM padding requirement from the quant method.
+        # When hidden_size is not aligned to 256, MXFP4 weights are padded
+        # and the kernel expects padded input. We handle padding here instead
+        # of in the layernorm, so the layernorm can use fused AllReduce.
+        if hasattr(self.experts.quant_method, "hidden_pad"):
+            self.moe_hidden_pad = self.experts.quant_method.hidden_pad
+        else:
+            self.moe_hidden_pad = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
 
-        g = self.router(x[..., : self.hidden_size])
+        g = self.router(x)
+
+        # Pad input for MXFP4 MoE GEMM alignment if needed
+        if self.moe_hidden_pad > 0:
+            x = F.pad(x, (0, self.moe_hidden_pad))
+
         x = self.experts(hidden_states=x, router_logits=g)
+
+        # Remove padding from output
+        if self.moe_hidden_pad > 0:
+            x = x[:, : self.hidden_size]
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             x = tensor_model_parallel_all_reduce(x)
@@ -238,10 +257,13 @@ class TransformerBlock(torch.nn.Module):
             eps=1e-5,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and layer_num > 0,
         )
-        # post_attention_layernorm cannot use fused_allreduce because
-        # x_pad_to_multiple is incompatible with the fused kernel.
+        # Fuse o_proj AllReduce into post_attention_layernorm.
+        # Padding for MXFP4 MoE GEMM alignment is now handled inside MLPBlock,
+        # so this layernorm no longer needs x_pad_to_multiple.
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=1e-5, x_pad_to_multiple=256
+            config.hidden_size,
+            eps=1e-5,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
     def forward(
@@ -260,7 +282,7 @@ class TransformerBlock(torch.nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        output = self.mlp(hidden_states)[:, : self.hidden_size]
+        output = self.mlp(hidden_states)
         return output, residual
 
 
