@@ -160,9 +160,9 @@ class Attention(nn.Module):
             )
         else:
             # for asm paged attention
-            asm_layout=False
-            if k_cache.dim()==5 and v_cache.dim()==5:
-                asm_layout=True
+            asm_layout = False
+            if k_cache.dim() == 5 and v_cache.dim() == 5:
+                asm_layout = True
             if self.rotary_emb is not None:
                 assert position is not None
                 q, k = self.rotary_emb(position, q, k)
@@ -208,7 +208,9 @@ class Attention(nn.Module):
         _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
         # assuem all query have same length
-        query_group_size = attn_metadata.max_seqlen_q * (num_q_heads_total // num_kv_heads)
+        query_group_size = attn_metadata.max_seqlen_q * (
+            num_q_heads_total // num_kv_heads
+        )
         assert num_q_heads_total % num_kv_heads == 0
 
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)

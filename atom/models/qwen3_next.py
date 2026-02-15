@@ -15,6 +15,7 @@ from atom.config import QuantizationConfig, Config
 
 # from atom.model_loader.loader import mamba_v2_sharded_weight_loader
 from atom.model_ops.activation import SiluAndMul
+
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention, LinearAttention
 from atom.model_ops.layernorm import RMSNorm, RMSNormGated, GemmaRMSNorm
@@ -67,7 +68,10 @@ from atom.utils import envs
 from aiter import fused_rope_rms
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
-ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
+    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+)
+
 
 def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
@@ -117,9 +121,7 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (
-                    loaded_start_idx + take
-                )  # type: ignore[misc]
+                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries
@@ -127,6 +129,7 @@ def mamba_v2_sharded_weight_loader(
             loaded_boundary += full_dim - extra
 
     return loader
+
 
 class RotaryEmbeddingQKNormFused(nn.Module):
     def __init__(
@@ -152,7 +155,11 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         cache = torch.cat((cos, sin), dim=-1)
         self.cos_sin_cache: torch.Tensor
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            self.register_buffer("cos_sin_cache", cache.view(cache.size(0), self.head_size), persistent=False)
+            self.register_buffer(
+                "cos_sin_cache",
+                cache.view(cache.size(0), self.head_size),
+                persistent=False,
+            )
         else:
             self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -165,7 +172,8 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+                / self.rotary_dim
             )
         )
         return inv_freq
@@ -180,7 +188,8 @@ class RotaryEmbeddingQKNormFused(nn.Module):
         sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
         return cos, sin
 
-    def forward(self,
+    def forward(
+        self,
         qkv: torch.Tensor,
         q_weight: torch.Tensor,
         k_weight: torch.Tensor,
@@ -321,14 +330,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             use_grouped_topk=False,
             prefix=f"{prefix}.experts",
-            config=config)
+            config=config,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -341,8 +350,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         final_hidden_states = shared_output + routed_output
 
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -351,7 +359,7 @@ class Qwen3NextAttention(nn.Module):
     def __init__(
         self,
         atom_config,
-        quant_config = None,
+        quant_config=None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -401,7 +409,7 @@ class Qwen3NextAttention(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        
+
         rotary_dim = int(self.head_dim * partial_rotary_factor)
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
@@ -427,7 +435,6 @@ class Qwen3NextAttention(nn.Module):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -435,7 +442,6 @@ class Qwen3NextAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -448,8 +454,7 @@ class Qwen3NextAttention(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
-        
+
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
         )
@@ -494,8 +499,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def __init__(
         self,
         config: Qwen3NextConfig,
-        quant_config = None,
-        speculative_config = None,
+        quant_config=None,
+        speculative_config=None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -601,7 +606,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        
+
         self.attn = LinearAttention(
             self.hidden_size,
             self.num_v_heads,
@@ -616,7 +621,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             activation=self.activation,
             layer_num=extract_layer_index(self.prefix),
         )
-
 
     def fix_query_key_value_ordering(
         self,
@@ -658,8 +662,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
         # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn],
         #  [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
-        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=2)
+        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=2)
 
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
         value = value.reshape(value.size(0), -1, self.head_v_dim)
@@ -756,7 +760,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # V1 profile run
             return
 
-        #assert isinstance(attn_metadata, dict)
+        # assert isinstance(attn_metadata, dict)
         # attn_metadata = attn_metadata[self.prefix]
         # assert isinstance(attn_metadata, GDNAttentionMetadata)
         has_initial_state = attn_metadata.has_initial_state
@@ -765,17 +769,22 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
-        
-        non_spec_state_indices_tensor = non_spec_state_indices_tensor + ((self.layer_idx + 1) % 4 - 1)
-        
+        spec_state_indices_tensor = (
+            attn_metadata.spec_state_indices_tensor
+        )  # noqa: E501
+        non_spec_state_indices_tensor = (
+            attn_metadata.non_spec_state_indices_tensor
+        )  # noqa: E501
+
+        non_spec_state_indices_tensor = non_spec_state_indices_tensor + (
+            (self.layer_idx + 1) % 4 - 1
+        )
+
         kv_cache_data = forward_context.kv_cache_data
 
         conv_state = self.mamba_k_cache.transpose(-1, -2)
         ssm_state = self.mamba_v_cache
-        
-        
+
         # if self.prefix=="model.layers.0.linear_attn" and conv_state.device.index==0:
         #     print(f"conv_state sum {conv_state.sum()}, ssm_state sum {ssm_state.sum()}", flush=True)
         # self_kv_cache = self.kv_cache[forward_context.virtual_engine]
@@ -942,7 +951,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             core_attn_out_non_spec, last_recurrent_state = None, None
 
         # 3. Merge core attention output
-        
+
         # if self.layer_idx==4:
         #    print("aaaa")
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
@@ -974,7 +983,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         quant_config = atom_config.quant_config
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
-        
+
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3NextGatedDeltaNet(
                 config,
@@ -1017,9 +1026,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1056,7 +1063,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
             self.linear_attn(
@@ -1072,7 +1078,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
-        
+
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -1085,10 +1091,9 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        
+
         hidden_states = self.mlp(hidden_states)
 
-        
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -1108,10 +1113,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 @support_torch_compile
 class Qwen3NextModel(nn.Module):
-    def __init__(
-            self,
-            atom_config: Config,
-            prefix: str = ""):
+    def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
 
         config: Qwen3NextConfig = atom_config.hf_config
@@ -1126,7 +1128,7 @@ class Qwen3NextModel(nn.Module):
             config.num_hidden_layers,
             lambda prefix, layer_num=None: Qwen3NextDecoderLayer(
                 atom_config,
-                layer_type = config.layer_types[extract_layer_index(prefix)],
+                layer_type=config.layer_types[extract_layer_index(prefix)],
                 prefix=prefix,
                 layer_num=layer_num,
             ),
@@ -1163,7 +1165,7 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
@@ -1184,10 +1186,8 @@ class Qwen3NextModel(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-    
-class Qwen3NextForCausalLM(
-    nn.Module
-):
+
+class Qwen3NextForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -1197,10 +1197,10 @@ class Qwen3NextForCausalLM(
     }
 
     def __init__(
-            self,
-            atom_config: Config,
-            prefix: str = "",
-        ):
+        self,
+        atom_config: Config,
+        prefix: str = "",
+    ):
         super().__init__()
         config = atom_config.hf_config
         quant_config = atom_config.quant_config
@@ -1249,24 +1249,23 @@ class Qwen3NextForCausalLM(
         logits = self.lm_head(hidden_states)
         return logits
 
-
     def make_empty_intermediate_tensors(
-            self, batch_size: int, dtype: torch.dtype,
-            device: torch.device) -> IntermediateTensors:
-        return IntermediateTensors({
-            "hidden_states":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-            "residual":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-        })
-    
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+                "residual": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+            }
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
 
 def gdn_attention_core(
     mixed_qkv: torch.Tensor,
@@ -1371,4 +1370,3 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
-    

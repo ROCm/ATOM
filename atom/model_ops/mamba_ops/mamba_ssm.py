@@ -21,6 +21,7 @@ if TRITON3:
     def softplus(dt):
         dt = tl.where(dt <= 20.0, tl.math.log(tl.math.exp(dt) + 1), dt)
         return dt
+
 else:
 
     @triton.jit

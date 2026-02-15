@@ -38,6 +38,7 @@ def _cached_get_attn_backend(
         raise ValueError(f"Invalid attention backend for {attention_cls}")
     return resolve_obj_by_qualname(attention_cls)
 
+
 def get_attn_backend_cls(block_size, use_mla, use_gdn) -> str:
     if use_mla:
         # if block_size == 1:

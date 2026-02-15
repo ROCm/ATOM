@@ -17,6 +17,7 @@ from atom.model_ops.fla_ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
+
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
@@ -101,6 +102,7 @@ def fused_gdn_gating(
     )
     return g, beta_output
 
+
 class GatedDetlaNet(nn.Module):
 
     def __init__(
@@ -135,7 +137,6 @@ class GatedDetlaNet(nn.Module):
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
 
-
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
@@ -155,8 +156,6 @@ class GatedDetlaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
-
-
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -165,12 +164,13 @@ class GatedDetlaNet(nn.Module):
         core_attn_out: torch.Tensor,
     ):
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
+
         fwd_ctx: ForwardContext = get_forward_context()
-        gdn_metadata:GDNAttentionMetadata  = fwd_ctx.attn_metadata.gdn_metadata
+        gdn_metadata: GDNAttentionMetadata = fwd_ctx.attn_metadata.gdn_metadata
 
         if gdn_metadata is None:
-            return 
-        #assert isinstance(gdn_metadata, dict)
+            return
+        # assert isinstance(gdn_metadata, dict)
         # gdn_metadata = gdn_metadata[self.prefix]
         # assert isinstance(gdn_metadata, GDNAttentionMetadata)
 
@@ -185,9 +185,10 @@ class GatedDetlaNet(nn.Module):
         spec_token_indx = gdn_metadata.spec_token_indx
         non_spec_token_indx = gdn_metadata.non_spec_token_indx
         spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = gdn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        non_spec_state_indices_tensor = (
+            gdn_metadata.non_spec_state_indices_tensor
+        )  # noqa: E501
         # non_spec_state_indices_tensor = non_spec_state_indices_tensor + ((self.layer_num + 1) % 4 - 1)
-
 
         conv_state = conv_state.transpose(-1, -2)
 
@@ -344,9 +345,7 @@ class GatedDetlaNet(nn.Module):
                     beta=beta_non_spec,
                     initial_state=ssm_state,
                     inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : gdn_metadata.num_decodes + 1
-                    ],
+                    cu_seqlens=non_spec_query_start_loc[: gdn_metadata.num_decodes + 1],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
@@ -369,4 +368,3 @@ class GatedDetlaNet(nn.Module):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-

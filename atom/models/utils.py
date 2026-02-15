@@ -272,15 +272,15 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
         except ValueError:
             continue
     if num_attn_module == 1 or "attn" not in layer_name:
-        assert len(int_vals) == 1, (
-            f"layer name {layer_name} should only contain one integer"
-        )
+        assert (
+            len(int_vals) == 1
+        ), f"layer name {layer_name} should only contain one integer"
 
         return int_vals[0]
     else:
-        assert len(int_vals) <= 2, (
-            f"layer name {layer_name} should contain most two integers"
-        )
+        assert (
+            len(int_vals) <= 2
+        ), f"layer name {layer_name} should contain most two integers"
         layer_index = (
             int_vals[0] * num_attn_module + int_vals[1]
             if len(int_vals) == 2

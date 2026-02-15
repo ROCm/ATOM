@@ -402,7 +402,9 @@ class tokenIDProcessor:
                         # so we can use sequential indexing
                         token_ids = [
                             token
-                            for tokens in scheduled_tokens[total_reqs_prefill : total_reqs_prefill + num_new_seqs]
+                            for tokens in scheduled_tokens[
+                                total_reqs_prefill : total_reqs_prefill + num_new_seqs
+                            ]
                             for token in tokens
                         ]
                         self.input_ids.np[:num_new_tokens] = token_ids
@@ -557,7 +559,9 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
-        self.num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.num_speculative_tokens = (
+            self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        )
         self.tokenID_processor = tokenIDProcessor(
             self.config.max_num_batched_tokens,
             self.device,
@@ -615,14 +619,11 @@ class ModelRunner:
                 and self.hf_text_config.kv_lora_rank is not None
             )
         return False
-    
+
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in (
-            "qwen3_next",
-            "qwen3_next_mtp"
-        ):
+        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
             return True
         return False
 
@@ -875,7 +876,8 @@ class ModelRunner:
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
-                self.max_bs, **i32_kwargs)
+                self.max_bs, **i32_kwargs
+            )
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -912,7 +914,9 @@ class ModelRunner:
                 )
         elif self.is_qwen_next():
             self.full_attention_interval = hf_config.full_attention_interval
-            self.num_full_attn = hf_config.num_hidden_layers // self.full_attention_interval
+            self.num_full_attn = (
+                hf_config.num_hidden_layers // self.full_attention_interval
+            )
             self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
 
             # full attention bytes
@@ -936,7 +940,10 @@ class ModelRunner:
                 self.num_speculative_tokens,
             )
 
-            one_layer_byte = sum(math.prod(subtuple) for subtuple in mamba_shape) * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+            one_layer_byte = (
+                sum(math.prod(subtuple) for subtuple in mamba_shape)
+                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+            )
             block_bytes = block_bytes + self.num_gdn_attn_state * one_layer_byte
         else:
             block_bytes = (
@@ -1026,7 +1033,7 @@ class ModelRunner:
                 dtype=dtypes.fp32,
                 device="cuda",
             )
-            
+
             mamba_shape = self.gated_delta_net_state_shape(
                 get_tp_group().world_size,
                 hf_config.linear_num_key_heads,
@@ -1034,14 +1041,20 @@ class ModelRunner:
                 hf_config.linear_key_head_dim,
                 hf_config.linear_key_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                self.num_speculative_tokens, # self.num_spec,
+                self.num_speculative_tokens,  # self.num_spec,
             )
-            self.mamba_k_cache = torch.zeros((self.num_gdn_attn_state, self.num_physical_kvcache_blocks) + mamba_shape[0],
-                                           dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                                            device="cuda")
-            self.mamba_v_cache = torch.zeros((self.num_gdn_attn_state, self.num_physical_kvcache_blocks) + mamba_shape[1],
-                                           dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                                            device="cuda")
+            self.mamba_k_cache = torch.zeros(
+                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
+                + mamba_shape[0],
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+            self.mamba_v_cache = torch.zeros(
+                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
+                + mamba_shape[1],
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
         else:
             self.kv_cache = torch.zeros(
                 2,
@@ -1157,7 +1170,12 @@ class ModelRunner:
                         module.max_model_len = self.config.max_model_len
                         layer_id += 1
                 elif hasattr(module, "base_linear_attention"):
-                    gdn_idx = layer_id // self.full_attention_interval * (self.full_attention_interval -1) + layer_id % self.full_attention_interval
+                    gdn_idx = (
+                        layer_id
+                        // self.full_attention_interval
+                        * (self.full_attention_interval - 1)
+                        + layer_id % self.full_attention_interval
+                    )
                     mamba_k_cache = self.mamba_k_cache[gdn_idx]
                     mamba_v_cache = self.mamba_v_cache[gdn_idx]
                     kv_cache_tensor = KVCacheTensor(
@@ -1427,7 +1445,6 @@ class ModelRunner:
         )
         reset_forward_context()
         return fwd_output
-
 
     def _calc_spec_decode_metadata(
         self,

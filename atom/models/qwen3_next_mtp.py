@@ -19,9 +19,6 @@ from atom.model_ops.linear import ColumnParallelLinear
 from atom.model_config.qwen3_next import Qwen3NextConfig
 from .utils import maybe_prefix
 
-
-
-
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -61,8 +58,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
                 layer_num=idx,
             )
             for idx in range(
-                self.mtp_start_layer_idx,
-                self.mtp_start_layer_idx + self.num_mtp_layers
+                self.mtp_start_layer_idx, self.mtp_start_layer_idx + self.num_mtp_layers
             )
         )
 
@@ -107,6 +103,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+
 # @support_torch_compile
 class Qwen3NextMTP(nn.Module):
     packed_modules_mapping = {
@@ -120,9 +117,9 @@ class Qwen3NextMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         config = atom_config.hf_config
         self.vllm_config = atom_config
-        assert not atom_config.enable_prefix_caching, (
-            "Qwen3NextMTP currently does not support prefix caching"
-        )
+        assert (
+            not atom_config.enable_prefix_caching
+        ), "Qwen3NextMTP currently does not support prefix caching"
 
         self.quant_config = atom_config.quant_config
 
@@ -177,7 +174,6 @@ class Qwen3NextMTP(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-
     # def remap_weight_names(weights):
     #     shared_weight_names = ["embed_tokens", "lm_head"]
 
@@ -193,21 +189,21 @@ def remap_mtp_weight_name(name: str) -> str | None:
     """
     Remap MTP weight names to match the model structure.
     Returns None if the weight should be skipped.
-    
+
     MTP weights are stored with 'mtp.' prefix in checkpoints but loaded
     into 'model.' in the actual model structure.
     Shared weights (embed_tokens, lm_head) are loaded into both base model and MTP.
     """
     shared_weight_names = ["embed_tokens", "lm_head"]
-    
+
     # Remap mtp.* -> model.*
     # print("remapping weight name: ", name, flush=True)
     if name.startswith("mtp."):
         return name.replace("mtp.", "model.")
-    
+
     # Allow shared weights to be loaded
     if any(key in name for key in shared_weight_names):
         return name
-    
+
     # Skip all other weights (they belong to base model, not MTP)
     return None

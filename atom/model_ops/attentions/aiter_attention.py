@@ -161,11 +161,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         context_lens = batch.context_lens
         block_tables = batch.block_tables
 
-
         if max_seqlen_q > 1:
             if bonus_list is not None:
                 context_lens = [
-                    context_len - batch.num_spec_step + bonus_list[i] if bonus_list[i] > 0 else context_len
+                    (
+                        context_len - batch.num_spec_step + bonus_list[i]
+                        if bonus_list[i] > 0
+                        else context_len
+                    )
                     for i, context_len in enumerate(context_lens)
                 ]
                 block_tables = [
@@ -179,7 +182,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ]
 
             slot_mapping = [
-                block_table[pos // self.model_runner.block_size] 
+                block_table[pos // self.model_runner.block_size]
                 * self.model_runner.block_size
                 + (pos % self.model_runner.block_size)
                 for block_table, seq_len in zip(block_tables, context_lens)
@@ -204,7 +207,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         sum_scheduled_tokens = batch.total_tokens_num_decode
         var["slot_mapping"].np[: bs * max_seqlen_q] = -1
         if not batch.is_dummy_run:
-            var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping[:sum_scheduled_tokens]
+            var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping[
+                :sum_scheduled_tokens
+            ]
 
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
