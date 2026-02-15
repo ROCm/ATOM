@@ -166,9 +166,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ) // self.model_runner.block_size
             last_block_tokens = batch.last_block_num_tokens[i]
             block_table = batch.block_tables[i]
-            for i in range(num_cached_blocks, num_blocks):
-                start = block_table[i] * self.model_runner.block_size
-                if i != num_blocks - 1:
+            for block_idx in range(num_cached_blocks, num_blocks):
+                start = block_table[block_idx] * self.model_runner.block_size
+                if block_idx != num_blocks - 1:
                     end = start + self.model_runner.block_size
                 else:
                     end = start + last_block_tokens

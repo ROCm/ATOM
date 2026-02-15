@@ -293,13 +293,31 @@ class EngineCore:
             logger.info("Profiler stopped.")
 
     def print_mtp_statistics(self):
-        stats = self.runner_mgr.call_func("get_mtp_statistics", wait_out=True)
+        # MTP stats are updated in Scheduler.postprocess (update_spec_stats), not in
+        # ModelRunner. Use scheduler stats when speculative decoding is enabled.
+        if self.scheduler.use_spec and self.scheduler.total_draft_tokens > 0:
+            num_steps = self.scheduler.total_draft_tokens // self.scheduler.mtp_k
+            avg_tokens_per_step = (
+                1.0 + self.scheduler.total_accepted_tokens / num_steps
+                if num_steps > 0
+                else 1.0
+            )
+            stats = {
+                "total_draft_tokens": self.scheduler.total_draft_tokens,
+                "total_accepted_tokens": self.scheduler.total_accepted_tokens,
+                "acceptance_rate": avg_tokens_per_step,
+            }
+        else:
+            stats = self.runner_mgr.call_func("get_mtp_statistics", wait_out=True)
         if stats and stats.get("total_draft_tokens", 0) > 0:
             logger.info(f"\n{'='*50}")
             logger.info("MTP (Multi-Token Prediction) Statistics:")
             logger.info(f"  Total draft tokens: {stats['total_draft_tokens']}")
             logger.info(f"  Accepted tokens:    {stats['total_accepted_tokens']}")
-            logger.info(f"  Acceptance rate:    {stats['acceptance_rate']:.2%}")
+            logger.info(
+                f"  Avg tokens/step:    {stats['acceptance_rate']:.2f} "
+                f"(acceptance rate)"
+            )
             logger.info(f"{'='*50}\n")
         else:
             logger.info(

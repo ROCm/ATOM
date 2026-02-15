@@ -1,12 +1,17 @@
 import logging
-
+import numpy as np
 import torch
 import torch.nn as nn
 from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config
 from atom.model_loader.loader import load_model
 from atom.models.deepseek_mtp import DeepSeekMTP
-from atom.utils.forward_context import get_forward_context
+from atom.model_engine.scheduler import ScheduledBatch
+from atom.utils.forward_context import get_forward_context, AttentionMetaData
+from atom.utils.block_convert import (
+    block_table_convert_triton,
+    kv_indices_convert_triton,
+)
 
 logger = logging.getLogger("atom")
 
@@ -104,6 +109,7 @@ class EagleProposer:
         # [batch]
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
+        batch: ScheduledBatch,
     ) -> torch.Tensor:
 
         forward_context = get_forward_context()
@@ -127,16 +133,121 @@ class EagleProposer:
                 positions=positions,
                 hidden_states=hidden_states,
             )
-            sample_hidden_states = ret_hidden_states[last_token_indices]
+            if i == 0:
+                sample_hidden_states = ret_hidden_states[last_token_indices]
+            else:
+                sample_hidden_states = ret_hidden_states
             logits = self.model.compute_logits(sample_hidden_states)
             new_draft_ids = logits.argmax(dim=-1)
             draft_token_ids[:, i] = new_draft_ids
 
+            if batch.is_dummy_run:
+                return draft_token_ids
+
             if i < self.mtp_k - 1:
                 # update metadata
                 input_ids = new_draft_ids
-                positions = positions[last_token_indices] + 1
+                if i == 0:
+                    positions = positions[last_token_indices] + 1
+                else:
+                    positions = positions + 1
                 hidden_states = sample_hidden_states
+
+                max_seqlen_q = 1
+                context.positions = positions
+                context.is_prefill = False
+
+                context_lens = positions + 1
+                slot_mapping = [
+                    block_table[pos // self.runner.block_size] * self.runner.block_size
+                    + (pos % self.runner.block_size)
+                    for block_table, seq_len in zip(batch.block_tables, context_lens)
+                    for pos in range(seq_len - max_seqlen_q, seq_len)
+                ]
+
+                var = self.runner.forward_vars
+
+                scheduled_bs = batch.total_seqs_num
+                var["slot_mapping"].np[: scheduled_bs * max_seqlen_q] = slot_mapping
+                var["slot_mapping"].np[
+                    scheduled_bs * max_seqlen_q : bs * max_seqlen_q
+                ] = -1
+
+                block_size = self.runner.attn_metadata_builder.block_size
+                block_ratio = self.runner.attn_metadata_builder.block_ratio
+
+                num_blocks_per_seq = [
+                    (ctx + block_size - 1) // block_size
+                    for ctx in context_lens.tolist()
+                ]
+                kv_indptr = np.cumsum(num_blocks_per_seq)
+                sum_blocks = kv_indptr[-1]
+                sum_blocks_before_converted = sum(
+                    [(i + block_ratio - 1) // block_ratio for i in num_blocks_per_seq]
+                )
+
+                def prepare_kv_indices():
+                    dst = var["kv_indices"].np
+                    offset = 0
+                    for bt in batch.block_tables:
+                        n = len(bt)
+                        dst[offset : offset + n] = bt
+                        offset += n
+
+                prepare_kv_indices()
+                var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
+                var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
+                var["kv_last_page_lens"].np[:scheduled_bs] = 1
+                var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
+
+                # Set cu_seqlens_q for decode mode (1 query token per sequence)
+                # cu_seqlens_q should be [0, 1, 2, 3, ..., bs]
+                var["cu_seqlens_q"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+
+                vars_used = [
+                    ("slot_mapping", bs * max_seqlen_q),
+                    ("cu_seqlens_q", bs + 1),
+                    ("kv_indptr", bs + 1),
+                    ("kv_indices", sum_blocks),
+                    ("kv_last_page_lens", bs),
+                ]
+                ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+                ctx_mla_ps = (
+                    self.runner.attn_metadata_builder.set_mla_persistent_worker_buffers(
+                        bs, 1
+                    )
+                )
+                ctx.update(ctx_mla_ps)
+                if block_ratio > 1:
+                    kv_indices_convert_triton(
+                        var["kv_indices"].gpu[:sum_blocks_before_converted],
+                        var["kv_indices_converted"].gpu[:sum_blocks],
+                        var["kv_indptr"].gpu[: bs + 1],
+                        block_ratio,
+                        block_size,
+                    )
+                    ctx["kv_indices_converted"] = var["kv_indices_converted"].gpu[
+                        :sum_blocks
+                    ]
+
+                    if "block_tables" in ctx:
+                        block_table_convert_triton(
+                            var["block_tables"].gpu[:bs],
+                            var["block_tables_converted"].gpu[:bs],
+                            var["context_lens"].gpu[:bs],
+                            block_ratio,
+                        )
+                        ctx["block_tables_converted"] = var[
+                            "block_tables_converted"
+                        ].gpu[:bs]
+
+                attn_metadata = AttentionMetaData(
+                    dropout_p=0.0,
+                    max_seqlen_q=max_seqlen_q,
+                    context_lens=context_lens,
+                    **ctx,
+                )
+                forward_context.attn_metadata = attn_metadata
 
         # [batch_size, mtp_k]
         return draft_token_ids

@@ -150,7 +150,8 @@ class Scheduler:
             ):
                 break
             num_seqs_prefill += 1
-            self.block_manager.allocate(seq)
+            num_additional_tokens = self.mtp_k - 1
+            self.block_manager.allocate(seq, num_additional_tokens)
             num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
@@ -230,16 +231,25 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def update_spec_stats(self, num_accepted_tokens):
+        # num_accepted_tokens = len(accepted tokens before first -1). The last token
+        # is either the target's correction (when rejected) or the bonus token
+        # (when all accepted); it is never a draft. So num_draft_accepted =
+        # num_accepted_tokens - 1. E.g. mtp_k=2: reject@0 -> len=1, draft_accepted=0;
+        # reject@1 -> len=2, draft_accepted=1; accept all -> len=3, draft_accepted=2.
         self.total_draft_tokens += self.mtp_k
-        self.total_accepted_tokens += num_accepted_tokens - self.mtp_k
+        self.total_accepted_tokens += max(0, num_accepted_tokens - 1)
 
         # Log MTP acceptance statistics periodically
+        # Avg tokens/step = 1 (target decode) + draft_accepted per step
         if self.total_draft_tokens > 0 and self.total_draft_tokens % 1000 == 0:
-            acceptance_rate = self.total_accepted_tokens / self.total_draft_tokens
+            num_steps = self.total_draft_tokens // self.mtp_k
+            avg_tokens_per_step = (
+                1.0 + self.total_accepted_tokens / num_steps if num_steps > 0 else 1.0
+            )
             logger.info(
                 f"[MTP Stats] Total draft tokens: {self.total_draft_tokens}, "
                 f"Accepted: {self.total_accepted_tokens}, "
-                f"Acceptance rate: {acceptance_rate:.2%}"
+                f"Avg tokens/step: {avg_tokens_per_step:.2f}"
             )
 
     def postprocess(
@@ -315,11 +325,15 @@ class Scheduler:
                 if len(seq.token_ids) >= len(stop_seq):
                     stop_len = len(stop_seq)
                     is_normal_stop = seq.token_ids[-stop_len:] == stop_seq
-                    is_mtp_stop = (
-                        self.use_spec
-                        and seq.token_ids[-(stop_len + self.mtp_k) : -self.mtp_k]
-                        == stop_seq
-                    )
+                    is_mtp_stop = False
+                    if self.use_spec:
+                        for i in range(1, self.mtp_k + 1):
+                            if (
+                                len(seq.token_ids) >= stop_len + i
+                                and seq.token_ids[-(stop_len + i) : -i] == stop_seq
+                            ):
+                                is_mtp_stop = True
+                                break
                     if is_normal_stop or is_mtp_stop:
                         leave_reason = "stop_sequence"
                         break
