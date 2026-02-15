@@ -216,7 +216,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[scheduled_bs:bs] = 0
 
         # Prepare kv_indptr and kv_indices for persistent attention
-        block_size = self.model_runner.block_size
         num_blocks_per_seq = [
             triton.cdiv(ctx_len, self.block_size) for ctx_len in context_lens
         ]

@@ -33,8 +33,6 @@ from atom.utils import (
     resolve_obj_by_qualname,
 )
 from atom.utils.selector import get_attn_backend
-
-logger = logging.getLogger("atom")
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -43,6 +41,9 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+
+logger = logging.getLogger("atom")
+
 
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
@@ -497,7 +498,7 @@ class ModelRunner:
         self.forward_vars["input_ids"].gpu[:bs].zero_()
         input_ids = self.forward_vars["input_ids"].gpu[:bs]
 
-        logits = self.run_model(input_ids)
+        self.run_model(input_ids)
 
         reset_forward_context()
         logger.debug(
@@ -603,7 +604,7 @@ class ModelRunner:
         self.max_bs = self.config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
-        i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        # i32_kwargs = {"dtype": torch.int32, "device": self.device}
         f32_kwargs = {"dtype": torch.float, "device": self.device}
 
         # TODO: remove it in forward_context
