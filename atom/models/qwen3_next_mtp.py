@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next MTP model."""
 
-
 import torch
 import torch.nn as nn
 from atom.config import Config
