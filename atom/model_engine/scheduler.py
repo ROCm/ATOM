@@ -319,7 +319,6 @@ class Scheduler:
             if draft_token_ids and seq.id in draft_token_ids:
                 seq.spec_token_ids = draft_token_ids[seq.id]
 
-
             if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
 
