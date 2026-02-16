@@ -19,6 +19,10 @@ from atom.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
 )
+from atom.models.deepseek_mtp import (
+    get_spec_layer_idx_from_weight_name,
+    rewrite_spec_layer_name,
+)
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.moe import (
     FusedMoEMethodBase,
@@ -98,10 +102,16 @@ def load_model(
             if name.endswith("kv_scale"):
                 continue
             if spec_decode:
-                remapped_name = remap_mtp_weight_name(name)
-                if remapped_name is None:
-                    continue
-                name = remapped_name
+                if hf_config.model_type == "deepseek_mtp":
+                    spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
+                    if spec_layer is None:
+                        continue
+                    name = rewrite_spec_layer_name(spec_layer, name)
+                elif hf_config.model_type == "qwen3_next_mtp":
+                    remapped_name = remap_mtp_weight_name(name)
+                    if remapped_name is None:
+                        continue
+                    name = remapped_name
             name_suffix = name.split(".")[-1]
             if name_suffix in weights_mapping.keys():
                 name = name.replace(name_suffix, weights_mapping[name_suffix])
