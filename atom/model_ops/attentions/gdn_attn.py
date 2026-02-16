@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
 from dataclasses import dataclass
-from typing import Type
+from typing import Optional, Type
 
+import aiter
 import numpy as np
 import torch
+from aiter import dtypes
+from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_gdn import GatedDetlaNet
+from atom.utils import CpuGpuBuffer
+from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_attention import AiterBackend, AiterAttentionMetadataBuilder
-from atom.utils import (
-    CpuGpuBuffer
-)
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -28,7 +31,6 @@ class GDNAttentionBackend(AiterBackend):
     @staticmethod
     def get_impl_cls() -> Type["GatedDetlaNet"]:
         return GatedDetlaNet
-
 
 @dataclass
 class GDNAttentionMetadata:
@@ -174,10 +176,10 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         num_decode_tokens = batch.total_tokens_num_decode
         num_prefill_tokens = batch.total_tokens_num_prefill
         num_reqs = batch.total_seqs_num
-        query_start_loc = attn_metadata.cu_seqlens_q
         self.prepare_block_tables(batch)
 
         context_lens_tensor = attn_metadata.context_lens
+        query_start_loc = attn_metadata.cu_seqlens_q
         context_lens_tensor = torch.zeros((batch.total_seqs_num_prefill)).cuda()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
@@ -265,8 +267,8 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
     ) -> GDNAttentionMetadata:
         # print("prepare prefill", flush=True)
         attn_metadata, positions = super().prepare_prefill(batch)
-        if batch.block_tables == []:
-            attn_metadata.gdn_metadata = None
+        if batch.block_tables==[]:
+            attn_metadata.gdn_metadata=None
             return attn_metadata, positions
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
 
@@ -336,7 +338,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions
 
-    def build_for_cudagraph_capture(self, bs: int):
+    def build_for_cudagraph_capture(
+        self, bs: int
+    ):
         var = self.model_runner.forward_vars
         if self.block_size == 1024:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
@@ -416,8 +420,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
 
 PAD_SLOT_ID = -1
-
-
 def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
     # Needed for causal_conv1d
     seqlens = query_start_loc_p.diff().to("cpu")
