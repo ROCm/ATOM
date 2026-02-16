@@ -172,7 +172,7 @@ class InputOutputProcessor:
         self.requests[seq.id] = seq
         logger.info(
             f"Request {seq.id} arrived, input tokens: {len(tokens)}, pending requests: {len(self.requests)} "
-            f"<{prompt_or_tokens=}>"
+            # f"<{prompt_or_tokens=}>"
         )
         return seq
 

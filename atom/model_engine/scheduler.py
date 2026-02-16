@@ -33,17 +33,38 @@ class ScheduledBatch:
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
         # self.seqs = seqs
         self.req_ids = list(seqs.keys())
-        self.scheduled_tokens = [
-            seq.token_ids[-num_tokens:]
-            for seq, num_tokens in zip(seqs.values(), num_scheduled_tokens)
-        ]
+        # self.scheduled_tokens = [
+        #     seq.token_ids[-num_tokens:]
+        #     for seq, num_tokens in zip(seqs.values(), num_scheduled_tokens)
+        # ]
         # logger.info(f"{num_scheduled_tokens=}")
         # logger.info(f"{self.scheduled_tokens=}")
-        self.temperatures = [seq.temperature for seq in seqs.values()]
-        self.context_lens = [seq.num_tokens for seq in seqs.values()]
-        self.num_rejected = np.array(
+        # num_scheduled_tokens for each sequence in the batch
+        self.num_scheduled_tokens = np.asarray(num_scheduled_tokens, dtype=np.int32)
+        self.temperatures = np.asarray(
+            [seq.temperature for seq in seqs.values()], dtype=np.float32
+        )
+        self.context_lens = np.asarray(
+            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
+        )
+        self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
         )
+
+        offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
+        self.scheduled_tokens = [
+            seq.token_ids[offset : offset + num]
+            for seq, num, offset in zip(seqs.values(), num_scheduled_tokens, offs)
+        ]
+        # TODO use following code to create a contiguous array for better performance
+        # self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
+        # pos = 0
+        # for seq, num, offset in zip(seqs.values(), num_scheduled_tokens, offs):
+        #     self.scheduled_tokens[pos : pos + num] = seq.token_ids[
+        #         offset : offset + num
+        #     ]
+        #     pos += num
+
         if num_spec_step > 0:
             self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
         self.block_tables = [
@@ -53,9 +74,6 @@ class ScheduledBatch:
             seq.last_block_num_tokens for seq in seqs.values()
         ]
         self.num_cached_tokens = [seq.num_cached_tokens for seq in seqs.values()]
-
-        # num_scheduled_tokens for each sequence in the batch
-        self.num_scheduled_tokens = num_scheduled_tokens
 
         # Total number of tokens scheduled for all requests.
         self.total_tokens_num = total_tokens_num
@@ -219,9 +237,9 @@ class Scheduler:
 
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs.values()))
-        logger.info(
-            f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, keys: {scheduled_seqs.keys()}"
-        )
+        # logger.info(
+        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, keys: {scheduled_seqs.keys()}"
+        # )
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -259,8 +277,6 @@ class Scheduler:
         self,
         seqs: list[Sequence],
         fwd_output: ScheduledBatchOutput,
-        # prev_token_ids: dict[int, tuple[int, ...]],
-        # draft_token_ids: Optional[dict[int, list[int]]],
         stream_output_queue=None,
     ) -> list[Sequence]:
         prev_token_ids = fwd_output.token_ids
@@ -295,13 +311,9 @@ class Scheduler:
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
-                # update the number of tokens in the sequence if draft token is rejected
-                # seq.token_ids[-num_placeholder:] = token_ids
-                # seq.num_tokens = len(seq.token_ids)
-                # seq.output_tokens[-num_placeholder:] = token_ids
-                logger.info(
-                    f"{seq.id=}, {num_new_token=} {num_rejected=} {seq.token_ids[-5:]=}"
-                )
+                # logger.info(
+                #     f"{seq.id=}, {num_new_token=} {num_rejected=} {seq.token_ids[-5:]=}"
+                # )
 
             else:
                 for token_id in token_ids:
@@ -387,9 +399,9 @@ class Scheduler:
                 if seq.status == SequenceStatus.RUNNING:
                     for _ in range(seq.num_placeholder):
                         seq.append_token(self.eos_token_id)
-                    logger.info(
-                        f"{seq.id=}, added {seq.num_placeholder}, total tokens now: {seq.num_tokens}"
-                    )
+                    # logger.info(
+                    #     f"{seq.id=}, added {seq.num_placeholder}, total tokens now: {seq.num_tokens}"
+                    # )
         for seq in finished_seqs:
             self.block_manager.deallocate(seq)
             self.running.remove(seq)

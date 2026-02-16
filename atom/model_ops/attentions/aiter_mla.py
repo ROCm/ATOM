@@ -238,8 +238,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
         if max_seqlen_q > 1:
-            # context_lens += batch.num_spec_step
-            # Get mapped_bonus_list (already mapped to current batch order in prepare_input_ids)
+            # Get num_rejected (already mapped to current batch order in prepare_input_ids)
             num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
                 context_lens -= num_rejected
@@ -341,13 +340,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
-        if str(positions.device) == "cuda:0":
-            logger.info(f"context_lens: {ctx['context_lens']}")
-            # logger.info(f"{positions=}")
-            # for el, var in ctx.items():
-            #     if "work_" in el or "reduce_" in el or "kv_" in el:
-            #         continue
-            #     logger.info(f"{el}: {var}")
+        # if str(positions.device) == "cuda:0":
+        #     logger.info(f"context_lens: {ctx['context_lens']}")
+        #     # logger.info(f"{positions=}")
+        #     # for el, var in ctx.items():
+        #     #     if "work_" in el or "reduce_" in el or "kv_" in el:
+        #     #         continue
+        #     #     logger.info(f"{el}: {var}")
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
