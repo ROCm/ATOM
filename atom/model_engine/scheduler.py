@@ -38,9 +38,13 @@ class ScheduledBatch:
         # print(f"{num_scheduled_tokens=}")
         # print(f"{self.scheduled_tokens=}")
         self.temperatures = [seq.temperature for seq in seqs.values()]
+
         self.context_lens = [seq.num_tokens for seq in seqs.values()]
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
+        ]
+        self.mamba_block_tables = [
+            seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table
         ]
         self.last_block_num_tokens = [
             seq.last_block_num_tokens for seq in seqs.values()
@@ -64,6 +68,8 @@ class ScheduledBatch:
 
         self.num_spec_step = num_spec_step
         self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
+        # the num accepted tokens should be lists of gpu tensors of size 1 or scalar zero
+        self.num_bonus_tokens = [seq.num_bonus_tokens for seq in seqs.values()]
 
         # logger.info(f"{self.num_scheduled_tokens=}")
         # logger.info(f"{self.context_lens=}")
@@ -272,21 +278,28 @@ class Scheduler:
                 continue
             token_ids = prev_token_ids[seq.id]
             num_accepted_token = len(token_ids)
+            num_draft_tokens = 0
+            if self.use_spec:
+                # Put the draft token into sequence to make sure it get scheduled in scheduler
+                draft_ids = draft_token_ids[seq.id] if seq.id in draft_token_ids else []
+                num_draft_tokens = len(draft_ids)
+                token_ids_w_draft = (*token_ids, *draft_ids)
+            else:
+                token_ids_w_draft = token_ids
             self.update_spec_stats(num_accepted_token)
             if is_deferred_out or (
                 self.use_spec and self.eos_token_id == seq.token_ids[-1]
             ):
-                # for i, el in enumerate(token_ids):
-                #     seq.token_ids[-num_placeholder + i] = el
-                #     seq.output_tokens[-num_placeholder + i] = el
                 # update the number of tokens in the sequence if draft token is rejected
-                seq.token_ids[-num_placeholder:] = token_ids
+                seq.token_ids[-seq.num_placeholder - seq.num_draft_tokens :] = (
+                    token_ids_w_draft
+                )
                 seq.num_tokens = len(seq.token_ids)
-                seq.output_tokens[-num_placeholder:] = token_ids
-
+                seq.output_tokens[-seq.num_placeholder :] = token_ids
             else:
                 for token_id in token_ids:
                     seq.append_token(token_id)
+            seq.num_draft_tokens = num_draft_tokens
             new_tokens = token_ids
 
             if need_placeholder:
@@ -312,6 +325,7 @@ class Scheduler:
             leave_reason = None
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
+                # if len(new_tokens) >= len(stop_seq):
                 if len(seq.token_ids) >= len(stop_seq):
                     stop_len = len(stop_seq)
                     is_normal_stop = seq.token_ids[-stop_len:] == stop_seq
@@ -358,6 +372,7 @@ class Scheduler:
             if leave_reason is not None:
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                # print(f"seq {seq.id} finished with reason: {leave_reason}", flush=True)
                 finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:

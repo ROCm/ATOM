@@ -4,7 +4,7 @@
 import logging
 import os
 import time
-from itertools import chain, islice
+from itertools import chain
 from typing import Any, Optional, Union
 import math
 
@@ -127,8 +127,9 @@ class tokenIDProcessor:
         event.synchronize()
         return token_ids.tolist()
 
-    def send_bonus_to_cpu_async(self, gpu_tensor: torch.Tensor):
+    def send_bonus_to_cpu_async(self, gpu_tensor: torch.Tensor, req_ids: list[int]):
         default_stream = torch.cuda.current_stream()
+        self.bonus_req_ids.append(req_ids)
         with torch.cuda.stream(self.async_copy_stream):
             self.async_copy_stream.wait_stream(default_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
@@ -140,7 +141,10 @@ class tokenIDProcessor:
             return None
         self.async_copy_event.synchronize()
         bonus_list = self.bonus_tokens_cpu.pop(0).numpy()
-        return bonus_list
+        req_ids = self.bonus_req_ids.pop(0)
+        for i, req_id in enumerate(req_ids):
+            self.bonus_tokens_map[req_id] = bonus_list[i]
+        return self.bonus_tokens_map
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -153,6 +157,8 @@ class tokenIDProcessor:
         self.bonus_tokens_cpu: list[torch.Tensor] = (
             []
         )  # Async queue for num_bonus_tokens
+        self.bonus_tokens_map: map[int, list[int]] = {}
+        self.bonus_req_ids: list[list[int]] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -320,14 +326,18 @@ class tokenIDProcessor:
             num_new_tokens = num_new_seqs
 
         # Receive and map bonus_list to current batch order
-        prev_bonus_num = self.recv_bonus_async()
+        prev_bonus_map = self.recv_bonus_async()
         total_seqs = num_deferred_seqs + num_new_seqs
-        if prev_bonus_num is not None and num_deferred_seqs > 0:
+        if prev_bonus_map is not None and num_deferred_seqs > 0:
             # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
-            mapped = np.full(total_seqs, self.num_speculative_tokens, dtype=np.int32)
-            if not self.prev_batch.total_seqs_num_prefill > 0:
-                mapped[deferred_curr_indices] = prev_bonus_num[deferred_prev_indices]
-            self.mapped_bonus_list = mapped
+            # New seqs get default value (tokens_per_seq - 1)
+
+            # -1 means this seq do not have prev bonus which means its prefill
+            # otherwise, all seq should have prev bonus result
+            self.mapped_bonus_list = [-1] * total_seqs
+            for i, req_id in enumerate(batch.req_ids):
+                if req_id in prev_bonus_map:
+                    self.mapped_bonus_list[i] = prev_bonus_map.pop(req_id)
         else:
             self.mapped_bonus_list = None
 
@@ -414,21 +424,15 @@ class tokenIDProcessor:
                         # MTP mode: combine scheduled_tokens and draft_tokens
                         # new_decode_front=True means new_curr_indices == list(range(num_new_seqs))
                         # so we can use sequential indexing
-                        scheduled_slice = scheduled_tokens[
-                            total_reqs_prefill : total_reqs_prefill + num_new_seqs
+                        token_ids = [
+                            token
+                            for tokens in scheduled_tokens[
+                                total_reqs_prefill : total_reqs_prefill + num_new_seqs
+                            ]
+                            for token in tokens
                         ]
                         draft_values = batch.scheduled_spec_decode_tokens.values()
 
-                        token_ids = np.fromiter(
-                            chain.from_iterable(
-                                (tokens[-1], *draft)
-                                for tokens, draft in zip(
-                                    scheduled_slice, islice(draft_values, num_new_seqs)
-                                )
-                            ),
-                            dtype=np.int32,
-                            count=num_new_tokens,
-                        )
                         self.input_ids.np[:num_new_tokens] = token_ids
                         self.input_ids.copy_to_gpu(num_new_tokens)
                     else:
@@ -452,11 +456,7 @@ class tokenIDProcessor:
                         for idx in new_curr_indices:
                             req_idx = total_reqs_prefill + idx
                             tokens = scheduled_tokens[req_idx]
-                            req_id = batch.req_ids[idx]
-                            draft_tokens = batch.scheduled_spec_decode_tokens.get(
-                                req_id, []
-                            )
-                            new_token_ids.extend([tokens[-1]] + draft_tokens)
+                            new_token_ids.extend(tokens)
                     else:
                         # Non-MTP mode: only first token from scheduled_tokens
                         new_token_ids = [
@@ -585,12 +585,14 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
-        num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.num_speculative_tokens = (
+            self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        )
         self.tokenID_processor = tokenIDProcessor(
             self.config.max_num_batched_tokens,
             self.device,
             hasattr(self, "drafter"),
-            num_speculative_tokens,
+            self.num_speculative_tokens,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(
@@ -647,7 +649,7 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("qwen3_next",):
+        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
             return True
         return False
 
@@ -899,6 +901,9 @@ class ModelRunner:
         }
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
+            self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs
+            )
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -957,9 +962,9 @@ class ModelRunner:
                 hf_config.linear_num_key_heads,
                 hf_config.linear_num_value_heads,
                 hf_config.linear_key_head_dim,
-                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0,  # self.num_spec,
+                self.num_speculative_tokens,
             )
 
             one_layer_byte = (
@@ -1005,6 +1010,7 @@ class ModelRunner:
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
+        num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
             # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
@@ -1041,7 +1047,7 @@ class ModelRunner:
 
             self.kv_cache = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 self.physical_block_size,
                 num_kv_heads,
@@ -1052,7 +1058,7 @@ class ModelRunner:
 
             self.kv_scale = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 num_kv_heads,
                 self.physical_block_size,
@@ -1067,7 +1073,7 @@ class ModelRunner:
                 hf_config.linear_key_head_dim,
                 hf_config.linear_key_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0,  # self.num_spec,
+                self.num_speculative_tokens,  # self.num_spec,
             )
             self.mamba_k_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
@@ -1387,6 +1393,7 @@ class ModelRunner:
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
+        num_bonus_tokens: Optional[torch.Tensor] = None
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(logits, temperatures)
         else:
@@ -1422,7 +1429,6 @@ class ModelRunner:
         token_ids = self.tokenID_processor.prepare_sampled_ids(
             batch, sampled_tokens, self.forward_done_event
         )
-
         draft_token_ids: Optional[torch.Tensor] = None
         if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
             if spec_decode_metadata is None:
@@ -1437,8 +1443,10 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 self.tokenID_processor.num_bonus_tokens = num_bonus_tokens
                 self.tokenID_processor.send_bonus_to_cpu_async(
-                    num_bonus_tokens
+                    num_bonus_tokens,
+                    batch.req_ids,
                 )  # Async copy to CPU
+
             draft_token_ids = self.propose_draft_token_ids(
                 batch,
                 self.tokenID_processor.input_ids.gpu[1 : batch.total_tokens_num + 1],

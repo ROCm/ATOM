@@ -6,6 +6,7 @@ from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config
 from atom.model_loader.loader import load_model
 from atom.models.deepseek_mtp import DeepSeekMTP
+from atom.models.qwen3_next_mtp import Qwen3NextMTP
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -13,6 +14,7 @@ logger = logging.getLogger("atom")
 
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": DeepSeekMTP,
+    "Qwen3NextMTPModel": Qwen3NextMTP,
 }
 
 
