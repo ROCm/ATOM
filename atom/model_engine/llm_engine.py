@@ -134,7 +134,6 @@ class InputOutputProcessor:
         self.block_size = block_size
         self.requests = {}
         self.mamba_enabled = False
-        print("the model type is ", self.config.hf_config.model_type)
         self.num_speculative_tokens = 0
         if (
             hasattr(self.config, "speculative_config")
@@ -145,7 +144,6 @@ class InputOutputProcessor:
             )
 
         if self.config.hf_config.model_type == "qwen3_next":
-            print("enable mamba", flush=True)
             self.mamba_enabled = True
 
     def preprocess(

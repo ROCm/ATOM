@@ -98,15 +98,10 @@ def load_model(
             if name.endswith("kv_scale"):
                 continue
             if spec_decode:
-                # spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
-                # if spec_layer is None:
-                #     continue
-                # name = rewrite_spec_layer_name(spec_layer, name)
                 remapped_name = remap_mtp_weight_name(name)
                 if remapped_name is None:
                     continue
                 name = remapped_name
-            # print("name: ", name, flush=True)
             name_suffix = name.split(".")[-1]
             if name_suffix in weights_mapping.keys():
                 name = name.replace(name_suffix, weights_mapping[name_suffix])
@@ -115,13 +110,11 @@ def load_model(
 
             layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
             layerId = int(layerId_.group(1)) if layerId_ else 0
-            # print("layerId: ", layerId, flush=True)
             if (
                 hf_config.num_hidden_layers
                 and layerId >= hf_config.num_hidden_layers
                 and not spec_decode
             ):
-                # print(f"Skipping loading {name} as layerId {layerId} >= num_hidden_layers {hf_config.num_hidden_layers}")
                 continue
             if (
                 is_rocm_aiter_fusion_shared_expert_enabled()
@@ -198,7 +191,6 @@ def load_model(
                         # weight_loader(param, weight_tensor)
                 else:
                     # Model doesn't have expert mapping, use generic loading
-                    # print("name to load: ", name, flush=True)
                     param = model.get_parameter(name)
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
