@@ -1375,7 +1375,10 @@ class ModelRunner:
             self.graphs[graph_key].replay()
             num_tokens = context.batch_size * max_q_len
             hidden_states = self.forward_vars["outputs"][:num_tokens]
-            logits = self.graph_logits[graph_key][:num_tokens]
+            if self.logits_in_graph:
+                logits = self.graph_logits[graph_key][:num_tokens]
+            else:
+                logits = self.model.compute_logits(hidden_states)
 
         return logits, hidden_states
 
@@ -1591,6 +1594,7 @@ class ModelRunner:
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
         self.graph_pool = None
+        self.logits_in_graph = self.world_size == 1
 
         with graph_capture() as gc:
             capture_range = (
@@ -1627,23 +1631,29 @@ class ModelRunner:
                     num_tokens_across_dp=num_tokens_across_dp,
                 )
 
-                # Warmup: run model forward + compute_logits
+                # Warmup
                 outputs[:num_tokens] = self.model(
                     input_ids[:num_tokens], positions[:num_tokens]
                 )
-                self.model.compute_logits(outputs[:num_tokens])
+                if self.logits_in_graph:
+                    self.model.compute_logits(outputs[:num_tokens])
 
-                # Capture: include compute_logits in the graph to avoid
-                # eager execution overhead during decode replay.
+                # Capture: include compute_logits only when TP=1 since
+                # ParallelLMHead uses NCCL all_gather which is not
+                # graph-capturable on HIP when TP > 1.
                 with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
                     outputs[:num_tokens] = self.model(
                         input_ids[:num_tokens], positions[:num_tokens]
                     )
-                    graph_logits = self.model.compute_logits(outputs[:num_tokens])
+                    if self.logits_in_graph:
+                        graph_logits = self.model.compute_logits(
+                            outputs[:num_tokens]
+                        )
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
                 self.graphs[(bs, max_q_len)] = graph
-                self.graph_logits[(bs, max_q_len)] = graph_logits
+                if self.logits_in_graph:
+                    self.graph_logits[(bs, max_q_len)] = graph_logits
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
         return time.time() - start_time, self.graph_bs
