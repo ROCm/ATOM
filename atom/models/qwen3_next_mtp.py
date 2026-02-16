@@ -170,7 +170,6 @@ class Qwen3NextMTP(nn.Module):
         )
 
 
-
 def remap_mtp_weight_name(name: str) -> str | None:
     """
     Remap MTP weight names to match the model structure.
