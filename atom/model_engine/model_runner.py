@@ -1646,9 +1646,7 @@ class ModelRunner:
                         input_ids[:num_tokens], positions[:num_tokens]
                     )
                     if self.logits_in_graph:
-                        graph_logits = self.model.compute_logits(
-                            outputs[:num_tokens]
-                        )
+                        graph_logits = self.model.compute_logits(outputs[:num_tokens])
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
                 self.graphs[(bs, max_q_len)] = graph
