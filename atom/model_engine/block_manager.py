@@ -124,7 +124,6 @@ class BlockManager:
                 self._deallocate_block(block_id)
             seq.mamba_block_table.clear()
 
-
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
@@ -175,5 +174,4 @@ class BlockManager:
         else:
             # Last block is not full and not at the boundary
             # Hash remains -1 until block is full (consistent with allocate logic)
-            # assert last_block.hash == -1, last_block.block_id
-            pass
+            assert last_block.hash == -1, last_block.block_id

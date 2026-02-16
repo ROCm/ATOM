@@ -4,7 +4,7 @@
 import logging
 import os
 import time
-from itertools import chain, islice
+from itertools import chain
 from typing import Any, Optional, Union
 import math
 
@@ -426,21 +426,13 @@ class tokenIDProcessor:
                         # so we can use sequential indexing
                         token_ids = [
                             token
-                            for tokens in scheduled_tokens[total_reqs_prefill : total_reqs_prefill + num_new_seqs]
+                            for tokens in scheduled_tokens[
+                                total_reqs_prefill : total_reqs_prefill + num_new_seqs
+                            ]
                             for token in tokens
                         ]
                         draft_values = batch.scheduled_spec_decode_tokens.values()
 
-                        # token_ids = np.fromiter(
-                        #     chain.from_iterable(
-                        #         (tokens[-1], *draft)
-                        #         for tokens, draft in zip(
-                        #             scheduled_slice, islice(draft_values, num_new_seqs)
-                        #         )
-                        #     ),
-                        #     dtype=np.int32,
-                        #     count=num_new_tokens,
-                        # )
                         self.input_ids.np[:num_new_tokens] = token_ids
                         self.input_ids.copy_to_gpu(num_new_tokens)
                     else:
@@ -464,10 +456,6 @@ class tokenIDProcessor:
                         for idx in new_curr_indices:
                             req_idx = total_reqs_prefill + idx
                             tokens = scheduled_tokens[req_idx]
-                            # req_id = batch.req_ids[idx]
-                            # draft_tokens = batch.scheduled_spec_decode_tokens.get(
-                            #     req_id, []
-                            # )
                             new_token_ids.extend(tokens)
                     else:
                         # Non-MTP mode: only first token from scheduled_tokens
@@ -597,7 +585,9 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
-        self.num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.num_speculative_tokens = (
+            self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        )
         self.tokenID_processor = tokenIDProcessor(
             self.config.max_num_batched_tokens,
             self.device,
@@ -659,10 +649,7 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in (
-            "qwen3_next",
-            "qwen3_next_mtp"
-        ):
+        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
             return True
         return False
 
@@ -915,7 +902,8 @@ class ModelRunner:
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
-                self.max_bs, **i32_kwargs)
+                self.max_bs, **i32_kwargs
+            )
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -974,7 +962,7 @@ class ModelRunner:
                 hf_config.linear_num_key_heads,
                 hf_config.linear_num_value_heads,
                 hf_config.linear_key_head_dim,
-                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
                 hf_config.linear_conv_kernel_dim,
                 self.num_speculative_tokens,
             )
@@ -1085,7 +1073,7 @@ class ModelRunner:
                 hf_config.linear_key_head_dim,
                 hf_config.linear_key_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                self.num_speculative_tokens, # self.num_spec,
+                self.num_speculative_tokens,  # self.num_spec,
             )
             self.mamba_k_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
@@ -1485,7 +1473,6 @@ class ModelRunner:
         reset_forward_context()
         return fwd_output
 
-
     def _calc_spec_decode_metadata(
         self,
         num_spec_steps: int,
@@ -1575,11 +1562,6 @@ class ModelRunner:
             batch.total_seqs_num, last_token_offset
         )
 
-        # print("before propose: ")
-        # print("target token ids: ", input_ids, flush=True)
-        # print("target positions: ", positions, flush=True)
-        # print("next_token_ids: ", next_token_ids)
-        # print("last token indices: ", last_token_indices, flush=True)
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,
             target_positions=positions,
@@ -1587,7 +1569,6 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
         )
-        # print("draft token is: ", draft_token, flush=True)
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     @torch.inference_mode()

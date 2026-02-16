@@ -136,8 +136,13 @@ class InputOutputProcessor:
         self.mamba_enabled = False
         print("the model type is ", self.config.hf_config.model_type)
         self.num_speculative_tokens = 0
-        if hasattr(self.config, "speculative_config") and self.config.speculative_config is not None:
-            self.num_speculative_tokens = self.config.speculative_config.num_speculative_tokens
+        if (
+            hasattr(self.config, "speculative_config")
+            and self.config.speculative_config is not None
+        ):
+            self.num_speculative_tokens = (
+                self.config.speculative_config.num_speculative_tokens
+            )
 
         if self.config.hf_config.model_type == "qwen3_next":
             print("enable mamba", flush=True)

@@ -301,9 +301,11 @@ class Scheduler:
                 #     seq.token_ids[-num_placeholder + i] = el
                 #     seq.output_tokens[-num_placeholder + i] = el
                 # update the number of tokens in the sequence if draft token is rejected
-                seq.token_ids[-seq.num_placeholder-seq.num_draft_tokens:] = token_ids_w_draft
+                seq.token_ids[-seq.num_placeholder - seq.num_draft_tokens :] = (
+                    token_ids_w_draft
+                )
                 seq.num_tokens = len(seq.token_ids)
-                seq.output_tokens[-seq.num_placeholder:] = token_ids
+                seq.output_tokens[-seq.num_placeholder :] = token_ids
                 # print("after update seq token ids: ", seq.token_ids, flush=True)
                 # print("newly generated token: ", seq.output_tokens, flush=True)
             else:
@@ -328,7 +330,7 @@ class Scheduler:
                 # seq.num_placeholder = 1+fwd_output.num_bonus_tokens[idx]
             if draft_token_ids and seq.id in draft_token_ids:
                 seq.spec_token_ids = draft_token_ids[seq.id]
-            
+
             # if num_bonus_tokens:
             #     print("update seq id: ", seq.id, flush=True)
             #     seq.num_bonus_tokens = num_bonus_tokens[seq.id]
