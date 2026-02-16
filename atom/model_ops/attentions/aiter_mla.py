@@ -237,14 +237,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
-        positions = np.tile(
-            np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
-        ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
         if max_seqlen_q > 1:
+            # context_lens += batch.num_spec_step
             # Get mapped_bonus_list (already mapped to current batch order in prepare_input_ids)
-            num_prev_bonus = self.model_runner.tokenID_processor.mapped_bonus_list
-            if num_prev_bonus is not None:
-                context_lens += num_prev_bonus - batch.num_spec_step
+            num_rejected = self.model_runner.tokenID_processor.num_rejected
+            if num_rejected is not None:
+                context_lens -= num_rejected
                 num_blocks = cdiv(context_lens, self.model_runner.block_size)
                 block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
 
@@ -262,6 +260,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     block_tables, batch.last_block_num_tokens
                 )
             ]
+        positions = np.tile(
+            np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
+        ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
 
         sum_scheduled_tokens = batch.total_tokens_num_decode
         var["slot_mapping"].np[: bs * max_seqlen_q] = -1
@@ -340,12 +341,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
-        # if str(positions.device)=='cuda:0':
-        #     for el, var in ctx.items():
-        #         if 'work_' in el or 'reduce_' in el:
-        #             continue
-        #         logger.info(f"{el}: {var}")
-        #     logger.info(f"{positions=}")
+        if str(positions.device) == "cuda:0":
+            logger.info(f"context_lens: {ctx['context_lens']}")
+            # logger.info(f"{positions=}")
+            # for el, var in ctx.items():
+            #     if "work_" in el or "reduce_" in el or "kv_" in el:
+            #         continue
+            #     logger.info(f"{el}: {var}")
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:

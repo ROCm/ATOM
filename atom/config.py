@@ -598,9 +598,7 @@ class Config:
 
     def __post_init__(self):
         # assert os.path.isdir(self.model)
-        assert (
-            self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1
-        ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
+
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(self.model)
         if not hasattr(self.hf_config, "rope_parameters"):

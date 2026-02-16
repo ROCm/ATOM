@@ -2,11 +2,11 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import math
 import os
 import time
 from itertools import chain, islice
 from typing import Any, Optional, Union
-import math
 
 import numpy as np
 import torch
@@ -66,14 +66,17 @@ class tokenIDProcessor:
 
     def __init__(
         self,
+        runner: "ModelRunner",
         max_num_batched_tokens: int,
-        device: torch.device,
         use_spec: bool = False,
-        num_speculative_tokens: int = 0,
+        num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         # self.is_deferred_out = False
         self.is_deferred_out = True
+
+        self.runner = runner
+        device = runner.device
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
@@ -81,12 +84,14 @@ class tokenIDProcessor:
             max_num_batched_tokens, dtype=torch.int64, device=device
         )
         self.use_spec = use_spec
-        if self.use_spec:
-            self.num_speculative_tokens = num_speculative_tokens
+        self.num_spec_tokens = num_spec_tokens
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_event = torch.cuda.Event()
         self.async_copy_stream = torch.cuda.Stream()
+        self.default_num_bonus_tokens = torch.zeros(
+            max_num_batched_tokens, dtype=torch.int32, device=device
+        )
         self.clean()
 
     def send_to_cpu_async(
@@ -120,15 +125,16 @@ class tokenIDProcessor:
             event.record(self.async_copy_stream)
         self.draft_token_ids_cpu.append((cpu_tensor, event))
 
-    def recv_async_output_draft(self) -> list[int]:
+    def recv_async_output_draft(self) -> np.ndarray:
         if not self.draft_token_ids_cpu:
-            return []
+            return np.array([], dtype=np.int32)
         token_ids, event = self.draft_token_ids_cpu.pop(0)
         event.synchronize()
-        return token_ids.tolist()
+        return token_ids.numpy()
 
     def send_bonus_to_cpu_async(self, gpu_tensor: torch.Tensor):
         default_stream = torch.cuda.current_stream()
+        self.num_bonus_tokens = gpu_tensor
         with torch.cuda.stream(self.async_copy_stream):
             self.async_copy_stream.wait_stream(default_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
@@ -272,6 +278,18 @@ class tokenIDProcessor:
             start_loc += new_token_num
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
+        prev_bonus_num = self.recv_bonus_async()
+        if prev_bonus_num is None:
+            prev_bonus_num = np.full(
+                batch.total_seqs_num, self.num_spec_tokens, dtype=np.int32
+            )
+        if self.prev_batch is not None and self.prev_batch.total_seqs_num_prefill > 0:
+            prev_bonus_num = np.full(
+                self.prev_batch.total_seqs_num, self.num_spec_tokens, dtype=np.int32
+            )
+        self.prev_rejected_num = self.num_spec_tokens - prev_bonus_num
+        # self.runner.debug(f"{prev_bonus_num=}")
+        # self.runner.debug(f"{self.prev_rejected_num=}")
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
             return self.input_ids.gpu[:total_tokens_prefill]
@@ -282,7 +300,7 @@ class tokenIDProcessor:
                     total_reqs_prefill : total_reqs_prefill + total_reqs_decode
                 ]
                 draft_values = batch.scheduled_spec_decode_tokens.values()
-                mtp_k = self.num_speculative_tokens
+                mtp_k = self.num_spec_tokens
                 token_ids = np.fromiter(
                     chain.from_iterable(
                         (tokens[0], *draft)
@@ -311,7 +329,7 @@ class tokenIDProcessor:
 
         # Calculate token counts: in MTP mode, each seq has multiple tokens
         if self.use_spec:
-            tokens_per_seq = self.num_speculative_tokens + 1
+            tokens_per_seq = self.num_spec_tokens + 1
             num_deferred_tokens = num_deferred_seqs * tokens_per_seq
             num_new_tokens = num_new_seqs * tokens_per_seq
         else:
@@ -320,16 +338,13 @@ class tokenIDProcessor:
             num_new_tokens = num_new_seqs
 
         # Receive and map bonus_list to current batch order
-        prev_bonus_num = self.recv_bonus_async()
-        total_seqs = num_deferred_seqs + num_new_seqs
-        if prev_bonus_num is not None and num_deferred_seqs > 0:
+        self.num_rejected = batch.num_rejected
+        if num_deferred_seqs > 0:
             # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
-            mapped = np.full(total_seqs, self.num_speculative_tokens, dtype=np.int32)
-            if not self.prev_batch.total_seqs_num_prefill > 0:
-                mapped[deferred_curr_indices] = prev_bonus_num[deferred_prev_indices]
-            self.mapped_bonus_list = mapped
-        else:
-            self.mapped_bonus_list = None
+            # mapped = np.full(total_seqs, 0, dtype=np.int32)
+            self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
+                deferred_prev_indices
+            ]
 
         if is_all_same:
             # All requests are the same, only deferred tokens
@@ -421,7 +436,7 @@ class tokenIDProcessor:
 
                         token_ids = np.fromiter(
                             chain.from_iterable(
-                                (tokens[-1], *draft)
+                                (tokens[0], *draft)
                                 for tokens, draft in zip(
                                     scheduled_slice, islice(draft_values, num_new_seqs)
                                 )
@@ -456,7 +471,7 @@ class tokenIDProcessor:
                             draft_tokens = batch.scheduled_spec_decode_tokens.get(
                                 req_id, []
                             )
-                            new_token_ids.extend([tokens[-1]] + draft_tokens)
+                            new_token_ids.extend([tokens[0]] + draft_tokens)
                     else:
                         # Non-MTP mode: only first token from scheduled_tokens
                         new_token_ids = [
@@ -468,33 +483,25 @@ class tokenIDProcessor:
                     ].copy_(self.input_ids.cpu[:num_new_tokens], non_blocking=True)
                 if gathered_tokens is not None:
                     self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
-
-        return self.input_ids.gpu[:total_tokens]
+        input_ids = self.input_ids.gpu[:total_tokens]
+        self.runner.debug(f"{input_ids=}")
+        return input_ids
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
-    ) -> dict[int, list[int]]:
+    ) -> np.ndarray:
         if not self.is_deferred_out:
-            draft_token_ids = draft_token_ids.tolist()
-            req_ids = batch.req_ids
-            ret = {
-                seq_id: token_id for seq_id, token_id in zip(req_ids, draft_token_ids)
-            }
-            ret[-1] = 0
+            ret = draft_token_ids.numpy()
         else:
             self.draft_token_ids = draft_token_ids
-            self.pre_num_decode_token_per_seq = self.num_speculative_tokens + 1
+            self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
             token_ids = self.recv_async_output_draft()
             self.send_to_cpu_async_draft(draft_token_ids)
             ret = (
-                {
-                    seq_id: token_id
-                    for seq_id, token_id in zip(self.prev_req_ids, token_ids)
-                }
+                token_ids
                 if self.prev_req_ids is not None
-                else {}
+                else np.array([], dtype=np.int32)
             )
-            ret[-1] = 1
         return ret
 
 
@@ -585,12 +592,12 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
-        num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
         self.tokenID_processor = tokenIDProcessor(
+            self,
             self.config.max_num_batched_tokens,
-            self.device,
             hasattr(self, "drafter"),
-            num_speculative_tokens,
+            num_spec_tokens,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(
@@ -1353,6 +1360,7 @@ class ModelRunner:
 
         temperatures = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
+        # self.debug(f"{input_ids=}")
         self.prepare_inputs(batch, input_ids)
         return (
             input_ids,
@@ -1387,8 +1395,10 @@ class ModelRunner:
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
+        bs = batch.total_seqs_num
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(logits, temperatures)
+            num_bonus_tokens = self.tokenID_processor.default_num_bonus_tokens[:bs]
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
@@ -1423,33 +1433,33 @@ class ModelRunner:
             batch, sampled_tokens, self.forward_done_event
         )
 
-        draft_token_ids: Optional[torch.Tensor] = None
+        draft_token_ids: Optional[np.ndarray] = None
+        prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
         if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
-            if spec_decode_metadata is None:
-                next_token_ids = sampled_tokens
-            else:
-                next_token_ids = torch.gather(
-                    sampled_tokens, 1, num_bonus_tokens.view(-1, 1)
-                ).view(-1)
-                # self.debug(f"{sampled_tokens=}")
-                # self.debug(f"{num_bonus_tokens=}")
-                # self.debug(f"{next_token_ids=}")
-                self.tokenID_processor.prev_token_ids = next_token_ids
-                self.tokenID_processor.num_bonus_tokens = num_bonus_tokens
-                self.tokenID_processor.send_bonus_to_cpu_async(
-                    num_bonus_tokens
-                )  # Async copy to CPU
+            next_token_ids = torch.gather(
+                sampled_tokens.view(bs, -1), 1, num_bonus_tokens.view(-1, 1)
+            ).view(bs)
+            # self.debug(f"{sampled_tokens=}")
+            # self.debug(f"{num_bonus_tokens=}")
+            # self.debug(f"{next_token_ids=}")
+            prev_rejected_num = self.tokenID_processor.prev_rejected_num
+            self.tokenID_processor.prev_token_ids = next_token_ids
+            self.tokenID_processor.send_bonus_to_cpu_async(
+                num_bonus_tokens
+            )  # Async copy to CPU
             draft_token_ids = self.propose_draft_token_ids(
                 batch,
                 self.tokenID_processor.input_ids.gpu[1 : batch.total_tokens_num + 1],
                 hidden_states,
                 next_token_ids,
             )
+            # self.debug(f"{num_bonus_tokens=}")
 
         return ScheduledBatchOutput(
-            token_ids,
-            draft_token_ids,
+            token_ids=token_ids,
+            draft_token_ids=draft_token_ids,
             is_deferred_out=self.tokenID_processor.is_deferred_out,
+            num_rejected=prev_rejected_num,
         )
 
     @torch.inference_mode()
