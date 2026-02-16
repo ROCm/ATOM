@@ -70,10 +70,12 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
-        self.last_block_num_tokens = [
-            seq.last_block_num_tokens for seq in seqs.values()
-        ]
-        self.num_cached_tokens = [seq.num_cached_tokens for seq in seqs.values()]
+        self.last_block_num_tokens = np.asarray(
+            [seq.last_block_num_tokens for seq in seqs.values()], dtype=np.int32
+        )
+        self.num_cached_tokens = np.asarray(
+            [seq.num_cached_tokens for seq in seqs.values()], dtype=np.int32
+        )
 
         # Total number of tokens scheduled for all requests.
         self.total_tokens_num = total_tokens_num
