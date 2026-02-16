@@ -170,7 +170,7 @@ jobs:
           -e ATOM_DISABLE_MMAP=true \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
-          --name $CONTAINER_NAME \
+          --name "$CONTAINER_NAME" \
           atom_test:ci
 
         env:
@@ -178,13 +178,13 @@ jobs:
 
       - name: Check shm size
         run: |
-          docker exec $CONTAINER_NAME df -h /dev/shm
+          docker exec "$CONTAINER_NAME" df -h /dev/shm
 
       - name: Download models
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} $CONTAINER_NAME bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
@@ -215,7 +215,7 @@ jobs:
           rocm-smi --showpids
           docker ps -a
           echo "========= End runner debug logs ==============="
-          docker exec $CONTAINER_NAME bash -lc "
+          docker exec "$CONTAINER_NAME" bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
               --model \"$model_path\" \
@@ -254,12 +254,12 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
-          docker exec $CONTAINER_NAME bash -lc "
+          docker exec "$CONTAINER_NAME" bash -lc "
             .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
           "
           echo ""
           echo "========== Running accuracy test =========="
-          docker exec $CONTAINER_NAME bash -lc "
+          docker exec "$CONTAINER_NAME" bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
       
@@ -286,5 +286,5 @@ jobs:
           if [[ ${{ matrix.runner }} == atom-mi355-8gpu.predownload ]]; then
             docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
           fi
-          docker stop $CONTAINER_NAME || true
-          docker rm $CONTAINER_NAME || true
+          docker stop "$CONTAINER_NAME" || true
+          docker rm "$CONTAINER_NAME" || true
