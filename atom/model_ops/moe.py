@@ -43,6 +43,7 @@ from atom.model_ops.utils import (
     per_tensor_dequantize,
     shuffle_weights,
 )
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
 from torch import nn
@@ -634,7 +635,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
-        self.use_triton = get_gfx().startswith("gfx94")
+        gfx = get_gfx()
+        self.use_triton = gfx.startswith("gfx94") or (
+            gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
+        )
         if self.use_triton:
             from atom.model_ops.utils import has_triton_kernels
 
