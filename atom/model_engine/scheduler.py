@@ -276,6 +276,9 @@ class Scheduler:
                 break
             num_seqs_prefill += 1
             self.block_manager.allocate(seq)
+            # Recalculate after allocation: prefix caching may have updated
+            # seq.num_cached_tokens, reducing the actual number of new tokens.
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL

@@ -97,6 +97,103 @@ class TestSchedule:
         assert SequenceStatus.WAITING in statuses
 
 
+# ── prefix caching ────────────────────────────────────────────────────────
+
+
+class TestPrefixCaching:
+    """Verify that prefix cache hits correctly reduce scheduled token counts."""
+
+    def _make_prefix_scheduler(self):
+        return Scheduler(
+            MockConfig(
+                enable_prefix_caching=True,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=20,
+                max_num_seqs=4,
+                max_num_batched_tokens=256,
+            )
+        )
+
+    def test_prefix_cache_reduces_token_count(self, seq_factory):
+        """After a first request populates the cache, a second request sharing
+        the same prefix should only schedule the non-cached tokens."""
+        sched = self._make_prefix_scheduler()
+
+        # First request: [1,2,3,4, 5,6,7,8, 9] — 3 blocks, first 2 full
+        seq1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        sched.add(seq1)
+        batch1, _ = sched.schedule()
+        assert batch1.total_tokens_num_prefill == 9  # no cache, all tokens
+
+        # Complete seq1 so its blocks are freed (but hashes remain)
+        seq1.append_token(2)  # EOS
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(token_ids={seq1.id: (2,)}, draft_token_ids=None),
+        )
+
+        # Second request shares the same prefix, differs in last block
+        # [1,2,3,4, 5,6,7,8, 10,11] — first 2 blocks (8 tokens) should be cached
+        seq2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 10, 11])
+        sched.add(seq2)
+        batch2, _ = sched.schedule()
+
+        # With the fix: only 2 new tokens (10, 11) should be scheduled
+        # Without the fix: all 10 tokens would be scheduled (the bug)
+        assert batch2.total_tokens_num_prefill == 2
+        assert batch2.num_scheduled_tokens == [2]
+        assert seq2.num_cached_tokens == 8
+
+    def test_prefix_cache_scheduled_tokens_content(self, seq_factory):
+        """Verify that scheduled_tokens only contains the non-cached suffix."""
+        sched = self._make_prefix_scheduler()
+
+        seq1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        sched.add(seq1)
+        sched.schedule()
+
+        seq1.append_token(2)  # EOS
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(token_ids={seq1.id: (2,)}, draft_token_ids=None),
+        )
+
+        seq2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 10, 11])
+        sched.add(seq2)
+        batch2, _ = sched.schedule()
+
+        # scheduled_tokens should be the last num_new_tokens of token_ids
+        assert batch2.scheduled_tokens == [[10, 11]]
+
+    def test_no_prefix_cache_full_tokens_scheduled(self, seq_factory):
+        """Without prefix caching, all tokens should be scheduled."""
+        sched = Scheduler(
+            MockConfig(
+                enable_prefix_caching=False,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=20,
+            )
+        )
+
+        seq1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        sched.add(seq1)
+        sched.schedule()
+
+        seq1.append_token(2)  # EOS
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(token_ids={seq1.id: (2,)}, draft_token_ids=None),
+        )
+
+        seq2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 10, 11])
+        sched.add(seq2)
+        batch2, _ = sched.schedule()
+
+        # No prefix caching → all 10 tokens are scheduled
+        assert batch2.total_tokens_num_prefill == 10
+        assert seq2.num_cached_tokens == 0
+
+
 # ── preempt ────────────────────────────────────────────────────────────────
 
 
