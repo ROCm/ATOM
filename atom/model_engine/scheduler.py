@@ -192,7 +192,7 @@ class Scheduler:
 
         if num_seqs_prefill > 0:
             logger.info(
-                f"Scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} tokens({num_scheduled_tokens}), keys: {scheduled_seqs.keys()}"
+                f"Scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} token_nums: {num_scheduled_tokens}, req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True
             # lip: TODO for prefill/decode mixed batch
@@ -235,7 +235,7 @@ class Scheduler:
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs.values()))
         # logger.info(
-        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, keys: {scheduled_seqs.keys()}"
+        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, req_ids: {tuple(scheduled_seqs.keys())}"
         # )
         return (
             ScheduledBatch(

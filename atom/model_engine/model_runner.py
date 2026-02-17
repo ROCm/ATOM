@@ -1269,8 +1269,7 @@ class ModelRunner:
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter"):
             scheduled_bs = batch.total_seqs_num_decode
-            spec_decode_metadata = self._calc_spec_decode_metadata(
-                self.drafter.mtp_k,
+            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
                 num_scheduled_tokens[:scheduled_bs],
                 cu_seqlens_q[:scheduled_bs],
                 input_ids,
@@ -1417,71 +1416,6 @@ class ModelRunner:
         )
         reset_forward_context()
         return fwd_output
-
-    def _calc_spec_decode_metadata(
-        self,
-        num_spec_steps: int,
-        num_sampled_tokens: np.ndarray,
-        cu_num_sampled_tokens: np.ndarray,
-        input_ids: torch.Tensor,
-    ) -> SpecDecodeMetadata:
-        # Inputs:
-        # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
-        # num_draft_tokens:         [  3,   0,   2,   0,   1]
-        # Outputs:
-        # cu_num_draft_tokens:      [  3,   3,   5,   5,   6]
-        # logits_indices:           [  0,   1,   2,   3, 103, 104, 105, 106,
-        #                            206, 207, 208]
-        # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
-        # bonus_logits_indices:     [  3,   4,   7,   8,  10]
-
-        # Compute the logits indices.
-        # [4, 1, 3, 1, 2]
-
-        scheduled_bs = len(num_sampled_tokens)
-
-        # Compute the bonus logits indices.
-        bonus_logits_indices = cu_num_sampled_tokens - 1
-
-        # Compute the draft logits indices.
-        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
-        # arange: [0, 1, 2, 0, 1, 0]
-        num_draft_tokens = np.full(scheduled_bs, num_spec_steps, dtype=np.int32)
-        cu_num_draft_tokens, arange = self._get_cumsum_and_arange(
-            num_draft_tokens, cumsum_dtype=np.int32
-        )
-        # [0, 0, 0, 5, 5, 9]
-        target_logits_indices = np.repeat(
-            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
-        )
-        # [0, 1, 2, 5, 6, 9]
-        target_logits_indices += arange
-        # self.debug(f"{target_logits_indices=}")
-
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
-        )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
-        )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
-        )
-
-        # Compute the draft token ids.
-        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = torch.index_select(input_ids, 0, bonus_logits_indices)
-
-        metadata = SpecDecodeMetadata(
-            draft_token_ids=draft_token_ids,
-            num_spec_steps=num_spec_steps,
-            num_draft_tokens_np=num_draft_tokens,
-            cu_num_draft_tokens=cu_num_draft_tokens,
-            target_logits_indices=target_logits_indices,
-            bonus_logits_indices=bonus_logits_indices,
-        )
-        return metadata
 
     def propose_draft_token_ids(
         self,
