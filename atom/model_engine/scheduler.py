@@ -28,7 +28,7 @@ class ScheduledBatch:
         total_seqs_num_decode: int = 0,
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
-        scheduled_spec_decode_tokens: dict[int, list[int]] = {},
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {},
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
         # self.seqs = seqs
@@ -52,21 +52,18 @@ class ScheduledBatch:
         )
 
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
-        self.scheduled_tokens = [
-            seq.token_ids[offset : offset + num]
-            for seq, num, offset in zip(seqs.values(), num_scheduled_tokens, offs)
-        ]
-        # TODO use following code to create a contiguous array for better performance
-        # self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
-        # pos = 0
-        # for seq, num, offset in zip(seqs.values(), num_scheduled_tokens, offs):
-        #     self.scheduled_tokens[pos : pos + num] = seq.token_ids[
-        #         offset : offset + num
-        #     ]
-        #     pos += num
+        self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
+        pos = 0
+        for seq, num, offset in zip(seqs.values(), num_scheduled_tokens, offs):
+            self.scheduled_tokens[pos : pos + num] = seq.token_ids[
+                offset : offset + num
+            ]
+            pos += num
 
         if num_spec_step > 0:
-            self.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
+            self.scheduled_spec_decode_tokens = np.asarray(
+                list(scheduled_spec_decode_tokens.values()), dtype=np.int32
+            )
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]

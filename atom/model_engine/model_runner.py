@@ -269,12 +269,9 @@ class tokenIDProcessor:
         total_reqs_prefill = batch.total_seqs_num_prefill
         total_reqs_decode = batch.total_seqs_num_decode
         """for prefill: all input ids are new"""
-        start_loc = 0
-        for tokens, new_token_num in zip(
-            scheduled_tokens[:total_reqs_prefill], token_nums[:total_reqs_prefill]
-        ):
-            self.input_ids.np[start_loc : start_loc + new_token_num] = tokens
-            start_loc += new_token_num
+        self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
+            :total_tokens_prefill
+        ]
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
         self.prev_rejected_num = self.recv_rejected_async()
@@ -284,28 +281,12 @@ class tokenIDProcessor:
             return self.input_ids.gpu[:total_tokens_prefill]
 
         if not self.is_deferred_out:
+            token_ids = scheduled_tokens[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ]
             if self.use_spec:
-                scheduled_tokens = scheduled_tokens[
-                    total_reqs_prefill : total_reqs_prefill + total_reqs_decode
-                ]
-                draft_values = batch.scheduled_spec_decode_tokens.values()
-                mtp_k = self.num_spec_tokens
-                token_ids = np.fromiter(
-                    chain.from_iterable(
-                        (tokens[0], *draft)
-                        for tokens, draft in zip(scheduled_tokens, draft_values)
-                    ),
-                    dtype=np.int32,
-                    count=total_reqs_decode * (mtp_k + 1),
-                )
-            else:
-                token_ids = [
-                    token
-                    for tokens in scheduled_tokens[
-                        total_reqs_prefill : total_reqs_prefill + total_reqs_decode
-                    ]
-                    for token in tokens
-                ]
+                token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
+
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
@@ -413,59 +394,29 @@ class tokenIDProcessor:
                         num_new_tokens : num_new_tokens + num_deferred_tokens
                     ] = gathered_tokens
                 if num_new_tokens > 0:
+                    token_ids = scheduled_tokens[
+                        total_tokens_prefill : total_tokens_prefill + num_new_tokens
+                    ].reshape(num_new_seqs, tokens_per_seq)
                     if self.use_spec:
-                        # MTP mode: combine scheduled_tokens and draft_tokens
-                        # new_decode_front=True means new_curr_indices == list(range(num_new_seqs))
-                        # so we can use sequential indexing
-                        scheduled_slice = scheduled_tokens[
-                            total_reqs_prefill : total_reqs_prefill + num_new_seqs
+                        token_ids[:, 1:] = batch.scheduled_spec_decode_tokens[
+                            :num_new_seqs
                         ]
-                        draft_values = batch.scheduled_spec_decode_tokens.values()
-
-                        token_ids = np.fromiter(
-                            chain.from_iterable(
-                                (tokens[0], *draft)
-                                for tokens, draft in zip(
-                                    scheduled_slice, islice(draft_values, num_new_seqs)
-                                )
-                            ),
-                            dtype=np.int32,
-                            count=num_new_tokens,
-                        )
-                        self.input_ids.np[:num_new_tokens] = token_ids
-                        self.input_ids.copy_to_gpu(num_new_tokens)
-                    else:
-                        # Non-MTP mode: flatten scheduled_tokens for new requests
-                        token_ids = [
-                            token
-                            for tokens in scheduled_tokens[
-                                total_reqs_prefill : total_reqs_prefill + num_new_seqs
-                            ]
-                            for token in tokens
-                        ]
-                        self.input_ids.np[:num_new_tokens] = token_ids
-                        self.input_ids.copy_to_gpu(num_new_tokens)
+                    self.input_ids.np[:num_new_tokens] = token_ids.flatten()
+                    self.input_ids.copy_to_gpu(num_new_tokens)
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
                 if num_new_tokens > 0:
+                    new_token_ids = scheduled_tokens[new_curr_indices].reshape(
+                        num_new_seqs, tokens_per_seq
+                    )
                     if self.use_spec:
                         # MTP mode: combine scheduled_tokens and draft_tokens
                         # For new_decode_front=False, use new_curr_indices to get the right sequences
-                        new_token_ids = []
-                        for idx in new_curr_indices:
-                            req_idx = total_reqs_prefill + idx
-                            tokens = scheduled_tokens[req_idx]
-                            req_id = batch.req_ids[idx]
-                            draft_tokens = batch.scheduled_spec_decode_tokens.get(
-                                req_id, []
-                            )
-                            new_token_ids.extend([tokens[0]] + draft_tokens)
-                    else:
-                        # Non-MTP mode: only first token from scheduled_tokens
-                        new_token_ids = [
-                            scheduled_tokens[idx][0] for idx in new_curr_indices
+                        draft_tokens = batch.scheduled_spec_decode_tokens[
+                            new_curr_indices
                         ]
-                    self.input_ids.np[:num_new_tokens] = new_token_ids
+                        new_token_ids[:, 1:] = draft_tokens
+                    self.input_ids.np[:num_new_tokens] = new_token_ids.flatten()
                     self.input_ids.gpu[
                         num_deferred_tokens : num_deferred_tokens + num_new_tokens
                     ].copy_(self.input_ids.cpu[:num_new_tokens], non_blocking=True)
