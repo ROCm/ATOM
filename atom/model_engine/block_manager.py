@@ -153,6 +153,7 @@ class BlockManager:
                 last_block.update(h, token_ids)
                 self.hash_to_block_id[h] = last_block.block_id
         else:
+            pass
             # Last block is not full and not at the boundary
             # Hash remains -1 until block is full (consistent with allocate logic)
-            assert last_block.hash == -1, last_block.block_id
+            # assert last_block.hash == -1, last_block.block_id

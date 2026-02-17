@@ -1,27 +1,29 @@
 import logging
 
+import numpy as np
 import torch
 import torch.nn as nn
 from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config
 from atom.model_loader.loader import load_model
-from atom.models.deepseek_mtp import DeepSeekMTP
-from atom.utils.forward_context import get_forward_context
+from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
+from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
 
 logger = logging.getLogger("atom")
 
 
 support_eagle_model_arch_dict = {
-    "DeepSeekMTPModel": DeepSeekMTP,
+    "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
 }
 
 
 class EagleProposer:
+
     def __init__(
         self,
         atom_config: Config,
         device: torch.device,
-        runner=None,
+        runner,
     ):
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
@@ -42,22 +44,15 @@ class EagleProposer:
 
         self.device = device
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
-        self.model = support_eagle_model_arch_dict[
-            draft_model_hf_config.architectures[0]
-        ](self.config)
+        model_class = resolve_obj_by_qualname(support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]])  # type: ignore
+        self.model = model_class(self.config)
 
-        self.hidden_size = getattr(self.config.hf_config, "hidden_size", 7168)
-        # persistent buffers for cuda graph
-        self.positions = torch.zeros(
-            self.max_num_tokens, dtype=torch.int64, device=device
-        )
-        self.hidden_states = torch.zeros(
-            (self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device
-        )
-
-        self.inputs_embeds = torch.zeros(
-            (self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device
-        )
+        i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        i64_kwargs = {"dtype": torch.int64, "device": self.device}
+        max_bs = self.config.max_num_seqs
+        self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
+        self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
+        self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
 
     def load_model(self, target_model: nn.Module) -> None:
 
@@ -165,3 +160,54 @@ class EagleProposer:
         token_indices = cu_seqlens_q[1:] - last_token_offset
 
         return token_indices
+
+    def calc_spec_decode_metadata(
+        self,
+        num_sampled_tokens: np.ndarray,
+        cu_num_sampled_tokens: np.ndarray,
+        input_ids: torch.Tensor,
+    ) -> SpecDecodeMetadata:
+        scheduled_bs = len(num_sampled_tokens)
+        sum_drafted_tokens = self.mtp_k * scheduled_bs
+
+        # Compute the bonus logits indices.
+        bonus_logits_indices = cu_num_sampled_tokens - 1
+
+        # Compute the draft logits indices.
+        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
+        # arange: [0, 1, 2, 0, 1, 0]
+        num_draft_tokens = np.full(scheduled_bs, self.mtp_k, dtype=np.int32)
+        cu_num_draft_tokens, arange = self.runner._get_cumsum_and_arange(
+            num_draft_tokens, cumsum_dtype=np.int32
+        )
+        # [0, 0, 0, 5, 5, 9]
+        target_logits_indices = np.repeat(
+            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+        )
+        # [0, 1, 2, 5, 6, 9]
+        target_logits_indices += arange
+        # self.debug(f"{target_logits_indices=}")
+
+        # Do the CPU -> GPU copy.
+        self.target_logits_indices.np[:sum_drafted_tokens] = target_logits_indices
+        self.cu_num_draft_tokens.np[:scheduled_bs] = cu_num_draft_tokens
+        self.bonus_logits_indices.np[:scheduled_bs] = bonus_logits_indices
+        target_logits_indices = self.target_logits_indices.copy_to_gpu(
+            sum_drafted_tokens
+        )
+        cu_num_draft_tokens = self.cu_num_draft_tokens.copy_to_gpu(scheduled_bs)
+        bonus_logits_indices = self.bonus_logits_indices.copy_to_gpu(scheduled_bs)
+
+        # Compute the draft token ids.
+        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        draft_token_ids = torch.index_select(input_ids[1:], 0, target_logits_indices)
+
+        metadata = SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_spec_steps=self.mtp_k,
+            num_draft_tokens_np=num_draft_tokens,
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+        )
+        return metadata
