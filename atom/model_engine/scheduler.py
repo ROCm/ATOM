@@ -302,11 +302,11 @@ class Scheduler:
             num_new_token = len(token_ids)
             self.update_spec_stats(num_new_token)
             idx = fwd_output.req_ids.index(seq.id)
-            if is_deferred_out or (
-                self.use_spec and self.eos_token_id == seq.token_ids[-1]
-            ):
+            if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
-                offset = num_new_token + num_rejected - self.mtp_k
+                offset = (
+                    num_new_token + num_rejected - self.mtp_k if self.use_spec else 0
+                )
                 seq.num_rejected = num_rejected
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el

@@ -328,7 +328,7 @@ class tokenIDProcessor:
 
         # Receive and map bonus_list to current batch order
         self.num_rejected = batch.num_rejected
-        if num_deferred_seqs > 0:
+        if num_deferred_seqs > 0 and self.prev_rejected_num is not None:
             # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
             self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
                 deferred_prev_indices
@@ -1424,24 +1424,28 @@ class ModelRunner:
         )
 
         draft_token_ids: Optional[np.ndarray] = None
-        prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-        if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
-            next_token_ids = torch.gather(
-                sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
-            ).view(bs)
+        if self.tokenID_processor.is_deferred_out:
             prev_rejected_num = self.tokenID_processor.prev_rejected_num
-            self.tokenID_processor.prev_token_ids = next_token_ids
             self.tokenID_processor.send_rejected_to_cpu_async(
                 num_reject_tokens
             )  # Async copy to CPU
-            draft_token_ids = self.propose_draft_token_ids(
-                batch,
-                self.tokenID_processor.input_ids.gpu[1 : batch.total_tokens_num + 1],
-                hidden_states,
-                next_token_ids,
-                num_reject_tokens,
-            )
-            # self.debug(f"{num_bonus_tokens=}")
+            if hasattr(self, "drafter"):
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                ).view(bs)
+                self.tokenID_processor.prev_token_ids = next_token_ids
+                draft_token_ids = self.propose_draft_token_ids(
+                    batch,
+                    self.tokenID_processor.input_ids.gpu[
+                        1 : batch.total_tokens_num + 1
+                    ],
+                    hidden_states,
+                    next_token_ids,
+                    num_reject_tokens,
+                )
+                # self.debug(f"{num_bonus_tokens=}")
+        else:
+            prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
 
         return ScheduledBatchOutput(
             token_ids=token_ids,
