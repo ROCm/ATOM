@@ -6,15 +6,14 @@ import torch.nn as nn
 from aiter.dist.parallel_state import get_pp_group
 from atom.config import CompilationLevel, Config
 from atom.model_loader.loader import load_model
-from atom.models.deepseek_mtp import DeepSeekMTP
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
 
 logger = logging.getLogger("atom")
 
 
 support_eagle_model_arch_dict = {
-    "DeepSeekMTPModel": DeepSeekMTP,
+    "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
 }
 
 
@@ -24,7 +23,7 @@ class EagleProposer:
         self,
         atom_config: Config,
         device: torch.device,
-        runner: "ModelRunner",
+        runner,
     ):
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
@@ -45,9 +44,8 @@ class EagleProposer:
 
         self.device = device
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
-        self.model = support_eagle_model_arch_dict[
-            draft_model_hf_config.architectures[0]
-        ](self.config)
+        model_class = resolve_obj_by_qualname(support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]])  # type: ignore
+        self.model = model_class(self.config)
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}

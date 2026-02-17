@@ -5,7 +5,6 @@ import logging
 import math
 import os
 import time
-from itertools import chain, islice
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -144,8 +143,7 @@ class tokenIDProcessor:
         if not self.rejected_tokens_cpu:
             return None
         self.async_copy_event.synchronize()
-        bonus_list = self.rejected_tokens_cpu.pop(0).numpy()
-        return bonus_list
+        return self.rejected_tokens_cpu.pop(0).numpy()
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -262,12 +260,10 @@ class tokenIDProcessor:
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
-        token_nums = batch.num_scheduled_tokens
         total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
-        total_reqs_decode = batch.total_seqs_num_decode
         """for prefill: all input ids are new"""
         self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
             :total_tokens_prefill
