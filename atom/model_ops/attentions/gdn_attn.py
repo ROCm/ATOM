@@ -158,10 +158,11 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         self.num_accepted_tokens.fill_(1)
         if self.model_runner.tokenID_processor.num_rejected is None:
             return
+        prev_prefills = batch.prev_prefills
         for idx, num_rejected_tokens in enumerate(
             self.model_runner.tokenID_processor.num_rejected
         ):
-            self.num_accepted_tokens[idx] = 1 + self.num_spec - num_rejected_tokens
+            self.num_accepted_tokens[idx] = 1 if prev_prefills[idx] else 1 + self.num_spec - num_rejected_tokens
 
     def prepare_gdn_metadata(
         self,

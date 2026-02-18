@@ -51,6 +51,10 @@ class ScheduledBatch:
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
         )
 
+        self.mamba_block_tables = [seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table]
+
+        self.prev_prefills = [seq.prev_prefill for seq in seqs.values()]
+
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
         pos = 0
@@ -212,6 +216,8 @@ class Scheduler:
         num_seqs_decode = 0
         while self.running and num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
+            print("schedule seq with token_ids: ", seq.token_ids, flush=True)
+            print("schedule seq with block tables: ", seq.block_table, flush=True)
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -279,6 +285,7 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
+        is_prev_prefill = fwd_output.is_prev_prefill
         # logger.info(
         #     f"Scheduler postprocess: received output for req_ids={fwd_output.req_ids}, draft_token_ids shape={fwd_output.draft_token_ids.shape}, accepted token ids: {prev_token_ids}"
         # )
@@ -290,8 +297,13 @@ class Scheduler:
         num_placeholder = self.mtp_k
         if is_deferred_out:
             num_placeholder += 1
-
+        print("is prev prefill: ", is_prev_prefill, flush=True)
+        print("fwd_output: ", fwd_output.req_ids, flush=True)
         for seq in self.running:
+            # Update the running status
+            if seq.id in is_prev_prefill:
+                seq.prev_prefill = is_prev_prefill[seq.id]
+
             if seq.id not in fwd_output.req_ids:
                 seq.num_placeholder = num_placeholder
                 continue
@@ -331,6 +343,7 @@ class Scheduler:
             leave_reason = None
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
+                print("checking stop sequence: ", seq.token_ids, flush=True)
                 if len(seq.token_ids) >= len(stop_seq):
                     stop_len = len(stop_seq)
                     is_normal_stop = seq.token_ids[-stop_len:] == stop_seq

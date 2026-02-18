@@ -62,6 +62,7 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
+        self.prev_prefill = True
 
         # stream callback
         self.stream_callback = stream_callback

@@ -91,6 +91,7 @@ class tokenIDProcessor:
         self.default_num_rejected_tokens = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
+        self.prev_prefills = torch.zeros(max_num_batched_tokens, dtype=torch.bool, device=device)
         self.clean()
 
     def send_to_cpu_async(
@@ -310,6 +311,7 @@ class tokenIDProcessor:
             self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
                 deferred_prev_indices
             ]
+            
 
         if is_all_same:
             # All requests are the same, only deferred tokens
@@ -1337,8 +1339,10 @@ class ModelRunner:
             sampled_tokens = self.sampler(logits, temperatures)
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
+            is_prefill = {req_id: True for req_id in batch.req_ids}
         else:
             assert logits is not None
+            is_prefill = {req_id: False for req_id in batch.req_ids}
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
@@ -1362,6 +1366,8 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
             )
+            print("sampled tokens: ", sampled_tokens, flush=True)
+            print("num bonus tokens: ", num_bonus_tokens, flush=True)
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 
@@ -1402,6 +1408,7 @@ class ModelRunner:
             draft_token_ids=draft_token_ids,
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
+            is_prev_prefill=is_prefill,
         )
 
     @torch.inference_mode()
