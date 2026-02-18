@@ -354,9 +354,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             ]
 
         attn_metadata.gdn_metadata = gdn_metadata
-        print("gdn attn meta: ", gdn_metadata, flush=True)
-        print("attn meta: ", attn_metadata, flush=True)
-        print("positions: ", positions, flush=True)
+        # print("gdn attn meta: ", gdn_metadata, flush=True)
+        # print("attn meta: ", attn_metadata, flush=True)
+        # print("positions: ", positions, flush=True)
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int):

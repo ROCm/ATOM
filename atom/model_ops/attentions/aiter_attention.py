@@ -164,7 +164,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         if max_seqlen_q > 1:
             num_rejected = self.model_runner.tokenID_processor.num_rejected
-            print("num rejected:", num_rejected, flush=True)
             if num_rejected is not None:
                 context_lens -= num_rejected
                 num_blocks = cdiv(context_lens, self.model_runner.block_size)
@@ -184,7 +183,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     block_tables, batch.last_block_num_tokens
                 )
             ]
-        print("context_lens:", context_lens, flush=True)
         positions = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)

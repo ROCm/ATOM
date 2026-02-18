@@ -1366,8 +1366,8 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
             )
-            print("sampled tokens: ", sampled_tokens, flush=True)
-            print("num bonus tokens: ", num_bonus_tokens, flush=True)
+            # print("sampled tokens: ", sampled_tokens, flush=True)
+            # print("num bonus tokens: ", num_bonus_tokens, flush=True)
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 

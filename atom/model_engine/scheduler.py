@@ -216,8 +216,8 @@ class Scheduler:
         num_seqs_decode = 0
         while self.running and num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
-            print("schedule seq with token_ids: ", seq.token_ids, flush=True)
-            print("schedule seq with block tables: ", seq.block_table, flush=True)
+            # print("schedule seq with token_ids: ", seq.token_ids, flush=True)
+            # print("schedule seq with block tables: ", seq.block_table, flush=True)
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -297,8 +297,8 @@ class Scheduler:
         num_placeholder = self.mtp_k
         if is_deferred_out:
             num_placeholder += 1
-        print("is prev prefill: ", is_prev_prefill, flush=True)
-        print("fwd_output: ", fwd_output.req_ids, flush=True)
+        # print("is prev prefill: ", is_prev_prefill, flush=True)
+        # print("fwd_output: ", fwd_output.req_ids, flush=True)
         for seq in self.running:
             # Update the running status
             if seq.id in is_prev_prefill:
@@ -343,10 +343,11 @@ class Scheduler:
             leave_reason = None
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
-                print("checking stop sequence: ", seq.token_ids, flush=True)
-                if len(seq.token_ids) >= len(stop_seq):
+                # print("checking stop sequence: ", seq.token_ids, flush=True)
+                # if len(seq.token_ids) >= len(stop_seq):
+                if num_tokens >= len(stop_seq):
                     stop_len = len(stop_seq)
-                    is_normal_stop = seq.token_ids[-stop_len:] == stop_seq
+                    is_normal_stop = seq.token_ids[num_tokens-stop_len:num_tokens] == stop_seq
                     is_mtp_stop = False
                     if self.use_spec:
                         for i in range(num_new_token):
