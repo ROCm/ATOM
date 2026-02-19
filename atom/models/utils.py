@@ -237,6 +237,38 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
+def build_packed_components_mapping(
+    packed_modules_mapping: dict[str, tuple[str, object]],
+) -> dict[str, list[str]]:
+    """Build an inverse mapping from packed parameter names to their original
+    checkpoint weight names.
+
+    Args:
+        packed_modules_mapping: Model's mapping from checkpoint weight name to
+            (packed_param_name, shard_id), e.g.::
+
+                {
+                    "q_proj": ("qkv_proj", "q"),
+                    "k_proj": ("qkv_proj", "k"),
+                    "v_proj": ("qkv_proj", "v"),
+                    "gate_proj": ("gate_up_proj", 0),
+                    "up_proj": ("gate_up_proj", 1),
+                }
+
+    Returns:
+        Inverse mapping from packed name to list of checkpoint names, e.g.::
+
+            {
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                "gate_up_proj": ["gate_proj", "up_proj"],
+            }
+    """
+    inverse: dict[str, list[str]] = {}
+    for ckpt_name, (packed_name, _shard_id) in packed_modules_mapping.items():
+        inverse.setdefault(packed_name, []).append(ckpt_name)
+    return inverse
+
+
 def should_ignore_layer(
     quantization_config: Optional[QuantizationConfig], prefix: str
 ) -> bool:
@@ -259,6 +291,26 @@ def should_ignore_layer(
             # case "lm_head". Common practice won't quant lm_head, however.
             if prefix.split(".")[-1] == exclude_layer:
                 return True
+    # Handle packed/merged module names (e.g. "gate_up_proj" -> "gate_proj"/"up_proj",
+    # "qkv_proj" -> "q_proj"/"k_proj"/"v_proj"). The exclude list uses checkpoint
+    # weight names, but the prefix may use the packed parameter name.
+    # The mapping is built from the model's own packed_modules_mapping and stored
+    # on the QuantizationConfig at model init time.
+    packed_components = quantization_config.get("packed_components", {})
+    leaf = prefix.rsplit(".", 1)[-1] if "." in prefix else prefix
+    if leaf in packed_components:
+        parent = prefix.rsplit(".", 1)[0] if "." in prefix else ""
+        for component in packed_components[leaf]:
+            component_path = f"{parent}.{component}" if parent else component
+            for exclude_layer in exclude_layers:
+                if exclude_layer.startswith("re"):
+                    regex_pattern = exclude_layer[3:]
+                    if re.search(regex_pattern, component_path):
+                        return True
+                elif component_path in exclude_layer:
+                    return True
+                elif component_path.split(".")[-1] == exclude_layer:
+                    return True
     return False
 
 
