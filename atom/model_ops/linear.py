@@ -700,6 +700,10 @@ class MergedReplicatedLinear(ReplicatedLinear):
             elif self.quant_type == QuantType.per_Tensor:
                 shard_offset = loaded_shard_id
                 shard_size = 1
+            else:
+                # per_Token and per_1x32: scale dim 0 matches output_size
+                shard_offset = sum(self.output_sizes[:loaded_shard_id])
+                shard_size = self.output_sizes[loaded_shard_id]
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id])
             shard_size = self.output_sizes[loaded_shard_id]
