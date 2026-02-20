@@ -38,6 +38,8 @@ class ScheduledBatch:
         # print(f"{num_scheduled_tokens=}")
         # print(f"{self.scheduled_tokens=}")
         self.temperatures = [seq.temperature for seq in seqs.values()]
+        self.top_ks = [seq.top_k for seq in seqs.values()]
+        self.top_ps = [seq.top_p for seq in seqs.values()]
         self.context_lens = [seq.num_tokens for seq in seqs.values()]
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
