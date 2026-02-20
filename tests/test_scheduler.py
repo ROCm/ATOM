@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/scheduler.py — public API only
 
+import numpy as np
+
 from atom.model_engine.scheduler import Scheduler, ScheduledBatchOutput
 from atom.model_engine.sequence import SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
@@ -121,7 +123,9 @@ class TestPostprocess:
 
     def _output(self, seq_id, tokens):
         return ScheduledBatchOutput(
-            token_ids={seq_id: tuple(tokens)}, draft_token_ids=None
+            token_ids={seq_id: tuple(tokens)},
+            num_rejected=np.zeros(0, dtype=np.int32),
+            draft_token_ids=None,
         )
 
     def test_appends_token(self, scheduler, seq_factory):
@@ -166,7 +170,11 @@ class TestPostprocess:
         sched.schedule()
         finished = sched.postprocess(
             list(sched.running),
-            ScheduledBatchOutput(token_ids={seq.id: (99,)}, draft_token_ids=None),
+            ScheduledBatchOutput(
+                token_ids={seq.id: (99,)},
+                num_rejected=np.zeros(0, dtype=np.int32),
+                draft_token_ids=None,
+            ),
         )
         assert len(finished) == 1
         assert "stop_99" in finished[0].leave_reason

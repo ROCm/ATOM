@@ -370,7 +370,19 @@ class Attention(nn.Module):
         if ctx.is_prefill:
             k_cache = k.unsqueeze(1)
             v_cache = v.unsqueeze(1)
-            block_tables = attn_metadata.fake_block_tables
+            # Create fake block_tables for prefill: each token is its own
+            # "block" (block_size=1).  Shape [num_seqs, max_seqlen_k].
+            batch_size = attn_metadata.cu_seqlens_k.shape[0] - 1
+            max_len = attn_metadata.max_seqlen_k
+            block_tables = torch.zeros(
+                batch_size, max_len, dtype=torch.int32, device=q.device
+            )
+            for i in range(batch_size):
+                s = attn_metadata.cu_seqlens_k[i].item()
+                e = attn_metadata.cu_seqlens_k[i + 1].item()
+                block_tables[i, : e - s] = torch.arange(
+                    s, e, dtype=torch.int32, device=q.device
+                )
 
         o = torch.empty_like(q)
         descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
@@ -407,7 +419,8 @@ class Attention(nn.Module):
         ctx = fwd_ctx.context
 
         if ctx.is_prefill:
-            return self.prefill_attention
+            # Always use Triton prefill (no CK/flash_attn_varlen_func dependency)
+            return self.prefill_attention_triton
         else:
             if self.use_triton_attn:
                 return self.paged_attention_triton

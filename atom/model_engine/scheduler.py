@@ -297,6 +297,7 @@ class Scheduler:
                 continue
             token_ids = prev_token_ids[seq.id]
             num_new_token = len(token_ids)
+            num_rejected = 0
             self.update_spec_stats(num_new_token)
             idx = fwd_output.req_ids.index(seq.id)
             if is_deferred_out or self.use_spec:

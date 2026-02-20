@@ -1,0 +1,69 @@
+# Dockerfile.clean — Wheel-only ATOM/AITER build (zero source compilation)
+#
+# Base: rocm/dev-ubuntu-24.04:7.2-complete (Python 3.12, full ROCm runtime)
+# All packages installed from pre-built wheels — no git clones, no compiles.
+#
+# Option A — from pre-built wheels directory:
+#   cd /home/pensun/ATOM
+#   DOCKER_BUILDKIT=1 docker build \
+#     --build-context wheels=/home/pensun/dist \
+#     -f docker/Dockerfile.clean -t atom:clean .
+#
+# Option B — multi-stage from Dockerfile.wheels builder image:
+#   docker build -f docker/Dockerfile.wheels -t atom:wheels .
+#   DOCKER_BUILDKIT=1 docker build \
+#     --build-context wheels=docker-image://atom:wheels \
+#     -f docker/Dockerfile.clean -t atom:clean .
+#
+# Run:
+#   docker run --rm --device=/dev/kfd --device=/dev/dri \
+#     -v /data2/models:/models atom:clean bash
+
+ARG BASE_IMAGE="rocm/dev-ubuntu-24.04:7.2-complete"
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── 1. System packages (minimal — no build tools needed) ─────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git python3-pip python3-dev \
+        ibverbs-utils libpci-dev locales \
+        openmpi-bin libopenmpi-dev libdw1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages --ignore-installed pip setuptools wheel
+
+# ── 2. Install all pre-built wheels ────────────────────────────────────
+# Uses bind-mount to avoid a 60+ GB COPY layer from the wheels image.
+# Works with both Option A (flat directory) and Option B (docker-image://).
+RUN --mount=type=bind,from=wheels,source=/,target=/mnt/wheels \
+    mkdir -p /tmp/wheels \
+    && find /mnt/wheels -name '*.whl' -exec cp {} /tmp/wheels/ \; \
+    && ls -lhS /tmp/wheels/*.whl \
+    && pip3 install --break-system-packages --no-deps \
+        /tmp/wheels/torch-*.whl \
+        /tmp/wheels/torchvision-*.whl \
+        /tmp/wheels/torchaudio-*.whl \
+        /tmp/wheels/triton-*.whl \
+        /tmp/wheels/triton_kernels-*.whl \
+    && pip3 install --break-system-packages \
+        filelock typing-extensions sympy networkx jinja2 fsspec numpy pillow \
+    && pip3 install --break-system-packages \
+        /tmp/wheels/mori-*.whl \
+        /tmp/wheels/flydsl-*.whl \
+    && pip3 install --break-system-packages \
+        /tmp/wheels/amd_aiter-*.whl \
+    && rm -rf /tmp/wheels \
+    && python3 -c "import torch; print(f'PyTorch {torch.__version__}, ROCm: {torch.version.hip}')" \
+    && python3 -c "import triton; print(f'Triton {triton.__version__}')" \
+    && python3 -c "import aiter; print('AITER OK')" \
+    && python3 -c "import flydsl; print('FlyDSL OK')" \
+    && pip3 show mori && echo "MORI wheel installed OK"
+
+# ── 3. ATOM (from build context — pure Python, instant install) ──────
+COPY . /app/ATOM
+RUN cd /app/ATOM && pip3 install --break-system-packages -e . \
+    && python3 -c "import atom; print('ATOM OK')"
+
+WORKDIR /app/ATOM
+CMD ["/bin/bash"]
