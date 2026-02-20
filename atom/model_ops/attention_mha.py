@@ -419,9 +419,8 @@ class Attention(nn.Module):
         ctx = fwd_ctx.context
 
         if ctx.is_prefill:
-            if self.use_triton_attn:
-                return self.prefill_attention_triton
-            return self.prefill_attention
+            # Always use Triton prefill (no CK/flash_attn_varlen_func dependency)
+            return self.prefill_attention_triton
         else:
             if self.use_triton_attn:
                 return self.paged_attention_triton

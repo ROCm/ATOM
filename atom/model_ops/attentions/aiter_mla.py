@@ -180,6 +180,56 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
+
+        # Prepare paged KV metadata for MLA prefill paths
+        # (needed by mla_prefill_fwd for bf16, unified_attention for fp8)
+        if batch.block_tables:
+            context_lens = np.asarray(batch.context_lens[:bs], dtype=np.int32)
+            num_blocks_per_seq = cdiv(context_lens, self.block_size)
+            kv_indptr = np.cumsum(num_blocks_per_seq)
+            sum_blocks = kv_indptr[-1]
+
+            dst = var["kv_indices"].np
+            offset = 0
+            for i in range(bs):
+                bt = batch.block_tables[i]
+                n = len(bt)
+                dst[offset : offset + n] = bt
+                offset += n
+            sum_blocks_before_converted = offset
+
+            var["kv_indptr"].np[0] = 0
+            var["kv_indptr"].np[1 : bs + 1] = kv_indptr
+
+            attn_metadata.kv_indptr = var["kv_indptr"].copy_to_gpu(bs + 1)
+            attn_metadata.kv_indices = var["kv_indices"].copy_to_gpu(
+                sum_blocks_before_converted
+            )
+            attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+
+            if self.block_ratio > 1:
+                kv_indices_convert_triton(
+                    var["kv_indices"].gpu[:sum_blocks_before_converted],
+                    var["kv_indices_converted"].gpu[:sum_blocks],
+                    var["kv_indptr"].gpu[: bs + 1],
+                    self.block_ratio,
+                    self.block_size,
+                )
+                attn_metadata.kv_indices = var["kv_indices_converted"].gpu[:sum_blocks]
+
+            # Prepare block_tables for unified_attention (fp8 prefill)
+            if attn_metadata.block_tables is None:
+                self.prepare_block_tables(batch)
+                attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+                if self.block_ratio > 1:
+                    block_table_convert_triton(
+                        var["block_tables"].gpu[:bs],
+                        var["block_tables_converted"].gpu[:bs],
+                        var["context_lens"].gpu[:bs],
+                        self.block_ratio,
+                    )
+                    attn_metadata.block_tables = var["block_tables_converted"].gpu[:bs]
+
         if self.is_sparse and attn_metadata.max_seqlen_k > self.index_topk:
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
