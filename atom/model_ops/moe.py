@@ -834,11 +834,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
-        self.use_triton = get_gfx().startswith("gfx94")
-        if self.use_triton:
-            from atom.model_ops.utils import has_triton_kernels
+        from atom.model_ops.utils import has_triton_kernels
 
-            assert has_triton_kernels(), "triton_kernels is not installed"
+        self.use_triton = get_gfx() in ("gfx942", "gfx950") and has_triton_kernels()
+        if not self.use_triton and not _has_ck_moe_sorting():
+            if has_triton_kernels():
+                self.use_triton = True
+                _moe_logger.info(
+                    "CK MOE sorting not available, "
+                    "using Triton MOE kernels for MXFP4"
+                )
 
     def create_weights(
         self,
