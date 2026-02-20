@@ -48,6 +48,206 @@ from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
 
+import logging
+
+_moe_logger = logging.getLogger(__name__)
+
+
+def _has_ck_moe_sorting() -> bool:
+    """Check if CK MOE sorting kernel is available."""
+    try:
+        import importlib
+
+        return importlib.util.find_spec("aiter.jit.module_moe_sorting") is not None
+    except Exception:
+        return False
+
+
+def _per_token_group_quant_fp8(x, group_size, fp8_dtype):
+    """Quantize input tensor to FP8 with per-token-group scaling.
+
+    Args:
+        x: Input tensor of shape (M, K) in bf16/fp16.
+        group_size: Number of elements per quantization group.
+        fp8_dtype: Target FP8 dtype (e.g. torch.float8_e4m3fnuz).
+
+    Returns:
+        x_fp8: Quantized tensor of shape (M, K).
+        scale: Dequantization scale of shape (M, K // group_size).
+    """
+    M, K = x.shape
+    assert K % group_size == 0
+    num_groups = K // group_size
+    x_float = x.float()
+    x_grouped = x_float.view(M, num_groups, group_size)
+    max_abs = x_grouped.abs().amax(dim=-1)  # (M, num_groups)
+    fp8_max = torch.finfo(fp8_dtype).max
+    scale = (max_abs / fp8_max).clamp(min=1e-12)
+    x_scaled = x_grouped / scale.unsqueeze(-1)
+    x_fp8 = x_scaled.clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    x_fp8 = x_fp8.view(M, K)
+    return x_fp8, scale
+
+
+def _triton_fp8_moe(
+    x,
+    w13,
+    w2,
+    topk_weights,
+    topk_ids,
+    w13_scale,
+    w2_scale,
+    top_k,
+    block_quant,
+    quant_type,
+):
+    """Execute FP8 MOE using AITER Triton kernels (no CK dependency).
+
+    Two-stage pipeline:
+      Stage 1 (GEMM1+SiLU): x @ w13^T with SiLU gating
+      Stage 2 (GEMM2): intermediate @ w2^T with routing weight accumulation
+
+    For GEMM2, we reshape the intermediate so each (token, expert_k) pair is
+    treated as an independent token with top_k=1, allowing correct A indexing.
+    """
+    import triton.language as tl
+    from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
+    from aiter.ops.triton.moe.moe_op_silu_fused import fused_moe_silu
+    from aiter.ops.triton.moe.moe_op import fused_moe as triton_fused_moe
+    from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config
+
+    M, hidden_dim = x.shape
+    E = w13.shape[0]
+    inter_dim_2 = w13.shape[1]  # 2 * inter_dim
+    inter_dim = inter_dim_2 // 2
+    # When fused shared experts are enabled, topk_ids has M*(top_k+1) elements
+    actual_top_k = topk_ids.numel() // M
+
+    if block_quant:
+        if quant_type == QuantType.per_1x128:
+            block_shape = [128, 128]
+        elif quant_type == QuantType.per_1x32:
+            block_shape = [1, 32]
+        else:
+            block_shape = None
+    else:
+        block_shape = None
+
+    config = get_optimal_moe_config(dtype=x.dtype, use_fp8_w8a8=True, M=M)
+    block_size_m = config["BLOCK_SIZE_M"]
+    compute_type = tl.bfloat16 if x.dtype == torch.bfloat16 else tl.float16
+
+    # --- Stage 1: Sorting ---
+    max_num_tokens_padded = topk_ids.numel() + E * (block_size_m - 1)
+    sorted_token_ids = torch.empty(
+        max_num_tokens_padded, dtype=torch.int32, device=x.device
+    )
+    sorted_token_ids.fill_(topk_ids.numel())
+    max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
+    expert_ids = torch.empty(max_num_m_blocks, dtype=torch.int32, device=x.device)
+    num_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=x.device)
+
+    moe_align_block_size_triton(
+        topk_ids, E, block_size_m, sorted_token_ids, expert_ids, num_tokens_post_pad
+    )
+
+    # --- Stage 2: GEMM1 with SiLU (x @ w13^T) ---
+    if block_quant and block_shape is not None:
+        block_k = block_shape[1]
+        a_fp8, a_scale = _per_token_group_quant_fp8(x, block_k, w13.dtype)
+    else:
+        a_fp8 = x
+        a_scale = None
+
+    intermediate = torch.zeros(
+        M * actual_top_k, inter_dim, dtype=x.dtype, device=x.device
+    )
+
+    fused_moe_silu(
+        A=a_fp8,
+        B=w13,
+        C=intermediate,
+        A_scale=a_scale,
+        B_scale=w13_scale,
+        B_zp=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_pad,
+        mul_routed_weight=False,
+        top_k=actual_top_k,
+        compute_type=compute_type,
+        use_fp8_w8a8=True,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        block_shape=block_shape,
+        config=config,
+    )
+
+    # --- Stage 3: GEMM2 (intermediate @ w2^T) ---
+    # Reshape for GEMM2: treat each (token, expert_k) as independent token
+    # with top_k=1 so the kernel indexes A correctly (A // top_k = A // 1 = A)
+    gemm2_topk_ids = topk_ids.reshape(M * actual_top_k, 1)
+    gemm2_topk_weights = topk_weights.reshape(M * actual_top_k, 1)
+
+    # Re-sort for GEMM2 with the reshaped topk_ids
+    gemm2_max_padded = gemm2_topk_ids.numel() + E * (block_size_m - 1)
+    gemm2_sorted_ids = torch.empty(gemm2_max_padded, dtype=torch.int32, device=x.device)
+    gemm2_sorted_ids.fill_(gemm2_topk_ids.numel())
+    gemm2_max_blocks = (gemm2_max_padded + block_size_m - 1) // block_size_m
+    gemm2_expert_ids = torch.empty(gemm2_max_blocks, dtype=torch.int32, device=x.device)
+    gemm2_num_pad = torch.empty(1, dtype=torch.int32, device=x.device)
+
+    moe_align_block_size_triton(
+        gemm2_topk_ids,
+        E,
+        block_size_m,
+        gemm2_sorted_ids,
+        gemm2_expert_ids,
+        gemm2_num_pad,
+    )
+
+    # Quantize intermediate for FP8 GEMM2
+    if block_quant and block_shape is not None:
+        block_k2 = block_shape[1]
+        inter_fp8, inter_scale = _per_token_group_quant_fp8(
+            intermediate, block_k2, w2.dtype
+        )
+    else:
+        inter_fp8 = intermediate
+        inter_scale = None
+
+    output = torch.zeros(
+        M * actual_top_k, 1, hidden_dim, dtype=x.dtype, device=x.device
+    )
+
+    triton_fused_moe(
+        A=inter_fp8,
+        B=w2,
+        C=output,
+        A_scale=inter_scale,
+        B_scale=w2_scale,
+        B_zp=None,
+        topk_weights=gemm2_topk_weights,
+        topk_ids=gemm2_topk_ids,
+        sorted_token_ids=gemm2_sorted_ids,
+        expert_ids=gemm2_expert_ids,
+        num_tokens_post_padded=gemm2_num_pad,
+        mul_routed_weight=True,
+        top_k=1,
+        compute_type=compute_type,
+        use_fp8_w8a8=True,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        block_shape=block_shape,
+        config=config,
+    )
+
+    # Reduce: sum across top_k experts per token
+    result = output.squeeze(1).view(M, actual_top_k, hidden_dim).sum(dim=1)
+    return result
+
 
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
@@ -634,11 +834,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
-        self.use_triton = get_gfx().startswith("gfx94")
-        if self.use_triton:
-            from atom.model_ops.utils import has_triton_kernels
+        from atom.model_ops.utils import has_triton_kernels
 
-            assert has_triton_kernels(), "triton_kernels is not installed"
+        self.use_triton = get_gfx() in ("gfx942", "gfx950") and has_triton_kernels()
+        if not self.use_triton and not _has_ck_moe_sorting():
+            if has_triton_kernels():
+                self.use_triton = True
+                _moe_logger.info(
+                    "CK MOE sorting not available, "
+                    "using Triton MOE kernels for MXFP4"
+                )
 
     def create_weights(
         self,
@@ -980,6 +1185,14 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 self.block_n = 1
                 self.block_k = 32
 
+        # Detect CK MOE availability; fall back to Triton MOE if unavailable
+        self.use_triton_moe = not _has_ck_moe_sorting()
+        if self.use_triton_moe:
+            _moe_logger.info(
+                "CK MOE sorting not available, using Triton MOE kernels "
+                "for CompressedTensors FP8"
+            )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1220,16 +1433,18 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Shuffle weights for asm moe (moved from inference to load time for better performance)
-        if w13.dtype in [
-            torch.int8,
-            torch.uint8,
-            torch.float8_e4m3fnuz,
-            torch.float8_e4m3fn,
-        ]:
-            from aiter.ops.shuffle import shuffle_weight
+        # Skip shuffle when using Triton path (Triton expects standard row-major)
+        if not self.use_triton_moe:
+            if w13.dtype in [
+                torch.int8,
+                torch.uint8,
+                torch.float8_e4m3fnuz,
+                torch.float8_e4m3fn,
+            ]:
+                from aiter.ops.shuffle import shuffle_weight
 
-            w13.data = shuffle_weight(w13.data)
-            w2.data = shuffle_weight(w2.data)
+                w13.data = shuffle_weight(w13.data)
+                w2.data = shuffle_weight(w2.data)
 
         # Call parent class for any additional processing
         super().process_weights_after_loading(layer)
@@ -1298,6 +1513,21 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
 
+        # Triton MOE fallback when CK is not available
+        if self.use_triton_moe:
+            return _triton_fp8_moe(
+                x=x,
+                w13=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                top_k=top_k,
+                block_quant=self.block_quant,
+                quant_type=self.quant_type,
+            )
+
         # Use modular kernel if available (for EP/DP setups)
         # Otherwise fall back to direct kernel call
         if self.fused_experts is not None:
@@ -1362,6 +1592,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
             self.quant_dtype == torch.float8_e4m3fnuz
         )
+        # Detect CK MOE availability; fall back to Triton MOE if unavailable
+        self.use_triton_moe = not _has_ck_moe_sorting()
+        if self.use_triton_moe:
+            _moe_logger.info(
+                "CK MOE sorting not available, using Triton MOE kernels for FP8"
+            )
 
     def create_weights(
         self,
@@ -1525,7 +1761,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = nn.Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale = nn.Parameter(w2_weight_scale, requires_grad=False)
 
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
+            if not self.use_triton_moe:
+                shuffle_weights(layer.w13_weight, layer.w2_weight)
 
             return
         else:
@@ -1597,7 +1834,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
                     start += shard_size
 
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
+            if not self.use_triton_moe:
+                shuffle_weights(layer.w13_weight, layer.w2_weight)
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales, requires_grad=False
@@ -1647,6 +1885,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        # Triton MOE fallback when CK is not available
+        if self.use_triton_moe:
+            return _triton_fp8_moe(
+                x=x,
+                w13=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                top_k=top_k,
+                block_quant=self.block_quant,
+                quant_type=self.quant_type,
+            )
         # per_Tensor not support num_local_tokens so not use mori
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
             return torch.ops.aiter.rocm_aiter_fused_moe(

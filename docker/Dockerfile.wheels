@@ -1,0 +1,159 @@
+# Dockerfile.wheels — Build/download all wheels for ATOM clean install
+#
+# Produces /wheels/ containing:
+#   torch, torchvision, torchaudio  (pulled from PyTorch nightly)
+#   triton 3.5.x                   (built from ROCm/triton source)
+#   triton_kernels                  (built from ROCm/triton source)
+#   flydsl                          (built from FlyDSL source + embedded MLIR runtime)
+#   mori                            (built from MORI source)
+#   amd_aiter                       (built with ENABLE_CK=0 + pre-compiled Triton kernels)
+#
+# Usage (standalone — extract wheels to host):
+#   docker build -f docker/Dockerfile.wheels -t atom:wheels .
+#   docker run --rm atom:wheels tar cf - /wheels | tar xf - -C /home/pensun/dist --strip-components=1
+#
+# Usage (multi-stage — pipe directly into Dockerfile.clean):
+#   DOCKER_BUILDKIT=1 docker build \
+#     --build-context wheels=docker-image://atom:wheels \
+#     -f docker/Dockerfile.clean -t atom:clean .
+
+ARG BASE_IMAGE="rocm/dev-ubuntu-24.04:7.2-complete"
+FROM ${BASE_IMAGE}
+
+ARG GPU_ARCH="gfx942;gfx950"
+ARG AITER_REPO="https://github.com/sunway513/aiter.git"
+ARG AITER_BRANCH="feat/prebuild-triton"
+ARG FLYDSL_REPO="https://github.com/ROCm/FlyDSL.git"
+ARG FLYDSL_BRANCH="main"
+ARG LLVM_COMMIT="04f968b02917"
+ARG MORI_REPO="https://github.com/ROCm/mori.git"
+ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG MAX_JOBS=""
+ARG PREBUILD_TRITON=1
+
+ENV GPU_ARCH_LIST=${GPU_ARCH}
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── 1. System packages + build tools ────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git cmake ninja-build \
+        python3-pip python3-dev python3-venv \
+        ibverbs-utils libpci-dev locales \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages --ignore-installed \
+        pip setuptools wheel build
+
+RUN mkdir -p /wheels
+
+# ── 2. Pull PyTorch ROCm 7.2 nightly wheels ─────────────────────────
+RUN pip3 download --no-deps --dest /wheels \
+        torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+
+# ── 3. Build Triton 3.5.x from ROCm fork ────────────────────────────
+RUN git clone --depth=1 --branch release/internal/3.5.x \
+        https://github.com/ROCm/triton.git /build/triton
+
+RUN cd /build/triton \
+    && pip3 install --break-system-packages -r python/requirements.txt \
+    && pip3 install --break-system-packages filecheck \
+    && MAX_JOBS=${MAX_JOBS:-64} pip3 wheel \
+        --no-build-isolation --no-deps -w /wheels . \
+    && ls -lh /wheels/triton-*.whl
+
+# Build triton_kernels wheel
+RUN cd /build/triton/python/triton_kernels \
+    && pip3 wheel --no-deps -w /wheels . \
+    && ls -lh /wheels/triton_kernels-*.whl
+
+# ── 4. Build LLVM/MLIR for FlyDSL ───────────────────────────────────
+# Blobless clone (~6 min vs ~30 min full clone). LLVM_COMMIT rarely
+# changes, so this layer stays cached across most rebuilds.
+RUN pip3 install --break-system-packages nanobind numpy pybind11
+
+RUN git clone --filter=blob:none --no-checkout \
+        https://github.com/ROCm/llvm-project.git /build/llvm-project \
+    && cd /build/llvm-project \
+    && git fetch origin amd-staging \
+    && git checkout ${LLVM_COMMIT}
+
+RUN mkdir -p /build/llvm-project/buildmlir \
+    && cd /build/llvm-project/buildmlir \
+    && NANOBIND_DIR=$(python3 -c "import nanobind; import os; print(os.path.dirname(nanobind.__file__) + '/cmake')") \
+    && cmake -G Ninja \
+        -S /build/llvm-project/llvm \
+        -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+        -DLLVM_TARGETS_TO_BUILD="X86;NVPTX;AMDGPU" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_STANDARD=17 \
+        -DLLVM_ENABLE_ASSERTIONS=ON \
+        -DLLVM_INSTALL_UTILS=ON \
+        -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
+        -DPython3_EXECUTABLE=$(which python3) \
+        -Dnanobind_DIR="$NANOBIND_DIR" \
+        -DBUILD_SHARED_LIBS=OFF \
+    && cmake --build . -j$(nproc) \
+    && cmake --install . --prefix /build/llvm-project/mlir_install
+
+# ── 5. Install torch + triton (needed for AITER/MORI builds) ────────
+RUN pip3 install --break-system-packages --no-deps \
+        /wheels/torch-*.whl /wheels/triton-3.5*.whl \
+    && pip3 install --break-system-packages \
+        filelock typing-extensions sympy networkx jinja2 fsspec numpy
+
+# ── 6. Build FlyDSL wheel ───────────────────────────────────────────
+RUN git clone --depth=1 --branch ${FLYDSL_BRANCH} ${FLYDSL_REPO} /build/FlyDSL
+
+RUN cd /build/FlyDSL \
+    && export MLIR_PATH=/build/llvm-project/mlir_install \
+    && bash flir/build.sh \
+    && export FLIR_IN_BUILD_SH=1 \
+    && pip3 install --break-system-packages auditwheel patchelf \
+    && python3 setup.py bdist_wheel \
+    && cp dist/flydsl-*.whl /wheels/ \
+    && ls -lh /wheels/flydsl-*.whl
+
+# ── 7. Build MORI wheel ─────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openmpi-bin libopenmpi-dev cython3 libdw1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Patch PyTorch's Caffe2Config.cmake: the ROCm nightly wheel's config
+# hard-errors when CUDA toolkit is not found, even though we only need ROCm.
+# Convert the fatal error to a warning so MORI (and other torch-cmake users)
+# can build against the ROCm PyTorch wheel without CUDA installed.
+RUN CAFFE2_CFG=$(python3 -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'share/cmake/Caffe2/Caffe2Config.cmake')") \
+    && sed -i 's/message(FATAL_ERROR "Your installed Caffe2 version uses CUDA/message(WARNING "Skipped: Your installed Caffe2 version uses CUDA/' "$CAFFE2_CFG"
+
+RUN git clone ${MORI_REPO} /build/mori \
+    && cd /build/mori \
+    && git checkout ${MORI_COMMIT} \
+    && grep -iv '^torch\|^triton' requirements-build.txt \
+        | pip3 install --break-system-packages -r /dev/stdin \
+    && git submodule update --init --recursive \
+    && pip3 wheel --no-build-isolation --no-deps -w /wheels . \
+    && ls -lh /wheels/mori-*.whl
+
+# ── 8. Build AITER wheel (ENABLE_CK=0, pre-compiled Triton kernels) ──
+RUN git clone --depth=1 --branch ${AITER_BRANCH} ${AITER_REPO} /build/aiter
+
+# Set AITER build env for all subsequent commands in this layer
+RUN cd /build/aiter \
+    && pip3 install --break-system-packages -r requirements.txt \
+    && export ENABLE_CK=0 PREBUILD_TRITON=${PREBUILD_TRITON} \
+              PREBUILD_TRITON_ARCHS="gfx942,gfx950" \
+              MAX_JOBS=${MAX_JOBS} GPU_ARCHS=${GPU_ARCH_LIST} \
+    && pip3 install --break-system-packages --no-build-isolation -e . \
+    && python3 -c "import aiter; print('editable install OK')" \
+    && echo "install" > aiter/install_mode \
+    && python3 setup.py bdist_wheel \
+    && cp dist/amd_aiter-*.whl /wheels/ \
+    && ls -lh /wheels/amd_aiter-*.whl
+
+# ── 9. Summary ──────────────────────────────────────────────────────
+RUN echo "=== Wheel inventory ===" && ls -lhS /wheels/*.whl && echo "=== Done ==="
+
+WORKDIR /wheels
+CMD ["ls", "-lhS", "/wheels/"]

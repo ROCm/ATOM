@@ -396,19 +396,22 @@ class MLAAttention(nn.Module):
 
             k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
-        output = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=attn_metadata.cu_seqlens_q,
-            cu_seqlens_k=attn_metadata.cu_seqlens_k,
-            max_seqlen_q=attn_metadata.max_seqlen_q,
-            max_seqlen_k=attn_metadata.max_seqlen_k,
-            min_seqlen_q=attn_metadata.min_seqlen_q,
-            dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
-            causal=True,
-        )
+        # Use PyTorch SDPA for MLA prefill attention (no CK dependency)
+        import torch.nn.functional as F
+
+        cu_q = attn_metadata.cu_seqlens_q
+        cu_k = attn_metadata.cu_seqlens_k
+        num_seqs = cu_q.shape[0] - 1
+        outputs = []
+        for i in range(num_seqs):
+            qi = q[cu_q[i] : cu_q[i + 1]].transpose(0, 1).unsqueeze(0)
+            ki = k[cu_k[i] : cu_k[i + 1]].transpose(0, 1).unsqueeze(0)
+            vi = v[cu_k[i] : cu_k[i + 1]].transpose(0, 1).unsqueeze(0)
+            oi = F.scaled_dot_product_attention(
+                qi, ki, vi, is_causal=True, scale=self.scale
+            )
+            outputs.append(oi.squeeze(0).transpose(0, 1))
+        output = torch.cat(outputs, dim=0)
 
         return self.o_proj(output.flatten(start_dim=-2))
 

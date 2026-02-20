@@ -34,6 +34,11 @@ if has_triton_kernels():
         from triton_kernels.matmul_ogs import FnSpecs, FusedActivation, matmul_ogs
         from triton_kernels.routing import routing
         from triton_kernels.matmul_ogs import PrecisionConfig
+        from triton_kernels.matmul_ogs import update_opt_flags_constraints
+
+        if get_gfx() == "gfx950":
+            # MI355X has 160KB LDS; default CDNA4 block_m=256 exceeds it.
+            update_opt_flags_constraints({"block_m": 128})
     except (AttributeError, ImportError) as e:
         logger.error(
             "Failed to import Triton kernels. Please make sure your triton "
@@ -53,9 +58,9 @@ def _swizzle_mxfp4(quant_tensor, scale):
     scale_layout_opts: dict[str, Any] = {}
     value_layout = StridedLayout
     if get_gfx() == "gfx950":
-        from triton_kernels.tensor_details.layout import GFX950MXScaleLayout
+        from triton_kernels.tensor_details.layout import CDNA4MXScaleLayout
 
-        scale_layout = GFX950MXScaleLayout
+        scale_layout = CDNA4MXScaleLayout
     else:
         scale_layout = StridedLayout
 

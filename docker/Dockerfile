@@ -14,6 +14,8 @@ ARG AITER_COMMIT="HEAD"
 ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
+# Set ENABLE_CK=0 to skip CK/ASM modules for a fast Triton-only AITER build
+ARG ENABLE_CK=1
 
 RUN pip install --upgrade pip
 RUN pip install lm-eval[api]
@@ -63,6 +65,10 @@ RUN git clone --depth=1 --branch release/internal/3.5.x https://github.com/ROCm/
   MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
 RUN pip show triton || true
 
+# Install triton_kernels (required for MXFP4 MoE on gfx94x)
+RUN pip install --no-deps -e /triton-test/python/triton_kernels/
+RUN pip show triton-kernels || true
+
 # Install Aiter
 RUN mkdir -p /app
 RUN pip uninstall -y aiter || true
@@ -70,8 +76,11 @@ RUN git clone $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
-    git submodule sync && git submodule update --init --recursive && \
-    MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+    if [ "$ENABLE_CK" != "0" ]; then \
+        git submodule sync && git submodule update --init --recursive; \
+    fi && \
+    ENABLE_CK=$ENABLE_CK MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
+        GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 RUN pip show amd-aiter || true
 
 
