@@ -1257,6 +1257,7 @@ class ModelRunner:
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
+            is_dummy_run=batch.is_dummy_run,
             batch_size=context_bs,
             graph_bs=graph_bs,
         )
@@ -1437,6 +1438,7 @@ class ModelRunner:
             target_token_ids=input_ids,
             target_positions=positions,
             target_hidden_states=hidden_states,
+            num_reject_tokens=num_reject_tokens,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
         )
@@ -1465,6 +1467,7 @@ class ModelRunner:
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
+        self.forward_vars["kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_pool = None

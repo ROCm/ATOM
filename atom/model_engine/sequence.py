@@ -64,7 +64,6 @@ class Sequence:
 
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)
-        self.num_placeholder = 0
 
         # statistics fields
         self.arrive_time = 0.0

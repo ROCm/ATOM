@@ -540,6 +540,7 @@ class MLAAttention(nn.Module):
             paged_kv_indices,
             attn_metadata.kv_last_page_lens,
             attn_metadata.max_seqlen_q,
+            num_kv_splits=16,
             sm_scale=self.scale,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
@@ -570,20 +571,7 @@ class MLAAttention(nn.Module):
             self.topk_indices_buffer is not None
             and attn_metadata.max_seqlen_k > self.topk_indices_buffer.shape[1]
         )
-        if attn_metadata.slot_mapping.numel():
-            # not dummy run
-            kv_cache_data = forward_context.kv_cache_data
-            if f"layer_{self.layer_num}" in kv_cache_data:
-                kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
-            else:
-                kv_cache = torch.tensor([])
-        slot_mapping_numel = (
-            attn_metadata.slot_mapping.numel()
-            if attn_metadata.slot_mapping is not None
-            else 0
-        )
-        is_dummy = slot_mapping_numel == 0
-        if is_dummy:
+        if forward_context.context.is_dummy_run:
             # dummy run: skip real attention and return
             output_shape = list(q.shape)
             output_shape[-1] = 7168
@@ -591,6 +579,8 @@ class MLAAttention(nn.Module):
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output
+        kv_cache_data = forward_context.kv_cache_data
+        kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
