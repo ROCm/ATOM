@@ -50,6 +50,7 @@ class EagleProposer:
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
+        self.arrange_bs = torch.arange(max_bs + 1, **i32_kwargs)
         self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
         self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
         self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
@@ -97,12 +98,14 @@ class EagleProposer:
         # [num_tokens, hidden_size]
         target_hidden_states: torch.Tensor,
         # [batch]
+        num_reject_tokens: torch.Tensor,
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
     ) -> torch.Tensor:
 
         forward_context = get_forward_context()
         context = forward_context.context
+        attn_metadata = forward_context.attn_metadata
         context.is_draft = True
         bs = context.batch_size
 
@@ -116,23 +119,53 @@ class EagleProposer:
         draft_token_ids = torch.empty(
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
+        # return draft_token_ids.fill_(1) # for debug
         for i in range(self.mtp_k):
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
                 hidden_states=hidden_states,
             )
-            sample_hidden_states = ret_hidden_states[last_token_indices]
+            sample_hidden_states = (
+                ret_hidden_states[last_token_indices] if i == 0 else ret_hidden_states
+            )
             logits = self.model.compute_logits(sample_hidden_states)
             new_draft_ids = logits.argmax(dim=-1)
             draft_token_ids[:, i] = new_draft_ids
 
             if i < self.mtp_k - 1:
+                if context.is_prefill:
+                    # TODO: currently we only support prefill for the first step, as the metadata preparation is a bit tricky. We can consider supporting prefill for subsequent steps in the future if needed.
+                    break
+                if i == 0:
+                    var = self.runner.forward_vars
+                    kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+                    kv_indices = var["kv_indices"].gpu
+                    slot_mapping = var["slot_mapping"].gpu[:bs]
+                    kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+                    attn_metadata.kv_indptr = kv_indptr
+                    attn_metadata.kv_indices = kv_indices
+                    attn_metadata.slot_mapping = slot_mapping
+                    attn_metadata.kv_last_page_lens = kv_last_page_lens
+                    positions = positions[last_token_indices]
+                    attn_metadata.max_seqlen_q = 1
+                    attn_metadata.cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
+                    kv_indptr[1 : bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
+                    context.is_prefill = False
+
                 # update metadata
+                attn_metadata.max_seqlen_k += 1
+                workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
+                    bs, attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k
+                )
+                for k, v in workinfos.items():
+                    attn_metadata.__dict__[k] = v
+                slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
                 input_ids = new_draft_ids
-                positions = positions[last_token_indices] + 1
+                positions += 1
                 hidden_states = sample_hidden_states
 
+        # self.runner.debug(f"{draft_token_ids=}")
         # [batch_size, mtp_k]
         return draft_token_ids
 
@@ -146,16 +179,16 @@ class EagleProposer:
         attn_metadata = forward_context.attn_metadata
 
         cu_seqlens_q = attn_metadata.cu_seqlens_q
-        context_lens = attn_metadata.context_lens
+        # context_lens = attn_metadata.context_lens
 
         # Only use decode sequences' context_lens and cu_seqlens_q (num_rejected_tokens length matches decode sequences)
         # These may contain padding, so we need to slice to match num_rejected_tokens length
-        context_lens = context_lens[:scheduled_bs]
+        # context_lens = context_lens[:scheduled_bs]
         # cu_seqlens_q has length scheduled_bs + 1 (includes 0 at start)
         cu_seqlens_q = cu_seqlens_q[: scheduled_bs + 1]
 
         # Calculate new sequence lengths
-        context_lens += 1
+        # context_lens += 1
 
         token_indices = cu_seqlens_q[1:] - last_token_offset
 

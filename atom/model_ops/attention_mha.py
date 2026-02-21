@@ -69,7 +69,7 @@ class Attention(nn.Module):
         fwd_ctx: ForwardContext = get_forward_context()
 
         # dummy run will skip attention in cuda graph capture phase
-        if fwd_ctx.attn_metadata.slot_mapping.numel() == 0:
+        if fwd_ctx.context.is_dummy_run:
             o = torch.empty_like(q)
             return o
 

@@ -15,6 +15,65 @@ from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 logger = logging.getLogger("atom")
 
 
+class SpecStats:
+    """Tracks speculative decoding acceptance statistics."""
+
+    __slots__ = ("mtp_k", "total_draft_tokens", "distribution", "_log_interval")
+
+    def __init__(self, mtp_k: int, log_interval: int = 1000):
+        self.mtp_k = mtp_k
+        self._log_interval = log_interval
+        self.total_draft_tokens: int = 0
+        self.distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
+
+    def update(self, num_accepted_tokens: int) -> None:
+        """Record acceptance result for one sequence in one decode step."""
+        self.total_draft_tokens += self.mtp_k
+        num_bonus = num_accepted_tokens - 1
+        self.distribution[num_bonus] += 1
+
+        if self.total_draft_tokens % self._log_interval < self.mtp_k:
+            self._log()
+
+    @property
+    def total_accepted(self) -> int:
+        """Total number of accepted bonus tokens across all steps."""
+        return sum(k * v for k, v in self.distribution.items())
+
+    @property
+    def total_steps(self) -> int:
+        """Total number of decode steps recorded."""
+        return sum(self.distribution.values())
+
+    @property
+    def acceptance_rate(self) -> float:
+        if self.total_draft_tokens == 0:
+            return 0.0
+        return self.total_accepted / self.total_draft_tokens
+
+    def get_statistics(self) -> dict:
+        """Return a summary dict compatible with engine_core reporting."""
+        return {
+            "total_draft_tokens": self.total_draft_tokens,
+            "total_accepted_tokens": self.total_accepted,
+            "acceptance_rate": self.acceptance_rate,
+            "distribution": dict(self.distribution),
+        }
+
+    def reset(self) -> None:
+        self.total_draft_tokens = 0
+        self.distribution = {k: 0 for k in range(self.mtp_k + 1)}
+
+    def _log(self) -> None:
+        ts = self.total_steps
+        logger.info(
+            f"[MTP Stats] Average toks/fwd: {1+self.total_accepted / ts:.2f}, "
+            f"Accepted/Total Draft tokens: {self.total_accepted}/{self.total_draft_tokens}, "
+            f"Acceptance rate: {self.acceptance_rate:.2%}, "
+            f"Accepted tokens distribution: { {k: f'{v / ts:.2%}' for k, v in self.distribution.items()} }"
+        )
+
+
 class ScheduledBatch:
     def __init__(
         self,
@@ -91,7 +150,6 @@ class ScheduledBatch:
         # logger.info(f"{self.context_lens=}")
         # logger.info(f"{[len(blk)*16 for blk in self.block_tables]=}")
         # logger.info(f"{self.block_tables=}")
-        # logger.info(f"{[seq.num_placeholder for seq in seqs.values()]=}")
 
 
 class ScheduledBatchOutput:
@@ -140,8 +198,9 @@ class Scheduler:
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
-        self.total_draft_tokens = 0
-        self.total_accepted_tokens = 0
+        self.spec_stats: Optional[SpecStats] = (
+            SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
+        )
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -224,7 +283,6 @@ class Scheduler:
                 num_seqs_decode += 1
                 num_new_tokens = self.mtp_k + 1
                 self.block_manager.may_append(seq, num_new_tokens)
-                # self.block_manager.may_append(seq, seq.num_placeholder)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
@@ -257,19 +315,6 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def update_spec_stats(self, num_accepted_tokens):
-        self.total_draft_tokens += self.mtp_k
-        self.total_accepted_tokens += num_accepted_tokens - self.mtp_k
-
-        # Log MTP acceptance statistics periodically
-        if self.total_draft_tokens > 0 and self.total_draft_tokens % 1000 == 0:
-            acceptance_rate = self.total_accepted_tokens / self.total_draft_tokens
-            logger.info(
-                f"[MTP Stats] Total draft tokens: {self.total_draft_tokens}, "
-                f"Accepted: {self.total_accepted_tokens}, "
-                f"Acceptance rate: {acceptance_rate:.2%}"
-            )
-
     def postprocess(
         self,
         seqs: list[Sequence],
@@ -293,23 +338,21 @@ class Scheduler:
 
         for seq in self.running:
             if seq.id not in fwd_output.req_ids:
-                seq.num_placeholder = num_placeholder
                 continue
             token_ids = prev_token_ids[seq.id]
             num_new_token = len(token_ids)
-            self.update_spec_stats(num_new_token)
+            if self.spec_stats:
+                self.spec_stats.update(num_new_token)
             idx = fwd_output.req_ids.index(seq.id)
             if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
-                offset = (
-                    num_new_token + num_rejected - self.mtp_k if self.use_spec else 0
-                )
+                offset = 0 if (num_new_token + num_rejected) == 1 else self.mtp_k
                 seq.num_rejected = num_rejected
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
                 # logger.info(
-                #     f"{seq.id=}, {num_new_token=} {num_rejected=} {seq.token_ids[-5:]=}"
+                #     f"{seq.id=}, {num_new_token=} {num_rejected=} {self.mtp_k} {token_ids=} {seq.token_ids[-8:]=}"
                 # )
 
             else:
@@ -317,9 +360,6 @@ class Scheduler:
                     seq.append_token(token_id)
             new_tokens = token_ids
 
-            if need_placeholder:
-                seq.num_placeholder = 1 + self.mtp_k - num_rejected
-                # seq.num_placeholder = 1 + self.mtp_k
             if self.mtp_k > 0:
                 idx = fwd_output.req_ids.index(seq.id)
                 seq.spec_token_ids = draft_token_ids[idx]
@@ -331,22 +371,15 @@ class Scheduler:
             leave_reason = None
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
-                if len(seq.token_ids) >= len(stop_seq):
-                    stop_len = len(stop_seq)
-                    is_normal_stop = seq.token_ids[-stop_len:] == stop_seq
-                    is_mtp_stop = False
-                    if self.use_spec:
-                        for i in range(num_new_token):
-                            offset = num_tokens - i
-                            if seq.token_ids[offset - stop_len : offset] == stop_seq:
-                                is_mtp_stop = True
-                                break
-                    # is_mtp_stop = (
-                    #     self.use_spec
-                    #     and seq.token_ids[num_tokens - stop_len : num_tokens]
-                    #     == stop_seq
-                    # )
-                    if is_normal_stop or is_mtp_stop:
+                stop_len = len(stop_seq)
+                if num_tokens >= stop_len:
+                    is_stop = False
+                    for i in range(num_new_token):
+                        offset = num_tokens - i
+                        if seq.token_ids[offset - stop_len : offset] == stop_seq:
+                            is_stop = True
+                            break
+                    if is_stop:
                         leave_reason = "stop_sequence"
                         break
             else:
@@ -382,6 +415,9 @@ class Scheduler:
                 )
 
             if leave_reason is not None:
+                # logger.info(
+                #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
+                # )
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
@@ -394,10 +430,11 @@ class Scheduler:
             # placeholder for the each decode step
             for seq in seqs:
                 if seq.status == SequenceStatus.RUNNING:
-                    for _ in range(seq.num_placeholder):
+                    num = num_placeholder - seq.num_rejected
+                    for _ in range(num):
                         seq.append_token(self.eos_token_id)
                     # logger.info(
-                    #     f"{seq.id=}, added {seq.num_placeholder}, total tokens now: {seq.num_tokens}"
+                    #     f"{seq.id=}, added {num}, total tokens now: {seq.num_tokens}"
                     # )
         for seq in finished_seqs:
             self.block_manager.deallocate(seq)
