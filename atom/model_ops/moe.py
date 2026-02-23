@@ -2381,10 +2381,16 @@ class FusedMoE(torch.nn.Module):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-        if expert_data.dtype != dtypes.fp4x2:
-            expert_data.copy_(loaded_weight)
-        else:
+        if expert_data.dtype == dtypes.fp4x2:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+        elif loaded_weight.dtype == torch.uint8 and expert_data.element_size() > 1:
+            # MXFP4 per-expert: packed FP4 bytes stored in a wider-dtype
+            # parameter (e.g. bf16).  Raw byte copy into the leading bytes
+            # of each element so that shuffle_weight operates correctly.
+            dst = expert_data.view(torch.uint8)
+            dst[..., :loaded_weight.shape[-1]].copy_(loaded_weight)
+        else:
+            expert_data.copy_(loaded_weight)
 
     def _load_w2(
         self,
@@ -2404,10 +2410,14 @@ class FusedMoE(torch.nn.Module):
                 shard_dim, shard_size * tp_rank, shard_size
             )
         # w2, down_proj: Load into only logical weight of w2.
-        if expert_data.dtype != dtypes.fp4x2:
-            expert_data.copy_(loaded_weight)
-        else:
+        if expert_data.dtype == dtypes.fp4x2:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+        elif loaded_weight.dtype == torch.uint8 and expert_data.element_size() > 1:
+            # MXFP4 per-expert: same raw byte copy as _load_w13.
+            dst = expert_data.view(torch.uint8)
+            dst[..., :loaded_weight.shape[-1]].copy_(loaded_weight)
+        else:
+            expert_data.copy_(loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
