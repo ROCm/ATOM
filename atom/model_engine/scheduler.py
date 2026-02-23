@@ -18,22 +18,35 @@ logger = logging.getLogger("atom")
 class SpecStats:
     """Tracks speculative decoding acceptance statistics."""
 
-    __slots__ = ("mtp_k", "total_draft_tokens", "distribution", "_log_interval")
+    __slots__ = (
+        "mtp_k",
+        "total_draft_tokens",
+        "distribution",
+        "_log_interval",
+        "_interval_draft_tokens",
+        "_interval_distribution",
+    )
 
     def __init__(self, mtp_k: int, log_interval: int = 1000):
         self.mtp_k = mtp_k
         self._log_interval = log_interval
         self.total_draft_tokens: int = 0
         self.distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
+        # Per-interval tracking
+        self._interval_draft_tokens: int = 0
+        self._interval_distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
 
     def update(self, num_accepted_tokens: int) -> None:
         """Record acceptance result for one sequence in one decode step."""
         self.total_draft_tokens += self.mtp_k
+        self._interval_draft_tokens += self.mtp_k
         num_bonus = num_accepted_tokens - 1
         self.distribution[num_bonus] += 1
+        self._interval_distribution[num_bonus] += 1
 
         if self.total_draft_tokens % self._log_interval < self.mtp_k:
             self._log()
+            self._reset_interval()
 
     @property
     def total_accepted(self) -> int:
@@ -63,11 +76,30 @@ class SpecStats:
     def reset(self) -> None:
         self.total_draft_tokens = 0
         self.distribution = {k: 0 for k in range(self.mtp_k + 1)}
+        self._reset_interval()
+
+    def _reset_interval(self) -> None:
+        self._interval_draft_tokens = 0
+        self._interval_distribution = {k: 0 for k in range(self.mtp_k + 1)}
 
     def _log(self) -> None:
         ts = self.total_steps
+        # Interval stats
+        iv_steps = sum(self._interval_distribution.values())
+        iv_accepted = sum(k * v for k, v in self._interval_distribution.items())
+        iv_rate = (
+            iv_accepted / self._interval_draft_tokens
+            if self._interval_draft_tokens > 0
+            else 0.0
+        )
         logger.info(
-            f"[MTP Stats] Average toks/fwd: {1+self.total_accepted / ts:.2f}, "
+            f"[MTP Stats Interval] Average toks/fwd: {1 + iv_accepted / iv_steps:.2f}, "
+            f"Accepted/Total Draft tokens: {iv_accepted}/{self._interval_draft_tokens}, "
+            f"Acceptance rate: {iv_rate:.2%}, "
+            f"Accepted tokens distribution: { {k: f'{v / iv_steps:.2%}' for k, v in self._interval_distribution.items()} }"
+        )
+        logger.info(
+            f"[MTP Stats         ] Average toks/fwd: {1+self.total_accepted / ts:.2f}, "
             f"Accepted/Total Draft tokens: {self.total_accepted}/{self.total_draft_tokens}, "
             f"Acceptance rate: {self.acceptance_rate:.2%}, "
             f"Accepted tokens distribution: { {k: f'{v / ts:.2%}' for k, v in self.distribution.items()} }"

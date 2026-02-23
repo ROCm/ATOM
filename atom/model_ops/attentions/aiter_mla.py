@@ -242,7 +242,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sum_scheduled_tokens + 1
             )
 
-        if batch.num_spec_step > 1:
+        if hasattr(self.model_runner, "drafter"):
             attn_metadata.kv_indices = var["kv_indices"].gpu
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
@@ -254,7 +254,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
-        max_seqlen_q = batch.num_spec_step + 1
+        max_seqlen_q = 1
+        if hasattr(self.model_runner, "drafter"):
+            max_seqlen_q = self.model_runner.drafter.mtp_k + 1
 
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)

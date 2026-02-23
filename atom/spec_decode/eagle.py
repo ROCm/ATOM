@@ -120,6 +120,7 @@ class EagleProposer:
             bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
         )
         # return draft_token_ids.fill_(1) # for debug
+        var = self.runner.forward_vars
         for i in range(self.mtp_k):
             ret_hidden_states = self.model(
                 input_ids=input_ids,
@@ -134,11 +135,7 @@ class EagleProposer:
             draft_token_ids[:, i] = new_draft_ids
 
             if i < self.mtp_k - 1:
-                if context.is_prefill:
-                    # TODO: currently we only support prefill for the first step, as the metadata preparation is a bit tricky. We can consider supporting prefill for subsequent steps in the future if needed.
-                    break
                 if i == 0:
-                    var = self.runner.forward_vars
                     kv_indptr = var["kv_indptr"].gpu[: bs + 1]
                     kv_indices = var["kv_indices"].gpu
                     slot_mapping = var["slot_mapping"].gpu[:bs]
