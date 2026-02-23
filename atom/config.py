@@ -645,8 +645,7 @@ class Config:
         if self.speculative_config is not None:
             if self.speculative_config.num_speculative_tokens > 4:
                 raise ValueError(
-                    f"num_speculative_tokens must be 1, got {self.speculative_config.num_speculative_tokens}. "
-                    "Only num_speculative_tokens=1 is currently supported."
+                    f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
                 )
 
     def compute_hash(self) -> str:
