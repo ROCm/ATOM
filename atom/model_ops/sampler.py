@@ -27,11 +27,11 @@ class Sampler(nn.Module):
         self,
         logits: torch.Tensor,  # (num_tokens, vocab_size)
         temperatures: torch.Tensor,  # (num_tokens,)
-        top_ks: torch.Tensor = None,  # (num_tokens,) int32, -1 means disabled
-        top_ps: torch.Tensor = None,  # (num_tokens,) float32, 1.0 means disabled
+        top_ks: torch.Tensor | None = None,  # (num_tokens,) int32, -1 means disabled
+        top_ps: torch.Tensor | None = None,  # (num_tokens,) float32, 1.0 means disabled
     ) -> torch.Tensor:  # (num_tokens,)
         """
-        Sample tokens from logits with optional top-k and top-p filtering.
+        Sample tokens from logits using temperature or top-k top-p filtering.
 
         Args:
             logits: Raw logits from model (num_tokens, vocab_size)
@@ -42,11 +42,11 @@ class Sampler(nn.Module):
         Returns:
             Sampled token IDs (num_tokens,)
         """
-        # Fast path: no filtering needed, use existing optimized sampler
+        # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             return self._temperature_sample(logits, temperatures)
 
-        # Slow path: apply top-k/top-p filtering
+        # Apply top-k/top-p filtering
         return self._topk_topp_sample(logits, temperatures, top_ks, top_ps)
 
     def _needs_filtering(
@@ -68,7 +68,7 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         temperatures: torch.Tensor,
     ) -> torch.Tensor:
-        """Original temperature-based Gumbel-max sampling (fast path)."""
+        """Temperature-based Gumbel-max sampling."""
         sampled_tokens = torch.empty(
             logits.size(0), dtype=torch.int, device=logits.device
         )
