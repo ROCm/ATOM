@@ -184,6 +184,11 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
+      
+      - name: Docker Login
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Generate Dockerfile for forked repo
         if: ${{ github.event.pull_request.head.repo.fork }}
