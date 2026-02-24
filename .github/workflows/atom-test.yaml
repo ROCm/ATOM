@@ -82,7 +82,7 @@ jobs:
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
     steps:
-      - name: Kill all Docker containers
+      - name: Kill all Docker containers and clean up workspace
         if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
@@ -90,6 +90,7 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true 
 
       - name: Show Docker containers
         if: matrix.runner == 'atom-mi355-8gpu.predownload'
