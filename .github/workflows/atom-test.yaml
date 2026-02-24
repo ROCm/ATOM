@@ -305,7 +305,7 @@ jobs:
           set -x
           echo "========== Cleaning up workspace =========="
           if [[ ${{ matrix.runner }} == atom-mi355-8gpu.predownload ]]; then
-            docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
+            docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
           fi
           docker stop atom_test || true
           docker rm atom_test || true
