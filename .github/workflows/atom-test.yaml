@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -94,7 +99,6 @@ jobs:
     name: ATOM Test
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - model_name: "Meta-Llama-3-8B-Instruct"
@@ -181,6 +185,11 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
+      
+      - name: Docker Login
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Generate Dockerfile for forked repo
         if: ${{ github.event.pull_request.head.repo.fork }}
