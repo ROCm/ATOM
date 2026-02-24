@@ -18,6 +18,7 @@ from aiter import (
 from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
+from atom.quant_spec import LayerQuantSpec
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 from atom.models.utils import get_quant_config_for_layer
 
@@ -201,12 +202,34 @@ class LinearBase(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = False,
         source_quant_dtype: torch.dtype | None = None,
+        layer_spec: Optional[LayerQuantSpec] = None,
     ):
         if quant_config is None:
             quant_config = QuantizationConfig()
-        self.source_quant_dtype = source_quant_dtype
-        quant_type = quant_config["quant_type"]
-        params_dtype = quant_config["quant_dtype"]
+
+        # --- New: prefer LayerQuantSpec if provided ---
+        if layer_spec is not None:
+            self._layer_spec = layer_spec
+        else:
+            # Build a LayerQuantSpec from old-style dict fields for compat
+            self._layer_spec = LayerQuantSpec(
+                quant_type=quant_config["quant_type"],
+                quant_dtype=quant_config["quant_dtype"],
+                is_dynamic=quant_config.get("is_dynamic", True),
+                quant_method=quant_config.get("quant_method", None),
+                checkpoint_dtype=source_quant_dtype,
+            )
+
+        # Backward compat: source_quant_dtype can come from layer_spec
+        self.source_quant_dtype = (
+            source_quant_dtype
+            if source_quant_dtype is not None
+            else self._layer_spec.checkpoint_dtype
+        )
+
+        # Effective quant params for this layer
+        quant_type = self._layer_spec.quant_type
+        params_dtype = self._layer_spec.quant_dtype
         super().__init__()
         self.reduce_results = reduce_results
         self.input_size = input_size
@@ -508,8 +531,12 @@ class MergedColumnParallelLinear(LinearBase):
         **kwargs,
     ):
         self.output_sizes = output_sizes
+        # Resolve per-layer spec via prefix
+        layer_spec = None
         if quant_config is not None and prefix:
-            quant_config = get_quant_config_for_layer(quant_config, prefix)
+            layer_spec = quant_config.resolve(prefix)
+            if not layer_spec.is_quantized:
+                quant_config = None  # backward compat: pass None to LinearBase
         super().__init__(
             input_size,
             output_sizes,
@@ -517,6 +544,7 @@ class MergedColumnParallelLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            layer_spec=layer_spec,
         )
 
     def weight_loader(
@@ -551,6 +579,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.head_size = head_size
@@ -576,12 +605,20 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads * self.head_size * tp_size,
         ]
 
+        # Resolve per-layer spec via prefix
+        layer_spec = None
+        if quant_config is not None and prefix:
+            layer_spec = quant_config.resolve(prefix)
+            if not layer_spec.is_quantized:
+                quant_config = None  # backward compat: pass None to LinearBase
+
         super().__init__(
             input_size,
             output_sizes,
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            layer_spec=layer_spec,
         )
 
     def weight_loader(
@@ -633,8 +670,12 @@ class RowParallelLinear(LinearBase):
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
+        # Resolve per-layer spec via prefix
+        layer_spec = None
         if quant_config is not None and prefix:
-            quant_config = get_quant_config_for_layer(quant_config, prefix)
+            layer_spec = quant_config.resolve(prefix)
+            if not layer_spec.is_quantized:
+                quant_config = None  # backward compat: pass None to LinearBase
         super().__init__(
             input_size,
             output_size,
@@ -643,6 +684,7 @@ class RowParallelLinear(LinearBase):
             quant_config=quant_config,
             reduce_results=reduce_results,
             source_quant_dtype=source_quant_dtype,
+            layer_spec=layer_spec,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):

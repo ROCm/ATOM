@@ -153,6 +153,7 @@ class Qwen3MoeAttention(nn.Module):
         kv_cache_dtype: str = "fp16",
         layer_num: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -181,6 +182,7 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
             quant_config=quant_config,
+            prefix=prefix,
         )
 
         self.o_proj = RowParallelLinear(
@@ -189,6 +191,7 @@ class Qwen3MoeAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
@@ -278,6 +281,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
 
         # `mlp_only_layers` in the config.
