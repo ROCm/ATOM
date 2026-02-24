@@ -242,12 +242,30 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sum_scheduled_tokens + 1
             )
 
-        if hasattr(self.model_runner, "drafter"):
+        if hasattr(self.model_runner, "drafter") or attn_metadata.has_cached:
             attn_metadata.kv_indices = var["kv_indices"].gpu
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+            attn_metadata.kv_indptr[0] = 0
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
                 attn_metadata.context_lens, 0
             )
+            attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+
+            if attn_metadata.has_cached:
+                # Ensure raw block_tables (not block_tables_converted) are on GPU.
+                # kv_indices_generate_triton applies block_ratio internally, so we
+                # must pass raw model-level block_ids to avoid double conversion.
+                if not batch.block_tables:
+                    self.prepare_block_tables(batch)
+                raw_block_tables = var["block_tables"].copy_to_gpu(bs)
+                max_seqlen_k = int(attn_metadata.context_lens.max().item())
+                kv_indices_generate_triton(
+                    raw_block_tables,
+                    attn_metadata.kv_indices,
+                    attn_metadata.kv_indptr,
+                    self.block_ratio,
+                    max_seqlen_k,
+                )
 
         return attn_metadata, positions
 

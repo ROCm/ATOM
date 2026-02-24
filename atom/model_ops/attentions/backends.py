@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generic, Optional, Type, TypeVar
 
 import torch
 from atom.model_engine.scheduler import ScheduledBatch
+
+logger = logging.getLogger("atom")
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import block_table_convert_triton
@@ -141,18 +144,23 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
         positions = []
+        cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        has_cached = False
         # seqs = list(batch.seqs.values())
         # seqs = seqs[:bs]
         for i in range(bs):
             seqlen = batch.context_lens[i]
             cached_seqlen = batch.num_cached_tokens[i]
+            if cached_seqlen > 0:
+                has_cached = True
             positions.extend(list(range(cached_seqlen, seqlen)))
             seqlen_q = seqlen - cached_seqlen
             seqlen_k = seqlen
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
@@ -166,17 +174,29 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ) // self.model_runner.block_size
             last_block_tokens = batch.last_block_num_tokens[i]
             block_table = batch.block_tables[i]
-            for i in range(num_cached_blocks, num_blocks):
-                start = block_table[i] * self.model_runner.block_size
-                if i != num_blocks - 1:
+            for blk_idx in range(num_cached_blocks, num_blocks):
+                start = block_table[blk_idx] * self.model_runner.block_size
+                if blk_idx != num_blocks - 1:
                     end = start + self.model_runner.block_size
                 else:
                     end = start + last_block_tokens
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > batch.total_tokens_num:  # prefix cache
+        if has_cached:
             self.prepare_block_tables(batch)
+        # Validate metadata consistency
+        assert (
+            len(positions) == sum_scheduled_tokens
+        ), f"positions length {len(positions)} != sum_scheduled_tokens {sum_scheduled_tokens}"
+        if batch.block_tables:
+            assert (
+                len(slot_mapping) == sum_scheduled_tokens
+            ), f"slot_mapping length {len(slot_mapping)} != sum_scheduled_tokens {sum_scheduled_tokens}"
+        assert (
+            cu_seqlens_q[-1] == sum_scheduled_tokens
+        ), f"cu_seqlens_q[-1]={cu_seqlens_q[-1]} != sum_scheduled_tokens={sum_scheduled_tokens}"
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
+        var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
         var["context_lens"].np[:bs] = batch.context_lens[:bs]
         min_seqlen_q = 0
@@ -186,6 +206,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ("slot_mapping", len(slot_mapping)),
             ("context_lens", bs),
         ]
+        if has_cached:
+            vars_used.append(("block_tables", bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         if self.block_ratio > 1 and "block_tables" in ctx:
@@ -202,6 +224,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             max_seqlen_k=max_seqlen_k,
             min_seqlen_q=min_seqlen_q,
             dropout_p=dropout_p,
+            has_cached=has_cached,
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
