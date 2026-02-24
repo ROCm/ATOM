@@ -188,6 +188,7 @@ class AttentionMetaData:
     reduce_partial_map: Optional[torch.Tensor] = None
 
     block_tables_converted: Optional[torch.Tensor] = None
+    has_cached: bool = False
 
     # only used for plugin mode to store the metadata for attn
     plugin_metadata: Optional["MetadataForPluginMode"] = None
@@ -219,7 +220,9 @@ class AttentionMetaData:
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
         plugin_metadata: Optional["MetadataForPluginMode"] = None,
+        has_cached: bool = False,
     ):
+        self.has_cached = has_cached
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_k = cu_seqlens_k
         self.max_seqlen_q = max_seqlen_q

@@ -302,12 +302,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sum_scheduled_tokens + 1
             )
 
-        if hasattr(self.model_runner, "drafter"):
+        if hasattr(self.model_runner, "drafter") or attn_metadata.has_cached:
             attn_metadata.kv_indices = var["kv_indices"].gpu
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+            attn_metadata.kv_indptr[0] = 0
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
                 attn_metadata.context_lens, 0
             )
+            attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
                 attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
