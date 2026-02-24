@@ -10,7 +10,6 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
-      - '**/*.txt'
   workflow_dispatch:
 
 concurrency:
