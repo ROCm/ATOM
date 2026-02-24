@@ -132,19 +132,27 @@ class tokenIDProcessor:
         event.synchronize()
         return token_ids.numpy()
 
-    def send_rejected_to_cpu_async(self, gpu_tensor: torch.Tensor):
+    def send_mtp_status_to_cpu_async(self, num_rejected: torch.Tensor, num_bonus: torch.Tensor):
+        # rejected num and bonus num are slightly different info for mtp
+        # take mtp=1 for example:
+        #   first decode after prefill have 0 rej, 0 bonus
+        #   prev acc decode have 0 rej, 1 bonus
+        #   prev rej decode have 1 rej, 0 bonus
+        # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.async_copy_stream):
             self.async_copy_stream.wait_stream(default_stream)
-            cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            num_rejected_cpu = num_rejected.to("cpu", non_blocking=True)
+            num_bonus_cpu = num_bonus.to("cpu", non_blocking=True)
             self.async_copy_event.record(self.async_copy_stream)
-        self.rejected_tokens_cpu.append(cpu_tensor)
+        self.rejected_tokens_cpu.append(num_rejected_cpu)
+        self.bonus_tokens_cpu.append(num_bonus_cpu)
 
-    def recv_rejected_async(self) -> Optional[np.ndarray]:
+    def recv_mtp_status_async(self) -> tuple[Optional[np.ndarray]]:
         if not self.rejected_tokens_cpu:
-            return None
+            return None, None
         self.async_copy_event.synchronize()
-        return self.rejected_tokens_cpu.pop(0).numpy()
+        return self.rejected_tokens_cpu.pop(0).numpy(), self.bonus_tokens_cpu.pop(0).numpy()
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -157,6 +165,9 @@ class tokenIDProcessor:
         self.rejected_tokens_cpu: list[torch.Tensor] = (
             []
         )  # Async queue for num_bonus_tokens
+        self.bonus_tokens_cpu: list[torch.Tensor] = (
+            []
+        )
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -271,7 +282,7 @@ class tokenIDProcessor:
         ]
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
-        self.prev_rejected_num = self.recv_rejected_async()
+        self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
@@ -306,9 +317,13 @@ class tokenIDProcessor:
 
         # Receive and map bonus_list to current batch order
         self.num_rejected = batch.num_rejected
+        self.num_bonus = batch.num_bonus
         if num_deferred_seqs > 0 and self.prev_rejected_num is not None:
             # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
             self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
+                deferred_prev_indices
+            ]
+            self.num_bonus[deferred_curr_indices] = self.prev_bonus_num[
                 deferred_prev_indices
             ]
             
@@ -1340,10 +1355,8 @@ class ModelRunner:
             sampled_tokens = self.sampler(logits, temperatures)
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
-            is_prefill = {req_id: True for req_id in batch.req_ids}
         else:
             assert logits is not None
-            is_prefill = {req_id: False for req_id in batch.req_ids}
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
@@ -1383,8 +1396,10 @@ class ModelRunner:
         draft_token_ids: Optional[np.ndarray] = None
         if self.tokenID_processor.is_deferred_out:
             prev_rejected_num = self.tokenID_processor.prev_rejected_num
-            self.tokenID_processor.send_rejected_to_cpu_async(
-                num_reject_tokens
+            prev_bonus_num = self.tokenID_processor.prev_bonus_num
+            self.tokenID_processor.send_mtp_status_to_cpu_async(
+                num_reject_tokens,
+                next_token_locs
             )  # Async copy to CPU
             if hasattr(self, "drafter"):
                 next_token_ids = torch.gather(
@@ -1403,13 +1418,14 @@ class ModelRunner:
                 # self.debug(f"{num_bonus_tokens=}")
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+            prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
 
         return ScheduledBatchOutput(
             token_ids=token_ids,
             draft_token_ids=draft_token_ids,
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
-            is_prev_prefill=is_prefill,
+            num_bonus=prev_bonus_num,
         )
 
     @torch.inference_mode()
