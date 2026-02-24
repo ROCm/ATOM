@@ -25,7 +25,7 @@ jobs:
 
   atom:
     needs: [pre-checks]
-    if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    # if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     name: ATOM Test
     strategy:
       fail-fast: false
