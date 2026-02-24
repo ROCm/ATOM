@@ -6,6 +6,7 @@ from enum import Enum, auto
 from itertools import count
 from typing import Any, Callable, Optional
 
+import numpy as np
 from atom.sampling_params import SamplingParams
 
 
@@ -48,6 +49,7 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        self.num_rejected = 0
         self.num_cached_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
@@ -61,7 +63,7 @@ class Sequence:
         self.output_tokens = []  # cache for newly generate tokens
 
         # save speculative tokens if is_deferred_output = False or prefill is inter
-        self.spec_token_ids: list[int] = []
+        self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)
         self.num_placeholder = 0
 
         # statistics fields
@@ -103,7 +105,7 @@ class Sequence:
 
     @property
     def completion_token_ids(self):
-        return self.token_ids[self.num_prompt_tokens :]
+        return self.token_ids[self.num_prompt_tokens : self.num_tokens]
 
     @property
     def num_cached_blocks(self):

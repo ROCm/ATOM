@@ -94,6 +94,7 @@ jobs:
     name: ATOM Test
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - model_name: "Meta-Llama-3-8B-Instruct"

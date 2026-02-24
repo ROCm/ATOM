@@ -598,15 +598,15 @@ class Config:
 
     def __post_init__(self):
         # assert os.path.isdir(self.model)
-        assert (
-            self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1
-        ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
+
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(self.model)
         if not hasattr(self.hf_config, "rope_parameters"):
             # Compatible with both transformers < 5
             rope_params = getattr(self.hf_config, "rope_scaling", {})
-            rope_params["rope_theta"] = self.hf_config.rope_theta
+            if rope_params is None:
+                rope_params = {}
+            rope_params["rope_theta"] = getattr(self.hf_config, "rope_theta", None)
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
