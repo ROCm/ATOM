@@ -156,13 +156,13 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
         self.num_accepted_tokens.fill_(1)
-        if self.model_runner.tokenID_processor.num_rejected is None:
+
+        if self.model_runner.tokenID_processor.num_bonus is None:
             return
-        prev_prefills = batch.prev_prefills
-        for idx, num_rejected_tokens in enumerate(
-            self.model_runner.tokenID_processor.num_rejected
+        for idx, num_bonus in enumerate(
+            self.model_runner.tokenID_processor.num_bonus
         ):
-            self.num_accepted_tokens[idx] = 1 if prev_prefills[idx] else 1 + self.num_spec - num_rejected_tokens
+            self.num_accepted_tokens[idx] = num_bonus + 1
 
     def prepare_gdn_metadata(
         self,
@@ -280,6 +280,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
         attn_metadata.gdn_metadata = gdn_metadata
         # print("gdn attn metadata: ", gdn_metadata, flush=True)
+        # print("positions: ", positions, flush=True)
         return attn_metadata, positions
 
     def prepare_decode(  # type: ignore[override]
