@@ -582,7 +582,7 @@ class MLAAttention(nn.Module):
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
-        if context.is_prefill and not use_prefill_mla:
+        if context.is_prefill and not use_prefill_mla and not attn_metadata.has_cached:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
