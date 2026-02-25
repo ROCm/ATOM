@@ -150,9 +150,14 @@ class tokenIDProcessor:
 
     def recv_mtp_status_async(self) -> tuple[Optional[np.ndarray]]:
         if not self.rejected_tokens_cpu:
-            return None, None
+            return None, None, self.status_map
         self.async_copy_event.synchronize()
-        return self.rejected_tokens_cpu.pop(0).numpy(), self.bonus_tokens_cpu.pop(0).numpy()
+        rejected_token_cpu = self.rejected_tokens_cpu.pop(0).numpy()
+        bonus_tokens_cpu = self.bonus_tokens_cpu.pop(0).numpy()
+        for idx, req_id in enumerate(self.prev_batch.req_ids):
+            self.status_map[req_id] = (rejected_token_cpu[idx], bonus_tokens_cpu[idx])
+
+        return rejected_token_cpu, bonus_tokens_cpu, self.status_map
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -168,6 +173,7 @@ class tokenIDProcessor:
         self.bonus_tokens_cpu: list[torch.Tensor] = (
             []
         )
+        self.status_map: map[int, tuple[int, int]] = {}  # req_id -> (num_rejected, num_bonus)
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -282,7 +288,7 @@ class tokenIDProcessor:
         ]
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
-        self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+        self.prev_rejected_num, self.prev_bonus_num, status_map = self.recv_mtp_status_async()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
@@ -318,14 +324,32 @@ class tokenIDProcessor:
         # Receive and map bonus_list to current batch order
         self.num_rejected = batch.num_rejected
         self.num_bonus = batch.num_bonus
+        # mtp_mapping = {req: [reject, bonus] 
+        #            for req in self.prev_batch.req_ids 
+        #            for reject in self.prev_rejected_num 
+        #            for bonus in self.prev_bonus_num}
+        # for idx, req_id in enumerate(batch.req_ids):
+        #     if req_id in mtp_mapping:
+        #         self.num_rejected[idx] = mtp_mapping[req_id][0]
+        #         self.num_bonus[idx] = mtp_mapping[req_id][1]
+
         if num_deferred_seqs > 0 and self.prev_rejected_num is not None:
             # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
-            self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
-                deferred_prev_indices
-            ]
-            self.num_bonus[deferred_curr_indices] = self.prev_bonus_num[
-                deferred_prev_indices
-            ]
+            for idx, req_id in enumerate(batch.req_ids):
+                if req_id in status_map:
+                    rejected_num, bonus_num = status_map[req_id]
+                    self.num_rejected[idx] = rejected_num
+                    self.num_bonus[idx] = bonus_num
+                else:
+                    self.num_rejected[idx] = 0
+                    self.num_bonus[idx] = 0
+            # self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
+            #     deferred_prev_indices
+            # ]
+            # self.num_bonus[deferred_curr_indices] = self.prev_bonus_num[
+            #     deferred_prev_indices
+            # ]
+
             
 
         if is_all_same:
