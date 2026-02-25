@@ -180,6 +180,13 @@ jobs:
             accuracy_test_threshold: "0.87"
             runner: atom-mi355-8gpu.predownload
             run_on_pr: false
+          - model_name: "Qwen3-Next-80B-A3B-Thinking"
+            model_path: "Qwen/Qwen3-Next-80B-A3B-Thinking"
+            extraArgs: "-tp 8"
+            env_vars: ""
+            accuracy_test_threshold: "0.65"
+            runner: atom-mi355-8gpu.predownload
+            run_on_pr: true
     if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     runs-on: ${{ matrix.runner }}
 
