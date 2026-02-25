@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import warnings
+
 import torch
 from aiter import mixed_sample_outer_exponential
 from aiter.ops.triton.softmax import softmax
@@ -15,6 +17,15 @@ try:
     AITER_TOPK_TOPP_AVAILABLE = True
 except ImportError:
     AITER_TOPK_TOPP_AVAILABLE = False
+    warnings.warn(
+        "aiter.ops.sampling not available. Top-k/top-p sampling will use "
+        "experimental native PyTorch implementation as fallback.",
+        UserWarning,
+        stacklevel=1,
+    )
+
+# Track whether we've already warned about native sampling being used
+_NATIVE_SAMPLING_WARNING_ISSUED = False
 
 
 class Sampler(nn.Module):
@@ -174,7 +185,23 @@ class Sampler(nn.Module):
         top_ps: torch.Tensor,
         temperatures: torch.Tensor,
     ) -> torch.Tensor:
-        """Native PyTorch fallback for top-k/top-p sampling."""
+        """
+        EXPERIMENTAL: Native PyTorch fallback for top-k/top-p sampling.
+
+        This implementation has not been thoroughly tested and may produce
+        different results compared to the optimized aiter implementation.
+        Use aiter.ops.sampling for production workloads.
+        """
+        global _NATIVE_SAMPLING_WARNING_ISSUED
+        if not _NATIVE_SAMPLING_WARNING_ISSUED:
+            warnings.warn(
+                "Using experimental native top-k/top-p sampling. "
+                "Install aiter.ops.sampling for optimized performance.",
+                UserWarning,
+                stacklevel=2,
+            )
+            _NATIVE_SAMPLING_WARNING_ISSUED = True
+
         batch_size, vocab_size = probs.shape
         device = probs.device
 
