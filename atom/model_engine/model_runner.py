@@ -1186,13 +1186,21 @@ class ModelRunner:
         temp_buffer.np[:bs] = batch.temperatures
         temperatures = temp_buffer.copy_to_gpu(bs)
 
+        # For top_ks and top_ps, check uniformity on CPU before GPU copy.
+        # If all values are the same, only copy a single element to save bandwidth.
         top_k_buffer = self.forward_vars["top_ks"]
         top_k_buffer.np[:bs] = batch.top_ks
-        top_ks = top_k_buffer.copy_to_gpu(bs)
+        if bs > 1 and all(k == batch.top_ks[0] for k in batch.top_ks):
+            top_ks = top_k_buffer.copy_to_gpu(1)
+        else:
+            top_ks = top_k_buffer.copy_to_gpu(bs)
 
         top_p_buffer = self.forward_vars["top_ps"]
         top_p_buffer.np[:bs] = batch.top_ps
-        top_ps = top_p_buffer.copy_to_gpu(bs)
+        if bs > 1 and all(p == batch.top_ps[0] for p in batch.top_ps):
+            top_ps = top_p_buffer.copy_to_gpu(1)
+        else:
+            top_ps = top_p_buffer.copy_to_gpu(bs)
 
         return temperatures, top_ks, top_ps
 

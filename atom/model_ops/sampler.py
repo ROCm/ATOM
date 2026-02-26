@@ -126,10 +126,14 @@ class Sampler(nn.Module):
             return self._native_sample(probs, top_ks, top_ps, temperatures)
 
     def _to_tensor_scalar(self, x: torch.Tensor):
-        """Convert to (tensor, scalar) tuple for aiter ops."""
+        """Convert to (tensor, scalar) tuple for aiter ops.
+
+        If tensor has size 1 (uniform value optimization from model_runner),
+        extract the scalar value for more efficient aiter kernel dispatch.
+        """
         if x is None:
             return (None, 0)
-        if (x == x[0]).all():  # Uniform value - use scalar for efficiency
+        if x.numel() == 1:  # Uniform value - use scalar for efficiency
             return (None, x[0].item())
         return (x, 0)
 
