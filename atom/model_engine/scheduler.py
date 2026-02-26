@@ -141,6 +141,12 @@ class ScheduledBatch:
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
         )
+        self.num_bonus = np.asarray(
+            [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
+        )
+        self.mamba_block_tables = [
+            seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table
+        ]
 
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
@@ -190,10 +196,10 @@ class ScheduledBatchOutput:
         self,
         token_ids: dict[int, tuple[int, ...]],
         num_rejected: np.ndarray,
+        num_bonus: np.ndarray,
         draft_token_ids: Optional[np.ndarray],
         # num_bonus_tokens
         is_deferred_out=False,
-        is_prev_prefill=False,
     ):
         # TODO need refine
         self.is_deferred_out = is_deferred_out
@@ -201,7 +207,7 @@ class ScheduledBatchOutput:
         self.token_ids = token_ids
         self.draft_token_ids = draft_token_ids
         self.num_rejected = num_rejected
-        self.is_prev_prefill = is_prev_prefill
+        self.num_bonus = num_bonus
         # logger.info(f"ScheduledBatchOutput: req_ids={self.req_ids}")
         # assert len(self.req_ids) - 1 == len(draft_token_ids)
         # self.num_bonus_tokens = num_bonus_tokens  # num per req
@@ -367,8 +373,8 @@ class Scheduler:
         num_placeholder = self.mtp_k
         if is_deferred_out:
             num_placeholder += 1
-
         for seq in self.running:
+            # Update the running status
             if seq.id not in fwd_output.req_ids:
                 continue
             token_ids = prev_token_ids[seq.id]
@@ -378,8 +384,10 @@ class Scheduler:
             idx = fwd_output.req_ids.index(seq.id)
             if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
+                num_bonus = fwd_output.num_bonus[idx]
                 offset = 0 if (num_new_token + num_rejected) == 1 else self.mtp_k
                 seq.num_rejected = num_rejected
+                seq.num_bonus_tokens = num_bonus
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el

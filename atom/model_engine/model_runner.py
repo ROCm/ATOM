@@ -35,7 +35,6 @@ from atom.utils import (
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
-    SpecDecodeMetadata,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
@@ -131,19 +130,34 @@ class tokenIDProcessor:
         event.synchronize()
         return token_ids.numpy()
 
-    def send_rejected_to_cpu_async(self, gpu_tensor: torch.Tensor):
+    def send_mtp_status_to_cpu_async(
+        self, num_rejected: torch.Tensor, num_bonus: torch.Tensor
+    ):
+        # rejected num and bonus num are slightly different info for mtp
+        # take mtp=1 for example:
+        #   first decode after prefill have 0 rej, 0 bonus
+        #   prev acc decode have 0 rej, 1 bonus
+        #   prev rej decode have 1 rej, 0 bonus
+        # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.async_copy_stream):
             self.async_copy_stream.wait_stream(default_stream)
-            cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            num_rejected_cpu = num_rejected.to("cpu", non_blocking=True)
+            num_bonus_cpu = num_bonus.to("cpu", non_blocking=True)
             self.async_copy_event.record(self.async_copy_stream)
-        self.rejected_tokens_cpu.append(cpu_tensor)
+        self.rejected_tokens_cpu.append(num_rejected_cpu)
+        self.bonus_tokens_cpu.append(num_bonus_cpu)
 
-    def recv_rejected_async(self) -> Optional[np.ndarray]:
+    def recv_mtp_status_async(
+        self,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         if not self.rejected_tokens_cpu:
-            return None
+            return None, None
         self.async_copy_event.synchronize()
-        return self.rejected_tokens_cpu.pop(0).numpy()
+        return (
+            self.rejected_tokens_cpu.pop(0).numpy(),
+            self.bonus_tokens_cpu.pop(0).numpy(),
+        )
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -156,6 +170,7 @@ class tokenIDProcessor:
         self.rejected_tokens_cpu: list[torch.Tensor] = (
             []
         )  # Async queue for num_bonus_tokens
+        self.bonus_tokens_cpu: list[torch.Tensor] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -270,7 +285,7 @@ class tokenIDProcessor:
         ]
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
-        self.prev_rejected_num = self.recv_rejected_async()
+        self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
@@ -305,9 +320,13 @@ class tokenIDProcessor:
 
         # Receive and map bonus_list to current batch order
         self.num_rejected = batch.num_rejected
+        self.num_bonus = batch.num_bonus
         if num_deferred_seqs > 0 and self.prev_rejected_num is not None:
             # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
             self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
+                deferred_prev_indices
+            ]
+            self.num_bonus[deferred_curr_indices] = self.prev_bonus_num[
                 deferred_prev_indices
             ]
 
@@ -526,12 +545,12 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
-        num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
             hasattr(self, "drafter"),
-            num_spec_tokens,
+            self.num_spec_tokens,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(
@@ -588,7 +607,7 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("qwen3_next",):
+        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
             return True
         return False
 
@@ -840,6 +859,9 @@ class ModelRunner:
         }
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
+            self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs
+            )
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -898,9 +920,9 @@ class ModelRunner:
                 hf_config.linear_num_key_heads,
                 hf_config.linear_num_value_heads,
                 hf_config.linear_key_head_dim,
-                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0,  # self.num_spec,
+                self.num_spec_tokens,
             )
 
             one_layer_byte = (
@@ -946,6 +968,7 @@ class ModelRunner:
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
+        num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
             # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
@@ -982,7 +1005,7 @@ class ModelRunner:
 
             self.kv_cache = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 self.physical_block_size,
                 num_kv_heads,
@@ -993,7 +1016,7 @@ class ModelRunner:
 
             self.kv_scale = torch.zeros(
                 2,
-                self.num_full_attn,
+                self.num_full_attn + num_draft_layers,
                 self.num_physical_kvcache_blocks,
                 num_kv_heads,
                 self.physical_block_size,
@@ -1006,9 +1029,9 @@ class ModelRunner:
                 hf_config.linear_num_key_heads,
                 hf_config.linear_num_value_heads,
                 hf_config.linear_key_head_dim,
-                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                0,  # self.num_spec,
+                self.num_spec_tokens,  # self.num_spec,
             )
             self.mamba_k_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
@@ -1373,8 +1396,9 @@ class ModelRunner:
         draft_token_ids: Optional[np.ndarray] = None
         if self.tokenID_processor.is_deferred_out:
             prev_rejected_num = self.tokenID_processor.prev_rejected_num
-            self.tokenID_processor.send_rejected_to_cpu_async(
-                num_reject_tokens
+            prev_bonus_num = self.tokenID_processor.prev_bonus_num
+            self.tokenID_processor.send_mtp_status_to_cpu_async(
+                num_reject_tokens, next_token_locs
             )  # Async copy to CPU
             if hasattr(self, "drafter"):
                 next_token_ids = torch.gather(
@@ -1393,12 +1417,14 @@ class ModelRunner:
                 # self.debug(f"{num_bonus_tokens=}")
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+            prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
 
         return ScheduledBatchOutput(
             token_ids=token_ids,
             draft_token_ids=draft_token_ids,
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
+            num_bonus=prev_bonus_num,
         )
 
     @torch.inference_mode()
