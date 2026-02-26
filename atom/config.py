@@ -285,7 +285,6 @@ class QuantizationConfig(dict):
         factors.append(self["quant_name"])
         factors.append(self["is_dynamic"])
         factors.append(self["quant_method"])
-        str_factors = str(factors)
         # assert_hashable(str_factors)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 

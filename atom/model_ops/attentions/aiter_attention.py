@@ -7,7 +7,6 @@ from typing import Type
 import aiter
 import numpy as np
 import torch
-import triton
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
@@ -17,8 +16,10 @@ from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
+
 def cdiv(a, b):
     return (a + b - 1) // b
+
 
 class AiterBackend(AttentionBackend):
     @staticmethod

@@ -35,7 +35,6 @@ from atom.utils import (
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
-    SpecDecodeMetadata,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
@@ -91,7 +90,9 @@ class tokenIDProcessor:
         self.default_num_rejected_tokens = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
-        self.prev_prefills = torch.zeros(max_num_batched_tokens, dtype=torch.bool, device=device)
+        self.prev_prefills = torch.zeros(
+            max_num_batched_tokens, dtype=torch.bool, device=device
+        )
         self.clean()
 
     def send_to_cpu_async(
@@ -132,7 +133,9 @@ class tokenIDProcessor:
         event.synchronize()
         return token_ids.numpy()
 
-    def send_mtp_status_to_cpu_async(self, num_rejected: torch.Tensor, num_bonus: torch.Tensor):
+    def send_mtp_status_to_cpu_async(
+        self, num_rejected: torch.Tensor, num_bonus: torch.Tensor
+    ):
         # rejected num and bonus num are slightly different info for mtp
         # take mtp=1 for example:
         #   first decode after prefill have 0 rej, 0 bonus
@@ -152,7 +155,10 @@ class tokenIDProcessor:
         if not self.rejected_tokens_cpu:
             return None, None
         self.async_copy_event.synchronize()
-        return self.rejected_tokens_cpu.pop(0).numpy(), self.bonus_tokens_cpu.pop(0).numpy()
+        return (
+            self.rejected_tokens_cpu.pop(0).numpy(),
+            self.bonus_tokens_cpu.pop(0).numpy(),
+        )
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -165,9 +171,7 @@ class tokenIDProcessor:
         self.rejected_tokens_cpu: list[torch.Tensor] = (
             []
         )  # Async queue for num_bonus_tokens
-        self.bonus_tokens_cpu: list[torch.Tensor] = (
-            []
-        )
+        self.bonus_tokens_cpu: list[torch.Tensor] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -326,7 +330,6 @@ class tokenIDProcessor:
             self.num_bonus[deferred_curr_indices] = self.prev_bonus_num[
                 deferred_prev_indices
             ]
-            
 
         if is_all_same:
             # All requests are the same, only deferred tokens
@@ -1398,8 +1401,7 @@ class ModelRunner:
             prev_rejected_num = self.tokenID_processor.prev_rejected_num
             prev_bonus_num = self.tokenID_processor.prev_bonus_num
             self.tokenID_processor.send_mtp_status_to_cpu_async(
-                num_reject_tokens,
-                next_token_locs
+                num_reject_tokens, next_token_locs
             )  # Async copy to CPU
             if hasattr(self, "drafter"):
                 next_token_ids = torch.gather(

@@ -27,7 +27,6 @@ from atom.model_ops.linear import (
 from atom.model_config.qwen3_next import Qwen3NextConfig
 
 
-from atom.utils.decorators import support_torch_compile
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 
 # from atom.model_ops.rotary_embedding import get_rope

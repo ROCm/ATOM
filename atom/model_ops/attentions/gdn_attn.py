@@ -159,9 +159,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
         if self.model_runner.tokenID_processor.num_bonus is None:
             return
-        for idx, num_bonus in enumerate(
-            self.model_runner.tokenID_processor.num_bonus
-        ):
+        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
             self.num_accepted_tokens[idx] = num_bonus + 1
 
     def prepare_gdn_metadata(
