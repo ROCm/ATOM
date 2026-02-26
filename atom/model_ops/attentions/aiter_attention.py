@@ -194,9 +194,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         sum_scheduled_tokens = batch.total_tokens_num_decode
         var["slot_mapping"].np[: bs * max_seqlen_q] = -1
         if not batch.is_dummy_run:
-            var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping[
-                :sum_scheduled_tokens
-            ]
+            var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping
 
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
@@ -254,11 +252,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
+        max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[:bs * max_q_len],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
-            max_seqlen_q=var["max_qlen"],
+            max_seqlen_q=max_q_len,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],
@@ -271,7 +270,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             **ctx_pa_ps,
         )
 
-        positions = var["positions"].copy_to_gpu(bs)
+        positions = var["positions"].copy_to_gpu(bs * max_q_len)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )

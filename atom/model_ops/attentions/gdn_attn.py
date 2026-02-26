@@ -95,7 +95,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        self.spec_sequence_masks = torch.ones(
+        self.spec_sequence_masks = torch.zeros(
             (self.max_bs,),
             dtype=torch.bool,
             device=self.device,
@@ -159,10 +159,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
         if self.model_runner.tokenID_processor.num_bonus is None:
             return
-        for idx, num_bonus in enumerate(
-            self.model_runner.tokenID_processor.num_bonus
-        ):
-            self.num_accepted_tokens[idx] = num_bonus + 1
+        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        self.num_accepted_tokens[:num_bonus.shape[0]].copy_(torch.from_numpy(num_bonus) + 1, non_blocking=True)
+
 
     def prepare_gdn_metadata(
         self,
@@ -206,9 +205,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             spec_token_indx = torch.arange(
                 spec_token_size, dtype=torch.int32, device=self.device
             )
-            non_spec_token_indx = torch.empty(
-                0, dtype=torch.int32, device=query_start_loc.device
-            )
+            non_spec_token_indx = self.non_spec_query_start_loc[:0]
             spec_sequence_masks = torch.ones(
                 num_reqs, dtype=torch.bool, device=self.device
             )
@@ -218,7 +215,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             non_spec_state_indices_tensor = None
             spec_query_start_loc = query_start_loc
             non_spec_query_start_loc = None
-            num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
+            num_accepted_tokens = self.num_accepted_tokens
             # if hasattr(self.model_runner.tokenID_processor, "num_bonus_tokens"):
             #     num_accepted_tokens = self.model_runner.tokenID_processor.num_bonus_tokens + 1
             # else:
@@ -294,7 +291,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         attn_metadata, positions = super().prepare_decode(batch, bs)
         self.model_runner.forward_vars["cu_seqlens_q"].cpu[
             bs:
-        ] = batch.total_tokens_num_decode
+        ] = self.model_runner.forward_vars["cu_seqlens_q"].cpu[bs]
         # we fill the attn_metadata cu_seqlens_q here since aiter attn won't calc it for decode
         attn_metadata.cu_seqlens_q = self.model_runner.forward_vars[
             "cu_seqlens_q"
@@ -309,13 +306,13 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             #     gdn_metadata.spec_state_indices_tensor, non_blocking=True
             # )
             self.spec_state_indices_tensor.gpu[num_decodes:, :].fill_(PAD_SLOT_ID)
-            # gdn_metadata.spec_state_indices_tensor = self.spec_state_indices_tensor[:num_decodes]
+            gdn_metadata.spec_state_indices_tensor = self.spec_state_indices_tensor.gpu[:bs]
 
             self.spec_sequence_masks[:num_decodes].copy_(
                 gdn_metadata.spec_sequence_masks, non_blocking=True
             )
             self.spec_sequence_masks[num_decodes:].fill_(False)
-            gdn_metadata.spec_sequence_masks = self.spec_sequence_masks[:num_decodes]
+            gdn_metadata.spec_sequence_masks = self.spec_sequence_masks[:bs]
 
             self.spec_token_indx[: gdn_metadata.spec_token_indx.size(0)].copy_(
                 gdn_metadata.spec_token_indx, non_blocking=True
@@ -330,14 +327,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             spec_num_query_tokens = self.spec_query_start_loc[num_decodes]
             self.spec_query_start_loc[num_decodes + 1 :].fill_(spec_num_query_tokens)
             gdn_metadata.spec_query_start_loc = self.spec_query_start_loc[
-                : num_decodes + 1
+                : bs + 1
             ]
 
-            self.num_accepted_tokens[:num_decodes].copy_(
-                gdn_metadata.num_accepted_tokens[:num_decodes], non_blocking=True
-            )
-            self.num_accepted_tokens[num_decodes:].fill_(1)
-            gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
         else:
             # self.non_spec_state_indices_tensor[:num_decodes].copy_(gdn_metadata.non_spec_state_indices_tensor, non_blocking=True)
             self.non_spec_state_indices_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
@@ -355,22 +347,20 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             ]
 
         attn_metadata.gdn_metadata = gdn_metadata
-        # print("gdn attn meta: ", gdn_metadata, flush=True)
-        # print("attn meta: ", attn_metadata, flush=True)
-        # print("positions: ", positions, flush=True)
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int):
         var = self.model_runner.forward_vars
+        max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         if self.block_size == 1024:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[:bs * max_q_len],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
-            max_seqlen_q=var["max_qlen"],
+            max_seqlen_q=max_q_len,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],
@@ -434,7 +424,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         # print("gdn attn metadata for cudagraph capture: ", gdn_metadata, flush=True)
         # print("attn metadata for cudagraph capture: ", attn_metadata, flush=True)
 
-        positions = var["positions"].copy_to_gpu(bs)
+        positions = var["positions"].copy_to_gpu(bs * max_q_len)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )
