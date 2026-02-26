@@ -305,6 +305,7 @@ class Qwen3NextAttention(nn.Module):
         rope_theta = rope_parameters.get("rope_theta", 10000)
         rope_scaling = rope_parameters.get("rope_scaling", None)
         partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
+
         rotary_dim = int(self.head_dim * partial_rotary_factor)
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
