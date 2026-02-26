@@ -769,7 +769,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-# @support_torch_compile
+@support_torch_compile
 class Qwen3NextModel(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
