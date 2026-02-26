@@ -148,7 +148,9 @@ class tokenIDProcessor:
         self.rejected_tokens_cpu.append(num_rejected_cpu)
         self.bonus_tokens_cpu.append(num_bonus_cpu)
 
-    def recv_mtp_status_async(self) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def recv_mtp_status_async(
+        self,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         if not self.rejected_tokens_cpu:
             return None, None
         self.async_copy_event.synchronize()
