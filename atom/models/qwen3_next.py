@@ -339,8 +339,8 @@ class Qwen3NextAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            q_gate, k, v = torch.split(
+                qkv, [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
             orig_shape = q_gate.shape[:-1]
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
@@ -348,7 +348,9 @@ class Qwen3NextAttention(nn.Module):
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
 
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
