@@ -78,7 +78,6 @@ class Sequence:
 
         # accepted tokens for spec decode
         self.num_bonus_tokens = 0
-        self.num_draft_tokens = 0
 
     def __len__(self):
         return self._num_tokens
