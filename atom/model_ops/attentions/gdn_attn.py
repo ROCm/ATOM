@@ -75,16 +75,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             self.num_spec = model_runner.drafter.mtp_k
         self.use_spec_decode = self.num_spec > 0
 
-        # self.spec_state_indices_tensor = torch.empty(
-        #     (self.max_bs, self.num_spec + 1),
-        #     dtype=torch.int32,
-        #     device=self.device,
-        # )
-        # self.non_spec_state_indices_tensor = torch.empty(
-        #     (self.max_bs,),
-        #     dtype=torch.int32,
-        #     device=self.device,
-        # )
         self.spec_state_indices_tensor = CpuGpuBuffer(
             (self.max_bs, self.num_spec + 1),
             dtype=torch.int32,
@@ -181,7 +171,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         context_lens_tensor = torch.zeros((batch.total_seqs_num_prefill)).cuda()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
-            # print("not use spec decode or is prefill", flush=True)
             self.prepare_state_indices(batch, with_spec=False)
             spec_token_indx = None
             non_spec_token_indx = None
@@ -217,22 +206,12 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             spec_query_start_loc = query_start_loc
             non_spec_query_start_loc = None
             num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
-            # if hasattr(self.model_runner.tokenID_processor, "num_bonus_tokens"):
-            #     num_accepted_tokens = self.model_runner.tokenID_processor.num_bonus_tokens + 1
-            # else:
-            #     num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
-            # num_accepted_tokens = batch.num_accepted_tokens
-            # num_accepted_tokens = self.model_runner.tokenID_processor.num_bonus_tokens
-            # print("num acceptted tokens: ", num_accepted_tokens, flush=True)
-            # if num_accepted_tokens is None:
-            #     num_accepted_tokens = self.num_accepted_tokens
             num_spec_decodes = num_decodes
             num_prefills = 0
             num_decodes = 0
             num_spec_decode_tokens = num_decode_tokens
             num_decode_tokens = 0
             num_prefill_tokens = 0
-            # print("num_accepted tokens : ", num_accepted_tokens, flush=True)
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
@@ -269,7 +248,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         self,
         batch: ScheduledBatch,
     ) -> GDNAttentionMetadata:
-        # print("prepare prefill", flush=True)
         attn_metadata, positions = super().prepare_prefill(batch)
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
@@ -277,8 +255,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
 
         attn_metadata.gdn_metadata = gdn_metadata
-        # print("gdn attn metadata: ", gdn_metadata, flush=True)
-        # print("positions: ", positions, flush=True)
         return attn_metadata, positions
 
     def prepare_decode(  # type: ignore[override]
@@ -286,9 +262,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         batch: ScheduledBatch,
         bs: int,
     ) -> GDNAttentionMetadata:
-        # print("prepare decode", flush=True)
         num_decodes = batch.total_seqs_num_decode
-        # print("num decodes: ", num_decodes, flush=True)
         attn_metadata, positions = super().prepare_decode(batch, bs)
         self.model_runner.forward_vars["cu_seqlens_q"].cpu[
             bs:
@@ -303,11 +277,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         # transfer data to ps buffer
         # gdn_metadata.non_spec_query_start_loc = self.model_runner.forward_vars["cu_seqlens_q"].copy_to_gpu(bs + 1)
         if self.use_spec_decode:
-            # self.spec_state_indices_tensor.gpu[:num_decodes, : self.num_spec + 1].copy_(
-            #     gdn_metadata.spec_state_indices_tensor, non_blocking=True
-            # )
             self.spec_state_indices_tensor.gpu[num_decodes:, :].fill_(PAD_SLOT_ID)
-            # gdn_metadata.spec_state_indices_tensor = self.spec_state_indices_tensor[:num_decodes]
 
             self.spec_sequence_masks[:num_decodes].copy_(
                 gdn_metadata.spec_sequence_masks, non_blocking=True
@@ -353,9 +323,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             ]
 
         attn_metadata.gdn_metadata = gdn_metadata
-        # print("gdn attn meta: ", gdn_metadata, flush=True)
-        # print("attn meta: ", attn_metadata, flush=True)
-        # print("positions: ", positions, flush=True)
         return attn_metadata, positions
 
     def build_for_cudagraph_capture(self, bs: int):
@@ -380,8 +347,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             ),
             **ctx_pa_ps,
         )
-        # num_accepted_tokens = torch.diff(attn_metadata.cu_seqlen_q)
-        # self.num_accepted_tokens[:bs].copy_(1, non_blocking=True)
+
         if self.use_spec_decode:
             gdn_metadata = GDNAttentionMetadata(
                 num_prefills=0,
@@ -429,8 +395,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
                 token_chunk_offset_ptr=None,
             )
         attn_metadata.gdn_metadata = gdn_metadata
-        # print("gdn attn metadata for cudagraph capture: ", gdn_metadata, flush=True)
-        # print("attn metadata for cudagraph capture: ", attn_metadata, flush=True)
 
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(

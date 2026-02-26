@@ -129,10 +129,6 @@ class Qwen3NextMTP(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
-        # self.logits_processor = LogitsProcessor(config.vocab_size)
-        # self.make_empty_intermediate_tensors = (
-        #     self.model.make_empty_intermediate_tensors
-        # )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -156,7 +152,6 @@ class Qwen3NextMTP(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        # return self.logits_processor(self.lm_head, hidden_states)
         return self.lm_head(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

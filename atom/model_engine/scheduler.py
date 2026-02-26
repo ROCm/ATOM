@@ -309,8 +309,6 @@ class Scheduler:
         num_seqs_decode = 0
         while self.running and num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
-            # print("schedule seq with token_ids: ", seq.token_ids, flush=True)
-            # print("schedule seq with block tables: ", seq.block_table, flush=True)
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -375,8 +373,6 @@ class Scheduler:
         num_placeholder = self.mtp_k
         if is_deferred_out:
             num_placeholder += 1
-        # print("is prev prefill: ", is_prev_prefill, flush=True)
-        # print("fwd_output: ", fwd_output.req_ids, flush=True)
         for seq in self.running:
             # Update the running status
             if seq.id not in fwd_output.req_ids:

@@ -5,15 +5,12 @@ from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
 
-# import torch.distributed as dist
 from aiter.dist.parallel_state import get_tensor_model_parallel_rank
 from transformers.activations import ACT2FN
 from atom.config import QuantizationConfig, Config
 
-# from atom.model_loader.loader import mamba_v2_sharded_weight_loader
 from atom.model_ops.activation import SiluAndMul
 
-# from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention, LinearAttention
 from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
@@ -30,7 +27,6 @@ from atom.model_config.qwen3_next import Qwen3NextConfig
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.utils.decorators import support_torch_compile
 
-# from atom.model_ops.rotary_embedding import get_rope
 from aiter.rotary_embedding import get_rope
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_ops.moe import FusedMoE
@@ -304,7 +300,6 @@ class Qwen3NextAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        # print("config: ", config, flush=True)
         rope_parameters = getattr(config, "rope_parameters", None)
         rope_parameters = rope_parameters or {}
         rope_theta = rope_parameters.get("rope_theta", 10000)
@@ -813,7 +808,6 @@ class Qwen3NextModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        # print("input ids: ", input_ids, flush=True)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
