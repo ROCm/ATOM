@@ -24,7 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from aiter import (
@@ -79,7 +79,6 @@ from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, _has_module
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
-    get_quant_config_for_layer,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -705,18 +704,14 @@ class DeepseekV2MLP(nn.Module):
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            quant_config=get_quant_config_for_layer(
-                quant_config, prefix=f"{prefix}.gate_up_proj"
-            ),
+            quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
-            quant_config=get_quant_config_for_layer(
-                quant_config, prefix=f"{prefix}.down_proj"
-            ),
+            quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
@@ -785,9 +780,7 @@ class DeepseekV2MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
             renormalize=config.norm_topk_prob,
-            quant_config=get_quant_config_for_layer(
-                quant_config, prefix=f"{prefix}.experts"
-            ),
+            quant_config=quant_config,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
@@ -959,7 +952,7 @@ def sparse_attn_indexer(
     context = forward_context.context
     slot_mapping = attn_metadata.slot_mapping
     # Skip for dummy runs to avoid corrupting KV cache
-    if kv_cache.numel() == 0:
+    if forward_context.context.is_dummy_run:
         # dummy runner
         return weights
     num_decode_tokens = context.batch_size if not context.is_prefill else 0

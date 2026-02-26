@@ -216,8 +216,8 @@ class EngineCore:
             while alive:
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
-                    serialized_obj = input_socket.recv(copy=False)
-                    request_type, reqs = pickle.loads(serialized_obj)
+                    obj = input_socket.recv(copy=False)
+                    request_type, reqs = pickle.loads(obj)
                     if request_type == EngineCoreRequestType.ADD:
                         req_ids = [req.id for req in reqs]
                         logger.debug(
@@ -254,16 +254,14 @@ class EngineCore:
                 if isinstance(item, tuple) and item[0] == "STREAM":
                     # Send stream outputs
                     stream_outputs = item[1]
-                    serialized_obj = pickle.dumps(
-                        (EngineCoreRequestType.STREAM, stream_outputs)
-                    )
-                    socket.send(serialized_obj)
+                    obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
+                    socket.send(obj)
                     continue
 
                 if isinstance(item, tuple) and item[0] == "READY":
                     # Send READY signal to indicate EngineCore is fully initialized
-                    serialized_obj = pickle.dumps((EngineCoreRequestType.READY, None))
-                    socket.send(serialized_obj)
+                    obj = pickle.dumps((EngineCoreRequestType.READY, None))
+                    socket.send(obj)
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
 
@@ -272,10 +270,10 @@ class EngineCore:
                 valid_seqs = [
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
-                serialized_obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
-                socket.send(serialized_obj)
                 num_valid = len(valid_seqs)
                 if num_valid > 0:
+                    obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
+                    socket.send(obj)
                     logger.info(f"{self.label}: output send {num_valid} reqs")
                 if len(valid_seqs) != len(seqs):
                     socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
@@ -290,7 +288,7 @@ class EngineCore:
 
     def stop_profiler(self):
         if self.profile_enbaled:
-            logger.info("Profiler stoping...")
+            logger.info("Profiler stopping...")
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
             logger.info("Profiler stopped.")
 

@@ -285,13 +285,12 @@ class QuantizationConfig(dict):
         factors.append(self["quant_name"])
         factors.append(self["is_dynamic"])
         factors.append(self["quant_method"])
-        str_factors = str(factors)
         # assert_hashable(str_factors)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
 
 def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
-    torch_dtype = getattr(config, "torch_dtype", "bf16")
+    torch_dtype = getattr(config, "dtype", "bf16")
     orig_quant_config = getattr(config, "quantization_config", None)
     if orig_quant_config is None:
         return QuantizationConfig(
@@ -524,6 +523,9 @@ class SpeculativeConfig:
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         if hf_config.model_type == "deepseek_v3":
             hf_config.model_type = "deepseek_mtp"
+        if hf_config.model_type == "qwen3_next":
+            hf_config.model_type = "qwen3_next_mtp"
+
         if hf_config.model_type == "deepseek_mtp":
             # DeepSeek MTP typically uses only 1 layer that gets reused
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
@@ -541,6 +543,18 @@ class SpeculativeConfig:
                     "architectures": ["DeepSeekMTPModel"],
                 }
             )
+        if hf_config.model_type == "qwen3_next_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            if n_predict != 1:
+                logger.warning(
+                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                    "(MTP typically uses 1 layer that gets reused)"
+                )
+                n_predict = 1
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Qwen3NextMTPModel"]}
+            )
+        logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
         method = self.method
@@ -598,15 +612,15 @@ class Config:
 
     def __post_init__(self):
         # assert os.path.isdir(self.model)
-        assert (
-            self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1
-        ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
+
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(self.model)
         if not hasattr(self.hf_config, "rope_parameters"):
             # Compatible with both transformers < 5
             rope_params = getattr(self.hf_config, "rope_scaling", {})
-            rope_params["rope_theta"] = self.hf_config.rope_theta
+            if rope_params is None:
+                rope_params = {}
+            rope_params["rope_theta"] = getattr(self.hf_config, "rope_theta", None)
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
@@ -637,16 +651,15 @@ class Config:
             self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             self.compilation_config.init_with_cudagraph_sizes()
         self.torch_dtype = (
-            self.hf_config.torch_dtype
-            if getattr(self.hf_config, "torch_dtype", None) is not None
+            self.hf_config.dtype
+            if getattr(self.hf_config, "dtype", None) is not None
             else torch.bfloat16
         )
 
         if self.speculative_config is not None:
-            if self.speculative_config.num_speculative_tokens != 1:
+            if self.speculative_config.num_speculative_tokens > 4:
                 raise ValueError(
-                    f"num_speculative_tokens must be 1, got {self.speculative_config.num_speculative_tokens}. "
-                    "Only num_speculative_tokens=1 is currently supported."
+                    f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
                 )
 
     def compute_hash(self) -> str:
