@@ -17,8 +17,9 @@ from aiter import (
 )
 from torch import nn
 
-from atom.config import QuantizationConfig
+from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
+from atom.models.utils import get_quant_config_for_layer
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
@@ -243,8 +244,9 @@ class LinearBase(nn.Module):
                 requires_grad=False,
             )
         if bias:
+            output_type = get_current_atom_config().torch_dtype
             self.bias = nn.Parameter(
-                torch.empty(self.output_size, dtype=params_dtype), requires_grad=False
+                torch.empty(self.output_size, dtype=output_type), requires_grad=False
             )
             self.bias.weight_loader_process = self.weight_loader_process
         else:
@@ -308,7 +310,6 @@ class LinearBase(nn.Module):
         loaded_weight: torch.Tensor,
         post_process_func: Callable = lambda a: a,
     ):
-        # assert not (param.data.dtype == torch.float4_e2m1fn_x2 and loaded_weight.dtype == torch.bfloat16)
         if (
             param.data.dtype != loaded_weight.dtype
             and param.data.element_size() == loaded_weight.element_size()
@@ -503,9 +504,12 @@ class MergedColumnParallelLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.output_sizes = output_sizes
+        if quant_config is not None and prefix:
+            quant_config = get_quant_config_for_layer(quant_config, prefix)
         super().__init__(
             input_size,
             output_sizes,
@@ -625,9 +629,12 @@ class RowParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
+        if quant_config is not None and prefix:
+            quant_config = get_quant_config_for_layer(quant_config, prefix)
         super().__init__(
             input_size,
             output_size,

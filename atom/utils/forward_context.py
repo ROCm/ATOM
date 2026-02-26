@@ -127,7 +127,6 @@ class SpecDecodeMetadata:
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
-    logits_indices: torch.Tensor
 
 
 @dataclass
@@ -135,6 +134,7 @@ class Context:
     # This context is used to store the basic context of the forward.
     positions: torch.Tensor
     is_prefill: bool = False
+    is_dummy_run: bool = False
     batch_size: int = 0
     graph_bs: int = 0
     is_draft: bool = False
@@ -143,12 +143,14 @@ class Context:
         self,
         positions: torch.Tensor,
         is_prefill: bool = False,
+        is_dummy_run: bool = False,
         batch_size: int = 0,
         graph_bs: int = 0,
         is_draft: bool = False,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
+        self.is_dummy_run = is_dummy_run
         self.batch_size = batch_size
         self.graph_bs = graph_bs
         self.is_draft = is_draft
@@ -184,7 +186,6 @@ class AttentionMetaData:
     reduce_partial_map: Optional[torch.Tensor] = None
 
     block_tables_converted: Optional[torch.Tensor] = None
-    kv_indices_converted: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -210,7 +211,6 @@ class AttentionMetaData:
         reduce_final_map: Optional[torch.Tensor] = None,
         reduce_partial_map: Optional[torch.Tensor] = None,
         block_tables_converted: Optional[torch.Tensor] = None,
-        kv_indices_converted: Optional[torch.Tensor] = None,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
     ):
@@ -237,8 +237,6 @@ class AttentionMetaData:
         self.reduce_partial_map = reduce_partial_map
         if block_tables_converted is not None:
             self.block_tables = block_tables_converted
-        if kv_indices_converted is not None:
-            self.kv_indices = kv_indices_converted
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
 
@@ -253,6 +251,39 @@ class AttentionMetaData:
             for field in fields(self)
             if field.name not in skip_fields
         }
+
+
+@dataclass
+class GDNAttentionMetadata:
+    num_prefills: int
+    num_prefill_tokens: int
+    num_decodes: int
+    num_decode_tokens: int
+    num_spec_decodes: int
+    num_spec_decode_tokens: int
+    num_actual_tokens: int
+
+    has_initial_state: torch.Tensor | None = None
+
+    spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
+    non_spec_query_start_loc: torch.Tensor | None = (
+        None  # shape: [batch - num_spec_decodes + 1,]
+    )
+
+    spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
+    non_spec_state_indices_tensor: torch.Tensor | None = (
+        None  # shape: [batch - num_spec_decodes,]
+    )
+    spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
+    spec_token_indx: torch.Tensor | None = None
+    non_spec_token_indx: torch.Tensor | None = None
+
+    num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
+
+    # The following attributes are for triton implementation of causal_conv1d
+    nums_dict: dict | None = None
+    batch_ptr: torch.Tensor | None = None
+    token_chunk_offset_ptr: torch.Tensor | None = None
 
 
 @dataclass

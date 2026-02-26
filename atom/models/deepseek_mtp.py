@@ -4,6 +4,8 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
+
+from aiter import dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -53,11 +55,16 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
         )
+
+        quant_config = atom_config.quant_config
+        if quant_config["quant_dtype"] == dtypes.fp4x2:
+            quant_config = QuantizationConfig()
+
         self.mtp_block = DeepseekV2DecoderLayer(
             prefix=prefix,
             config=self.config,
             cache_config=atom_config.kv_cache_dtype,
-            quant_config=atom_config.quant_config,
+            quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
         )

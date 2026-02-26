@@ -7,10 +7,14 @@ from typing import (
     Protocol,
     Tuple,
     Union,
+    Optional,
 )
 
 import torch
 import os
+import re
+
+from atom.config import QuantizationConfig
 
 import logging
 
@@ -214,28 +218,6 @@ def maybe_prefix(prefix: str, name: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
-def extract_layer_index(layer_name: str) -> int:
-    """
-    Extract the layer index from the module name.
-    Examples:
-    - "encoder.layers.0" -> 0
-    - "encoder.layers.1.self_attn" -> 1
-    - "2.self_attn" -> 2
-    - "model.encoder.layers.0.sub.1" -> ValueError
-    """
-    subnames = layer_name.split(".")
-    int_vals: List[int] = []
-    for subname in subnames:
-        try:
-            int_vals.append(int(subname))
-        except ValueError:
-            continue
-    assert len(int_vals) == 1, (
-        f"layer name {layer_name} should" " only contain one integer"
-    )
-    return int_vals[0]
-
-
 def cast_overflow_tensors(
     tensors: torch.Tensor,
     offset: float = 1000,
@@ -253,3 +235,72 @@ def fast_topk(values, topk, dim):
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
+
+
+def should_ignore_layer(
+    quantization_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    if quantization_config is None:
+        return True
+    exclude_layers: List[str] = quantization_config.get("exclude_layers", [])
+    if not exclude_layers:
+        return False
+    for exclude_layer in exclude_layers:
+        if exclude_layer.startswith("re"):
+            # case "re:model.layers.*self_attn.*", remove the 're:' prefix
+            regex_pattern = exclude_layer[3:]
+            if re.search(regex_pattern, prefix):
+                return True
+        elif prefix in exclude_layer:
+            # case exclude_layer like "model.layers.0.self_attn.q_a_proj"
+            # a common prefix for linear layers in attn like "model.layers.0.self_attn"
+            return True
+        else:
+            # case "lm_head". Common practice won't quant lm_head, however.
+            if prefix.split(".")[-1] == exclude_layer:
+                return True
+    return False
+
+
+def get_quant_config_for_layer(
+    quantization_config: Optional[QuantizationConfig], prefix: str
+) -> Optional[QuantizationConfig]:
+    return (
+        None
+        if should_ignore_layer(quantization_config, prefix)
+        else quantization_config
+    )
+
+
+def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
+    """
+    Extract the layer index from the module name.
+    Examples:
+    - "encoder.layers.0" -> 0
+    - "encoder.layers.1.self_attn" -> 1
+    - "2.self_attn" -> 2
+    - "model.encoder.layers.0.sub.1" -> ValueError if num_attn_module == 1
+    """
+    subnames = layer_name.split(".")
+    int_vals: list[int] = []
+    for subname in subnames:
+        try:
+            int_vals.append(int(subname))
+        except ValueError:
+            continue
+    if num_attn_module == 1 or "attn" not in layer_name:
+        assert (
+            len(int_vals) == 1
+        ), f"layer name {layer_name} should only contain one integer"
+
+        return int_vals[0]
+    else:
+        assert (
+            len(int_vals) <= 2
+        ), f"layer name {layer_name} should contain at most two integers"
+        layer_index = (
+            int_vals[0] * num_attn_module + int_vals[1]
+            if len(int_vals) == 2
+            else int_vals[0]
+        )
+        return layer_index

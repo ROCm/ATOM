@@ -42,10 +42,15 @@ if [ "$TYPE" == "accuracy" ]; then
 
   echo ""
   echo "========== Running accuracy test =========="
+  mkdir -p accuracy_test_results
+  RESULT_FILENAME=accuracy_test_results/$(date +%Y%m%d%H%M%S).json
   lm_eval --model local-completions \
           --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False \
           --tasks gsm8k \
-          --num_fewshot 3
+          --num_fewshot 3 \
+          --output_path "${RESULT_FILENAME}"
+  echo "Accuracy test results saved to ${RESULT_FILENAME}"
+  chmod -R 777 accuracy_test_results
 fi
 
 if [ "$TYPE" == "benchmark" ]; then

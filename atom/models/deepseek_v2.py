@@ -24,7 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from aiter import (
@@ -82,6 +82,7 @@ from atom.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    should_ignore_layer,
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -761,6 +762,7 @@ class DeepseekV2MoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
+            # MoE gate normally remains unquantized, but may not declare as ignore layers in quantization_config
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
@@ -950,7 +952,7 @@ def sparse_attn_indexer(
     context = forward_context.context
     slot_mapping = attn_metadata.slot_mapping
     # Skip for dummy runs to avoid corrupting KV cache
-    if kv_cache.numel() == 0:
+    if forward_context.context.is_dummy_run:
         # dummy runner
         return weights
     num_decode_tokens = context.batch_size if not context.is_prefill else 0
@@ -1217,8 +1219,6 @@ class DeepseekV2MLAAttention(nn.Module):
         v_head_dim: int,
         q_lora_rank: Optional[int],
         kv_lora_rank: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         cache_config: str = "bf16",
         quant_config: Optional[QuantizationConfig] = None,
@@ -1242,15 +1242,18 @@ class DeepseekV2MLAAttention(nn.Module):
         self.num_local_heads = num_heads // tp_size
 
         self.scaling = self.qk_head_dim**-0.5
-        self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
 
         # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains AITER BF16 GEMMs,
         # For FP8 and use_triton_gemm(), fused_qkv_a_proj is AITER-Triton FP8 GEMMs while others remain AITER FP8 GEMMs
         if quant_config["quant_dtype"] == dtypes.fp4x2:
-            if not use_triton_gemm():
-                # TODO use ignore layer for mxfp4 attention
+            # normally linear layers in attn share the same quant config
+            if should_ignore_layer(quant_config, prefix):
+                source_quant_dtype = None
+                quant_config = None
+                base_quant_config = None
+            elif not use_triton_gemm():
                 source_quant_dtype = None
                 quant_config = None
                 base_quant_config = None
@@ -1324,8 +1327,10 @@ class DeepseekV2MLAAttention(nn.Module):
             source_quant_dtype=None,
         )
 
-        if rope_scaling:
-            rope_scaling["rope_type"] = "deepseek_yarn"
+        rope_params = config.rope_parameters
+        rope_params["rope_type"] = "deepseek_yarn"
+        rope_theta = rope_params["rope_theta"]
+        rope_scaling = rope_params
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
@@ -1334,9 +1339,9 @@ class DeepseekV2MLAAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=False,
         )
-        if rope_scaling:
-            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-            scaling_factor = rope_scaling["factor"]
+        if rope_params:
+            mscale_all_dim = rope_params.get("mscale_all_dim", False)
+            scaling_factor = rope_params["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
@@ -1516,8 +1521,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
@@ -1533,8 +1536,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank if hasattr(config, "q_lora_rank") else None,
             kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,

@@ -70,7 +70,6 @@ def rejection_sample(
     assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
-    # print(1111111, f"{batch_size=} {type(cu_num_draft_tokens)=}")
 
     # Create output buffer.
     output_token_ids = torch.empty(
@@ -78,7 +77,6 @@ def rejection_sample(
         dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
         device=device,
     )
-    output_token_ids.fill_(-1)
     num_bonus_tokens = torch.empty(batch_size, dtype=torch.int32, device=device)
 
     # Rejection sampling for greedy sampling requests.
@@ -118,25 +116,31 @@ def rejection_greedy_sample_kernel(
 
     rejected = False
     num_bonus_token = -1
+    INVALID_TOKEN: tl.constexpr = -1
     for pos in range(num_draft_tokens):
-        if not rejected:
+        if rejected:
+            target_argmax_id = INVALID_TOKEN
+        else:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
             target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
-            tl.store(
-                output_token_ids_ptr + req_idx * (num_spec_steps + 1) + pos,
-                target_argmax_id,
-            )
+            target_argmax_id = tl.cast(target_argmax_id, tl.int32)
             if draft_token_id != target_argmax_id:
                 # Reject.
                 rejected = True
             num_bonus_token += 1
+        tl.store(
+            output_token_ids_ptr + req_idx * (num_spec_steps + 1) + pos,
+            target_argmax_id,
+        )
 
-    if not rejected:
+    if rejected:
+        bonus_token_id = INVALID_TOKEN
+    else:
         # If all tokens are accepted, append the bonus token.
         bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
         num_bonus_token += 1
-        tl.store(
-            output_token_ids_ptr + req_idx * (num_spec_steps + 1) + num_draft_tokens,
-            bonus_token_id,
-        )
+    tl.store(
+        output_token_ids_ptr + req_idx * (num_spec_steps + 1) + num_draft_tokens,
+        bonus_token_id,
+    )
     tl.store(num_bonus_tokens_ptr + req_idx, num_bonus_token)

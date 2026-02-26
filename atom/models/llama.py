@@ -27,41 +27,33 @@
 from typing import Any, Optional, Union
 
 import torch
-from torch import nn
-from transformers import LlamaConfig
+from aiter import QuantType
+from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
+from aiter.rotary_embedding import get_rope
+from atom.config import Config, QuantizationConfig
+from atom.model_ops.activation import SiluAndMul
 
 # from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention
-
-from aiter.dist.parallel_state import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
-from atom.model_ops.activation import SiluAndMul
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from aiter.rotary_embedding import get_rope
-from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
-from atom.config import QuantizationConfig, Config
-from atom.utils.decorators import support_torch_compile
-
 from atom.models.utils import (
+    IntermediateTensors,
     PPMissingLayer,
     extract_layer_index,
-    IntermediateTensors,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
 from atom.utils import envs
-
-from aiter import (
-    QuantType,
-)
+from atom.utils.decorators import support_torch_compile
+from torch import nn
+from transformers import LlamaConfig
 
 ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT = (
     envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
@@ -255,8 +247,9 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_params = config.rope_parameters
+        rope_theta = rope_params["rope_theta"]
+        rope_scaling = rope_params
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):

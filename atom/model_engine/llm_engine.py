@@ -23,7 +23,9 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         config = Config(model, **config_kwargs)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.model, use_fast=True, trust_remote_code=config.trust_remote_code
+        )
         config.bos_token_id = self.tokenizer.bos_token_id
         config.eos_token_id = self.tokenizer.eos_token_id
         stop_token_ids = set(config.stop_token_ids)
@@ -35,7 +37,7 @@ class LLMEngine:
         self.data_parallel_size = data_parallel_size
         self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
-            self.tokenizer, config.kv_cache_block_size
+            config, self.tokenizer, config.kv_cache_block_size
         )
         self.core_mgr = CoreManager(config)
         self._step_lock = None
@@ -119,7 +121,6 @@ class LLMEngine:
 
     def stop_profile(self):
         self.core_mgr.send_utility_command("stop_profile")
-        logger.info("Profiling stopped. Trace files should be generated.")
 
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
@@ -127,10 +128,23 @@ class LLMEngine:
 
 class InputOutputProcessor:
 
-    def __init__(self, tokenizer, block_size):
+    def __init__(self, config, tokenizer, block_size):
+        self.config = config
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        self.mamba_enabled = False
+        self.num_speculative_tokens = 0
+        if (
+            hasattr(self.config, "speculative_config")
+            and self.config.speculative_config is not None
+        ):
+            self.num_speculative_tokens = (
+                self.config.speculative_config.num_speculative_tokens
+            )
+
+        if self.config.hf_config.model_type == "qwen3_next":
+            self.mamba_enabled = True
 
     def preprocess(
         self,
@@ -166,11 +180,14 @@ class InputOutputProcessor:
             sampling_params,
             stop_token_sequences,
             stream_callback=stream_callback,
+            num_draft_tokens=self.num_speculative_tokens,
+            mamba_enabled=self.mamba_enabled,
         )
         seq.arrive_time = time.time()
         self.requests[seq.id] = seq
-        print(
-            f"Request {seq.id} arrived, input tokens: {len(tokens)}, pending requests: {len(self.requests)}"
+        logger.info(
+            f"Request {seq.id} arrived, input tokens: {len(tokens)}, pending requests: {len(self.requests)} "
+            # f"<{prompt_or_tokens=}>"
         )
         return seq
 
@@ -195,7 +212,7 @@ class InputOutputProcessor:
                         req.num_completion_tokens - 1
                     )
 
-            print(
+            logger.info(
                 f"Request {req.id} finished with reason {req.leave_reason}. "
                 f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
                 f"latency: {req.leave_time - req.arrive_time:.2f}s, "

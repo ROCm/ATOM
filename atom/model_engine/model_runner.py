@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import math
 import os
 import time
 from typing import Any, Optional, Union
@@ -34,7 +35,6 @@ from atom.utils import (
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
-    SpecDecodeMetadata,
     get_forward_context,
     reset_forward_context,
     set_forward_context,
@@ -52,6 +52,8 @@ support_model_arch_dict = {
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
+    "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
+    "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -62,14 +64,17 @@ class tokenIDProcessor:
 
     def __init__(
         self,
+        runner: "ModelRunner",
         max_num_batched_tokens: int,
-        device: torch.device,
         use_spec: bool = False,
-        num_speculative_tokens: int = 0,
+        num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         # self.is_deferred_out = False
         self.is_deferred_out = True
+
+        self.runner = runner
+        device = runner.device
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
@@ -77,27 +82,36 @@ class tokenIDProcessor:
             max_num_batched_tokens, dtype=torch.int64, device=device
         )
         self.use_spec = use_spec
-        if self.use_spec:
-            self.num_speculative_tokens = num_speculative_tokens
+        self.num_spec_tokens = num_spec_tokens
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_event = torch.cuda.Event()
         self.async_copy_stream = torch.cuda.Stream()
+        self.default_num_rejected_tokens = torch.zeros(
+            max_num_batched_tokens, dtype=torch.int32, device=device
+        )
         self.clean()
 
-    def send_to_cpu_async(self, gpu_tensor: torch.Tensor):
-        default_stream = torch.cuda.current_stream()
+    def send_to_cpu_async(
+        self,
+        gpu_tensor: torch.Tensor,
+        cpu_tensor_handle,
+        data_ready: torch.cuda.Event,
+        copy_done: Optional[torch.cuda.Event] = None,
+    ):
+        copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
-            self.async_copy_stream.wait_stream(default_stream)
+            data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
-            self.async_copy_event.record(self.async_copy_stream)
-        self.token_ids_cpu.append(cpu_tensor)
+            copy_done.record(self.async_copy_stream)
+        cpu_tensor_handle.append((cpu_tensor, copy_done))
 
-    def recv_async_output(self) -> list[int]:
-        if not self.token_ids_cpu:
+    def recv_async_output(self, cpu_tensor_handle) -> list[int]:
+        if not cpu_tensor_handle:
             return []
-        self.async_copy_event.synchronize()
-        token_ids = self.token_ids_cpu.pop(0).tolist()
+        cpu_tensor, event = cpu_tensor_handle.pop(0)
+        event.synchronize()
+        token_ids = cpu_tensor.tolist()
         return token_ids
 
     def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
@@ -109,27 +123,41 @@ class tokenIDProcessor:
             event.record(self.async_copy_stream)
         self.draft_token_ids_cpu.append((cpu_tensor, event))
 
-    def recv_async_output_draft(self) -> list[int]:
+    def recv_async_output_draft(self) -> np.ndarray:
         if not self.draft_token_ids_cpu:
-            return []
+            return np.array([], dtype=np.int32)
         token_ids, event = self.draft_token_ids_cpu.pop(0)
         event.synchronize()
-        return token_ids.tolist()
+        return token_ids.numpy()
 
-    def send_bonus_to_cpu_async(self, gpu_tensor: torch.Tensor):
+    def send_mtp_status_to_cpu_async(
+        self, num_rejected: torch.Tensor, num_bonus: torch.Tensor
+    ):
+        # rejected num and bonus num are slightly different info for mtp
+        # take mtp=1 for example:
+        #   first decode after prefill have 0 rej, 0 bonus
+        #   prev acc decode have 0 rej, 1 bonus
+        #   prev rej decode have 1 rej, 0 bonus
+        # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.async_copy_stream):
             self.async_copy_stream.wait_stream(default_stream)
-            cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            num_rejected_cpu = num_rejected.to("cpu", non_blocking=True)
+            num_bonus_cpu = num_bonus.to("cpu", non_blocking=True)
             self.async_copy_event.record(self.async_copy_stream)
-        self.bonus_tokens_cpu.append(cpu_tensor)
+        self.rejected_tokens_cpu.append(num_rejected_cpu)
+        self.bonus_tokens_cpu.append(num_bonus_cpu)
 
-    def recv_bonus_async(self) -> Optional[list[int]]:
-        if not self.bonus_tokens_cpu:
-            return None
+    def recv_mtp_status_async(
+        self,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if not self.rejected_tokens_cpu:
+            return None, None
         self.async_copy_event.synchronize()
-        bonus_list = self.bonus_tokens_cpu.pop(0).tolist()
-        return bonus_list
+        return (
+            self.rejected_tokens_cpu.pop(0).numpy(),
+            self.bonus_tokens_cpu.pop(0).numpy(),
+        )
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -139,9 +167,10 @@ class tokenIDProcessor:
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
         self.draft_token_ids_cpu: list[torch.Tensor] = []
-        self.bonus_tokens_cpu: list[torch.Tensor] = (
+        self.rejected_tokens_cpu: list[torch.Tensor] = (
             []
         )  # Async queue for num_bonus_tokens
+        self.bonus_tokens_cpu: list[torch.Tensor] = []
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
@@ -163,7 +192,10 @@ class tokenIDProcessor:
             return (token_id,)
 
     def prepare_sampled_ids(
-        self, batch: ScheduledBatch, sampled_token_ids: torch.Tensor
+        self,
+        batch: ScheduledBatch,
+        sampled_token_ids: torch.Tensor,
+        sync_event: torch.cuda.Event,
     ) -> dict[int, tuple[int, ...]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
@@ -175,8 +207,8 @@ class tokenIDProcessor:
             ret[-1] = 0  # is_deferred_out flag
             return ret
 
-        token_ids = self.recv_async_output()
-        self.send_to_cpu_async(sampled_token_ids)
+        token_ids = self.recv_async_output(self.token_ids_cpu)
+        self.send_to_cpu_async(sampled_token_ids, self.token_ids_cpu, sync_event)
         token_id_dict = {}
         self.prev_req_ids = None
         if self.prev_batch is not None:
@@ -197,34 +229,41 @@ class tokenIDProcessor:
 
     def get_token_locations(
         self, batch: ScheduledBatch
-    ) -> tuple[list[int], list[int], list[int], bool]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
         prev_req_ids = self.prev_batch.req_ids
         cur_req_ids = batch.req_ids
-        prev_id_to_idx = {req_id: i for i, req_id in enumerate(prev_req_ids)}
+        num_prev = len(prev_req_ids)
+        num_cur = len(cur_req_ids)
 
-        deferred_curr_indices = []
-        deferred_prev_indices = []  # old requests position in prev_batch
-        new_curr_indices = []  # new requests position in cur_batch
+        prev_id_to_idx = dict(zip(prev_req_ids, range(num_prev)))
 
-        for cur_idx, req_id in enumerate(cur_req_ids):
-            if req_id in prev_id_to_idx:
-                deferred_curr_indices.append(cur_idx)
-                deferred_prev_indices.append(prev_id_to_idx[req_id])
+        deferred_curr = np.empty(num_cur, dtype=np.intp)
+        deferred_prev = np.empty(num_cur, dtype=np.intp)
+        new_curr = np.empty(num_cur, dtype=np.intp)
+        n_deferred = 0
+        n_new = 0
+
+        for cur_idx in range(num_cur):
+            prev_idx = prev_id_to_idx.get(cur_req_ids[cur_idx])
+            if prev_idx is not None:
+                deferred_curr[n_deferred] = cur_idx
+                deferred_prev[n_deferred] = prev_idx
+                n_deferred += 1
             else:
-                new_curr_indices.append(cur_idx)
+                new_curr[n_new] = cur_idx
+                n_new += 1
+
+        deferred_curr = deferred_curr[:n_deferred]
+        deferred_prev = deferred_prev[:n_deferred]
+        new_curr = new_curr[:n_new]
 
         is_all_same = (
-            len(new_curr_indices) == 0
-            and len(deferred_curr_indices) == len(prev_req_ids)
-            and deferred_curr_indices == deferred_prev_indices
+            n_new == 0
+            and n_deferred == num_prev
+            and np.array_equal(deferred_curr, deferred_prev)
         )
 
-        return (
-            deferred_curr_indices,
-            deferred_prev_indices,
-            new_curr_indices,
-            is_all_same,
-        )
+        return deferred_curr, deferred_prev, new_curr, is_all_same
 
     def prepare_input_ids(
         self,
@@ -236,45 +275,29 @@ class tokenIDProcessor:
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
-        token_nums = batch.num_scheduled_tokens
         total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
-        total_reqs_decode = batch.total_seqs_num_decode
         """for prefill: all input ids are new"""
-        start_loc = 0
-        for tokens, new_token_num in zip(
-            scheduled_tokens[:total_reqs_prefill], token_nums[:total_reqs_prefill]
-        ):
-            self.input_ids.np[start_loc : start_loc + new_token_num] = tokens
-            start_loc += new_token_num
+        self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
+            :total_tokens_prefill
+        ]
         self.input_ids.copy_to_gpu(total_tokens_prefill)
+
+        self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
             return self.input_ids.gpu[:total_tokens_prefill]
 
         if not self.is_deferred_out:
+            token_ids = scheduled_tokens[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ]
             if self.use_spec:
-                token_ids = [
-                    token
-                    for tokens, draft_tokens in zip(
-                        scheduled_tokens[
-                            total_reqs_prefill : total_reqs_prefill + total_reqs_decode
-                        ],
-                        batch.scheduled_spec_decode_tokens.values(),
-                    )
-                    for token in [tokens[0]] + draft_tokens
-                ]
-            else:
-                token_ids = [
-                    token
-                    for tokens in scheduled_tokens[
-                        total_reqs_prefill : total_reqs_prefill + total_reqs_decode
-                    ]
-                    for token in tokens
-                ]
+                token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
+
             self.input_ids.np[:total_tokens_decode] = token_ids
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
@@ -287,7 +310,7 @@ class tokenIDProcessor:
 
         # Calculate token counts: in MTP mode, each seq has multiple tokens
         if self.use_spec:
-            tokens_per_seq = self.num_speculative_tokens + 1
+            tokens_per_seq = self.num_spec_tokens + 1
             num_deferred_tokens = num_deferred_seqs * tokens_per_seq
             num_new_tokens = num_new_seqs * tokens_per_seq
         else:
@@ -296,17 +319,16 @@ class tokenIDProcessor:
             num_new_tokens = num_new_seqs
 
         # Receive and map bonus_list to current batch order
-        prev_bonus_list = self.recv_bonus_async()
-        total_seqs = num_deferred_seqs + num_new_seqs
-        if prev_bonus_list is not None and num_deferred_seqs > 0:
+        self.num_rejected = batch.num_rejected
+        self.num_bonus = batch.num_bonus
+        if num_deferred_seqs > 0 and self.prev_rejected_num is not None:
             # Map: prev_bonus_list[prev_idx] → mapped_bonus_list[curr_idx]
-            # New seqs get default value (tokens_per_seq - 1)
-            self.mapped_bonus_list = [tokens_per_seq - 1] * total_seqs
-            for curr_idx, prev_idx in zip(deferred_curr_indices, deferred_prev_indices):
-                if prev_idx < len(prev_bonus_list):
-                    self.mapped_bonus_list[curr_idx] = prev_bonus_list[prev_idx]
-        else:
-            self.mapped_bonus_list = None
+            self.num_rejected[deferred_curr_indices] = self.prev_rejected_num[
+                deferred_prev_indices
+            ]
+            self.num_bonus[deferred_curr_indices] = self.prev_bonus_num[
+                deferred_prev_indices
+            ]
 
         if is_all_same:
             # All requests are the same, only deferred tokens
@@ -339,9 +361,11 @@ class tokenIDProcessor:
             is_prev_prefill = self.prev_batch.total_tokens_num_prefill > 0
             new_decode_front = (
                 is_prev_prefill
-                and new_curr_indices == list(range(num_new_seqs))
-                and deferred_curr_indices
-                == list(range(num_new_seqs, num_new_seqs + num_deferred_seqs))
+                and np.array_equal(new_curr_indices, np.arange(num_new_seqs))
+                and np.array_equal(
+                    deferred_curr_indices,
+                    np.arange(num_new_seqs, num_new_seqs + num_deferred_seqs),
+                )
             )
 
             gathered_tokens = None
@@ -385,89 +409,52 @@ class tokenIDProcessor:
                         num_new_tokens : num_new_tokens + num_deferred_tokens
                     ] = gathered_tokens
                 if num_new_tokens > 0:
+                    token_ids = scheduled_tokens[
+                        total_tokens_prefill : total_tokens_prefill + num_new_tokens
+                    ].reshape(num_new_seqs, tokens_per_seq)
                     if self.use_spec:
-                        # MTP mode: combine scheduled_tokens and draft_tokens
-                        # new_decode_front=True means new_curr_indices == list(range(num_new_seqs))
-                        # so we can use sequential indexing
-                        token_ids = [
-                            token
-                            for tokens, draft_tokens in zip(
-                                scheduled_tokens[
-                                    total_reqs_prefill : total_reqs_prefill
-                                    + num_new_seqs
-                                ],
-                                list(batch.scheduled_spec_decode_tokens.values())[
-                                    :num_new_seqs
-                                ],
-                            )
-                            for token in [tokens[-1]] + draft_tokens
+                        token_ids[:, 1:] = batch.scheduled_spec_decode_tokens[
+                            :num_new_seqs
                         ]
-                        self.input_ids.np[:num_new_tokens] = token_ids
-                        self.input_ids.copy_to_gpu(num_new_tokens)
-                    else:
-                        # Non-MTP mode: flatten scheduled_tokens for new requests
-                        token_ids = [
-                            token
-                            for tokens in scheduled_tokens[
-                                total_reqs_prefill : total_reqs_prefill + num_new_seqs
-                            ]
-                            for token in tokens
-                        ]
-                        self.input_ids.np[:num_new_tokens] = token_ids
-                        self.input_ids.copy_to_gpu(num_new_tokens)
+                    self.input_ids.np[:num_new_tokens] = token_ids.flatten()
+                    self.input_ids.copy_to_gpu(num_new_tokens)
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
                 if num_new_tokens > 0:
+                    new_token_ids = scheduled_tokens[new_curr_indices].reshape(
+                        num_new_seqs, tokens_per_seq
+                    )
                     if self.use_spec:
                         # MTP mode: combine scheduled_tokens and draft_tokens
                         # For new_decode_front=False, use new_curr_indices to get the right sequences
-                        new_token_ids = []
-                        for idx in new_curr_indices:
-                            req_idx = total_reqs_prefill + idx
-                            tokens = scheduled_tokens[req_idx]
-                            req_id = batch.req_ids[idx]
-                            draft_tokens = batch.scheduled_spec_decode_tokens.get(
-                                req_id, []
-                            )
-                            new_token_ids.extend([tokens[-1]] + draft_tokens)
-                    else:
-                        # Non-MTP mode: only first token from scheduled_tokens
-                        new_token_ids = [
-                            scheduled_tokens[idx][0] for idx in new_curr_indices
+                        draft_tokens = batch.scheduled_spec_decode_tokens[
+                            new_curr_indices
                         ]
-                    self.input_ids.np[:num_new_tokens] = new_token_ids
+                        new_token_ids[:, 1:] = draft_tokens
+                    self.input_ids.np[:num_new_tokens] = new_token_ids.flatten()
                     self.input_ids.gpu[
                         num_deferred_tokens : num_deferred_tokens + num_new_tokens
                     ].copy_(self.input_ids.cpu[:num_new_tokens], non_blocking=True)
                 if gathered_tokens is not None:
                     self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
-
-        return self.input_ids.gpu[:total_tokens]
+        input_ids = self.input_ids.gpu[:total_tokens]
+        return input_ids
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
-    ) -> dict[int, list[int]]:
+    ) -> np.ndarray:
         if not self.is_deferred_out:
-            draft_token_ids = draft_token_ids.tolist()
-            req_ids = batch.req_ids
-            ret = {
-                seq_id: token_id for seq_id, token_id in zip(req_ids, draft_token_ids)
-            }
-            ret[-1] = 0
+            ret = draft_token_ids.numpy()
         else:
             self.draft_token_ids = draft_token_ids
-            self.pre_num_decode_token_per_seq = self.num_speculative_tokens + 1
+            self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
             token_ids = self.recv_async_output_draft()
             self.send_to_cpu_async_draft(draft_token_ids)
             ret = (
-                {
-                    seq_id: token_id
-                    for seq_id, token_id in zip(self.prev_req_ids, token_ids)
-                }
+                token_ids
                 if self.prev_req_ids is not None
-                else {}
+                else np.array([], dtype=np.int32)
             )
-            ret[-1] = 1
         return ret
 
 
@@ -483,11 +470,13 @@ class ModelRunner:
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
-        if self.hf_text_config.model_type in [
-            "llama"
-        ] and self.hf_text_config.torch_dtype in [torch.bfloat16, torch.float16]:
+        if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
+            torch.bfloat16,
+            torch.float16,
+        ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
+        self.use_gdn = self.is_qwen_next()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -546,6 +535,7 @@ class ModelRunner:
         self.attn_backend = get_attn_backend(
             self.block_size,
             use_mla=self.use_mla,
+            use_gdn=self.use_gdn,
         )
         if self.config.speculative_config and get_pp_group().is_last_rank:
             from atom.utils.backends import set_model_tag
@@ -555,12 +545,12 @@ class ModelRunner:
             self.rejection_sampler = RejectionSampler()
             self.mtp_total_draft_tokens = 0
             self.mtp_total_accepted_tokens = 0
-        num_speculative_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
         self.tokenID_processor = tokenIDProcessor(
+            self,
             self.config.max_num_batched_tokens,
-            self.device,
             hasattr(self, "drafter"),
-            num_speculative_tokens,
+            self.num_spec_tokens,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(
@@ -585,6 +575,7 @@ class ModelRunner:
         self.allocate_forward_vars()
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
         self.physical_block_size = self.attn_metadata_builder.block_size
+        self.forward_done_event = torch.cuda.Event()
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
@@ -611,6 +602,13 @@ class ModelRunner:
                 self.hf_text_config.model.model_type in ("deepseek_v2", "deepseek_v3")
                 and self.hf_text_config.kv_lora_rank is not None
             )
+        return False
+
+    def is_qwen_next(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
+            return True
         return False
 
     def get_mtp_statistics(self) -> dict:
@@ -842,7 +840,7 @@ class ModelRunner:
     def allocate_forward_vars(self):
         config = self.config
         hidden_size = config.hf_config.hidden_size
-        hidden_type = config.hf_config.torch_dtype
+        hidden_type = config.torch_dtype
         self.max_bs = self.config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
@@ -863,6 +861,9 @@ class ModelRunner:
         }
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
+            self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs
+            )
 
     def get_num_blocks(self):
         torch.set_default_device(self.device)
@@ -874,6 +875,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        planned = int(total * config.gpu_memory_utilization)
         torch.set_default_device("cpu")
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
@@ -884,7 +886,7 @@ class ModelRunner:
         if self.use_mla:
             block_bytes = (
                 hf_config.num_hidden_layers
-                * self.physical_block_size
+                * self.block_size
                 * 576
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
@@ -893,11 +895,18 @@ class ModelRunner:
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
                 block_bytes += (
                     hf_config.num_hidden_layers
-                    * self.physical_block_size
+                    * self.block_size
                     * aligned_index_dim
                     * dtypes.fp8.itemsize
                 )
-        else:
+        elif self.is_qwen_next():
+            self.full_attention_interval = hf_config.full_attention_interval
+            self.num_full_attn = (
+                hf_config.num_hidden_layers // self.full_attention_interval
+            )
+            self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
+
+            # full attention bytes
             block_bytes = (
                 2
                 * hf_config.num_hidden_layers
@@ -906,11 +915,43 @@ class ModelRunner:
                 * hf_config.head_dim
                 * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
             )
-        num_kvcache_blocks = (
-            int(total * config.gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        ) // self.attn_metadata_builder.block_ratio
-        assert num_kvcache_blocks > 0, f"need at least {block_bytes} KV cache"
+
+            # gdn attn bytes
+            mamba_shape = self.gated_delta_net_state_shape(
+                get_tp_group().world_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                hf_config.linear_conv_kernel_dim,
+                self.num_spec_tokens,
+            )
+
+            one_layer_byte = (
+                sum(math.prod(subtuple) for subtuple in mamba_shape)
+                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+            )
+            block_bytes = block_bytes + self.num_gdn_attn_state * one_layer_byte
+        else:
+            block_bytes = (
+                2
+                * hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * hf_config.head_dim
+                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+            )
+        available_for_kv = min((planned - max(peak, current)), free)
+        num_kvcache_blocks = available_for_kv // block_bytes
+        assert num_kvcache_blocks > 0, (
+            f"Not enough memory for KV cache with block size({self.block_size}). "
+            f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
+            f"but available memory is {free / (1 << 20):.2f}MB "
+            f"(planned: {planned / (1 << 30):.2f}GB ({total/ (1 << 30):.2f}GB*{config.gpu_memory_utilization}), "
+            f"used: {used / (1 << 30):.2f}GB, "
+            f"peak: {peak / (1 << 30):.2f}GB, "
+            f"current: {current / (1 << 30):.2f}GB)"
+        )
         return num_kvcache_blocks
 
     def allocate_kv_cache(self, num_kvcache_blocks):
@@ -929,6 +970,7 @@ class ModelRunner:
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
+        num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             draft_hf_config = self.config.speculative_config.draft_model_hf_config
             # For MTP, use num_nextn_predict_layers instead of num_hidden_layers
@@ -961,6 +1003,50 @@ class ModelRunner:
                     dtype=dtypes.fp8,
                     device="cuda",
                 )
+        elif self.is_qwen_next():
+
+            self.kv_cache = torch.zeros(
+                2,
+                self.num_full_attn + num_draft_layers,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
+                num_kv_heads,
+                hf_config.head_dim,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+
+            self.kv_scale = torch.zeros(
+                2,
+                self.num_full_attn + num_draft_layers,
+                self.num_physical_kvcache_blocks,
+                num_kv_heads,
+                self.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            )
+
+            mamba_shape = self.gated_delta_net_state_shape(
+                get_tp_group().world_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                hf_config.linear_conv_kernel_dim,
+                self.num_spec_tokens,  # self.num_spec,
+            )
+            self.mamba_k_cache = torch.zeros(
+                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
+                + mamba_shape[0],
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+            self.mamba_v_cache = torch.zeros(
+                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
+                + mamba_shape[1],
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
         else:
             self.kv_cache = torch.zeros(
                 2,
@@ -1005,14 +1091,18 @@ class ModelRunner:
                 if hasattr(module, "base_attention"):
                     if hasattr(module, "use_mla") and not module.use_mla:
                         # Non-MLA attention
-                        k_cache = self.kv_cache[0, layer_id].view(
+                        if self.is_qwen_next():
+                            attn_idx = layer_id // self.full_attention_interval
+                        else:
+                            attn_idx = layer_id
+                        k_cache = self.kv_cache[0, attn_idx].view(
                             self.num_physical_kvcache_blocks,
                             num_kv_heads,
                             hf_config.head_dim // x,
                             self.physical_block_size,
                             x,
                         )
-                        v_cache = self.kv_cache[1, layer_id].view(
+                        v_cache = self.kv_cache[1, attn_idx].view(
                             self.num_physical_kvcache_blocks,
                             num_kv_heads,
                             hf_config.head_dim,
@@ -1020,8 +1110,8 @@ class ModelRunner:
                         )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, layer_id]
-                            module.v_scale = self.kv_scale[1, layer_id]
+                            module.k_scale = self.kv_scale[0, attn_idx]
+                            module.v_scale = self.kv_scale[1, attn_idx]
 
                         k_scale = module.k_scale
                         v_scale = module.v_scale
@@ -1071,6 +1161,24 @@ class ModelRunner:
                         module.kv_cache = kv_cache
                         module.max_model_len = self.config.max_model_len
                         layer_id += 1
+                elif hasattr(module, "base_linear_attention"):
+                    gdn_idx = (
+                        layer_id
+                        // self.full_attention_interval
+                        * (self.full_attention_interval - 1)
+                        + layer_id % self.full_attention_interval
+                    )
+                    mamba_k_cache = self.mamba_k_cache[gdn_idx]
+                    mamba_v_cache = self.mamba_v_cache[gdn_idx]
+                    kv_cache_tensor = KVCacheTensor(
+                        layer_num=layer_id,
+                        k_cache=mamba_k_cache,
+                        v_cache=mamba_v_cache,
+                        k_scale=None,
+                        v_scale=None,
+                    )
+                    kv_cache_tensors.append(kv_cache_tensor)
+                    layer_id += 1
 
         # Store KVCacheConfig
         kv_cache_data = {
@@ -1082,6 +1190,31 @@ class ModelRunner:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
+
+    def gated_delta_net_state_shape(
+        self,
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_kernel_size: int,
+        num_spec: int = 0,
+    ):
+        conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
+        conv_state_shape = (
+            conv_dim // tp_world_size,
+            conv_kernel_size - 1 + num_spec,
+        )
+
+        conv_state_shape = conv_state_shape[1], conv_state_shape[0]
+
+        temporal_state_shape = (
+            num_v_heads // tp_world_size,
+            head_k_dim,
+            head_v_dim,
+        )
+        return conv_state_shape, temporal_state_shape
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
         dp_size = self.config.parallel_config.data_parallel_size
@@ -1113,7 +1246,7 @@ class ModelRunner:
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
-        num_scheduled_tokens = batch.num_scheduled_tokens
+        num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
         num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
@@ -1149,6 +1282,7 @@ class ModelRunner:
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
+            is_dummy_run=batch.is_dummy_run,
             batch_size=context_bs,
             graph_bs=graph_bs,
         )
@@ -1157,13 +1291,9 @@ class ModelRunner:
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter"):
             scheduled_bs = batch.total_seqs_num_decode
-            num_draft_tokens = np.full(scheduled_bs, self.drafter.mtp_k, dtype=np.int32)
-            # Use only real sequences; cudagraph padding should not affect
-            # spec decode metadata or rejection sampling.
-            spec_decode_metadata = self._calc_spec_decode_metadata(
-                self.drafter.mtp_k,
-                num_draft_tokens,
-                cu_seqlens_q[: scheduled_bs + 1],
+            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
+                num_scheduled_tokens[:scheduled_bs],
+                cu_seqlens_q[:scheduled_bs],
                 input_ids,
             )
 
@@ -1208,9 +1338,9 @@ class ModelRunner:
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
+        temperatures, top_ks, top_ps = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         self.prepare_inputs(batch, input_ids)
-        temperatures, top_ks, top_ps = self.prepare_sample(batch)
         return (
             input_ids,
             temperatures,
@@ -1233,7 +1363,9 @@ class ModelRunner:
             self.graphs[graph_key].replay()
             num_tokens = context.batch_size * max_q_len
             hidden_states = self.forward_vars["outputs"][:num_tokens]
-        return self.model.compute_logits(hidden_states), hidden_states
+        logits = self.model.compute_logits(hidden_states)
+
+        return logits, hidden_states
 
     def postprocess(
         self,
@@ -1244,27 +1376,26 @@ class ModelRunner:
         top_ps: torch.Tensor,
         # following for draft
         hidden_states: torch.Tensor,
-    ) -> tuple[dict[int, tuple[int, ...]], Optional[torch.Tensor]]:
+    ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
+        bs = batch.total_seqs_num
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(logits, temperatures, top_ks, top_ps)
+            num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
+            next_token_locs = num_reject_tokens
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            bonus_logits = logits[bonus_logits_indices]
+            bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+            target_logits = torch.index_select(logits, 0, target_logits_indices)
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
                 top_ks=top_ks,
                 top_ps=top_ps,
             )
-            # Just like `bonus_logits`, `target_logits` is a new tensor with
-            # separate storage from the original `logits` tensor. Therefore,
-            # it is safe to update `target_logits` in place.
-            target_logits = logits[target_logits_indices]
-
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
                 raise ValueError(
@@ -1279,43 +1410,50 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
             )
+            num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
+            next_token_locs = num_bonus_tokens
 
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+
+        self.forward_done_event.record()
         token_ids = self.tokenID_processor.prepare_sampled_ids(
-            batch,
-            sampled_tokens,
+            batch, sampled_tokens, self.forward_done_event
         )
 
-        draft_token_ids: Optional[torch.Tensor] = None
-        if self.tokenID_processor.is_deferred_out and hasattr(self, "drafter"):
-            if spec_decode_metadata is None:
-                next_token_ids = sampled_tokens
-            else:
-                # num_accepted = (sampled_tokens != -1).sum(dim=1)
-                # last_indices = num_accepted - 1
-                bs = batch.total_seqs_num_decode
-                # self.debug(f"{num_accepted=}")
-                # self.debug(f"{num_bonus_tokens=}")
-                # self.debug(f"{last_indices=}")
-                # self.debug(f"{sampled_tokens=}")
-                next_token_ids = sampled_tokens[
-                    torch.arange(bs, device=sampled_tokens.device), num_bonus_tokens
-                ]
-                # self.debug(f"{next_token_ids=}")
+        draft_token_ids: Optional[np.ndarray] = None
+        if self.tokenID_processor.is_deferred_out:
+            prev_rejected_num = self.tokenID_processor.prev_rejected_num
+            prev_bonus_num = self.tokenID_processor.prev_bonus_num
+            self.tokenID_processor.send_mtp_status_to_cpu_async(
+                num_reject_tokens, next_token_locs
+            )  # Async copy to CPU
+            if hasattr(self, "drafter"):
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
-                self.tokenID_processor.num_bonus_tokens = num_bonus_tokens
-                self.tokenID_processor.send_bonus_to_cpu_async(
-                    num_bonus_tokens
-                )  # Async copy to CPU
-            draft_token_ids = self.propose_draft_token_ids(
-                batch,
-                self.tokenID_processor.input_ids.gpu[1 : batch.total_tokens_num + 1],
-                hidden_states,
-                next_token_ids,
-            )
+                draft_token_ids = self.propose_draft_token_ids(
+                    batch,
+                    self.tokenID_processor.input_ids.gpu[
+                        1 : batch.total_tokens_num + 1
+                    ],
+                    hidden_states,
+                    next_token_ids,
+                    num_reject_tokens,
+                )
+                # self.debug(f"{num_bonus_tokens=}")
+        else:
+            prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+            prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
 
-        return ScheduledBatchOutput(token_ids, draft_token_ids)
+        return ScheduledBatchOutput(
+            token_ids=token_ids,
+            draft_token_ids=draft_token_ids,
+            is_deferred_out=self.tokenID_processor.is_deferred_out,
+            num_rejected=prev_rejected_num,
+            num_bonus=prev_bonus_num,
+        )
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
@@ -1332,107 +1470,19 @@ class ModelRunner:
         reset_forward_context()
         return fwd_output
 
-    def _calc_spec_decode_metadata(
-        self,
-        num_spec_steps: int,
-        num_draft_tokens: np.ndarray,
-        cu_num_scheduled_tokens: np.ndarray,
-        input_ids: torch.Tensor,
-    ) -> SpecDecodeMetadata:
-        # Inputs:
-        # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
-        # num_draft_tokens:         [  3,   0,   2,   0,   1]
-        # Outputs:
-        # cu_num_draft_tokens:      [  3,   3,   5,   5,   6]
-        # logits_indices:           [  0,   1,   2,   3, 103, 104, 105, 106,
-        #                            206, 207, 208]
-        # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
-        # bonus_logits_indices:     [  3,   4,   7,   8,  10]
-
-        # Compute the logits indices.
-        # [4, 1, 3, 1, 2]
-        # self.debug(f"{num_draft_tokens=}")
-        # self.debug(f"{cu_num_scheduled_tokens=}")
-        # self.debug(f"{input_ids=}")
-        num_sampled_tokens = num_draft_tokens + 1
-
-        # Step 1. cu_num_sampled_tokens: [4, 5, 8, 9, 11]
-        # arange: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]
-        cu_num_sampled_tokens, arange = self._get_cumsum_and_arange(
-            num_sampled_tokens, cumsum_dtype=np.int32
-        )
-        # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
-        logits_indices = np.repeat(
-            cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
-        )
-        # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
-        logits_indices += arange
-        # self.debug(f"{logits_indices=}")
-
-        # Compute the bonus logits indices.
-        bonus_logits_indices = cu_num_sampled_tokens - 1
-
-        # Compute the draft logits indices.
-        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
-        # arange: [0, 1, 2, 0, 1, 0]
-        cu_num_draft_tokens, arange = self._get_cumsum_and_arange(
-            num_draft_tokens, cumsum_dtype=np.int32
-        )
-        # [0, 0, 0, 5, 5, 9]
-        target_logits_indices = np.repeat(
-            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
-        )
-        # [0, 1, 2, 5, 6, 9]
-        target_logits_indices += arange
-        # self.debug(f"{target_logits_indices=}")
-
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
-        )
-        logits_indices = torch.from_numpy(logits_indices).to(
-            self.device, non_blocking=True
-        )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
-        )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
-        )
-
-        # Compute the draft token ids.
-        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        # draft_token_ids = input_ids[logits_indices]
-        draft_token_ids = input_ids[bonus_logits_indices]
-
-        metadata = SpecDecodeMetadata(
-            draft_token_ids=draft_token_ids,
-            num_spec_steps=num_spec_steps,
-            num_draft_tokens_np=num_draft_tokens,
-            cu_num_draft_tokens=cu_num_draft_tokens,
-            target_logits_indices=target_logits_indices,
-            bonus_logits_indices=bonus_logits_indices,
-            logits_indices=logits_indices,
-        )
-        return metadata
-
     def propose_draft_token_ids(
         self,
         batch: ScheduledBatch,
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        num_reject_tokens: torch.Tensor,
     ):
         # num_scheduled_tokens = batch.total_tokens_num
         forward_context = get_forward_context()
 
         positions = forward_context.context.positions
-        spec_decode_metadata = forward_context.spec_decode_metadata
-        if spec_decode_metadata is None:
-            last_token_offset = 1
-        else:
-            num_bonus_tokens = self.tokenID_processor.num_bonus_tokens
-            last_token_offset = 1 + self.drafter.mtp_k - num_bonus_tokens
+        last_token_offset = 1 + num_reject_tokens
 
         assert isinstance(self.drafter, EagleProposer)
 
@@ -1444,6 +1494,7 @@ class ModelRunner:
             target_token_ids=input_ids,
             target_positions=positions,
             target_hidden_states=hidden_states,
+            num_reject_tokens=num_reject_tokens,
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
         )
@@ -1472,6 +1523,7 @@ class ModelRunner:
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
+        self.forward_vars["kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_pool = None

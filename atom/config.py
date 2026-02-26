@@ -10,13 +10,12 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 import torch
+from aiter import QuantType
+from aiter.utility.dtypes import d_dtypes
 from atom.utils import envs, get_open_port
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
-from transformers import AutoConfig, PretrainedConfig, GenerationConfig
-
-from aiter import QuantType
-from aiter.utility.dtypes import d_dtypes
+from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 logger = logging.getLogger("atom")
 
@@ -255,6 +254,7 @@ class QuantizationConfig(dict):
         is_dynamic=True,
         quant_name="",
         quant_method=None,
+        exclude_layers: Optional[list[str]] = None,
     ):
         super().__init__()
         self["quant_type"] = quant_type if quant_type is not None else QuantType.No
@@ -262,6 +262,7 @@ class QuantizationConfig(dict):
         self["quant_name"] = quant_name
         self["is_dynamic"] = is_dynamic
         self["quant_method"] = quant_method
+        self["exclude_layers"] = exclude_layers if exclude_layers is not None else []
 
     def get_name(self):
         return self["quant_name"]
@@ -284,13 +285,12 @@ class QuantizationConfig(dict):
         factors.append(self["quant_name"])
         factors.append(self["is_dynamic"])
         factors.append(self["quant_method"])
-        str_factors = str(factors)
         # assert_hashable(str_factors)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
 
 def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
-    torch_dtype = getattr(config, "torch_dtype", "bf16")
+    torch_dtype = getattr(config, "dtype", "bf16")
     orig_quant_config = getattr(config, "quantization_config", None)
     if orig_quant_config is None:
         return QuantizationConfig(
@@ -348,8 +348,23 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
         is_dynamic = False
     else:
         is_dynamic = True
+    if quant_method == "compressed-tensors":
+        exclude_layers_key = "ignore"
+    elif quant_method == "quark":
+        exclude_layers_key = "exclude"
+    else:
+        logger.warning(
+            f"Using 'ignore' as key for exclude layers with quant_method {quant_method}, \
+                       please double check the quantization config."
+        )
+        exclude_layers_key = "ignore"
+    exclude_layers = orig_quant_config.get(exclude_layers_key, None)
     return QuantizationConfig(
-        quant_type, quant_dtype, is_dynamic, quant_method=quant_method
+        quant_type,
+        quant_dtype,
+        is_dynamic,
+        quant_method=quant_method,
+        exclude_layers=exclude_layers,
     )
 
 
@@ -508,6 +523,9 @@ class SpeculativeConfig:
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         if hf_config.model_type == "deepseek_v3":
             hf_config.model_type = "deepseek_mtp"
+        if hf_config.model_type == "qwen3_next":
+            hf_config.model_type = "qwen3_next_mtp"
+
         if hf_config.model_type == "deepseek_mtp":
             # DeepSeek MTP typically uses only 1 layer that gets reused
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
@@ -525,6 +543,18 @@ class SpeculativeConfig:
                     "architectures": ["DeepSeekMTPModel"],
                 }
             )
+        if hf_config.model_type == "qwen3_next_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            if n_predict != 1:
+                logger.warning(
+                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                    "(MTP typically uses 1 layer that gets reused)"
+                )
+                n_predict = 1
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Qwen3NextMTPModel"]}
+            )
+        logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
         method = self.method
@@ -535,6 +565,7 @@ class SpeculativeConfig:
 @dataclass
 class Config:
     model: str
+    trust_remote_code: bool = False
     max_num_batched_tokens: int = 16384
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -581,11 +612,17 @@ class Config:
 
     def __post_init__(self):
         # assert os.path.isdir(self.model)
-        assert (
-            self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1
-        ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
+
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(self.model)
+        if not hasattr(self.hf_config, "rope_parameters"):
+            # Compatible with both transformers < 5
+            rope_params = getattr(self.hf_config, "rope_scaling", {})
+            if rope_params is None:
+                rope_params = {}
+            rope_params["rope_theta"] = getattr(self.hf_config, "rope_theta", None)
+            self.hf_config.rope_parameters = rope_params
+
         self.generation_config = get_generation_config(self.model)
         if self.generation_config is not None:
             if (
@@ -614,16 +651,15 @@ class Config:
             self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             self.compilation_config.init_with_cudagraph_sizes()
         self.torch_dtype = (
-            self.hf_config.torch_dtype
-            if getattr(self.hf_config, "torch_dtype", None) is not None
+            self.hf_config.dtype
+            if getattr(self.hf_config, "dtype", None) is not None
             else torch.bfloat16
         )
 
         if self.speculative_config is not None:
-            if self.speculative_config.num_speculative_tokens != 1:
+            if self.speculative_config.num_speculative_tokens > 4:
                 raise ValueError(
-                    f"num_speculative_tokens must be 1, got {self.speculative_config.num_speculative_tokens}. "
-                    "Only num_speculative_tokens=1 is currently supported."
+                    f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
                 )
 
     def compute_hash(self) -> str:

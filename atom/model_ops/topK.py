@@ -14,6 +14,20 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 @torch_compile_guard()
 def is_rocm_aiter_fusion_shared_expert_enabled() -> bool:
     config = get_current_atom_config()
+
+    quant_config = config.quant_config
+    is_shared_experts_excluded = False
+    is_experts_excluded = False
+    exclude_layers = quant_config["exclude_layers"]
+    for layer in exclude_layers:
+        if "shared_experts" in layer:
+            is_shared_experts_excluded = True
+        if "experts" in layer and "shared_experts" not in layer:
+            is_experts_excluded = True
+    # don't fuse shared experts if they don't share the same quantization
+    if is_shared_experts_excluded != is_experts_excluded:
+        return False
+
     dp_size = config.parallel_config.data_parallel_size
     if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
         return False
