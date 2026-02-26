@@ -202,9 +202,13 @@ class Attention(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
 
         o = torch.empty_like(q)
-        num_seqs, num_q_heads_total, head_size = q.shape
+        num_seqs = attn_metadata.context_lens.shape[0]
+        _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        query_group_size = num_q_heads_total // num_kv_heads
+        # assume all query have same length
+        query_group_size = attn_metadata.max_seqlen_q * (
+            num_q_heads_total // num_kv_heads
+        )
         assert num_q_heads_total % num_kv_heads == 0
 
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
@@ -241,7 +245,6 @@ class Attention(nn.Module):
             if self.kv_cache_dtype == "bf16"  # or per_tensor
             else aiter.dtypes.fp8
         )
-
         torch.ops.aiter.pa_decode_gluon(
             o,
             q,
@@ -280,9 +283,11 @@ class Attention(nn.Module):
             attn_metadata.block_tables,
             attn_metadata.context_lens,
             attn_metadata.block_tables.stride(0),
+            max_qlen=attn_metadata.max_seqlen_q,
             K_QScale=k_scale,
             V_QScale=v_scale,
             out_=None,
+            qo_indptr=attn_metadata.cu_seqlens_q,
             high_precision=0,
         )
 

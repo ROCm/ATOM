@@ -61,7 +61,7 @@ def linear_attention_with_output_base_fake(
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    return
+    return core_attn_out
 
 
 @mark_spliting_op(
