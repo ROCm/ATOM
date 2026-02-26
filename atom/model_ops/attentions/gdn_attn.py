@@ -275,7 +275,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata)
 
         # transfer data to ps buffer
-        # gdn_metadata.non_spec_query_start_loc = self.model_runner.forward_vars["cu_seqlens_q"].copy_to_gpu(bs + 1)
         if self.use_spec_decode:
             self.spec_state_indices_tensor.gpu[num_decodes:, :].fill_(PAD_SLOT_ID)
 
@@ -307,9 +306,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             self.num_accepted_tokens[num_decodes:].fill_(1)
             gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
         else:
-            # self.non_spec_state_indices_tensor[:num_decodes].copy_(gdn_metadata.non_spec_state_indices_tensor, non_blocking=True)
             self.non_spec_state_indices_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
-            # gdn_metadata.non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[:num_decodes]
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 gdn_metadata.non_spec_query_start_loc[: num_decodes + 1],

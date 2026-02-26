@@ -205,7 +205,7 @@ class Attention(nn.Module):
         num_seqs = attn_metadata.context_lens.shape[0]
         _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        # assuem all query have same length
+        # assume all query have same length
         query_group_size = attn_metadata.max_seqlen_q * (
             num_q_heads_total // num_kv_heads
         )

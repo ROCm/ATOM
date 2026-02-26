@@ -40,7 +40,7 @@ class Sequence:
         stop_token_sequences: list[list[int]] = None,
         stream_callback: Optional[Callable[[Any], None]] = None,
         id=None,
-        num_speculative_tokens: int = 0,
+        num_draft_tokens: int = 0,
         mamba_enabled: bool = False,
     ):
         self.block_size = block_size
@@ -49,7 +49,7 @@ class Sequence:
         self.type = SequenceType.DUMMY
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
-        self.num_speculative_tokens = num_speculative_tokens
+        self.num_draft_tokens = num_draft_tokens
         self.mamba_enabled = mamba_enabled
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
@@ -96,7 +96,7 @@ class Sequence:
         self.num_blocks = (value + self.block_size - 1) // self.block_size
         # for mamba-like arch, we need to make sure there are always 1 + spec number of blocks
         if self.mamba_enabled:
-            self.num_mamba_blocks = 1 + self.num_speculative_tokens
+            self.num_mamba_blocks = 1 + self.num_draft_tokens
         else:
             self.num_mamba_blocks = 0
         self.last_block_num_tokens = (

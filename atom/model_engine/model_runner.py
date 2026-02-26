@@ -90,9 +90,6 @@ class tokenIDProcessor:
         self.default_num_rejected_tokens = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
-        self.prev_prefills = torch.zeros(
-            max_num_batched_tokens, dtype=torch.bool, device=device
-        )
         self.clean()
 
     def send_to_cpu_async(
@@ -151,7 +148,7 @@ class tokenIDProcessor:
         self.rejected_tokens_cpu.append(num_rejected_cpu)
         self.bonus_tokens_cpu.append(num_bonus_cpu)
 
-    def recv_mtp_status_async(self) -> tuple[Optional[np.ndarray]]:
+    def recv_mtp_status_async(self) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         if not self.rejected_tokens_cpu:
             return None, None
         self.async_copy_event.synchronize()
@@ -1030,7 +1027,7 @@ class ModelRunner:
                 hf_config.linear_num_key_heads,
                 hf_config.linear_num_value_heads,
                 hf_config.linear_key_head_dim,
-                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
                 hf_config.linear_conv_kernel_dim,
                 self.num_spec_tokens,  # self.num_spec,
             )
@@ -1383,8 +1380,6 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
             )
-            # print("sampled tokens: ", sampled_tokens, flush=True)
-            # print("num bonus tokens: ", num_bonus_tokens, flush=True)
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 

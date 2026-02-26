@@ -554,7 +554,7 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Qwen3NextMTPModel"]}
             )
-        print("hf config is: ", hf_config, flush=True)
+        logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
         method = self.method
