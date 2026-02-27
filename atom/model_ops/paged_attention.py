@@ -65,11 +65,8 @@ class PagedAttention(BaseAttention):
             self.use_mla = use_mla
             self.rotary_emb = rotary_emb
 
-            try:
-                from vllm.attention.layer import Attention, AttentionType
-            except ImportError:
-                from vllm.model_executor.layers.attention import Attention
-                from vllm.v1.attention.backend import AttentionType
+            from vllm.model_executor.layers.attention import Attention
+            from vllm.v1.attention.backend import AttentionType
 
             atom_config = get_current_atom_config()
             assert (

@@ -275,10 +275,7 @@ def load_model(
     for _, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
             if is_vllm():
-                try:
-                    from vllm.attention.layer import Attention
-                except ImportError:
-                    from vllm.model_executor.layers.attention import Attention
+                from vllm.model_executor.layers.attention import Attention
 
                 # call vLLM attn weights post processing with act_dtype if using vLLM attention module
                 if isinstance(module, Attention):
