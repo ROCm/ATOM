@@ -10,6 +10,11 @@ from transformers.activations import ACT2FN
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
+<<<<<<< Updated upstream
+=======
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.utils.custom_register import direct_register_custom_op
+>>>>>>> Stashed changes
 
 from atom.model_ops.base_attention import Attention, LinearAttention
 from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
@@ -50,6 +55,102 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
 
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def shard_qkvzba_kernel(
+    qkvzba_ptr,     # [num_tokens,  (2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim + 2 * num_v_heads)]
+    qkv_ptr,        # [num_tokens, (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim)]
+    z_ptr,          # [num_tokens, num_v_heads * head_v_dim]
+    b_ptr,          # [num_tokens, num_v_heads]
+    a_ptr,          # [num_tokens, num_v_heads]
+    num_k_heads: tl.constexpr,
+    num_v_heads: tl.constexpr,
+    head_k_dim: tl.constexpr,
+    head_v_dim: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    last_head_id = 2 * (num_k_heads + num_v_heads)
+    z_head_id = 2 * num_k_heads + num_v_heads
+    qk_head_id = 2 * num_k_heads
+    QKVZ_TOTAL_SIZE = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim + 2 * num_v_heads 
+    if head_id == last_head_id: # ba
+        load_ptr = qkvzba_ptr + token_id * QKVZ_TOTAL_SIZE + 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
+        offset = tl.arange(0, num_v_heads)
+        b_val = tl.load(load_ptr + offset)
+        a_val = tl.load(load_ptr + num_v_heads + offset)
+        tl.store(b_ptr + token_id * num_v_heads + offset, b_val)
+        tl.store(a_ptr + token_id * num_v_heads + offset, a_val)
+    elif head_id >= z_head_id:   # z
+        offset = tl.arange(0, head_v_dim)
+        qkvzba_off_ptr = qkvzba_ptr + token_id * QKVZ_TOTAL_SIZE \
+                            + 2 * num_k_heads * head_k_dim \
+                            + num_v_heads * head_v_dim \
+                            + (head_id - z_head_id) * head_v_dim
+        z_val = tl.load(qkvzba_off_ptr + offset)
+        z_ptr_offset = z_ptr + token_id * head_v_dim * num_v_heads + (head_id - z_head_id) * head_v_dim
+        tl.store(z_ptr_offset + offset, z_val)
+    elif head_id >= qk_head_id:  # v
+        offset = tl.arange(0, head_v_dim)
+        qkvzba_off_ptr = qkvzba_ptr + token_id * QKVZ_TOTAL_SIZE \
+                            + 2 * num_k_heads * head_k_dim \
+                            + (head_id - qk_head_id) * head_v_dim
+        v_val = tl.load(qkvzba_off_ptr + offset)
+        qkv_ptr_offset = qkv_ptr + token_id * (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim) \
+                            + 2 * num_k_heads * head_k_dim \
+                            + (head_id - qk_head_id) * head_v_dim
+        tl.store(qkv_ptr_offset + offset, v_val)
+    elif head_id < qk_head_id:   # qk
+        offset = tl.arange(0, head_k_dim)
+        qkvzba_off_ptr = qkvzba_ptr + token_id * QKVZ_TOTAL_SIZE \
+                            + head_id * head_k_dim
+        qk_val = tl.load(qkvzba_off_ptr + offset)
+        qkv_ptr_offset = qkv_ptr + token_id * 2 * num_k_heads * head_k_dim + head_id * head_k_dim
+        tl.store(qkv_ptr_offset + offset, qk_val)
+
+
+
+def shard_qkvzba(qkvzba: torch.Tensor, num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int)->tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ba_dim = num_v_heads * 2
+    ba_dim_pow2 = triton.next_power_of_2(ba_dim)
+    num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
+    qkv_mixed = torch.empty([num_tokens, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim], dtype=dtype, device=device)
+    z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
+    b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    head_to_launch = 2 * (num_k_heads + num_v_heads) + 1
+    grid = (num_tokens, head_to_launch)
+    shard_qkvzba_kernel[grid](
+        qkvzba,
+        qkv_mixed,
+        z,
+        b,
+        a,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+    )
+    return qkv_mixed, z, b, a
+
+def shard_qkvzba_fake(qkvzba: torch.Tensor, num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int)->tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
+    qkv_mixed = torch.empty([num_tokens, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim], dtype=dtype, device=device)
+    z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
+    b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    return qkv_mixed, z, b, a
+
+
+direct_register_custom_op(
+    "shard_qkvzba",
+    shard_qkvzba,
+    mutates_args=[],
+    fake_impl=shard_qkvzba_fake
+)
 
 def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
@@ -422,20 +523,27 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # projection of the input hidden states
         self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         self.projection_size_ba = self.num_v_heads * 2
-        self.in_proj_qkvz = ColumnParallelLinear(
+        # self.in_proj_qkvz = ColumnParallelLinear(
+        #     input_size=self.hidden_size,
+        #     output_size=self.projection_size_qkvz,
+        #     bias=False,
+        #     quant_config=quant_config,
+        #     prefix=f"{prefix}.in_proj_qkvz",
+        # )
+        # # ba_proj doesn't support blockwise fp8 quantization.
+        # self.in_proj_ba = ColumnParallelLinear(
+        #     input_size=self.hidden_size,
+        #     output_size=self.projection_size_ba,
+        #     bias=False,
+        #     quant_config=quant_config,
+        #     prefix=f"{prefix}.in_proj_ba",
+        # )
+        self.in_proj_qkvzba = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=self.projection_size_qkvz,
+            output_sizes=[self.projection_size_qkvz, self.projection_size_ba],
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_qkvz",
-        )
-        # ba_proj doesn't support blockwise fp8 quantization.
-        self.in_proj_ba = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.projection_size_ba,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_ba",
+            prefix=f"{prefix}.in_proj_qkvzba",
         )
 
         query_key_settings = (self.key_dim, 0, False)
@@ -587,15 +695,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-        projected_states_ba = self.in_proj_ba(hidden_states)
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(
-            projected_states_qkvz, projected_states_ba
-        )
-        query, key, value = map(
-            lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-        )
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
+        # projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+        # projected_states_ba = self.in_proj_ba(hidden_states)
+        projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
+        k_heads_after_tp = self.num_k_heads // self.tp_size
+        v_heads_after_tp = self.num_v_heads // self.tp_size
+        mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
+        # mixed_qkv, z, b, a = shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
+        # query, key, value, z, b, a = self.fix_query_key_value_ordering(
+        #     projected_states_qkvz, projected_states_ba
+        # )
+        # query, key, value = map(
+        #     lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
+        # )
+        # mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -848,6 +961,10 @@ class Qwen3NextForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
+        "in_proj_qkvz": ("in_proj_qkvzba", 0),
+        "in_proj_ba": ("in_proj_qkvzba", 1),
     }
 
     def __init__(
