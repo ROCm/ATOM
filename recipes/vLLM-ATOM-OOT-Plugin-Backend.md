@@ -14,7 +14,7 @@ cd ATOM
 git checkout origin/zejun/plugin_for_atom_1223
 pip install -e . 2>&1 | tee build.log
 ```
-For AITER, there is no specific requirements, however, if you find any latest fusion kernels are missing, you may need to upgrade the AITER
+For AITER, you can build AITER with the latest main branch. The AITER version requirement for ATOM OOT is consistent with the AITER version requirement of the ATOM server mode.
 Additionally, you may need to install some dependencies by:
 ```bash
 pip install --upgrade triton
