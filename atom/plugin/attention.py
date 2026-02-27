@@ -170,8 +170,9 @@ def AiterBackendDecoratorForPluginMode(cls):
         cls.full_cls_name = vllmAiterBackendMethods.full_cls_name
         cls.accept_output_buffer = vllmAiterBackendMethods.accept_output_buffer
         cls.supported_dtypes = vllmAiterBackendMethods.supported_dtypes
-        cls.forward_includes_kv_cache_update = \
+        cls.forward_includes_kv_cache_update = (
             vllmAiterBackendMethods.forward_includes_kv_cache_update
+        )
         cls.get_supported_kernel_block_sizes = (
             vllmAiterBackendMethods.get_supported_kernel_block_sizes
         )
