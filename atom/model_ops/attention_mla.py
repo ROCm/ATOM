@@ -5,6 +5,9 @@ import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional
+import triton
+import triton.language as tl
+
 
 import torch
 from aiter import (
@@ -643,10 +646,6 @@ class MLAAttention(nn.Module):
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
         return output
-
-
-import triton
-import triton.language as tl
 
 
 @triton.jit

@@ -93,7 +93,7 @@ def load_model(
         for maybe_matching_name in maybe_matching_list:
             if maybe_matching_name in name:
                 return maybe_matching_name
-        return None 
+        return None
 
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})

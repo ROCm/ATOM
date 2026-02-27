@@ -301,11 +301,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
             # For FP8: use FP8 dtype for communication
             # For FP4/no quant: use bfloat16
-            mori_dtype = (
-                quant_config.quant_dtype
-                if is_fp8 and quant_type is not None
-                else torch.bfloat16
-            )
+            # mori_dtype = (
+            #     quant_config.quant_dtype
+            #     if is_fp8 and quant_type is not None
+            #     else torch.bfloat16
+            # )
             # mori_dtype = torch.bfloat16
 
             all_to_all_args = dict(
@@ -877,7 +877,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import triton_kernel_moe_forward
-            assert fused_shared_experts_scoring_func is None, "triton kernel does not support fused shared experts func"
+
+            assert (
+                fused_shared_experts_scoring_func is None
+            ), "triton kernel does not support fused shared experts func"
 
             return triton_kernel_moe_forward(
                 x,
@@ -1471,7 +1474,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            assert self.quant_config["is_dynamic"] == True
+            assert self.quant_config["is_dynamic"]
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
@@ -1512,7 +1515,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # TODO (rob): refactor block quant into separate class.
         if self.block_quant:
-            assert self.quant_config["is_dynamic"] == True
+            assert self.quant_config["is_dynamic"]
             if self.need_normalize_e4m3fn_to_e4m3fnuz:
                 w13_weight, w13_weight_scale, w13_input_scale = (
                     normalize_e4m3fn_to_e4m3fnuz(
@@ -1834,7 +1837,6 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        tp_rank = 0 if self.tp_size == 1 else get_tp_group().rank_in_group
         self.global_num_experts = num_experts
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
@@ -2548,7 +2550,7 @@ class FusedMoE(torch.nn.Module):
                     if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
                     else "experts.w2_"
                 ),
-            f"experts.{expert_id}.{weight_name}.",
+                f"experts.{expert_id}.{weight_name}.",
                 expert_id,
                 shard_id,
             )

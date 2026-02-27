@@ -203,7 +203,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if config.shared_expert_intermediate_size > 0 and not is_rocm_aiter_fusion_shared_expert_enabled():
+        if (
+            config.shared_expert_intermediate_size > 0
+            and not is_rocm_aiter_fusion_shared_expert_enabled()
+        ):
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -225,7 +228,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=False,
-            shared_expert_scoring_func='sigmoid' if self.shared_expert is None else None,
+            shared_expert_scoring_func=(
+                "sigmoid" if self.shared_expert is None else None
+            ),
             prefix=f"{prefix}.experts",
             config=config,
         )
@@ -860,7 +865,7 @@ class Qwen3NextForCausalLM(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
         ".gate.": (".gate.", 0),
-        "shared_expert_gate": ("gate", 1)
+        "shared_expert_gate": ("gate", 1),
     }
 
     def __init__(
