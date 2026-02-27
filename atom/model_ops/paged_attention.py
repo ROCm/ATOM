@@ -65,7 +65,6 @@ class PagedAttention(BaseAttention):
             self.use_mla = use_mla
             self.rotary_emb = rotary_emb
 
-            # vLLM import paths differ across versions.
             try:
                 from vllm.attention.layer import Attention, AttentionType
             except ImportError:
