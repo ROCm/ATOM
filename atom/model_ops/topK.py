@@ -132,7 +132,7 @@ def rocm_aiter_topk_softmax_impl(
     )
     # TODO(ganyi): remove this .contiguous after kernel support striding input
     topk_softmax(
-        topk_weights, topk_ids, token_expert_indicies, gating_output.contiguous(), renormalize
+        topk_weights, topk_ids, token_expert_indicies, gating_output, renormalize
     )
     if is_rocm_aiter_fusion_shared_expert_enabled() and num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
