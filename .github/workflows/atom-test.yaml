@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -32,6 +33,7 @@ jobs:
       ruff: true
 
   build_atom_image:
+    if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     needs: [pre-checks]
     name: Build ATOM image
     runs-on: build-only-atom
@@ -179,9 +181,12 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ matrix.run_on_pr }}" = "false" ]; then
             echo "should_skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping this job as it is a nightly-only model on PR."
+            exit 78
           else
             echo "should_skip=false" >> "$GITHUB_OUTPUT"
           fi
+
       - name: Kill all Docker containers and clean up workspace
         if: steps.check_skip.outputs.should_skip != 'true' && matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
