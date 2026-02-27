@@ -99,7 +99,7 @@ def load_model(
         ):
             if load_dummy:
                 continue
-            if name.endswith("kv_scale"):
+            if name.endswith("kv_scale") or "inv_freq" in name:
                 continue
             if spec_decode:
                 if hf_config.model_type == "deepseek_mtp":
