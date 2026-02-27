@@ -112,7 +112,7 @@ class vllmAiterBackendMethods:
     # handle the output buffer by itself
     accept_output_buffer: bool = False
     supported_dtypes: list = [torch.float16, torch.bfloat16]
-    forward_includes_kv_cache_update: bool = False
+    forward_includes_kv_cache_update: bool = True
 
     def __init__(self):
         raise TypeError(
