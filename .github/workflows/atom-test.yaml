@@ -10,6 +10,9 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
+  schedule:
+    # Nightly at 00:00 Beijing time (16:00 UTC)
+    - cron: '0 16 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -95,48 +98,54 @@ jobs:
 
   atom:
     needs: [pre-checks, build_atom_image]
-    if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     name: ATOM Test
     strategy:
       fail-fast: false
       matrix:
         include:
+          # run_on_pr: true = run on PR + push/schedule; false = nightly/schedule only
           - model_name: "Meta-Llama-3-8B-Instruct"
             model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: ""
             accuracy_test_threshold: "0.73"
             runner: linux-atom-mi355-1
+            run_on_pr: true
           - model_name: "Llama-3.3-70B-Instruct-MXFP4-Preview"
             model_path: "amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: ""
             accuracy_test_threshold: "0.88"
             runner: linux-atom-mi355-1
+            run_on_pr: true
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             accuracy_test_threshold: "0.94"
             runner: atom-mi355-8gpu.predownload
+            run_on_pr: false
           - model_name: "DeepSeek-R1-0528 MTP"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
             env_vars: ""
             accuracy_test_threshold: "0.94"
             runner: atom-mi355-8gpu.predownload
+            run_on_pr: false
           - model_name: "DeepSeek-R1-0528-FP4"
             model_path: "amd/DeepSeek-R1-0528-mtp-mxfp4"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             accuracy_test_threshold: "0.93"
             runner: atom-mi355-8gpu.predownload
+            run_on_pr: false
           - model_name: "DeepSeek-R1-0528-FP4 MTP"
             model_path: "amd/DeepSeek-R1-0528-mtp-mxfp4"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
             env_vars: ""
             accuracy_test_threshold: "0.93"
             runner: atom-mi355-8gpu.predownload
+            run_on_pr: false
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
@@ -144,6 +153,7 @@ jobs:
               ATOM_GPT_OSS_MODEL=1
             accuracy_test_threshold: "0.38"
             runner: linux-atom-mi355-1
+            run_on_pr: true
           - model_name: "gpt-oss-120b (2 GPUs)"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel"
@@ -151,6 +161,7 @@ jobs:
               ATOM_GPT_OSS_MODEL=1
             accuracy_test_threshold: "0.38"
             runner: linux-atom-mi355-4
+            run_on_pr: false
           - model_name: "Qwen3-235B-A22B-Instruct-2507-FP8"
             model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
@@ -158,11 +169,21 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
             accuracy_test_threshold: "0.87"
             runner: atom-mi355-8gpu.predownload
+            run_on_pr: false
+    if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     runs-on: ${{ matrix.runner }}
 
     steps:
+      - name: Check if run (skip nightly-only models on PR)
+        id: check_skip
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ matrix.run_on_pr }}" = "false" ]; then
+            echo "should_skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Kill all Docker containers and clean up workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: steps.check_skip.outputs.should_skip != 'true' && matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -172,27 +193,28 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true 
 
       - name: Show Docker containers
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: steps.check_skip.outputs.should_skip != 'true' && matrix.runner == 'atom-mi355-8gpu.predownload'
         run: docker ps -a
 
       - name: Show ROCm memory usage
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: steps.check_skip.outputs.should_skip != 'true' && matrix.runner == 'atom-mi355-8gpu.predownload'
         run: rocm-smi --showmemuse
 
       - name: Show ROCm GPU processes
-        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: steps.check_skip.outputs.should_skip != 'true' && matrix.runner == 'atom-mi355-8gpu.predownload'
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
+        if: steps.check_skip.outputs.should_skip != 'true'
         uses: actions/checkout@v4
       
       - name: Docker Login
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: steps.check_skip.outputs.should_skip != 'true' && !github.event.pull_request.head.repo.fork
         run: |
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Generate Dockerfile for forked repo
-        if: ${{ github.event.pull_request.head.repo.fork }}
+        if: steps.check_skip.outputs.should_skip != 'true' && github.event.pull_request.head.repo.fork
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
@@ -224,7 +246,7 @@ jobs:
           EOF
 
       - name: Build Docker image for forked repo
-        if: ${{ github.event.pull_request.head.repo.fork }}
+        if: steps.check_skip.outputs.should_skip != 'true' && github.event.pull_request.head.repo.fork
         run: |
           docker build --network=host \
             --no-cache \
@@ -232,6 +254,7 @@ jobs:
             -f Dockerfile.mod .
 
       - name: Start CI container
+        if: steps.check_skip.outputs.should_skip != 'true'
         run: |
           echo "Clean up containers..."
           (docker ps -aq -f name=atom_test | xargs -r docker stop) || true
@@ -288,10 +311,12 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Check shm size
+        if: steps.check_skip.outputs.should_skip != 'true'
         run: |
           docker exec atom_test df -h /dev/shm
 
       - name: Download models
+        if: steps.check_skip.outputs.should_skip != 'true'
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
@@ -304,6 +329,7 @@ jobs:
           fi
 
       - name: Run ATOM simple inference
+        if: steps.check_skip.outputs.should_skip != 'true'
         timeout-minutes: 30
         run: |
           # Run the inference and capture output
@@ -340,9 +366,9 @@ jobs:
           cat atom_test_output.txt
 
       - name: Compare output with golden outputs
+        if: steps.check_skip.outputs.should_skip != 'true' && false
         timeout-minutes: 30
-        # if: ${{ matrix.model_name == 'Meta-Llama-3-8B-Instruct' }}
-        if: ${{ false }} # TODO: skip for all test until it's fixed
+        # TODO: skip for all test until it's fixed
         run: |
           echo "========== Comparing output with golden outputs =========="
           if ! diff -u -B -w --strip-trailing-cr \
@@ -355,6 +381,7 @@ jobs:
           fi
       
       - name: Run ATOM accuracy test
+        if: steps.check_skip.outputs.should_skip != 'true'
         timeout-minutes: 30
         run: |
           set -euo pipefail
@@ -375,7 +402,7 @@ jobs:
           " 2>&1 | tee atom_accuracy_output.txt
       
       - name: Check accuracy test results
-        if: success()
+        if: steps.check_skip.outputs.should_skip != 'true' && success()
         run: |
           result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
@@ -399,20 +426,20 @@ jobs:
           fi
 
       - name: Collect Test Summary
-        if: success()
+        if: steps.check_skip.outputs.should_skip != 'true' && success()
         run: |
           echo "Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
           awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
-        if: always()
+        if: steps.check_skip.outputs.should_skip != 'true' && always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.model_name }}_atom_test_output.txt
           path: atom_test_output.txt
 
       - name: Clean Up
-        if: always()
+        if: steps.check_skip.outputs.should_skip != 'true' && always()
         run: |
           # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
           # We should use non-root user to run the test to avoid this issue.
