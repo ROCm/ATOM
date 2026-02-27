@@ -32,7 +32,7 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 
-torch.set_printoptions(threshold=10_000)
+# torch.set_printoptions(threshold=10_000)
 
 logger = logging.getLogger("atom")
 
