@@ -196,6 +196,11 @@ class PagedAttentionImplPluginModeMethods:
             "It is only used as a method container for the decorator."
         )
 
+    # this method will just be called by vLLM and there is no logic in this method
+    # as ATOM handles the process after loading weights for all ops by itself
+    def process_weights_after_loading(self, act_dtype: torch.dtype = torch.bfloat16):
+        pass
+
     def rope_cache_plugin_mode(
         self,
         q: torch.Tensor,
@@ -870,6 +875,7 @@ class PagedAttentionImplPluginModeMethods:
 
 def PagedAttentionImplDecoratorForPluginMode(cls):
     method_names = [
+        "process_weights_after_loading",
         "rope_cache_plugin_mode",
         "paged_attention_triton_plugin_mode",
         "paged_attention_asm_plugin_mode",

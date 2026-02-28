@@ -118,7 +118,6 @@ def load_model_in_plugin_mode(
         spec_decode=False,
         prefix=prefix,
         is_plugin_mode=True,
-        act_dtype=config.plugin_config.model_config.dtype,
     )
     _empty_cache()
     return loaded_weights_record
@@ -132,7 +131,6 @@ def load_model(
     spec_decode: bool = False,
     prefix: str = "",
     is_plugin_mode: bool = False,
-    act_dtype: torch.dtype = None,
 ):
     def have_shared_expert(name):
         maybe_matching_list = ["mlp.shared_experts.", "mlp.shared_expert."]
@@ -274,20 +272,9 @@ def load_model(
             future.result()
     for _, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
-            if is_vllm():
-                try:
-                    from vllm.attention.layer import Attention
-                except ImportError:
-                    from vllm.model_executor.layers.attention import Attention
-
-                # call vLLM attn weights post processing with act_dtype if using vLLM attention module
-                if isinstance(module, Attention):
-                    module.process_weights_after_loading(act_dtype=act_dtype)
-                else:
-                    module.process_weights_after_loading()
-            else:
-                module.process_weights_after_loading()
+            module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
+
         # when running plugin mode for sglang, don't do the post process here
         # since sglang will call this func automatically after finishing loading
         if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():

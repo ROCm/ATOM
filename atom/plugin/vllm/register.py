@@ -2,6 +2,7 @@ import os
 from typing import Optional
 import logging
 
+import torch
 from atom.plugin.prepare import _set_framework_backbone
 
 logger = logging.getLogger("atom")
@@ -42,6 +43,36 @@ def register_platform() -> Optional[str]:
     return "atom.plugin.vllm.platform.ATOMPlatform"
 
 
+def _patch_vllm_attention_process_weights_after_loading() -> None:
+    try:
+        from vllm.attention.layer import Attention
+    except ImportError:
+        from vllm.model_executor.layers.attention import Attention
+
+    orig = Attention.process_weights_after_loading
+
+    if getattr(orig, "_atom_default_act_dtype_patched", False):
+        return
+
+    try:
+        import inspect
+        sig = inspect.signature(orig)
+        act_dtype_param = sig.parameters.get("act_dtype")
+        if act_dtype_param is not None and act_dtype_param.default is not inspect._empty:
+            return
+    except Exception:
+        pass
+
+    import functools
+
+    @functools.wraps(orig)
+    def wrapped(self, act_dtype: "torch.dtype" = torch.bfloat16):
+        return orig(self, act_dtype)
+
+    setattr(wrapped, "_atom_default_act_dtype_patched", True)
+    Attention.process_weights_after_loading = wrapped
+
+
 def register_model() -> None:
     if disable_vllm_plugin:
         logger.info("Disable ATOM model register")
@@ -69,3 +100,7 @@ def register_model() -> None:
     if any_updated:
         vllm_model_registry._try_load_model_cls.cache_clear()
         vllm_model_registry._try_inspect_model_cls.cache_clear()
+
+    # patch attention process weights after loading
+    # to avoid the specific handle in ATOM loader
+    _patch_vllm_attention_process_weights_after_loading()
