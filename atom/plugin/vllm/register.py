@@ -56,9 +56,13 @@ def _patch_vllm_attention_process_weights_after_loading() -> None:
 
     try:
         import inspect
+
         sig = inspect.signature(orig)
         act_dtype_param = sig.parameters.get("act_dtype")
-        if act_dtype_param is not None and act_dtype_param.default is not inspect._empty:
+        if (
+            act_dtype_param is not None
+            and act_dtype_param.default is not inspect._empty
+        ):
             return
     except Exception:
         pass

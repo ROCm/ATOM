@@ -31,7 +31,7 @@ from atom.model_ops.moe import (
 from aiter.dist.parallel_state import get_tp_group
 from atom.models.qwen3_next_mtp import remap_mtp_weight_name
 
-from atom.plugin.prepare import is_vllm, is_sglang
+from atom.plugin.prepare import is_sglang
 
 logger = logging.getLogger("atom")
 
