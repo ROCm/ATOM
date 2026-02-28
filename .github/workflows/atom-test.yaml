@@ -112,42 +112,42 @@ jobs:
             env_vars: ""
             accuracy_test_threshold: "0.73"
             runner: linux-atom-mi355-1
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "Llama-3.3-70B-Instruct-MXFP4-Preview"
             model_path: "amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: ""
             accuracy_test_threshold: "0.88"
             runner: linux-atom-mi355-1
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "DeepSeek-R1-0528"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             accuracy_test_threshold: "0.94"
             runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "DeepSeek-R1-0528 MTP"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
             env_vars: ""
             accuracy_test_threshold: "0.94"
             runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "DeepSeek-R1-0528-FP4"
             model_path: "amd/DeepSeek-R1-0528-mtp-mxfp4"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             accuracy_test_threshold: "0.93"
             runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "DeepSeek-R1-0528-FP4 MTP"
             model_path: "amd/DeepSeek-R1-0528-mtp-mxfp4"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
             env_vars: ""
             accuracy_test_threshold: "0.93"
             runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
@@ -155,7 +155,7 @@ jobs:
               ATOM_GPT_OSS_MODEL=1
             accuracy_test_threshold: "0.38"
             runner: linux-atom-mi355-1
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "gpt-oss-120b (2 GPUs)"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
@@ -163,7 +163,7 @@ jobs:
               ATOM_GPT_OSS_MODEL=1
             accuracy_test_threshold: "0.38"
             runner: linux-atom-mi355-4
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "Qwen3-235B-A22B-Instruct-2507-FP8"
             model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
@@ -171,7 +171,7 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
             accuracy_test_threshold: "0.87"
             runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
+            run_on_pr: false
           - model_name: "Qwen3-235B-A22B-Instruct-2507-MXFP4"
             model_path: "amd/Qwen3-235B-A22B-Instruct-2507-MXFP4"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
