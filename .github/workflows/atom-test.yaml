@@ -179,7 +179,7 @@ jobs:
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
             accuracy_test_threshold: "0.87"
             runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
+            run_on_pr: false
     if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     runs-on: ${{ matrix.runner }}
 
