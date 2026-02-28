@@ -327,7 +327,7 @@ class Qwen3NextAttention(nn.Module):
         )
 
         # TODO: maybe dual attention
-        self.attn = ops.ATTN_CLS(
+        self.attn = ops.Attention(
             self.num_heads,
             self.head_dim,
             self.scaling,

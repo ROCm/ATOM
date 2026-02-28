@@ -170,12 +170,11 @@ class MixtralAttention(nn.Module):
             base=int(self.rope_theta),
             is_neox_style=True,
         )
-        self.attn = ops.ATTN_CLS(
+        self.attn = ops.Attention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            alibi_slopes=None,
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             quant_config=quant_config,

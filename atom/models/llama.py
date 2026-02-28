@@ -190,12 +190,11 @@ class LlamaAttention(nn.Module):
             if is_sliding:
                 sliding_window = config.sliding_window
 
-        self.attn = ops.ATTN_CLS(
+        self.attn = ops.Attention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            alibi_slopes=None,
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             per_layer_sliding_window=sliding_window,

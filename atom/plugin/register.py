@@ -45,11 +45,11 @@ def set_attn_cls() -> None:
     import atom.model_ops as ops
 
     if is_vllm():
-        ops.ATTN_CLS = ops.PagedAttention
-        logger.info("Set ATTN_CLS to PagedAttention for vLLM")
+        ops.Attention = ops.PagedAttention
+        logger.info("Set Attention to PagedAttention for vLLM")
     elif is_sglang():
-        ops.ATTN_CLS = ops.RadixAttention
-        logger.info("Set ATTN_CLS to RadixAttention for SGLang")
+        ops.Attention = ops.RadixAttention
+        logger.info("Set Attention to RadixAttention for SGLang")
 
 
 def init_aiter_dist(config: Config) -> None:

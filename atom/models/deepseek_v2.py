@@ -1390,12 +1390,11 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer=self.indexer,
         )
 
-        self.mla_attn = ops.ATTN_CLS(
+        self.mla_attn = ops.Attention(
             num_heads=self.num_local_heads,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             scale=self.scaling,
             num_kv_heads=1,
-            alibi_slopes=None,
             kv_cache_dtype=cache_config,
             layer_num=layer_num,
             use_mla=True,

@@ -105,12 +105,11 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = ops.ATTN_CLS(
+        self.attn = ops.Attention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
-            alibi_slopes=None,
             kv_cache_dtype=kv_cache_dtype,
             layer_num=layer_num,
             use_mla=False,

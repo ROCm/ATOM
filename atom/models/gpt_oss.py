@@ -121,12 +121,11 @@ class OAIAttention(nn.Module):
 
         # Only apply sliding window to every other layer
         sliding_window = config.sliding_window if self.layer_idx % 2 == 0 else None
-        self.attn = ops.ATTN_CLS(
+        self.attn = ops.Attention(
             self.num_local_attention_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_local_key_value_heads,
-            alibi_slopes=None,
             kv_cache_dtype=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,

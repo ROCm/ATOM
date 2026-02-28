@@ -39,13 +39,13 @@ class AiterBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls():
-        attn_cls = ops.ATTN_CLS
+        attn_cls = ops.Attention
         if attn_cls == PagedAttention:
             return PagedAttentionImpl
         elif attn_cls == RadixAttention:
             raise NotImplementedError("RadixAttention is not supported for now")
         raise NotImplementedError(
-            f"Unsupported attention class {attn_cls!r} configured in ops.ATTN_CLS"
+            f"Unsupported attention class {attn_cls!r} configured in ops.Attention"
         )
 
 
