@@ -12,8 +12,8 @@ on:
       - 'LICENSE'
       - '.gitignore'
   schedule:
-    # Nightly at 01:00 Beijing time (17:00 UTC)
-    - cron: '0 17 * * *'
+    # Nightly at 00:00 Beijing time (16:00 UTC)
+    - cron: '0 16 * * *'
   workflow_dispatch:
 
 concurrency:
