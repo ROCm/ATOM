@@ -10,16 +10,13 @@ from transformers.activations import ACT2FN
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
-<<<<<<< Updated upstream
-=======
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.utils.custom_register import direct_register_custom_op
->>>>>>> Stashed changes
 
 from atom.model_ops.base_attention import Attention, LinearAttention
 from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
 from atom.model_ops.linear import (
+    QKVZBAParallelLinear,
     QKVParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -73,56 +70,52 @@ def shard_qkvzba_kernel(
 ):
     token_id = tl.program_id(0)
     head_id = tl.program_id(1)
-    last_head_id = 2 * (num_k_heads + num_v_heads)
-    z_head_id = 2 * num_k_heads + num_v_heads
-    qk_head_id = 2 * num_k_heads
-    QKVZ_TOTAL_SIZE = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim + 2 * num_v_heads 
-    if head_id == last_head_id: # ba
-        load_ptr = qkvzba_ptr + token_id * QKVZ_TOTAL_SIZE + 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
-        offset = tl.arange(0, num_v_heads)
-        b_val = tl.load(load_ptr + offset)
-        a_val = tl.load(load_ptr + num_v_heads + offset)
-        tl.store(b_ptr + token_id * num_v_heads + offset, b_val)
-        tl.store(a_ptr + token_id * num_v_heads + offset, a_val)
-    elif head_id >= z_head_id:   # z
-        offset = tl.arange(0, head_v_dim)
-        qkvzba_off_ptr = qkvzba_ptr + token_id * QKVZ_TOTAL_SIZE \
-                            + 2 * num_k_heads * head_k_dim \
-                            + num_v_heads * head_v_dim \
-                            + (head_id - z_head_id) * head_v_dim
-        z_val = tl.load(qkvzba_off_ptr + offset)
-        z_ptr_offset = z_ptr + token_id * head_v_dim * num_v_heads + (head_id - z_head_id) * head_v_dim
-        tl.store(z_ptr_offset + offset, z_val)
-    elif head_id >= qk_head_id:  # v
-        offset = tl.arange(0, head_v_dim)
-        qkvzba_off_ptr = qkvzba_ptr + token_id * QKVZ_TOTAL_SIZE \
-                            + 2 * num_k_heads * head_k_dim \
-                            + (head_id - qk_head_id) * head_v_dim
-        v_val = tl.load(qkvzba_off_ptr + offset)
-        qkv_ptr_offset = qkv_ptr + token_id * (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim) \
-                            + 2 * num_k_heads * head_k_dim \
-                            + (head_id - qk_head_id) * head_v_dim
-        tl.store(qkv_ptr_offset + offset, v_val)
-    elif head_id < qk_head_id:   # qk
-        offset = tl.arange(0, head_k_dim)
-        qkvzba_off_ptr = qkvzba_ptr + token_id * QKVZ_TOTAL_SIZE \
-                            + head_id * head_k_dim
-        qk_val = tl.load(qkvzba_off_ptr + offset)
-        qkv_ptr_offset = qkv_ptr + token_id * 2 * num_k_heads * head_k_dim + head_id * head_k_dim
-        tl.store(qkv_ptr_offset + offset, qk_val)
+    QKVZ_TOTAL_SIZE = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
+    QKVZ_DIM_SIZE = 2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads
+    BA_TOTAL_SIZE = 2 * num_v_heads
+    KV_HEAD_RATIO: tl.constexpr = num_v_heads // num_k_heads
+    ROW_SIZE = QKVZ_TOTAL_SIZE + BA_TOTAL_SIZE
+    if head_id == num_k_heads: # ba
+        load_ptr = qkvzba_ptr + token_id * ROW_SIZE + QKVZ_TOTAL_SIZE
+        b_offset = tl.arange(0, num_v_heads) // KV_HEAD_RATIO * KV_HEAD_RATIO * 2 + tl.arange(0, num_v_heads) % KV_HEAD_RATIO
+        a_offset = b_offset + KV_HEAD_RATIO
+        b_val = tl.load(load_ptr + b_offset)
+        a_val = tl.load(load_ptr + a_offset)
+        store_offset = tl.arange(0, num_v_heads)
+        tl.store(b_ptr + token_id * num_v_heads + store_offset, b_val)
+        tl.store(a_ptr + token_id * num_v_heads + store_offset, a_val)
+    else:
+        base_ptr = qkvzba_ptr + token_id * ROW_SIZE + head_id * QKVZ_DIM_SIZE
+        qkv_base_ptr = qkv_ptr + token_id * (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim)
+        k_dim_offset = tl.arange(0, head_k_dim)
+        v_dim_offset = tl.arange(0, head_v_dim)
+        q_val = tl.load(base_ptr + k_dim_offset)
+        q_store_ptr = qkv_base_ptr + head_id * head_k_dim
+        tl.store(q_store_ptr + k_dim_offset, q_val)
+
+        k_val = tl.load(base_ptr + head_k_dim + k_dim_offset)
+        k_store_ptr = qkv_base_ptr + num_k_heads * head_k_dim + head_id * head_k_dim
+        tl.store(k_store_ptr + k_dim_offset, k_val)
+
+        for sub_head in tl.static_range(0, KV_HEAD_RATIO):
+          v_val = tl.load(base_ptr + 2 * head_k_dim + sub_head * head_v_dim + v_dim_offset)
+          v_store_ptr = qkv_base_ptr + 2 * num_k_heads * head_k_dim + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
+          tl.store(v_store_ptr + v_dim_offset, v_val)
+
+        for sub_head in tl.static_range(0, KV_HEAD_RATIO):
+          z_val = tl.load(base_ptr + 2 * head_k_dim + KV_HEAD_RATIO * head_v_dim + sub_head * head_v_dim + v_dim_offset)
+          z_store_ptr = z_ptr + token_id * num_v_heads * head_v_dim + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
+          tl.store(z_store_ptr + v_dim_offset, z_val)
 
 
 
 def shard_qkvzba(qkvzba: torch.Tensor, num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int)->tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    ba_dim = num_v_heads * 2
-    ba_dim_pow2 = triton.next_power_of_2(ba_dim)
     num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
     qkv_mixed = torch.empty([num_tokens, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim], dtype=dtype, device=device)
     z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
     b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
     a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-    head_to_launch = 2 * (num_k_heads + num_v_heads) + 1
-    grid = (num_tokens, head_to_launch)
+    grid = (num_tokens, num_k_heads + 1)
     shard_qkvzba_kernel[grid](
         qkvzba,
         qkv_mixed,
@@ -523,24 +516,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # projection of the input hidden states
         self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         self.projection_size_ba = self.num_v_heads * 2
-        # self.in_proj_qkvz = ColumnParallelLinear(
-        #     input_size=self.hidden_size,
-        #     output_size=self.projection_size_qkvz,
-        #     bias=False,
-        #     quant_config=quant_config,
-        #     prefix=f"{prefix}.in_proj_qkvz",
-        # )
-        # # ba_proj doesn't support blockwise fp8 quantization.
-        # self.in_proj_ba = ColumnParallelLinear(
-        #     input_size=self.hidden_size,
-        #     output_size=self.projection_size_ba,
-        #     bias=False,
-        #     quant_config=quant_config,
-        #     prefix=f"{prefix}.in_proj_ba",
-        # )
-        self.in_proj_qkvzba = MergedColumnParallelLinear(
+        self.in_proj_qkvzba = QKVZBAParallelLinear(
             input_size=self.hidden_size,
-            output_sizes=[self.projection_size_qkvz, self.projection_size_ba],
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_qkvzba",
@@ -611,12 +592,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def fix_query_key_value_ordering(
         self,
-        mixed_qkvz,
-        mixed_ba,
+        mixed_qkvzba,
     ):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
+        qkvz_split_size = self.num_k_heads // self.tp_size * (
+                self.head_k_dim
+                + self.head_k_dim
+                + (self.head_v_dim + self.head_v_dim)
+                * self.num_v_heads
+                // self.num_k_heads
+            )
+        ba_split_size = self.num_k_heads // self.tp_size * 2 * self.num_v_heads // self.num_k_heads
+        mixed_qkvz, mixed_ba = torch.split(mixed_qkvzba, [qkvz_split_size, ba_split_size], dim=-1)
         new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
             self.num_k_heads // self.tp_size,
             (
@@ -700,7 +689,25 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
         k_heads_after_tp = self.num_k_heads // self.tp_size
         v_heads_after_tp = self.num_v_heads // self.tp_size
+# <<<<<<< HEAD
         mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
+# =======
+#         # mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
+#         dtype = hidden_states.dtype
+#         device = hidden_states.device
+#         num_k_heads = self.num_k_heads // self.tp_size
+#         num_v_heads = self.num_v_heads // self.tp_size
+#         mixed_qkv = torch.empty([num_tokens,  2 * num_k_heads * self.head_k_dim + num_v_heads * self.head_v_dim], dtype=dtype, device=device)
+#         z = torch.empty([num_tokens, num_v_heads, self.head_v_dim], dtype=dtype, device=device)
+#         b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+#         a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+#         print("mixed qkv: ", mixed_qkv.shape, mixed_qkv.stride())
+#         print("z: ", z.shape, z.stride())
+#         print("b: ", b.shape, b.stride())
+#         print("a: ", a.shape, a.stride())
+#         # query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvzba)
+
+# >>>>>>> 97b58f5 (acc right)
         # mixed_qkv, z, b, a = shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
         # query, key, value, z, b, a = self.fix_query_key_value_ordering(
         #     projected_states_qkvz, projected_states_ba
@@ -710,6 +717,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # )
         # mixed_qkv = torch.cat((query, key, value), dim=-1)
 
+        # print(f"prefix: {self.prefix} weight shape {self.in_proj_qkvzba.weight.data.shape} tensor: ", self.in_proj_qkvzba.weight.data, flush=True)
+        # print(f"prefix: {self.prefix} mixed_qkv shape {mixed_qkv.shape} tensor: ", mixed_qkv, flush=True)
+        # print(f"prefix: {self.prefix} z shape {z.shape} tensor: ", z, flush=True)
+        # print(f"prefix: {self.prefix} b shape {b.shape} tensor: ", b, flush=True)
+        # print(f"prefix: {self.prefix} a shape {a.shape} tensor: ", a, flush=True)
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
@@ -963,8 +975,10 @@ class Qwen3NextForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
         ".gate.": (".gate.", 0),
         "shared_expert_gate": ("gate", 1),
-        "in_proj_qkvz": ("in_proj_qkvzba", 0),
-        "in_proj_ba": ("in_proj_qkvzba", 1),
+        "in_proj_qkvz": ("in_proj_qkvzba", "qkvz"),
+        "in_proj_ba": ("in_proj_qkvzba", "ba"),
+        # "in_proj_qkvz": ("in_proj_qkvzba", 0),
+        # "in_proj_ba": ("in_proj_qkvzba", 1),
     }
 
     def __init__(
