@@ -176,6 +176,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         if cu_seqlens_k[-1] > batch.total_tokens_num:  # prefix cache
             self.prepare_block_tables(batch)
         var["positions"].np[:sum_scheduled_tokens] = positions
+        var["slot_mapping"].np[:sum_scheduled_tokens] = -1
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
         var["context_lens"].np[:bs] = batch.context_lens[:bs]
@@ -183,7 +184,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         dropout_p = 0.0
         vars_used = [
             ("cu_seqlens_q", bs + 1),
-            ("slot_mapping", len(slot_mapping)),
+            ("slot_mapping", sum_scheduled_tokens),
             ("context_lens", bs),
         ]
 

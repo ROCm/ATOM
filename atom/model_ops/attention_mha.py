@@ -369,13 +369,7 @@ class Attention(nn.Module):
         # value:  [num_blocks, 1, num_kv_heads, head_size]
 
         attn_metadata = fwd_ctx.attn_metadata
-        ctx = fwd_ctx.context
-
         block_tables = attn_metadata.block_tables
-        if ctx.is_prefill:
-            k_cache = k.unsqueeze(1)
-            v_cache = v.unsqueeze(1)
-            block_tables = attn_metadata.fake_block_tables
 
         o = torch.empty_like(q)
         descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])

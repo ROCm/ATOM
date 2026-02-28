@@ -11,7 +11,10 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import Attention
 from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import block_table_convert_triton
+from atom.utils.block_convert import (
+    block_table_convert_triton,
+    kv_indices_generate_triton,
+)
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
@@ -94,7 +97,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ),
             "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
-                self.max_bs * self.max_num_blocks_per_seq // self.block_ratio,
+                self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             ),
         }
@@ -209,11 +212,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         sum_blocks = kv_indptr[-1] if len(kv_indptr) > 0 else 0
         sum_blocks_before_converted = cdiv(num_blocks_per_seq, self.block_ratio).sum()
 
-        var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
-            itertools.chain.from_iterable(block_tables),
-            dtype=np.int32,
-            count=sum_blocks_before_converted,
-        )
         var["kv_indptr"].np[0] = 0
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
@@ -224,13 +222,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ("cu_seqlens_q", bs + 1),
             ("block_tables", bs),
             ("kv_indptr", bs + 1),
-            ("kv_indices", sum_blocks_before_converted),
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         if self.block_size == 1024:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
             ctx.update(ctx_pa_ps)
+
+        ctx["kv_indices"] = var["kv_indices"].gpu
+        max_seqlen_k = context_lens.max()
+        kv_indices_generate_triton(
+            ctx["block_tables"],
+            ctx["kv_indices"],
+            ctx["kv_indptr"],
+            self.block_ratio,
+            max_seqlen_k,
+        )
         if self.block_ratio > 1 and "block_tables" in ctx:
             block_table_convert_triton(
                 var["block_tables"].gpu[:bs],
@@ -262,7 +269,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_q=var["max_qlen"],
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
-            kv_indices=var["kv_indices"].gpu[:],
+            kv_indices=var["kv_indices"].gpu,
             max_seqlen_k=self.model_runner.config.max_model_len,
             block_tables_converted=(
                 var["block_tables_converted"].gpu[:bs]

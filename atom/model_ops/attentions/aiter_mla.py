@@ -95,7 +95,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
             "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
-                self.max_bs * self.max_num_blocks_per_seq // self.block_ratio,
+                self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             ),
             "kv_last_page_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
@@ -248,6 +248,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
                 attn_metadata.context_lens, 0
             )
+            if attn_metadata.block_tables is None:
+                self.prepare_block_tables(batch)
+                attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+                kv_indices_generate_triton(
+                    attn_metadata.block_tables,
+                    attn_metadata.kv_indices,
+                    attn_metadata.kv_indptr,
+                    self.block_ratio,
+                    attn_metadata.max_seqlen_k,
+                )
+            else:
+                kv_indices_generate_triton(
+                    attn_metadata.block_tables,
+                    attn_metadata.kv_indices,
+                    attn_metadata.kv_indptr,
+                    self.block_ratio,
+                    attn_metadata.max_seqlen_k,
+                )
 
         return attn_metadata, positions
 
@@ -389,7 +407,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_q=max_q_len,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
-            kv_indices=var["kv_indices"].gpu[:],
+            kv_indices=var["kv_indices"].gpu,
             kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],
             sparse_kv_indptr=sparse_kv_indptr,
             block_tables_converted=(

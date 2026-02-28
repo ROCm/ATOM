@@ -293,14 +293,8 @@ class EngineCore:
             logger.info("Profiler stopped.")
 
     def print_mtp_statistics(self):
-        stats = self.runner_mgr.call_func("get_mtp_statistics", wait_out=True)
-        if stats and stats.get("total_draft_tokens", 0) > 0:
-            logger.info(f"\n{'='*50}")
-            logger.info("MTP (Multi-Token Prediction) Statistics:")
-            logger.info(f"  Total draft tokens: {stats['total_draft_tokens']}")
-            logger.info(f"  Accepted tokens:    {stats['total_accepted_tokens']}")
-            logger.info(f"  Acceptance rate:    {stats['acceptance_rate']:.2%}")
-            logger.info(f"{'='*50}\n")
+        if self.scheduler.spec_stats is not None:
+            self.scheduler.spec_stats._log()
         else:
             logger.info(
                 "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"

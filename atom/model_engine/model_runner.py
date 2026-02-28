@@ -611,29 +611,6 @@ class ModelRunner:
             return True
         return False
 
-    def get_mtp_statistics(self) -> dict:
-        if hasattr(self, "mtp_total_draft_tokens"):
-            acceptance_rate = (
-                self.mtp_total_accepted_tokens / self.mtp_total_draft_tokens
-                if self.mtp_total_draft_tokens > 0
-                else 0.0
-            )
-            return {
-                "total_draft_tokens": self.mtp_total_draft_tokens,
-                "total_accepted_tokens": self.mtp_total_accepted_tokens,
-                "acceptance_rate": acceptance_rate,
-            }
-        return {
-            "total_draft_tokens": 0,
-            "total_accepted_tokens": 0,
-            "acceptance_rate": 0.0,
-        }
-
-    def reset_mtp_statistics(self):
-        if hasattr(self, "mtp_total_draft_tokens"):
-            self.mtp_total_draft_tokens = 0
-            self.mtp_total_accepted_tokens = 0
-
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
     ) -> CpuGpuBuffer:
@@ -707,6 +684,7 @@ class ModelRunner:
     def debug(self, *args: Any):
         if self.rank == 0:
             logger.info(*args)
+        # logger.info(*args)
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
@@ -1317,7 +1295,7 @@ class ModelRunner:
 
         temperatures = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        # self.debug(f"{input_ids=}")
+        self.debug(f"{input_ids=}")
         self.prepare_inputs(batch, input_ids)
         return (
             input_ids,
@@ -1405,6 +1383,8 @@ class ModelRunner:
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
+                logger.info(f"{sampled_tokens=}")
+                logger.info(f"{next_token_locs=}")
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
