@@ -14,10 +14,14 @@ from .attention_mla import MLAModules
 from atom.config import get_current_atom_config
 from atom.utils.selector import get_attn_backend
 
-# Attention interface class for constructing frontend model
-import atom.model_ops as ops
 
-Attention = ops.Attention
+# frontend interface class for constructing attention
+# op in model file
+class Attention:
+    def __new__(cls, *args, **kwargs):
+        from atom.model_ops import Attention
+
+        return Attention(*args, **kwargs)
 
 
 def fake_(
