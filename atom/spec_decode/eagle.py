@@ -114,7 +114,7 @@ class EagleProposer:
         input_ids = target_token_ids
         # input_ids[last_token_indices] = next_token_ids
         input_ids.scatter_(0, last_token_indices, next_token_ids)
-        positions = target_positions+1
+        positions = target_positions + 1
         hidden_states = target_hidden_states
 
         draft_token_ids = torch.empty(
@@ -123,34 +123,18 @@ class EagleProposer:
         # return draft_token_ids.fill_(1) # for debug
         var = self.runner.forward_vars
         for i in range(self.mtp_k):
-            # self.runner.debug(f"Draft step {i}, {hidden_states.shape=}")
-            # self.runner.debug(f"Draft step {i}, {input_ids=}")
-            # self.runner.debug(f"Draft step {i}, {positions=}")
-            # self.runner.debug(f"Draft step {i}, {attn_metadata.kv_indptr=}")
-            # # self.runner.debug(
-            # #     f"Draft step {i}, {attn_metadata.kv_indices[:attn_metadata.kv_indptr[-1].item()]=}"
-            # # )
-            # # self.runner.debug(f"Draft step {i}, {attn_metadata.block_tables=}")
-            # self.runner.debug(f"Draft step {i}, {attn_metadata.cu_seqlens_q=}")
-            # self.runner.debug(f"Draft step {i}, {attn_metadata.slot_mapping=}")
-            # self.runner.debug(f"Draft step {i}, {attn_metadata.context_lens=}")
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
                 hidden_states=hidden_states,
             )
             sample_hidden_states = (
-                ret_hidden_states[last_token_indices] if i == 0 else ret_hidden_states
+                torch.index_select(ret_hidden_states, 0, last_token_indices)
+                if i == 0
+                else ret_hidden_states
             )
             logits = self.model.compute_logits(sample_hidden_states)
-            # if sample_hidden_states.shape[0] ==4:
-            #     self.runner.debug(f"Draft step {i}, {sample_hidden_states=}")
-            #     self.runner.debug(f"Draft step {i}, {logits=}")
             new_draft_ids = logits.argmax(dim=-1)
-            # topk_weights, topk_ids = torch.topk(logits, k=10, dim=1)
-            # self.runner.debug(f"Draft step {i}, {new_draft_ids=}")
-            # self.runner.debug(f"Draft step {i}, {topk_weights=}")
-            # self.runner.debug(f"Draft step {i}, {topk_ids=}")
             draft_token_ids[:, i] = new_draft_ids
 
             if i < self.mtp_k - 1:
@@ -158,7 +142,9 @@ class EagleProposer:
                     attn_metadata.max_seqlen_q = 1
                     kv_indptr = var["kv_indptr"].gpu[: bs + 1]
                     kv_indices = var["kv_indices"].gpu
-                    slot_mapping = var["slot_mapping"].gpu[:bs* attn_metadata.max_seqlen_q]
+                    slot_mapping = var["slot_mapping"].gpu[
+                        : bs * attn_metadata.max_seqlen_q
+                    ]
                     kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
                     cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
                     attn_metadata.kv_indptr = kv_indptr
@@ -166,10 +152,9 @@ class EagleProposer:
                     attn_metadata.cu_seqlens_q = cu_seqlens_q
                     attn_metadata.slot_mapping = slot_mapping
                     attn_metadata.kv_last_page_lens = kv_last_page_lens
-                    # kv_indptr[: bs + 1] += self.arrange_bs[: bs + 1]
                     cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
                     kv_indptr[1 : bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
-                    positions = positions[last_token_indices]
+                    positions = torch.gather(positions, 0, last_token_indices)
                     context.is_prefill = False
 
                 # update metadata

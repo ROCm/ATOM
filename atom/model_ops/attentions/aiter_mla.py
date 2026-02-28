@@ -311,22 +311,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
-        # var["context_lens"].np[scheduled_bs:bs] = 0
 
         num_blocks_per_seq = cdiv(context_lens, self.block_size)
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1]
-        # sum_blocks_before_converted = cdiv(num_blocks_per_seq, self.block_ratio).sum()
 
-        # def prepare_kv_indices():
-        #     dst = var["kv_indices"].np
-        #     offset = 0
-        #     for bt in block_tables:
-        #         n = len(bt)
-        #         dst[offset : offset + n] = bt
-        #         offset += n
-
-        # prepare_kv_indices()
         self.prepare_block_tables(batch)
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
@@ -340,12 +329,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ("cu_seqlens_q", bs + 1),
             ("kv_indptr", bs + 1),
             ("block_tables", bs),
-            # ("kv_indices", sum_blocks),
             ("kv_last_page_lens", bs),
         ]
         if self.is_sparse:
-            # self.prepare_block_tables(batch)
-            # vars_used.append(("block_tables", bs))
             index_topk = self.index_topk
             sparse_context_lens = np.clip(var["context_lens"].np[:bs], None, index_topk)
             var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
@@ -386,7 +372,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
-        # if str(positions.device) == "cuda:0":
+        # if self.model_runner.rank == 0:
         #     logger.info(f"context_lens: {ctx['context_lens']}")
         #     # logger.info(f"{positions=}")
         #     # for el, var in ctx.items():
