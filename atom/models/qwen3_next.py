@@ -689,39 +689,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
         k_heads_after_tp = self.num_k_heads // self.tp_size
         v_heads_after_tp = self.num_v_heads // self.tp_size
-# <<<<<<< HEAD
         mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
-# =======
-#         # mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
-#         dtype = hidden_states.dtype
-#         device = hidden_states.device
-#         num_k_heads = self.num_k_heads // self.tp_size
-#         num_v_heads = self.num_v_heads // self.tp_size
-#         mixed_qkv = torch.empty([num_tokens,  2 * num_k_heads * self.head_k_dim + num_v_heads * self.head_v_dim], dtype=dtype, device=device)
-#         z = torch.empty([num_tokens, num_v_heads, self.head_v_dim], dtype=dtype, device=device)
-#         b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-#         a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-#         print("mixed qkv: ", mixed_qkv.shape, mixed_qkv.stride())
-#         print("z: ", z.shape, z.stride())
-#         print("b: ", b.shape, b.stride())
-#         print("a: ", a.shape, a.stride())
-#         # query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvzba)
 
-# >>>>>>> 97b58f5 (acc right)
-        # mixed_qkv, z, b, a = shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
-        # query, key, value, z, b, a = self.fix_query_key_value_ordering(
-        #     projected_states_qkvz, projected_states_ba
-        # )
-        # query, key, value = map(
-        #     lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-        # )
-        # mixed_qkv = torch.cat((query, key, value), dim=-1)
-
-        # print(f"prefix: {self.prefix} weight shape {self.in_proj_qkvzba.weight.data.shape} tensor: ", self.in_proj_qkvzba.weight.data, flush=True)
-        # print(f"prefix: {self.prefix} mixed_qkv shape {mixed_qkv.shape} tensor: ", mixed_qkv, flush=True)
-        # print(f"prefix: {self.prefix} z shape {z.shape} tensor: ", z, flush=True)
-        # print(f"prefix: {self.prefix} b shape {b.shape} tensor: ", b, flush=True)
-        # print(f"prefix: {self.prefix} a shape {a.shape} tensor: ", a, flush=True)
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
@@ -973,12 +942,8 @@ class Qwen3NextForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
-        ".gate.": (".gate.", 0),
-        "shared_expert_gate": ("gate", 1),
         "in_proj_qkvz": ("in_proj_qkvzba", "qkvz"),
         "in_proj_ba": ("in_proj_qkvzba", "ba"),
-        # "in_proj_qkvz": ("in_proj_qkvzba", 0),
-        # "in_proj_ba": ("in_proj_qkvzba", 1),
     }
 
     def __init__(
