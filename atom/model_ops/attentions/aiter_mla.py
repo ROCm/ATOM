@@ -369,15 +369,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             max_seqlen_k,
         )
-        if self.block_ratio > 1:
-            if "block_tables" in ctx:
-                block_table_convert_triton(
-                    var["block_tables"].gpu[:bs],
-                    var["block_tables_converted"].gpu[:bs],
-                    var["context_lens"].gpu[:bs],
-                    self.block_ratio,
-                )
-                ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
+        # if self.block_ratio > 1:
+        #     if "block_tables" in ctx:
+        #         block_table_convert_triton(
+        #             var["block_tables"].gpu[:bs],
+        #             var["block_tables_converted"].gpu[:bs],
+        #             var["context_lens"].gpu[:bs],
+        #             self.block_ratio,
+        #         )
+        #         ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,

@@ -149,7 +149,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         return logits
 
 
-@support_torch_compile
+# @support_torch_compile
 class DeepSeekMTP(nn.Module):
 
     def __init__(self, atom_config: Config, prefix: str = ""):

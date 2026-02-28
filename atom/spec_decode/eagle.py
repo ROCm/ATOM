@@ -123,17 +123,17 @@ class EagleProposer:
         # return draft_token_ids.fill_(1) # for debug
         var = self.runner.forward_vars
         for i in range(self.mtp_k):
-            self.runner.debug(f"Draft step {i}, {hidden_states.shape=}")
-            self.runner.debug(f"Draft step {i}, {input_ids=}")
-            self.runner.debug(f"Draft step {i}, {positions=}")
-            self.runner.debug(f"Draft step {i}, {attn_metadata.kv_indptr=}")
-            # self.runner.debug(
-            #     f"Draft step {i}, {attn_metadata.kv_indices[:attn_metadata.kv_indptr[-1].item()]=}"
-            # )
-            # self.runner.debug(f"Draft step {i}, {attn_metadata.block_tables=}")
-            self.runner.debug(f"Draft step {i}, {attn_metadata.cu_seqlens_q=}")
-            self.runner.debug(f"Draft step {i}, {attn_metadata.slot_mapping=}")
-            self.runner.debug(f"Draft step {i}, {attn_metadata.context_lens=}")
+            # self.runner.debug(f"Draft step {i}, {hidden_states.shape=}")
+            # self.runner.debug(f"Draft step {i}, {input_ids=}")
+            # self.runner.debug(f"Draft step {i}, {positions=}")
+            # self.runner.debug(f"Draft step {i}, {attn_metadata.kv_indptr=}")
+            # # self.runner.debug(
+            # #     f"Draft step {i}, {attn_metadata.kv_indices[:attn_metadata.kv_indptr[-1].item()]=}"
+            # # )
+            # # self.runner.debug(f"Draft step {i}, {attn_metadata.block_tables=}")
+            # self.runner.debug(f"Draft step {i}, {attn_metadata.cu_seqlens_q=}")
+            # self.runner.debug(f"Draft step {i}, {attn_metadata.slot_mapping=}")
+            # self.runner.debug(f"Draft step {i}, {attn_metadata.context_lens=}")
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -143,11 +143,14 @@ class EagleProposer:
                 ret_hidden_states[last_token_indices] if i == 0 else ret_hidden_states
             )
             logits = self.model.compute_logits(sample_hidden_states)
-            if sample_hidden_states.shape[0] ==4:
-                self.runner.debug(f"Draft step {i}, {sample_hidden_states=}")
-                self.runner.debug(f"Draft step {i}, {logits=}")
+            # if sample_hidden_states.shape[0] ==4:
+            #     self.runner.debug(f"Draft step {i}, {sample_hidden_states=}")
+            #     self.runner.debug(f"Draft step {i}, {logits=}")
             new_draft_ids = logits.argmax(dim=-1)
-            self.runner.debug(f"Draft step {i}, {new_draft_ids=}")
+            # topk_weights, topk_ids = torch.topk(logits, k=10, dim=1)
+            # self.runner.debug(f"Draft step {i}, {new_draft_ids=}")
+            # self.runner.debug(f"Draft step {i}, {topk_weights=}")
+            # self.runner.debug(f"Draft step {i}, {topk_ids=}")
             draft_token_ids[:, i] = new_draft_ids
 
             if i < self.mtp_k - 1:
@@ -181,7 +184,7 @@ class EagleProposer:
                 positions += 1
                 hidden_states = sample_hidden_states
 
-        # self.runner.debug(f"{draft_token_ids=}")
+        # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]
         return draft_token_ids
 

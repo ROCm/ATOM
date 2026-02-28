@@ -684,7 +684,6 @@ class ModelRunner:
     def debug(self, *args: Any):
         if self.rank == 0:
             logger.info(*args)
-        # logger.info(*args)
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
@@ -1295,7 +1294,7 @@ class ModelRunner:
 
         temperatures = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        self.debug(f"{input_ids=}")
+        # self.debug(f"{input_ids=}")
         self.prepare_inputs(batch, input_ids)
         return (
             input_ids,
@@ -1383,8 +1382,8 @@ class ModelRunner:
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
-                logger.info(f"{sampled_tokens=}")
-                logger.info(f"{next_token_locs=}")
+                # self.debug(f"{sampled_tokens=}")
+                # self.debug(f"{next_token_locs=}")
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
