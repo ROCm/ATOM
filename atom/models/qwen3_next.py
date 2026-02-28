@@ -730,8 +730,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        # projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-        # projected_states_ba = self.in_proj_ba(hidden_states)
         projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
         k_heads_after_tp = self.num_k_heads // self.tp_size
         v_heads_after_tp = self.num_v_heads // self.tp_size
