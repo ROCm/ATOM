@@ -4,6 +4,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
+import triton
+import triton.language as tl
 
 from aiter.dist.parallel_state import get_tensor_model_parallel_rank
 from transformers.activations import ACT2FN
@@ -53,16 +55,13 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
 )
 
 
-import triton
-import triton.language as tl
-
 @triton.jit
 def shard_qkvzba_kernel(
-    qkvzba_ptr,     # [num_tokens,  (2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim + 2 * num_v_heads)]
-    qkv_ptr,        # [num_tokens, (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim)]
-    z_ptr,          # [num_tokens, num_v_heads * head_v_dim]
-    b_ptr,          # [num_tokens, num_v_heads]
-    a_ptr,          # [num_tokens, num_v_heads]
+    qkvzba_ptr,  # [num_tokens,  (2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim + 2 * num_v_heads)]
+    qkv_ptr,  # [num_tokens, (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim)]
+    z_ptr,  # [num_tokens, num_v_heads * head_v_dim]
+    b_ptr,  # [num_tokens, num_v_heads]
+    a_ptr,  # [num_tokens, num_v_heads]
     num_k_heads: tl.constexpr,
     num_v_heads: tl.constexpr,
     head_k_dim: tl.constexpr,
@@ -75,9 +74,12 @@ def shard_qkvzba_kernel(
     BA_TOTAL_SIZE = 2 * num_v_heads
     KV_HEAD_RATIO: tl.constexpr = num_v_heads // num_k_heads
     ROW_SIZE = QKVZ_TOTAL_SIZE + BA_TOTAL_SIZE
-    if head_id == num_k_heads: # ba
+    if head_id == num_k_heads:  # ba
         load_ptr = qkvzba_ptr + token_id * ROW_SIZE + QKVZ_TOTAL_SIZE
-        b_offset = tl.arange(0, num_v_heads) // KV_HEAD_RATIO * KV_HEAD_RATIO * 2 + tl.arange(0, num_v_heads) % KV_HEAD_RATIO
+        b_offset = (
+            tl.arange(0, num_v_heads) // KV_HEAD_RATIO * KV_HEAD_RATIO * 2
+            + tl.arange(0, num_v_heads) % KV_HEAD_RATIO
+        )
         a_offset = b_offset + KV_HEAD_RATIO
         b_val = tl.load(load_ptr + b_offset)
         a_val = tl.load(load_ptr + a_offset)
@@ -86,7 +88,9 @@ def shard_qkvzba_kernel(
         tl.store(a_ptr + token_id * num_v_heads + store_offset, a_val)
     else:
         base_ptr = qkvzba_ptr + token_id * ROW_SIZE + head_id * QKVZ_DIM_SIZE
-        qkv_base_ptr = qkv_ptr + token_id * (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim)
+        qkv_base_ptr = qkv_ptr + token_id * (
+            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+        )
         k_dim_offset = tl.arange(0, head_k_dim)
         v_dim_offset = tl.arange(0, head_v_dim)
         q_val = tl.load(base_ptr + k_dim_offset)
@@ -98,20 +102,45 @@ def shard_qkvzba_kernel(
         tl.store(k_store_ptr + k_dim_offset, k_val)
 
         for sub_head in tl.static_range(0, KV_HEAD_RATIO):
-          v_val = tl.load(base_ptr + 2 * head_k_dim + sub_head * head_v_dim + v_dim_offset)
-          v_store_ptr = qkv_base_ptr + 2 * num_k_heads * head_k_dim + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
-          tl.store(v_store_ptr + v_dim_offset, v_val)
+            v_val = tl.load(
+                base_ptr + 2 * head_k_dim + sub_head * head_v_dim + v_dim_offset
+            )
+            v_store_ptr = (
+                qkv_base_ptr
+                + 2 * num_k_heads * head_k_dim
+                + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
+            )
+            tl.store(v_store_ptr + v_dim_offset, v_val)
 
         for sub_head in tl.static_range(0, KV_HEAD_RATIO):
-          z_val = tl.load(base_ptr + 2 * head_k_dim + KV_HEAD_RATIO * head_v_dim + sub_head * head_v_dim + v_dim_offset)
-          z_store_ptr = z_ptr + token_id * num_v_heads * head_v_dim + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
-          tl.store(z_store_ptr + v_dim_offset, z_val)
+            z_val = tl.load(
+                base_ptr
+                + 2 * head_k_dim
+                + KV_HEAD_RATIO * head_v_dim
+                + sub_head * head_v_dim
+                + v_dim_offset
+            )
+            z_store_ptr = (
+                z_ptr
+                + token_id * num_v_heads * head_v_dim
+                + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
+            )
+            tl.store(z_store_ptr + v_dim_offset, z_val)
 
 
-
-def shard_qkvzba(qkvzba: torch.Tensor, num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int)->tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def shard_qkvzba(
+    qkvzba: torch.Tensor,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
-    qkv_mixed = torch.empty([num_tokens, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim], dtype=dtype, device=device)
+    qkv_mixed = torch.empty(
+        [num_tokens, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim],
+        dtype=dtype,
+        device=device,
+    )
     z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
     b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
     a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
@@ -129,9 +158,20 @@ def shard_qkvzba(qkvzba: torch.Tensor, num_k_heads: int, num_v_heads: int, head_
     )
     return qkv_mixed, z, b, a
 
-def shard_qkvzba_fake(qkvzba: torch.Tensor, num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int)->tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+def shard_qkvzba_fake(
+    qkvzba: torch.Tensor,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
-    qkv_mixed = torch.empty([num_tokens, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim], dtype=dtype, device=device)
+    qkv_mixed = torch.empty(
+        [num_tokens, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim],
+        dtype=dtype,
+        device=device,
+    )
     z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
     b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
     a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
@@ -139,11 +179,9 @@ def shard_qkvzba_fake(qkvzba: torch.Tensor, num_k_heads: int, num_v_heads: int, 
 
 
 direct_register_custom_op(
-    "shard_qkvzba",
-    shard_qkvzba,
-    mutates_args=[],
-    fake_impl=shard_qkvzba_fake
+    "shard_qkvzba", shard_qkvzba, mutates_args=[], fake_impl=shard_qkvzba_fake
 )
+
 
 def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
@@ -597,15 +635,23 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
-        qkvz_split_size = self.num_k_heads // self.tp_size * (
+        qkvz_split_size = (
+            self.num_k_heads
+            // self.tp_size
+            * (
                 self.head_k_dim
                 + self.head_k_dim
                 + (self.head_v_dim + self.head_v_dim)
                 * self.num_v_heads
                 // self.num_k_heads
             )
-        ba_split_size = self.num_k_heads // self.tp_size * 2 * self.num_v_heads // self.num_k_heads
-        mixed_qkvz, mixed_ba = torch.split(mixed_qkvzba, [qkvz_split_size, ba_split_size], dim=-1)
+        )
+        ba_split_size = (
+            self.num_k_heads // self.tp_size * 2 * self.num_v_heads // self.num_k_heads
+        )
+        mixed_qkvz, mixed_ba = torch.split(
+            mixed_qkvzba, [qkvz_split_size, ba_split_size], dim=-1
+        )
         new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
             self.num_k_heads // self.tp_size,
             (
@@ -689,7 +735,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
         k_heads_after_tp = self.num_k_heads // self.tp_size
         v_heads_after_tp = self.num_v_heads // self.tp_size
-        mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(projected_states_qkvzba, k_heads_after_tp, v_heads_after_tp, self.head_k_dim, self.head_v_dim)
+        mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(
+            projected_states_qkvzba,
+            k_heads_after_tp,
+            v_heads_after_tp,
+            self.head_k_dim,
+            self.head_v_dim,
+        )
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)

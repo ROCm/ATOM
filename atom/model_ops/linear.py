@@ -52,7 +52,7 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
 def divide(numerator, denominator):
@@ -120,7 +120,6 @@ def gemm_a4w4_quant(
         )
     else:
         m, k = x.view(-1, x.size(-1)).shape
-        n = weight.shape[0]
 
         y = torch.empty(
             (
@@ -540,6 +539,7 @@ class MergedColumnParallelLinear(LinearBase):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param.weight_loader_process(param_data, loaded_weight)
 
+
 class QKVZBAParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
@@ -560,7 +560,11 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         tp_size = get_tp_group().world_size
         self.num_k_heads = divide(self.num_k_heads, tp_size)
         self.num_v_heads = divide(self.num_v_heads, tp_size)
-        output_sizes = [(2 * head_k_dim * self.num_k_heads + 2 * head_v_dim * self.num_v_heads) * tp_size, 2 * self.num_v_heads * tp_size]
+        output_sizes = [
+            (2 * head_k_dim * self.num_k_heads + 2 * head_v_dim * self.num_v_heads)
+            * tp_size,
+            2 * self.num_v_heads * tp_size,
+        ]
         super().__init__(
             input_size,
             output_sizes,
@@ -575,12 +579,18 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         param_data = param.data
         assert loaded_shard_id in ["qkvz", "ba"]
         if loaded_shard_id == "qkvz":
-            shard_size = 2 * self.num_k_heads * self.head_k_dim + 2 * self.num_v_heads * self.head_v_dim
+            shard_size = (
+                2 * self.num_k_heads * self.head_k_dim
+                + 2 * self.num_v_heads * self.head_v_dim
+            )
             shard_offset = 0
             shard_rank = self.tp_rank
         elif loaded_shard_id == "ba":
             shard_size = 2 * self.num_v_heads
-            shard_offset = 2 * self.num_k_heads * self.head_k_dim + 2 * self.num_v_heads * self.head_v_dim
+            shard_offset = (
+                2 * self.num_k_heads * self.head_k_dim
+                + 2 * self.num_v_heads * self.head_v_dim
+            )
             shard_rank = self.tp_rank
 
         if param is getattr(self, "weight_scale", None) or param is getattr(
@@ -597,6 +607,7 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
+
 
 class QKVParallelLinear(ColumnParallelLinear):
     def __init__(
