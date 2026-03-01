@@ -34,9 +34,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     block_idx_last_scheduled_token,  # (batch,)
     initial_state_idx,  # (batch,)
     num_computed_tokens,  # (batch,)
-    o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+    query_ptr,  # (k_dim_size, seqlen)
+    key_ptr,  # (k_dim_size, seqlen)
+    value_ptr,  # (v_dim_size, seqlen)
     # Matrix dimensions
     dim: tl.constexpr,
+    k_dim_size: tl.constexpr,
+    v_dim_size: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
     # Strides
@@ -48,8 +52,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_istate_dim: tl.constexpr,
     stride_istate_token: tl.constexpr,
     stride_cache_indices: tl.constexpr,
-    stride_o_dim: tl.constexpr,
-    stride_o_token: tl.constexpr,
+    query_dim_stride: tl.constexpr,
+    query_token_stride: tl.constexpr,
+    key_dim_stride: tl.constexpr,
+    key_token_stride: tl.constexpr,
+    value_dim_stride: tl.constexpr,
+    value_token_stride: tl.constexpr,
     stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
     # others
     pad_slot_id: tl.constexpr,
@@ -63,6 +71,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    k_start_dim = k_dim_size
+    v_start_dim = k_dim_size * 2
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
     stride_conv_state_seq = stride_istate_seq
@@ -81,6 +91,33 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     # BLOCK_N elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_feats_start = tl.program_id(1) * BLOCK_N
+    o_ptr = x_ptr
+    stride_o_token = stride_x_token
+    stride_o_dim = stride_x_dim
+    idx_feats_o = idx_feats
+    dim_limits = dim
+    # Assume the idx_feats can be fully divided by BLOCK_N
+    if idx_feats_start < k_start_dim:
+        o_ptr = query_ptr
+        stride_o_token = query_token_stride
+        stride_o_dim = query_dim_stride
+        idx_feats_o = idx_feats
+        dim_limits = k_dim_size
+    elif idx_feats_start < v_start_dim:
+        o_ptr = key_ptr
+        stride_o_token = key_token_stride
+        stride_o_dim = key_dim_stride
+        idx_feats_o = idx_feats - k_start_dim
+        dim_limits = k_dim_size
+    elif idx_feats_start < dim:
+        o_ptr = value_ptr
+        stride_o_token = value_token_stride
+        stride_o_dim = value_dim_stride
+        idx_feats_o = idx_feats - v_start_dim
+        dim_limits = v_dim_size
+    else:
+        return
 
     if idx_seq == pad_slot_id:
         return
@@ -467,13 +504,15 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
+
         mask_1d = (idx_token < segment_len) & (
-            idx_feats < dim
+            idx_feats_o < dim_limits
         )  # token-index  # feature-index
+
         o_ptrs = (
             o_ptr
             + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
+            + (idx_feats_o * stride_o_dim)
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
@@ -485,6 +524,8 @@ def causal_conv1d_fn(
     bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
+    k_dim_size: int,
+    v_dim_size: int,
     cache_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
@@ -588,6 +629,17 @@ def causal_conv1d_fn(
     stride_istate_dim = 0
     stride_istate_token = 0
     num_cache_lines = 0
+    query = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    key = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    value = torch.empty([cu_seqlen, v_dim_size], dtype=x.dtype, device=x.device)
+
+    query_token_stride = query.stride(0)
+    key_token_stride = key.stride(0)
+    value_token_stride = value.stride(0)
+    query_dim_stride = query.stride(1)
+    key_dim_stride = key.stride(1)
+    value_dim_stride = value.stride(1)
+
     BLOCK_M = 8
     if conv_states is not None:
         # extensions to support vLLM:
@@ -726,9 +778,13 @@ def causal_conv1d_fn(
         block_idx_last_scheduled_token,
         initial_state_idx,
         num_computed_tokens,
-        out,
+        query,
+        key,
+        value,
         # Matrix dimensions
         dim,
+        k_dim_size,
+        v_dim_size,
         cu_seqlen,
         num_cache_lines,
         # stride
@@ -740,8 +796,12 @@ def causal_conv1d_fn(
         stride_istate_dim,
         stride_istate_token,
         stride_cache_indices,
-        stride_o_dim,
-        stride_o_token,
+        query_dim_stride,
+        query_token_stride,
+        key_dim_stride,
+        key_token_stride,
+        value_dim_stride,
+        value_token_stride,
         block_size_to_align // BLOCK_M,
         # others
         pad_slot_id,
@@ -757,7 +817,7 @@ def causal_conv1d_fn(
         BLOCK_N=256,
         num_stages=2,
     )
-    return out.to(original_x_dtype)
+    return query, key, value
 
 
 @triton.jit()
@@ -772,11 +832,15 @@ def _causal_conv1d_update_kernel(
     query_start_loc_ptr,  # (batch + 1)
     block_idx_last_scheduled_token,  # (batch,)
     initial_state_idx,  # (batch,)
-    o_ptr,  # (batch, dim, seqlen)
+    query_ptr,  # (batch, dim, seqlen)
+    key_ptr,
+    value_ptr,
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
     seqlen: tl.constexpr,
+    k_dim_size: tl.constexpr,
+    v_dim_size: tl.constexpr,
     state_len: tl.constexpr,
     num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
     # Strides
@@ -789,9 +853,18 @@ def _causal_conv1d_update_kernel(
     stride_conv_state_dim: tl.constexpr,
     stride_conv_state_tok: tl.constexpr,
     stride_state_indices: tl.constexpr,
-    stride_o_seq: tl.constexpr,
-    stride_o_dim: tl.constexpr,
-    stride_o_token: tl.constexpr,
+    # stride_o_seq: tl.constexpr,
+    # stride_o_dim: tl.constexpr,
+    # stride_o_token: tl.constexpr,
+    stride_q_seq: tl.constexpr,
+    stride_q_token: tl.constexpr,
+    stride_q_dim: tl.constexpr,
+    stride_k_seq: tl.constexpr,
+    stride_k_token: tl.constexpr,
+    stride_k_dim: tl.constexpr,
+    stride_v_seq: tl.constexpr,
+    stride_v_token: tl.constexpr,
+    stride_v_dim: tl.constexpr,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters
@@ -812,6 +885,39 @@ def _causal_conv1d_update_kernel(
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_feats_start = tl.program_id(1) * BLOCK_N
+    k_start_point: tl.constexpr = k_dim_size
+    v_start_point: tl.constexpr = k_dim_size * 2
+    stride_o_seq = stride_q_seq
+
+    o_ptr = x_ptr
+    stride_o_token = stride_x_token
+    stride_o_dim = stride_x_dim
+    idx_feats_o = idx_feats
+    dim_limits = dim
+    if idx_feats_start < k_start_point:
+        o_ptr = query_ptr
+        stride_o_token = stride_q_token
+        stride_o_dim = stride_q_dim
+        idx_feats_o = idx_feats
+        dim_limits = k_dim_size
+        stride_o_seq = stride_q_seq
+    elif idx_feats_start < v_start_point:
+        o_ptr = key_ptr
+        stride_o_token = stride_k_token
+        stride_o_dim = stride_k_dim
+        idx_feats_o = idx_feats - k_start_point
+        dim_limits = k_dim_size
+        stride_o_seq = stride_k_seq
+    elif idx_feats_start < dim:
+        o_ptr = value_ptr
+        stride_o_token = stride_v_token
+        stride_o_dim = stride_v_dim
+        idx_feats_o = idx_feats - v_start_point
+        dim_limits = v_dim_size
+        stride_o_seq = stride_v_seq
+    else:
+        return
 
     if IS_APC_ENABLED:
         # Get the state from the initial_state_idx
@@ -1075,11 +1181,22 @@ def _causal_conv1d_update_kernel(
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
+
+        # if idx_feats_start < k_start_point:
+        #     idx_feats_o = idx_feats
+        #     dim_limits = k_start_point
+        # elif idx_feats_start < v_start_point:
+        #     idx_feats_o = idx_feats - k_start_point
+        #     dim_limits = v_start_point
+        # else:
+        #     idx_feats_o = idx_feats - v_start_point
+        #     dim_limits = v_start_point + v_dim_size
+
         mask_1d = (idx_token < seqlen) & (
-            idx_feats < dim
+            idx_feats_o < dim_limits
         )  # token-index  # feature-index
         o_ptrs = (
-            o_ptr + o_offset + idx_token * stride_o_token + (idx_feats * stride_o_dim)
+            o_ptr + o_offset + idx_token * stride_o_token + (idx_feats_o * stride_o_dim)
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
@@ -1089,6 +1206,8 @@ def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
+    k_dim_size: int,
+    v_dim_size: int,
     bias: torch.Tensor | None = None,
     activation: bool | str | None = None,
     conv_state_indices: torch.Tensor | None = None,
@@ -1174,12 +1293,23 @@ def causal_conv1d_update(
         if conv_state_indices is None:
             assert conv_state.size(0) >= batch
         else:
-            assert (batch,) == conv_state_indices.shape
+            assert (
+                batch == conv_state_indices.shape[0]
+            ), f"ERROR: conv_state_indices should have shape ({batch},*) but got {conv_state_indices.shape}"
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
+    num_tokens = x.shape[0]
+    query = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
+    key = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
+    value = torch.empty([num_tokens, v_dim_size, 1], dtype=x.dtype, device=x.device)
+
+    stride_q_seq, stride_q_dim, stride_q_token = query.stride()
+    stride_k_seq, stride_k_dim, stride_k_token = key.stride()
+    stride_v_seq, stride_v_dim, stride_v_token = value.stride()
+
     out = x
     stride_w_dim, stride_w_width = weight.stride()
 
@@ -1221,11 +1351,15 @@ def causal_conv1d_update(
         query_start_loc,
         block_idx_last_scheduled_token,
         initial_state_idx,
-        out,
+        query,
+        key,
+        value,
         # Matrix dimensions
         batch,
         dim,
         seqlen,
+        k_dim_size,
+        v_dim_size,
         state_len,
         num_cache_lines,
         # stride
@@ -1238,9 +1372,18 @@ def causal_conv1d_update(
         stride_istate_dim,
         stride_istate_token,
         stride_state_indices,
-        stride_o_seq,
-        stride_o_dim,
-        stride_o_token,
+        # stride_o_seq,
+        # stride_o_dim,
+        # stride_o_token,
+        stride_q_seq,
+        stride_q_token,
+        stride_q_dim,
+        stride_k_seq,
+        stride_k_token,
+        stride_k_dim,
+        stride_v_seq,
+        stride_v_token,
+        stride_v_dim,
         # others
         pad_slot_id,
         # META
@@ -1256,4 +1399,7 @@ def causal_conv1d_update(
     )
     if unsqueeze:
         out = out.squeeze(-1)
-    return out.to(original_x_dtype)
+    query = query.squeeze(-1)
+    key = key.squeeze(-1)
+    value = value.squeeze(-1)
+    return query, key, value
