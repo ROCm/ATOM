@@ -29,7 +29,8 @@ class SpecStats:
 
     def __init__(self, mtp_k: int, log_interval: int = 1000):
         self.mtp_k = mtp_k
-        self._log_interval = log_interval
+        # Log every log_interval decode steps (in terms of draft tokens)
+        self._log_interval = log_interval * mtp_k
         self.total_draft_tokens: int = 0
         self.distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
         # Per-interval tracking
@@ -44,7 +45,7 @@ class SpecStats:
         self.distribution[num_bonus] += 1
         self._interval_distribution[num_bonus] += 1
 
-        if self.total_draft_tokens % self._log_interval < self.mtp_k:
+        if self.total_draft_tokens % self._log_interval == 0:
             self._log()
             self._reset_interval()
 
