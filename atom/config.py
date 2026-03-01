@@ -130,7 +130,7 @@ class CompilationConfig:
     - FULL_AND_PIECEWISE.
 
     PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
-    incompatiable ops (i.e. some attention ops) outside the cudagraph
+    incompatible ops (i.e. some attention ops) outside the cudagraph
     for general flexibility.
     This is the default mode.
 
@@ -337,9 +337,8 @@ def get_quant_config(config: PretrainedConfig) -> QuantizationConfig:
                 f"{dtype_prefix}{bit}" if bit != 4 else f"{dtype_prefix}{bit}x2"
             )
             quant_dtype = d_dtypes.get(quant_dtype_str, None)
-    assert (
-        quant_dtype is not None
-    ), f"Cannot parse quant dtype from {orig_quant_config_str}"
+    if quant_dtype is None:
+        raise ValueError(f"Cannot parse quant dtype from {orig_quant_config_str}")
     if quant_dtype == d_dtypes["fp4x2"]:
         quant_type = QuantType.per_1x32
 
@@ -613,7 +612,10 @@ class Config:
     def __post_init__(self):
         # assert os.path.isdir(self.model)
 
-        assert 1 <= self.tensor_parallel_size <= 8
+        if not (1 <= self.tensor_parallel_size <= 8):
+            raise ValueError(
+                f"tensor_parallel_size must be between 1 and 8, got {self.tensor_parallel_size}."
+            )
         self.hf_config = get_hf_config(self.model)
         if not hasattr(self.hf_config, "rope_parameters"):
             # Compatible with both transformers < 5
@@ -659,7 +661,7 @@ class Config:
         if self.speculative_config is not None:
             if self.speculative_config.num_speculative_tokens > 4:
                 raise ValueError(
-                    f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
+                    f"num_speculative_tokens must be between 1 and 4, got {self.speculative_config.num_speculative_tokens}."
                 )
 
     def compute_hash(self) -> str:

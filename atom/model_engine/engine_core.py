@@ -62,7 +62,7 @@ class EngineCore:
         )
         self.input_thread.start()
 
-        self.profile_enbaled = config.torch_profiler_dir is not None
+        self.profile_enabled = config.torch_profiler_dir is not None
         init_exit_handler(self)
         self._init_data_parallel(config)
 
@@ -283,11 +283,11 @@ class EngineCore:
                     break
 
     def start_profiler(self):
-        if self.profile_enbaled:
+        if self.profile_enabled:
             self.runner_mgr.call_func("start_profiler")
 
     def stop_profiler(self):
-        if self.profile_enbaled:
+        if self.profile_enabled:
             logger.info("Profiler stopping...")
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
             logger.info("Profiler stopped.")

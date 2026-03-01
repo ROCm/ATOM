@@ -382,6 +382,7 @@ class Scheduler:
             if self.spec_stats:
                 self.spec_stats.update(num_new_token)
             idx = fwd_output.req_ids.index(seq.id)
+            num_rejected = 0
             if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
                 num_bonus = fwd_output.num_bonus[idx]
