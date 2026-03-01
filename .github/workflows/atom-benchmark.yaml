@@ -34,6 +34,36 @@ on:
           Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
         type: string
         default: "1024,1024,128,0.8"
+  # Reusable workflow: other repos or workflows can call this via:
+  #   uses: owner/ATOM/.github/workflows/atom-benchmark.yaml@ref
+  #   with: { param_lists: '...', image: '...', ... }
+  #   secrets: { HF_TOKEN: ... }  # optional
+  workflow_call:
+    inputs:
+      deepseek-r1-0528:
+        description: "Benchmark DeepSeek-R1-0528"
+        type: boolean
+        default: true
+      gpt-oss-120b:
+        description: "Benchmark gpt-oss-120b"
+        type: boolean
+        default: true
+      extra_args:
+        description: "Extra arguments to pass to the ATOM server"
+        type: string
+        default: ""
+      image:
+        description: "Image to use for the benchmark"
+        type: string
+        default: "rocm/atom-dev:latest"
+      param_lists:
+        description: "Benchmark param sets: input_length,output_length,concurrency,random_range_ratio; multiple sets separated by semicolon"
+        type: string
+        default: "1024,1024,128,0.8"
+    secrets:
+      HF_TOKEN:
+        description: "HuggingFace token for gated models (optional)"
+        required: false
 
 jobs:
   parse-param-lists:
@@ -145,6 +175,7 @@ jobs:
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Run benchmark
         timeout-minutes: 30
@@ -265,6 +296,7 @@ jobs:
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Run benchmark
         timeout-minutes: 30
