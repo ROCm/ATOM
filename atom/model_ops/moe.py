@@ -247,6 +247,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
     ) -> torch.Tensor:
@@ -300,11 +301,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
             # For FP8: use FP8 dtype for communication
             # For FP4/no quant: use bfloat16
-            mori_dtype = (
-                quant_config.quant_dtype
-                if is_fp8 and quant_type is not None
-                else torch.bfloat16
-            )
+            # mori_dtype = (
+            #     quant_config.quant_dtype
+            #     if is_fp8 and quant_type is not None
+            #     else torch.bfloat16
+            # )
             # mori_dtype = torch.bfloat16
 
             all_to_all_args = dict(
@@ -465,6 +466,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
@@ -479,7 +481,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
+            num_routing_experts=global_num_experts,
             num_fused_shared_experts=layer.num_fused_shared_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
         if self.fused_experts:
@@ -868,10 +872,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
+        fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import triton_kernel_moe_forward
+
+            assert (
+                fused_shared_experts_scoring_func is None
+            ), "triton kernel does not support fused shared experts func"
 
             return triton_kernel_moe_forward(
                 x,
@@ -901,7 +910,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
+            num_routing_experts=global_num_experts,
             num_fused_shared_experts=layer.num_fused_shared_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
         if self.fused_experts is None:
@@ -1275,6 +1286,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
+        fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
         """Apply compressed-tensors FP8 MoE computation."""
@@ -1291,6 +1303,8 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
             num_fused_shared_experts=layer.num_fused_shared_experts,
+            num_routing_experts=layer.global_num_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
 
@@ -1460,7 +1474,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            assert self.quant_config["is_dynamic"] == True
+            assert self.quant_config["is_dynamic"]
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
@@ -1501,7 +1515,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # TODO (rob): refactor block quant into separate class.
         if self.block_quant:
-            assert self.quant_config["is_dynamic"] == True
+            assert self.quant_config["is_dynamic"]
             if self.need_normalize_e4m3fn_to_e4m3fnuz:
                 w13_weight, w13_weight_scale, w13_input_scale = (
                     normalize_e4m3fn_to_e4m3fnuz(
@@ -1631,6 +1645,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
+        fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
@@ -1644,6 +1659,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            num_routing_experts=global_num_experts,
             num_fused_shared_experts=layer.num_fused_shared_experts,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
@@ -1800,10 +1817,11 @@ class FusedMoE(torch.nn.Module):
         apply_router_weight_on_input: bool = False,
         has_bias: bool = True,
         activation: ActivationType = ActivationType.Silu,
+        shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
     ):
         super().__init__()
-
+        self.prefix = prefix
         self.params_dtype = (
             quant_config["quant_dtype"] if quant_config else torch.get_default_dtype()
         )
@@ -1819,7 +1837,6 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        tp_rank = 0 if self.tp_size == 1 else get_tp_group().rank_in_group
         self.global_num_experts = num_experts
         if self.use_ep:
             self.local_num_experts, self.expert_map = determine_expert_map(
@@ -1832,6 +1849,7 @@ class FusedMoE(torch.nn.Module):
             self.expert_map = None
         self.top_k = top_k
         self.global_num_experts = num_experts
+        self.shared_expert_scoring_func = shared_expert_scoring_func
 
         self.num_fused_shared_experts = (
             config.n_shared_experts
@@ -1928,7 +1946,6 @@ class FusedMoE(torch.nn.Module):
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
         quant_method_str = quant_config.get("quant_method", None)
-
         if quant_config["quant_type"] == QuantType.No:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
                 moe
@@ -2367,7 +2384,9 @@ class FusedMoE(torch.nn.Module):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        num_routing_experts: int = 0,
         num_fused_shared_experts: int = 0,
+        fused_shared_experts_scoring_func: Optional[str] = None,
         routed_scaling_factor: float = 1.0,
     ):
 
@@ -2375,6 +2394,7 @@ class FusedMoE(torch.nn.Module):
         if use_grouped_topk:
             assert topk_group is not None
             assert num_expert_group is not None
+            assert fused_shared_experts_scoring_func is None
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -2392,6 +2412,9 @@ class FusedMoE(torch.nn.Module):
                 gating_output=router_logits,
                 topk=top_k,
                 renormalize=renormalize,
+                num_fused_shared_experts=num_fused_shared_experts,
+                num_routing_experts=num_routing_experts,
+                fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             )
 
         return topk_weights, topk_ids
@@ -2433,6 +2456,7 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             scoring_func=self.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
+            fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
@@ -2486,6 +2510,7 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             scoring_func=self.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
+            fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
