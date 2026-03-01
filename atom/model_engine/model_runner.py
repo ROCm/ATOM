@@ -54,6 +54,7 @@ support_model_arch_dict = {
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
