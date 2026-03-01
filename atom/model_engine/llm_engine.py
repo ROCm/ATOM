@@ -35,7 +35,6 @@ class LLMEngine:
         # Set data parallel size in config
         config.parallel_config.data_parallel_size = data_parallel_size
         self.data_parallel_size = data_parallel_size
-        self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
