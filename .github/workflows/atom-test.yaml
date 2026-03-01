@@ -135,14 +135,14 @@ jobs:
             runner: atom-mi355-8gpu.predownload
             run_on_pr: true
           - model_name: "DeepSeek-R1-0528-FP4"
-            model_path: "amd/DeepSeek-R1-0528-mtp-mxfp4"
+            model_path: "amd/DeepSeek-R1-0528-MXFP4"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             accuracy_test_threshold: "0.93"
             runner: atom-mi355-8gpu.predownload
             run_on_pr: true
           - model_name: "DeepSeek-R1-0528-FP4 MTP"
-            model_path: "amd/DeepSeek-R1-0528-mtp-mxfp4"
+            model_path: "amd/DeepSeek-R1-0528-MXFP4"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
             env_vars: ""
             accuracy_test_threshold: "0.93"
@@ -329,7 +329,7 @@ jobs:
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
+            if ! docker exec atom_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
