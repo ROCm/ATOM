@@ -13,6 +13,7 @@ from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
 from atom.utils.custom_register import direct_register_custom_op
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 
 from atom.model_ops.base_attention import Attention, LinearAttention
 from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
@@ -21,7 +22,7 @@ from atom.model_ops.linear import (
     QKVZBAParallelLinear,
     QKVParallelLinear,
     MergedColumnParallelLinear,
-    ReplicatedLinear,
+    MergedReplicatedLinear,
     RowParallelLinear,
     ColumnParallelLinear,
 )
@@ -323,17 +324,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         #     self.physical_expert_start + self.n_local_physical_experts
         # )
 
-        self.gate = ReplicatedLinear(
+        self.gate = MergedReplicatedLinear(
             config.hidden_size,
-            config.num_experts,
+            [config.num_experts, config.n_shared_experts],
             bias=False,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
+        # print(f"layer {prefix}, gate weight: {self.gate.weight.data}", flush=True)
 
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if config.shared_expert_intermediate_size > 0:
+        if (
+            config.shared_expert_intermediate_size > 0
+            and not is_rocm_aiter_fusion_shared_expert_enabled()
+        ):
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -355,6 +360,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=False,
+            shared_expert_scoring_func=(
+                "sigmoid" if self.shared_expert is None else None
+            ),
             prefix=f"{prefix}.experts",
             config=config,
         )
@@ -370,10 +378,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         routed_output = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-
-        shared_output = self.shared_expert(hidden_states)
-
-        final_hidden_states = shared_output + routed_output
+        if not is_rocm_aiter_fusion_shared_expert_enabled():
+            shared_output = self.shared_expert(hidden_states)
+            final_hidden_states = shared_output + routed_output
+        else:
+            final_hidden_states = routed_output
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -437,6 +446,7 @@ class Qwen3NextAttention(nn.Module):
         rope_theta = rope_parameters.get("rope_theta", 10000)
         rope_scaling = rope_parameters.get("rope_scaling", None)
         partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
+
         rotary_dim = int(self.head_dim * partial_rotary_factor)
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
@@ -471,8 +481,8 @@ class Qwen3NextAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            q_gate, k, v = torch.split(
+                qkv, [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
             orig_shape = q_gate.shape[:-1]
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
@@ -480,7 +490,9 @@ class Qwen3NextAttention(nn.Module):
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
 
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
@@ -916,6 +928,8 @@ class Qwen3NextModel(nn.Module):
 
         config: Qwen3NextConfig = atom_config.hf_config
         self.config = config
+        self.config.n_shared_experts = 1
+        self.config.n_routed_experts = self.config.num_experts
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -981,7 +995,12 @@ class Qwen3NextModel(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.n_routed_experts
+            + (
+                self.config.n_shared_experts
+                if is_rocm_aiter_fusion_shared_expert_enabled()
+                else 0
+            ),
         )
 
 
@@ -994,6 +1013,8 @@ class Qwen3NextForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
         "in_proj_qkvz": ("in_proj_qkvzba", "qkvz"),
         "in_proj_ba": ("in_proj_qkvzba", "ba"),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
     }
 
     def __init__(

@@ -88,6 +88,13 @@ def load_model(
     load_dummy: bool = False,
     spec_decode: bool = False,
 ):
+    def have_shared_expert(name):
+        maybe_matching_list = ["mlp.shared_experts.", "mlp.shared_expert."]
+        for maybe_matching_name in maybe_matching_list:
+            if maybe_matching_name in name:
+                return maybe_matching_name
+        return None
+
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
@@ -99,7 +106,7 @@ def load_model(
         ):
             if load_dummy:
                 continue
-            if name.endswith("kv_scale"):
+            if name.endswith("kv_scale") or "inv_freq" in name:
                 continue
             if spec_decode:
                 if hf_config.model_type == "deepseek_mtp":
@@ -126,13 +133,14 @@ def load_model(
                 and not spec_decode
             ):
                 continue
+            maybe_matching_name = have_shared_expert(name)
             if (
                 is_rocm_aiter_fusion_shared_expert_enabled()
-                and "mlp.shared_experts" in name
+                and maybe_matching_name is not None
             ):
                 name = name.replace(
-                    "mlp.shared_experts",
-                    f"mlp.experts.{hf_config.n_routed_experts}",
+                    maybe_matching_name,
+                    f"mlp.experts.{hf_config.n_routed_experts}.",
                 )
             for k in packed_modules_mapping:
                 # We handle the experts below in expert_params_mapping

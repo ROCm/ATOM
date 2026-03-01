@@ -5,6 +5,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
+  schedule:
+    # Nightly at 01:00 Beijing time (17:00 UTC)
+    - cron: '0 17 * * *'
   workflow_dispatch:
     inputs:
       deepseek-r1-0528:
@@ -42,7 +45,7 @@ jobs:
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
-          IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
+          IFS=';' read -ra SETS <<< "${{ inputs.param_lists || '1024,1024,128,0.8' }}"
           MATRIX_JSON="["
           SEP=""
           for SET in "${SETS[@]}"; do
@@ -62,7 +65,7 @@ jobs:
           echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
   deepseek-r1-0528-benchmark:
-    if: ${{ inputs.deepseek-r1-0528 }}
+    if: ${{ github.event_name == 'schedule' || inputs.deepseek-r1-0528 }}
     name: DeepSeek-R1-0528 Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
     needs: [parse-param-lists]
     strategy:
@@ -138,7 +141,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
-          ${{ inputs.image }}
+          ${{ inputs.image || 'rocm/atom-dev:latest' }}
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
@@ -155,7 +158,7 @@ jobs:
             model_path="${{ env.MODEL_PATH }}"
           fi
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
+            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
           "
           echo "========== Running benchmark test =========="
           docker exec atom-benchmark bash -lc "
@@ -176,12 +179,12 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
 
   gpt-oss-120b-benchmark:
-    if: ${{ inputs.gpt-oss-120b }}
+    if: ${{ github.event_name == 'schedule' || inputs.gpt-oss-120b }}
     name: GPT-OSS-120b Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
     needs: [parse-param-lists]
     strategy:
@@ -258,7 +261,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
-          ${{ inputs.image }}
+          ${{ inputs.image || 'rocm/atom-dev:latest' }}
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
@@ -275,7 +278,7 @@ jobs:
             model_path="${{ env.MODEL_PATH }}"
           fi
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
+            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
           "
           echo "========== Running benchmark test =========="
           docker exec atom-benchmark bash -lc "
@@ -296,7 +299,7 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
 
