@@ -310,9 +310,10 @@ class Scheduler:
 
         # decode
         num_seqs_decode = 0
+        num_new_tokens = self.mtp_k + 1
         while self.running and num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq, num_new_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -322,7 +323,6 @@ class Scheduler:
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
-                num_new_tokens = self.mtp_k + 1
                 self.block_manager.may_append(seq, num_new_tokens)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
@@ -385,6 +385,7 @@ class Scheduler:
             if self.spec_stats:
                 self.spec_stats.update(num_new_token)
             idx = fwd_output.req_ids.index(seq.id)
+            num_rejected = 0
             if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
                 num_bonus = fwd_output.num_bonus[idx]

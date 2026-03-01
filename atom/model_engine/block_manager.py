@@ -122,45 +122,21 @@ class BlockManager:
                 self._deallocate_block(block_id)
             seq.mamba_block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
+        needed_blocks = (
+            (len(seq) + num_new_tokens + self.block_size - 1) // self.block_size
+        )
+        blocks_to_allocate = needed_blocks - len(seq.block_table)
+        return len(self.free_block_ids) >= max(0, blocks_to_allocate)
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         seq_len = len(seq)
-        # Check if we need to allocate a new block
-        # When len(seq) % block_size == 1, we need a new block for the next token
-        # When block_size == 1, every token needs a new block
-        if 0 < seq_len % self.block_size <= num_new_tokens or self.block_size == 1:
-            needed_blocks = (seq_len + self.block_size - 1) // self.block_size
-            while len(block_table) < needed_blocks:
-                # For block_size == 1, we need to update hash for each new block
-                # For block_size > 1, the previous block should have hash != -1 (unless it's the first block)
-                if self.block_size == 1:
-                    # Allocate new block and update hash immediately (like allocate does for full blocks)
-                    block_id = self.free_block_ids[0]
-                    block = self._allocate_block(block_id)
-                    block_table.append(block_id)
-                    token_ids = [seq[-1]]
-                    prefix = (
-                        self.blocks[block_table[-2]].hash
-                        if len(block_table) > 1
-                        else -1
-                    )
-                    h = self.compute_hash(token_ids, prefix)
-                    block.update(h, token_ids)
-                    self.hash_to_block_id[h] = block_id
-                else:
-                    # For block_size > 1, we only allocate new block when needed
-                    # The hash will be updated when the block becomes full
-                    block_id = self.free_block_ids[0]
-                    block = self._allocate_block(block_id)
-                    block_table.append(block_id)
-                    last_block = block
-        elif seq_len % self.block_size == 0:
-            # Last block is now full, update its hash (similar to allocate)
-            # TODO: fix hash
+
+        # Phase 1: If the last block just became full, register its hash
+        # so it can be reused for prefix caching on future sequences.
+        if seq_len % self.block_size == 0 and self.block_size > 1:
             token_ids = seq.block(seq.num_blocks - 1)
             if len(token_ids) == self.block_size:
                 prefix = (
@@ -169,8 +145,26 @@ class BlockManager:
                 h = self.compute_hash(token_ids, prefix)
                 last_block.update(h, token_ids)
                 self.hash_to_block_id[h] = last_block.block_id
-        else:
-            pass
-            # Last block is not full and not at the boundary
-            # Hash remains -1 until block is full (consistent with allocate logic)
-            # assert last_block.hash == -1, last_block.block_id
+
+        # Phase 2: Allocate new blocks for the upcoming tokens.
+        needed_blocks = (
+            (seq_len + num_new_tokens + self.block_size - 1) // self.block_size
+        )
+        while len(block_table) < needed_blocks:
+            if self.block_size == 1:
+                block_id = self.free_block_ids[0]
+                block = self._allocate_block(block_id)
+                block_table.append(block_id)
+                token_ids = [seq[-1]]
+                prefix = (
+                    self.blocks[block_table[-2]].hash
+                    if len(block_table) > 1
+                    else -1
+                )
+                h = self.compute_hash(token_ids, prefix)
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block_id
+            else:
+                block_id = self.free_block_ids[0]
+                block = self._allocate_block(block_id)
+                block_table.append(block_id)
