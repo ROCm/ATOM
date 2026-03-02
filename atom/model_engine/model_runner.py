@@ -70,8 +70,10 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        # self.is_deferred_out = False
-        self.is_deferred_out = False #PD only
+        # Deferred output is disabled when running in P/D disaggregation mode
+        # (kv_transfer_config is set), enabled otherwise.
+        # TODO: enable deferred output in P/D disaggregation mode
+        self.is_deferred_out = not bool(runner.config.kv_transfer_config)
 
         self.runner = runner
         device = runner.device
