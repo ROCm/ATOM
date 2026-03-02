@@ -12,7 +12,6 @@ from transformers.activations import ACT2FN
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
-from atom.utils.custom_register import direct_register_custom_op
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 
 from atom.model_ops.base_attention import Attention, LinearAttention
