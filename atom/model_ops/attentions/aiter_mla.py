@@ -302,13 +302,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_blocks_per_seq_bk = [
             (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
         ]
-        num_blocks_per_seq=[]
+        num_blocks_per_seq = []
         for i, (ctx, is_first) in enumerate(zip(batch.context_lens, batch.is_first_decode_without_local_prefill)):
-            if is_first :
-                # 第一次解码：直接使用已分配的 block 数量
+            if is_first:
+                # First decode after remote prefill: use pre-allocated block count
                 blocks = len(batch.block_tables[i])
             else:
-                # 正常情况：向上取整计算需要的 block 数量
+                # Normal case: ceil-divide context length by block size
                 blocks = (ctx + self.block_size - 1) // self.block_size
             num_blocks_per_seq.append(blocks)
         sum_blocks_before_converted = sum([(i + self.block_ratio - 1) // self.block_ratio for i in num_blocks_per_seq])
