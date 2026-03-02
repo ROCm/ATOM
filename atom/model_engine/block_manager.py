@@ -8,7 +8,9 @@ import xxhash
 from atom.config import Config
 from atom.model_engine.sequence import Sequence
 
-FAKE_REMOTE_HASH=100001
+FAKE_REMOTE_HASH = 100001
+
+
 class Block:
 
     def __init__(self, block_id):

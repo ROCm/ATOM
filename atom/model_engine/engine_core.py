@@ -20,9 +20,9 @@ from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
 
-logger = logging.getLogger("atom")
-
 from atom.disaggregation.kvoutput_aggregator import KVOutputAggregator
+
+logger = logging.getLogger("atom")
 
 
 class EngineCoreRequestType(enum.Enum):
@@ -103,7 +103,7 @@ class EngineCore:
             target=self.process_input_sockets, args=(self.input_address,), daemon=True
         )
         self.input_thread.start()
-        
+
         self.kv_aggregator = KVOutputAggregator(world_size=config.tensor_parallel_size)
 
         # We can not start input thread here since dp need to sync with other ranks,
@@ -160,32 +160,32 @@ class EngineCore:
 
     def _process_engine_step(self):
         scheduled_batch, seqs = self.scheduler.schedule()
-        
-        if scheduled_batch is None :
-            logger.debug(f"{self.label}: No sequences to schedule, skipping forward")
-            return False
-        
-        #----------
-        if scheduled_batch.connector_meta_output is not None:
-            logger.debug(f": Processing KV connector output")
-            self.runner_mgr.call_func("process_kvconnector_output",scheduled_batch.connector_meta_output )
-            logger.debug(f": Finished processing KV connector output")
-        if  not (scheduled_batch is None or len(scheduled_batch.req_ids)==0):
 
-            fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-            
-        kvoutput =self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
-        
-   
-        # finished_recving_req = self.kv_aggregator.aggregate_kv_output(kvoutput_all)
-        
-        
-        self.scheduler._update_from_kv_xfer_finished(kvoutput)
-        if  scheduled_batch is None or len(scheduled_batch.req_ids)==0:
-            logger.debug(f"{self.label}: Empty scheduled batch, skipping processing")
+        if scheduled_batch is None:
+            logger.debug("%s: No sequences to schedule, skipping forward", self.label)
             return False
-        
-        # logger.info(f"{kv_finished_output=}")
+
+        # Dispatch KV connector metadata to workers (triggers async KV load)
+        if scheduled_batch.connector_meta_output is not None:
+            self.runner_mgr.call_func(
+                "process_kvconnector_output", scheduled_batch.connector_meta_output
+            )
+
+        # Run the model forward pass if there are actual sequences
+        has_seqs = len(scheduled_batch.req_ids) > 0
+        if has_seqs:
+            fwd_out = self.runner_mgr.call_func(
+                "forward", scheduled_batch, wait_out=True
+            )
+
+        # Aggregate KV transfer status from all workers
+        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+        if not has_seqs:
+            logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
+            return False
+
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(

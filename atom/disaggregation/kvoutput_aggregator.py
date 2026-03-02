@@ -1,175 +1,158 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+"""
+KV Output Aggregator for Multi-Worker Transfer Coordination.
+
+In tensor-parallel (TP) setups, each TP worker independently tracks its own
+KV cache transfer progress.  The scheduler, however, needs a single unified
+view of which requests have completed across *all* workers.
+
+This module provides:
+
+- :class:`KVConnectorOutput`: Per-worker transfer status dataclass.
+- :class:`KVOutputAggregator`: Combines per-worker outputs into a single
+  scheduler-level view using a countdown-based approach.
+"""
+
+from __future__ import annotations
+
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger("atom")
+
+__all__ = ["KVConnectorOutput", "KVOutputAggregator"]
 
 
 @dataclass
 class KVConnectorOutput:
+    """Per-worker snapshot of finished KV cache transfers.
+
+    Each TP worker produces one of these per scheduler step.  The
+    :class:`KVOutputAggregator` combines them to determine which
+    request IDs have finished on *all* workers.
+
+    Attributes:
+        finished_sending: Request IDs whose KV send completed on this worker.
+        finished_recving: Request IDs whose KV receive completed on this worker.
+    """
+
     finished_sending: set[str] = field(default_factory=set)
     finished_recving: set[str] = field(default_factory=set)
-    
+
     def is_empty(self) -> bool:
-        """Check if both finished_sending and finished_recving are empty."""
+        """Return True if no transfers finished on this worker."""
         return not self.finished_sending and not self.finished_recving
 
-
-class KVOutputAggregator:
-    """Utility class to aggregate the KVConnectorOutput of all workers into a single
-    output corresponding to Rank 0 for scheduler."""
-
-    def __init__(self, world_size: int = 8):
-        # Track remaining workers for each request for sending and receiving separately
-        self._remaining_sending_workers = dict[str, int]()  # req_id -> remaining_workers_count
-        self._remaining_recving_workers = dict[str, int]()  # req_id -> remaining_workers_count
-        self._world_size = world_size
-
-    def aggregate(self, worker_outputs: list[KVConnectorOutput]) -> KVConnectorOutput:
-        """
-        Aggregate KVConnectorOutput from all workers and return completed req_ids.
-        
-        Args:
-            worker_outputs: List of KVConnectorOutput from each worker
-            
-        Returns:
-            KVConnectorOutput containing req_ids that have been completed by ALL workers
-        """
-        if not worker_outputs:
-            return KVConnectorOutput()
-        
-        # Collect all unique req_ids from all workers for both sending and receiving
-        all_sending_req_ids = set()
-        all_recving_req_ids = set()
-        
-        for worker_output in worker_outputs:
-            if worker_output.finished_sending:
-                all_sending_req_ids.update(worker_output.finished_sending)
-            if worker_output.finished_recving:
-                all_recving_req_ids.update(worker_output.finished_recving)
-        
-        # Initialize remaining workers count for new req_ids
-        for req_id in all_sending_req_ids:
-            if req_id not in self._remaining_sending_workers:
-                self._remaining_sending_workers[req_id] = self._world_size
-        
-        for req_id in all_recving_req_ids:
-            if req_id not in self._remaining_recving_workers:
-                self._remaining_recving_workers[req_id] = self._world_size
-        
-        # Update remaining count for each worker's completed req_ids
-        for worker_output in worker_outputs:
-            # Process sending req_ids
-            if worker_output.finished_sending:
-                for req_id in worker_output.finished_sending:
-                    if req_id in self._remaining_sending_workers:
-                        self._remaining_sending_workers[req_id] -= 1
-            
-            # Process receiving req_ids
-            if worker_output.finished_recving:
-                for req_id in worker_output.finished_recving:
-                    if req_id in self._remaining_recving_workers:
-                        self._remaining_recving_workers[req_id] -= 1
-        
-        # Find req_ids that have reached 0 remaining workers
-        finished_sending_req_ids = set()
-        finished_recving_req_ids = set()
-        
-        # Check sending req_ids
-        sending_req_ids_to_remove = []
-        for req_id, remaining in self._remaining_sending_workers.items():
-            if remaining <= 0:
-                finished_sending_req_ids.add(req_id)
-                sending_req_ids_to_remove.append(req_id)
-        
-        # Check receiving req_ids
-        recving_req_ids_to_remove = []
-        for req_id, remaining in self._remaining_recving_workers.items():
-            if remaining <= 0:
-                finished_recving_req_ids.add(req_id)
-                recving_req_ids_to_remove.append(req_id)
-        
-        # Clean up finished req_ids
-        for req_id in sending_req_ids_to_remove:
-            del self._remaining_sending_workers[req_id]
-        
-        for req_id in recving_req_ids_to_remove:
-            del self._remaining_recving_workers[req_id]
-        
-        return KVConnectorOutput(
-            finished_sending=finished_sending_req_ids,
-            finished_recving=finished_recving_req_ids
+    def __repr__(self) -> str:
+        return (
+            f"KVConnectorOutput(sending={self.finished_sending}, "
+            f"recving={self.finished_recving})"
         )
 
 
-# Test code
-if __name__ == "__main__":
-    print("Test 1: Basic scenario")
-    aggregator = KVOutputAggregator(world_size=8)
-    
-    # Round 1: All workers output empty sets
-    worker_outputs = [KVConnectorOutput() for _ in range(8)]
-    finished = aggregator.aggregate(worker_outputs)
-    print(f"Round 1 finished_sending: {finished.finished_sending}, finished_recving: {finished.finished_recving}")
-    
-    # Round 2: All workers finish sending req_id="1"
-    worker_outputs = [KVConnectorOutput(finished_sending={"1"}) for _ in range(8)]
-    finished = aggregator.aggregate(worker_outputs)
-    print(f"Round 2 finished_sending: {finished.finished_sending}, finished_recving: {finished.finished_recving}")
-    
-    # Round 3: All workers finish receiving req_id="1"
-    worker_outputs = [KVConnectorOutput(finished_recving={"1"}) for _ in range(8)]
-    finished = aggregator.aggregate(worker_outputs)
-    print(f"Round 3 finished_sending: {finished.finished_sending}, finished_recving: {finished.finished_recving}")
-    
-    print("\nTest 2: Complex scenario")
-    aggregator2 = KVOutputAggregator(world_size=8)
-    
-    # Round 1: Partial workers complete partial requests
-    worker_outputs = [
-        KVConnectorOutput(finished_sending={"1", "2"}, finished_recving={"1"}),
-        KVConnectorOutput(finished_sending={"1"}),
-        KVConnectorOutput(finished_sending={"2"}, finished_recving={"2"}),
-        KVConnectorOutput(finished_sending={"1"}),
-        KVConnectorOutput(),  # Empty output
-        KVConnectorOutput(finished_sending={"1"}, finished_recving={"3"}),
-        KVConnectorOutput(finished_sending={"2"}),
-        KVConnectorOutput(finished_sending={"1"})
-    ]
-    finished = aggregator2.aggregate(worker_outputs)
-    print(f"Round 1 finished_sending: {finished.finished_sending}, finished_recving: {finished.finished_recving}")
-    
-    # Round 2: Remaining workers complete
-    worker_outputs = [
-        KVConnectorOutput(finished_sending={"3"}, finished_recving={"3"}),
-        KVConnectorOutput(finished_sending={"2", "3"}, finished_recving={"1"}),
-        KVConnectorOutput(finished_sending={"3"}, finished_recving={"2"}),
-        KVConnectorOutput(finished_sending={"2"}, finished_recving={"1"}),
-        KVConnectorOutput(finished_sending={"1", "2"}, finished_recving={"2"}),
-        KVConnectorOutput(finished_sending={"2", "3"}, finished_recving={"1"}),
-        KVConnectorOutput(finished_sending={"1"}, finished_recving={"2"}),
-        KVConnectorOutput(finished_sending={"2"}, finished_recving={"3"})
-    ]
-    finished = aggregator2.aggregate(worker_outputs)
-    print(f"Round 2 finished_sending: {finished.finished_sending}, finished_recving: {finished.finished_recving}")
-    
-    print("\nTest 3: Gradual completion scenario")
-    aggregator3 = KVOutputAggregator(world_size=3)  # Use smaller world_size
-    
-    # Round 1: Only 2 workers finish sending
-    worker_outputs = [
-        KVConnectorOutput(finished_sending={"A"}),
-        KVConnectorOutput(finished_sending={"A"}),
-        KVConnectorOutput()
-    ]
-    finished = aggregator3.aggregate(worker_outputs)
-    print(f"Round 1 finished_sending: {finished.finished_sending}")
-    
-    # Round 2: Last worker finishes sending
-    worker_outputs = [
-        KVConnectorOutput(finished_sending={"B"}),
-        KVConnectorOutput(finished_recving={"A"}),
-        KVConnectorOutput(finished_sending={"A"})  # Last worker finishes sending
-    ]
-    finished = aggregator3.aggregate(worker_outputs)
-    print(f"Round 2 finished_sending: {finished.finished_sending}, finished_recving: {finished.finished_recving}")
+class KVOutputAggregator:
+    """Aggregates :class:`KVConnectorOutput` from all TP workers.
+
+    Uses a countdown approach: when a request ID first appears, a counter
+    is initialized to ``world_size``.  Each worker that reports it as
+    finished decrements the counter.  When the counter reaches zero,
+    the request is considered globally complete and is emitted.
+
+    Args:
+        world_size: Number of TP workers to aggregate over.
+
+    Example::
+
+        aggregator = KVOutputAggregator(world_size=8)
+        per_worker_outputs = [worker.get_kv_output() for worker in workers]
+        result = aggregator.aggregate(per_worker_outputs)
+        # result.finished_recving contains only IDs done on ALL 8 workers
+    """
+
+    def __init__(self, world_size: int = 8) -> None:
+        if world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {world_size}")
+        self._world_size = world_size
+        self._remaining_sending: dict[str, int] = {}
+        self._remaining_recving: dict[str, int] = {}
+
+    @property
+    def world_size(self) -> int:
+        return self._world_size
+
+    def aggregate(
+        self, worker_outputs: list[KVConnectorOutput]
+    ) -> KVConnectorOutput:
+        """Aggregate per-worker outputs and return globally completed request IDs.
+
+        Args:
+            worker_outputs: One :class:`KVConnectorOutput` per worker.
+
+        Returns:
+            A new :class:`KVConnectorOutput` containing only request IDs
+            that have been reported as finished by **all** workers.
+        """
+        if not worker_outputs:
+            return KVConnectorOutput()
+
+        # Collect all unique IDs reported in this round
+        all_sending_ids: set[str] = set()
+        all_recving_ids: set[str] = set()
+        for wo in worker_outputs:
+            if wo.finished_sending:
+                all_sending_ids.update(wo.finished_sending)
+            if wo.finished_recving:
+                all_recving_ids.update(wo.finished_recving)
+
+        # Initialize counters for newly seen request IDs
+        for rid in all_sending_ids:
+            if rid not in self._remaining_sending:
+                self._remaining_sending[rid] = self._world_size
+
+        for rid in all_recving_ids:
+            if rid not in self._remaining_recving:
+                self._remaining_recving[rid] = self._world_size
+
+        # Decrement counters based on each worker's report
+        for wo in worker_outputs:
+            if wo.finished_sending:
+                for rid in wo.finished_sending:
+                    if rid in self._remaining_sending:
+                        self._remaining_sending[rid] -= 1
+
+            if wo.finished_recving:
+                for rid in wo.finished_recving:
+                    if rid in self._remaining_recving:
+                        self._remaining_recving[rid] -= 1
+
+        # Harvest IDs whose counters have reached zero
+        done_sending = {
+            rid for rid, cnt in self._remaining_sending.items() if cnt <= 0
+        }
+        done_recving = {
+            rid for rid, cnt in self._remaining_recving.items() if cnt <= 0
+        }
+
+        # Clean up completed entries
+        for rid in done_sending:
+            del self._remaining_sending[rid]
+        for rid in done_recving:
+            del self._remaining_recving[rid]
+
+        return KVConnectorOutput(
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+        )
+
+    def reset(self) -> None:
+        """Clear all internal tracking state."""
+        self._remaining_sending.clear()
+        self._remaining_recving.clear()
+
+    @property
+    def pending_count(self) -> tuple[int, int]:
+        """Return ``(num_pending_sending, num_pending_recving)``."""
+        return len(self._remaining_sending), len(self._remaining_recving)

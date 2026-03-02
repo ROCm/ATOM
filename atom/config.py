@@ -598,6 +598,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
     kv_transfer_config: dict = field(default_factory=dict)
+
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.compilation_config.cudagraph_capture_sizes
@@ -655,19 +656,19 @@ class Config:
             if getattr(self.hf_config, "dtype", None) is not None
             else torch.bfloat16
         )
-        
-        
-        if hasattr(self, 'kv_transfer_config') and isinstance(self.kv_transfer_config, str):  
-            import json  
-            try:  
-                # 尝试 JSON 解析  
-                self.kv_transfer_config = json.loads(self.kv_transfer_config)  
-            except json.JSONDecodeError:  
-                # 如果不是 JSON，尝试 ast.literal_eval  
-                import ast  
-                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)  
-        
-        
+
+        if hasattr(self, "kv_transfer_config") and isinstance(
+            self.kv_transfer_config, str
+        ):
+            import json
+
+            try:
+                self.kv_transfer_config = json.loads(self.kv_transfer_config)
+            except json.JSONDecodeError:
+                import ast
+
+                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+
 
         if self.speculative_config is not None:
             if self.speculative_config.num_speculative_tokens > 4:

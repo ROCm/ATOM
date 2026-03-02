@@ -2,19 +2,16 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from dataclasses import dataclass
-from typing import List, Optional
-import enum
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
 
 @dataclass
 class RequestOutput:
     """Output structure passed to stream callback."""
 
-    request_id: int  # Sequence ID
-    output_tokens: List[int]  # Newly generated tokens since last callback
-    finished: bool  # Whether the sequence is finished
-    finish_reason: Optional[str] = (
-        None  # Reason for finishing (eos, max_tokens, stop_sequence, etc.)
-    )
+    request_id: int
+    output_tokens: List[int]
+    finished: bool
+    finish_reason: Optional[str] = None
     kv_transfer_params_output: Optional[Dict[str, Any]] = None
 

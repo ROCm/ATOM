@@ -6,11 +6,10 @@ import math
 import os
 import time
 from typing import Any, Optional, Union
-import torch
 
-import torch.distributed as dist
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.profiler as torch_profiler
 import tqdm
 from aiter import destroy_dist_env, dtypes, init_dist_env
@@ -34,9 +33,9 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.disaggregation.kv_connector import kvconnector
-from atom.utils.forward_context import get_kvconnector
+from atom.disaggregation.kv_connector import KVConnector
 from atom.disaggregation.kvoutput_aggregator import KVConnectorOutput
+from atom.utils.forward_context import get_kvconnector
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -46,8 +45,6 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.selector import get_attn_backend
-
-logger = logging.getLogger("atom")
 
 logger = logging.getLogger("atom")
 
@@ -791,7 +788,7 @@ class ModelRunner:
         logger.info(
             f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens"
         )
-        #TODO , get connector
+        # TODO: initialize KV connector during warmup
         return True
 
     def warmup_model(self):
@@ -1330,13 +1327,13 @@ class ModelRunner:
             temperatures,
         )
 
-    def run_model(self, input_ids: torch.Tensor,batch=None):
+    def run_model(self, input_ids: torch.Tensor, batch=None):
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
-        
+
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             hidden_states = self.model(input_ids, positions)
         else:
@@ -1433,6 +1430,7 @@ class ModelRunner:
             num_rejected=prev_rejected_num,
             num_bonus=prev_bonus_num,
         )
+
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         input_ids, temperatures = self.prepare_model(batch)
@@ -1443,15 +1441,19 @@ class ModelRunner:
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
-        if  connector_meta_output is not None:
-            from atom.utils.forward_context import get_kvconnector
-            if get_kvconnector() is not None:
-                get_kvconnector().start_load_kv(connector_meta_output)
+        """Dispatch KV connector metadata to initiate async KV loading."""
+        if connector_meta_output is not None:
+            connector = get_kvconnector()
+            if connector is not None:
+                connector.start_load_kv(connector_meta_output)
+
     @torch.inference_mode()
-    def async_proc_aggregation(self):
-        done_sending, done_recving=get_kvconnector().get_finished()
-        kvoutput=KVConnectorOutput(finished_sending=done_sending,finished_recving=done_recving)
-        return kvoutput
+    def async_proc_aggregation(self) -> KVConnectorOutput:
+        """Collect finished send/recv status from the KV connector."""
+        done_sending, done_recving = get_kvconnector().get_finished()
+        return KVConnectorOutput(
+            finished_sending=done_sending, finished_recving=done_recving
+        )
 
     def propose_draft_token_ids(
         self,

@@ -356,46 +356,76 @@ def set_forward_context(
 def reset_forward_context() -> None:
     global _forward_context
     _forward_context = ForwardContext()
-import logging
-logger = logging.getLogger("atom")
 
-from atom.disaggregation.kv_connector import kvconnector
-_global_kvconnector: Optional[kvconnector] = None
-_global_kvconnector_scheduler = None
-def get_kvconnector(role="worker", config=None) -> kvconnector:
-    """从任何文件调用此函数获取全局kvconnector实例（惰性初始化）"""
-    if hasattr(config, 'kv_transfer_config') and config.kv_transfer_config:
-            
 
-        if role=="worker":
-            global _global_kvconnector
-            
-            
-            from aiter.dist.parallel_state import get_tp_group,get_dp_group
-            try :
-                tp_rank = get_tp_group().rank_in_group
-            except:
-                logger.warning("get_tp_group failed, maybe dist not initialized, return kvconnector as None")
-                return None
-            if _global_kvconnector is None:
-                _global_kvconnector = kvconnector(config)
-                logger.debug(f"Initializing global kvconnector at tp_rank {tp_rank}")
-                
-        elif role=="scheduler":
-            from atom.disaggregation.kv_connector import kvconnector_scheduler
-            _global_kvconnector_scheduler = kvconnector_scheduler(config)
-            logger.debug(f"Initializing global kvconnector_scheduler")
-            return _global_kvconnector_scheduler
-        
-        else:
-            raise ValueError(f"Unknown role {role} for kvconnector")
+# ---------------------------------------------------------------------------
+# KV Connector global instances (lazy initialization)
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger("atom")
+
+_global_kvconnector: Optional[Any] = None
+_global_kvconnector_scheduler: Optional[Any] = None
+
+
+def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> Any:
+    """Get or lazily initialize the global KV connector instance.
+
+    The connector is role-dependent:
+      - ``"worker"``: Returns a ``KVConnector`` (worker-side, per TP rank).
+      - ``"scheduler"``: Returns a ``KVConnectorScheduler`` (scheduler-side).
+
+    Args:
+        role: Either ``"worker"`` or ``"scheduler"``.
+        config: Engine config; required on first call to trigger initialization.
+
+    Returns:
+        The KV connector instance, or ``None`` if KV transfer is not configured.
+    """
+    global _global_kvconnector, _global_kvconnector_scheduler
+
+    if not (hasattr(config, "kv_transfer_config") and config.kv_transfer_config):
+        return _global_kvconnector
+
+    if role == "worker":
+        from aiter.dist.parallel_state import get_tp_group
+
+        try:
+            tp_rank = get_tp_group().rank_in_group
+        except Exception:
+            _logger.warning(
+                "get_tp_group() failed (dist not initialized?), returning None"
+            )
+            return None
+
+        if _global_kvconnector is None:
+            from atom.disaggregation.kv_connector import KVConnector
+
+            _global_kvconnector = KVConnector(config)
+            _logger.debug("Initialized global KVConnector at tp_rank %d", tp_rank)
+
+    elif role == "scheduler":
+        from atom.disaggregation.kv_connector import KVConnectorScheduler
+
+        _global_kvconnector_scheduler = KVConnectorScheduler(config)
+        _logger.debug("Initialized global KVConnectorScheduler")
+        return _global_kvconnector_scheduler
+
+    else:
+        raise ValueError(f"Unknown KV connector role: {role!r}")
 
     return _global_kvconnector
 
-def set_kv_cache_data(kv_cache_data: dict[int, KVCacheTensor], config=None) -> None:
+
+def set_kv_cache_data(
+    kv_cache_data: dict[int, KVCacheTensor], config: Optional[Config] = None
+) -> None:
+    """Register KV cache data globally and with the KV connector if enabled."""
     global _forward_kv_cache_context
-    if hasattr(config, 'kv_transfer_config') and config.kv_transfer_config:
-        kvconnector_instance = get_kvconnector(config=config)
-        kvconnector_instance.register_kv_caches(kv_cache_data)
-        
+
+    if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
+        connector = get_kvconnector(config=config)
+        if connector is not None:
+            connector.register_kv_caches(kv_cache_data)
+
     _forward_kv_cache_context.kv_cache_data = kv_cache_data
