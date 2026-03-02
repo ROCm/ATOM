@@ -853,9 +853,6 @@ def _causal_conv1d_update_kernel(
     stride_conv_state_dim: tl.constexpr,
     stride_conv_state_tok: tl.constexpr,
     stride_state_indices: tl.constexpr,
-    # stride_o_seq: tl.constexpr,
-    # stride_o_dim: tl.constexpr,
-    # stride_o_token: tl.constexpr,
     stride_q_seq: tl.constexpr,
     stride_q_token: tl.constexpr,
     stride_q_dim: tl.constexpr,
@@ -1182,16 +1179,6 @@ def _causal_conv1d_update_kernel(
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
 
-        # if idx_feats_start < k_start_point:
-        #     idx_feats_o = idx_feats
-        #     dim_limits = k_start_point
-        # elif idx_feats_start < v_start_point:
-        #     idx_feats_o = idx_feats - k_start_point
-        #     dim_limits = v_start_point
-        # else:
-        #     idx_feats_o = idx_feats - v_start_point
-        #     dim_limits = v_start_point + v_dim_size
-
         mask_1d = (idx_token < seqlen) & (
             idx_feats_o < dim_limits
         )  # token-index  # feature-index
@@ -1372,9 +1359,6 @@ def causal_conv1d_update(
         stride_istate_dim,
         stride_istate_token,
         stride_state_indices,
-        # stride_o_seq,
-        # stride_o_dim,
-        # stride_o_token,
         stride_q_seq,
         stride_q_token,
         stride_q_dim,

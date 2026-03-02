@@ -160,9 +160,6 @@ class GatedDetlaNet(nn.Module):
 
         if gdn_metadata is None:
             return core_attn_out
-        # assert isinstance(gdn_metadata, dict)
-        # gdn_metadata = gdn_metadata[self.prefix]
-        # assert isinstance(gdn_metadata, GDNAttentionMetadata)
 
         gdn_cache = fwd_ctx.kv_cache_data
         conv_state = gdn_cache[f"layer_{self.layer_num}"].k_cache
@@ -178,15 +175,9 @@ class GatedDetlaNet(nn.Module):
         non_spec_state_indices_tensor = (
             gdn_metadata.non_spec_state_indices_tensor
         )  # noqa: E501
-        # non_spec_state_indices_tensor = non_spec_state_indices_tensor + ((self.layer_num + 1) % 4 - 1)
 
         conv_state = conv_state.transpose(-1, -2)
 
-        # if self.prefix=="model.layers.0.linear_attn" and conv_state.device.index==0:
-        #     print(f"conv_state sum {conv_state.sum()}, ssm_state sum {ssm_state.sum()}", flush=True)
-        # self_kv_cache = self.kv_cache[fwd_ctx.virtual_engine]
-        # conv_state = self_kv_cache[0].transpose(-1, -2)
-        # ssm_state = self_kv_cache[1]
         num_actual_tokens = gdn_metadata.num_actual_tokens
         num_accepted_tokens = gdn_metadata.num_accepted_tokens
 
@@ -209,7 +200,7 @@ class GatedDetlaNet(nn.Module):
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
-        # print(f"with shape {mixed_qkv_non_spec.shape[0]}", flush=True)
+
         # # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
             query_spec, key_spec, value_spec = causal_conv1d_update(
@@ -319,8 +310,6 @@ class GatedDetlaNet(nn.Module):
 
         # 2.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
-            # print("ssm sstates: ", ssm_state.shape)
-            # print("non_spec_state_indices_tensor: ", non_spec_state_indices_tensor.shape, flush=True)
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
