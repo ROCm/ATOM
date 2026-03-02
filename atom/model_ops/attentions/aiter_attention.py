@@ -210,7 +210,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         num_blocks_per_seq = cdiv(context_lens, self.block_size)
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1] if len(kv_indptr) > 0 else 0
-        sum_blocks_before_converted = cdiv(num_blocks_per_seq, self.block_ratio).sum()
 
         var["kv_indptr"].np[0] = 0
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
