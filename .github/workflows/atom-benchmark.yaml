@@ -146,6 +146,18 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+              echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
       - name: Run benchmark
         timeout-minutes: 30
         run: |
@@ -265,6 +277,18 @@ jobs:
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+              echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
 
       - name: Run benchmark
         timeout-minutes: 30
