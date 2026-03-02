@@ -149,12 +149,85 @@ class TestCanAppend:
         seq.append_token(5)
         assert not bm.can_append(seq)
 
+    def test_at_block_boundary_needs_block(self, seq_factory):
+        """seq_len=4, block_size=4 → at boundary, 1 new token needs 1 new block."""
+        cfg = MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4])
+        bm.allocate(seq)
+        assert bm.can_append(seq, num_new_tokens=1)
+
+    def test_at_block_boundary_no_free(self, seq_factory):
+        """seq_len=4, block_size=4, 0 free blocks → cannot append."""
+        cfg = MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4])
+        bm.allocate(seq)
+        assert not bm.can_append(seq, num_new_tokens=1)
+
+    def test_multi_token_needs_two_blocks(self, seq_factory):
+        """seq_len=7, block_size=4, num_new_tokens=4 → total 11, needs 3 blocks,
+        2 allocated, need 1 more. With only 1 free block, should succeed."""
+        cfg = MockConfig(num_kvcache_blocks=3, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4, 5, 6, 7])
+        bm.allocate(seq)
+        assert len(seq.block_table) == 2
+        assert bm.can_append(seq, num_new_tokens=4)
+
+    def test_multi_token_not_enough_free(self, seq_factory):
+        """seq_len=5, block_size=4, num_new_tokens=4 → total 9, needs 3 blocks,
+        2 allocated, need 1 more. With 0 free blocks, should fail."""
+        cfg = MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4, 5])
+        bm.allocate(seq)
+        assert len(seq.block_table) == 2
+        assert not bm.can_append(seq, num_new_tokens=4)
+
+    def test_multi_token_enough_free(self, seq_factory):
+        """seq_len=7, block_size=4, num_new_tokens=4 → needs 1 more block.
+        With enough free blocks, should succeed."""
+        cfg = MockConfig(num_kvcache_blocks=10, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4, 5, 6, 7])
+        bm.allocate(seq)
+        assert bm.can_append(seq, num_new_tokens=4)
+
+    def test_multi_token_crosses_two_boundaries(self, seq_factory):
+        """seq_len=5, block_size=4, num_new_tokens=4 → total 9, needs 3 blocks,
+        but only 2 allocated. Need 1 more free block."""
+        cfg = MockConfig(num_kvcache_blocks=10, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4, 5])
+        bm.allocate(seq)
+        assert len(seq.block_table) == 2
+        assert bm.can_append(seq, num_new_tokens=4)
+
+    def test_multi_token_exact_fit(self, seq_factory):
+        """seq_len=4, block_size=4, num_new_tokens=4 → total 8, needs 2 blocks.
+        With exactly 1 free block, should succeed."""
+        cfg = MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4])
+        bm.allocate(seq)
+        assert bm.can_append(seq, num_new_tokens=4)
+
+    def test_multi_token_one_short(self, seq_factory):
+        """seq_len=4, block_size=4, num_new_tokens=5 → total 9, needs 3 blocks.
+        With only 1 free block, should fail."""
+        cfg = MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4])
+        bm.allocate(seq)
+        assert not bm.can_append(seq, num_new_tokens=5)
+
 
 class TestMayAppend:
     def test_no_new_block_within_boundary(self, block_manager, seq_factory):
-        seq = seq_factory([1, 2, 3])
+        seq = seq_factory([1, 2])
         block_manager.allocate(seq)
-        seq.append_token(4)
+        seq.append_token(3)
         block_manager.may_append(seq)
         assert len(seq.block_table) == 1
 
@@ -166,10 +239,128 @@ class TestMayAppend:
         assert len(seq.block_table) == 2
 
     def test_block_size_1(self, seq_factory):
+        """block_size=1: seq=[1,2] → 2 blocks. append(3) → seq_len=3.
+        may_append(num_new_tokens=1) → needs ceil((3+1)/1) = 4 blocks."""
         cfg = MockConfig(num_kvcache_blocks=10, kv_cache_block_size=1)
         bm = BlockManager(cfg)
         seq = seq_factory([1, 2], block_size=1)
         bm.allocate(seq)
         seq.append_token(3)
         bm.may_append(seq)
+        assert len(seq.block_table) == 4
+
+    def test_multi_token_allocates_enough_blocks(self, seq_factory):
+        """seq_len=5, block_size=4, num_new_tokens=4 → total 9, needs 3 blocks."""
+        cfg = MockConfig(num_kvcache_blocks=10, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4, 5])
+        bm.allocate(seq)
+        assert len(seq.block_table) == 2
+        bm.may_append(seq, num_new_tokens=4)
         assert len(seq.block_table) == 3
+
+    def test_multi_token_at_boundary(self, seq_factory):
+        """seq_len=4, block_size=4, num_new_tokens=4 → total 8, needs 2 blocks."""
+        cfg = MockConfig(num_kvcache_blocks=10, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4])
+        bm.allocate(seq)
+        assert len(seq.block_table) == 1
+        bm.may_append(seq, num_new_tokens=4)
+        assert len(seq.block_table) == 2
+
+    def test_multi_token_crosses_two_boundaries(self, seq_factory):
+        """seq_len=4, block_size=4, num_new_tokens=5 → total 9, needs 3 blocks."""
+        cfg = MockConfig(num_kvcache_blocks=10, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3, 4])
+        bm.allocate(seq)
+        assert len(seq.block_table) == 1
+        bm.may_append(seq, num_new_tokens=5)
+        assert len(seq.block_table) == 3
+
+    def test_hash_registered_at_boundary(self, seq_factory):
+        """When seq fills a block exactly, may_append should register its hash."""
+        cfg = MockConfig(
+            num_kvcache_blocks=10, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3])
+        bm.allocate(seq)
+        seq.append_token(4)
+        bm.may_append(seq, num_new_tokens=1)
+        last_block = bm.blocks[seq.block_table[0]]
+        assert last_block.hash != -1
+        assert last_block.hash in bm.hash_to_block_id
+
+    def test_block_size_1_multi_token(self, seq_factory):
+        """block_size=1: seq=[1,2] → 2 blocks. append(3) → seq_len=3.
+        may_append(num_new_tokens=3) → needs ceil((3+3)/1) = 6 blocks."""
+        cfg = MockConfig(num_kvcache_blocks=10, kv_cache_block_size=1)
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2], block_size=1)
+        bm.allocate(seq)
+        assert len(seq.block_table) == 2
+        seq.append_token(3)
+        bm.may_append(seq, num_new_tokens=3)
+        assert len(seq.block_table) == 6
+
+
+# ── Prefix caching during decode ──────────────────────────────────────────
+
+
+class TestPrefixCachingDecode:
+    def test_hash_registered_during_decode(self, seq_factory):
+        """Block completed during decode should register its hash for reuse."""
+        cfg = MockConfig(
+            num_kvcache_blocks=10, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        bm = BlockManager(cfg)
+        seq = seq_factory([1, 2, 3])
+        bm.allocate(seq)
+        seq.append_token(4)
+        bm.may_append(seq, num_new_tokens=1)
+
+        block = bm.blocks[seq.block_table[0]]
+        expected_hash = BlockManager.compute_hash([1, 2, 3, 4])
+        assert block.hash == expected_hash
+        assert bm.hash_to_block_id[expected_hash] == block.block_id
+
+    def test_decode_block_reused_by_new_sequence(self, seq_factory):
+        """A block completed and hashed during decode should be a cache hit
+        for a new sequence with the same prefix."""
+        cfg = MockConfig(
+            num_kvcache_blocks=10, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        bm = BlockManager(cfg)
+
+        s1 = seq_factory([1, 2, 3])
+        bm.allocate(s1)
+        s1.append_token(4)
+        bm.may_append(s1, num_new_tokens=1)
+        bm.deallocate(s1)
+
+        s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        bm.allocate(s2)
+        assert s2.num_cached_tokens == 4
+
+    def test_multi_step_decode_builds_prefix(self, seq_factory):
+        """Simulate multiple decode steps filling blocks, then verify
+        a new sequence gets cache hits on the completed blocks."""
+        cfg = MockConfig(
+            num_kvcache_blocks=10, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        bm = BlockManager(cfg)
+
+        seq = seq_factory([1, 2, 3, 4])
+        bm.allocate(seq)
+
+        for tok in [5, 6, 7, 8]:
+            seq.append_token(tok)
+            bm.may_append(seq, num_new_tokens=1)
+
+        bm.deallocate(seq)
+
+        s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        bm.allocate(s2)
+        assert s2.num_cached_tokens == 8

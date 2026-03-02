@@ -218,7 +218,10 @@ class TestPostprocess:
 
     def _output(self, seq_id, tokens):
         return ScheduledBatchOutput(
-            token_ids={seq_id: tuple(tokens)}, draft_token_ids=None
+            token_ids={seq_id: tuple(tokens)},
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
         )
 
     def test_appends_token(self, scheduler, seq_factory):
@@ -263,7 +266,12 @@ class TestPostprocess:
         sched.schedule()
         finished = sched.postprocess(
             list(sched.running),
-            ScheduledBatchOutput(token_ids={seq.id: (99,)}, draft_token_ids=None),
+            ScheduledBatchOutput(
+                token_ids={seq.id: (99,)},
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
         )
         assert len(finished) == 1
         assert "stop_99" in finished[0].leave_reason
