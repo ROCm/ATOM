@@ -18,21 +18,19 @@ disable_vllm_plugin_attention = (
 
 if not disable_vllm_plugin:
     from vllm.platforms.rocm import RocmPlatform
+
+    class ATOMPlatform(RocmPlatform):
+        # For multi-modality models, to make AiterBackend supported by ViT,
+        # get_supported_vit_attn_backends may need to be overridden here
+        @classmethod
+        def get_attn_backend_cls(cls, selected_backend, attn_selector_config) -> str:
+            if disable_vllm_plugin_attention:
+                logger.info("Fallback to original vLLM attention backend")
+                return super().get_attn_backend_cls(
+                    selected_backend, attn_selector_config
+                )
+
+            logger.info("Use atom attention backend")
+            return "atom.model_ops.attentions.aiter_attention.AiterBackend"
 else:
-    # Keep the module importable even when vLLM isn't available / plugin disabled.
-    RocmPlatform = object  # type: ignore[assignment]
-
-
-class ATOMPlatform(RocmPlatform):
-    # For multi-modality models, to make AiterBackend supported by ViT,
-    # get_supported_vit_attn_backends may need to be overridden.
-    @classmethod
-    def get_attn_backend_cls(cls, selected_backend, attn_selector_config) -> str:
-        # Fall back to original behavior of vLLM mainline.
-        if disable_vllm_plugin_attention:
-            logger.info("Fallback to original vLLM attention backend")
-            return super().get_attn_backend_cls(selected_backend, attn_selector_config)
-
-        # Return ATOM attention backend.
-        logger.info("Use atom attention backend")
-        return "atom.model_ops.attentions.aiter_attention.AiterBackend"
+    ATOMPlatform = None

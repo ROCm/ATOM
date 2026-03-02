@@ -285,9 +285,7 @@ class PagedAttentionImplPluginModeMethods:
             q, k, v = qkv.split(
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
-        # elif use_triton_attn and self.rotary_emb is not None:
-        elif 0:
-            # FIXME: this should be fixed by moving rope outside of attention
+        elif use_triton_attn and self.rotary_emb is not None:
             k_scale = v_scale = self.kv_scale
 
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
@@ -668,6 +666,8 @@ class PagedAttentionImplPluginModeMethods:
 
         # when using this optimization, the qkv tensor and
         # position tensor are passed through q,k,v
+        # when not using this optimization, the position is not
+        # needed as the ROPE has been calculated outside of attention
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             assert (
                 position is None
@@ -679,11 +679,6 @@ class PagedAttentionImplPluginModeMethods:
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
             query, key, value = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
-        else:
-            # the position is computed by ATOM, and contained in attention metadata
-            # when dummy run, the attn metadata is None
-            if attn_metadata is not None:
-                position = attn_metadata.plugin_metadata.context.positions
 
         query = query.view(-1, self.num_heads, self.head_dim)
         key = key.view(-1, self.num_kv_heads, self.head_dim)
@@ -836,8 +831,8 @@ class PagedAttentionImplPluginModeMethods:
             if self.use_triton_attn:
                 self.paged_attention_triton_plugin_mode(
                     q=query[:num_decode_tokens],
-                    k=new_key_cache,
-                    v=new_value_cache,
+                    k_cache=new_key_cache,
+                    v_cache=new_value_cache,
                     k_scale=k_scale,
                     v_scale=v_scale,
                     out=output_actual_tokens[:num_decode_tokens],

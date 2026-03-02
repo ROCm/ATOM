@@ -37,20 +37,19 @@ def _set_framework_backbone(framework: str) -> None:
 
 def prepare_model(config: Any, engine: str):
     """
-    Prepare the model to upper framework, including
-    register custom ops and init aiter dist
+    Prepare the model to upper framework SGLang
     """
     logger.info(f"Prepare model for plugin mode, the upper engine is {engine}")
 
     _set_framework_backbone(engine)
 
-    # different engine passed different config
-    if is_vllm():
-        # FIXME: remove the legacy code here
-        # model_arch = config.model_config.architectures[0]
-        raise NotImplementedError("VLLM will not be supported for now")
-    elif is_sglang():
+    if is_sglang():
         model_arch = config.architectures[0]
+    else:
+        raise ValueError(
+            f"prepare_model does not support engine {engine!r} "
+            f"with config type {type(config)}"
+        )
 
     # import here to avoid partial initialization
     from .register import (
@@ -75,10 +74,7 @@ def prepare_model(config: Any, engine: str):
     model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
     logger.info(f"ATOM model class for {model_arch} is {model_cls}")
 
-    if is_vllm():
-        # register_ops_to_vllm(atom_config=atom_config)
-        raise NotImplementedError("VLLM will not be supported for now")
-    elif is_sglang():
+    if is_sglang():
         register_ops_to_sglang(atom_config=atom_config)
 
     set_attn_cls()

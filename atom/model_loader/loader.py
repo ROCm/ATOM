@@ -283,4 +283,5 @@ def load_model(
             quant_method.init_prepare_finalize(module)
 
     if is_plugin_mode:
+        print('[zejun] return loaded_weights_record = \n', loaded_weights_record, flush=True)
         return loaded_weights_record

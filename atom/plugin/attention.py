@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Generic, Optional
 import logging
 
 from dataclasses import dataclass
@@ -229,7 +229,14 @@ def create_attn_metadata_builder_init_method(base_class):
         layers = get_layers_from_vllm_config(config, Attention)
         for layer in layers.values():
             assert isinstance(layer.impl, PagedAttentionImpl)
-            sliding_window_sizes.add((layer.impl.sliding_window - 1, 0))
+            sliding_window = layer.impl.sliding_window
+            print('[zejun] layer.impl.sliding_window = ', sliding_window, flush=True)
+            if sliding_window is None or sliding_window == -1:
+                sliding_window_sizes.add(None)
+            elif isinstance(sliding_window, tuple):
+                sliding_window_sizes.add(sliding_window)
+            else:
+                sliding_window_sizes.add((sliding_window - 1, 0))
 
         while len(sliding_window_sizes) > 0:
             sliding_window_config = sliding_window_sizes.pop()
@@ -580,8 +587,15 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
         new_class = type(cls.__name__, (base_class,), class_dict)
 
         # replace the inherit base class for plugin mode, meanwhile support generic base class
-        if needs_generic and generic_base is not None:
-            new_class.__orig_bases__ = (generic_base[new_class],)
+        is_generic_builder_base = (
+            isinstance(generic_base, type)
+            and issubclass(generic_base, Generic)
+            and len(getattr(generic_base, "__parameters__", ())) > 0
+        )
+        if needs_generic and is_generic_builder_base:
+            new_class.__orig_bases__ = (generic_base[AttentionMetaData],)
+        else:
+            new_class.__orig_bases__ = (generic_base,)
 
         return new_class
 
