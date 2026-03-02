@@ -33,7 +33,7 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.disaggregation.kv_connector import KVConnector
+from atom.disaggregation.kv_transfer_engine import KVConnector
 from atom.disaggregation.kvoutput_aggregator import KVConnectorOutput
 from atom.utils.forward_context import get_kvconnector
 from atom.utils.forward_context import (

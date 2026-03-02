@@ -400,13 +400,13 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
             return None
 
         if _global_kvconnector is None:
-            from atom.disaggregation.kv_connector import KVConnector
+            from atom.disaggregation.kv_transfer_engine import KVConnector
 
             _global_kvconnector = KVConnector(config)
             _logger.debug("Initialized global KVConnector at tp_rank %d", tp_rank)
 
     elif role == "scheduler":
-        from atom.disaggregation.kv_connector import KVConnectorScheduler
+        from atom.disaggregation.kv_transfer_engine import KVConnectorScheduler
 
         _global_kvconnector_scheduler = KVConnectorScheduler(config)
         _logger.debug("Initialized global KVConnectorScheduler")

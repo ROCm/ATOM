@@ -25,7 +25,7 @@ from typing import Optional
 import numpy as np
 
 from atom.config import Config
-from atom.disaggregation.kv_connector import KVConnectorOutput
+from atom.disaggregation.kv_transfer_engine import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
