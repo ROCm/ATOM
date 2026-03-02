@@ -1372,7 +1372,8 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            hidden_states = self.model(input_ids, positions)
+            with record_function(f"prefill"):
+                hidden_states = self.model(input_ids, positions)
         else:
             with record_function(f"decode_step_bs_{bs}"):
                 graph_bs = context.graph_bs

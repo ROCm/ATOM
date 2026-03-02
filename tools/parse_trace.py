@@ -3,7 +3,7 @@
 Parse PyTorch profiler trace JSON to extract kernel information.
 
 Usage:
-    python parse_trace.py <trace.json> [output.csv]
+    python parse_trace.py <trace.json> [--layer N]
 """
 
 import csv
@@ -11,6 +11,7 @@ import json
 import gzip
 import sys
 import bisect
+import argparse
 from typing import List, Dict, Any, Tuple, Optional
 
 # Modules to filter out (no corresponding GPU kernel in decode)
@@ -199,187 +200,264 @@ def has_kernel_launch(event: Dict, events: List[Dict]) -> bool:
 # Parse Functions
 # =============================================================================
 
-def parse_prefill(events: List[Dict], output_csv: str) -> None:
+def parse_prefill(events: List[Dict], output_csv: str, target_layer: int = 3) -> None:
     """
-    Parse prefill phase: find kernel launch modules between capture_graph end
-    and the first decode_step.
+    Parse prefill phase: find the actual prefill event on CPU trace (user_annotation).
+
+    Warmup rule:
+    - If only one prefill exists, it is the actual prefill (no warmup).
+    - If >=2 prefills exist:
+      - If there is a decode_step_bs* event between prefill[0] and prefill[1], prefill[0]
+        is treated as warmup and prefill[1] is the actual prefill.
+      - Otherwise, prefill[0] is the actual prefill.
     """
-    # Find capture_graph end time (use prefix match for capture_graph_bs_X)
-    capture_graphs = find_events(events, 'capture_graph', prefix=True)
-    if not capture_graphs:
-        print("No capture_graph events found.")
-        return
-    
-    # Use the LAST capture_graph (latest end time)
-    cg = max(capture_graphs, key=lambda e: e['ts'] + e.get('dur', 0))
-    cg_end_ts = cg['ts'] + cg.get('dur', 0)
-    print(f"Last capture_graph ({cg.get('name')}) ends at: {cg_end_ts}")
-    
-    # Find all CompiledFxGraph events after capture_graph, before first decode_step
-    decode_steps = find_events(events, 'decode_step', prefix=True)
-    decode_start = decode_steps[0]['ts'] if decode_steps else float('inf')
-    
-    compiled_fx = [
+    # CPU side prefill/decode annotations
+    prefills = [
         e for e in events
-        if 'CompiledFxGraph' in e.get('name', '') and e.get('ph') == 'X'
-        and e['ts'] >= cg_end_ts and e['ts'] < decode_start
+        if e.get('name') == 'prefill'
+        and e.get('ph') == 'X'
+        and e.get('cat') == 'user_annotation'
     ]
-    compiled_fx = sorted(compiled_fx, key=lambda x: x['ts'])
-    
-    if not compiled_fx:
-        print("No CompiledFxGraph events found in prefill range.")
+    prefills = sorted(prefills, key=lambda x: x['ts'])
+
+    if not prefills:
+        print("No prefill (user_annotation) events found.")
+        with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['cpu_module', 'gpu_kernel', 'duration_us'])
         return
-    
-    # Use first decode_step as prefill end
-    prefill_start = cg_end_ts
-    prefill_end = decode_start
-    
-    print(f"Prefill phase: {prefill_start} ~ {prefill_end}")
-    print(f"CompiledFxGraph count: {len(compiled_fx)}")
-    
-    # Pre-filter events to prefill time range only (for speed)
-    prefill_events = [
+
+    actual_prefill_idx = 0
+    warmup_detected = False
+
+    # Only evaluate warmup when there are at least two prefills.
+    if len(prefills) >= 2:
+        first = prefills[0]
+        second = prefills[1]
+        gap_start = first['ts'] + first.get('dur', 0)
+        gap_end = second['ts']
+
+        # If decode_step_bs appears in [gap_start, gap_end], first prefill is warmup.
+        has_decode_between = any(
+            e.get('ph') == 'X'
+            and e.get('cat') == 'user_annotation'
+            and e.get('name', '').startswith('decode_step_bs')
+            and gap_start <= e.get('ts', 0) <= gap_end
+            for e in events
+        )
+        if has_decode_between:
+            actual_prefill_idx = 1
+            warmup_detected = True
+
+    actual_prefill = prefills[actual_prefill_idx]
+    print(f"Found {len(prefills)} prefill events (user_annotation)")
+    if warmup_detected:
+        print("Warmup detected: decode_step_bs found between prefill[0] and prefill[1]")
+    else:
+        print("No warmup prefill detected by rule, using prefill[0]")
+    print(
+        f"Using prefill[{actual_prefill_idx}] "
+        f"(ts={actual_prefill.get('ts', 0):.0f}, dur={actual_prefill.get('dur', 0):.0f})"
+    )
+
+    # Build prefill hierarchy on the same thread as the selected CPU prefill.
+    # Using thread affinity is more robust than category-only filtering.
+    prefill_tid = actual_prefill.get('tid')
+    prefill_pid = actual_prefill.get('pid')
+    prefill_hierarchy_events = [
         e for e in events
         if e.get('ph') == 'X'
-        and e['ts'] >= prefill_start
-        and e['ts'] < prefill_end
+        and e.get('tid') == prefill_tid
+        and e.get('pid') == prefill_pid
     ]
-    print(f"Events in prefill range: {len(prefill_events)}")
-    
-    # Find kernel launches in prefill range
-    kernel_launches = [
-        e for e in prefill_events
-        if is_kernel_launch(e.get('name', ''))
-    ]
-    print(f"Kernel launches in prefill: {len(kernel_launches)}")
-    
-    # For each CompiledFxGraph, find direct children with kernel launches
-    # Format: (timestamp, name, kernel_names)
-    kernel_modules = []
-    for cfg in compiled_fx:
-        cfg_ts, cfg_dur = cfg['ts'], cfg.get('dur', 0)
-        
-        # Find events within this cfg (use pre-filtered list)
-        cfg_events = [
-            e for e in prefill_events
-            if is_within(e['ts'], e.get('dur', 0), cfg_ts, cfg_dur)
+    # Build index once for fast subtree queries in prefill parsing.
+    prefill_idx = EventIndex(prefill_hierarchy_events)
+    level1_children = prefill_idx.get_direct_children(actual_prefill)
+    print(
+        f"Prefill level 1 (same thread pid={prefill_pid}, tid={prefill_tid}): "
+        f"{len(level1_children)} nodes"
+    )
+    print("First 20 level 1 nodes:")
+    for i, child in enumerate(level1_children[:20]):
+        print(
+            f"  [{i:02d}] {child.get('name', '<unknown>')} "
+            f"(ts={child.get('ts', 0):.0f}, dur={child.get('dur', 0):.0f})"
+        )
+
+    # Keep only level2 children that have kernel launch in their subtree.
+    launch_level2_items = []
+    for l1 in level1_children:
+        l1_name = l1.get('name', '<unknown>')
+        level2_children = prefill_idx.get_direct_children(l1)
+        level2_with_launch = [
+            l2 for l2 in level2_children
+            if prefill_idx.has_kernel_launch(l2)
         ]
-        
-        # Count kernel launches in this cfg
-        cfg_kernel_count = sum(1 for e in cfg_events if is_kernel_launch(e.get('name', '')))
-        if cfg_kernel_count == 0:
-            continue
-        
-        # Find direct children of cfg
-        direct = []
-        for e in cfg_events:
-            if e is cfg:
-                continue
-            e_ts, e_dur = e['ts'], e.get('dur', 0)
-            # Check if nested inside another cfg_event
-            is_direct = not any(
-                is_within(e_ts, e_dur, o['ts'], o.get('dur', 0))
-                for o in cfg_events if o is not e and o is not cfg
-            )
-            if is_direct:
-                direct.append(e)
-        
-        # Filter to those with kernel launches in subtree
-        for child in direct:
-            child_name = child.get('name', '')
-            # Skip GPU kernels (cat='kernel'), kernel launches, CompiledFxGraph, and filtered modules
-            if child.get('cat') == 'kernel':
-                continue
-            if is_kernel_launch(child_name):
-                continue
-            if 'CompiledFxGraph' in child_name:
-                continue
-            if should_filter(child_name) or should_filter_prefill(child_name):
-                continue
-            
-            # Count kernel launches in child's subtree
-            c_ts, c_dur = child['ts'], child.get('dur', 0)
-            kernel_count = sum(
-                1 for e in cfg_events
-                if is_kernel_launch(e.get('name', '')) and is_within(e['ts'], e.get('dur', 0), c_ts, c_dur)
-            )
-            
-            if kernel_count > 0:
-                kernel_modules.append((child['ts'], child_name, kernel_count))
-    
-    # Also find modules parallel to CompiledFxGraph (e.g., unified_attention_with_output_base)
-    # These are top-level modules with kernel launches that are NOT inside any CompiledFxGraph
-    PARALLEL_MODULE_PATTERNS = ['unified_attention', 'attention_base']
-    
-    for e in prefill_events:
-        e_name = e.get('name', '')
-        # Only process modules matching specific patterns
-        if not any(p in e_name.lower() for p in PARALLEL_MODULE_PATTERNS):
-            continue
-        if e.get('cat') == 'kernel':
-            continue
-        if is_kernel_launch(e_name):
-            continue
-        
-        # Check if inside any CompiledFxGraph
-        e_ts, e_dur = e['ts'], e.get('dur', 0)
-        inside_cfg = any(
-            is_within(e_ts, e_dur, cfg['ts'], cfg.get('dur', 0))
-            for cfg in compiled_fx
+        for l2 in level2_with_launch:
+            launch_level2_items.append({
+                'level1_name': l1_name,
+                'level2_event': l2,
+            })
+
+    print(f"Level2 children with kernel launch: {len(launch_level2_items)}")
+    print("First 20 level2 (with kernel launch):")
+    for i, item in enumerate(launch_level2_items[:20]):
+        l2 = item['level2_event']
+        print(
+            f"  [{i:02d}] L1={item['level1_name']} | "
+            f"L2={l2.get('name', '<unknown>')} | "
+            f"cat={l2.get('cat', '')} | dur={l2.get('dur', 0):.0f}"
         )
-        if inside_cfg:
-            continue
-        
-        # Count kernel launches in this event's subtree
-        kernel_count = sum(
-            1 for kl in prefill_events
-            if is_kernel_launch(kl.get('name', '')) and is_within(kl['ts'], kl.get('dur', 0), e_ts, e_dur)
-        )
-        
-        if kernel_count > 0:
-            kernel_modules.append((e_ts, e_name, kernel_count))
-    
-    # Sort by timestamp
-    kernel_modules = sorted(kernel_modules, key=lambda x: x[0])
-    
-    # Get GPU kernels in prefill range, sorted by time
-    gpu_kernels = [
-        e for e in events
-        if e.get('cat') == 'kernel' and prefill_start <= e['ts'] <= prefill_end
+
+    # Layer extraction by rmsnorm positions:
+    # each layer has 2 rmsnorm modules, layer N starts at rmsnorm index 2*N (0-based).
+    TARGET_LAYER = target_layer
+    norm_indices = [
+        i for i, item in enumerate(launch_level2_items)
+        if 'rmsnorm' in item['level2_event'].get('name', '').lower()
     ]
-    gpu_kernels = sorted(gpu_kernels, key=lambda x: x['ts'])
-    
-    # Build CSV rows
-    rows = []
-    gpu_idx = 0
-    last_mod_name = None
-    
-    for ts, mod_name, kernel_count in kernel_modules:
-        for i in range(kernel_count):
-            # Only show module name on first kernel AND if different from last module
-            if i == 0 and mod_name != last_mod_name:
-                display_name = mod_name
-                last_mod_name = mod_name
-            else:
-                display_name = ''
-            
-            # Get GPU kernel info
-            if gpu_idx < len(gpu_kernels):
-                gpu = gpu_kernels[gpu_idx]
-                rows.append([display_name, gpu.get('name', 'N/A'), gpu.get('dur', 0)])
-                gpu_idx += 1
-            else:
-                rows.append([display_name, 'N/A', 0])
-    
-    # Write CSV
+    print(f"Found {len(norm_indices)} rmsnorm modules in level2-with-launch rows")
+
+    layer_items = []
+    norm_start_idx = TARGET_LAYER * 2
+    norm_end_idx = (TARGET_LAYER + 1) * 2
+    if norm_start_idx >= len(norm_indices):
+        print(f"Not enough rmsnorm modules for layer {TARGET_LAYER}, writing empty CSV")
+    else:
+        mod_start = norm_indices[norm_start_idx]
+        mod_end = norm_indices[norm_end_idx] if norm_end_idx < len(norm_indices) else len(launch_level2_items)
+        layer_items = launch_level2_items[mod_start:mod_end]
+        print(
+            f"Layer {TARGET_LAYER} range by rmsnorm: "
+            f"rows [{mod_start}:{mod_end}) from rmsnorm #{norm_start_idx+1} to #{norm_end_idx+1}"
+        )
+        print(f"Layer {TARGET_LAYER} modules: {len(layer_items)}")
+
+    # Build launch->kernel mapping by correlation id.
+    # Build launch candidates from current prefill thread/range once.
+    runtime_launches = [
+        e for e in prefill_hierarchy_events
+        if e.get('cat') == 'cuda_runtime' and is_kernel_launch(e.get('name', ''))
+    ]
+    runtime_launches.sort(key=lambda x: x.get('ts', 0))
+    runtime_launch_ts = [e.get('ts', 0) for e in runtime_launches]
+
+    output_rows = []
+    level2_kernel_map: Dict[str, List[str]] = {}
+    corr_needed = set()
+    for item in layer_items:
+        l1_name = item['level1_name']
+        l2 = item['level2_event']
+        l2_start = l2.get('ts', 0)
+        l2_end = l2_start + l2.get('dur', 0)
+        l2_name = l2.get('name', '<unknown>')
+        l2_cat = l2.get('cat', '')
+        l2_dur = l2.get('dur', 0)
+
+        left = bisect.bisect_left(runtime_launch_ts, l2_start)
+        right = bisect.bisect_right(runtime_launch_ts, l2_end)
+        launches_in_l2 = runtime_launches[left:right]
+
+        if not launches_in_l2:
+            output_rows.append([
+                l1_name, l2_name, l2_cat, l2_dur,
+                'N/A', 0, '', 'N/A', 0
+            ])
+            continue
+
+        for launch in launches_in_l2:
+            launch_name = launch.get('name', 'N/A')
+            launch_dur = launch.get('dur', 0)
+            corr = (launch.get('args') or {}).get('correlation')
+            if corr is not None:
+                corr_needed.add(corr)
+            matched_kernels = []  # Fill after kernel index is built.
+            output_rows.append([
+                l1_name, l2_name, l2_cat, l2_dur,
+                launch_name, launch_dur, corr if corr is not None else '',
+                'PENDING', 0
+            ])
+
+    # Build kernel index only for correlations we actually need.
+    kernel_by_corr: Dict[Any, List[Dict]] = {}
+    if corr_needed:
+        for e in events:
+            if e.get('ph') != 'X' or e.get('cat') != 'kernel':
+                continue
+            corr = (e.get('args') or {}).get('correlation')
+            if corr is None or corr not in corr_needed:
+                continue
+            kernel_by_corr.setdefault(corr, []).append(e)
+        for corr in kernel_by_corr:
+            kernel_by_corr[corr].sort(key=lambda x: x.get('ts', 0))
+
+    # Expand pending launch rows into launch->kernel rows.
+    expanded_rows = []
+    for row in output_rows:
+        l1_name, l2_name, l2_cat, l2_dur, launch_name, launch_dur, corr, _, _ = row
+        corr_val = corr if corr != '' else None
+        matched_kernels = kernel_by_corr.get(corr_val, []) if corr_val is not None else []
+        if not matched_kernels:
+            expanded_rows.append([
+                l1_name, l2_name, l2_cat, l2_dur,
+                launch_name, launch_dur, corr, 'N/A', 0
+            ])
+            level2_kernel_map.setdefault(l2_name, [])
+            continue
+        for k in matched_kernels:
+            kernel_name = k.get('name', 'N/A')
+            expanded_rows.append([
+                l1_name, l2_name, l2_cat, l2_dur,
+                launch_name, launch_dur, corr, kernel_name, k.get('dur', 0)
+            ])
+            level2_kernel_map.setdefault(l2_name, []).append(kernel_name)
+    output_rows = expanded_rows
+
+    print(f"Layer {TARGET_LAYER} launch->kernel mapping rows: {len(output_rows)}")
+    print("First 20 mapping rows:")
+    for i, row in enumerate(output_rows[:20]):
+        print(
+            f"  [{i:02d}] L2={row[1]} | launch={row[4]} | "
+            f"corr={row[6]} | kernel={row[7]}"
+        )
+    print(f"Layer {TARGET_LAYER} level2 -> gpu operators:")
+    for level2_name, kernels in level2_kernel_map.items():
+        # Keep order while removing duplicates.
+        uniq = list(dict.fromkeys(kernels))
+        if not uniq:
+            print(f"  - {level2_name}: N/A")
+            continue
+        print(f"  - {level2_name}: {len(uniq)} operator(s)")
+        for kname in uniq:
+            print(f"      * {kname}")
+
+    # Convert to decode-style CSV rows with prefill filters.
+    # Output columns: cpu_module, gpu_kernel, duration_us
+    csv_rows = []
+    prev_module_key = None
+    for row in output_rows:
+        l1_name, l2_name, l2_cat, l2_dur = row[0], row[1], row[2], row[3]
+        gpu_kernel = row[7]
+        gpu_dur = row[8]
+
+        if should_filter_prefill(l2_name):
+            continue
+        if gpu_kernel in ('', 'N/A'):
+            continue
+
+        # Only merge display for consecutive rows from the same level2 instance.
+        module_key = (l1_name, l2_name, l2_cat, l2_dur)
+        show_module = clean_module_name(l2_name) if module_key != prev_module_key else ''
+        csv_rows.append([show_module, gpu_kernel, gpu_dur])
+        prev_module_key = module_key
+
+    print(f"Prefill decode-style CSV rows (after filters): {len(csv_rows)}")
+
+    # Write decode-style CSV for prefill.
     with open(output_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['cpu_module', 'gpu_kernel', 'duration_us'])
-        writer.writerows(rows)
-    
-    print(f"\nPrefill kernel launch modules: {len(kernel_modules)}")
-    print(f"GPU kernels used: {gpu_idx}/{len(gpu_kernels)}")
-    print(f"CSV written to: {output_csv} ({len(rows)} rows)")
+        writer.writerows(csv_rows)
 
 
 def clean_module_name(name: str) -> str:
@@ -469,7 +547,7 @@ def process_regular_module(
     return rows
 
 
-def parse_decode(events: List[Dict], output_csv: str) -> None:
+def parse_decode(events: List[Dict], output_csv: str, target_layer: int = 3) -> None:
     """
     Parse decode phase: map capture_graph modules to GPU kernels.
     
@@ -595,7 +673,7 @@ def parse_decode(events: List[Dict], output_csv: str) -> None:
     
     # Extract layer 3 (4th layer, 0-indexed)
     # Each layer has 2 norms, so layer N starts at norm index 2*N
-    TARGET_LAYER = 3
+    TARGET_LAYER = target_layer
     norm_start_idx = TARGET_LAYER * 2  # 6 (7th norm, 0-indexed)
     norm_end_idx = (TARGET_LAYER + 1) * 2  # 8 (9th norm, 0-indexed)
     
@@ -632,26 +710,32 @@ def parse_decode(events: List[Dict], output_csv: str) -> None:
 # =============================================================================
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
+    parser = argparse.ArgumentParser(description="Parse PyTorch profiler trace JSON to extract kernel information.")
+    parser.add_argument('filepath', help='Path to trace JSON or JSON.GZ file')
+    parser.add_argument('--layer', type=int, default=3, help='Target layer index (default: 3)')
+    args = parser.parse_args()
+
+    if args.layer < 0:
+        print("--layer must be >= 0")
         sys.exit(1)
-    
-    filepath = sys.argv[1]
+
+    filepath = args.filepath
+    target_layer = args.layer
     
     print(f"Loading: {filepath}")
     trace = load_trace(filepath)
     events = trace.get('traceEvents', [])
     print(f"Loaded {len(events)} events\n")
     
-    # print("=" * 60)
-    # print("PREFILL ANALYSIS")
-    # print("=" * 60)
-    # parse_prefill(events, 'prefill_breakdown.csv')
+    print("=" * 60)
+    print("PREFILL ANALYSIS")
+    print("=" * 60)
+    parse_prefill(events, 'prefill_breakdown.csv', target_layer=target_layer)
     
     print("\n" + "=" * 60)
     print("DECODE ANALYSIS")
     print("=" * 60)
-    parse_decode(events, 'decode_breakdown.csv')
+    parse_decode(events, 'decode_breakdown.csv', target_layer=target_layer)
 
 
 if __name__ == '__main__':
