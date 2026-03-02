@@ -159,7 +159,7 @@ jobs:
           fi
 
       - name: Run benchmark
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
@@ -169,13 +169,12 @@ jobs:
           else
             model_path="${{ env.MODEL_PATH }}"
           fi
+          # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
             .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
-          "
-          echo "========== Running benchmark test =========="
-          docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
-          ls -all .
+            echo '========== Running benchmark test =========='
+            RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ls -all .
           "
 
       - name: Upload benchmark result
@@ -291,7 +290,7 @@ jobs:
           fi
 
       - name: Run benchmark
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
@@ -301,13 +300,12 @@ jobs:
           else
             model_path="${{ env.MODEL_PATH }}"
           fi
+          # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
             .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
-          "
-          echo "========== Running benchmark test =========="
-          docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
-          ls -all .
+            echo '========== Running benchmark test =========='
+            RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ls -all .
           "
       
       - name: Upload benchmark result
