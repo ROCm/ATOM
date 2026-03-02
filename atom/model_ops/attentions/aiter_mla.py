@@ -303,7 +303,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
         ]
         num_blocks_per_seq=[]
-        for i, (ctx, is_first) in enumerate(zip(batch.context_lens, batch.is_first_decode_without_local_perfill)):
+        for i, (ctx, is_first) in enumerate(zip(batch.context_lens, batch.is_first_decode_without_local_prefill)):
             if is_first :
                 # 第一次解码：直接使用已分配的 block 数量
                 blocks = len(batch.block_tables[i])

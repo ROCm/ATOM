@@ -33,8 +33,11 @@ import msgpack
 import zmq
 from quart import Quart, make_response, request
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 prefill_instances: list[dict] = []
 decode_instances: list[dict] = []
