@@ -230,7 +230,7 @@ def create_attn_metadata_builder_init_method(base_class):
         for layer in layers.values():
             assert isinstance(layer.impl, PagedAttentionImpl)
             sliding_window = layer.impl.sliding_window
-            print('[zejun] layer.impl.sliding_window = ', sliding_window, flush=True)
+            print("[zejun] layer.impl.sliding_window = ", sliding_window, flush=True)
             if sliding_window is None or sliding_window == -1:
                 sliding_window_sizes.add(None)
             elif isinstance(sliding_window, tuple):

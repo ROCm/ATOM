@@ -32,5 +32,6 @@ if not disable_vllm_plugin:
 
             logger.info("Use atom attention backend")
             return "atom.model_ops.attentions.aiter_attention.AiterBackend"
+
 else:
     ATOMPlatform = None
