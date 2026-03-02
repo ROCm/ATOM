@@ -11,6 +11,7 @@ from atom.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
+    WAITING_FOR_REMOTE_KVS = auto()
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
@@ -40,6 +41,7 @@ class Sequence:
         stop_token_sequences: list[list[int]] = None,
         stream_callback: Optional[Callable[[Any], None]] = None,
         id=None,
+        kv_transfer_params: dict = None,
         num_draft_tokens: int = 0,
         mamba_enabled: bool = False,
     ):
@@ -62,7 +64,7 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
-
+        self.is_first_decode = False
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
@@ -75,6 +77,11 @@ class Sequence:
         self.first_token_time = 0.0
         self.leave_time = 0.0
         self.leave_reason = ""
+        
+        # kv_transfer params
+        self.kv_transfer_params = kv_transfer_params
+        self.kv_transfer_params_output = None
+
 
         # accepted tokens for spec decode
         self.num_bonus_tokens = 0

@@ -91,7 +91,7 @@ class CompletionRequest(BaseModel):
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
-
+    kv_transfer_params: Optional[Dict[str, Any]] = None
 
 class ChatCompletionResponse(BaseModel):
     """Response model for chat completions."""
@@ -115,6 +115,7 @@ class CompletionResponse(BaseModel):
     model: str
     choices: List[Dict[str, Any]]
     usage: Dict[str, Any]
+    kv_transfer_params: Optional[Dict[str, Any]] = None
 
 
 # ============================================================================
@@ -142,6 +143,7 @@ def create_chat_completion_chunk(
     content: str = "",
     finish_reason: Optional[str] = None,
     usage: Optional[Dict] = None,
+    **extra_fields, 
 ) -> str:
     """Create a chat completion chunk in SSE format.
 
@@ -169,6 +171,8 @@ def create_chat_completion_chunk(
             }
         ],
     }
+    chunk.update(extra_fields)  
+
     if usage is not None:
         chunk["usage"] = usage
     return f"data: {json.dumps(chunk)}\n\n"
@@ -329,6 +333,9 @@ def _send_stream_chunk_direct(
         "started_at": started_at,
     }
 
+    if hasattr(request_output, 'kv_transfer_params_output') and request_output.kv_transfer_params_output:  
+        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
+
     loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
 
 
@@ -364,7 +371,7 @@ def send_stream_chunk(request_output: RequestOutput) -> None:
 
 
 async def generate_async(
-    prompt: str, sampling_params: SamplingParams, request_id: str
+    prompt: str, sampling_params: SamplingParams, request_id: str, kv_transfer_params: Optional[Dict[str, Any]] = None
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests.
 
@@ -387,8 +394,11 @@ async def generate_async(
     all_token_ids: List[int] = []
     finish_reason: Optional[str] = None
     seq = None
-
+    kv_transfer_output_meta_info = None
     def completion_callback(request_output: RequestOutput):
+        nonlocal kv_transfer_output_meta_info
+        
+        kv_transfer_output_meta_info = request_output.kv_transfer_params_output
         """Callback that receives incremental tokens and completion signal."""
         now = time.time()
         loop.call_soon_threadsafe(
@@ -403,7 +413,7 @@ async def generate_async(
 
     def do_preprocess():
         return engine.io_processor.preprocess(
-            prompt, sampling_params, stream_callback=completion_callback
+            prompt, sampling_params, stream_callback=completion_callback, kv_transfer_params=kv_transfer_params
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -438,8 +448,11 @@ async def generate_async(
         and num_tokens_output > 1
         else 0.0
     )
-
-    yield {
+    
+    logger.debug(f"Request {seq.id} completed:")  
+    logger.debug(f"Generated Text: {text}")  
+    logger.debug(f"Finish reason: {finish_reason}")
+    response = {
         "text": text,
         "token_ids": all_token_ids,
         "finish_reason": finish_reason,
@@ -449,7 +462,13 @@ async def generate_async(
         "tpot": tpot,
         "latency": latency,
     }
+    if kv_transfer_output_meta_info is not None:
 
+        response['kv_transfer_output_meta_info'] = kv_transfer_output_meta_info
+    yield response
+
+    
+  
 
 def validate_model(requested_model: Optional[str]) -> None:
     """Validate that the requested model matches the server's model.
@@ -469,7 +488,7 @@ def validate_model(requested_model: Optional[str]) -> None:
 
 
 async def setup_streaming_request(
-    prompt: str, sampling_params: SamplingParams, request_id: str
+    prompt: str, sampling_params: SamplingParams, request_id: str,kv_transfer_params
 ) -> Tuple[int, asyncio.Queue]:
     """Set up a streaming request with the engine.
 
@@ -498,7 +517,7 @@ async def setup_streaming_request(
 
     def do_preprocess():
         seq = engine.io_processor.preprocess(
-            prompt, sampling_params, stream_callback=stream_callback
+            prompt, sampling_params, stream_callback=stream_callback,kv_transfer_params=kv_transfer_params
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -551,11 +570,16 @@ async def stream_chat_response(
 
         num_tokens_output += len(chunk_data.get("token_ids", []))
 
+        extra_fields={}
+        if "kv_transfer_params" in chunk_data:  
+            extra_fields["kv_transfer_params"] = chunk_data["kv_transfer_params"]  
+          
         yield create_chat_completion_chunk(
             request_id,
             model,
             new_text,
             finish_reason=chunk_data.get("finish_reason"),
+            **extra_fields,
         )
 
         if chunk_data.get("finished", False):
@@ -756,7 +780,7 @@ async def completions(request: CompletionRequest):
         # Handle streaming requests
         if request.stream:
             seq_id, stream_queue = await setup_streaming_request(
-                request.prompt, sampling_params, request_id
+                request.prompt, sampling_params, request_id, kv_transfer_params=request.kv_transfer_params
             )
 
             return StreamingResponse(
@@ -768,13 +792,13 @@ async def completions(request: CompletionRequest):
 
         # Handle non-streaming requests
         final_output = None
-        async for output in generate_async(request.prompt, sampling_params, request_id):
+        async for output in generate_async(request.prompt, sampling_params, request_id,kv_transfer_params=request.kv_transfer_params):
             final_output = output
 
         if final_output is None:
             raise RuntimeError("No output generated")
 
-        return CompletionResponse(
+        response_data= CompletionResponse(
             id=request_id,
             created=int(time.time()),
             model=model_name,
@@ -795,7 +819,12 @@ async def completions(request: CompletionRequest):
                 "latency_s": round(final_output.get("latency", 0.0), 4),
             },
         )
+        if "kv_transfer_output_meta_info" in final_output:  
+            response_data = response_data.model_copy(update={  
+                "kv_transfer_params": final_output["kv_transfer_output_meta_info"]  
+            })  
 
+        return response_data
     except ValueError as e:
         logger.error(f"Validation error in completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))

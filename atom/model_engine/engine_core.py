@@ -22,6 +22,8 @@ from atom.utils.distributed.utils import (
 
 logger = logging.getLogger("atom")
 
+from atom.disaggregation.kvoutput_aggregator import KVOutputAggregator
+
 
 class EngineCoreRequestType(enum.Enum):
     """
@@ -57,10 +59,6 @@ class EngineCore:
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
         )
         self.output_thread.start()
-        self.input_thread = threading.Thread(
-            target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        )
-        self.input_thread.start()
 
         self.profile_enbaled = config.torch_profiler_dir is not None
         init_exit_handler(self)
@@ -101,10 +99,12 @@ class EngineCore:
 
         # Start input thread AFTER model is loaded so the "ready" signal
         # is sent only when the engine is truly ready to accept requests
-        # self.input_thread = threading.Thread(
-        #     target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        # )
-        # self.input_thread.start()
+        self.input_thread = threading.Thread(
+            target=self.process_input_sockets, args=(self.input_address,), daemon=True
+        )
+        self.input_thread.start()
+        
+        self.kv_aggregator = KVOutputAggregator(world_size=config.tensor_parallel_size)
 
         # We can not start input thread here since dp need to sync with other ranks,
         # Otherwise, DP will hang always.
@@ -159,12 +159,33 @@ class EngineCore:
                 break
 
     def _process_engine_step(self):
-        if not self.scheduler.has_requests():
-            return False
         scheduled_batch, seqs = self.scheduler.schedule()
-        # if scheduled_batch is None:
-        #     return False
-        fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        
+        if scheduled_batch is None :
+            logger.debug(f"{self.label}: No sequences to schedule, skipping forward")
+            return False
+        
+        #----------
+        if scheduled_batch.connector_meta_output is not None:
+            logger.debug(f": Processing KV connector output")
+            self.runner_mgr.call_func("process_kvconnector_output",scheduled_batch.connector_meta_output )
+            logger.debug(f": Finished processing KV connector output")
+        if  not (scheduled_batch is None or len(scheduled_batch.req_ids)==0):
+
+            fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+            
+        kvoutput =self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        
+   
+        # finished_recving_req = self.kv_aggregator.aggregate_kv_output(kvoutput_all)
+        
+        
+        self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        if  scheduled_batch is None or len(scheduled_batch.req_ids)==0:
+            logger.debug(f"{self.label}: Empty scheduled batch, skipping processing")
+            return False
+        
+        # logger.info(f"{kv_finished_output=}")
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
@@ -194,7 +215,7 @@ class EngineCore:
                     return True
                 recv_reqs.append(seq)
         if len(recv_reqs) > 0:
-            logger.info(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
+            logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
         return False
 

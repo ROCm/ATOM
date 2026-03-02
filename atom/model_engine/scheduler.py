@@ -2,12 +2,15 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import math
 import time
 from collections import deque
 from typing import Optional
 
 import numpy as np
+
 from atom.config import Config
+from atom.disaggregation.kv_connector import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -117,6 +120,7 @@ class ScheduledBatch:
         total_seqs_num: int = 0,
         total_seqs_num_prefill: int = 0,
         total_seqs_num_decode: int = 0,
+        connector_meta_output=None,
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {},
@@ -147,9 +151,19 @@ class ScheduledBatch:
         self.mamba_block_tables = [
             seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table
         ]
+  
+            
+        self.is_first_decode_without_local_perfill = [
+            seq.is_first_decode 
+            for seq in seqs.values()
+        ]
+        self.temperatures = [seq.temperature for seq in seqs.values()]
+        self.context_lens = [seq.num_tokens for seq in seqs.values()]
 
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
+        # if len(self.scheduled_tokens)>=1 and len(self.scheduled_tokens[0])>=1 and  self.scheduled_tokens[0][0]==0:
+        #     c=0
         pos = 0
         for seq, num, offset in zip(seqs.values(), num_scheduled_tokens, offs):
             self.scheduled_tokens[pos : pos + num] = seq.token_ids[
@@ -178,6 +192,9 @@ class ScheduledBatch:
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
+        
+        self.connector_meta_output = connector_meta_output
+        self.finished_recving_kv_req_ids=[]
 
         self.is_dummy_run = is_dummy_run
 
@@ -224,6 +241,11 @@ class Scheduler:
         self.block_manager = BlockManager(config)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.config =  config
+        # Use a temporary deque to collect requests that need to be skipped
+        # and put back at the head of the waiting queue later
+        self.finished_recving_kv_req_ids=[]
+        self.deferred_free_blocks={}  # for read mode ,prefill defered to free blocks
         # Time at previous scheduling step
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
@@ -240,6 +262,9 @@ class Scheduler:
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
 
+        from atom.utils.forward_context import get_kvconnector
+        self.kv_connector = get_kvconnector("scheduler", config)
+
     def is_finished(self):
         return not self.waiting and not self.running
 
@@ -254,46 +279,92 @@ class Scheduler:
         scheduled_seqs = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
-
+        skipped_waiting_requests: deque[Sequence] = deque()
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, list[int]] = {}
 
         if not self.running and not self.waiting:
-            # self.block_manager.reset()
             return None
 
-        while (
-            (self.delay_factor <= 0 or self._passed_delay(time.time()))
-            and self.waiting
-            and num_seqs_prefill < self.max_num_seqs
-        ):
-            seq = self.waiting[0]
+        while self.waiting and num_seqs_prefill < self.max_num_seqs:
+            seq = self.waiting.popleft()  
+            
+            # KVTransfer: skip request if still waiting for remote kvs.
+            waiting_remote_to_waiting_ready=False
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                waiting_remote_to_waiting_ready = self._update_waiting_for_remote_kv(seq)
+                if waiting_remote_to_waiting_ready:
+                    seq.status = SequenceStatus.WAITING
+                else:
+                    # if wait remote kv not ready, skip this request for now
+                    skipped_waiting_requests.append(seq)
+                    continue
+            
+            need_to_remove_to_load_kv_async_queue = False
+            if self.kv_connector is not None and waiting_remote_to_waiting_ready is False:
+                    ext_tokens, need_to_remove_to_load_kv_async_queue = self.kv_connector.get_num_new_matched_tokens(seq)
+                    
+        # while (
+        #     (self.delay_factor <= 0 or self._passed_delay(time.time()))
+        #     and self.waiting
+        #     and num_seqs_prefill < self.max_num_seqs
+        # ):
+            # seq = self.waiting[0]
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
                 num_batched_tokens + num_new_tokens > self.max_num_batched_tokens
                 or not self.block_manager.can_allocate(seq)
-            ):
+            ):  
+                self.waiting.appendleft(seq)
                 break
+            
+            if not waiting_remote_to_waiting_ready:
+                self.block_manager.allocate(seq)
+                
+            if self.kv_connector is not None:
+                self.kv_connector.update_state_after_alloc(seq)
+                
+            if need_to_remove_to_load_kv_async_queue:
+                # If loading async, allocate memory and put request
+                # into the WAITING_FOR_REMOTE_KV state.
+                skipped_waiting_requests.append(seq)
+                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                continue
+
+            if waiting_remote_to_waiting_ready:
+                seq.status = SequenceStatus.RUNNING  
+                seq.is_first_decode=True                  
+                self.running.append(seq)
+                continue
+            
             num_seqs_prefill += 1
-            self.block_manager.allocate(seq)
             num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
-            self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs[seq.id] = seq
             num_scheduled_tokens.append(num_new_tokens)
+
+        
+        if skipped_waiting_requests:
+            logger.debug(f"Re-adding {len(skipped_waiting_requests)} skipped requests back to waiting queue.")
+            self.waiting.extend(skipped_waiting_requests)
 
         num_scheduled_tokens_np = num_scheduled_tokens
         total_tokens_num_prefill = sum(num_scheduled_tokens_np)
 
         if num_seqs_prefill > 0:
+
             logger.info(
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} token_nums: {num_scheduled_tokens}, req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True
             # lip: TODO for prefill/decode mixed batch
-            return (
+            
+            connector_meta_output=None
+            if self.kv_connector is not None:
+                connector_meta_output=self.kv_connector.build_connector_meta()
+            scheduled_batch_resut= (
                 ScheduledBatch(
                     seqs=scheduled_seqs,
                     num_scheduled_tokens=num_scheduled_tokens_np,
@@ -301,10 +372,13 @@ class Scheduler:
                     total_tokens_num_prefill=total_tokens_num_prefill,
                     total_seqs_num=num_seqs_prefill,
                     total_seqs_num_prefill=num_seqs_prefill,
+                    connector_meta_output=connector_meta_output,
+
                 ),
                 scheduled_seqs,
             )
-
+            return scheduled_batch_resut
+        
         # decode
         num_seqs_decode = 0
         while self.running and num_seqs_decode < self.max_num_seqs:
@@ -319,22 +393,32 @@ class Scheduler:
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
+          
+                if not getattr(seq, 'is_first_decode', False):
+                    #avoid reallocate block for 1025  with block_size=16. because 1025 prefill will allocate 1040 tokens.
+                    
+                    self.block_manager.may_append(seq)
+
                 num_new_tokens = self.mtp_k + 1
-                self.block_manager.may_append(seq, num_new_tokens)
+                # self.block_manager.may_append(seq, num_new_tokens)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
+                
+              
                 num_scheduled_tokens.append(num_new_tokens)
+                seq.is_first_decode=False
 
         num_scheduled_tokens_np = num_scheduled_tokens
         total_tokens_num_decode = sum(num_scheduled_tokens_np)
 
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs.values()))
-        # logger.info(
-        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, req_ids: {tuple(scheduled_seqs.keys())}"
-        # )
-        return (
-            ScheduledBatch(
+        if  scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs.values()))
+        connector_meta_output=None
+        if self.kv_connector is not None:
+            connector_meta_output=self.kv_connector.build_connector_meta()
+        
+        
+        tmp =  ScheduledBatch(
                 seqs=scheduled_seqs,
                 num_scheduled_tokens=num_scheduled_tokens_np,
                 total_tokens_num=total_tokens_num_decode,
@@ -342,9 +426,12 @@ class Scheduler:
                 total_seqs_num=num_seqs_prefill + num_seqs_decode,
                 total_seqs_num_prefill=num_seqs_prefill,
                 total_seqs_num_decode=num_seqs_decode,
+                connector_meta_output=connector_meta_output,
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            ),
+            )
+        return (
+            tmp,
             scheduled_seqs,
         )
 
@@ -382,6 +469,8 @@ class Scheduler:
             if self.spec_stats:
                 self.spec_stats.update(num_new_token)
             idx = fwd_output.req_ids.index(seq.id)
+            #TODO: deffered output has issue here
+            num_rejected = 0
             if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
                 num_bonus = fwd_output.num_bonus[idx]
@@ -435,8 +524,12 @@ class Scheduler:
                     leave_reason = f"stop_{first_stop_token}"
                 elif seq.num_completion_tokens >= seq.max_tokens:
                     leave_reason = "max_tokens"
+                    
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:
+                
+                if self.kv_connector is not None and leave_reason is not None:
+                    self.kv_connector.request_finished(seq)
                 output_tokens_list = (
                     list(new_tokens)
                     if isinstance(new_tokens, tuple)
@@ -446,8 +539,13 @@ class Scheduler:
                     request_id=seq.id,
                     output_tokens=output_tokens_list,
                     finished=(leave_reason is not None),
-                    finish_reason=leave_reason,
+                    finish_reason=leave_reason,  
+                    kv_transfer_params_output=getattr(seq, 'kv_transfer_params_output', None),  
                 )
+                
+                if request_output.kv_transfer_params_output is not None:
+                    logger.info("KV transfer output present in stream output.")
+                    
                 # Store sequence ID instead of sequence object to avoid pickling issues
                 stream_outputs.append((seq.id, request_output))
                 logger.debug(
@@ -477,9 +575,67 @@ class Scheduler:
                     #     f"{seq.id=}, added {num}, total tokens now: {seq.num_tokens}"
                     # )
         for seq in finished_seqs:
-            self.block_manager.deallocate(seq)
+            logger.debug(f"Scheduler: Freeing blocks for finished seq {seq.id}")
+            if self.kv_connector is not None:
+                if self.kv_connector.is_producer ==False:
+                    self.block_manager.deallocate(seq) # decode finished free block
+                else:
+                    logger.debug(f"Deferring block free for seq {seq.id} until after KV transfer send is finished.")
+                    self.deferred_free_blocks[seq.id]=seq
+            else:
+                self.block_manager.deallocate(seq)
+                 
             self.running.remove(seq)
         return finished_seqs
+    
+    def _update_waiting_for_remote_kv(self, seq:Sequence) -> bool:
+        """
+        P/D: check if the request_id is finished_recving.
+        The finished_recving_kv_req_ids list is populated
+        on the previous steps()'s update_from_output based
+        on the worker side connector.
+        When the kv transfer is ready, we cache the blocks
+        and the request state will be moved back to WAITING from
+        WAITING_FOR_REMOTE_KV.
+        """
+        if seq.id not in self.finished_recving_kv_req_ids:
+            return False
+
+        self.finished_recving_kv_req_ids.remove(seq.id)
+        logger.debug(f"Scheduler: KV transfer finished for seq {seq.id}, ready for scheduling.")
+        return True
+
+    
+    def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
+        """
+        KV Connector: update the scheduler state based on the output.
+
+        The Worker side connectors add finished_recving and
+        finished_sending reqs to the output.
+        * if finished_sending: free the blocks
+        * if finished_recving: add to state so we can
+            schedule the request during the next step.
+        """
+        if kv_connector_output is None:
+            return
+
+        # KV Connector: update recv and send status from last step.
+        for req_id in kv_connector_output.finished_recving or ():
+            assert self.kv_connector.is_producer==False, "only consumer need update recving kv"
+            logger.debug("Finished recving KV transfer for request %s", req_id)
+            self.finished_recving_kv_req_ids.append(req_id)
+        
+        for req_id in kv_connector_output.finished_sending or ():
+            assert self.kv_connector.is_producer==True, "only producer need free block after sending kv"
+            logger.debug(f"Finished sending KV transfer for request {req_id}")
+
+            assert req_id in self.deferred_free_blocks, f"{req_id=} not found in {self.deferred_free_blocks=}."
+            # if req_id not in self.deferred_free_blocks:
+            #     logger.info(f"{req_id=} not found in {self.deferred_free_blocks=}.")
+            #     continue
+            
+            self.block_manager.deallocate(self.deferred_free_blocks[req_id])
+            del self.deferred_free_blocks[req_id]
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

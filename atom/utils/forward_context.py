@@ -356,8 +356,46 @@ def set_forward_context(
 def reset_forward_context() -> None:
     global _forward_context
     _forward_context = ForwardContext()
+import logging
+logger = logging.getLogger("atom")
 
+from atom.disaggregation.kv_connector import kvconnector
+_global_kvconnector: Optional[kvconnector] = None
+_global_kvconnector_scheduler = None
+def get_kvconnector(role="worker", config=None) -> kvconnector:
+    """从任何文件调用此函数获取全局kvconnector实例（惰性初始化）"""
+    if hasattr(config, 'kv_transfer_config') and config.kv_transfer_config:
+            
 
-def set_kv_cache_data(kv_cache_data: dict[int, KVCacheTensor]) -> None:
+        if role=="worker":
+            global _global_kvconnector
+            
+            
+            from aiter.dist.parallel_state import get_tp_group,get_dp_group
+            try :
+                tp_rank = get_tp_group().rank_in_group
+            except:
+                logger.warning("get_tp_group failed, maybe dist not initialized, return kvconnector as None")
+                return None
+            if _global_kvconnector is None:
+                _global_kvconnector = kvconnector(config)
+                logger.debug(f"Initializing global kvconnector at tp_rank {tp_rank}")
+                
+        elif role=="scheduler":
+            from atom.disaggregation.kv_connector import kvconnector_scheduler
+            _global_kvconnector_scheduler = kvconnector_scheduler(config)
+            logger.debug(f"Initializing global kvconnector_scheduler")
+            return _global_kvconnector_scheduler
+        
+        else:
+            raise ValueError(f"Unknown role {role} for kvconnector")
+
+    return _global_kvconnector
+
+def set_kv_cache_data(kv_cache_data: dict[int, KVCacheTensor], config=None) -> None:
     global _forward_kv_cache_context
+    if hasattr(config, 'kv_transfer_config') and config.kv_transfer_config:
+        kvconnector_instance = get_kvconnector(config=config)
+        kvconnector_instance.register_kv_caches(kv_cache_data)
+        
     _forward_kv_cache_context.kv_cache_data = kv_cache_data

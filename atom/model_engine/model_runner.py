@@ -6,7 +6,9 @@ import math
 import os
 import time
 from typing import Any, Optional, Union
+import torch
 
+import torch.distributed as dist
 import numpy as np
 import torch
 import torch.profiler as torch_profiler
@@ -32,6 +34,9 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
+from atom.disaggregation.kv_connector import kvconnector
+from atom.utils.forward_context import get_kvconnector
+from atom.disaggregation.kvoutput_aggregator import KVConnectorOutput
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -41,6 +46,8 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.selector import get_attn_backend
+
+logger = logging.getLogger("atom")
 
 logger = logging.getLogger("atom")
 
@@ -55,10 +62,6 @@ support_model_arch_dict = {
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
 }
-# seed = 34567
-# np.random.seed(seed)
-# torch.cuda.manual_seed_all(seed)
-
 
 class tokenIDProcessor:
 
@@ -71,7 +74,7 @@ class tokenIDProcessor:
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         # self.is_deferred_out = False
-        self.is_deferred_out = True
+        self.is_deferred_out = False #PD only
 
         self.runner = runner
         device = runner.device
@@ -163,6 +166,7 @@ class tokenIDProcessor:
         self.token_ids_cpu: list[torch.Tensor] = []
 
         self.prev_batch: Optional[ScheduledBatch] = None
+        self.prev_token_ids: Optional[torch.Tensor] = None
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
@@ -273,7 +277,8 @@ class tokenIDProcessor:
 
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
-        GPU need to be copied into the corresponding slots into input_ids."""
+        GPU need to be copied into the corresponding slots into input_ids.
+        """
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
         total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
@@ -689,7 +694,7 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
                 record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
+                with_stack=True,
                 profile_memory=enable_detailed_profiling,
                 on_trace_ready=torch_profiler.tensorboard_trace_handler(
                     self.profiler_dir, use_gzip=True
@@ -786,6 +791,7 @@ class ModelRunner:
         logger.info(
             f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens"
         )
+        #TODO , get connector
         return True
 
     def warmup_model(self):
@@ -1184,7 +1190,7 @@ class ModelRunner:
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
         # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
-        set_kv_cache_data(kv_cache_data)
+        set_kv_cache_data(kv_cache_data,config)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
@@ -1324,12 +1330,13 @@ class ModelRunner:
             temperatures,
         )
 
-    def run_model(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def run_model(self, input_ids: torch.Tensor,batch=None):
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
+        
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             hidden_states = self.model(input_ids, positions)
         else:
@@ -1426,19 +1433,25 @@ class ModelRunner:
             num_rejected=prev_rejected_num,
             num_bonus=prev_bonus_num,
         )
-
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         input_ids, temperatures = self.prepare_model(batch)
-        logits, hidden_states = self.run_model(input_ids)
-        fwd_output = self.postprocess(
-            batch,
-            logits,
-            temperatures,
-            hidden_states,
-        )
+        logits, hidden_states = self.run_model(input_ids, batch)
+        fwd_output = self.postprocess(batch, logits, temperatures, hidden_states)
         reset_forward_context()
         return fwd_output
+
+    @torch.inference_mode()
+    def process_kvconnector_output(self, connector_meta_output):
+        if  connector_meta_output is not None:
+            from atom.utils.forward_context import get_kvconnector
+            if get_kvconnector() is not None:
+                get_kvconnector().start_load_kv(connector_meta_output)
+    @torch.inference_mode()
+    def async_proc_aggregation(self):
+        done_sending, done_recving=get_kvconnector().get_finished()
+        kvoutput=KVConnectorOutput(finished_sending=done_sending,finished_recving=done_recving)
+        return kvoutput
 
     def propose_draft_token_ids(
         self,
@@ -1473,7 +1486,6 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         start_time = time.time()
-        # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.config.compilation_config.cudagraph_capture_sizes
         else:

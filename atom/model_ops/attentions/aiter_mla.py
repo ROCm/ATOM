@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
 import logging
 from typing import Type
 
@@ -295,10 +296,25 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[:scheduled_bs] = context_lens
         # var["context_lens"].np[scheduled_bs:bs] = 0
 
-        num_blocks_per_seq = cdiv(context_lens, self.block_size)
+        self.prepare_block_tables(batch)
+
+
+        num_blocks_per_seq_bk = [
+            (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
+        ]
+        num_blocks_per_seq=[]
+        for i, (ctx, is_first) in enumerate(zip(batch.context_lens, batch.is_first_decode_without_local_perfill)):
+            if is_first :
+                # 第一次解码：直接使用已分配的 block 数量
+                blocks = len(batch.block_tables[i])
+            else:
+                # 正常情况：向上取整计算需要的 block 数量
+                blocks = (ctx + self.block_size - 1) // self.block_size
+            num_blocks_per_seq.append(blocks)
+        sum_blocks_before_converted = sum([(i + self.block_ratio - 1) // self.block_ratio for i in num_blocks_per_seq])
+
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1]
-        # sum_blocks_before_converted = cdiv(num_blocks_per_seq, self.block_ratio).sum()
 
         # def prepare_kv_indices():
         #     dst = var["kv_indices"].np
@@ -308,8 +324,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         #         dst[offset : offset + n] = bt
         #         offset += n
 
-        # prepare_kv_indices()
-        self.prepare_block_tables(batch)
+        def prepare_kv_indices():
+            
+            var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
+                itertools.chain.from_iterable(batch.block_tables),
+                dtype=np.int32,
+                count=sum_blocks_before_converted,
+            )
+
+        prepare_kv_indices()
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
         var["kv_last_page_lens"].np[:scheduled_bs] = (

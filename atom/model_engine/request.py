@@ -3,7 +3,8 @@
 
 from dataclasses import dataclass
 from typing import List, Optional
-
+import enum
+from typing import Dict, Any, Optional
 
 @dataclass
 class RequestOutput:
@@ -15,3 +16,5 @@ class RequestOutput:
     finish_reason: Optional[str] = (
         None  # Reason for finishing (eos, max_tokens, stop_sequence, etc.)
     )
+    kv_transfer_params_output: Optional[Dict[str, Any]] = None
+
