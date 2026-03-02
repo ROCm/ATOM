@@ -291,7 +291,7 @@ jobs:
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -c "python -m huggingface_hub download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "python -m huggingface_hub download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
               echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
               exit 1
             fi
