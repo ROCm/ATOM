@@ -573,7 +573,9 @@ class ModelRunner:
             self.drafter.load_model(self.model)
         torch.set_default_device(self.device)
         self.allocate_forward_vars()
-        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
+        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
+            model_runner=self
+        )
         self.physical_block_size = self.attn_metadata_builder.block_size
         self.forward_done_event = torch.cuda.Event()
         self.warmup_model()
@@ -1272,7 +1274,7 @@ class ModelRunner:
             self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
                 self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
             )
-        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
+        attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
         # graph_bs should be batch size (number of sequences), not token count
@@ -1521,7 +1523,7 @@ class ModelRunner:
                 )
 
                 attn_metadata, context = (
-                    self.attn_metadata_builder.build_for_cudagraph_capture(bs)
+                    self.attn_metadata_builder.build_for_cudagraph_capture(bs=bs)
                 )
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                 num_tokens += num_pad

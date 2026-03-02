@@ -17,6 +17,10 @@ from atom.utils.distributed.utils import stateless_init_torch_distributed_proces
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+# plugin-related utilities
+from atom.plugin import is_plugin_mode
+from atom.plugin.config import PluginConfig
+
 logger = logging.getLogger("atom")
 
 
@@ -598,6 +602,9 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
 
+    # only use for plugin mode
+    plugin_config: Optional[PluginConfig] = None
+
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.compilation_config.cudagraph_capture_sizes
@@ -621,6 +628,7 @@ class Config:
             if rope_params is None:
                 rope_params = {}
             rope_params["rope_theta"] = getattr(self.hf_config, "rope_theta", None)
+            rope_params["rope_type"] = getattr(self.hf_config, "rope_type", "default")
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
@@ -640,16 +648,25 @@ class Config:
                 self.max_model_len, hf_config_max_position_embeddings
             )
         # assert self.max_num_batched_tokens >= self.max_model_len
-        if self.torch_profiler_dir is not None:
-            os.makedirs(self.torch_profiler_dir, exist_ok=True)
-        assert self.torch_profiler_dir is None or os.path.isdir(
-            self.torch_profiler_dir
-        ), f"torch_profiler_dir {self.torch_profiler_dir} is not a valid directory"
-        if self.compilation_config.level == CompilationLevel.PIECEWISE:
-            self.compilation_config.set_splitting_ops_for_v1()
-            self._set_cudagraph_sizes()
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-            self.compilation_config.init_with_cudagraph_sizes()
+        if not is_plugin_mode():
+            if self.torch_profiler_dir is not None:
+                os.makedirs(self.torch_profiler_dir, exist_ok=True)
+            assert self.torch_profiler_dir is None or os.path.isdir(
+                self.torch_profiler_dir
+            ), f"torch_profiler_dir {self.torch_profiler_dir} is not a valid directory"
+
+        # only for server mode or plugin mode(vllm)
+        # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
+        # for cuda graph capture, plugin mode(vllm) uses the vLLM's cuda graph capture policy
+        if not is_plugin_mode() or (
+            self.plugin_config is not None and self.plugin_config.is_vllm
+        ):
+            if self.compilation_config.level == CompilationLevel.PIECEWISE:
+                self.compilation_config.set_splitting_ops_for_v1()
+                self._set_cudagraph_sizes()
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                self.compilation_config.init_with_cudagraph_sizes()
+
         self.torch_dtype = (
             self.hf_config.dtype
             if getattr(self.hf_config, "dtype", None) is not None
