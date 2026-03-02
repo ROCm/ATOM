@@ -146,8 +146,20 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+              echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
       - name: Run benchmark
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
@@ -157,13 +169,12 @@ jobs:
           else
             model_path="${{ env.MODEL_PATH }}"
           fi
+          # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
             .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
-          "
-          echo "========== Running benchmark test =========="
-          docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
-          ls -all .
+            echo '========== Running benchmark test =========='
+            RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ls -all .
           "
 
       - name: Upload benchmark result
@@ -266,8 +277,20 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+              echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
       - name: Run benchmark
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
@@ -277,13 +300,12 @@ jobs:
           else
             model_path="${{ env.MODEL_PATH }}"
           fi
+          # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
             .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
-          "
-          echo "========== Running benchmark test =========="
-          docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
-          ls -all .
+            echo '========== Running benchmark test =========='
+            RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ls -all .
           "
       
       - name: Upload benchmark result
