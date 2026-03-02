@@ -163,31 +163,6 @@ def shard_qkvzba(
     return mixed_qkv, z, b, a
 
 
-def shard_qkvzba_fake(
-    qkvzba: torch.Tensor,
-    num_k_heads: int,
-    num_v_heads: int,
-    head_k_dim: int,
-    head_v_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
-    mixed_qkv = torch.empty(
-        [
-            num_tokens,
-            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
-        ],
-        dtype=dtype,
-        device=device,
-    )
-    z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
-    b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-    a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-    return mixed_qkv, z, b, a
-
-
-direct_register_custom_op(
-    "shard_qkvzba", shard_qkvzba, mutates_args=[], fake_impl=shard_qkvzba_fake
-)
 
 
 def mamba_v2_sharded_weight_loader(
@@ -752,7 +727,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         k_heads_after_tp = self.num_k_heads // self.tp_size
         v_heads_after_tp = self.num_v_heads // self.tp_size
 
-        mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(
+        mixed_qkv, z, b, a = shard_qkvzba(
             projected_states_qkvzba,
             k_heads_after_tp,
             v_heads_after_tp,
