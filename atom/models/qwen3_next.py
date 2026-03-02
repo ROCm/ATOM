@@ -163,8 +163,6 @@ def shard_qkvzba(
     return mixed_qkv, z, b, a
 
 
-
-
 def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
     tp_size: int,
