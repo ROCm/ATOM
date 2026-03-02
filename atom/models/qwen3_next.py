@@ -748,11 +748,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         dtype = projected_states_qkvzba.dtype
         device = projected_states_qkvzba.device
         mixed_qkv = torch.empty(
-            [num_tokens, 2 * k_heads_after_tp * self.head_k_dim + v_heads_after_tp * self.head_v_dim],
+            [
+                num_tokens,
+                2 * k_heads_after_tp * self.head_k_dim
+                + v_heads_after_tp * self.head_v_dim,
+            ],
             dtype=dtype,
             device=device,
         )
-        z = torch.empty([num_tokens, v_heads_after_tp, self.head_v_dim], dtype=dtype, device=device)
+        z = torch.empty(
+            [num_tokens, v_heads_after_tp, self.head_v_dim], dtype=dtype, device=device
+        )
         b = torch.empty([num_tokens, v_heads_after_tp], dtype=dtype, device=device)
         a = torch.empty([num_tokens, v_heads_after_tp], dtype=dtype, device=device)
         mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(
