@@ -255,6 +255,7 @@ class QuantizationConfig(dict):
         quant_name="",
         quant_method=None,
         exclude_layers: Optional[list[str]] = None,
+        packed_components: Optional[dict[str, list[str]]] = None,
     ):
         super().__init__()
         self["quant_type"] = quant_type if quant_type is not None else QuantType.No
@@ -263,6 +264,9 @@ class QuantizationConfig(dict):
         self["is_dynamic"] = is_dynamic
         self["quant_method"] = quant_method
         self["exclude_layers"] = exclude_layers if exclude_layers is not None else []
+        self["packed_components"] = (
+            packed_components if packed_components is not None else {}
+        )
 
     def get_name(self):
         return self["quant_name"]

@@ -68,6 +68,56 @@ def _swizzle_mxfp4(quant_tensor, scale):
     return quant_tensor, InFlexData(), scale
 
 
+def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
+    """Convert FusedMoE.select_experts output to triton routing data structures.
+
+    This bridges the gap between ATOM's grouped topk / sigmoid routing
+    (which triton_kernels routing() does not support) and the triton
+    matmul_ogs compute kernels.
+
+    Args:
+        topk_weights: (n_tokens, n_expts_act) routing weights from select_experts
+        topk_ids: (n_tokens, n_expts_act) expert indices from select_experts
+        n_expts_tot: total number of experts (global, before EP)
+
+    Returns:
+        (RoutingData, GatherIndx, ScatterIndx) compatible with triton_kernel_fused_experts
+    """
+    from triton_kernels.routing import (
+        RoutingData,
+        GatherIndx,
+        ScatterIndx,
+        compute_expt_data,
+    )
+
+    n_tokens, n_expts_act = topk_weights.shape
+    n_gates_pad = n_tokens * n_expts_act
+
+    # Sort each token's selected experts by expert_id (required by triton kernels)
+    expt_indx_sorted, sort_indices = torch.sort(topk_ids.int(), dim=1)
+    expt_scal_sorted = torch.gather(topk_weights, 1, sort_indices.long())
+
+    # Flatten to 1D
+    expt_scal = expt_scal_sorted.reshape(-1).to(topk_weights.dtype)
+    expt_indx = expt_indx_sorted.reshape(-1).to(torch.int32)
+
+    # Sort by expert_id globally so experts are contiguous for the matmul
+    topk_indx = torch.argsort(expt_indx, stable=True).int()
+    gate_indx = torch.argsort(topk_indx, stable=True).int()
+    gate_scal = expt_scal[topk_indx.long()]
+
+    # Histogram of tokens over experts
+    hist = torch.histc(expt_indx.float(), bins=n_expts_tot, max=n_expts_tot - 1).int()
+
+    # Build routing data structures using triton-accelerated compute_expt_data
+    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad)
+
+    routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
+    return routing_data, gather_indx, scatter_indx
+
+
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     """
     Shrink the given tensor and apply the given view to it.  This is
@@ -161,25 +211,36 @@ def triton_kernel_fused_experts(
     if global_num_experts == -1:
         global_num_experts = E
 
+    half_N = N // 2
+
     if intermediate_cache is None:
         intermediate_cache = torch.empty(
-            (batch_dim, M * topk, N // 2),
+            (batch_dim, M * topk, half_N),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
 
     # Add batch_dim to output buffer because matmul_ogs expects 3D output
     intermediate_cache = _resize_cache(
-        intermediate_cache, (batch_dim, M * topk, N // 2)
+        intermediate_cache, (batch_dim, M * topk, half_N)
     )
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
-    act = FusedActivation(
-        FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
-        (swiglu_alpha, swiglu_limit),
-        2,
-    )
     gammas = routing_data.gate_scal if routing_data else None
+
+    # NOTE: We intentionally do NOT use the triton fused SwiGLU activation
+    # because it expects interleaved [gate0, up0, gate1, up1, ...] layout
+    # while our w13 weights produce concatenated [gate | up] output.
+    # It also uses a non-standard formula: s*sigmoid(alpha*s)*(linear+1)
+    # with alpha=1.702, which differs from the standard SiLU activation
+    # (x*sigmoid(x)*up) used by most MoE models.
+    # Instead, we compute the matmul without fused activation and apply
+    # standard silu(gate) * up manually.
+    raw_intermediate = torch.empty(
+        (batch_dim, M * topk, N),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
 
     matmul_ogs(
         hidden_states,
@@ -189,12 +250,17 @@ def triton_kernel_fused_experts(
         gather_indx=gather_indx,
         precision_config=w13_precision_config,
         gammas=gammas if apply_router_weight_on_input else None,
-        fused_activation=act,
-        y=intermediate_cache,
+        y=raw_intermediate,
     )
 
+    # Standard SiLU/SwiGLU activation: silu(gate) * up
+    raw_2d = raw_intermediate.view(M * topk, N)
+    gate = raw_2d[:, :half_N]
+    up = raw_2d[:, half_N:]
+    intermediate_cache[0] = torch.nn.functional.silu(gate) * up
+
     matmul_ogs(
-        intermediate_cache.view(M * topk, N // 2),
+        intermediate_cache.view(M * topk, half_N),
         w2,
         w2_bias,
         routing_data,
@@ -203,5 +269,6 @@ def triton_kernel_fused_experts(
         gammas=None if apply_router_weight_on_input else gammas,
         y=output_tensor,
     )
+
     output_tensor = output_tensor.view(M, K)
     return output_tensor

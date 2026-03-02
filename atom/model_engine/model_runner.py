@@ -23,6 +23,7 @@ from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
+from atom.models.utils import build_packed_components_mapping
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import Sampler
 from atom.spec_decode.eagle import EagleProposer
@@ -563,6 +564,7 @@ class ModelRunner:
         )
 
         model_class = resolve_obj_by_qualname(support_model_arch_dict[hf_config.architectures[0]])  # type: ignore
+        self.build_inverse_mapping(model_class)
         self.model = model_class(config)
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
@@ -584,6 +586,16 @@ class ModelRunner:
 
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
+
+    def build_inverse_mapping(self, model_class: Any):
+        # Build inverse mapping from the model class's packed_modules_mapping
+        # BEFORE instantiation, so that get_quant_config_for_layer can resolve
+        # packed names (e.g. "gate_up_proj") during layer construction.
+        packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+        if packed_modules_mapping and self.config.quant_config.get("exclude_layers"):
+            self.config.quant_config["packed_components"] = (
+                build_packed_components_mapping(packed_modules_mapping)
+            )
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):

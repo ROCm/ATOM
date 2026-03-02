@@ -876,7 +876,68 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
         if self.use_triton:
-            from atom.model_ops.fused_moe_triton import triton_kernel_moe_forward
+            from atom.model_ops.fused_moe_triton import (
+                triton_kernel_moe_forward,
+                triton_kernel_fused_experts,
+                routing_from_topk,
+            )
+
+            # Check if the model needs custom routing that triton routing()
+            # does not support (grouped topk, sigmoid scoring, bias correction).
+            needs_custom_routing = (
+                use_grouped_topk
+                or scoring_func != "softmax"
+                or e_score_correction_bias is not None
+                or custom_routing_function is not None
+            )
+
+            if needs_custom_routing:
+                # Use ATOM's full-featured select_experts for routing,
+                # then triton matmul_ogs for the actual MoE computation.
+                topk_weights, topk_ids = FusedMoE.select_experts(
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    use_grouped_topk=use_grouped_topk,
+                    top_k=top_k,
+                    renormalize=renormalize,
+                    topk_group=topk_group,
+                    num_expert_group=num_expert_group,
+                    custom_routing_function=custom_routing_function,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    num_fused_shared_experts=layer.num_fused_shared_experts,
+                    routed_scaling_factor=layer.routed_scaling_factor,
+                )
+
+                # Convert to triton routing data structures
+                n_expts_tot = router_logits.shape[-1]
+                if global_num_experts > 0:
+                    n_expts_tot = global_num_experts
+
+                routing_data, gather_idx, scatter_idx = routing_from_topk(
+                    topk_weights, topk_ids, n_expts_tot
+                )
+
+                output = torch.empty_like(x)
+                _moe_result = triton_kernel_fused_experts(
+                    output,
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    routing_data,
+                    gather_idx,
+                    scatter_idx,
+                    topk=top_k,
+                    activation=activation,
+                    w13_precision_config=self.w13_precision_config,
+                    w2_precision_config=self.w2_precision_config,
+                    w1_bias=layer.w13_bias,
+                    w2_bias=layer.w2_bias,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                )
+                return _moe_result
 
             assert (
                 fused_shared_experts_scoring_func is None
@@ -2094,18 +2155,27 @@ class FusedMoE(torch.nn.Module):
 
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
-        shard_size = expert_data.shape[shard_dim] // 2
+        expert_shard_size = expert_data.shape[shard_dim] // 2
+        # Derive shard size from loaded_weight (unpadded checkpoint) to avoid
+        # out-of-bounds when expert_data is padded (e.g. MXFP4 alignment).
+        load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
         loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
+            shard_dim, load_shard_size * tp_rank, load_shard_size
         )
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+            expert_data = expert_data.narrow(shard_dim, 0, expert_shard_size)
         # w3, up_proj: Load into second logical weight of w13.
         else:
             assert shard_id == "w3"
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            expert_data = expert_data.narrow(
+                shard_dim, expert_shard_size, expert_shard_size
+            )
+        # When expert_data is padded beyond the actual weight size, narrow to
+        # the loaded weight size so the copy shape matches.
+        if load_shard_size != expert_shard_size:
+            expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         if expert_data.dtype != dtypes.fp4x2:
             expert_data.copy_(loaded_weight)
         else:
@@ -2125,9 +2195,14 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
         if not load_full:
+            # Derive shard size from loaded_weight (unpadded checkpoint) to
+            # avoid out-of-bounds when expert_data is padded (e.g. MXFP4).
+            load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
             loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
+                shard_dim, load_shard_size * tp_rank, load_shard_size
             )
+            if load_shard_size != shard_size:
+                expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
         if expert_data.dtype != dtypes.fp4x2:
             expert_data.copy_(loaded_weight)
