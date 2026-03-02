@@ -523,7 +523,7 @@ class MergedColumnParallelLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
-            prefix=kwargs.get("prefix", ""),
+            prefix=prefix,
         )
 
     def weight_loader(
@@ -651,7 +651,7 @@ class RowParallelLinear(LinearBase):
             quant_config=quant_config,
             reduce_results=reduce_results,
             source_quant_dtype=source_quant_dtype,
-            prefix=kwargs.get("prefix", ""),
+            prefix=prefix,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):

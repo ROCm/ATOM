@@ -10,7 +10,8 @@ import csv
 import json
 import gzip
 import sys
-from typing import List, Dict, Any
+import bisect
+from typing import List, Dict, Any, Tuple, Optional
 
 # Modules to filter out (no corresponding GPU kernel in decode)
 FILTER_OUT = ['fill_']
@@ -52,15 +53,97 @@ def should_filter_prefill(name: str) -> bool:
 
 
 # =============================================================================
-# Event Query Functions
+# Optimized Event Index for fast time-range queries
+# =============================================================================
+
+class EventIndex:
+    """Pre-indexed events for fast time-range queries."""
+    
+    def __init__(self, events: List[Dict]):
+        # Filter duration events only
+        self.duration_events = [e for e in events if e.get('ph') == 'X']
+        self.duration_events.sort(key=lambda x: x['ts'])
+        self.ts_list = [e['ts'] for e in self.duration_events]
+        
+        # Pre-compute kernel launch flags and prefix sum
+        self._is_kernel_launch = [is_kernel_launch(e.get('name', '')) for e in self.duration_events]
+        self._kernel_prefix_sum = [0]
+        for is_kl in self._is_kernel_launch:
+            self._kernel_prefix_sum.append(self._kernel_prefix_sum[-1] + (1 if is_kl else 0))
+    
+    def events_in_range(self, start_ts: float, end_ts: float) -> List[Dict]:
+        """Get all duration events within [start_ts, end_ts]."""
+        left = bisect.bisect_left(self.ts_list, start_ts)
+        right = bisect.bisect_right(self.ts_list, end_ts)
+        return [
+            e for e in self.duration_events[left:right]
+            if e['ts'] + e.get('dur', 0) <= end_ts
+        ]
+    
+    def count_kernel_launches_in_range(self, start_ts: float, end_ts: float) -> int:
+        """Count kernel launches within time range (fast using prefix sum)."""
+        left = bisect.bisect_left(self.ts_list, start_ts)
+        right = bisect.bisect_right(self.ts_list, end_ts)
+        count = 0
+        for i in range(left, right):
+            e = self.duration_events[i]
+            if e['ts'] + e.get('dur', 0) <= end_ts and self._is_kernel_launch[i]:
+                count += 1
+        return count
+    
+    def get_direct_children(self, parent: Dict) -> List[Dict]:
+        """Get direct children of parent event (optimized)."""
+        p_ts = parent['ts']
+        p_end = p_ts + parent.get('dur', 0)
+        
+        # Get candidates in parent's time range
+        candidates = [
+            e for e in self.events_in_range(p_ts, p_end)
+            if e is not parent
+        ]
+        
+        if not candidates:
+            return []
+        
+        # Filter to direct children only (not nested in other candidates)
+        # Sort by duration descending - larger events are potential parents
+        candidates_sorted = sorted(candidates, key=lambda x: -x.get('dur', 0))
+        
+        direct = []
+        for i, c in enumerate(candidates_sorted):
+            c_ts, c_dur = c['ts'], c.get('dur', 0)
+            c_end = c_ts + c_dur
+            # Check if c is nested inside any larger candidate
+            is_nested = False
+            for j in range(i):  # Only check larger (earlier in sorted list)
+                o = candidates_sorted[j]
+                o_ts = o['ts']
+                o_end = o_ts + o.get('dur', 0)
+                if c_ts >= o_ts and c_end <= o_end:
+                    is_nested = True
+                    break
+            if not is_nested:
+                direct.append(c)
+        
+        return sorted(direct, key=lambda x: x['ts'])
+    
+    def count_kernel_launches(self, event: Dict) -> int:
+        """Count kernel launches within event's time range."""
+        e_ts = event['ts']
+        e_end = e_ts + event.get('dur', 0)
+        return self.count_kernel_launches_in_range(e_ts, e_end)
+    
+    def has_kernel_launch(self, event: Dict) -> bool:
+        """Check if event contains any kernel launch."""
+        return self.count_kernel_launches(event) > 0
+
+
+# =============================================================================
+# Legacy functions (for prefill compatibility)
 # =============================================================================
 
 def find_events(events: List[Dict], name: str, prefix: bool = False) -> List[Dict]:
-    """Find all duration events (ph='X') with given name, sorted by time.
-    
-    Args:
-        prefix: If True, match names starting with 'name'; if False, exact match.
-    """
+    """Find all duration events (ph='X') with given name, sorted by time."""
     if prefix:
         result = [e for e in events if e.get('name', '').startswith(name) and e.get('ph') == 'X']
     else:
@@ -78,18 +161,15 @@ def get_direct_children(parent: Dict, events: List[Dict]) -> List[Dict]:
     """Get direct children of parent event (excluding nested children)."""
     p_ts, p_dur = parent['ts'], parent.get('dur', 0)
     
-    # Find all events within parent
     candidates = [
         e for e in events
         if e.get('ph') == 'X' and e is not parent
         and is_within(e.get('ts', 0), e.get('dur', 0), p_ts, p_dur)
     ]
     
-    # Filter to direct children only
     direct = []
     for c in candidates:
         c_ts, c_dur = c['ts'], c.get('dur', 0)
-        # Check if c is nested inside any other candidate
         is_direct = not any(
             is_within(c_ts, c_dur, o['ts'], o.get('dur', 0))
             for o in candidates if o is not c
@@ -302,47 +382,131 @@ def parse_prefill(events: List[Dict], output_csv: str) -> None:
     print(f"CSV written to: {output_csv} ({len(rows)} rows)")
 
 
+def clean_module_name(name: str) -> str:
+    """Clean and simplify module name."""
+    # Remove 'aiter::' prefix if present
+    if name.startswith('aiter::'):
+        name = name[7:]  # len('aiter::') == 7
+    
+    # Rename based on keywords (rope takes priority)
+    name_lower = name.lower()
+    if 'rope' in name_lower:
+        return 'rope'
+    if 'cache' in name_lower:
+        return 'kv_cache'
+    
+    return name
+
+
+def process_moe_module(
+    mod_name: str,
+    kernel_count: int,
+    start_gpu_idx: int,
+    gpu_kernels: List[Dict]
+) -> List[List]:
+    """
+    Process moe_forward module: categorize kernels by name.
+    
+    - 'moesort' in kernel name -> moe_sort
+    - 'topk' in kernel name -> moe_topk
+    - others -> keep original mod_name
+    
+    Returns list of [display_name, gpu_kernel_name, gpu_dur] rows.
+    """
+    rows = []
+    prev_category = None
+    clean_mod_name = clean_module_name(mod_name)
+    
+    for i in range(kernel_count):
+        gpu_idx = start_gpu_idx + i
+        gpu_kernel_name = 'N/A'
+        gpu_dur = 0
+        if gpu_idx < len(gpu_kernels):
+            gpu = gpu_kernels[gpu_idx]
+            gpu_kernel_name = gpu.get('name', 'N/A')
+            gpu_dur = gpu.get('dur', 0)
+        
+        # Determine category based on kernel name
+        kernel_lower = gpu_kernel_name.lower()
+        if 'moesort' in kernel_lower:
+            category = 'moe_sort'
+        elif 'topk' in kernel_lower:
+            category = 'moe_topk'
+        else:
+            category = clean_mod_name
+        
+        # Show name only on first kernel of each category
+        display_name = category if category != prev_category else ''
+        prev_category = category
+        rows.append([display_name, gpu_kernel_name, gpu_dur])
+    
+    return rows
+
+
+def process_regular_module(
+    mod_name: str,
+    kernel_count: int,
+    start_gpu_idx: int,
+    gpu_kernels: List[Dict]
+) -> List[List]:
+    """
+    Process regular module: show name on first kernel only.
+    
+    Returns list of [display_name, gpu_kernel_name, gpu_dur] rows.
+    """
+    rows = []
+    clean_mod_name = clean_module_name(mod_name)
+    for i in range(kernel_count):
+        gpu_idx = start_gpu_idx + i
+        gpu_kernel_name = 'N/A'
+        gpu_dur = 0
+        if gpu_idx < len(gpu_kernels):
+            gpu = gpu_kernels[gpu_idx]
+            gpu_kernel_name = gpu.get('name', 'N/A')
+            gpu_dur = gpu.get('dur', 0)
+        display_name = clean_mod_name if i == 0 else ''
+        rows.append([display_name, gpu_kernel_name, gpu_dur])
+    return rows
+
+
 def parse_decode(events: List[Dict], output_csv: str) -> None:
     """
     Parse decode phase: map capture_graph modules to GPU kernels.
     
     Output CSV columns: cpu_module, gpu_kernel, duration_us
     """
-    # Find decode_step events (with bs suffix like decode_step_bs_1)
+    print("Building event index...")
+    
+    # Find GPU-annotated decode_step events (cat='gpu_user_annotation')
     decode_steps = [
         e for e in events
-        if e.get('name', '').startswith('decode_step') and e.get('ph') == 'X'
+        if e.get('name', '').startswith('decode_step') 
+        and e.get('ph') == 'X'
+        and e.get('cat') == 'gpu_user_annotation'
     ]
     decode_steps = sorted(decode_steps, key=lambda x: x['ts'])
+    
     if not decode_steps:
-        print("No decode_step events found.")
+        print("No decode_step (gpu_user_annotation) events found.")
         return
     
-    # Group by name and find the first occurrence of each batch size
-    # Then select the one with longer duration (GPU thread has longer duration)
-    from collections import defaultdict
-    by_name = defaultdict(list)
-    for ds in decode_steps:
-        by_name[ds.get('name', '')].append(ds)
+    # Skip warmup: find first gap > 100ms (warmup/run boundary)
+    # Normal decode gaps are < 5ms, so 100ms is safe threshold
+    WARMUP_GAP_THRESHOLD = 100000  # 100ms in microseconds
+    actual_run_idx = 0
+    found_warmup_boundary = False
+    for i in range(1, len(decode_steps)):
+        gap = decode_steps[i]['ts'] - (decode_steps[i-1]['ts'] + decode_steps[i-1].get('dur', 0))
+        if gap > WARMUP_GAP_THRESHOLD:
+            actual_run_idx = i
+            found_warmup_boundary = True
+            print(f"Warmup/run boundary at [{i-1}]->[{i}], gap={gap/1000:.1f}ms")
+            break
     
-    # For each name, prefer the one with longer duration (GPU thread)
-    first_ds_candidates = []
-    for name, dss in by_name.items():
-        # Sort by ts and get earliest
-        dss_sorted = sorted(dss, key=lambda x: x['ts'])
-        # Find the longest duration among first few
-        earliest_ts = dss_sorted[0]['ts']
-        candidates = [d for d in dss_sorted if d['ts'] < earliest_ts + 10000]  # within 10ms
-        if candidates:
-            best = max(candidates, key=lambda x: x.get('dur', 0))
-            first_ds_candidates.append(best)
+    if not found_warmup_boundary:
+        print("No warmup detected (no gap > 100ms), using first decode_step")
     
-    if not first_ds_candidates:
-        first_ds = decode_steps[0]
-    else:
-        # Pick the one with longest duration
-        first_ds = max(first_ds_candidates, key=lambda x: x.get('dur', 0))
-    
+    first_ds = decode_steps[actual_run_idx]
     first_ds_name = first_ds.get('name', '')
     if '_bs_' in first_ds_name:
         bs = first_ds_name.split('_bs_')[-1]
@@ -371,6 +535,20 @@ def parse_decode(events: List[Dict], output_csv: str) -> None:
         print("No capture_graph events found.")
         return
     
+    cg = capture_graphs[0]
+    print(f"Using: {cg.get('name')}")
+    
+    # Build optimized index only for capture_graph's time range
+    cg_start = cg['ts']
+    cg_end = cg_start + cg.get('dur', 0)
+    cg_events = [
+        e for e in events
+        if e.get('ph') == 'X' and e.get('ts', 0) >= cg_start 
+        and e.get('ts', 0) + e.get('dur', 0) <= cg_end
+    ]
+    print(f"Events in capture_graph: {len(cg_events)}")
+    idx = EventIndex(cg_events)
+    
     # Get GPU kernels from first decode_step (within its duration)
     ds1_start = first_ds['ts']
     ds1_end = ds1_start + first_ds.get('dur', 0)
@@ -384,13 +562,13 @@ def parse_decode(events: List[Dict], output_csv: str) -> None:
     print(f"  Range: {ds1_start:.0f} ~ {ds1_end:.0f} (dur={first_ds.get('dur', 0):.0f})")
     print(f"  GPU kernels: {len(gpu_kernels)}")
     
-    cg = capture_graphs[0]
-    print(f"Using: {cg.get('name')}")
-    direct_children = get_direct_children(cg, events)
-    kernel_children = [c for c in direct_children if has_kernel_launch(c, events)]
+    # Use optimized index for children lookup
+    direct_children = idx.get_direct_children(cg)
+    kernel_children = [c for c in direct_children if idx.has_kernel_launch(c)]
+    print(f"Direct children with kernels: {len(kernel_children)}")
     
-    # Build CSV rows
-    rows = []
+    # Collect all modules with their kernel info
+    all_modules = []  # list of (mod_name, kernel_count, start_gpu_idx)
     gpu_idx = 0
     
     for child in kernel_children:
@@ -399,25 +577,45 @@ def parse_decode(events: List[Dict], output_csv: str) -> None:
             continue
         
         # Get sub-children (actual module names)
-        sub_children = get_direct_children(child, events)
-        sub_kernel_children = [sc for sc in sub_children if has_kernel_launch(sc, events)]
+        sub_children = idx.get_direct_children(child)
+        sub_kernel_children = [sc for sc in sub_children if idx.has_kernel_launch(sc)]
         
         # Determine modules to process
         modules = sub_kernel_children if sub_kernel_children else [child]
         
         for mod in modules:
             mod_name = mod.get('name', '<unknown>')
-            kernel_count = count_kernel_launches(mod, events)
-            
-            for i in range(kernel_count):
-                # Only show module name on first kernel, rest use empty string
-                display_name = mod_name if i == 0 else ''
-                if gpu_idx < len(gpu_kernels):
-                    gpu = gpu_kernels[gpu_idx]
-                    rows.append([display_name, gpu.get('name', 'N/A'), gpu.get('dur', 0)])
-                    gpu_idx += 1
-                else:
-                    rows.append([display_name, 'N/A', 0])
+            kernel_count = idx.count_kernel_launches(mod)
+            all_modules.append((mod_name, kernel_count, gpu_idx))
+            gpu_idx += kernel_count
+    
+    # Find norm positions (rmsnorm in name)
+    norm_indices = [i for i, (name, _, _) in enumerate(all_modules) if 'rmsnorm' in name.lower()]
+    print(f"Found {len(norm_indices)} norm modules")
+    
+    # Extract layer 3 (4th layer, 0-indexed)
+    # Each layer has 2 norms, so layer N starts at norm index 2*N
+    TARGET_LAYER = 3
+    norm_start_idx = TARGET_LAYER * 2  # 6 (7th norm, 0-indexed)
+    norm_end_idx = (TARGET_LAYER + 1) * 2  # 8 (9th norm, 0-indexed)
+    
+    if norm_start_idx >= len(norm_indices):
+        print(f"Not enough norms for layer {TARGET_LAYER}")
+        return
+    
+    # Module range for layer 3: from norm_indices[6] to norm_indices[8] (exclusive)
+    mod_start = norm_indices[norm_start_idx]
+    mod_end = norm_indices[norm_end_idx] if norm_end_idx < len(norm_indices) else len(all_modules)
+    
+    print(f"Layer {TARGET_LAYER}: modules [{mod_start}:{mod_end}] (norms at indices {norm_start_idx}, {norm_start_idx+1})")
+    
+    # Build CSV rows for layer 3 only
+    rows = []
+    for mod_name, kernel_count, start_gpu_idx in all_modules[mod_start:mod_end]:
+        if 'moe_forward' in mod_name.lower():
+            rows.extend(process_moe_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels))
+        else:
+            rows.extend(process_regular_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels))
     
     # Write CSV
     with open(output_csv, 'w', newline='', encoding='utf-8') as f:
@@ -425,7 +623,7 @@ def parse_decode(events: List[Dict], output_csv: str) -> None:
         writer.writerow(['cpu_module', 'gpu_kernel', 'duration_us'])
         writer.writerows(rows)
     
-    print(f"GPU kernels used: {gpu_idx}/{len(gpu_kernels)}")
+    print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
     print(f"CSV written to: {output_csv} ({len(rows)} rows)")
 
 
@@ -445,10 +643,10 @@ def main():
     events = trace.get('traceEvents', [])
     print(f"Loaded {len(events)} events\n")
     
-    print("=" * 60)
-    print("PREFILL ANALYSIS")
-    print("=" * 60)
-    parse_prefill(events, 'prefill_breakdown.csv')
+    # print("=" * 60)
+    # print("PREFILL ANALYSIS")
+    # print("=" * 60)
+    # parse_prefill(events, 'prefill_breakdown.csv')
     
     print("\n" + "=" * 60)
     print("DECODE ANALYSIS")
