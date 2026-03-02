@@ -852,6 +852,8 @@ class ModelRunner:
             "input_ids": self.tokenID_processor.input_ids,
             "positions": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
             "temperatures": CpuGpuBuffer(self.max_bs, **f32_kwargs),
+            "top_ks": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "top_ps": CpuGpuBuffer(self.max_bs, **f32_kwargs),
             # Keep enough space for MTP decode (max_q_len > 1).
             "outputs": torch.empty(
                 self.max_num_batched_tokens, hidden_size, dtype=hidden_type
@@ -1305,23 +1307,45 @@ class ModelRunner:
         )
         return graph_bs
 
-    def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
+    def prepare_sample(
+        self, batch: ScheduledBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bs = batch.total_seqs_num
-        buffer = self.forward_vars["temperatures"]
-        buffer.np[:bs] = batch.temperatures
-        return buffer.copy_to_gpu(bs)
+
+        temp_buffer = self.forward_vars["temperatures"]
+        temp_buffer.np[:bs] = batch.temperatures
+        temperatures = temp_buffer.copy_to_gpu(bs)
+
+        # For top_ks and top_ps, check uniformity on CPU before GPU copy.
+        # If all values are the same, only copy a single element to save bandwidth.
+        top_k_buffer = self.forward_vars["top_ks"]
+        top_k_buffer.np[:bs] = batch.top_ks
+        if bs > 1 and all(k == batch.top_ks[0] for k in batch.top_ks):
+            top_ks = top_k_buffer.copy_to_gpu(1)
+        else:
+            top_ks = top_k_buffer.copy_to_gpu(bs)
+
+        top_p_buffer = self.forward_vars["top_ps"]
+        top_p_buffer.np[:bs] = batch.top_ps
+        if bs > 1 and all(p == batch.top_ps[0] for p in batch.top_ps):
+            top_ps = top_p_buffer.copy_to_gpu(1)
+        else:
+            top_ps = top_p_buffer.copy_to_gpu(bs)
+
+        return temperatures, top_ks, top_ps
 
     def prepare_model(self, batch: ScheduledBatch):
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
-        temperatures = self.prepare_sample(batch)
+        temperatures, top_ks, top_ps = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        # self.debug(f"{input_ids=}")
         self.prepare_inputs(batch, input_ids)
         return (
             input_ids,
             temperatures,
+            top_ks,
+            top_ps,
         )
 
     def run_model(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1348,13 +1372,15 @@ class ModelRunner:
         batch: ScheduledBatch,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
         # following for draft
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
-            sampled_tokens = self.sampler(logits, temperatures)
+            sampled_tokens = self.sampler(logits, temperatures, top_ks, top_ps)
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
         else:
@@ -1367,6 +1393,8 @@ class ModelRunner:
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -1429,12 +1457,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        input_ids, temperatures = self.prepare_model(batch)
+        input_ids, temperatures, top_ks, top_ps = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids)
         fwd_output = self.postprocess(
             batch,
             logits,
             temperatures,
+            top_ks,
+            top_ps,
             hidden_states,
         )
         reset_forward_context()

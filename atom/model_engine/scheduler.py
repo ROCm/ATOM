@@ -147,6 +147,12 @@ class ScheduledBatch:
         self.mamba_block_tables = [
             seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table
         ]
+        self.top_ks = np.asarray(
+            [seq.top_k for seq in seqs.values()], dtype=np.int32
+        )
+        self.top_ps = np.asarray(
+            [seq.top_p for seq in seqs.values()], dtype=np.float32
+        )
 
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
