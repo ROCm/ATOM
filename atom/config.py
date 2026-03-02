@@ -13,6 +13,14 @@ import torch
 from aiter import QuantType
 from aiter.utility.dtypes import d_dtypes
 from atom.utils import envs, get_open_port
+from atom.quant_spec import (
+    LayerQuantSpec,
+    ParsedQuantConfig,
+    get_quant_parser,
+    _parse_quant_type,
+    _parse_quant_dtype,
+    _parse_is_dynamic,
+)
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
@@ -247,6 +255,15 @@ class CompilationConfig:
 
 
 class QuantizationConfig(dict):
+    """Model-wide quantization configuration.
+
+    Still inherits from dict for backward compatibility with existing code
+    that accesses ``quant_config["quant_type"]``, etc.
+
+    New code should prefer the :pyattr:`parsed` attribute and
+    :pymeth:`resolve` method.
+    """
+
     def __init__(
         self,
         quant_type=QuantType.No,
@@ -255,6 +272,8 @@ class QuantizationConfig(dict):
         quant_name="",
         quant_method=None,
         exclude_layers: Optional[list[str]] = None,
+        *,
+        parsed: Optional[ParsedQuantConfig] = None,
     ):
         super().__init__()
         self["quant_type"] = quant_type if quant_type is not None else QuantType.No
@@ -264,8 +283,83 @@ class QuantizationConfig(dict):
         self["quant_method"] = quant_method
         self["exclude_layers"] = exclude_layers if exclude_layers is not None else []
 
+        # --- New: structured parsed config ---
+        if parsed is not None:
+            self._parsed = parsed
+        else:
+            # Build a ParsedQuantConfig from the scalar fields so that
+            # manually-constructed QuantizationConfigs still work.
+            self._parsed = ParsedQuantConfig(
+                global_spec=LayerQuantSpec(
+                    quant_type=self["quant_type"],
+                    quant_dtype=self["quant_dtype"],
+                    is_dynamic=self["is_dynamic"],
+                    quant_method=self["quant_method"],
+                ),
+                exclude_layers=self["exclude_layers"],
+            )
+
+    # -- public API --------------------------------------------------------
+
+    @property
+    def parsed(self) -> ParsedQuantConfig:
+        """Access the structured :class:`ParsedQuantConfig`."""
+        return self._parsed
+
+    @property
+    def global_spec(self) -> LayerQuantSpec:
+        """Shortcut for ``self.parsed.global_spec``."""
+        return self._parsed.global_spec
+
+    def resolve(self, prefix: str) -> LayerQuantSpec:
+        """Return the :class:`LayerQuantSpec` for layer *prefix*.
+
+        Resolution order:
+        1. Explicit per-layer override in ``parsed.layer_specs[prefix]``.
+        2. Check the exclude list — if the layer is excluded, return
+           ``LayerQuantSpec.no_quant()``.
+        3. Fall back to ``parsed.global_spec``.
+        """
+        # 1. Explicit per-layer override
+        layer_specs = self._parsed.layer_specs
+        if prefix in layer_specs:
+            return layer_specs[prefix]
+
+        # 2. Check exclude list
+        if self._is_excluded(prefix):
+            return LayerQuantSpec.no_quant()
+
+        # 3. Global default
+        return self._parsed.global_spec
+
+    # -- backward compat ---------------------------------------------------
+
     def get_name(self):
         return self["quant_name"]
+
+    # -- internals ---------------------------------------------------------
+
+    def _is_excluded(self, prefix: str) -> bool:
+        """Check whether *prefix* matches the exclude list.
+
+        Uses the same logic as the original ``should_ignore_layer``
+        in ``atom.models.utils`` so behaviour is identical.
+        """
+        exclude_layers: list[str] = self._parsed.exclude_layers
+        if not exclude_layers:
+            return False
+        for exclude_layer in exclude_layers:
+            if exclude_layer.startswith("re"):
+                # case "re:model.layers.*self_attn.*"
+                regex_pattern = exclude_layer[3:]
+                if re.search(regex_pattern, prefix):
+                    return True
+            elif prefix in exclude_layer:
+                return True
+            else:
+                if prefix.split(".")[-1] == exclude_layer:
+                    return True
+        return False
 
     def compute_hash(self) -> str:
         """
