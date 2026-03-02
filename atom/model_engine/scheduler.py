@@ -195,23 +195,27 @@ class ScheduledBatchOutput:
 
     def __init__(
         self,
-        token_ids: dict[int, tuple[int, ...]],
-        num_rejected: np.ndarray,
-        num_bonus: np.ndarray,
+        req_ids: list[int],
+        token_ids: list[tuple[int, ...]],
+        num_rejected: Optional[np.ndarray],
+        num_bonus: Optional[np.ndarray],
         draft_token_ids: Optional[np.ndarray],
-        # num_bonus_tokens
         is_deferred_out=False,
     ):
-        # TODO need refine
-        self.is_deferred_out = is_deferred_out
-        self.req_ids = list(token_ids.keys())
+        self.req_ids = req_ids
         self.token_ids = token_ids
         self.draft_token_ids = draft_token_ids
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
-        # logger.info(f"ScheduledBatchOutput: req_ids={self.req_ids}")
-        # assert len(self.req_ids) - 1 == len(draft_token_ids)
-        # self.num_bonus_tokens = num_bonus_tokens  # num per req
+        self.is_deferred_out = is_deferred_out
+        # O(1) lookup: req_id -> index (lazy-built on first access)
+        self._req_id_to_idx: Optional[dict[int, int]] = None
+
+    def get_idx(self, req_id: int) -> Optional[int]:
+        """O(1) lookup of request index by id."""
+        if self._req_id_to_idx is None:
+            self._req_id_to_idx = {rid: i for i, rid in enumerate(self.req_ids)}
+        return self._req_id_to_idx.get(req_id)
 
 
 class Scheduler:
@@ -257,7 +261,7 @@ class Scheduler:
         num_batched_tokens = 0
 
         num_scheduled_tokens: list[int] = []
-        scheduled_spec_decode_tokens: dict[int, list[int]] = {}
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
         if not self.running and not self.waiting:
             # self.block_manager.reset()
@@ -376,13 +380,13 @@ class Scheduler:
             num_placeholder += 1
         for seq in self.running:
             # Update the running status
-            if seq.id not in fwd_output.req_ids:
+            idx = fwd_output.get_idx(seq.id)
+            if idx is None:
                 continue
-            token_ids = prev_token_ids[seq.id]
+            token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if self.spec_stats:
                 self.spec_stats.update(num_new_token)
-            idx = fwd_output.req_ids.index(seq.id)
             if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
                 num_bonus = fwd_output.num_bonus[idx]
@@ -402,7 +406,7 @@ class Scheduler:
             new_tokens = token_ids
 
             if self.mtp_k > 0:
-                idx = fwd_output.req_ids.index(seq.id)
+                # idx already resolved above via get_idx
                 seq.spec_token_ids = draft_token_ids[idx]
 
             if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:

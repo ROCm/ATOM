@@ -175,57 +175,59 @@ class tokenIDProcessor:
             None  # Mapped to current batch order
         )
 
-    def _process_token_id(self, token_id) -> tuple[int, ...]:
-        """Helper function: process a single token_id, handling list and non-list cases.
-
-        Optimized: eliminates double traversal (removed 'in' check before 'index').
-        Returns tuple for better performance and immutability.
-        """
-        if isinstance(token_id, list):
-            try:
-                idx = token_id.index(-1)
-                return tuple(token_id[:idx])
-            except ValueError:
-                # No -1 found, return the entire list as tuple
-                return tuple(token_id)
-        else:
-            return (token_id,)
+    @staticmethod
+    def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
+        """Batch process token_ids: vectorized -1 truncation using numpy."""
+        arr = np.array(token_ids, dtype=np.int64)
+        mask = arr == -1
+        if not mask.any():
+            # No -1 sentinel in any row, convert each row to tuple directly
+            return [tuple(row) for row in arr.tolist()]
+        # Per-row: find first -1, truncate
+        # Use argmax on mask; rows without -1 get 0, disambiguate with ~mask.any(axis=1)
+        has_sentinel = mask.any(axis=1)
+        first_neg = mask.argmax(axis=1)
+        result = []
+        rows = arr.tolist()
+        for i, row in enumerate(rows):
+            if has_sentinel[i]:
+                result.append(tuple(row[: first_neg[i]]))
+            else:
+                result.append(tuple(row))
+        return result
 
     def prepare_sampled_ids(
         self,
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-    ) -> dict[int, tuple[int, ...]]:
+    ) -> tuple[list[int], list[tuple[int, ...]]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
-            ret = {
-                seq_id: self._process_token_id(token_id)
-                for seq_id, token_id in zip(req_ids, token_ids)
-            }
-            ret[-1] = 0  # is_deferred_out flag
-            return ret
+            if token_ids and isinstance(token_ids[0], list):
+                processed = self._batch_process_token_ids(token_ids)
+            else:
+                processed = [(tid,) for tid in token_ids]
+            return req_ids, processed
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
         self.send_to_cpu_async(sampled_token_ids, self.token_ids_cpu, sync_event)
-        token_id_dict = {}
+        req_ids_out: list[int] = []
+        processed_out: list[tuple[int, ...]] = []
         self.prev_req_ids = None
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
-            token_id_dict = {
-                seq_id: self._process_token_id(token_id)
-                for seq_id, token_id in zip(self.prev_req_ids, token_ids)
-            }
-        else:
-            # first time, no previous tokens
-            token_ids = {}
+            req_ids_out = self.prev_req_ids
+            if token_ids and isinstance(token_ids[0], list):
+                processed_out = self._batch_process_token_ids(token_ids)
+            else:
+                processed_out = [(tid,) for tid in token_ids]
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
-        token_id_dict[-1] = 1
 
-        return token_id_dict
+        return req_ids_out, processed_out
 
     def get_token_locations(
         self, batch: ScheduledBatch
@@ -1366,7 +1368,7 @@ class ModelRunner:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
         self.forward_done_event.record()
-        token_ids = self.tokenID_processor.prepare_sampled_ids(
+        req_ids_out, token_ids_out = self.tokenID_processor.prepare_sampled_ids(
             batch, sampled_tokens, self.forward_done_event
         )
 
@@ -1399,7 +1401,8 @@ class ModelRunner:
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
 
         return ScheduledBatchOutput(
-            token_ids=token_ids,
+            req_ids=req_ids_out,
+            token_ids=token_ids_out,
             draft_token_ids=draft_token_ids,
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
