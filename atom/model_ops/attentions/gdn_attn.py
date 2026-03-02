@@ -107,8 +107,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        self.non_spec_query_start_loc = torch.empty(
-            (self.max_bs + 1,),
+        self.non_spec_query_start_loc = torch.arange(
+            start=0,
+            end=self.max_bs + 1,
             dtype=torch.int32,
             device=self.device,
         )
