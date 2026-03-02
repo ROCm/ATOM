@@ -131,20 +131,27 @@ def shard_qkvzba_kernel(
 
 def shard_qkvzba(
     qkvzba: torch.Tensor,
-    qkv_mixed: torch.Tensor,
-    z: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
     num_k_heads: int,
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, _, _ = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
+    num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
+    mixed_qkv = torch.empty(
+        [
+            num_tokens,
+            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
+    b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
     grid = (num_tokens, num_k_heads + 1)
     shard_qkvzba_kernel[grid](
         qkvzba,
-        qkv_mixed,
+        mixed_qkv,
         z,
         b,
         a,
@@ -153,30 +160,29 @@ def shard_qkvzba(
         head_k_dim,
         head_v_dim,
     )
-    return qkv_mixed, z, b, a
+    return mixed_qkv, z, b, a
 
 
 def shard_qkvzba_fake(
     qkvzba: torch.Tensor,
-    qkv_mixed: torch.Tensor,
-    z: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
     num_k_heads: int,
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
-    # qkv_mixed = torch.empty(
-    #     [num_tokens, 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim],
-    #     dtype=dtype,
-    #     device=device,
-    # )
-    # z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
-    # b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-    # a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-    return qkv_mixed, z, b, a
+    num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
+    mixed_qkv = torch.empty(
+        [
+            num_tokens,
+            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
+    b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    return mixed_qkv, z, b, a
 
 
 direct_register_custom_op(
@@ -745,28 +751,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
         k_heads_after_tp = self.num_k_heads // self.tp_size
         v_heads_after_tp = self.num_v_heads // self.tp_size
-        dtype = projected_states_qkvzba.dtype
-        device = projected_states_qkvzba.device
-        mixed_qkv = torch.empty(
-            [
-                num_tokens,
-                2 * k_heads_after_tp * self.head_k_dim
-                + v_heads_after_tp * self.head_v_dim,
-            ],
-            dtype=dtype,
-            device=device,
-        )
-        z = torch.empty(
-            [num_tokens, v_heads_after_tp, self.head_v_dim], dtype=dtype, device=device
-        )
-        b = torch.empty([num_tokens, v_heads_after_tp], dtype=dtype, device=device)
-        a = torch.empty([num_tokens, v_heads_after_tp], dtype=dtype, device=device)
+
         mixed_qkv, z, b, a = torch.ops.aiter.shard_qkvzba(
             projected_states_qkvzba,
-            mixed_qkv,
-            z,
-            b,
-            a,
             k_heads_after_tp,
             v_heads_after_tp,
             self.head_k_dim,
