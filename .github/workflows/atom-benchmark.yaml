@@ -41,11 +41,44 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
+    env:
+      # Nightly params aligned with InferenceX dsr1-fp8 config: 1k1k, 1k8k, 8k1k with multiple concurrency levels
+      NIGHTLY_PARAM_LISTS: |
+        1024,1024,1,0.8;
+        1024,1024,2,0.8;
+        1024,1024,4,0.8;
+        1024,1024,8,0.8;
+        1024,1024,16,0.8;
+        1024,1024,32,0.8;
+        1024,1024,64,0.8;
+        1024,1024,128,0.8;
+        1024,1024,256,0.8;
+        1024,8192,1,0.8;
+        1024,8192,2,0.8;
+        1024,8192,4,0.8;
+        1024,8192,8,0.8;
+        1024,8192,16,0.8;
+        1024,8192,32,0.8;
+        8192,1024,1,0.8;
+        8192,1024,2,0.8;
+        8192,1024,4,0.8;
+        8192,1024,8,0.8;
+        8192,1024,16,0.8;
+        8192,1024,32,0.8;
+        8192,1024,64,0.8;
+        8192,1024,128,0.8
     steps:
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
-          IFS=';' read -ra SETS <<< "${{ inputs.param_lists || '1024,1024,128,0.8' }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PARAM_LISTS="${NIGHTLY_PARAM_LISTS}"
+            echo "Using nightly param lists (1k1k, 1k8k, 8k1k with multiple concurrency)"
+          else
+            PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
+            echo "Using param_lists: ${PARAM_LISTS}"
+          fi
+          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
           MATRIX_JSON="["
           SEP=""
           for SET in "${SETS[@]}"; do
@@ -150,7 +183,7 @@ jobs:
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "python3 -m huggingface_hub download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
               echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
               exit 1
             fi
@@ -281,7 +314,7 @@ jobs:
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "python3 -m huggingface_hub download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
               echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
               exit 1
             fi
