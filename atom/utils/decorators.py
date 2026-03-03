@@ -17,6 +17,7 @@ import time
 
 from atom.config import CompilationConfig, Config, CompilationLevel
 
+from atom.utils.graph_marker import graph_marker
 # from atom.utils import start_monitoring_torch_compile
 
 _T = TypeVar("_T", bound=type[nn.Module])
@@ -24,6 +25,84 @@ _T = TypeVar("_T", bound=type[nn.Module])
 context_manager = None
 torch_compile_start_time: float = 0.0
 
+
+def _graph_marker_first_tensor(obj, name: str):
+    if torch.is_tensor(obj):
+        return graph_marker(obj, name=name), True
+    if isinstance(obj, tuple):
+        out = []
+        marked_any = False
+        for v in obj:
+            if marked_any:
+                out.append(v)
+                continue
+            vv, marked_any = _graph_marker_first_tensor(v, name)
+            out.append(vv)
+        out_t = tuple(out)
+        # namedtuple support
+        if hasattr(obj, "_fields"):
+            return obj.__class__(*out_t), marked_any
+        return out_t, marked_any
+    if isinstance(obj, list):
+        out = []
+        marked_any = False
+        for v in obj:
+            if marked_any:
+                out.append(v)
+                continue
+            vv, marked_any = _graph_marker_first_tensor(v, name)
+            out.append(vv)
+        return out, marked_any
+    if isinstance(obj, dict):
+        out = {}
+        marked_any = False
+        for k, v in obj.items():
+            if marked_any:
+                out[k] = v
+                continue
+            vv, marked_any = _graph_marker_first_tensor(v, name)
+            out[k] = vv
+        return out, marked_any
+    return obj, False
+
+
+def mark_trace(cls):
+    forward = getattr(cls, "forward", None)
+    if forward is None:
+        return cls
+    if getattr(forward, "__mark_trace_wrapped__", False):
+        return cls
+
+    from atom.utils.graph_marker import is_graph_marker_enabled
+
+    def wrapped_forward(self, *args, **kwargs):
+        # When mark-trace is disabled, bypass all wrapping logic entirely
+        if not is_graph_marker_enabled():
+            return forward(self, *args, **kwargs)
+        
+        prefix = getattr(self, "prefix", cls.__name__)
+        # Mark only the first tensor across args/kwargs, keeping names stable.
+        args_l = list(args)
+        marked = False
+        for i, a in enumerate(args_l):
+            if marked:
+                break
+            aa, marked = _graph_marker_first_tensor(a, f"{prefix}_start")
+            args_l[i] = aa
+        if not marked:
+            for k, v in list(kwargs.items()):
+                if marked:
+                    break
+                vv, marked = _graph_marker_first_tensor(v, f"{prefix}_start")
+                kwargs[k] = vv
+        args = tuple(args_l)
+        y = forward(self, *args, **kwargs)
+        yy, _ = _graph_marker_first_tensor(y, f"{prefix}_end")
+        return yy
+
+    wrapped_forward.__mark_trace_wrapped__ = True
+    cls.forward = wrapped_forward
+    return cls
 
 # We remove it from utils/__init__.py to avoid circular import
 def start_monitoring_torch_compile(vllm_config: Config):

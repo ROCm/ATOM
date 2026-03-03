@@ -63,6 +63,7 @@ class EngineCore:
         self.input_thread.start()
 
         self.profile_enbaled = config.torch_profiler_dir is not None
+        self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
         self._init_data_parallel(config)
 
@@ -83,6 +84,9 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
+                # Start profiler before cudagraph capture only if mark-trace is enabled.
+                if self.profile_enbaled and self.mark_trace:
+                    self.runner_mgr.call_func("start_profiler", wait_out=True)
                 cap_cost, bs = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
@@ -284,7 +288,7 @@ class EngineCore:
 
     def start_profiler(self):
         if self.profile_enbaled:
-            self.runner_mgr.call_func("start_profiler")
+            self.runner_mgr.call_func("start_profiler", wait_out=True)
 
     def stop_profiler(self):
         if self.profile_enbaled:

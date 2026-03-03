@@ -5,6 +5,8 @@ import logging
 import math
 import os
 import time
+from contextlib import nullcontext
+from itertools import chain, islice
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -19,6 +21,7 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
+from torch.profiler import record_function
 from atom.config import Config, KVCacheTensor, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -462,6 +465,9 @@ class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
         self.config = config
+        self.mark_trace = getattr(config, "mark_trace", False)
+        from atom.utils.graph_marker import set_graph_marker_enabled
+        set_graph_marker_enabled(self.mark_trace)
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
@@ -696,6 +702,7 @@ class ModelRunner:
                 ),
             )
             self.profiler.__enter__()
+        return True
 
     def stop_profiler(self):
         """Stop profiling for this rank"""
@@ -1331,14 +1338,24 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            hidden_states = self.model(input_ids, positions)
+            with (
+                record_function("prefill")
+                if self.mark_trace
+                else nullcontext()
+            ):
+                hidden_states = self.model(input_ids, positions)
         else:
-            graph_bs = context.graph_bs
-            max_q_len = forward_context.attn_metadata.max_seqlen_q
-            graph_key = (graph_bs, max_q_len)
-            self.graphs[graph_key].replay()
-            num_tokens = context.batch_size * max_q_len
-            hidden_states = self.forward_vars["outputs"][:num_tokens]
+            with (
+                record_function(f"decode_step_bs_{bs}")
+                if self.mark_trace
+                else nullcontext()
+            ):
+                graph_bs = context.graph_bs
+                max_q_len = forward_context.attn_metadata.max_seqlen_q
+                graph_key = (graph_bs, max_q_len)
+                self.graphs[graph_key].replay()
+                num_tokens = context.batch_size * max_q_len
+                hidden_states = self.forward_vars["outputs"][:num_tokens]
         logits = self.model.compute_logits(hidden_states)
 
         return logits, hidden_states
@@ -1536,11 +1553,15 @@ class ModelRunner:
                 outputs[:num_tokens] = self.model(
                     input_ids[:num_tokens], positions[:num_tokens]
                 )  # warmup
-
-                with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
-                    outputs[:num_tokens] = self.model(
-                        input_ids[:num_tokens], positions[:num_tokens]
-                    )  # capture
+                with (
+                    record_function(f"capture_graph_bs_{bs}")
+                    if self.mark_trace
+                    else nullcontext()
+                ):
+                    with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
+                        outputs[:num_tokens] = self.model(
+                            input_ids[:num_tokens], positions[:num_tokens]
+                        )  # capture
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
                 self.graphs[(bs, max_q_len)] = graph
