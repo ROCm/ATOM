@@ -530,7 +530,7 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
             csv_rows.extend(process_moe_module(mod_name, len(kernels), 0, kernels))
         else:
             for k in kernels:
-                csv_rows.append([clean_module_name(mod_name), k['name'], k['dur']])
+                csv_rows.append([clean_module_name(mod_name, k['name']), k['name'], k['dur']])
 
     print(f"Prefill decode-style CSV rows (after filters): {len(csv_rows)}")
     rename_rmsnorm_modules(csv_rows)
@@ -539,14 +539,20 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
     write_breakdown_xlsx(output_xlsx, csv_rows, sheet_name='prefill')
 
 
-def clean_module_name(name: str) -> str:
+def clean_module_name(name: str, mapped_kernel_name: str = '') -> str:
     """Clean and simplify module name."""
+    # Runtime launch wrappers should display the actual launched operator name.
+    if 'hipmodulelaunchkernel' in name.lower() and mapped_kernel_name not in ('', 'N/A'):
+        name = mapped_kernel_name
+
     # Remove 'aiter::' prefix if present
     if name.startswith('aiter::'):
         name = name[7:]  # len('aiter::') == 7
     
     # Rename based on keywords (rope takes priority)
     name_lower = name.lower()
+    if 'rope' in name_lower and 'cache' in name_lower:
+        return 'rope & kv_cache'
     if 'rope' in name_lower:
         return 'rope'
     if 'cache' in name_lower:
@@ -571,8 +577,6 @@ def process_moe_module(
     Returns list of [display_name, gpu_kernel_name, gpu_dur] rows.
     """
     rows = []
-    clean_mod_name = clean_module_name(mod_name)
-    
     for i in range(kernel_count):
         gpu_idx = start_gpu_idx + i
         gpu_kernel_name = 'N/A'
@@ -589,7 +593,7 @@ def process_moe_module(
         elif 'topk' in kernel_lower:
             category = 'moe_topk'
         else:
-            category = clean_mod_name
+            category = clean_module_name(mod_name, gpu_kernel_name)
         
         # Always show category/module name on each row.
         display_name = category
@@ -606,7 +610,6 @@ def process_regular_module(
 ) -> List[List]:
     """Process regular module and show module name on every row."""
     rows = []
-    clean_mod_name = clean_module_name(mod_name)
     for i in range(kernel_count):
         gpu_idx = start_gpu_idx + i
         gpu_kernel_name = 'N/A'
@@ -615,7 +618,7 @@ def process_regular_module(
             gpu = gpu_kernels[gpu_idx]
             gpu_kernel_name = gpu.get('name', 'N/A')
             gpu_dur = gpu.get('dur', 0)
-        display_name = clean_mod_name
+        display_name = clean_module_name(mod_name, gpu_kernel_name)
         rows.append([display_name, gpu_kernel_name, gpu_dur])
     return rows
 

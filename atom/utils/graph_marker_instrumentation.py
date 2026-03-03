@@ -3,29 +3,19 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 
-_GRAPH_MARKER_RE = re.compile(
-    r"""torch\.ops\.aiter\.graph_marker\.default\(
-        \s*[^,]+,\s*
-        (?P<q>['"])(?P<name>.*?)(?P=q)
-        \s*\)""",
-    re.VERBOSE,
-)
-
 _SUBGRAPH_ID_RE = re.compile(r"artifact_shape_[^/]+_subgraph_(\d+)")
 
-_GRAPH_MARKER_LINE_RE = re.compile(
+_ASSIGNMENT_RE = re.compile(
     r"""^(?P<indent>\s*)
         (?P<lhs>[A-Za-z_]\w*)\s*=\s*
-        torch\.ops\.aiter\.graph_marker\.default\(
-            \s*(?P<arg>[^,]+?)\s*,\s*
-            (?P<q>['"])(?P<name>.*?)(?P=q)\s*
-        \)\s*$""",
+        (?P<rhs>.+?)\s*$""",
     re.VERBOSE,
 )
 
@@ -35,6 +25,163 @@ class _Marker:
     idx: int
     indent: str
     name: str
+
+
+@dataclass(frozen=True)
+class _ParsedMarkerAssignment:
+    indent: str
+    lhs: str
+    arg: str
+    name: str
+
+
+_GRAPH_MARKER_PREFIX = "torch.ops.aiter.graph_marker.default("
+
+
+def _find_matching_paren(s: str, open_idx: int) -> Optional[int]:
+    depth = 0
+    in_str: Optional[str] = None
+    escaped = False
+    for i in range(open_idx, len(s)):
+        ch = s[i]
+        if in_str is not None:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _split_top_level_args(s: str) -> list[str]:
+    out: list[str] = []
+    depth_paren = 0
+    depth_bracket = 0
+    depth_brace = 0
+    in_str: Optional[str] = None
+    escaped = False
+    start = 0
+    for i, ch in enumerate(s):
+        if in_str is not None:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+        if ch == "(":
+            depth_paren += 1
+            continue
+        if ch == ")":
+            depth_paren -= 1
+            continue
+        if ch == "[":
+            depth_bracket += 1
+            continue
+        if ch == "]":
+            depth_bracket -= 1
+            continue
+        if ch == "{":
+            depth_brace += 1
+            continue
+        if ch == "}":
+            depth_brace -= 1
+            continue
+        if (
+            ch == ","
+            and depth_paren == 0
+            and depth_bracket == 0
+            and depth_brace == 0
+        ):
+            out.append(s[start:i].strip())
+            start = i + 1
+    out.append(s[start:].strip())
+    return out
+
+
+def _parse_graph_marker_call_expr(expr: str) -> Optional[tuple[str, str]]:
+    idx = expr.find(_GRAPH_MARKER_PREFIX)
+    if idx < 0:
+        return None
+    open_idx = idx + len(_GRAPH_MARKER_PREFIX) - 1
+    close_idx = _find_matching_paren(expr, open_idx)
+    if close_idx is None:
+        return None
+    call_src = expr[idx : close_idx + 1]
+    if call_src.count("(") != call_src.count(")"):
+        return None
+    # Ensure the matched call is the whole RHS expression (allowing whitespace).
+    if expr[:idx].strip() or expr[close_idx + 1 :].strip():
+        return None
+    inner = call_src[len(_GRAPH_MARKER_PREFIX) : -1]
+    args = _split_top_level_args(inner)
+    if len(args) < 2:
+        return None
+    arg_expr = args[0]
+    try:
+        name = ast.literal_eval(args[1])
+    except Exception:
+        return None
+    if not isinstance(name, str):
+        return None
+    return arg_expr, name
+
+
+def _parse_graph_marker_assignment_line(line: str) -> Optional[_ParsedMarkerAssignment]:
+    m = _ASSIGNMENT_RE.match(line.rstrip("\n"))
+    if not m:
+        return None
+    rhs = m.group("rhs")
+    parsed = _parse_graph_marker_call_expr(rhs)
+    if parsed is None:
+        return None
+    arg, name = parsed
+    return _ParsedMarkerAssignment(
+        indent=m.group("indent"),
+        lhs=m.group("lhs"),
+        arg=arg,
+        name=name,
+    )
+
+
+def _extract_graph_marker_name(line: str) -> Optional[str]:
+    idx = line.find(_GRAPH_MARKER_PREFIX)
+    if idx < 0:
+        return None
+    open_idx = idx + len(_GRAPH_MARKER_PREFIX) - 1
+    close_idx = _find_matching_paren(line, open_idx)
+    if close_idx is None:
+        return None
+    call_src = line[idx : close_idx + 1]
+    inner = call_src[len(_GRAPH_MARKER_PREFIX) : -1]
+    args = _split_top_level_args(inner)
+    if len(args) < 2:
+        return None
+    try:
+        name = ast.literal_eval(args[1])
+    except Exception:
+        return None
+    return name if isinstance(name, str) else None
 
 
 def _iter_py_files(root: str) -> Iterable[str]:
@@ -77,11 +224,11 @@ def _ensure_record_function_import(lines: list[str]) -> None:
 def _collect_markers(lines: list[str]) -> list[_Marker]:
     out: list[_Marker] = []
     for i, line in enumerate(lines):
-        m = _GRAPH_MARKER_RE.search(line)
-        if not m:
+        name = _extract_graph_marker_name(line)
+        if name is None:
             continue
         indent = re.match(r"^(\s*)", line).group(1)  # type: ignore[union-attr]
-        out.append(_Marker(idx=i, indent=indent, name=m.group("name")))
+        out.append(_Marker(idx=i, indent=indent, name=name))
     return out
 
 
@@ -184,12 +331,9 @@ def _strip_runtime_graph_markers(lines: list[str]) -> bool:
     out: list[str] = []
     changed = False
     for line in lines:
-        m = _GRAPH_MARKER_LINE_RE.match(line.rstrip("\n"))
-        if m:
-            indent = m.group("indent")
-            lhs = m.group("lhs")
-            arg = m.group("arg").strip()
-            out.append(f"{indent}{lhs} = {arg}\n")
+        parsed = _parse_graph_marker_assignment_line(line)
+        if parsed is not None:
+            out.append(f"{parsed.indent}{parsed.lhs} = {parsed.arg}\n")
             changed = True
             continue
 
