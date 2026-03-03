@@ -72,8 +72,9 @@ jobs:
         id: parse-param-lists
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            PARAM_LISTS="${NIGHTLY_PARAM_LISTS}"
+            PARAM_LISTS="${{ env.NIGHTLY_PARAM_LISTS }}"
             echo "Using nightly param lists (1k1k, 1k8k, 8k1k with multiple concurrency)"
+            echo "PARAM_LISTS: ${PARAM_LISTS}"
           else
             PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
             echo "Using param_lists: ${PARAM_LISTS}"
@@ -183,7 +184,7 @@ jobs:
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "python3 -m huggingface_hub download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
               echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
               exit 1
             fi
@@ -314,7 +315,7 @@ jobs:
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "python3 -m huggingface_hub download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
               echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
               exit 1
             fi
