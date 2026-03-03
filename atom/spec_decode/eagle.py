@@ -107,7 +107,6 @@ class EagleProposer:
         forward_context = get_forward_context()
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
-        context.is_draft = True
         bs = context.batch_size
 
         assert self.runner is not None

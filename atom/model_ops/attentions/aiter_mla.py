@@ -251,21 +251,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
                 attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
-                kv_indices_generate_triton(
-                    attn_metadata.block_tables,
-                    attn_metadata.kv_indices,
-                    attn_metadata.kv_indptr,
-                    self.block_ratio,
-                    attn_metadata.max_seqlen_k,
-                )
-            else:
-                kv_indices_generate_triton(
-                    attn_metadata.block_tables,
-                    attn_metadata.kv_indices,
-                    attn_metadata.kv_indptr,
-                    self.block_ratio,
-                    attn_metadata.max_seqlen_k,
-                )
+            kv_indices_generate_triton(
+                attn_metadata.block_tables,
+                attn_metadata.kv_indices,
+                attn_metadata.kv_indptr,
+                self.block_ratio,
+                attn_metadata.max_seqlen_k,
+            )
 
         return attn_metadata, positions
 
