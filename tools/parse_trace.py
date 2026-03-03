@@ -99,6 +99,25 @@ def write_breakdown_xlsx(output_xlsx: str, rows: List[List[Any]], sheet_name: st
     wb.save(output_xlsx)
 
 
+def rename_rmsnorm_modules(rows: List[List[Any]]) -> None:
+    """
+    Rename first two rmsnorm cpu module names in-place:
+    - first  -> input_layernorm
+    - second -> post_attn_layernorm
+    """
+    seen = 0
+    for row in rows:
+        if not row or len(row) < 1:
+            continue
+        mod = row[0]
+        if isinstance(mod, str) and 'rmsnorm' in mod.lower():
+            if seen == 0:
+                row[0] = 'input_layernorm'
+            elif seen == 1:
+                row[0] = 'post_attn_layernorm'
+            seen += 1
+
+
 # =============================================================================
 # Optimized Event Index for fast time-range queries
 # =============================================================================
@@ -475,11 +494,12 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
         for kname in uniq:
             print(f"      * {kname}")
 
-    # Convert to decode-style CSV rows with prefill filters.
+    # Convert to decode-style rows with prefill filters and MoE categorization.
     # Output columns: cpu_module, gpu_kernel, duration_us
-    csv_rows = []
+    module_instances: List[Dict[str, Any]] = []
+    instance_idx: Dict[Tuple[Any, ...], int] = {}
     for row in output_rows:
-        l2_name = row[1]
+        l1_name, l2_name, l2_cat, l2_dur = row[0], row[1], row[2], row[3]
         gpu_kernel = row[7]
         gpu_dur = row[8]
 
@@ -488,9 +508,32 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
         if gpu_kernel in ('', 'N/A'):
             continue
 
-        csv_rows.append([clean_module_name(l2_name), gpu_kernel, gpu_dur])
+        # Keep module instances separated by their parent+name+category+duration,
+        # preserving the original order from the trace.
+        key = (l1_name, l2_name, l2_cat, l2_dur)
+        if key not in instance_idx:
+            instance_idx[key] = len(module_instances)
+            module_instances.append({'mod_name': l2_name, 'kernels': []})
+        module_instances[instance_idx[key]]['kernels'].append({
+            'name': gpu_kernel,
+            'dur': gpu_dur,
+        })
+
+    csv_rows = []
+    for inst in module_instances:
+        mod_name = inst['mod_name']
+        kernels = inst['kernels']
+        if not kernels:
+            continue
+
+        if 'moe_forward' in mod_name.lower():
+            csv_rows.extend(process_moe_module(mod_name, len(kernels), 0, kernels))
+        else:
+            for k in kernels:
+                csv_rows.append([clean_module_name(mod_name), k['name'], k['dur']])
 
     print(f"Prefill decode-style CSV rows (after filters): {len(csv_rows)}")
+    rename_rmsnorm_modules(csv_rows)
 
     # Write XLSX for prefill.
     write_breakdown_xlsx(output_xlsx, csv_rows, sheet_name='prefill')
@@ -724,6 +767,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
             rows.extend(process_moe_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels))
         else:
             rows.extend(process_regular_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels))
+    rename_rmsnorm_modules(rows)
     
     # Write XLSX
     write_breakdown_xlsx(output_xlsx, rows, sheet_name='decode')
@@ -745,7 +789,7 @@ def main():
     if args.layer < 0:
         print("--layer must be >= 0")
         sys.exit(1)
-
+    
     filepath = args.filepath
     target_layer = args.layer
     
