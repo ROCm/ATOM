@@ -108,6 +108,7 @@ class EagleProposer:
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
         bs = context.batch_size
+        context.is_draft = True
 
         assert self.runner is not None
         input_ids = target_token_ids
