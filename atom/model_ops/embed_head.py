@@ -8,9 +8,10 @@ import triton.language as tl
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_tp_group
 from aiter.tuned_gemm import tgemm
-from torch import nn
-
 from atom.utils.forward_context import ForwardContext, get_forward_context
+from torch import nn
+from atom.plugin import is_plugin_mode
+
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
