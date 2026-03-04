@@ -6,7 +6,7 @@ from typing import Type
 
 import numpy as np
 import torch
-from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1, decode_update_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
@@ -127,7 +127,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.model_runner.forward_vars.update(mla_metadata)
 
-    def set_mla_persistent_worker_buffers(self, bs: int, max_q_len: int):
+    def set_mla_persistent_worker_buffers(self, bs: int, max_q_len: int, only_update: bool = False):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
@@ -142,26 +142,51 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
-        get_mla_metadata_v1(
-            var["cu_seqlens_q"].gpu[: bs + 1],
-            (
-                var["sparse_kv_indptr"].gpu[: bs + 1]
-                if self.is_sparse
-                else var["kv_indptr"].gpu[: bs + 1]
-            ),
-            var["kv_last_page_lens"].gpu[:bs],
-            self.num_attention_heads,
-            1,  # nhead_kv,
-            True,
-            work_meta_data,
-            work_info_set,
-            work_indptr,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            page_size=self.block_size,
-            **split_params,
-        )
+        if only_update:
+            decode_update_mla_metadata_v1(
+                var["cu_seqlens_q"].gpu[: bs + 1],
+                (
+                    var["sparse_kv_indptr"].gpu[: bs + 1]
+                    if self.is_sparse
+                    else var["kv_indptr"].gpu[: bs + 1]
+                ),
+                var["kv_last_page_lens"].gpu[:bs],
+                self.num_attention_heads,
+                1,  # nhead_kv,
+                True,
+                work_meta_data,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                page_size=self.block_size,
+                kv_granularity=max(self.block_size, 16),
+                max_seqlen_qo=max_q_len,
+                dtype_q=torch.bfloat16,
+                dtype_kv=dtypes.d_dtypes[self.model_runner.config.kv_cache_dtype],
+            )
+        else:
+            get_mla_metadata_v1(
+                var["cu_seqlens_q"].gpu[: bs + 1],
+                (
+                    var["sparse_kv_indptr"].gpu[: bs + 1]
+                    if self.is_sparse
+                    else var["kv_indptr"].gpu[: bs + 1]
+                ),
+                var["kv_last_page_lens"].gpu[:bs],
+                self.num_attention_heads,
+                1,  # nhead_kv,
+                True,
+                work_meta_data,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                page_size=self.block_size,
+                **split_params,
+            )
         return {
             "work_meta_data": work_meta_data,
             "work_info_set": work_info_set,
@@ -187,7 +212,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             max_seqlen_k,
         )
-        return self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
+        return self.set_mla_persistent_worker_buffers(bs, max_seqlen_q, True)
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = super().prepare_prefill(batch)
