@@ -190,6 +190,9 @@ jobs:
     if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     runs-on: ${{ matrix.runner }}
 
+    env:
+      CONTAINER_NAME: atom_test_${{ strategy.job-index }}
+
     steps:
       - name: Kill all Docker containers and clean up workspace
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
