@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import Optional, Iterable
 
 import torch
 import torch.distributed as dist
@@ -35,6 +35,8 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.moe import FusedMoE
+
+from atom.model_loader.loader import load_model_in_plugin_mode
 
 # from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from atom.models.utils import (
@@ -391,3 +393,15 @@ class GptOssForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_local_experts,
         )
+
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # load weights in plugin mode and discard passed weights generator
+        # here prefix is "model." because GptOssForCausalLM is constructed in model
+        # wrapper class, so the name of loaded weights are prefixed with "model.".
+        # The vLLM will check the name of the loaded weights to make sure all the
+        # weights are loaded correctly
+        loaded_weights_record = load_model_in_plugin_mode(
+            model=self, config=self.atom_config, prefix="model."
+        )
+        return loaded_weights_record
