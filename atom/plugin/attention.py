@@ -341,8 +341,16 @@ class vllmAttentionMetadataBuilderMethods:
         decode_metadata = None
         if num_decodes > 0:
             decode_metadata = AiterFlashAttentionDecodeMetadata(
-                max_query_len=common_attn_metadata.max_query_len if decode_only else query_lens_cpu[:num_decodes].max().item(),
-                max_seq_len=common_attn_metadata.max_seq_len if decode_only else seq_lens[:num_decodes].max().item(),
+                max_query_len=(
+                    common_attn_metadata.max_query_len
+                    if decode_only
+                    else query_lens_cpu[:num_decodes].max().item()
+                ),
+                max_seq_len=(
+                    common_attn_metadata.max_seq_len
+                    if decode_only
+                    else seq_lens[:num_decodes].max().item()
+                ),
                 query_start_loc=common_attn_metadata.query_start_loc[: num_decodes + 1],
             )
 
@@ -478,8 +486,16 @@ class vllmAttentionMetadataBuilderMethods:
                 num_decodes + num_extends :
             ]
             prefill_metadata = AiterFlashAttentionPrefillMetadata(
-                max_query_len=common_attn_metadata.max_query_len if prefill_only else query_lens_cpu[:num_decodes].max().item(),
-                max_seq_len=common_attn_metadata.max_seq_len if prefill_only else query_lens_cpu[:num_decodes].max().item(),
+                max_query_len=(
+                    common_attn_metadata.max_query_len
+                    if prefill_only
+                    else query_lens_cpu[:num_decodes].max().item()
+                ),
+                max_seq_len=(
+                    common_attn_metadata.max_seq_len
+                    if prefill_only
+                    else query_lens_cpu[:num_decodes].max().item()
+                ),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
             )
 
