@@ -61,10 +61,15 @@ def _masked_embedding_launcher(
     out = torch.empty(N, D, dtype=weight.dtype, device=weight.device)
     grid = (N, triton.cdiv(D, BLOCK_D))
     _masked_embedding_kernel[grid](
-        x, weight, out,
-        vocab_start_idx, vocab_end_idx,
-        weight.stride(0), out.stride(0),
-        N, D,
+        x,
+        weight,
+        out,
+        vocab_start_idx,
+        vocab_end_idx,
+        weight.stride(0),
+        out.stride(0),
+        N,
+        D,
         BLOCK_D=BLOCK_D,
     )
     return out
@@ -77,7 +82,10 @@ def _masked_embedding_fake(
     vocab_end_idx: int,
 ) -> torch.Tensor:
     return torch.empty(
-        x.numel(), weight.shape[1], dtype=weight.dtype, device=weight.device,
+        x.numel(),
+        weight.shape[1],
+        dtype=weight.dtype,
+        device=weight.device,
     )
 
 
@@ -122,7 +130,9 @@ class VocabParallelEmbedding(nn.Module):
     def forward(self, x: torch.Tensor):
         # Torch compile will make logical_and, mask, embedding in a fused triton kernel, but make accuracy issue in MTP.
         if self.tp_size > 1:
-            y = masked_embedding(x, self.weight, self.vocab_start_idx, self.vocab_end_idx)
+            y = masked_embedding(
+                x, self.weight, self.vocab_start_idx, self.vocab_end_idx
+            )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         else:
             y = F.embedding(x, self.weight)
