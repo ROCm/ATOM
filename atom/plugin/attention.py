@@ -19,19 +19,15 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 
 
 @dataclass
-class AiterFlashAttentionDecodeMetadata:
+class AiterFlashAttentionPhaseMetadata:
     max_query_len: int
     min_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
 
 
-@dataclass
-class AiterFlashAttentionPrefillMetadata:
-    max_query_len: int
-    min_query_len: int
-    max_seq_len: int
-    query_start_loc: torch.Tensor
+AiterFlashAttentionDecodeMetadata = AiterFlashAttentionPhaseMetadata
+AiterFlashAttentionPrefillMetadata = AiterFlashAttentionPhaseMetadata
 
 
 @dataclass
@@ -1271,53 +1267,15 @@ def AiterBackendDecoratorForPluginMode(cls):
     Decorator for AiterBackend to add specific methods and attributes for plugin mode
     """
     is_vllm_mode = is_vllm()
-
     if is_vllm_mode:
-        # for vllm, add the required methods
         if not issubclass(cls.get_impl_cls(), MLAAttention):
-
-            cls.full_cls_name = vllmAiterAttentionBackendMethods.full_cls_name
-            cls.accept_output_buffer = (
-                vllmAiterAttentionBackendMethods.accept_output_buffer
-            )
-            cls.supported_dtypes = vllmAiterAttentionBackendMethods.supported_dtypes
-            cls.forward_includes_kv_cache_update = (
-                vllmAiterAttentionBackendMethods.forward_includes_kv_cache_update
-            )
-            cls.get_supported_kernel_block_sizes = (
-                vllmAiterAttentionBackendMethods.get_supported_kernel_block_sizes
-            )
-            cls.get_kv_cache_shape = vllmAiterAttentionBackendMethods.get_kv_cache_shape
-            cls.is_mla = vllmAiterAttentionBackendMethods.is_mla
-            cls.get_required_kv_cache_layout = (
-                vllmAiterAttentionBackendMethods.get_required_kv_cache_layout
-            )
-            cls.get_supported_head_sizes = (
-                vllmAiterAttentionBackendMethods.get_supported_head_sizes
-            )
-            cls.supports_alibi_sqrt = (
-                vllmAiterAttentionBackendMethods.supports_alibi_sqrt
-            )
+            methods_cls = vllmAiterAttentionBackendMethods
         else:
-            # for mla, add the required methods
-            cls.full_cls_name = vllmAiterMLABackendMethods.full_cls_name
-            cls.accept_output_buffer = vllmAiterMLABackendMethods.accept_output_buffer
-            cls.supported_dtypes = vllmAiterMLABackendMethods.supported_dtypes
-            cls.get_supported_kernel_block_sizes = (
-                vllmAiterMLABackendMethods.get_supported_kernel_block_sizes
-            )
-            cls.get_kv_cache_shape = vllmAiterMLABackendMethods.get_kv_cache_shape
-            cls.is_mla = vllmAiterMLABackendMethods.is_mla
-            cls.get_required_kv_cache_layout = (
-                vllmAiterMLABackendMethods.get_required_kv_cache_layout
-            )
-            cls.get_supported_head_sizes = (
-                vllmAiterMLABackendMethods.get_supported_head_sizes
-            )
-            cls.supports_alibi_sqrt = vllmAiterMLABackendMethods.supports_alibi_sqrt
-            cls.get_kv_cache_stride_order = (
-                vllmAiterMLABackendMethods.get_kv_cache_stride_order
-            )
+            methods_cls = vllmAiterMLABackendMethods
+        for name in dir(methods_cls):
+            if name.startswith("_"):
+                continue
+            setattr(cls, name, getattr(methods_cls, name))
     return cls
 
 
