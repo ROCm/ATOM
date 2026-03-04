@@ -4,39 +4,39 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
+import triton
+import triton.language as tl
 
-# import torch.distributed as dist
+from aiter.dist.parallel_state import get_tensor_model_parallel_rank
 from transformers.activations import ACT2FN
 from atom.config import QuantizationConfig, Config
 
-from atom.model_loader.loader import mamba_v2_sharded_weight_loader
 from atom.model_ops.activation import SiluAndMul
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 
-# from atom.model_ops.attention import Attention
 from atom.model_ops.base_attention import Attention, LinearAttention
 from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
 from atom.model_ops.linear import (
+    QKVZBAParallelLinear,
     QKVParallelLinear,
     MergedColumnParallelLinear,
-    ReplicatedLinear,
+    MergedReplicatedLinear,
     RowParallelLinear,
     ColumnParallelLinear,
 )
 from atom.model_config.qwen3_next import Qwen3NextConfig
 
 
-from atom.utils.decorators import support_torch_compile
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from atom.utils.decorators import support_torch_compile
 
-# from atom.model_ops.rotary_embedding import get_rope
 from aiter.rotary_embedding import get_rope
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_ops.moe import FusedMoE
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
     get_ep_group,
 )
 from atom.models.utils import (
@@ -53,6 +53,171 @@ ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
+
+
+@triton.jit
+def shard_qkvzba_kernel(
+    qkvzba_ptr,  # [num_tokens,  (2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim + 2 * num_v_heads)]
+    qkv_ptr,  # [num_tokens, (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim)]
+    z_ptr,  # [num_tokens, num_v_heads * head_v_dim]
+    b_ptr,  # [num_tokens, num_v_heads]
+    a_ptr,  # [num_tokens, num_v_heads]
+    num_k_heads: tl.constexpr,
+    num_v_heads: tl.constexpr,
+    head_k_dim: tl.constexpr,
+    head_v_dim: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    QKVZ_TOTAL_SIZE = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
+    QKVZ_DIM_SIZE = 2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads
+    BA_TOTAL_SIZE = 2 * num_v_heads
+    KV_HEAD_RATIO: tl.constexpr = num_v_heads // num_k_heads
+    ROW_SIZE = QKVZ_TOTAL_SIZE + BA_TOTAL_SIZE
+    if head_id == num_k_heads:  # ba
+        load_ptr = qkvzba_ptr + token_id * ROW_SIZE + QKVZ_TOTAL_SIZE
+        b_offset = (
+            tl.arange(0, num_v_heads) // KV_HEAD_RATIO * KV_HEAD_RATIO * 2
+            + tl.arange(0, num_v_heads) % KV_HEAD_RATIO
+        )
+        a_offset = b_offset + KV_HEAD_RATIO
+        b_val = tl.load(load_ptr + b_offset)
+        a_val = tl.load(load_ptr + a_offset)
+        store_offset = tl.arange(0, num_v_heads)
+        tl.store(b_ptr + token_id * num_v_heads + store_offset, b_val)
+        tl.store(a_ptr + token_id * num_v_heads + store_offset, a_val)
+    else:
+        base_ptr = qkvzba_ptr + token_id * ROW_SIZE + head_id * QKVZ_DIM_SIZE
+        qkv_base_ptr = qkv_ptr + token_id * (
+            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+        )
+        k_dim_offset = tl.arange(0, head_k_dim)
+        v_dim_offset = tl.arange(0, head_v_dim)
+        q_val = tl.load(base_ptr + k_dim_offset)
+        q_store_ptr = qkv_base_ptr + head_id * head_k_dim
+        tl.store(q_store_ptr + k_dim_offset, q_val)
+
+        k_val = tl.load(base_ptr + head_k_dim + k_dim_offset)
+        k_store_ptr = qkv_base_ptr + num_k_heads * head_k_dim + head_id * head_k_dim
+        tl.store(k_store_ptr + k_dim_offset, k_val)
+
+        for sub_head in tl.static_range(0, KV_HEAD_RATIO):
+            v_val = tl.load(
+                base_ptr + 2 * head_k_dim + sub_head * head_v_dim + v_dim_offset
+            )
+            v_store_ptr = (
+                qkv_base_ptr
+                + 2 * num_k_heads * head_k_dim
+                + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
+            )
+            tl.store(v_store_ptr + v_dim_offset, v_val)
+
+        for sub_head in tl.static_range(0, KV_HEAD_RATIO):
+            z_val = tl.load(
+                base_ptr
+                + 2 * head_k_dim
+                + KV_HEAD_RATIO * head_v_dim
+                + sub_head * head_v_dim
+                + v_dim_offset
+            )
+            z_store_ptr = (
+                z_ptr
+                + token_id * num_v_heads * head_v_dim
+                + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
+            )
+            tl.store(z_store_ptr + v_dim_offset, z_val)
+
+
+def shard_qkvzba(
+    qkvzba: torch.Tensor,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
+    mixed_qkv = torch.empty(
+        [
+            num_tokens,
+            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    z = torch.empty([num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device)
+    b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
+    grid = (num_tokens, num_k_heads + 1)
+    shard_qkvzba_kernel[grid](
+        qkvzba,
+        mixed_qkv,
+        z,
+        b,
+        a,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+    )
+    return mixed_qkv, z, b, a
+
+
+def mamba_v2_sharded_weight_loader(
+    shard_spec: list[tuple[int, int, float]],
+    tp_size: int,
+    tp_rank: int,
+):
+    """Create a weight loader for mamba v2. This ensures that the projections
+    are correctly sharded so that they can be split into x, B, C. It also
+    ensures that all the groups corresponding to a head shard is placed
+    together with it.
+    """
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        # - track boundary of (sharded) param, and loaded_weight, respectively
+        boundary, loaded_boundary = 0, 0
+
+        # - iterate over the shard specs
+        for full_dim, extra, duplicate_groups in shard_spec:
+            # - full dim is the model dim (before TP).
+            # - extra > 0, means there is expected overall increase
+            #   of dimensions. This is so because of replication.
+            # - ratio is used map the tp_rank to the actual shard
+            #   rank. This is useful when there is replication of
+            #   groups to accompany head shards.
+
+            # - size of the loaded shard
+            shard_size = full_dim // tp_size
+
+            # - compute the rank into the loaded shard.
+            # - if there is replication, different TP shards will
+            #   take from the same rank.
+            # NOTE: currently we only support duplication
+            # in the case where num_groups == 1
+            rank = 0 if duplicate_groups else tp_rank
+
+            # - leftmost boundary index into loaded weight.
+            loaded_skip = rank * shard_size
+            loaded_start_idx = loaded_boundary + loaded_skip
+
+            # - take these many dims from the loaded weight.
+            take = min(shard_size, full_dim - extra - loaded_skip)
+
+            # - always shard on dim 0
+            # - the ignore is for a mundane mypy error as it does not
+            #   seem to handle slices well.
+            # https://github.com/python/mypy/issues/2410
+            param.data[
+                boundary : (boundary + take), ...  # type: ignore[misc]
+            ] = loaded_weight[
+                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
+            ]  # type: ignore[misc]
+
+            # move indexing boundaries
+            boundary += shard_size
+            loaded_boundary += full_dim - extra
+
+    return loader
 
 
 class Qwen3NextMLP(nn.Module):
@@ -137,17 +302,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         #     self.physical_expert_start + self.n_local_physical_experts
         # )
 
-        self.gate = ReplicatedLinear(
+        self.gate = MergedReplicatedLinear(
             config.hidden_size,
-            config.num_experts,
+            [config.num_experts, config.n_shared_experts],
             bias=False,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
+        # print(f"layer {prefix}, gate weight: {self.gate.weight.data}", flush=True)
 
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if config.shared_expert_intermediate_size > 0:
+        if (
+            config.shared_expert_intermediate_size > 0
+            and not is_rocm_aiter_fusion_shared_expert_enabled()
+        ):
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -169,6 +338,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=False,
+            shared_expert_scoring_func=(
+                "sigmoid" if self.shared_expert is None else None
+            ),
             prefix=f"{prefix}.experts",
             config=config,
         )
@@ -184,10 +356,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         routed_output = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-
-        shared_output = self.shared_expert(hidden_states)
-
-        final_hidden_states = shared_output + routed_output
+        if not is_rocm_aiter_fusion_shared_expert_enabled():
+            shared_output = self.shared_expert(hidden_states)
+            final_hidden_states = shared_output + routed_output
+        else:
+            final_hidden_states = routed_output
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -246,9 +419,11 @@ class Qwen3NextAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        rope_parameters = getattr(config, "rope_parameters", None)
+        rope_parameters = rope_parameters or {}
+        rope_theta = rope_parameters.get("rope_theta", 10000)
+        rope_scaling = rope_parameters.get("rope_scaling", None)
+        partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
 
         rotary_dim = int(self.head_dim * partial_rotary_factor)
         self.rotary_emb = get_rope(
@@ -284,8 +459,8 @@ class Qwen3NextAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            q_gate, k, v = torch.split(
+                qkv, [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
             orig_shape = q_gate.shape[:-1]
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
@@ -293,7 +468,9 @@ class Qwen3NextAttention(nn.Module):
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
 
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
@@ -367,20 +544,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # projection of the input hidden states
         self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         self.projection_size_ba = self.num_v_heads * 2
-        self.in_proj_qkvz = ColumnParallelLinear(
+        self.in_proj_qkvzba = QKVZBAParallelLinear(
             input_size=self.hidden_size,
-            output_size=self.projection_size_qkvz,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_qkvz",
-        )
-        # ba_proj doesn't support blockwise fp8 quantization.
-        self.in_proj_ba = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.projection_size_ba,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_ba",
+            prefix=f"{prefix}.in_proj_qkvzba",
         )
 
         query_key_settings = (self.key_dim, 0, False)
@@ -448,12 +620,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def fix_query_key_value_ordering(
         self,
-        mixed_qkvz,
-        mixed_ba,
+        mixed_qkvzba,
     ):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
+        qkvz_split_size = (
+            self.num_k_heads
+            // self.tp_size
+            * (
+                self.head_k_dim
+                + self.head_k_dim
+                + (self.head_v_dim + self.head_v_dim)
+                * self.num_v_heads
+                // self.num_k_heads
+            )
+        )
+        ba_split_size = (
+            self.num_k_heads // self.tp_size * 2 * self.num_v_heads // self.num_k_heads
+        )
+        mixed_qkvz, mixed_ba = torch.split(
+            mixed_qkvzba, [qkvz_split_size, ba_split_size], dim=-1
+        )
         new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
             self.num_k_heads // self.tp_size,
             (
@@ -532,15 +720,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-        projected_states_ba = self.in_proj_ba(hidden_states)
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(
-            projected_states_qkvz, projected_states_ba
+        projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
+        k_heads_after_tp = self.num_k_heads // self.tp_size
+        v_heads_after_tp = self.num_v_heads // self.tp_size
+
+        mixed_qkv, z, b, a = shard_qkvzba(
+            projected_states_qkvzba,
+            k_heads_after_tp,
+            v_heads_after_tp,
+            self.head_k_dim,
+            self.head_v_dim,
         )
-        query, key, value = map(
-            lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-        )
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -553,7 +743,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             device=hidden_states.device,
         )
 
-        self.attn(mixed_qkv, b, a, core_attn_out)
+        core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
 
         # ============================================================
         # Part 3: Output Projection
@@ -717,6 +907,8 @@ class Qwen3NextModel(nn.Module):
 
         config: Qwen3NextConfig = atom_config.hf_config
         self.config = config
+        self.config.n_shared_experts = 1
+        self.config.n_routed_experts = self.config.num_experts
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -782,7 +974,12 @@ class Qwen3NextModel(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.n_routed_experts
+            + (
+                self.config.n_shared_experts
+                if is_rocm_aiter_fusion_shared_expert_enabled()
+                else 0
+            ),
         )
 
 
@@ -793,6 +990,10 @@ class Qwen3NextForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        "in_proj_qkvz": ("in_proj_qkvzba", "qkvz"),
+        "in_proj_ba": ("in_proj_qkvzba", "ba"),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
     }
 
     def __init__(

@@ -4,7 +4,6 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
-
 from aiter import dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
@@ -14,7 +13,7 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
 
-from atom.utils.decorators import support_torch_compile
+# from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from .deepseek_v2 import DeepseekV2DecoderLayer
@@ -78,9 +77,10 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        masked_inputs_embeds = torch.where(
-            positions.unsqueeze(-1) == 0, 0, inputs_embeds
-        )
+        # masked_inputs_embeds = torch.where(
+        #     positions.unsqueeze(-1) == 0, 0, inputs_embeds
+        # )
+        masked_inputs_embeds = inputs_embeds
         inputs_embeds = self.enorm(masked_inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -150,7 +150,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         return logits
 
 
-@support_torch_compile
+# @support_torch_compile
 class DeepSeekMTP(nn.Module):
 
     def __init__(self, atom_config: Config, prefix: str = ""):

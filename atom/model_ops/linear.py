@@ -52,7 +52,7 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
 def divide(numerator, denominator):
@@ -120,7 +120,6 @@ def gemm_a4w4_quant(
         )
     else:
         m, k = x.view(-1, x.size(-1)).shape
-        n = weight.shape[0]
 
         y = torch.empty(
             (
@@ -538,6 +537,75 @@ class MergedColumnParallelLinear(LinearBase):
 
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        param.weight_loader_process(param_data, loaded_weight)
+
+
+class QKVZBAParallelLinear(ColumnParallelLinear):
+    def __init__(
+        self,
+        input_size: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        source_quant_dtype: torch.dtype = None,
+        **kwargs,
+    ):
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        tp_size = get_tp_group().world_size
+        self.num_k_heads = divide(self.num_k_heads, tp_size)
+        self.num_v_heads = divide(self.num_v_heads, tp_size)
+        output_sizes = [
+            (2 * head_k_dim * self.num_k_heads + 2 * head_v_dim * self.num_v_heads)
+            * tp_size,
+            2 * self.num_v_heads * tp_size,
+        ]
+        super().__init__(
+            input_size,
+            output_sizes,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+        )
+
+    def weight_loader(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
+    ):
+        param_data = param.data
+        assert loaded_shard_id in ["qkvz", "ba"]
+        if loaded_shard_id == "qkvz":
+            shard_size = (
+                2 * self.num_k_heads * self.head_k_dim
+                + 2 * self.num_v_heads * self.head_v_dim
+            )
+            shard_offset = 0
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "ba":
+            shard_size = 2 * self.num_v_heads
+            shard_offset = (
+                2 * self.num_k_heads * self.head_k_dim
+                + 2 * self.num_v_heads * self.head_v_dim
+            )
+            shard_rank = self.tp_rank
+
+        if param is getattr(self, "weight_scale", None) or param is getattr(
+            self, "input_scale", None
+        ):
+            if self.quant_type == QuantType.per_1x128:
+                shard_offset //= 128
+                shard_size //= 128
+            elif self.quant_type == QuantType.per_Tensor:
+                loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
+                shard_offset = ["qkvz", "ba"].index(loaded_shard_id)
+                shard_size = 1
+        start_idx = shard_rank * shard_size
+        param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
 
 

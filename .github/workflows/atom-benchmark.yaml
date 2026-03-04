@@ -5,6 +5,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
+  schedule:
+    # Nightly at 01:00 Beijing time (17:00 UTC)
+    - cron: '0 17 * * *'
   workflow_dispatch:
     inputs:
       deepseek-r1-0528:
@@ -38,11 +41,22 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
+    env:
+      # Nightly params aligned with InferenceX dsr1-fp8 config: 1k1k, 1k8k, 8k1k with multiple concurrency levels
+      NIGHTLY_PARAM_LISTS: "1024,1024,1,0.8;1024,1024,2,0.8;1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,1024,256,0.8;1024,8192,1,0.8;1024,8192,2,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;8192,1024,1,0.8;8192,1024,2,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8"
     steps:
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
-          IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PARAM_LISTS="${{ env.NIGHTLY_PARAM_LISTS }}"
+            echo "Using nightly param lists (1k1k, 1k8k, 8k1k with multiple concurrency)"
+            echo "PARAM_LISTS: ${PARAM_LISTS}"
+          else
+            PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
+            echo "Using param_lists: ${PARAM_LISTS}"
+          fi
+          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
           MATRIX_JSON="["
           SEP=""
           for SET in "${SETS[@]}"; do
@@ -62,7 +76,7 @@ jobs:
           echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
   deepseek-r1-0528-benchmark:
-    if: ${{ inputs.deepseek-r1-0528 }}
+    if: ${{ github.event_name == 'schedule' || inputs.deepseek-r1-0528 }}
     name: DeepSeek-R1-0528 Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
     needs: [parse-param-lists]
     strategy:
@@ -138,13 +152,25 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
-          ${{ inputs.image }}
+          ${{ inputs.image || 'rocm/atom-dev:latest' }}
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+              echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
       - name: Run benchmark
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
@@ -154,13 +180,12 @@ jobs:
           else
             model_path="${{ env.MODEL_PATH }}"
           fi
+          # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
-          "
-          echo "========== Running benchmark test =========="
-          docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
-          ls -all .
+            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
+            echo '========== Running benchmark test =========='
+            RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ls -all .
           "
 
       - name: Upload benchmark result
@@ -176,12 +201,12 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
 
   gpt-oss-120b-benchmark:
-    if: ${{ inputs.gpt-oss-120b }}
+    if: ${{ github.event_name == 'schedule' || inputs.gpt-oss-120b }}
     name: GPT-OSS-120b Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
     needs: [parse-param-lists]
     strategy:
@@ -258,13 +283,25 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
-          ${{ inputs.image }}
+          ${{ inputs.image || 'rocm/atom-dev:latest' }}
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+              echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
       - name: Run benchmark
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
@@ -274,13 +311,12 @@ jobs:
           else
             model_path="${{ env.MODEL_PATH }}"
           fi
+          # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
-          "
-          echo "========== Running benchmark test =========="
-          docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
-          ls -all .
+            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
+            echo '========== Running benchmark test =========='
+            RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ls -all .
           "
       
       - name: Upload benchmark result
@@ -296,7 +332,7 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
 

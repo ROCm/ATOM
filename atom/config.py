@@ -17,6 +17,10 @@ from atom.utils.distributed.utils import stateless_init_torch_distributed_proces
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+# plugin-related utilities
+from atom.plugin import is_plugin_mode
+from atom.plugin.config import PluginConfig
+
 logger = logging.getLogger("atom")
 
 
@@ -285,7 +289,6 @@ class QuantizationConfig(dict):
         factors.append(self["quant_name"])
         factors.append(self["is_dynamic"])
         factors.append(self["quant_method"])
-        str_factors = str(factors)
         # assert_hashable(str_factors)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
@@ -524,6 +527,9 @@ class SpeculativeConfig:
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         if hf_config.model_type == "deepseek_v3":
             hf_config.model_type = "deepseek_mtp"
+        if hf_config.model_type == "qwen3_next":
+            hf_config.model_type = "qwen3_next_mtp"
+
         if hf_config.model_type == "deepseek_mtp":
             # DeepSeek MTP typically uses only 1 layer that gets reused
             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
@@ -541,6 +547,18 @@ class SpeculativeConfig:
                     "architectures": ["DeepSeekMTPModel"],
                 }
             )
+        if hf_config.model_type == "qwen3_next_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            if n_predict != 1:
+                logger.warning(
+                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                    "(MTP typically uses 1 layer that gets reused)"
+                )
+                n_predict = 1
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Qwen3NextMTPModel"]}
+            )
+        logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
         method = self.method
@@ -584,6 +602,9 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
 
+    # only use for plugin mode
+    plugin_config: Optional[PluginConfig] = None
+
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.compilation_config.cudagraph_capture_sizes
@@ -598,9 +619,7 @@ class Config:
 
     def __post_init__(self):
         # assert os.path.isdir(self.model)
-        assert (
-            self.kv_cache_block_size % 16 == 0 or self.kv_cache_block_size == 1
-        ), f"kv_cache_block_size ({self.kv_cache_block_size}) must be a multiple of 16 or 1"
+
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(self.model)
         if not hasattr(self.hf_config, "rope_parameters"):
@@ -609,6 +628,7 @@ class Config:
             if rope_params is None:
                 rope_params = {}
             rope_params["rope_theta"] = getattr(self.hf_config, "rope_theta", None)
+            rope_params["rope_type"] = getattr(self.hf_config, "rope_type", "default")
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
@@ -628,16 +648,25 @@ class Config:
                 self.max_model_len, hf_config_max_position_embeddings
             )
         # assert self.max_num_batched_tokens >= self.max_model_len
-        if self.torch_profiler_dir is not None:
-            os.makedirs(self.torch_profiler_dir, exist_ok=True)
-        assert self.torch_profiler_dir is None or os.path.isdir(
-            self.torch_profiler_dir
-        ), f"torch_profiler_dir {self.torch_profiler_dir} is not a valid directory"
-        if self.compilation_config.level == CompilationLevel.PIECEWISE:
-            self.compilation_config.set_splitting_ops_for_v1()
-            self._set_cudagraph_sizes()
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-            self.compilation_config.init_with_cudagraph_sizes()
+        if not is_plugin_mode():
+            if self.torch_profiler_dir is not None:
+                os.makedirs(self.torch_profiler_dir, exist_ok=True)
+            assert self.torch_profiler_dir is None or os.path.isdir(
+                self.torch_profiler_dir
+            ), f"torch_profiler_dir {self.torch_profiler_dir} is not a valid directory"
+
+        # only for server mode or plugin mode(vllm)
+        # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
+        # for cuda graph capture, plugin mode(vllm) uses the vLLM's cuda graph capture policy
+        if not is_plugin_mode() or (
+            self.plugin_config is not None and self.plugin_config.is_vllm
+        ):
+            if self.compilation_config.level == CompilationLevel.PIECEWISE:
+                self.compilation_config.set_splitting_ops_for_v1()
+                self._set_cudagraph_sizes()
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                self.compilation_config.init_with_cudagraph_sizes()
+
         self.torch_dtype = (
             self.hf_config.dtype
             if getattr(self.hf_config, "dtype", None) is not None
@@ -645,10 +674,9 @@ class Config:
         )
 
         if self.speculative_config is not None:
-            if self.speculative_config.num_speculative_tokens != 1:
+            if self.speculative_config.num_speculative_tokens > 4:
                 raise ValueError(
-                    f"num_speculative_tokens must be 1, got {self.speculative_config.num_speculative_tokens}. "
-                    "Only num_speculative_tokens=1 is currently supported."
+                    f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
                 )
 
     def compute_hash(self) -> str:

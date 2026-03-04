@@ -60,9 +60,9 @@ def main():
         for prompt in prompts
     ]
     print("This is prompts:", prompts)
-    print("Warming up...")
-    _ = llm.generate(["warmup"], sampling_params)
-    print("Warm up done")
+    # print("Warming up...")
+    # _ = llm.generate(["warmup"], sampling_params)
+    # print("Warm up done")
 
     print("\n" + "=" * 70)
     print("Starting profiling...")

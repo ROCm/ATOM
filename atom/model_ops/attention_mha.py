@@ -15,8 +15,15 @@ from torch import nn
 
 from .attention_mla import MLAModules
 
+from atom.plugin.prepare import is_plugin_mode, is_vllm
+from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
 
-class Attention(nn.Module):
+
+@PagedAttentionImplDecoratorForPluginMode
+class PagedAttentionImpl(nn.Module):
+    """
+    Attention paged implementation
+    """
 
     def __init__(
         self,
@@ -24,11 +31,15 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        alibi_slopes: list[float] | None,
+        sliding_window: Optional[int] = None,
         kv_cache_dtype="bf16",
+        logits_soft_cap: float | None = None,
+        attn_type=None,
+        kv_sharing_target_layer_name: int | None = None,
         layer_num=0,
         mla_modules: Optional[MLAModules] = None,
         sinks: Optional[nn.Parameter] = None,
-        sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
         q_norm: Optional[torch.nn.Module] = None,
         k_norm: Optional[torch.nn.Module] = None,
@@ -37,12 +48,16 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
+        # for upper framework, it uses head_size in built-in methods
+        self.head_size = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.alibi_slopes = alibi_slopes
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
+        self.device = "cuda:" + str(torch.cuda.current_device())
         self.layer_num = layer_num
         self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
@@ -56,7 +71,11 @@ class Attention(nn.Module):
         self.q_norm = q_norm
         self.k_norm = k_norm
 
-    def forward(
+        # for plugin mode(vllm), the query quant is disabled for now
+        if is_vllm():
+            self.supports_quant_query_input = False
+
+    def forward_impl_server_mode(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -69,7 +88,7 @@ class Attention(nn.Module):
         fwd_ctx: ForwardContext = get_forward_context()
 
         # dummy run will skip attention in cuda graph capture phase
-        if fwd_ctx.attn_metadata.slot_mapping.numel() == 0:
+        if fwd_ctx.context.is_dummy_run:
             o = torch.empty_like(q)
             return o
 
@@ -202,9 +221,13 @@ class Attention(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
 
         o = torch.empty_like(q)
-        num_seqs, num_q_heads_total, head_size = q.shape
+        num_seqs = attn_metadata.context_lens.shape[0]
+        _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        query_group_size = num_q_heads_total // num_kv_heads
+        # assume all query have same length
+        query_group_size = attn_metadata.max_seqlen_q * (
+            num_q_heads_total // num_kv_heads
+        )
         assert num_q_heads_total % num_kv_heads == 0
 
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
@@ -241,7 +264,6 @@ class Attention(nn.Module):
             if self.kv_cache_dtype == "bf16"  # or per_tensor
             else aiter.dtypes.fp8
         )
-
         torch.ops.aiter.pa_decode_gluon(
             o,
             q,
@@ -280,9 +302,11 @@ class Attention(nn.Module):
             attn_metadata.block_tables,
             attn_metadata.context_lens,
             attn_metadata.block_tables.stride(0),
+            max_qlen=attn_metadata.max_seqlen_q,
             K_QScale=k_scale,
             V_QScale=v_scale,
             out_=None,
+            qo_indptr=attn_metadata.cu_seqlens_q,
             high_precision=0,
         )
 
@@ -364,13 +388,7 @@ class Attention(nn.Module):
         # value:  [num_blocks, 1, num_kv_heads, head_size]
 
         attn_metadata = fwd_ctx.attn_metadata
-        ctx = fwd_ctx.context
-
         block_tables = attn_metadata.block_tables
-        if ctx.is_prefill:
-            k_cache = k.unsqueeze(1)
-            v_cache = v.unsqueeze(1)
-            block_tables = attn_metadata.fake_block_tables
 
         o = torch.empty_like(q)
         descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
@@ -417,3 +435,39 @@ class Attention(nn.Module):
                 if atom_config.kv_cache_block_size == 1024:
                     return self.paged_attention_persistent_asm
                 return self.paged_attention_asm
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor = None,
+        attn_metadata=None,
+        position: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor] = None,
+        qkv: torch.Tensor = None,
+        output: torch.Tensor = None,
+        **kwargs,
+    ):
+        if is_plugin_mode():
+            # forward impl method are added by the decorator
+            # PagedAttentionImplDecoratorForPluginMode
+            return self.forward_impl_plugin_mode(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                position=position,
+                q_scale=q_scale,
+                qkv=qkv,
+            )
+        else:
+            # only for server mode, keep the original method
+            o = self.forward_impl_server_mode(
+                q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
+            )
+
+            return o

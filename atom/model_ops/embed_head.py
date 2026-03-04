@@ -6,9 +6,9 @@ import torch.nn.functional as F
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_tp_group
 from aiter.tuned_gemm import tgemm
-from torch import nn
-
 from atom.utils.forward_context import ForwardContext, get_forward_context
+from torch import nn
+from atom.plugin import is_plugin_mode
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -68,13 +68,14 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor):
-        forward_context: ForwardContext = get_forward_context()
-        context = forward_context.context
-        attn_metadata = forward_context.attn_metadata
-        # context = get_context()
-        if context.is_prefill and not context.is_draft:
-            last_indices = attn_metadata.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+        if not is_plugin_mode():
+            forward_context: ForwardContext = get_forward_context()
+            context = forward_context.context
+            attn_metadata = forward_context.attn_metadata
+            # context = get_context()
+            if context.is_prefill and not context.is_draft:
+                last_indices = attn_metadata.cu_seqlens_q[1:] - 1
+                x = x[last_indices].contiguous()
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             logits = tensor_model_parallel_all_gather(logits)

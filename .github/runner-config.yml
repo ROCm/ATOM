@@ -1,0 +1,19 @@
+# Runner label → GPU hardware mapping
+# Used by frameworks-devops-dashboard to display GPU architecture
+# Update this when runners are added/changed in CI workflows
+runners:
+  atom-mi355-8gpu.predownload:
+    gpu_arch: MI355
+    gpu_count: 8
+
+  linux-atom-mi355-1:
+    gpu_arch: MI355
+    gpu_count: 1
+
+  linux-atom-mi355-4:
+    gpu_arch: MI355
+    gpu_count: 4
+
+  linux-atom-mi355-8:
+    gpu_arch: MI355
+    gpu_count: 8

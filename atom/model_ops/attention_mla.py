@@ -5,6 +5,9 @@ import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional
+import triton
+import triton.language as tl
+
 
 import torch
 from aiter import (
@@ -32,7 +35,7 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 
-torch.set_printoptions(threshold=10_000)
+# torch.set_printoptions(threshold=10_000)
 
 logger = logging.getLogger("atom")
 
@@ -93,7 +96,7 @@ class MLAAttention(nn.Module):
     def __init__(
         self,
         num_heads: int,
-        head_size: int,
+        head_dim: int,
         scale: float,
         num_kv_heads: int,
         kv_cache_dtype: str,
@@ -104,7 +107,7 @@ class MLAAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
-        self.head_size = head_size
+        self.head_dim = head_dim
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype if kv_cache_dtype == "fp8" else "auto"
@@ -540,6 +543,7 @@ class MLAAttention(nn.Module):
             paged_kv_indices,
             attn_metadata.kv_last_page_lens,
             attn_metadata.max_seqlen_q,
+            num_kv_splits=16,
             sm_scale=self.scale,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
@@ -570,20 +574,7 @@ class MLAAttention(nn.Module):
             self.topk_indices_buffer is not None
             and attn_metadata.max_seqlen_k > self.topk_indices_buffer.shape[1]
         )
-        if attn_metadata.slot_mapping.numel():
-            # not dummy run
-            kv_cache_data = forward_context.kv_cache_data
-            if f"layer_{self.layer_num}" in kv_cache_data:
-                kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
-            else:
-                kv_cache = torch.tensor([])
-        slot_mapping_numel = (
-            attn_metadata.slot_mapping.numel()
-            if attn_metadata.slot_mapping is not None
-            else 0
-        )
-        is_dummy = slot_mapping_numel == 0
-        if is_dummy:
+        if forward_context.context.is_dummy_run:
             # dummy run: skip real attention and return
             output_shape = list(q.shape)
             output_shape[-1] = 7168
@@ -591,6 +582,8 @@ class MLAAttention(nn.Module):
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output
+        kv_cache_data = forward_context.kv_cache_data
+        kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
@@ -653,10 +646,6 @@ class MLAAttention(nn.Module):
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
         return output
-
-
-import triton
-import triton.language as tl
 
 
 @triton.jit
