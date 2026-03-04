@@ -7,12 +7,11 @@ import triton
 import triton.language as tl
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
+from atom.plugin import is_plugin_mode
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
-from atom.plugin import is_plugin_mode
-
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 @triton.jit
@@ -176,7 +175,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
-            logits = tensor_model_parallel_all_gather(logits)
+            logits = tensor_model_parallel_all_gather(logits, use_custom=True)
             # all_logits = (
             #     [torch.empty_like(logits) for _ in range(self.tp_size)]
             #     if self.tp_rank == 0
