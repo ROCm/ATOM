@@ -22,6 +22,7 @@ ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMMoEForCau
 _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "Qwen3ForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "DeepseekV3ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
 }
 
 
@@ -43,13 +44,8 @@ def register_platform() -> Optional[str]:
     return "atom.plugin.vllm.platform.ATOMPlatform"
 
 
-def _patch_vllm_attention_process_weights_after_loading() -> None:
-    try:
-        from vllm.attention.layer import Attention
-    except ImportError:
-        from vllm.model_executor.layers.attention import Attention
-
-    orig = Attention.process_weights_after_loading
+def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
+    orig = attention.process_weights_after_loading
 
     if getattr(orig, "_atom_default_act_dtype_patched", False):
         return
@@ -74,7 +70,7 @@ def _patch_vllm_attention_process_weights_after_loading() -> None:
         return orig(self, act_dtype)
 
     setattr(wrapped, "_atom_default_act_dtype_patched", True)
-    Attention.process_weights_after_loading = wrapped
+    attention.process_weights_after_loading = wrapped
 
 
 def register_model() -> None:
@@ -107,4 +103,10 @@ def register_model() -> None:
 
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
-    _patch_vllm_attention_process_weights_after_loading()
+    try:
+        from vllm.attention.layer import Attention, MLAAttention
+    except ImportError:
+        from vllm.model_executor.layers.attention import Attention, MLAAttention
+
+    _patch_vllm_attention_process_weights_after_loading(Attention)
+    _patch_vllm_attention_process_weights_after_loading(MLAAttention)

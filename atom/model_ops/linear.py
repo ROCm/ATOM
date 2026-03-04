@@ -385,8 +385,9 @@ class LinearBase(nn.Module):
                 if self.quant_type.value == QuantType.per_1x128.value:
                     quant_func = functools_partial(quant_func, transpose_scale=True)
                 if self.quant_type.value != QuantType.per_1x32.value:
+                    # quant_func will call view, so we need to call contiguous to avoid view error
                     x, x_scale = quant_func(
-                        x,
+                        x.contiguous(),
                         quant_dtype=self.params_dtype,
                         scale=getattr(self, "input_scale", None),
                     )

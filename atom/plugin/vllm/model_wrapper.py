@@ -29,6 +29,7 @@ logger = logging.getLogger("atom")
 _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
+    "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
 }
 
 
@@ -107,6 +108,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             assert intermediate_tensors is not None
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
+
+        # capture. This ensures attention_mla reads correct positions in graph mode.
+        # This is only for mla attention in plugin mode.
+        if "positions" in self.atom_config.compilation_config.static_forward_context:
+            buf = self.atom_config.compilation_config.static_forward_context[
+                "positions"
+            ]
+            buf[: positions.numel()].copy_(positions)
 
         hidden_states = self.model(
             input_ids=input_ids,

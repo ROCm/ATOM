@@ -135,14 +135,6 @@ def all_close_1d(x: torch.Tensor) -> bool:
     return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))
 
 
-def per_tensor_dequantize(
-    tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
-) -> torch.Tensor:
-    fake_qweight = tensor.to(torch.float16)
-    dq_weight = fake_qweight * inv_scale
-    return dq_weight
-
-
 def get_and_maybe_dequant_weights(layer: nn.Module) -> torch.Tensor:
     if layer.quant_type != QuantType.No:
         # NOTE: This should only be used offline, since it's O(N^3)
