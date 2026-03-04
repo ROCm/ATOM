@@ -3,7 +3,7 @@
 
 # from flash_attn import flash_attn_with_kvcache
 from typing import Optional
-
+import os
 import torch
 from torch import nn
 
@@ -60,15 +60,15 @@ class PagedAttention(BaseAttention):
             **kwargs,
         )
 
+        self.use_mla = use_mla
         # for plugin mode
         if is_vllm():
-            self.use_mla = use_mla
-            self.rotary_emb = rotary_emb
+            self.rotary_emb = mla_modules.rotary_emb
 
             try:
-                from vllm.attention.layer import Attention, AttentionType
+                from vllm.attention.layer import Attention, MLAAttention, AttentionType
             except ImportError:
-                from vllm.model_executor.layers.attention import Attention
+                from vllm.model_executor.layers.attention import Attention, MLAAttention
                 from vllm.v1.attention.backend import AttentionType
 
             atom_config = get_current_atom_config()
@@ -88,28 +88,85 @@ class PagedAttention(BaseAttention):
                 extra_impl_args["rotary_emb"] = rotary_emb
                 extra_impl_args["q_norm"] = q_norm
                 extra_impl_args["k_norm"] = k_norm
+                if use_mla:
+                    extra_impl_args["layer_num"] = layer_num
+                    extra_impl_args["mla_modules"] = mla_modules
 
-            self.attn = Attention(
-                num_heads=num_heads,
-                head_size=head_dim,
-                scale=scale,
-                num_kv_heads=num_kv_heads,
-                alibi_slopes=alibi_slopes,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                logits_soft_cap=None,
-                per_layer_sliding_window=per_layer_sliding_window,
-                prefix=f"{prefix}",
-                attn_type=AttentionType.DECODER,
-                kv_sharing_target_layer_name=None,
-                **extra_impl_args,
-            )
+            if use_mla:
+                assert (
+                    mla_modules.indexer is None
+                ), "MLAAttention is not supported for sparse mode"
+                self.num_heads = num_heads
+                self.v_head_dim = mla_modules.v_head_dim
+                self.qk_head_dim = mla_modules.qk_head_dim
+                self.qk_nope_head_dim = mla_modules.qk_nope_head_dim
+                self.q_proj = mla_modules.q_proj
+                self.o_proj = mla_modules.o_proj
+
+                self.attn = MLAAttention(
+                    num_heads=num_heads,
+                    scale=scale,
+                    qk_nope_head_dim=mla_modules.qk_nope_head_dim,
+                    qk_rope_head_dim=mla_modules.qk_rope_head_dim,
+                    v_head_dim=mla_modules.v_head_dim,
+                    q_lora_rank=mla_modules.q_lora_rank,
+                    kv_lora_rank=mla_modules.kv_lora_rank,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.attn",
+                    kv_b_proj=mla_modules.kv_b_proj,
+                    use_sparse=False,
+                    indexer=mla_modules.indexer,
+                    **extra_impl_args,
+                )
+
+                def wrap_kv_b_proj(module_instance):
+                    orig_impl = module_instance.forward
+
+                    def new_forward(*args, **kwargs):
+                        out = orig_impl(*args, **kwargs)
+                        if (
+                            os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower()
+                            == "0"
+                        ):
+                            return out
+                        return out, None
+
+                    module_instance.forward = new_forward
+                    return module_instance
+
+                # vllm kv_b_proj return two values (output, bias), so we need to wrap it for fallback path.
+                self.attn.impl.kv_b_proj = wrap_kv_b_proj(self.attn.impl.kv_b_proj)
+            else:
+                self.attn = Attention(
+                    num_heads=num_heads,
+                    head_size=head_dim,
+                    scale=scale,
+                    num_kv_heads=num_kv_heads,
+                    alibi_slopes=alibi_slopes,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    logits_soft_cap=None,
+                    per_layer_sliding_window=per_layer_sliding_window,
+                    prefix=f"{prefix}",
+                    attn_type=AttentionType.DECODER,
+                    kv_sharing_target_layer_name=None,
+                    **extra_impl_args,
+                )
 
             compilation_config = atom_config.compilation_config
             self.layer_name = prefix
             if self.layer_name in compilation_config.static_forward_context:
                 raise ValueError("Duplicate layer: {}".format(self.layer_name))
             compilation_config.static_forward_context[self.layer_name] = self
+
+            if self.use_mla:
+                max_num_tokens = (
+                    atom_config.plugin_config.vllm_scheduler_config.max_num_batched_tokens
+                )
+                compilation_config.static_forward_context["positions"] = torch.zeros(
+                    max_num_tokens, dtype=torch.int64, device="cuda"
+                )
             return
 
         self.num_heads = num_heads
@@ -122,7 +179,6 @@ class PagedAttention(BaseAttention):
         self.k_scale = self.v_scale = None
         self.layer_num = layer_num
         self.mla_modules = mla_modules
-        self.use_mla = use_mla
         self.base_attention = None
         self.kv_cache = torch.tensor([])
         self.indexer = mla_modules.indexer if mla_modules is not None else None
@@ -136,7 +192,7 @@ class PagedAttention(BaseAttention):
             use_mla=self.use_mla,
         )
         impl_cls = self.attn_backend.get_impl_cls()
-        self.impl = impl_cls(
+        impl_args = dict(
             num_heads=num_heads,
             head_dim=head_dim,
             scale=scale,
@@ -153,7 +209,8 @@ class PagedAttention(BaseAttention):
             k_norm=k_norm,
             **kwargs,
         )
-
+        impl_args["head_size" if self.use_mla else "head_dim"] = head_dim
+        self.impl = impl_cls(**impl_args)
         compilation_config = atom_config.compilation_config
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name

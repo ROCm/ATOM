@@ -9,7 +9,6 @@ import logging
 import os
 
 logger = logging.getLogger("atom")
-
 # This flag is used to enable the vLLM plugin mode.
 disable_vllm_plugin = os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
 disable_vllm_plugin_attention = (
@@ -31,6 +30,8 @@ if not disable_vllm_plugin:
                 )
 
             logger.info("Use atom attention backend")
+            if attn_selector_config.use_mla:
+                return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"
             return "atom.model_ops.attentions.aiter_attention.AiterBackend"
 
 else:

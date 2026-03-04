@@ -35,6 +35,11 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
 
+
+from atom.plugin import is_plugin_mode, is_vllm
+
+from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
+
 # torch.set_printoptions(threshold=10_000)
 
 logger = logging.getLogger("atom")
@@ -92,11 +97,12 @@ def dynamic_per_batched_tensor_quant(
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
+@MLAAttentionImplDecoratorForPluginMode
 class MLAAttention(nn.Module):
     def __init__(
         self,
         num_heads: int,
-        head_dim: int,
+        head_size: int,
         scale: float,
         num_kv_heads: int,
         kv_cache_dtype: str,
@@ -107,7 +113,7 @@ class MLAAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = head_dim
+        self.head_dim = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype if kv_cache_dtype == "fp8" else "auto"
@@ -134,7 +140,34 @@ class MLAAttention(nn.Module):
         )
         self.layer_num = layer_num
 
-    def process_weights_after_loading(self):
+        # for plugin mode(vllm)
+        if is_vllm():
+            self.supports_quant_query_input = False
+            self.dcp_world_size: int = -1
+            from vllm.config import get_current_vllm_config
+            from vllm.model_executor.layers.attention.mla_attention import (
+                MLACommonMetadataBuilder,
+            )
+
+            self.chunked_prefill_workspace_size = (
+                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
+                    get_current_vllm_config()
+                )
+            )
+            self.cp_kv_cache_interleave_size: int = (
+                get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+            )
+
+            self.is_aiter_triton_fp4_bmm_enabled = (
+                is_rocm_aiter_fp4bmm_enabled()
+                and self.kv_b_proj.weight.dtype == torch.bfloat16
+            )
+            # q_pad_num_heads in kwargs
+            self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
+            self._pad_v = True
+            self.flash_attn_varlen_func = flash_attn_varlen_func
+
+    def process_weights_after_loading(self, act_dtype: Optional[torch.dtype] = None):
         if is_rocm_aiter_fp4bmm_enabled():
             kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj)
             self.W_K, self.W_K_scale, W_V, self.W_V_scale = quark_post_load_weights(
@@ -146,7 +179,7 @@ class MLAAttention(nn.Module):
             self.W_K_scale = self.W_K_scale.transpose(-2, -1).contiguous()
             self.W_V = self.W_V.transpose(-2, -1).contiguous()
             self.W_V_scale = self.W_V_scale.transpose(-2, -1).contiguous()
-        else:  # is_rocm_aiter_fp8bmm_enabled():
+        else:  # is_rocm_aiter_fp8bmm_enabled()
             kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
             assert kv_b_proj_weight.shape == (
                 self.kv_lora_rank,
@@ -175,7 +208,7 @@ class MLAAttention(nn.Module):
                 W_V, dtype=dtypes.fp8
             )
 
-    def _v_up_proj_and_o_proj(self, x):
+    def _v_up_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
@@ -207,7 +240,7 @@ class MLAAttention(nn.Module):
             )
             # Convert from (B, N, V) to (B, N * V)
             x = x.reshape(-1, self.num_heads * self.v_head_dim)
-        return self.o_proj(x)
+        return x
 
     def _q_proj_and_k_up_proj(self, x, x_scale=None):
         q_nope, q_pe = (
@@ -413,7 +446,7 @@ class MLAAttention(nn.Module):
             causal=True,
         )
 
-        return self.o_proj(output.flatten(start_dim=-2))
+        return output.flatten(start_dim=-2)
 
     def _forward_prefill_mla(
         self,
@@ -480,7 +513,7 @@ class MLAAttention(nn.Module):
                     None,
                 )
 
-        return self._v_up_proj_and_o_proj(o)
+        return self._v_up_proj(o)
 
     def _forward_decode(
         self,
@@ -555,16 +588,15 @@ class MLAAttention(nn.Module):
             kv_scale=self._k_scale,
         )
 
-        return self._v_up_proj_and_o_proj(o)
+        return self._v_up_proj(o)
 
-    def forward(
+    def forward_impl_server_mode(
         self,
-        q: torch.Tensor,  # query in unified attn
+        q: torch.Tensor,
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
-        positions: torch.Tensor,
-        q_scale: Optional[torch.Tensor],
-        qkv: Optional[torch.Tensor],
+        positions: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
@@ -577,7 +609,7 @@ class MLAAttention(nn.Module):
         if forward_context.context.is_dummy_run:
             # dummy run: skip real attention and return
             output_shape = list(q.shape)
-            output_shape[-1] = 7168
+            output_shape[-1] = self.num_heads * self.v_head_dim
             atom_config = get_current_atom_config()
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
@@ -646,6 +678,41 @@ class MLAAttention(nn.Module):
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
         return output
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,  # query in unified attn
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        kv_cache: torch.Tensor = None,
+        attn_metadata=None,
+        positions: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor] = None,
+        output: torch.Tensor = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if is_plugin_mode():
+            # forward impl method are added by the decorator
+            # MLAAttentionImplDecoratorForPluginMode
+            return self.forward_impl_plugin_mode(
+                layer=layer,
+                q=query,
+                k_c_normed=k_nope,
+                k_pe=k_rope,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                output=output,
+            )
+        else:
+            # only for server mode, keep the original method
+            return self.forward_impl_server_mode(
+                q=query,
+                k_nope=k_nope,
+                k_rope=k_rope,
+                positions=positions,
+                q_scale=q_scale,
+            )
 
 
 @triton.jit
