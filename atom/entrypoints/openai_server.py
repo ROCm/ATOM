@@ -910,16 +910,6 @@ def main():
     engine_args = EngineArgs.from_cli_args(args)
     engine = engine_args.create_engine()
 
-    if args.mark_trace:
-        logger.info(
-            "--mark-trace enabled: reinitializing engine once to apply compile-time instrumentation changes."
-        )
-        try:
-            engine.core_mgr.close()
-        except Exception as e:
-            logger.warning(f"Failed to close engine before reinitialize: {e}")
-        engine = engine_args.create_engine()
-
     print(f"Starting server on {args.host}:{args.server_port}...")
     uvicorn.run(app, host=args.host, port=args.server_port)
 

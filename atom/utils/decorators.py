@@ -5,6 +5,7 @@ from typing import Callable, Optional, TypeVar, Union
 import inspect
 import os
 import sys
+from functools import wraps
 from types import CodeType
 from abc import abstractmethod
 from contextlib import contextmanager
@@ -24,6 +25,63 @@ _T = TypeVar("_T", bound=type[nn.Module])
 
 context_manager = None
 torch_compile_start_time: float = 0.0
+
+
+def record_function(prefix: Union[str, Callable, None] = None):
+    """
+    Decorator that wraps a function with torch.profiler.record_function.
+
+    Usage:
+    - @record_function
+    - @record_function("my_prefix")
+    """
+
+    def _decorate(func: Callable):
+        # Try to recover the original callable signature even when func is wrapped
+        # by other decorators.
+        base_func = inspect.unwrap(func)
+        try:
+            base_sig = inspect.signature(base_func)
+        except (TypeError, ValueError):
+            base_sig = None
+
+        @wraps(func)
+        def _wrapped(*args, **kwargs):
+            # Keep this decorator no-op unless mark-trace is enabled.
+            from atom.utils.graph_marker import is_graph_marker_enabled
+            if not is_graph_marker_enabled():
+                return func(*args, **kwargs)
+
+            # Priority:
+            # 1) explicit decorator prefix: @record_function("xxx")
+            # 2) runtime function argument named "prefix" when non-empty
+            # 3) function name fallback
+            if prefix is not None:
+                span_name = str(prefix)
+            else:
+                span_name = func.__name__
+                runtime_prefix = kwargs.get("prefix")
+                if not (isinstance(runtime_prefix, str) and runtime_prefix):
+                    if base_sig is not None:
+                        try:
+                            bound = base_sig.bind_partial(*args, **kwargs)
+                            runtime_prefix = bound.arguments.get("prefix")
+                        except Exception:
+                            runtime_prefix = None
+                if isinstance(runtime_prefix, str) and runtime_prefix:
+                    span_name = runtime_prefix
+
+            with torch.profiler.record_function(f"{span_name}"):
+                return func(*args, **kwargs)
+
+        return _wrapped
+
+    # Support @record_function without parentheses.
+    if callable(prefix):
+        func = prefix
+        prefix = None
+        return _decorate(func)
+    return _decorate
 
 
 def _graph_marker_first_tensor(obj, name: str):

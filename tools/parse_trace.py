@@ -11,6 +11,7 @@ import gzip
 import sys
 import bisect
 import argparse
+import re
 from typing import List, Dict, Any, Tuple, Optional
 from openpyxl import Workbook
 
@@ -53,69 +54,124 @@ def should_filter_prefill(name: str) -> bool:
     return any(f in name for f in FILTER_OUT_PREFILL)
 
 
-def write_breakdown_xlsx(output_xlsx: str, rows: List[List[Any]], sheet_name: str) -> None:
+def write_breakdown_xlsx(
+    output_xlsx: str,
+    rows: List[List[Any]],
+    sheet_name: str,
+    avg_rows: Optional[List[List[Any]]] = None,
+) -> None:
     """
     Write XLSX breakdown with columns:
-    cpu_module, gpu_kernel, duration_us, sum per module.
+    cpu_module, gpu_kernel, duration_us, sum per module,
+    avg duration_us, avg sum per module.
 
-    The 1st and 4th columns are merged for contiguous identical modules.
+    The 1st/4th columns are merged for contiguous identical modules.
+    AVG columns are appended to the right in the same table.
     """
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_name
-    ws.append(['cpu_module', 'gpu_kernel', 'duration_us', 'sum per module'])
+    ws.append([
+        'cpu_module', 'gpu_kernel', 'duration_us', 'sum per module',
+        'avg duration_us', 'avg sum per module'
+    ])
 
-    if not rows:
-        wb.save(output_xlsx)
-        return
+    def build_groups(block_rows: List[List[Any]]) -> List[Tuple[int, int, str, float]]:
+        groups: List[Tuple[int, int, str, float]] = []
+        i = 0
+        while i < len(block_rows):
+            mod = block_rows[i][0]
+            j = i + 1
+            total = float(block_rows[i][2])
+            while j < len(block_rows) and block_rows[j][0] == mod:
+                total += float(block_rows[j][2])
+                j += 1
+            groups.append((i, j - 1, mod, total))
+            i = j
+        return groups
 
-    # Build contiguous groups by cpu_module in current row order.
-    groups: List[Tuple[int, int, str, float]] = []
-    i = 0
-    while i < len(rows):
-        mod = rows[i][0]
-        j = i + 1
-        total = float(rows[i][2])
-        while j < len(rows) and rows[j][0] == mod:
-            total += float(rows[j][2])
-            j += 1
-        groups.append((i, j - 1, mod, total))
-        i = j
+    main_groups = build_groups(rows) if rows else []
+    renamed_group_mods = [g[2] for g in main_groups]
+    seen_rmsnorm = 0
+    for gi, mod in enumerate(renamed_group_mods):
+        if isinstance(mod, str) and 'rmsnorm' in mod.lower():
+            if seen_rmsnorm == 0:
+                renamed_group_mods[gi] = 'input_layernorm'
+            elif seen_rmsnorm == 1:
+                renamed_group_mods[gi] = 'post_attn_layernorm'
+            seen_rmsnorm += 1
 
-    # Write rows with per-module sum in 4th column.
-    for start, end, _, total in groups:
+    avg_sum_by_row: Dict[int, float] = {}
+    if avg_rows:
+        avg_groups = build_groups(avg_rows)
+        for start, end, _, total in avg_groups:
+            for i in range(start, end + 1):
+                avg_sum_by_row[i] = total
+
+    data_start_row = ws.max_row + 1
+    for gi, (start, end, _, total) in enumerate(main_groups):
+        renamed_mod = renamed_group_mods[gi]
         for idx in range(start, end + 1):
-            mod, kernel, dur = rows[idx]
-            ws.append([mod, kernel, dur, total])
+            _, kernel, dur = rows[idx]
+            avg_dur = float(avg_rows[idx][2]) if avg_rows and idx < len(avg_rows) else ''
+            avg_sum = avg_sum_by_row.get(idx, '')
+            ws.append([renamed_mod, kernel, dur, total, avg_dur, avg_sum])
 
-    # Merge col A and D for each contiguous module group (row offset +2 for header).
-    for start, end, _, _ in groups:
+    for start, end, _, _ in main_groups:
         if end > start:
-            r1 = start + 2
-            r2 = end + 2
+            r1 = data_start_row + start
+            r2 = data_start_row + end
             ws.merge_cells(start_row=r1, start_column=1, end_row=r2, end_column=1)
             ws.merge_cells(start_row=r1, start_column=4, end_row=r2, end_column=4)
+            if avg_rows:
+                ws.merge_cells(start_row=r1, start_column=6, end_row=r2, end_column=6)
+
+    total_duration = sum(float(r[2]) for r in rows) if rows else 0.0
+    total_avg_duration = sum(float(r[2]) for r in avg_rows) if avg_rows else ''
+    ws.append(['TOTAL', '', total_duration, '', total_avg_duration, ''])
 
     wb.save(output_xlsx)
 
 
-def rename_rmsnorm_modules(rows: List[List[Any]]) -> None:
+def _normalize_module_for_avg(name: str) -> str:
+    if not isinstance(name, str):
+        return str(name)
+    return re.sub(r"model\.layers\.\d+\.", "model.layers.*.", name)
+
+
+def build_avg_rows_from_layers(
+    layer_rows_list: List[List[List[Any]]],
+    layer_start_idx: int,
+    section_name: str,
+) -> Optional[List[List[Any]]]:
     """
-    Rename first two rmsnorm cpu module names in-place:
-    - first  -> input_layernorm
-    - second -> post_attn_layernorm
+    Build AVG rows across layers using layer-3 rows as template.
+    Returns None if any layer cannot be aligned by (module, kernel) sequence.
     """
-    seen = 0
-    for row in rows:
-        if not row or len(row) < 1:
-            continue
-        mod = row[0]
-        if isinstance(mod, str) and 'rmsnorm' in mod.lower():
-            if seen == 0:
-                row[0] = 'input_layernorm'
-            elif seen == 1:
-                row[0] = 'post_attn_layernorm'
-            seen += 1
+    if not layer_rows_list:
+        return []
+
+    base = layer_rows_list[0]
+    base_sig = [(_normalize_module_for_avg(r[0]), r[1]) for r in base]
+
+    for rel_idx, rows in enumerate(layer_rows_list[1:], start=1):
+        sig = [(_normalize_module_for_avg(r[0]), r[1]) for r in rows]
+        if sig != base_sig:
+            bad_layer = layer_start_idx + rel_idx
+            print(
+                f"{section_name} avg skipped: layer {bad_layer} does not match layer {layer_start_idx} layout."
+            )
+            return None
+
+    n = len(layer_rows_list)
+    avg_rows: List[List[Any]] = []
+    for i, (mod, kernel) in enumerate(base_sig):
+        # Keep original module display style from layer_start_idx rows.
+        display_mod = base[i][0]
+        avg_dur = sum(float(layer_rows_list[l][i][2]) for l in range(n)) / n
+        avg_rows.append([display_mod, kernel, avg_dur])
+    return avg_rows
+
 
 
 # =============================================================================
@@ -340,12 +396,6 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
         f"Prefill level 1 (same thread pid={prefill_pid}, tid={prefill_tid}): "
         f"{len(level1_children)} nodes"
     )
-    print("First 20 level 1 nodes:")
-    for i, child in enumerate(level1_children[:20]):
-        print(
-            f"  [{i:02d}] {child.get('name', '<unknown>')} "
-            f"(ts={child.get('ts', 0):.0f}, dur={child.get('dur', 0):.0f})"
-        )
 
     # Keep only level2 children that have kernel launch in their subtree.
     launch_level2_items = []
@@ -363,38 +413,36 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
             })
 
     print(f"Level2 children with kernel launch: {len(launch_level2_items)}")
-    print("First 20 level2 (with kernel launch):")
-    for i, item in enumerate(launch_level2_items[:20]):
-        l2 = item['level2_event']
-        print(
-            f"  [{i:02d}] L1={item['level1_name']} | "
-            f"L2={l2.get('name', '<unknown>')} | "
-            f"cat={l2.get('cat', '')} | dur={l2.get('dur', 0):.0f}"
-        )
 
     # Layer extraction by rmsnorm positions:
     # each layer has 2 rmsnorm modules, layer N starts at rmsnorm index 2*N (0-based).
     TARGET_LAYER = target_layer
-    norm_indices = [
+    all_norm_indices = [
         i for i, item in enumerate(launch_level2_items)
         if 'rmsnorm' in item['level2_event'].get('name', '').lower()
     ]
-    print(f"Found {len(norm_indices)} rmsnorm modules in level2-with-launch rows")
+    # Last rmsnorm is final layernorm, not part of transformer layers.
+    norm_indices = all_norm_indices[:-1] if len(all_norm_indices) > 0 else []
+    print(
+        f"Found {len(all_norm_indices)} rmsnorm modules in level2-with-launch rows "
+        f"({len(norm_indices)} used for layer split, excluding final layernorm)"
+    )
 
-    layer_items = []
+    mod_start = 0
+    mod_end = 0
     norm_start_idx = TARGET_LAYER * 2
     norm_end_idx = (TARGET_LAYER + 1) * 2
+    final_norm_idx = all_norm_indices[-1] if len(all_norm_indices) > 0 else len(launch_level2_items)
     if norm_start_idx >= len(norm_indices):
-        print(f"Not enough rmsnorm modules for layer {TARGET_LAYER}, writing empty CSV")
+        print(f"Not enough rmsnorm modules for layer {TARGET_LAYER}, writing empty XLSX")
     else:
         mod_start = norm_indices[norm_start_idx]
-        mod_end = norm_indices[norm_end_idx] if norm_end_idx < len(norm_indices) else len(launch_level2_items)
-        layer_items = launch_level2_items[mod_start:mod_end]
+        mod_end = norm_indices[norm_end_idx] if norm_end_idx < len(norm_indices) else final_norm_idx
         print(
             f"Layer {TARGET_LAYER} range by rmsnorm: "
             f"rows [{mod_start}:{mod_end}) from rmsnorm #{norm_start_idx+1} to #{norm_end_idx+1}"
         )
-        print(f"Layer {TARGET_LAYER} modules: {len(layer_items)}")
+        print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
 
     # Build launch->kernel mapping by correlation id.
     # Build launch candidates from current prefill thread/range once.
@@ -405,41 +453,23 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
     runtime_launches.sort(key=lambda x: x.get('ts', 0))
     runtime_launch_ts = [e.get('ts', 0) for e in runtime_launches]
 
-    output_rows = []
-    level2_kernel_map: Dict[str, List[str]] = {}
+    item_corrs: List[List[Any]] = []
     corr_needed = set()
-    for item in layer_items:
-        l1_name = item['level1_name']
+    for item in launch_level2_items:
         l2 = item['level2_event']
         l2_start = l2.get('ts', 0)
         l2_end = l2_start + l2.get('dur', 0)
-        l2_name = l2.get('name', '<unknown>')
-        l2_cat = l2.get('cat', '')
-        l2_dur = l2.get('dur', 0)
 
         left = bisect.bisect_left(runtime_launch_ts, l2_start)
         right = bisect.bisect_right(runtime_launch_ts, l2_end)
         launches_in_l2 = runtime_launches[left:right]
-
-        if not launches_in_l2:
-            output_rows.append([
-                l1_name, l2_name, l2_cat, l2_dur,
-                'N/A', 0, '', 'N/A', 0
-            ])
-            continue
-
+        curr_corrs = []
         for launch in launches_in_l2:
-            launch_name = launch.get('name', 'N/A')
-            launch_dur = launch.get('dur', 0)
             corr = (launch.get('args') or {}).get('correlation')
             if corr is not None:
                 corr_needed.add(corr)
-            matched_kernels = []  # Fill after kernel index is built.
-            output_rows.append([
-                l1_name, l2_name, l2_cat, l2_dur,
-                launch_name, launch_dur, corr if corr is not None else '',
-                'PENDING', 0
-            ])
+                curr_corrs.append(corr)
+        item_corrs.append(curr_corrs)
 
     # Build kernel index only for correlations we actually need.
     kernel_by_corr: Dict[Any, List[Dict]] = {}
@@ -454,89 +484,55 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
         for corr in kernel_by_corr:
             kernel_by_corr[corr].sort(key=lambda x: x.get('ts', 0))
 
-    # Expand pending launch rows into launch->kernel rows.
-    expanded_rows = []
-    for row in output_rows:
-        l1_name, l2_name, l2_cat, l2_dur, launch_name, launch_dur, corr, _, _ = row
-        corr_val = corr if corr != '' else None
-        matched_kernels = kernel_by_corr.get(corr_val, []) if corr_val is not None else []
-        if not matched_kernels:
-            expanded_rows.append([
-                l1_name, l2_name, l2_cat, l2_dur,
-                launch_name, launch_dur, corr, 'N/A', 0
-            ])
-            level2_kernel_map.setdefault(l2_name, [])
-            continue
-        for k in matched_kernels:
-            kernel_name = k.get('name', 'N/A')
-            expanded_rows.append([
-                l1_name, l2_name, l2_cat, l2_dur,
-                launch_name, launch_dur, corr, kernel_name, k.get('dur', 0)
-            ])
-            level2_kernel_map.setdefault(l2_name, []).append(kernel_name)
-    output_rows = expanded_rows
+    item_kernels: List[List[Dict[str, Any]]] = []
+    for corrs in item_corrs:
+        kernels = []
+        for corr in corrs:
+            for k in kernel_by_corr.get(corr, []):
+                kernels.append({'name': k.get('name', 'N/A'), 'dur': k.get('dur', 0)})
+        item_kernels.append(kernels)
 
-    print(f"Layer {TARGET_LAYER} launch->kernel mapping rows: {len(output_rows)}")
-    print("First 20 mapping rows:")
-    for i, row in enumerate(output_rows[:20]):
-        print(
-            f"  [{i:02d}] L2={row[1]} | launch={row[4]} | "
-            f"corr={row[6]} | kernel={row[7]}"
-        )
-    print(f"Layer {TARGET_LAYER} level2 -> gpu operators:")
-    for level2_name, kernels in level2_kernel_map.items():
-        # Keep order while removing duplicates.
-        uniq = list(dict.fromkeys(kernels))
-        if not uniq:
-            print(f"  - {level2_name}: N/A")
-            continue
-        print(f"  - {level2_name}: {len(uniq)} operator(s)")
-        for kname in uniq:
-            print(f"      * {kname}")
+    def build_rows_from_item_range(start: int, end: int) -> List[List[Any]]:
+        rows = []
+        for i in range(start, end):
+            item = launch_level2_items[i]
+            mod_name = item['level2_event'].get('name', '<unknown>')
+            if should_filter_prefill(mod_name):
+                continue
+            kernels = [k for k in item_kernels[i] if k['name'] not in ('', 'N/A')]
+            if not kernels:
+                continue
+            if 'moe_forward' in mod_name.lower():
+                rows.extend(process_moe_module(mod_name, len(kernels), 0, kernels))
+            else:
+                for k in kernels:
+                    rows.append([clean_module_name(mod_name, k['name']), k['name'], k['dur']])
+        return rows
 
-    # Convert to decode-style rows with prefill filters and MoE categorization.
-    # Output columns: cpu_module, gpu_kernel, duration_us
-    module_instances: List[Dict[str, Any]] = []
-    instance_idx: Dict[Tuple[Any, ...], int] = {}
-    for row in output_rows:
-        l1_name, l2_name, l2_cat, l2_dur = row[0], row[1], row[2], row[3]
-        gpu_kernel = row[7]
-        gpu_dur = row[8]
-
-        if should_filter_prefill(l2_name):
-            continue
-        if gpu_kernel in ('', 'N/A'):
-            continue
-
-        # Keep module instances separated by their parent+name+category+duration,
-        # preserving the original order from the trace.
-        key = (l1_name, l2_name, l2_cat, l2_dur)
-        if key not in instance_idx:
-            instance_idx[key] = len(module_instances)
-            module_instances.append({'mod_name': l2_name, 'kernels': []})
-        module_instances[instance_idx[key]]['kernels'].append({
-            'name': gpu_kernel,
-            'dur': gpu_dur,
-        })
-
-    csv_rows = []
-    for inst in module_instances:
-        mod_name = inst['mod_name']
-        kernels = inst['kernels']
-        if not kernels:
-            continue
-
-        if 'moe_forward' in mod_name.lower():
-            csv_rows.extend(process_moe_module(mod_name, len(kernels), 0, kernels))
-        else:
-            for k in kernels:
-                csv_rows.append([clean_module_name(mod_name, k['name']), k['name'], k['dur']])
+    # Target layer rows.
+    csv_rows = build_rows_from_item_range(mod_start, mod_end) if norm_start_idx < len(norm_indices) else []
+    print(f"Layer {TARGET_LAYER} launch->kernel mapping rows: {len(csv_rows)}")
 
     print(f"Prefill decode-style CSV rows (after filters): {len(csv_rows)}")
-    rename_rmsnorm_modules(csv_rows)
+
+    # AVG rows from layer 3 to last layer.
+    avg_rows = None
+    avg_layer_rows: List[List[List[Any]]] = []
+    avg_start_layer = 3
+    layer = avg_start_layer
+    while 2 * layer < len(norm_indices):
+        s = norm_indices[2 * layer]
+        e_idx = 2 * (layer + 1)
+        e = norm_indices[e_idx] if e_idx < len(norm_indices) else final_norm_idx
+        avg_layer_rows.append(build_rows_from_item_range(s, e))
+        layer += 1
+    if avg_layer_rows:
+        avg_rows = build_avg_rows_from_layers(avg_layer_rows, avg_start_layer, "Prefill")
+        if avg_rows is not None:
+            print(f"Prefill avg rows: {len(avg_rows)}")
 
     # Write XLSX for prefill.
-    write_breakdown_xlsx(output_xlsx, csv_rows, sheet_name='prefill')
+    write_breakdown_xlsx(output_xlsx, csv_rows, sheet_name='prefill', avg_rows=avg_rows)
 
 
 def clean_module_name(name: str, mapped_kernel_name: str = '') -> str:
@@ -555,7 +551,7 @@ def clean_module_name(name: str, mapped_kernel_name: str = '') -> str:
         return 'rope & kv_cache'
     if 'rope' in name_lower:
         return 'rope'
-    if 'cache' in name_lower:
+    if 'cache' in name_lower and 'gemm' not in name_lower:
         return 'kv_cache'
     
     return name
@@ -662,9 +658,14 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
     
     first_ds = decode_steps[actual_run_idx]
     first_ds_name = first_ds.get('name', '')
+    target_bs: Optional[int] = None
     if '_bs_' in first_ds_name:
         bs = first_ds_name.split('_bs_')[-1]
         target_cg_name = f'capture_graph_bs_{bs}'
+        try:
+            target_bs = int(bs)
+        except ValueError:
+            target_bs = None
     else:
         target_cg_name = 'capture_graph'
     
@@ -676,6 +677,26 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
         e for e in events
         if e.get('name') == target_cg_name and e.get('ph') == 'X'
     ]
+    if not capture_graphs and target_bs is not None:
+        # Prefer the largest capture_graph_bs_K where K < target_bs.
+        lower_bs_candidates: List[Tuple[int, Dict[str, Any]]] = []
+        for e in events:
+            if e.get('ph') != 'X':
+                continue
+            n = e.get('name', '')
+            m = re.match(r'^capture_graph_bs_(\d+)$', n)
+            if not m:
+                continue
+            k = int(m.group(1))
+            if k < target_bs:
+                lower_bs_candidates.append((k, e))
+        if lower_bs_candidates:
+            best_bs = max(k for k, _ in lower_bs_candidates)
+            capture_graphs = sorted(
+                [e for k, e in lower_bs_candidates if k == best_bs],
+                key=lambda x: x.get('ts', 0),
+            )
+            print(f"No exact match, using nearest lower capture_graph_bs_{best_bs}")
     if not capture_graphs:
         # Fallback: find any capture_graph
         capture_graphs = [
@@ -744,8 +765,13 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
             gpu_idx += kernel_count
     
     # Find norm positions (rmsnorm in name)
-    norm_indices = [i for i, (name, _, _) in enumerate(all_modules) if 'rmsnorm' in name.lower()]
-    print(f"Found {len(norm_indices)} norm modules")
+    all_norm_indices = [i for i, (name, _, _) in enumerate(all_modules) if 'rmsnorm' in name.lower()]
+    # Last rmsnorm is final layernorm, not part of transformer layers.
+    norm_indices = all_norm_indices[:-1] if len(all_norm_indices) > 0 else []
+    print(
+        f"Found {len(all_norm_indices)} norm modules "
+        f"({len(norm_indices)} used for layer split, excluding final layernorm)"
+    )
     
     # Extract layer 3 (4th layer, 0-indexed)
     # Each layer has 2 norms, so layer N starts at norm index 2*N
@@ -753,27 +779,46 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
     norm_start_idx = TARGET_LAYER * 2  # 6 (7th norm, 0-indexed)
     norm_end_idx = (TARGET_LAYER + 1) * 2  # 8 (9th norm, 0-indexed)
     
+    final_norm_idx = all_norm_indices[-1] if len(all_norm_indices) > 0 else len(all_modules)
     if norm_start_idx >= len(norm_indices):
         print(f"Not enough norms for layer {TARGET_LAYER}")
         return
     
     # Module range for layer 3: from norm_indices[6] to norm_indices[8] (exclusive)
     mod_start = norm_indices[norm_start_idx]
-    mod_end = norm_indices[norm_end_idx] if norm_end_idx < len(norm_indices) else len(all_modules)
+    mod_end = norm_indices[norm_end_idx] if norm_end_idx < len(norm_indices) else final_norm_idx
     
     print(f"Layer {TARGET_LAYER}: modules [{mod_start}:{mod_end}] (norms at indices {norm_start_idx}, {norm_start_idx+1})")
     
-    # Build CSV rows for layer 3 only
-    rows = []
-    for mod_name, kernel_count, start_gpu_idx in all_modules[mod_start:mod_end]:
-        if 'moe_forward' in mod_name.lower():
-            rows.extend(process_moe_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels))
-        else:
-            rows.extend(process_regular_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels))
-    rename_rmsnorm_modules(rows)
+    def build_rows_for_module_range(start: int, end: int) -> List[List[Any]]:
+        rows = []
+        for mod_name, kernel_count, start_gpu_idx in all_modules[start:end]:
+            if 'moe_forward' in mod_name.lower():
+                rows.extend(process_moe_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels))
+            else:
+                rows.extend(process_regular_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels))
+        return rows
+
+    # Target layer rows.
+    rows = build_rows_for_module_range(mod_start, mod_end)
+
+    # AVG rows from layer 3 to last layer.
+    avg_rows = None
+    avg_layer_rows: List[List[List[Any]]] = []
+    layer = 3
+    while 2 * layer < len(norm_indices):
+        s = norm_indices[2 * layer]
+        e_idx = 2 * (layer + 1)
+        e = norm_indices[e_idx] if e_idx < len(norm_indices) else final_norm_idx
+        avg_layer_rows.append(build_rows_for_module_range(s, e))
+        layer += 1
+    if avg_layer_rows:
+        avg_rows = build_avg_rows_from_layers(avg_layer_rows, 3, "Decode")
+        if avg_rows is not None:
+            print(f"Decode avg rows: {len(avg_rows)}")
     
     # Write XLSX
-    write_breakdown_xlsx(output_xlsx, rows, sheet_name='decode')
+    write_breakdown_xlsx(output_xlsx, rows, sheet_name='decode', avg_rows=avg_rows)
     
     print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
     print(f"XLSX written to: {output_xlsx} ({len(rows)} rows)")

@@ -230,6 +230,34 @@ class CompilerManager:
                     handle,
                 )
 
+        # When mark-trace is enabled, post-processing may rewrite generated
+        # artifact sources. Force reloading from cache artifact so the current
+        # process uses the rewritten artifact immediately.
+        try:
+            from atom.utils.graph_marker import is_graph_marker_enabled
+
+            force_reload = is_graph_marker_enabled()
+        except Exception:
+            force_reload = False
+        if force_reload and handle is not None and not self.disable_cache:
+            try:
+                reloaded_graph = self.load(
+                    graph, example_inputs, graph_index, runtime_shape
+                )
+                if reloaded_graph is not None:
+                    compiled_graph = reloaded_graph
+                    logger.info(
+                        "Force reloaded compiled graph from cache artifact "
+                        "(graph_index=%s, runtime_shape=%s).",
+                        graph_index,
+                        runtime_shape,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to force reload compiled graph from cache artifact; "
+                    "falling back to in-memory compiled callable."
+                )
+
         # after compiling the last graph, record the end time
         if graph_index == num_graphs - 1:
             now = time.time()
