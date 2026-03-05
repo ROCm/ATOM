@@ -489,12 +489,12 @@ class vllmAttentionMetadataBuilderMethods:
                 max_query_len=(
                     common_attn_metadata.max_query_len
                     if prefill_only
-                    else query_lens_cpu[:num_decodes].max().item()
+                    else query_lens_cpu[num_decodes + num_extends :].max().item()
                 ),
                 max_seq_len=(
                     common_attn_metadata.max_seq_len
                     if prefill_only
-                    else query_lens_cpu[:num_decodes].max().item()
+                    else query_lens_cpu[num_decodes + num_extends :].max().item()
                 ),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
             )
