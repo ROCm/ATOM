@@ -94,13 +94,19 @@ RUN echo "========== [6.5/7] Install vLLM runtime requirements ==========" \
     && "${VENV_PYTHON}" -m pip install --no-deps -r /tmp/requirements.common.no_xgrammar.txt \
     && "${VENV_PYTHON}" -m pip install --no-deps "xgrammar==0.1.29" \
     && "${VENV_PYTHON}" -m pip install --no-deps -r requirements/rocm.txt \
+    && "${VENV_PYTHON}" -m pip install --upgrade-strategy only-if-needed \
+       "openai>=1.99.1" \
+       "anthropic>=0.71.0" \
+       "fastapi[standard]>=0.115.0" \
+       "aiohttp" \
+       "runai-model-streamer[s3,gcs]==0.15.3" \
     && if [ -d /opt/rocm/share/amd_smi ]; then \
          "${VENV_PYTHON}" -m pip install --no-deps /opt/rocm/share/amd_smi; \
        else \
          "${VENV_PYTHON}" -m pip install --no-deps amdsmi; \
        fi \
-    && "${VENV_PYTHON}" -m pip install --no-deps cbor2 gguf amdsmi \
-    && "${VENV_PYTHON}" -m pip show cbor2 gguf amdsmi
+    && "${VENV_PYTHON}" -m pip install --no-deps cbor2 gguf amdsmi uvloop httptools websockets \
+    && "${VENV_PYTHON}" -m pip show cbor2 gguf amdsmi uvloop
 
 RUN echo "========== [7/7] Optional utilities ==========" \
     && if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi \
