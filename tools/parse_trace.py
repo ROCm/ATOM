@@ -179,7 +179,9 @@ def build_avg_rows_from_layers(
     for i, (mod, kernel) in enumerate(base_sig):
         # Keep original module display style from layer_start_idx rows.
         display_mod = base[i][0]
-        avg_dur = sum(float(layer_rows_list[layer_idx][i][2]) for layer_idx in range(n)) / n
+        avg_dur = (
+            sum(float(layer_rows_list[layer_idx][i][2]) for layer_idx in range(n)) / n
+        )
         avg_rows.append([display_mod, kernel, avg_dur])
     return avg_rows
 
