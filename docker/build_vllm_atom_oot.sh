@@ -3,6 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/build_vllm_atom_oot_$(date +%Y%m%d_%H%M%S).log}"
+
+mkdir -p "${LOG_DIR}"
+# Mirror all stdout/stderr to terminal and log file.
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 DOCKERFILE_PATH="${SCRIPT_DIR}/Dockerfile_vllm_atom_oot"
 IMAGE_TAG="${IMAGE_TAG:-rocm/atom-vllm-dev:nightly_202603040155}"
@@ -20,6 +26,7 @@ print_banner() {
 }
 
 print_banner "Build vLLM on top of ATOM base image"
+echo "Log file        : ${LOG_FILE}"
 echo "Dockerfile      : ${DOCKERFILE_PATH}"
 echo "Build context   : ${REPO_ROOT}"
 echo "Target image    : ${IMAGE_TAG}"

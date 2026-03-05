@@ -49,17 +49,19 @@ RUN echo "========== [6/7] Install vLLM wheel (no dependency override) =========
     && python3 -m pip install --no-deps /tmp/vllm-wheels/*.whl \
     && python3 -m pip show vllm
 
-RUN echo "========== [7/7] Optional utilities and final version print ==========" \
-    && if [ "${INSTALL_LM_EVAL}" = "1" ]; then python3 -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi \
-    && python3 - <<'PY' \
-import importlib.metadata as m; \
-pkgs = ["vllm", "torch", "triton", "amd-aiter", "atom"]; \
-print("Final package versions:"); \
-for p in pkgs: \
-    try: \
-        print(f"  {p}: {m.version(p)}"); \
-    except Exception: \
-        print(f"  {p}: <not installed>"); \
+RUN echo "========== [7/7] Optional utilities ==========" \
+    && if [ "${INSTALL_LM_EVAL}" = "1" ]; then python3 -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi
+
+RUN echo "========== [7/7] Final version print ==========" \
+    && python3 - <<'PY'
+import importlib.metadata as m
+pkgs = ["vllm", "torch", "triton", "amd-aiter", "atom"]
+print("Final package versions:")
+for p in pkgs:
+    try:
+        print(f"  {p}: {m.version(p)}")
+    except Exception:
+        print(f"  {p}: <not installed>")
 PY
 
 CMD ["/bin/bash"]
