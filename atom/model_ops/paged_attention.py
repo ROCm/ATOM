@@ -3,7 +3,6 @@
 
 # from flash_attn import flash_attn_with_kvcache
 from typing import Optional
-import os
 import torch
 from torch import nn
 
