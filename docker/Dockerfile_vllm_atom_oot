@@ -95,9 +95,10 @@ RUN echo "========== [6.5/7] Install vLLM runtime requirements ==========" \
     && if [ -d /opt/rocm/share/amd_smi ]; then \
          "${VENV_PYTHON}" -m pip install /opt/rocm/share/amd_smi; \
        else \
-         "${VENV_PYTHON}" -m pip install amdsmi || true; \
+         "${VENV_PYTHON}" -m pip install amdsmi; \
        fi \
-    && "${VENV_PYTHON}" -m pip show cbor2 gguf amdsmi || true
+    && "${VENV_PYTHON}" -m pip install --upgrade-strategy only-if-needed cbor2 gguf amdsmi \
+    && "${VENV_PYTHON}" -m pip show cbor2 gguf amdsmi
 
 RUN echo "========== [7/7] Optional utilities ==========" \
     && if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi \

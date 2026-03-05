@@ -18,6 +18,7 @@ VLLM_COMMIT="${VLLM_COMMIT:-f5d17400303149bbb480f6abfb6f7bb646c1d895}"
 MAX_JOBS="${MAX_JOBS:-64}"
 INSTALL_LM_EVAL="${INSTALL_LM_EVAL:-1}"
 PULL_BASE_IMAGE="${PULL_BASE_IMAGE:-1}"
+BUILD_NO_CACHE="${BUILD_NO_CACHE:-1}"
 
 print_banner() {
   echo "============================================================"
@@ -35,6 +36,7 @@ echo "vLLM repo       : ${VLLM_REPO}"
 echo "vLLM commit     : ${VLLM_COMMIT}"
 echo "MAX_JOBS        : ${MAX_JOBS}"
 echo "INSTALL_LM_EVAL : ${INSTALL_LM_EVAL}"
+echo "BUILD_NO_CACHE  : ${BUILD_NO_CACHE}"
 echo
 echo "Build plan:"
 echo "  Step 1/4: (optional) pull base image"
@@ -62,7 +64,13 @@ fi
 echo
 
 print_banner "Step 3/4 - Build target image: ${IMAGE_TAG}"
+NO_CACHE_FLAG=""
+if [[ "${BUILD_NO_CACHE}" == "1" ]]; then
+  NO_CACHE_FLAG="--no-cache"
+fi
+
 DOCKER_BUILDKIT=1 docker build \
+  ${NO_CACHE_FLAG} \
   -f "${DOCKERFILE_PATH}" \
   -t "${IMAGE_TAG}" \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
