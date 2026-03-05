@@ -91,15 +91,15 @@ RUN echo "========== [6/7] Install vLLM wheel (no dependency override) =========
 RUN echo "========== [6.5/7] Install vLLM runtime requirements ==========" \
     && cd /app/vllm \
     && sed '/^xgrammar[[:space:]]*==/d' requirements/common.txt > /tmp/requirements.common.no_xgrammar.txt \
-    && "${VENV_PYTHON}" -m pip install --upgrade-strategy only-if-needed -c /tmp/atom-base-constraints.txt -r /tmp/requirements.common.no_xgrammar.txt \
+    && "${VENV_PYTHON}" -m pip install --no-deps -r /tmp/requirements.common.no_xgrammar.txt \
     && "${VENV_PYTHON}" -m pip install --no-deps "xgrammar==0.1.29" \
-    && "${VENV_PYTHON}" -m pip install --upgrade-strategy only-if-needed -c /tmp/atom-base-constraints.txt -r requirements/rocm.txt \
+    && "${VENV_PYTHON}" -m pip install --no-deps -r requirements/rocm.txt \
     && if [ -d /opt/rocm/share/amd_smi ]; then \
-         "${VENV_PYTHON}" -m pip install /opt/rocm/share/amd_smi; \
+         "${VENV_PYTHON}" -m pip install --no-deps /opt/rocm/share/amd_smi; \
        else \
-         "${VENV_PYTHON}" -m pip install amdsmi; \
+         "${VENV_PYTHON}" -m pip install --no-deps amdsmi; \
        fi \
-    && "${VENV_PYTHON}" -m pip install --upgrade-strategy only-if-needed cbor2 gguf amdsmi \
+    && "${VENV_PYTHON}" -m pip install --no-deps cbor2 gguf amdsmi \
     && "${VENV_PYTHON}" -m pip show cbor2 gguf amdsmi
 
 RUN echo "========== [7/7] Optional utilities ==========" \
