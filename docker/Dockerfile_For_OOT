@@ -1,4 +1,4 @@
-ARG BASE_IMAGE="rocm/atom-dev:nightly_202603040155"
+ARG BASE_IMAGE="rocm/vllm-dev:base"
 ARG GPU_ARCH="gfx942;gfx950"
 
 FROM ${BASE_IMAGE}
@@ -8,6 +8,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG GPU_ARCH
 ENV GPU_ARCH_LIST=${GPU_ARCH}
 ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
+ENV VLLM_TARGET_DEVICE=rocm
 ENV TOKENIZERS_PARALLELISM=false
 ENV SAFETENSORS_FAST_GPU=1
 ENV HIP_FORCE_DEV_KERNARG=1
@@ -16,32 +17,112 @@ ENV HIP_FORCE_DEV_KERNARG=1
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
 ARG VLLM_COMMIT="main"
 
-RUN python3 -m pip install --upgrade pip \
-    && python3 -m pip install cmake
+# ---- ATOM build args ----
+ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
+ARG ATOM_COMMIT="HEAD"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT="HEAD"
+ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG PREBUILD_KERNELS=1
+ARG MAX_JOBS=64
 
 WORKDIR /app
 
+RUN apt-get update && apt --fix-broken install -y \
+    && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    git \
+    cython3 \
+    ibverbs-utils \
+    openmpi-bin \
+    libopenmpi-dev \
+    libpci-dev \
+    cmake \
+    libdw1 \
+    locales \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --upgrade pip \
+    && python3 -m pip install lm-eval[api]
+
 # ---------------------------
-# Build and install vLLM (commit selectable)
-# Reuse triton and aiter from atom base image.
+# Build and install vLLM (ROCm path)
+# Matches upstream Dockerfile.rocm flow.
 # ---------------------------
 RUN git clone ${VLLM_REPO} /app/vllm \
     && cd /app/vllm \
     && git fetch --all --tags \
     && git checkout ${VLLM_COMMIT} \
-    && sed -E '/(^|[<>=[:space:]])(triton|aiter|amd-aiter)([<>=[:space:]]|$)/Id' requirements/rocm.txt > requirements/rocm_no_triton_aiter.txt \
-    && python3 -m pip install -r requirements/rocm_no_triton_aiter.txt \
+    && python3 -m pip install -r requirements/rocm.txt \
     && python3 setup.py clean --all \
     && python3 setup.py bdist_wheel --dist-dir=dist \
     && (python3 -m pip uninstall -y vllm || true) \
     && python3 -m pip install dist/*.whl
 
-# A common profiler workaround from vllm ROCm image
+# Lock torch version after vLLM install so ATOM stage cannot change it.
+RUN TORCH_VERSION="$(python3 -m pip show torch | sed -n 's/^Version: //p')" \
+    && echo "torch==${TORCH_VERSION}" > /tmp/torch_pin.txt \
+    && cat /tmp/torch_pin.txt
+
+# ---------------------------
+# Install MORI
+# ---------------------------
+RUN git clone https://github.com/ROCm/mori.git /app/mori \
+    && cd /app/mori \
+    && git checkout ${MORI_COMMIT} \
+    && python3 -m pip install -c /tmp/torch_pin.txt -r requirements-build.txt \
+    && git submodule update --init --recursive \
+    && python3 setup.py install
+
+# ---------------------------
+# Update RCCL
+# ---------------------------
+ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
+ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
+ARG RCCL_SRC_DIR="/app/rccl"
+RUN python3 -m pip install cmake \
+    && git clone "${RCCL_REPO}" "${RCCL_SRC_DIR}" \
+    && cd "${RCCL_SRC_DIR}" \
+    && git checkout "${RCCL_BRANCH}" \
+    && ./install.sh -p --amdgpu_targets=${GPU_ARCH_LIST} \
+    && DEBIAN_FRONTEND=noninteractive dpkg -i --force-all ${RCCL_SRC_DIR}/build/release/*.deb \
+    && rm -rf ${RCCL_SRC_DIR}/build
+
+# ---------------------------
+# Update Triton
+# ---------------------------
+RUN (python3 -m pip uninstall -y triton || true) \
+    && git clone --depth=1 --branch release/internal/3.5.x https://github.com/ROCm/triton.git /app/triton-test \
+    && cd /app/triton-test \
+    && python3 -m pip install -c /tmp/torch_pin.txt -r python/requirements.txt \
+    && python3 -m pip install -c /tmp/torch_pin.txt filecheck \
+    && MAX_JOBS=${MAX_JOBS} python3 -m pip --retries=10 --default-timeout=60 install .
+
+# ---------------------------
+# Install AITER
+# ---------------------------
+RUN (python3 -m pip uninstall -y aiter || true) \
+    && git clone ${AITER_REPO} /app/aiter-test \
+    && cd /app/aiter-test \
+    && git checkout ${AITER_COMMIT} \
+    && python3 -m pip install -c /tmp/torch_pin.txt -r requirements.txt \
+    && git submodule sync \
+    && git submodule update --init --recursive \
+    && MAX_JOBS=${MAX_JOBS} PREBUILD_KERNELS=${PREBUILD_KERNELS} GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+
+# ---------------------------
+# Install ATOM (do not change torch from vLLM stage)
+# ---------------------------
+RUN (python3 -m pip uninstall -y atom || true) \
+    && git clone ${ATOM_REPO} /app/ATOM \
+    && cd /app/ATOM \
+    && git checkout ${ATOM_COMMIT} \
+    && python3 -m pip install -c /tmp/torch_pin.txt -e .
+
 RUN echo "ROCTRACER_MAX_EVENTS=10000000" > /app/libkineto.conf
 ENV KINETO_CONFIG="/app/libkineto.conf"
 
-# Print key versions for quick smoke verification
-RUN python3 -m pip show vllm || true \
+RUN python3 -m pip show torch || true \
+    && python3 -m pip show vllm || true \
     && python3 -m pip show atom || true \
     && python3 -m pip show amd-aiter || true \
     && python3 -m pip show triton || true
