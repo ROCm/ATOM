@@ -14,6 +14,13 @@ BASE_IMAGE="${BASE_IMAGE:-${ATOM_BASE_IMAGE}}"
 VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:base}"
 BUILD_VLLM_BASE="${BUILD_VLLM_BASE:-0}"
 
+echo "========================================"
+echo "OOT Docker build config"
+echo "  Base image       : ${BASE_IMAGE}"
+echo "  VLLM commit      : ${VLLM_COMMIT}"
+echo "  Final image name : ${IMAGE_TAG}"
+echo "========================================"
+
 if [[ "${BUILD_VLLM_BASE}" == "1" ]]; then
   VLLM_TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "${VLLM_TMP_DIR}"' EXIT
@@ -55,4 +62,9 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg "VLLM_COMMIT=${VLLM_COMMIT}" \
   "$@" \
   "${REPO_ROOT}"
+
+echo "Build finished."
+echo "  Final image name : ${IMAGE_TAG}"
+echo "  Base image used  : ${BASE_IMAGE}"
+echo "  VLLM commit used : ${VLLM_COMMIT}"
 

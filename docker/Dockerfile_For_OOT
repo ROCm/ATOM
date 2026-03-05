@@ -29,11 +29,11 @@ RUN git clone ${VLLM_REPO} /app/vllm \
     && cd /app/vllm \
     && git fetch --all --tags \
     && git checkout ${VLLM_COMMIT} \
-    && sed -E '/(^|[<>=[:space:]])(triton|aiter|amd-aiter)([<>=[:space:]]|$)/Id' requirements/rocm.txt > /tmp/rocm_no_triton_aiter.txt \
-    && python3 -m pip install -r /tmp/rocm_no_triton_aiter.txt \
+    && sed -E '/(^|[<>=[:space:]])(triton|aiter|amd-aiter)([<>=[:space:]]|$)/Id' requirements/rocm.txt > requirements/rocm_no_triton_aiter.txt \
+    && python3 -m pip install -r requirements/rocm_no_triton_aiter.txt \
     && python3 setup.py clean --all \
     && python3 setup.py bdist_wheel --dist-dir=dist \
-    && python3 -m pip uninstall -y vllm || true \
+    && (python3 -m pip uninstall -y vllm || true) \
     && python3 -m pip install dist/*.whl
 
 # A common profiler workaround from vllm ROCm image
