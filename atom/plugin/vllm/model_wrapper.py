@@ -29,6 +29,7 @@ logger = logging.getLogger("atom")
 _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
+    "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
 }
 
 
