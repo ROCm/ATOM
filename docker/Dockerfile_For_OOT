@@ -8,9 +8,6 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG GPU_ARCH
 ENV GPU_ARCH_LIST=${GPU_ARCH}
 ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
-ENV UV_HTTP_TIMEOUT=500
-ENV UV_INDEX_STRATEGY="unsafe-best-match"
-ENV UV_LINK_MODE=copy
 ENV TOKENIZERS_PARALLELISM=false
 ENV SAFETENSORS_FAST_GPU=1
 ENV HIP_FORCE_DEV_KERNARG=1
@@ -19,26 +16,8 @@ ENV HIP_FORCE_DEV_KERNARG=1
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
 ARG VLLM_COMMIT="main"
 
-# ---- dependencies needed by vLLM build ----
-RUN apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git \
-    curl \
-    wget \
-    ca-certificates \
-    apt-transport-https \
-    sqlite3 \
-    libsqlite3-dev \
-    libfmt-dev \
-    libmsgpack-dev \
-    libsuitesparse-dev \
-    cmake \
-    && rm -rf /var/lib/apt/lists/*
-
 RUN python3 -m pip install --upgrade pip \
-    && python3 -m pip install lm-eval[api] cmake
-
-# vLLM docker uses uv heavily; keep installer consistent with upstream rocm flow
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
+    && python3 -m pip install cmake
 
 WORKDIR /app
 
