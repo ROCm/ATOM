@@ -188,7 +188,8 @@ def _iter_py_files(root: str) -> Iterable[str]:
 def _ensure_record_function_import(lines: list[str]) -> None:
     # If already imported or referenced via qualified name, do nothing.
     if any(
-        ("record_function" in l and ("import" in l or "from torch" in l)) for l in lines
+        ("record_function" in line and ("import" in line or "from torch" in line))
+        for line in lines
     ):
         return
 
@@ -407,7 +408,7 @@ def instrument_record_functions_in_file(
         # Only strip marker calls if we either:
         # - wrapped/upgraded this run, or
         # - the file already contains record_function blocks (previous run)
-        already_has_record = any("with record_function(" in l for l in lines)
+        already_has_record = any("with record_function(" in line for line in lines)
         if wrapped_or_upgraded or already_has_record:
             stripped = _strip_runtime_graph_markers(lines)
 
