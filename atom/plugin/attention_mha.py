@@ -75,7 +75,7 @@ class PagedAttentionImplPluginModeMethods:
             # ATOM: [num_blocks, num_kv_heads, head_size, block_size],
             # vLLM: [num_blocks, num_kv_heads, block_size // x, head_size, x],
             v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                [num_blocks, num_kv_heads, head_size, block_size],
                 dtype=v_cache.dtype,
                 device="meta",
             )
@@ -134,9 +134,13 @@ class PagedAttentionImplPluginModeMethods:
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
         elif use_triton_attn and self.rotary_emb is not None:
-            k_scale = v_scale = self.kv_scale
-
-            q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+            
+            k_scale = v_scale = self.one_scale
+            qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
+            q, k, v = qkv.split(
+                [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
+            )
+            q, k, _k_cache, _v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
                 v,
@@ -229,9 +233,7 @@ class PagedAttentionImplPluginModeMethods:
         )
 
         per_tensor = False
-        if k_scale is not None:
-            per_tensor = k_scale.numel() == 1
-            if not per_tensor:
+        if k_scale is not None and k_scale.numel() > 1:
                 k_scale = k_scale.unsqueeze(-1)
                 v_scale = v_scale.unsqueeze(-1)
         compute_type = (
@@ -557,6 +559,13 @@ class PagedAttentionImplPluginModeMethods:
             # update the layer kv scale tensor
             self.k_scale = self.kv_scale[0]
             self.v_scale = self.kv_scale[1]
+            one_kv_scale = (
+                torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
+                if self.kv_cache_dtype == "fp8"
+                else 1.0
+            )
+            kv_scale = torch.ones((1,), dtype=torch.float32, device=self.device)
+            self.one_scale = kv_scale
             layer.k_scale = self.k_scale
             layer.v_scale = self.v_scale
 
@@ -669,7 +678,7 @@ class PagedAttentionImplPluginModeMethods:
                 device="meta",
             )
             v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                [num_blocks, num_kv_heads, head_size, block_size],
                 dtype=v_cache.dtype,
                 device="meta",
             )

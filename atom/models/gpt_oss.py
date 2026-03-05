@@ -37,6 +37,7 @@ from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParall
 from atom.model_ops.moe import FusedMoE
 
 from atom.model_loader.loader import load_model_in_plugin_mode
+from atom.utils import envs
 
 # from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from atom.models.utils import (
@@ -143,7 +144,12 @@ class OAIAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         # q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, positions)
+        if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            attn_output = self.attn(
+                query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
+            )
+        else:        
+            attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output
 
