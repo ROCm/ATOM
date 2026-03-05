@@ -10,9 +10,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV MAX_JOBS=${MAX_JOBS}
 WORKDIR /app
 
-# Keep toolchain utilities lightweight and deterministic.
-RUN echo "========== [1/7] Prepare build utilities ==========" \
+# Repair apt dependency state first, then install required utilities.
+RUN echo "========== [1/7] Fix apt dependencies and prepare build utilities ==========" \
     && apt-get update \
+    && apt --fix-broken install -y \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
