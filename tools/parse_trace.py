@@ -332,10 +332,15 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
         is treated as warmup and prefill[1] is the actual prefill.
       - Otherwise, prefill[0] is the actual prefill.
     """
-    # CPU side prefill/decode annotations
+    # CPU side prefill/decode annotations.
+    # Accept both legacy "prefill" and traced variants like
+    # "prefill_bs_1_ctxlens_tensor([417], ...)".
     prefills = [
         e for e in events
-        if e.get('name') == 'prefill'
+        if (
+            e.get('name') == 'prefill'
+            or e.get('name', '').startswith('prefill_bs_')
+        )
         and e.get('ph') == 'X'
         and e.get('cat') == 'user_annotation'
     ]
@@ -704,7 +709,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
             if e.get('name', '').startswith('capture_graph') and e.get('ph') == 'X'
         ]
         capture_graphs = sorted(capture_graphs, key=lambda x: x['ts'])
-        print(f"No exact match, using first capture_graph")
+        print("No exact match, using first capture_graph")
     
     if not capture_graphs:
         print("No capture_graph events found.")

@@ -6,7 +6,6 @@ import math
 import os
 import time
 from contextlib import nullcontext
-from itertools import chain, islice
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -1339,7 +1338,7 @@ class ModelRunner:
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             with (
-                record_function("prefill")
+                record_function(f"prefill_bs_{bs}_ctxlens_{forward_context.attn_metadata.context_lens}")
                 if self.mark_trace
                 else nullcontext()
             ):
