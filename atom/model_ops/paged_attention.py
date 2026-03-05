@@ -63,7 +63,7 @@ class PagedAttention(BaseAttention):
         self.use_mla = use_mla
         # for plugin mode
         if is_vllm():
-            self.rotary_emb = mla_modules.rotary_emb
+            self.rotary_emb = mla_modules.rotary_emb if use_mla else rotary_emb
 
             try:
                 from vllm.attention.layer import Attention, MLAAttention, AttentionType
@@ -125,11 +125,6 @@ class PagedAttention(BaseAttention):
 
                     def new_forward(*args, **kwargs):
                         out = orig_impl(*args, **kwargs)
-                        if (
-                            os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower()
-                            == "0"
-                        ):
-                            return out
                         return out, None
 
                     module_instance.forward = new_forward
@@ -165,8 +160,8 @@ class PagedAttention(BaseAttention):
                     max_num_tokens = (
                         atom_config.plugin_config.vllm_scheduler_config.max_num_batched_tokens
                     )
-                    compilation_config.static_forward_context["positions"] = torch.zeros(
-                        max_num_tokens, dtype=torch.int64, device="cuda"
+                    compilation_config.static_forward_context["positions"] = (
+                        torch.zeros(max_num_tokens, dtype=torch.int64, device="cuda")
                     )
             return
 
