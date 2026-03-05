@@ -1204,11 +1204,6 @@ def AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
 
 
 class vllmAiterMLABackendMethods:
-    # here attention in ATOM doesn't accept the output buffer because
-    # ATOM works as a model impl backend, it needs the maximum freedom
-    # to decide the output buffer and shape, thus here use this flag to
-    # let vllm don't allocate the output buffer for ATOM. ATOM will
-    # handle the output buffer by itself
     accept_output_buffer: bool = True
     supported_dtypes: list = [torch.float16, torch.bfloat16]
 

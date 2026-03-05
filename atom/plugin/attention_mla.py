@@ -276,9 +276,9 @@ class MLAAttentionImplPluginModeMethods:
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            k = self._concat_k_nope_k_pe_plugin_mode(k_nope, k_pe)
 
-            attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
+            attn_output, attn_softmax_lse = self._run_prefill_context_chunk_plugin_mode(
                 prefill=prefill_metadata,
                 chunk_idx=i,
                 q=q,
