@@ -697,6 +697,133 @@ class MLAAttention(nn.Module):
 
         return self.o_proj(output.flatten(start_dim=-2))
 
+    def _forward_prefill_mha_prefix_cache(
+        self,
+        q: torch.Tensor,
+        k_prefix: torch.Tensor,
+        v_prefix: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_rope: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+    ) -> torch.Tensor:
+        """Prefill MHA with prefix cache (doc §4.3, §4.4): project new tokens,
+        concat [cached | new] per batch, flash attention."""
+        assert attn_metadata is not None and attn_metadata.has_cached
+
+        if k_rope.dim() == 2:
+            k_rope = k_rope.unsqueeze(1)
+
+        # Step 4.3: Project new tokens' latent to k_new, v_new
+        if use_triton_gemm():
+            weight = self.kv_b_proj.weight
+            weight_scale = self.kv_b_proj.weight_scale
+            if (
+                fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
+                and weight.dtype == dtypes.fp8
+            ):
+                weight_shuffled = weight.reshape(
+                    weight.shape[0] // 16, weight.shape[1] * 16
+                )
+                output_dtype = kv_c_normed.dtype
+                quant_func = functools_partial(
+                    get_hip_quant(QuantType.per_1x128), transpose_scale=True
+                )
+                q_input, x_scale = quant_func(
+                    kv_c_normed,
+                    quant_dtype=dtypes.fp8,
+                    scale=getattr(self.kv_b_proj, "input_scale", None),
+                )
+                k_nope_new, v_new = fused_gemm_a8w8_blockscale_preshuffle_split_cat(
+                    q_input,
+                    weight_shuffled,
+                    k_rope.expand((-1, self.num_heads, -1)),
+                    x_scale,
+                    weight_scale,
+                    self.qk_nope_head_dim,
+                    self.v_head_dim,
+                    output_dtype,
+                )
+            else:
+                kv_nope = self.kv_b_proj(kv_c_normed).view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                k_nope_new, v_new = kv_nope.split(
+                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                )
+            k_new = torch.cat(
+                (k_nope_new, k_rope.expand((*k_nope_new.shape[:-1], -1))), dim=-1
+            )
+        else:
+            kv_nope = self.kv_b_proj(kv_c_normed).view(
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope_new, v_new = kv_nope.split(
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
+            k_new = torch.cat(
+                (k_nope_new, k_rope.expand((*k_nope_new.shape[:-1], -1))), dim=-1
+            )
+
+        # Step 4.4: Concat [cached | new] per batch, flash attention
+        bs = attn_metadata.cu_seqlens_q.shape[0] - 1
+        cu_seqlens_q = attn_metadata.cu_seqlens_q
+        cu_seqlens_k = attn_metadata.cu_seqlens_k
+        num_cached_tokens = attn_metadata.num_cached_tokens
+
+        total_tokens = cu_seqlens_k[-1].item()
+        output_dtype = q.dtype
+        k_full = torch.empty(
+            (total_tokens, self.num_heads, self.qk_head_dim),
+            dtype=output_dtype,
+            device=q.device,
+        )
+        v_full = torch.empty(
+            (total_tokens, self.num_heads, self.v_head_dim),
+            dtype=output_dtype,
+            device=q.device,
+        )
+
+        cached_offset = 0
+        for i in range(bs):
+            start = cu_seqlens_k[i].item()
+            end = cu_seqlens_k[i + 1].item()
+            cached_i = num_cached_tokens[i].item()
+            new_i = end - start - cached_i
+
+            # k_prefix/v_prefix are 2D [total_cached, num_heads*head_dim], reshape to 3D
+            k_full[start : start + cached_i] = (
+                k_prefix[cached_offset : cached_offset + cached_i]
+                .view(cached_i, self.num_heads, self.qk_head_dim)
+                .to(output_dtype)
+            )
+            v_full[start : start + cached_i] = (
+                v_prefix[cached_offset : cached_offset + cached_i]
+                .view(cached_i, self.num_heads, self.v_head_dim)
+                .to(output_dtype)
+            )
+
+            new_start = cu_seqlens_q[i].item()
+            k_full[start + cached_i : end] = k_new[new_start : new_start + new_i]
+            v_full[start + cached_i : end] = v_new[new_start : new_start + new_i]
+
+            cached_offset += cached_i
+
+        output = flash_attn_varlen_func(
+            q=q,
+            k=k_full,
+            v=v_full,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q,
+            cu_seqlens_k=attn_metadata.cu_seqlens_k,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_seqlen_k=attn_metadata.max_seqlen_k,
+            min_seqlen_q=attn_metadata.min_seqlen_q,
+            dropout_p=attn_metadata.dropout_p,
+            softmax_scale=self.scale,
+            causal=True,
+        )
+
+        return self.o_proj(output.flatten(start_dim=-2))
+
     def _forward_prefill_mla(
         self,
         q: torch.Tensor,
@@ -890,6 +1017,86 @@ class MLAAttention(nn.Module):
                 and not is_rocm_aiter_fp4bmm_enabled()
                 and self.qk_nope_head_dim == self.v_head_dim
             )
+
+            # Step 4.1: Build cached-only metadata (doc §4.1)
+            if use_prefix_cache:
+                num_cached_tokens = attn_metadata.num_cached_tokens
+                bs = num_cached_tokens.shape[0]
+                total_cached = num_cached_tokens.sum().item()
+                block_size = kv_cache.shape[1]
+                num_cached_blocks = (
+                    num_cached_tokens.to(q.device) + block_size - 1
+                ) // block_size
+
+                kv_indptr_cached = torch.zeros(
+                    bs + 1, dtype=torch.int32, device=q.device
+                )
+                kv_indptr_cached[1:] = torch.cumsum(num_cached_blocks, dim=0)
+                kv_prefix_sum_context_lens = torch.zeros(
+                    bs + 1, dtype=torch.int32, device=q.device
+                )
+                kv_prefix_sum_context_lens[1:] = torch.cumsum(
+                    num_cached_tokens.to(q.device), dim=0
+                )
+
+                kv_indices_cached = torch.empty(
+                    kv_indptr_cached[-1].item(),
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                block_tables = attn_metadata.block_tables
+                for i in range(bs):
+                    n = num_cached_blocks[i].item()
+                    if n > 0:
+                        kv_indices_cached[
+                            kv_indptr_cached[i].item() : kv_indptr_cached[
+                                i + 1
+                            ].item()
+                        ] = block_tables[i, :n]
+
+                # Step 4.2: gather_kv_b_proj - Gather + Project (doc §4.2)
+                k_prefix = torch.zeros(
+                    (
+                        total_cached,
+                        self.num_heads
+                        * (self.qk_nope_head_dim + self.qk_rope_head_dim),
+                    ),
+                    device=q.device,
+                    dtype=(
+                        dtypes.fp8
+                        if self.kv_cache_dtype.startswith("fp8")
+                        else self.dtype
+                    ),
+                )
+                v_prefix = torch.zeros(
+                    (
+                        total_cached,
+                        self.num_heads * self.qk_nope_head_dim,
+                    ),
+                    device=q.device,
+                    dtype=(
+                        dtypes.fp8
+                        if self.kv_cache_dtype.startswith("fp8")
+                        else self.dtype
+                    ),
+                )
+
+                gather_kv_b_proj(
+                    kv_cache,
+                    self._k_scale,
+                    kv_indptr_cached,
+                    kv_indices_cached,
+                    kv_prefix_sum_context_lens,
+                    self.kv_b_proj.weight,
+                    self.kv_b_proj.weight_scale,
+                    k_prefix.view(
+                        -1,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    ),
+                    v_prefix.view(-1, self.num_heads, self.qk_nope_head_dim),
+                )
+
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
@@ -906,9 +1113,20 @@ class MLAAttention(nn.Module):
                     scale=self._k_scale,
                 )
 
-            output = self._forward_prefill_mha(
-                prefill_q, k_nope, k_rope, kv_cache, attn_metadata
-            )
+            # Step 4.3-4.4: Concat cached + new, flash attention (doc §4.3, §4.4)
+            if use_prefix_cache:
+                output = self._forward_prefill_mha_prefix_cache(
+                    prefill_q,
+                    k_prefix,
+                    v_prefix,
+                    k_nope,
+                    k_rope,
+                    attn_metadata,
+                )
+            else:
+                output = self._forward_prefill_mha(
+                    prefill_q, k_nope, k_rope, kv_cache, attn_metadata
+                )
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
