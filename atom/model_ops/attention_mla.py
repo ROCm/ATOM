@@ -76,6 +76,258 @@ if is_rocm_aiter_fp4bmm_enabled():
     from atom.model_ops.utils import quark_post_load_weights
 
 
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _triton_gather_kv_b_proj(
+    batch_size,
+    k_buffer,  # [num_block, block_size, kv_c_dim + kv_pe_dim]
+    k_scale,  # [1] or None
+    kv_indptr,  # [batch_size + 1]
+    kv_indices,  # [total_kv]
+    kv_prefix_sum_context_lens,  # [batch_size + 1]
+    kv_proj_weight,  # [tp_k_head_num * 2 * qk_nope_head_dim, kv_c_dim]
+    kv_proj_scale,  # [tp_k_head_num * 2 * qk_nope_head_dim // 128, kv_c_dim // 128]
+    k_prefix,  # [total_kv, tp_k_head_num * qk_nope_head_dim + kv_pe_dim]
+    v_prefix,  # [total_kv, tp_k_head_num * qk_nope_head_dim]
+    KBlockSize: tl.constexpr,
+    TpNumHeads: tl.constexpr,
+    QkNopeHeadDim: tl.constexpr,
+    KV_CDim: tl.constexpr,
+    KV_PeDim: tl.constexpr,
+    ChunkK: tl.constexpr,
+):
+    stride_k_buffer: tl.constexpr = KBlockSize * (KV_CDim + KV_PeDim)
+    stride_k_prefix: tl.constexpr = TpNumHeads * (QkNopeHeadDim + KV_PeDim)
+    stride_v_prefix: tl.constexpr = TpNumHeads * QkNopeHeadDim
+
+    ScaleKGranularity: tl.constexpr = 128
+    ScaleNGranularity: tl.constexpr = 128
+    KBlocksPerChunkK: tl.constexpr = ChunkK // KBlockSize
+    assert KV_CDim == 4 * ScaleKGranularity
+
+    # ===---------------------------------------------------
+    # Workload Partition
+    # ===---------------------------------------------------
+    pid = tl.program_id(0)
+    pid_batch = pid // TpNumHeads
+    pid_head = pid % TpNumHeads
+
+    kv_block_start = tl.load(kv_indptr + pid_batch)
+    kv_block_end = tl.load(kv_indptr + pid_batch + 1)
+
+    context_start = tl.load(kv_prefix_sum_context_lens + pid_batch)
+    context_end = tl.load(kv_prefix_sum_context_lens + pid_batch + 1)
+
+    total_kv_block = kv_block_end - kv_block_start
+    total_kv_chunk = (total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK
+
+    # ===---------------------------------------------------
+    # Pipeline Start
+    # ===---------------------------------------------------
+    k_type = k_buffer.dtype.element_ty
+    if k_type == tl.bfloat16:
+        k_scalar_scale = 1.0
+    else:
+        k_scalar_scale = tl.load(k_scale)
+
+    k_nope_weight_base_offset = (
+        kv_proj_weight
+        + pid_head * 2 * QkNopeHeadDim * KV_CDim
+        + tl.arange(0, QkNopeHeadDim)[:, None] * KV_CDim
+        + tl.arange(0, ScaleKGranularity)[None, :]
+    )
+    k_nope_scale_base_offset = (
+        kv_proj_scale
+        + pid_head
+        * 2
+        * QkNopeHeadDim
+        * KV_CDim
+        // ScaleKGranularity
+        // ScaleNGranularity
+        + tl.arange(0, QkNopeHeadDim // ScaleNGranularity)
+        * (KV_CDim // ScaleKGranularity)
+    )
+
+    k_nope_weight_0 = tl.load(k_nope_weight_base_offset + 0 * ScaleKGranularity).to(
+        k_type
+    )
+    k_nope_weight_1 = tl.load(k_nope_weight_base_offset + 1 * ScaleKGranularity).to(
+        k_type
+    )
+    k_nope_weight_2 = tl.load(k_nope_weight_base_offset + 2 * ScaleKGranularity).to(
+        k_type
+    )
+    k_nope_weight_3 = tl.load(k_nope_weight_base_offset + 3 * ScaleKGranularity).to(
+        k_type
+    )
+
+    v_nope_weight_0 = tl.load(
+        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 0 * ScaleKGranularity
+    ).to(k_type)
+    v_nope_weight_1 = tl.load(
+        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 1 * ScaleKGranularity
+    ).to(k_type)
+    v_nope_weight_2 = tl.load(
+        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 2 * ScaleKGranularity
+    ).to(k_type)
+    v_nope_weight_3 = tl.load(
+        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 3 * ScaleKGranularity
+    ).to(k_type)
+
+    k_nope_scale_0 = tl.load(k_nope_scale_base_offset + 0)
+    k_nope_scale_1 = tl.load(k_nope_scale_base_offset + 1)
+    k_nope_scale_2 = tl.load(k_nope_scale_base_offset + 2)
+    k_nope_scale_3 = tl.load(k_nope_scale_base_offset + 3)
+
+    v_nope_scale_0 = tl.load(
+        k_nope_scale_base_offset
+        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
+        + 0
+    )
+    v_nope_scale_1 = tl.load(
+        k_nope_scale_base_offset
+        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
+        + 1
+    )
+    v_nope_scale_2 = tl.load(
+        k_nope_scale_base_offset
+        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
+        + 2
+    )
+    v_nope_scale_3 = tl.load(
+        k_nope_scale_base_offset
+        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
+        + 3
+    )
+
+    for chunk_id in range(total_kv_chunk):
+        kv_block_idx = tl.load(
+            kv_indices
+            + kv_block_start
+            + chunk_id * KBlocksPerChunkK
+            + tl.arange(0, ChunkK) // KBlockSize,
+            mask=chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
+            < total_kv_block,
+        )
+        kv_c_data_base_offset = (
+            kv_block_idx[:, None] * stride_k_buffer
+            + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
+            + tl.arange(0, ScaleKGranularity)[None, :]
+        )  # [ChunkK, kv_c_dim]
+
+        accum_k = tl.zeros((ChunkK, QkNopeHeadDim), dtype=tl.float32)
+        accum_v = tl.zeros((ChunkK, QkNopeHeadDim), dtype=tl.float32)
+
+        kv_c_data_0 = tl.load(k_buffer + kv_c_data_base_offset + 0 * ScaleKGranularity)
+        kv_c_data_1 = tl.load(k_buffer + kv_c_data_base_offset + 1 * ScaleKGranularity)
+        kv_c_data_2 = tl.load(k_buffer + kv_c_data_base_offset + 2 * ScaleKGranularity)
+        kv_c_data_3 = tl.load(k_buffer + kv_c_data_base_offset + 3 * ScaleKGranularity)
+        kv_pe_data = tl.load(
+            k_buffer
+            + kv_block_idx[:, None] * stride_k_buffer
+            + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
+            + KV_CDim
+            + tl.arange(0, KV_PeDim)[None, :],
+        )
+
+        accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0
+        accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0
+        accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1
+        accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1
+        accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2
+        accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2
+        accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3
+        accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3
+
+        accum_k *= k_scalar_scale
+        accum_v *= k_scalar_scale
+        kv_pe_data *= k_scalar_scale
+
+        context_mask = (
+            context_start + chunk_id * ChunkK + tl.arange(0, ChunkK) < context_end
+        )
+        tl.store(
+            k_prefix
+            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
+            * stride_k_prefix
+            + pid_head * (QkNopeHeadDim + KV_PeDim)
+            + QkNopeHeadDim
+            + tl.arange(0, KV_PeDim)[None, :],
+            kv_pe_data,
+            mask=context_mask[:, None],
+        )
+        tl.store(
+            k_prefix
+            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
+            * stride_k_prefix
+            + pid_head * (QkNopeHeadDim + KV_PeDim)
+            + tl.arange(0, QkNopeHeadDim)[None, :],
+            accum_k,
+            mask=context_mask[:, None],
+        )
+        tl.store(
+            v_prefix
+            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
+            * stride_v_prefix
+            + pid_head * QkNopeHeadDim
+            + tl.arange(0, QkNopeHeadDim)[None, :],
+            accum_v,
+            mask=context_mask[:, None],
+        )
+
+def gather_kv_b_proj(
+    k_buffer: torch.Tensor,  # [num_block, block_size, hidden_dim]
+    k_scale: torch.Tensor,  # [1]
+    kv_indptr: torch.Tensor,  # [batch_size + 1]
+    kv_indices: torch.Tensor,  # len(kv_indices) = kv_indptr[-1]
+    kv_prefix_sum_context_lens: torch.Tensor,  # [batch_size + 1]
+    kv_proj_weight: torch.Tensor,  # [2 * 128 // TP * 128, 512]
+    kv_proj_scale: torch.Tensor,  # [2 * 128 // TP, 4], blockscale=128 x 128
+    k_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim]
+    v_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim]
+):
+    num_block, block_size, hidden_dim = k_buffer.shape
+    batch_size = kv_indptr.shape[0] - 1
+    weight_n, weight_k = kv_proj_weight.shape
+    scale_n, scale_k = kv_proj_scale.shape
+    total_kv_k, tp_k_head_num_k, qk_nope_pe_dim = k_prefix.shape
+    total_kv_v, tp_k_head_num_v, qk_nope_dim = v_prefix.shape
+
+    scale_k_granularity = weight_k // scale_k
+    scale_n_granularity = weight_n // scale_n
+
+    ChunkK = 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
+
+    assert total_kv_k == total_kv_v
+    assert tp_k_head_num_k == tp_k_head_num_v
+    assert scale_k_granularity == 128
+    assert scale_n_granularity == 128
+    assert ChunkK % block_size == 0
+
+    grid = (batch_size * tp_k_head_num_k,)
+    kernel = _triton_gather_kv_b_proj[grid](
+        batch_size,
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        kv_proj_scale,
+        k_prefix,
+        v_prefix,
+        KBlockSize=block_size,
+        TpNumHeads=tp_k_head_num_k,
+        QkNopeHeadDim=qk_nope_dim,
+        KV_CDim=weight_k,
+        KV_PeDim=qk_nope_pe_dim - qk_nope_dim,
+        ChunkK=ChunkK,
+        num_stages=3,
+    )
+
 # MLA Specific Arguments
 @dataclass
 class MLAModules:
@@ -632,7 +884,12 @@ class MLAAttention(nn.Module):
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
-        if context.is_prefill and not use_prefill_mla and not attn_metadata.has_cached:
+        if context.is_prefill and not use_prefill_mla:
+            use_prefix_cache = (
+                attn_metadata.has_cached
+                and not is_rocm_aiter_fp4bmm_enabled()
+                and self.qk_nope_head_dim == self.v_head_dim
+            )
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
