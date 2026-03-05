@@ -255,14 +255,13 @@ class CompilationConfig:
             ]
 
 
-class QuantizationConfig(dict):
+class QuantizationConfig:
     """Model-wide quantization configuration.
 
-    Still inherits from dict for backward compatibility with existing code
-    that accesses ``quant_config["quant_type"]``, etc.
-
-    New code should prefer the :pyattr:`parsed` attribute and
-    :pymeth:`resolve` method.
+    The primary API is :pymeth:`resolve` and the :pyattr:`parsed` /
+    :pyattr:`global_spec` attributes.  Scalar convenience properties
+    (``quant_type``, ``quant_dtype``, ``is_dynamic``, ``quant_method``)
+    delegate to ``global_spec``.
     """
 
     def __init__(
@@ -276,15 +275,9 @@ class QuantizationConfig(dict):
         *,
         parsed: Optional[ParsedQuantConfig] = None,
     ):
-        super().__init__()
-        self["quant_type"] = quant_type if quant_type is not None else QuantType.No
-        self["quant_dtype"] = quant_dtype if quant_dtype is not None else torch.bfloat16
-        self["quant_name"] = quant_name
-        self["is_dynamic"] = is_dynamic
-        self["quant_method"] = quant_method
-        self["exclude_layers"] = exclude_layers if exclude_layers is not None else []
+        self._quant_name = quant_name
 
-        # --- New: structured parsed config ---
+        # --- Structured parsed config ---
         if parsed is not None:
             self._parsed = parsed
         else:
@@ -292,12 +285,14 @@ class QuantizationConfig(dict):
             # manually-constructed QuantizationConfigs still work.
             self._parsed = ParsedQuantConfig(
                 global_spec=LayerQuantSpec(
-                    quant_type=self["quant_type"],
-                    quant_dtype=self["quant_dtype"],
-                    is_dynamic=self["is_dynamic"],
-                    quant_method=self["quant_method"],
+                    quant_type=quant_type if quant_type is not None else QuantType.No,
+                    quant_dtype=(
+                        quant_dtype if quant_dtype is not None else torch.bfloat16
+                    ),
+                    is_dynamic=is_dynamic,
+                    quant_method=quant_method,
                 ),
-                exclude_layers=self["exclude_layers"],
+                exclude_layers=exclude_layers if exclude_layers is not None else [],
             )
 
     # -- public API --------------------------------------------------------
@@ -342,18 +337,35 @@ class QuantizationConfig(dict):
         # 4. Global default
         return self._parsed.global_spec
 
-    # -- backward compat ---------------------------------------------------
+    # -- scalar convenience properties ------------------------------------
 
-    def get_name(self):
-        return self["quant_name"]
+    @property
+    def quant_type(self) -> "QuantType":
+        return self._parsed.global_spec.quant_type
+
+    @property
+    def quant_dtype(self) -> torch.dtype:
+        return self._parsed.global_spec.quant_dtype
+
+    @property
+    def is_dynamic(self) -> bool:
+        return self._parsed.global_spec.is_dynamic
+
+    @property
+    def quant_method(self) -> Optional[str]:
+        return self._parsed.global_spec.quant_method
+
+    # -- named accessor ---------------------------------------------------
+
+    def get_name(self) -> str:
+        return self._quant_name
 
     # -- internals ---------------------------------------------------------
 
     def _is_excluded(self, prefix: str) -> bool:
         """Check whether *prefix* matches the exclude list.
 
-        Uses the same logic as the original ``should_ignore_layer``
-        in ``atom.models.utils`` so behaviour is identical.
+        Supports bare suffix, substring, and ``re:`` prefix for regex patterns.
         """
         exclude_layers: list[str] = self._parsed.exclude_layers
         if not exclude_layers:
@@ -384,12 +396,11 @@ class QuantizationConfig(dict):
         the final hidden states.
         """
         factors: list[Any] = []
-        factors.append(self["quant_type"])
-        factors.append(self["quant_dtype"])
-        factors.append(self["quant_name"])
-        factors.append(self["is_dynamic"])
-        factors.append(self["quant_method"])
-        # assert_hashable(str_factors)
+        factors.append(self.quant_type)
+        factors.append(self.quant_dtype)
+        factors.append(self._quant_name)
+        factors.append(self.is_dynamic)
+        factors.append(self.quant_method)
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
 

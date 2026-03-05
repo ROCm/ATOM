@@ -9,7 +9,7 @@ Tests cover:
 - Parser registry: registration, dispatch, fallback
 - QuarkParser / CompressedTensorsParser / GenericParser: parsing logic
 - QuantizationConfig.resolve(): exclude-list resolution, per-layer overrides
-- Backward compatibility: dict access, should_ignore_layer, get_quant_config_for_layer
+- QuantizationConfig scalar properties: quant_type, quant_dtype, is_dynamic, quant_method
 - LinearBase: layer_spec parameter plumbing
 """
 
@@ -292,10 +292,11 @@ class TestQuantizationConfigResolve(unittest.TestCase):
 
 
 # ====================================================================
-# 7. Backward compatibility
+# 7. Scalar properties and resolve API
 # ====================================================================
 class TestBackwardCompat(unittest.TestCase):
-    def test_dict_access(self):
+    def test_scalar_properties(self):
+        """QuantizationConfig exposes scalar properties that delegate to global_spec."""
         from atom.config import QuantizationConfig
 
         qc = QuantizationConfig(
@@ -304,36 +305,36 @@ class TestBackwardCompat(unittest.TestCase):
             quant_method="quark",
             exclude_layers=["lm_head"],
         )
-        self.assertEqual(qc["quant_type"], QuantType.per_1x32)
-        self.assertEqual(qc["quant_dtype"], torch.float4_e2m1fn_x2)
-        self.assertEqual(qc["quant_method"], "quark")
-        self.assertEqual(qc["exclude_layers"], ["lm_head"])
+        self.assertEqual(qc.quant_type, QuantType.per_1x32)
+        self.assertEqual(qc.quant_dtype, torch.float4_e2m1fn_x2)
+        self.assertEqual(qc.quant_method, "quark")
+        self.assertEqual(qc.parsed.exclude_layers, ["lm_head"])
 
-    def test_should_ignore_layer_uses_resolve(self):
+    def test_resolve_excluded_layer(self):
+        """resolve() returns no_quant spec for excluded layers."""
         from atom.config import QuantizationConfig
-        from atom.models.utils import should_ignore_layer
 
         qc = QuantizationConfig(
             quant_type=QuantType.per_1x32,
             quant_dtype=torch.float4_e2m1fn_x2,
             exclude_layers=["lm_head"],
         )
-        self.assertTrue(should_ignore_layer(qc, "lm_head"))
-        self.assertFalse(should_ignore_layer(qc, "model.layers.0.mlp.down_proj"))
+        self.assertFalse(qc.resolve("lm_head").is_quantized)
+        self.assertTrue(qc.resolve("model.layers.0.mlp.down_proj").is_quantized)
 
-    def test_get_quant_config_for_layer(self):
+    def test_resolve_replaces_legacy_helpers(self):
+        """resolve() subsumes what get_quant_config_for_layer used to return."""
         from atom.config import QuantizationConfig
-        from atom.models.utils import get_quant_config_for_layer
 
         qc = QuantizationConfig(
             quant_type=QuantType.per_1x32,
             quant_dtype=torch.float4_e2m1fn_x2,
             exclude_layers=["lm_head"],
         )
-        self.assertIsNone(get_quant_config_for_layer(qc, "lm_head"))
-        self.assertIs(
-            get_quant_config_for_layer(qc, "model.layers.0.mlp.down_proj"), qc
-        )
+        excluded_spec = qc.resolve("lm_head")
+        included_spec = qc.resolve("model.layers.0.mlp.down_proj")
+        self.assertFalse(excluded_spec.is_quantized)
+        self.assertTrue(included_spec.is_quantized)
 
     def test_parsed_property(self):
         from atom.config import QuantizationConfig
@@ -416,8 +417,8 @@ class TestLinearBaseLayerSpec(unittest.TestCase):
         self.assertTrue(lb._layer_spec.needs_online_quant)
 
     @patch("atom.model_ops.linear.get_tp_group")
-    def test_no_layer_spec_builds_from_dict(self, mock_tp):
-        """When layer_spec is not provided, LinearBase builds one from the dict."""
+    def test_no_layer_spec_builds_from_global_spec(self, mock_tp):
+        """When layer_spec is not provided, LinearBase builds one from global_spec."""
         mock_group = MagicMock()
         mock_group.rank_in_group = 0
         mock_group.world_size = 1

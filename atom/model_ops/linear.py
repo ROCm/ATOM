@@ -205,16 +205,16 @@ class LinearBase(nn.Module):
         if quant_config is None:
             quant_config = QuantizationConfig()
 
-        # --- New: prefer LayerQuantSpec if provided ---
+        # layer_spec is always provided by the linear subclasses via resolve()
         if layer_spec is not None:
             self._layer_spec = layer_spec
         else:
-            # Build a LayerQuantSpec from old-style dict fields for compat
+            # Fallback: build from global_spec when no prefix was supplied
             self._layer_spec = LayerQuantSpec(
-                quant_type=quant_config["quant_type"],
-                quant_dtype=quant_config["quant_dtype"],
-                is_dynamic=quant_config.get("is_dynamic", True),
-                quant_method=quant_config.get("quant_method", None),
+                quant_type=quant_config.global_spec.quant_type,
+                quant_dtype=quant_config.global_spec.quant_dtype,
+                is_dynamic=quant_config.global_spec.is_dynamic,
+                quant_method=quant_config.global_spec.quant_method,
                 checkpoint_dtype=source_quant_dtype,
             )
 
