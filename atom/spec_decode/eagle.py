@@ -107,14 +107,14 @@ class EagleProposer:
         forward_context = get_forward_context()
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
-        context.is_draft = True
         bs = context.batch_size
+        context.is_draft = True
 
         assert self.runner is not None
         input_ids = target_token_ids
         # input_ids[last_token_indices] = next_token_ids
         input_ids.scatter_(0, last_token_indices, next_token_ids)
-        positions = target_positions
+        positions = target_positions + 1
         hidden_states = target_hidden_states
 
         draft_token_ids = torch.empty(
@@ -129,7 +129,9 @@ class EagleProposer:
                 hidden_states=hidden_states,
             )
             sample_hidden_states = (
-                ret_hidden_states[last_token_indices] if i == 0 else ret_hidden_states
+                torch.index_select(ret_hidden_states, 0, last_token_indices)
+                if i == 0
+                else ret_hidden_states
             )
             logits = self.model.compute_logits(sample_hidden_states)
             new_draft_ids = logits.argmax(dim=-1)
@@ -137,18 +139,22 @@ class EagleProposer:
 
             if i < self.mtp_k - 1:
                 if i == 0:
+                    attn_metadata.max_seqlen_q = 1
                     kv_indptr = var["kv_indptr"].gpu[: bs + 1]
                     kv_indices = var["kv_indices"].gpu
-                    slot_mapping = var["slot_mapping"].gpu[:bs]
+                    slot_mapping = var["slot_mapping"].gpu[
+                        : bs * attn_metadata.max_seqlen_q
+                    ]
                     kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+                    cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
                     attn_metadata.kv_indptr = kv_indptr
                     attn_metadata.kv_indices = kv_indices
+                    attn_metadata.cu_seqlens_q = cu_seqlens_q
                     attn_metadata.slot_mapping = slot_mapping
                     attn_metadata.kv_last_page_lens = kv_last_page_lens
-                    positions = positions[last_token_indices]
-                    attn_metadata.max_seqlen_q = 1
-                    attn_metadata.cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
+                    cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
                     kv_indptr[1 : bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
+                    positions = torch.gather(positions, 0, last_token_indices)
                     context.is_prefill = False
 
                 # update metadata
@@ -163,7 +169,7 @@ class EagleProposer:
                 positions += 1
                 hidden_states = sample_hidden_states
 
-        # self.runner.debug(f"{draft_token_ids=}")
+        # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]
         return draft_token_ids
 

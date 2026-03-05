@@ -110,7 +110,7 @@ class AsyncIOProc:
                 if func is None:
                     continue
                 out = func(*args)
-                if out is not None:
+                if self.io_addrs[1] is not None and out is not None:
                     self.io_queues[1].put_nowait(out)
             if func_name == "exit":
                 break

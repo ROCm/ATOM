@@ -3,15 +3,181 @@
 
 # from flash_attn import flash_attn_with_kvcache
 from typing import Optional
+from abc import ABC, abstractmethod
 
 import torch
 from torch import nn
+import triton
+import triton.language as tl
 
 
 from atom.utils import mark_spliting_op
 from .attention_mla import MLAModules
 from atom.config import get_current_atom_config
 from atom.utils.selector import get_attn_backend
+
+
+# frontend interface class for constructing attention
+# op in model file
+class Attention:
+    def __new__(cls, *args, **kwargs):
+        from atom.model_ops import Attention
+
+        return Attention(*args, **kwargs)
+
+
+# this triton kernel is used to fetch the stored kv in
+# kv cache for computing the extend path(chunked prefill)
+# and it can be used for both server mode and plugin mode
+@triton.jit
+def cp_mha_gather_cache_kernel(
+    key_cache_ptr,  # [num_blocks, page_size, num_head, head_size]
+    value_cache_ptr,  # [num_blocks, page_size, num_head, head_size]
+    key_ptr,  # [num_tokens, num_heads, head_size]
+    value_ptr,  # [num_tokens, num_heads, head_size]
+    block_table_ptr,  # [num_batches, max_block_num]
+    cu_seqlens_kv_ptr,  # [num_batches + 1]
+    token_to_batch_ptr,  # [max_cum_tokens]
+    seq_start_ptr,  # [num_batches]
+    k_scale_ptr,  # [1] / [num_blocks, num_kv_heads, page_size]
+    v_scale_ptr,
+    num_heads,
+    head_size,
+    x,
+    max_block_num,
+    DEQUANT: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    CACHE_FORMAT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    key_ptr_offset = key_ptr + token_id * head_size * num_heads + head_id * head_size
+    value_ptr_offset = (
+        value_ptr + token_id * head_size * num_heads + head_id * head_size
+    )
+    batch_idx = tl.load(token_to_batch_ptr + token_id)
+    batch_start = tl.load(seq_start_ptr + batch_idx)
+    token_start = tl.load(cu_seqlens_kv_ptr + batch_idx)
+    batch_offset = token_id - token_start + batch_start
+    block_offset = batch_offset // PAGE_SIZE
+    block_id = tl.load(block_table_ptr + max_block_num * batch_idx + block_offset).to(
+        tl.int64
+    )
+    slot_id = batch_offset % PAGE_SIZE
+
+    if CACHE_FORMAT == "NHD":
+        # for kv cache layout as
+        # K: [num_blocks, page_size, num_head, head_dim]
+        # V: [num_blocks, page_size, num_head, head_dim]
+        key_cache_ptr_offset = (
+            key_cache_ptr
+            + block_id * num_heads * head_size * PAGE_SIZE
+            + slot_id * num_heads * head_size
+            + head_id * head_size
+        )
+        value_cache_ptr_offset = (
+            value_cache_ptr
+            + block_id * num_heads * head_size * PAGE_SIZE
+            + slot_id * num_heads * head_size
+            + head_id * head_size
+        )
+        k_reg = tl.load(key_cache_ptr_offset + col_offsets)
+        v_reg = tl.load(value_cache_ptr_offset + col_offsets)
+        if DEQUANT:
+            k_scale = tl.load(k_scale_ptr)
+            v_scale = tl.load(v_scale_ptr)
+            k_dtype = k_reg.dtype
+            v_dtype = v_reg.dtype
+            k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
+            v_reg = (v_reg.to(tl.float32) * v_scale).to(v_dtype)
+        tl.store(key_ptr_offset + col_offsets, k_reg)
+        tl.store(value_ptr_offset + col_offsets, v_reg)
+
+    elif CACHE_FORMAT == "SHUFFLE":
+        # for kv cache layout as
+        # K: [num_blocks, num_head, head_dim // x, page_size, x]
+        # V: [num_blocks, num_head, page_size // x, head_dim, x]
+        key_cache_ptr_offset = (
+            key_cache_ptr
+            + block_id * num_heads * head_size * PAGE_SIZE
+            + head_id * head_size * PAGE_SIZE
+            + slot_id * x
+        )
+        value_cache_ptr_offset = (
+            value_cache_ptr
+            + block_id * num_heads * head_size * PAGE_SIZE
+            + head_id * head_size * PAGE_SIZE
+            + (slot_id // x) * head_size * x
+            + slot_id % x
+        )
+        k_reg_offset = col_offsets // x * PAGE_SIZE * x + col_offsets % x
+        v_reg_offset = col_offsets * x
+        k_reg = tl.load(key_cache_ptr_offset + k_reg_offset)
+        v_reg = tl.load(value_cache_ptr_offset + v_reg_offset)
+        if DEQUANT:
+            k_scale = 1.0
+            v_scale = 1.0
+            k_reg = k_reg.to(tl.float32) * k_scale
+            v_reg = v_reg.to(tl.float32) * v_scale
+        tl.store(key_ptr_offset + col_offsets, k_reg)
+        tl.store(value_ptr_offset + col_offsets, v_reg)
+
+
+def cp_mha_gather_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_tables: torch.Tensor,
+    k_scales: Optional[torch.Tensor],
+    v_scales: Optional[torch.Tensor],
+    cu_seqlens_kv: torch.Tensor,
+    token_to_batch: torch.Tensor,
+    seq_starts: torch.Tensor,
+    dequant: bool,
+    kv_cache_layout: str,
+    total_tokens: int,
+):
+    assert kv_cache_layout in [
+        "NHD",
+        "SHUFFLE",
+    ], "kv_cache_layout only support NHD, SHUFFLE"
+    if dequant:
+        assert k_scales is not None and v_scales is not None
+    head_dim = key.shape[2]
+    x = 16 // key_cache.element_size()
+    # For k cache layout: [num_blocks, num_heads, page_size, head_dim]
+    assert head_dim == key_cache.shape[3], (
+        "We assume your kv cache layout is [num_blocks, "
+        "page_size, num_heads, head_dim], but got otherwise"
+    )
+    page_size = key_cache.shape[1]
+    num_heads = key_cache.shape[2]
+
+    grid = lambda meta: (total_tokens, num_heads)  # noqa: E731
+    cp_mha_gather_cache_kernel[grid](
+        key_cache,
+        value_cache,
+        key,
+        value,
+        block_tables,
+        cu_seqlens_kv,
+        token_to_batch,
+        seq_starts,
+        k_scales,
+        v_scales,
+        num_heads,
+        head_dim,
+        x,
+        block_tables.size(1),
+        DEQUANT=dequant,
+        PAGE_SIZE=page_size,
+        CACHE_FORMAT=kv_cache_layout,
+        BLOCK_SIZE=head_dim,
+    )
 
 
 def fake_(
@@ -51,7 +217,18 @@ def unified_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.impl.forward(q, k, v, positions, q_scale, qkv)
+    if use_mla:
+        return self.impl.forward(q, k, v, positions, q_scale, qkv)
+    else:
+        return self.impl.forward(
+            layer=self,
+            query=q,
+            key=k,
+            value=v,
+            position=positions,
+            q_scale=q_scale,
+            qkv=qkv,
+        )
 
 
 def linear_attention_with_output_base_fake(
@@ -79,7 +256,12 @@ def linear_attention_with_output_base(
     return self.impl.forward(mixed_qkv, b, a, core_attn_out)
 
 
-class Attention(nn.Module):
+class BaseAttention(nn.Module, ABC):
+    """
+    Abstract base class for attention
+
+    This class defines the interface that all attention implementations must follow
+    """
 
     def __init__(
         self,
@@ -95,71 +277,23 @@ class Attention(nn.Module):
         per_layer_sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
         prefix: Optional[str] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
         **kwargs,
     ):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scale = scale
-        self.num_kv_heads = num_kv_heads
-        self.k_cache = self.v_cache = torch.tensor([])
-        self.kv_cache_dtype = kv_cache_dtype
-        self.max_model_len = 0
-        self.k_scale = self.v_scale = None
-        self.layer_num = layer_num
-        self.mla_modules = mla_modules
-        self.use_mla = use_mla
-        self.base_attention = None
-        self.kv_cache = torch.tensor([])
-        self.indexer = mla_modules.indexer if mla_modules is not None else None
-        self.sinks = sinks
 
-        atom_config = get_current_atom_config()
-        dtype = atom_config.torch_dtype
-        block_size = atom_config.kv_cache_block_size
-        self.attn_backend = get_attn_backend(
-            block_size,
-            use_mla=self.use_mla,
-        )
-        impl_cls = self.attn_backend.get_impl_cls()
-        self.impl = impl_cls(
-            num_heads,
-            head_dim,
-            scale,
-            num_kv_heads,
-            kv_cache_dtype,
-            layer_num,
-            mla_modules,
-            sinks=sinks,
-            sliding_window=per_layer_sliding_window,
-            rotary_emb=rotary_emb,
-            dtype=dtype,
-            q_norm=q_norm,
-            k_norm=k_norm,
-        )
-
-        compilation_config = atom_config.compilation_config
-        default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
-        self.layer_name = prefix if prefix is not None else default_name
-        if self.layer_name in compilation_config.static_forward_context:
-            raise ValueError("Duplicate layer: {}".format(self.layer_name))
-        compilation_config.static_forward_context[self.layer_name] = self
-
+    @abstractmethod
     def forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        positions: torch.Tensor = None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
         q_scale: Optional[torch.Tensor] = None,
-        qkv: torch.Tensor = None,
-    ):
-        output = torch.ops.aiter.unified_attention_with_output_base(
-            q, q_scale, k, v, positions, self.layer_name, self.use_mla, qkv
+        **kwargs,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement the forward() method"
         )
-        return output
 
 
 class LinearAttention(nn.Module):

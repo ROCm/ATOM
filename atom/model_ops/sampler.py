@@ -1,11 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from functools import lru_cache
+
 import torch
 from aiter import mixed_sample_outer_exponential
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
+
+
+@lru_cache(maxsize=1)
+def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
+    """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
+    This is key to deterministic inference, as it ensures that the same random values are used for each token across different runs.
+    """
+    return torch.empty((1, vocab_size), dtype=torch.float, device=device).exponential_(
+        1
+    )
 
 
 class Sampler(nn.Module):
@@ -19,22 +31,15 @@ class Sampler(nn.Module):
         logits: torch.Tensor,  # (token_num, vocab_size)
         temperatures: torch.Tensor,  # (token_num,)
     ) -> torch.Tensor:  # (token_num,)
-        sampled_tokens = torch.empty(
-            logits.size(0), dtype=torch.int, device=logits.device
-        )
-        exponential = (
-            torch.empty((1, logits.shape[-1]), dtype=torch.float, device=logits.device)
-            .exponential_(1)
-            .expand(*logits.shape)
+        token_num, vocab_size = logits.shape
+        sampled_tokens = torch.empty(token_num, dtype=torch.int, device=logits.device)
+        exponential = get_per_token_exponential(vocab_size, logits.device).expand(
+            token_num, vocab_size
         )
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
         return sampled_tokens
-        logits = logits.float()
-        return torch.where(
-            temperatures == 0, self.greedy_sample(logits), self.random_sample(logits)
-        ).to(torch.int)
 
     def greedy_sample(
         self, logits: torch.Tensor  # (token_num, vocab_size)

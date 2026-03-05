@@ -47,6 +47,7 @@ from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
+from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -1773,6 +1774,7 @@ direct_register_custom_op(
 )
 
 
+@FusedMoEDecoratorForPluginMode
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 

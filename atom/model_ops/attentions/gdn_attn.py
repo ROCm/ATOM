@@ -69,7 +69,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         self,
         model_runner,
     ):
-        super().__init__(model_runner)
+        super().__init__(model_runner=model_runner)
         self.num_spec = 0
         if hasattr(model_runner, "drafter"):
             self.num_spec = model_runner.drafter.mtp_k

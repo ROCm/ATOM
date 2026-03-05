@@ -4,7 +4,6 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
-
 from aiter import dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
@@ -78,9 +77,10 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        masked_inputs_embeds = torch.where(
-            positions.unsqueeze(-1) == 0, 0, inputs_embeds
-        )
+        # masked_inputs_embeds = torch.where(
+        #     positions.unsqueeze(-1) == 0, 0, inputs_embeds
+        # )
+        masked_inputs_embeds = inputs_embeds
         inputs_embeds = self.enorm(masked_inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
