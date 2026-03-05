@@ -545,6 +545,8 @@ def rocm_asm_moe_impl(
         quant_type_ in [QuantType.per_Token, QuantType.per_1x128]
         and hidden_states.dtype in [torch.float16, torch.bfloat16]
         and w1.dtype in [torch.int8, torch.uint8, torch.float8_e4m3fnuz]
+        and fc1_smooth_scale_fixed is not None
+        and fc2_smooth_scale_fixed is not None
     )
 
     return asm_moe(
