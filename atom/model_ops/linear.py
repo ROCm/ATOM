@@ -169,9 +169,10 @@ def gemm_a8w8_blockscale_preshuffle_fake(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
-    prefix: str="",
+    prefix: str = "",
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
 
 @record_function
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_preshuffle_fake, mutates_args=[])
@@ -181,7 +182,7 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
-    prefix: str="",
+    prefix: str = "",
 ) -> torch.Tensor:
     if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
         weight_shuffled = weight.reshape(weight.shape[0] // 16, weight.shape[1] * 16)
@@ -427,7 +428,12 @@ class LinearBase(nn.Module):
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
                 y = gemm_a8w8_blockscale_preshuffle_impl(
-                    x, self.weight, x_scale, self.weight_scale, dtype=otype, prefix=self.prefix
+                    x,
+                    self.weight,
+                    x_scale,
+                    self.weight_scale,
+                    dtype=otype,
+                    prefix=self.prefix,
                 )
                 if self.bias is not None:
                     y += self.bias

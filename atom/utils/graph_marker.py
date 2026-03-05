@@ -46,5 +46,3 @@ def graph_marker(x: torch.Tensor, name: str) -> torch.Tensor:
     if not _GRAPH_MARKER_ENABLED:
         return x
     return _graph_marker_impl(x)
-
-

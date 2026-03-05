@@ -468,6 +468,7 @@ class ModelRunner:
         self.config = config
         self.mark_trace = getattr(config, "mark_trace", False)
         from atom.utils.graph_marker import set_graph_marker_enabled
+
         set_graph_marker_enabled(self.mark_trace)
         set_current_atom_config(config)
         hf_config = config.hf_config
@@ -1323,7 +1324,9 @@ class ModelRunner:
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             with (
-                record_function(f"prefill_bs_{bs}_ctxlens_{forward_context.attn_metadata.context_lens}")
+                record_function(
+                    f"prefill_bs_{bs}_ctxlens_{forward_context.attn_metadata.context_lens}"
+                )
                 if self.mark_trace
                 else nullcontext()
             ):

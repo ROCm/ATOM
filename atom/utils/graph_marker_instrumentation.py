@@ -9,7 +9,6 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-
 _SUBGRAPH_ID_RE = re.compile(r"artifact_shape_[^/]+_subgraph_(\d+)")
 
 _ASSIGNMENT_RE = re.compile(
@@ -107,12 +106,7 @@ def _split_top_level_args(s: str) -> list[str]:
         if ch == "}":
             depth_brace -= 1
             continue
-        if (
-            ch == ","
-            and depth_paren == 0
-            and depth_bracket == 0
-            and depth_brace == 0
-        ):
+        if ch == "," and depth_paren == 0 and depth_bracket == 0 and depth_brace == 0:
             out.append(s[start:i].strip())
             start = i + 1
     out.append(s[start:].strip())
@@ -194,8 +188,7 @@ def _iter_py_files(root: str) -> Iterable[str]:
 def _ensure_record_function_import(lines: list[str]) -> None:
     # If already imported or referenced via qualified name, do nothing.
     if any(
-        ("record_function" in l and ("import" in l or "from torch" in l))
-        for l in lines
+        ("record_function" in l and ("import" in l or "from torch" in l)) for l in lines
     ):
         return
 
@@ -240,7 +233,9 @@ def _prefix_and_kind(name: str) -> Optional[tuple[str, str]]:
     return None
 
 
-def _already_wrapped(lines: list[str], indent: str, prefix: str, start_idx: int, end_idx: int) -> bool:
+def _already_wrapped(
+    lines: list[str], indent: str, prefix: str, start_idx: int, end_idx: int
+) -> bool:
     needle = f'{indent}with record_function("{prefix}"):\n'
     for i in range(start_idx, min(end_idx, len(lines))):
         if lines[i] == needle:
@@ -283,7 +278,9 @@ def _wrap_region_with_record_function(
 
     # If we already inserted a record_function line in a previous run, upgrade it
     # in-place (e.g. "mlp" -> "layer_0_mlp") and exit without touching indentation.
-    if insert_at < len(lines) and lines[insert_at].startswith(f"{indent}with record_function("):
+    if insert_at < len(lines) and lines[insert_at].startswith(
+        f"{indent}with record_function("
+    ):
         if lines[insert_at] != with_line:
             lines[insert_at] = with_line
         return
@@ -301,7 +298,7 @@ def _wrap_region_with_record_function(
         if line.strip() == "":
             continue
         if line.startswith(indent_prefix):
-            lines[i] = indent_prefix + extra + line[len(indent_prefix):]
+            lines[i] = indent_prefix + extra + line[len(indent_prefix) :]
 
 
 def _layer_id_from_wrapper_path(path: str) -> Optional[int]:
@@ -338,9 +335,8 @@ def _strip_runtime_graph_markers(lines: list[str]) -> bool:
             continue
 
         if (
-            ("assert_size_stride" in line or "assert_alignment" in line)
-            and "torch.ops.aiter.graph_marker.default" in line
-        ):
+            "assert_size_stride" in line or "assert_alignment" in line
+        ) and "torch.ops.aiter.graph_marker.default" in line:
             changed = True
             continue
 
@@ -351,7 +347,9 @@ def _strip_runtime_graph_markers(lines: list[str]) -> bool:
     return changed
 
 
-def instrument_record_functions_in_file(path: str, *, strip_markers: bool = True) -> bool:
+def instrument_record_functions_in_file(
+    path: str, *, strip_markers: bool = True
+) -> bool:
     """
     Returns True if the file was modified.
     """
@@ -391,7 +389,9 @@ def instrument_record_functions_in_file(path: str, *, strip_markers: bool = True
     # Apply from bottom to top so indices stay valid.
     wrapped_or_upgraded = False
     if has_intervals:
-        for start_mk, end_mk, prefix in sorted(intervals, key=lambda t: t[0].idx, reverse=True):
+        for start_mk, end_mk, prefix in sorted(
+            intervals, key=lambda t: t[0].idx, reverse=True
+        ):
             _wrap_region_with_record_function(
                 lines,
                 start_marker_idx=start_mk.idx,
@@ -430,5 +430,3 @@ def instrument_record_functions_in_dir(root: str, *, strip_markers: bool = True)
         if instrument_record_functions_in_file(fp, strip_markers=strip_markers):
             changed += 1
     return changed
-
-

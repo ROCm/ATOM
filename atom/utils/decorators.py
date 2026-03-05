@@ -19,6 +19,7 @@ import time
 from atom.config import CompilationConfig, Config, CompilationLevel
 
 from atom.utils.graph_marker import graph_marker
+
 # from atom.utils import start_monitoring_torch_compile
 
 _T = TypeVar("_T", bound=type[nn.Module])
@@ -49,6 +50,7 @@ def record_function(prefix: Union[str, Callable, None] = None):
         def _wrapped(*args, **kwargs):
             # Keep this decorator no-op unless mark-trace is enabled.
             from atom.utils.graph_marker import is_graph_marker_enabled
+
             if not is_graph_marker_enabled():
                 return func(*args, **kwargs)
 
@@ -137,7 +139,7 @@ def mark_trace(cls):
         # When mark-trace is disabled, bypass all wrapping logic entirely
         if not is_graph_marker_enabled():
             return forward(self, *args, **kwargs)
-        
+
         prefix = getattr(self, "prefix", cls.__name__)
         # Mark only the first tensor across args/kwargs, keeping names stable.
         args_l = list(args)
@@ -161,6 +163,7 @@ def mark_trace(cls):
     wrapped_forward.__mark_trace_wrapped__ = True
     cls.forward = wrapped_forward
     return cls
+
 
 # We remove it from utils/__init__.py to avoid circular import
 def start_monitoring_torch_compile(vllm_config: Config):
