@@ -94,7 +94,7 @@ RUN echo "========== [6.5/7] Install vLLM runtime requirements ==========" \
     && "${VENV_PYTHON}" -m pip install --no-deps -r /tmp/requirements.common.no_xgrammar.txt \
     && "${VENV_PYTHON}" -m pip install --no-deps "xgrammar==0.1.29" \
     && "${VENV_PYTHON}" -m pip install --no-deps -r requirements/rocm.txt \
-    && "${VENV_PYTHON}" -m pip install --upgrade-strategy only-if-needed \
+    && "${VENV_PYTHON}" -m pip install --upgrade-strategy only-if-needed -c /tmp/atom-base-constraints.txt \
        "openai>=1.99.1" \
        "anthropic>=0.71.0" \
        "fastapi[standard]>=0.115.0" \
