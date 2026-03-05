@@ -161,12 +161,13 @@ class PagedAttention(BaseAttention):
             compilation_config.static_forward_context[self.layer_name] = self
 
             if self.use_mla:
-                max_num_tokens = (
-                    atom_config.plugin_config.vllm_scheduler_config.max_num_batched_tokens
-                )
-                compilation_config.static_forward_context["positions"] = torch.zeros(
-                    max_num_tokens, dtype=torch.int64, device="cuda"
-                )
+                if "positions" not in compilation_config.static_forward_context:
+                    max_num_tokens = (
+                        atom_config.plugin_config.vllm_scheduler_config.max_num_batched_tokens
+                    )
+                    compilation_config.static_forward_context["positions"] = torch.zeros(
+                        max_num_tokens, dtype=torch.int64, device="cuda"
+                    )
             return
 
         self.num_heads = num_heads
