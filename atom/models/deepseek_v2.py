@@ -24,7 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
-from typing import Optional, Tuple, Union, Iterable
+from typing import Optional, Tuple, Union
 
 import torch
 from aiter import (
@@ -1899,15 +1899,6 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # load weights in plugin mode and discard passed weights generator
-        from atom.model_loader.loader import load_model_in_plugin_mode
-
-        loaded_weights_record = load_model_in_plugin_mode(
-            model=self, config=self.atom_config, prefix="model."
-        )
-        return loaded_weights_record
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

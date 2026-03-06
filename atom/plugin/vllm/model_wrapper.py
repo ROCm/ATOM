@@ -20,6 +20,7 @@ from vllm.sequence import IntermediateTensors
 
 import atom  # noqa: F401
 from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.model_loader.loader import load_model_in_plugin_mode
 
 import logging
 
@@ -134,7 +135,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        return self.model.load_weights(weights)
+        loaded_weights_record = load_model_in_plugin_mode(
+            model=self.model, config=self.model.atom_config, prefix="model."
+        )
+        return loaded_weights_record
 
     def compute_logits(
         self,

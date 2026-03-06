@@ -19,6 +19,9 @@ from aiter.mla import mla_decode_fwd
 from functools import partial as functools_partial
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
+from atom.plugin.prepare import is_vllm
+from atom.utils import envs
+
 
 import logging
 
@@ -533,7 +536,7 @@ class MLAAttentionImplPluginModeMethods:
 
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
-        o = torch.zeros(
+        o = torch.empty(
             B,
             self.num_heads,
             self.kv_lora_rank,
@@ -810,6 +813,33 @@ class MLAAttentionImplPluginModeMethods:
         return output_padded
 
 
+def _mla_plugin_mode_init(self, *args, **kwargs):
+    """Extra initialization for MLAAttentionImpl in plugin mode (vllm)."""
+    if is_vllm():
+        from vllm.config import get_current_vllm_config
+        from vllm.model_executor.layers.attention.mla_attention import (
+            MLACommonMetadataBuilder,
+        )
+
+        self.supports_quant_query_input = False
+        self.dcp_world_size: int = -1
+        self.chunked_prefill_workspace_size = (
+            MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
+                get_current_vllm_config()
+            )
+        )
+        self.cp_kv_cache_interleave_size: int = (
+            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+        )
+        self.is_aiter_triton_fp4_bmm_enabled = (
+            envs.ATOM_USE_TRITON_MXFP4_BMM
+            and self.kv_b_proj.weight.dtype == torch.bfloat16
+        )
+        self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
+        self._pad_v = True
+        self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
+
+
 def MLAAttentionImplDecoratorForPluginMode(cls):
     method_names = [
         "_concat_k_nope_k_pe_plugin_mode",
@@ -829,5 +859,14 @@ def MLAAttentionImplDecoratorForPluginMode(cls):
     for method_name in method_names:
         method = getattr(MLAAttentionImplPluginModeMethods, method_name)
         setattr(cls, method_name, method)
+
+    # Wrap __init__ to inject plugin-mode initialization
+    orig_init = cls.__init__
+
+    def new_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        _mla_plugin_mode_init(self, *args, **kwargs)
+
+    cls.__init__ = new_init
 
     return cls
