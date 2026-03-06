@@ -62,17 +62,15 @@ class Sampler(nn.Module):
 
     def _needs_filtering(
         self,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
     ) -> bool:
-        """Check if any request needs top-k or top-p filtering."""
-        if top_ks is None and top_ps is None:
-            return False
+        """Check if any request needs top-k or top-p filtering.
 
-        needs_topk = top_ks is not None and (top_ks != -1).any()
-        needs_topp = top_ps is not None and (top_ps < 1.0).any()
-
-        return needs_topk or needs_topp
+        This check is O(1) - the actual filtering check is done on CPU in
+        model_runner.prepare_sample(), which passes None if no filtering needed.
+        """
+        return top_ks is not None or top_ps is not None
 
     def _temperature_sample(
         self,
@@ -99,8 +97,8 @@ class Sampler(nn.Module):
         self,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
     ) -> torch.Tensor:
         """Top-K/Top-P sampling with temperature scaling."""
         # Fast path: if ALL requests are greedy (temperature=0), just do argmax
@@ -114,9 +112,9 @@ class Sampler(nn.Module):
         scaled_logits = logits / temperatures.unsqueeze(-1).clamp(min=self.eps)
         probs = scaled_logits.softmax(dim=-1, dtype=torch.float32).contiguous()
 
-        # Determine which filtering is needed
-        has_topk = top_ks is not None and (top_ks != -1).any()
-        has_topp = top_ps is not None and (top_ps < 1.0).any()
+        # model_runner.prepare_sample passes None if filtering not needed for that type
+        has_topk = top_ks is not None
+        has_topp = top_ps is not None
 
         if AITER_TOPK_TOPP_AVAILABLE:
             return self._aiter_sample(

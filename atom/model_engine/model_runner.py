@@ -1309,28 +1309,39 @@ class ModelRunner:
 
     def prepare_sample(
         self, batch: ScheduledBatch
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         bs = batch.total_seqs_num
 
         temp_buffer = self.forward_vars["temperatures"]
         temp_buffer.np[:bs] = batch.temperatures
         temperatures = temp_buffer.copy_to_gpu(bs)
 
-        # For top_ks and top_ps, check uniformity on CPU before GPU copy.
-        # If all values are the same, only copy a single element to save bandwidth.
-        top_k_buffer = self.forward_vars["top_ks"]
-        top_k_buffer.np[:bs] = batch.top_ks
-        if bs > 1 and all(k == batch.top_ks[0] for k in batch.top_ks):
-            top_ks = top_k_buffer.copy_to_gpu(1)
-        else:
-            top_ks = top_k_buffer.copy_to_gpu(bs)
+        # Check on CPU whether filtering is needed to avoid GPU sync in sampler.
+        # If no filtering needed, return None to skip GPU copy entirely.
+        needs_topk = (batch.top_ks != -1).any()
+        needs_topp = (batch.top_ps < 1.0).any()
 
-        top_p_buffer = self.forward_vars["top_ps"]
-        top_p_buffer.np[:bs] = batch.top_ps
-        if bs > 1 and all(p == batch.top_ps[0] for p in batch.top_ps):
-            top_ps = top_p_buffer.copy_to_gpu(1)
+        if needs_topk:
+            top_k_buffer = self.forward_vars["top_ks"]
+            top_k_buffer.np[:bs] = batch.top_ks
+            # If all values are the same, only copy one element to save bandwidth
+            if bs > 1 and (batch.top_ks == batch.top_ks[0]).all():
+                top_ks = top_k_buffer.copy_to_gpu(1)
+            else:
+                top_ks = top_k_buffer.copy_to_gpu(bs)
         else:
-            top_ps = top_p_buffer.copy_to_gpu(bs)
+            top_ks = None
+
+        if needs_topp:
+            top_p_buffer = self.forward_vars["top_ps"]
+            top_p_buffer.np[:bs] = batch.top_ps
+            # If all values are the same, only copy one element to save bandwidth
+            if bs > 1 and (batch.top_ps == batch.top_ps[0]).all():
+                top_ps = top_p_buffer.copy_to_gpu(1)
+            else:
+                top_ps = top_p_buffer.copy_to_gpu(bs)
+        else:
+            top_ps = None
 
         return temperatures, top_ks, top_ps
 
