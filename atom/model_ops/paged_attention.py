@@ -118,19 +118,6 @@ class PagedAttention(BaseAttention):
                     indexer=mla_modules.indexer,
                     **extra_impl_args,
                 )
-
-                def wrap_kv_b_proj(module_instance):
-                    orig_impl = module_instance.forward
-
-                    def new_forward(*args, **kwargs):
-                        out = orig_impl(*args, **kwargs)
-                        return out, None
-
-                    module_instance.forward = new_forward
-                    return module_instance
-
-                # vllm kv_b_proj return two values (output, bias), so we need to wrap it for fallback path.
-                self.attn.impl.kv_b_proj = wrap_kv_b_proj(self.attn.impl.kv_b_proj)
             else:
                 self.attn = Attention(
                     num_heads=num_heads,

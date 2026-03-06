@@ -275,7 +275,7 @@ class MLAAttentionImplPluginModeMethods:
                 toks=toks,
             )
 
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+            kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -342,7 +342,7 @@ class MLAAttentionImplPluginModeMethods:
             kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
 
-            kv_nope = self.kv_b_proj(kv_c_normed.contiguous())[0].view(
+            kv_nope = self.kv_b_proj(kv_c_normed.contiguous()).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -460,7 +460,7 @@ class MLAAttentionImplPluginModeMethods:
                     output_dtype,
                 )
             else:
-                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                kv_nope = self.kv_b_proj(kv_c_normed).view(
                     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
                 )
                 k_nope, v = kv_nope.split(
@@ -469,7 +469,7 @@ class MLAAttentionImplPluginModeMethods:
 
                 k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
         else:
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+            kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
