@@ -36,7 +36,7 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 )
 
 
-from atom.plugin import is_plugin_mode, is_vllm
+from atom.plugin import is_plugin_mode
 
 from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
 
@@ -139,33 +139,6 @@ class MLAAttention(nn.Module):
             else None
         )
         self.layer_num = layer_num
-
-        # for plugin mode(vllm)
-        if is_vllm():
-            self.supports_quant_query_input = False
-            self.dcp_world_size: int = -1
-            from vllm.config import get_current_vllm_config
-            from vllm.model_executor.layers.attention.mla_attention import (
-                MLACommonMetadataBuilder,
-            )
-
-            self.chunked_prefill_workspace_size = (
-                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                    get_current_vllm_config()
-                )
-            )
-            self.cp_kv_cache_interleave_size: int = (
-                get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
-            )
-
-            self.is_aiter_triton_fp4_bmm_enabled = (
-                is_rocm_aiter_fp4bmm_enabled()
-                and self.kv_b_proj.weight.dtype == torch.bfloat16
-            )
-            # q_pad_num_heads in kwargs
-            self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
-            self._pad_v = True
-            self.flash_attn_varlen_func = flash_attn_varlen_func
 
     def process_weights_after_loading(self, act_dtype: Optional[torch.dtype] = None):
         if is_rocm_aiter_fp4bmm_enabled():
