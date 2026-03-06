@@ -22,6 +22,7 @@ ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMMoEForCau
 _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "Qwen3ForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
 }
 
 
