@@ -365,6 +365,7 @@ class PagedAttentionImplPluginModeMethods:
             causal=True,
             window_size=sliding_window,
             alibi_slopes=self.alibi_slopes,
+            sink_ptr=self.sinks,
             return_lse=False,
             out=output,
         )
