@@ -555,9 +555,9 @@ class VllmBackend:
             hash_content = []
             for filepath in forward_code_files:
                 hash_content.append(filepath)
-                if filepath == "<string>":
+                if filepath == "<string>" or filepath == "<frozen os>":
                     # This means the function was dynamically generated, with
-                    # e.g. exec(). We can't actually check these.
+                    # e.g. exec() or frozen os module. We can't actually check these.
                     continue
                 with open(filepath) as f:
                     hash_content.append(f.read())
