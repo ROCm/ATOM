@@ -1948,6 +1948,28 @@ class FusedMoE(torch.nn.Module):
 
         if quant_config is not None and prefix:
             quant_config = get_quant_config_for_layer(quant_config, prefix)
+        if quant_config is None:
+            quant_config = QuantizationConfig()
+
+        # Resolve per-layer quant spec so the dispatch below sees the
+        # correct dtype/type when per-layer overrides differ from the
+        # global config (e.g., MXFP4 globally but FP8 for MTP layers).
+        if hasattr(quant_config, "resolve") and prefix:
+            _spec = quant_config.resolve(prefix)
+            if _spec.is_quantized and (
+                _spec.quant_dtype != quant_config["quant_dtype"]
+                or _spec.quant_type != quant_config["quant_type"]
+            ):
+                quant_config = QuantizationConfig(
+                    quant_type=_spec.quant_type,
+                    quant_dtype=_spec.quant_dtype,
+                    is_dynamic=quant_config.get("is_dynamic", True),
+                    quant_name=quant_config.get("quant_name", ""),
+                    quant_method=quant_config.get("quant_method", None),
+                )
+        # Update instance attrs to match the (possibly resolved) config
+        self.quant_config = quant_config
+        self.params_dtype = quant_config["quant_dtype"]
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
@@ -1961,6 +1983,13 @@ class FusedMoE(torch.nn.Module):
             and quant_config["quant_dtype"] == dtypes.fp8
         ):
             # Use CompressedTensorsFp8MoEMethod for compressed-tensors format
+            self.quant_method = CompressedTensorsFp8MoEMethod(quant_config, moe)
+        elif (
+            quant_config["quant_dtype"] == dtypes.fp8
+            and quant_config["quant_type"] == QuantType.per_Token
+        ):
+            # Per-channel FP8 (e.g., Quark per_Token override for MTP layers)
+            # needs CompressedTensors-style weight scale handling
             self.quant_method = CompressedTensorsFp8MoEMethod(quant_config, moe)
         elif quant_config["quant_dtype"] == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(quant_config, moe)
@@ -2078,6 +2107,10 @@ class FusedMoE(torch.nn.Module):
         tp_rank: int,
     ):
         # for per channel weight quantization
+        # When scales are stored as [N,1] (CompressedTensors per-channel)
+        # but loaded from checkpoint as [N], reshape to match.
+        if loaded_weight.dim() == 1 and expert_data.dim() == 2:
+            loaded_weight = loaded_weight.unsqueeze(-1)
         if shard_id == "w2":
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):

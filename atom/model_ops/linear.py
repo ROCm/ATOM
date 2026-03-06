@@ -18,8 +18,8 @@ from aiter import (
 from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
+from atom.quant_spec import LayerQuantSpec
 from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
-from atom.models.utils import get_quant_config_for_layer
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
@@ -200,12 +200,34 @@ class LinearBase(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = False,
         source_quant_dtype: torch.dtype | None = None,
+        layer_spec: Optional[LayerQuantSpec] = None,
     ):
         if quant_config is None:
             quant_config = QuantizationConfig()
-        self.source_quant_dtype = source_quant_dtype
-        quant_type = quant_config["quant_type"]
-        params_dtype = quant_config["quant_dtype"]
+
+        # --- New: prefer LayerQuantSpec if provided ---
+        if layer_spec is not None:
+            self._layer_spec = layer_spec
+        else:
+            # Build a LayerQuantSpec from old-style dict fields for compat
+            self._layer_spec = LayerQuantSpec(
+                quant_type=quant_config["quant_type"],
+                quant_dtype=quant_config["quant_dtype"],
+                is_dynamic=quant_config.get("is_dynamic", True),
+                quant_method=quant_config.get("quant_method", None),
+                checkpoint_dtype=source_quant_dtype,
+            )
+
+        # Backward compat: source_quant_dtype can come from layer_spec
+        self.source_quant_dtype = (
+            source_quant_dtype
+            if source_quant_dtype is not None
+            else self._layer_spec.checkpoint_dtype
+        )
+
+        # Effective quant params for this layer
+        quant_type = self._layer_spec.quant_type
+        params_dtype = self._layer_spec.quant_dtype
         super().__init__()
         self.reduce_results = reduce_results
         self.input_size = input_size
@@ -259,7 +281,7 @@ class LinearBase(nn.Module):
                     torch.empty(len(self.output_partition_sizes), 1, dtype=dtypes.fp32),
                     requires_grad=False,
                 )
-                if not quant_config["is_dynamic"]:
+                if not self._layer_spec.is_dynamic:
                     self.input_scale = nn.Parameter(
                         torch.empty(
                             len(self.output_partition_sizes), 1, dtype=dtypes.fp32
@@ -453,6 +475,13 @@ class ReplicatedLinear(LinearBase):
         source_quant_dtype: torch.dtype = None,
         **kwargs,
     ):
+        # Extract per-layer info from kwargs
+        prefix = kwargs.pop("prefix", "")
+        layer_spec = kwargs.pop("layer_spec", None)
+        if layer_spec is None and quant_config is not None and prefix:
+            layer_spec = quant_config.resolve(prefix)
+            if not layer_spec.is_quantized:
+                quant_config = None  # backward compat: pass None to LinearBase
         super().__init__(
             input_size,
             output_size,
@@ -460,10 +489,17 @@ class ReplicatedLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            layer_spec=layer_spec,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
+        # Checkpoint scales are often 1-D; reshape to match param shape (e.g. [N] -> [N, 1])
+        if (
+            loaded_weight.shape != param_data.shape
+            and loaded_weight.ndim < param_data.ndim
+        ):
+            loaded_weight = loaded_weight.view(param_data.shape)
         param.weight_loader_process(param_data, loaded_weight)
 
 
@@ -475,9 +511,16 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.tp_dim = 0
+        # Resolve per-layer spec via prefix
+        layer_spec = None
+        if quant_config is not None and prefix:
+            layer_spec = quant_config.resolve(prefix)
+            if not layer_spec.is_quantized:
+                quant_config = None  # backward compat: pass None to LinearBase
         super().__init__(
             input_size,
             output_size,
@@ -485,6 +528,7 @@ class ColumnParallelLinear(LinearBase):
             bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            layer_spec=layer_spec,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -492,6 +536,12 @@ class ColumnParallelLinear(LinearBase):
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        # Checkpoint scales are often 1-D; reshape to match param shape (e.g. [N] -> [N, 1])
+        if (
+            loaded_weight.shape != param_data.shape
+            and loaded_weight.ndim < param_data.ndim
+        ):
+            loaded_weight = loaded_weight.view(param_data.shape)
         param.weight_loader_process(param_data, loaded_weight)
 
 
@@ -507,8 +557,12 @@ class MergedColumnParallelLinear(LinearBase):
         **kwargs,
     ):
         self.output_sizes = output_sizes
+        # Resolve per-layer spec via prefix
+        layer_spec = None
         if quant_config is not None and prefix:
-            quant_config = get_quant_config_for_layer(quant_config, prefix)
+            layer_spec = quant_config.resolve(prefix)
+            if not layer_spec.is_quantized:
+                quant_config = None  # backward compat: pass None to LinearBase
         super().__init__(
             input_size,
             output_sizes,
@@ -516,6 +570,7 @@ class MergedColumnParallelLinear(LinearBase):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            layer_spec=layer_spec,
         )
 
     def weight_loader(
@@ -619,6 +674,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.head_size = head_size
@@ -644,12 +700,20 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads * self.head_size * tp_size,
         ]
 
+        # Resolve per-layer spec via prefix
+        layer_spec = None
+        if quant_config is not None and prefix:
+            layer_spec = quant_config.resolve(prefix)
+            if not layer_spec.is_quantized:
+                quant_config = None  # backward compat: pass None to LinearBase
+
         super().__init__(
             input_size,
             output_sizes,
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            layer_spec=layer_spec,
         )
 
     def weight_loader(
@@ -701,8 +765,12 @@ class RowParallelLinear(LinearBase):
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
+        # Resolve per-layer spec via prefix
+        layer_spec = None
         if quant_config is not None and prefix:
-            quant_config = get_quant_config_for_layer(quant_config, prefix)
+            layer_spec = quant_config.resolve(prefix)
+            if not layer_spec.is_quantized:
+                quant_config = None  # backward compat: pass None to LinearBase
         super().__init__(
             input_size,
             output_size,
@@ -711,18 +779,33 @@ class RowParallelLinear(LinearBase):
             quant_config=quant_config,
             reduce_results=reduce_results,
             source_quant_dtype=source_quant_dtype,
+            layer_spec=layer_spec,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
+        is_scale = param is getattr(self, "weight_scale", None) or param is getattr(
+            self, "input_scale", None
+        )
         if param is not getattr(self, "bias", None):
-            shard_size = param_data.size(self.tp_dim)
-            if len(loaded_weight.shape) == 0:
-                loaded_weight = loaded_weight.view(1, 1)
-            if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
-                loaded_weight = loaded_weight.repeat(1, self.tp_size)
-            start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+            # For per-token / per-channel scales, the scale is NOT sharded
+            # along the input (tp_dim=1) dimension -- each rank holds the
+            # full scale.  Only the weight itself (2-D) is narrowed.
+            if is_scale and loaded_weight.ndim <= 1:
+                # Checkpoint scale is 1-D [output_size]; reshape to [output_size, 1]
+                if (
+                    loaded_weight.shape != param_data.shape
+                    and loaded_weight.ndim < param_data.ndim
+                ):
+                    loaded_weight = loaded_weight.view(param_data.shape)
+            else:
+                shard_size = param_data.size(self.tp_dim)
+                if len(loaded_weight.shape) == 0:
+                    loaded_weight = loaded_weight.view(1, 1)
+                if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
+                    loaded_weight = loaded_weight.repeat(1, self.tp_size)
+                start_idx = self.tp_rank * shard_size
+                loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         else:
             if self.tp_size > 0 and self.tp_rank != 0:
                 loaded_weight.zero_()
@@ -742,10 +825,11 @@ class MergedReplicatedLinear(ReplicatedLinear):
         self.output_sizes = output_size
         super().__init__(
             input_size,
-            sum(output_size),  # ？
+            sum(output_size),
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            **kwargs,  # forward prefix/layer_spec to ReplicatedLinear
         )
 
     def weight_loader(
@@ -768,8 +852,24 @@ class MergedReplicatedLinear(ReplicatedLinear):
             elif self.quant_type == QuantType.per_Tensor:
                 shard_offset = loaded_shard_id
                 shard_size = 1
+            elif self.quant_type in (QuantType.per_Token, QuantType.per_1x32):
+                # per_Token: scale shape is (output_size, 1)
+                # per_1x32:  scale shape is (output_size, ceil(input_size/32))
+                # Both are sharded along dim-0 (output_size) like the weight.
+                shard_offset = sum(self.output_sizes[:loaded_shard_id])
+                shard_size = self.output_sizes[loaded_shard_id]
+            else:
+                # Fallback: treat scale shard dims the same as weight dims
+                shard_offset = sum(self.output_sizes[:loaded_shard_id])
+                shard_size = self.output_sizes[loaded_shard_id]
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id])
             shard_size = self.output_sizes[loaded_shard_id]
         param_data = param_data.narrow(0, shard_offset, shard_size)
+        # Checkpoint scales are often 1-D; reshape to match param shape (e.g. [N] -> [N, 1])
+        if (
+            loaded_weight.shape != param_data.shape
+            and loaded_weight.ndim < param_data.ndim
+        ):
+            loaded_weight = loaded_weight.view(param_data.shape)
         param.weight_loader_process(param_data, loaded_weight)

@@ -183,6 +183,7 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
             quant_config=atom_config.quant_config,
+            prefix=prefix,
         )
 
         self.o_proj = RowParallelLinear(
@@ -191,6 +192,7 @@ class Qwen3MoeAttention(nn.Module):
             bias=False,
             quant_config=atom_config.quant_config,
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
