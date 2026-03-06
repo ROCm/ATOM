@@ -82,7 +82,6 @@ from atom.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
-    should_ignore_layer,
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -1247,9 +1246,14 @@ class DeepseekV2MLAAttention(nn.Module):
 
         # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains AITER BF16 GEMMs,
         # For FP8 and use_triton_gemm(), fused_qkv_a_proj is AITER-Triton FP8 GEMMs while others remain AITER FP8 GEMMs
-        if quant_config["quant_dtype"] == dtypes.fp4x2:
+        _attn_quant_dtype = (
+            quant_config.resolve(prefix).quant_dtype
+            if quant_config is not None
+            else None
+        )
+        if _attn_quant_dtype == dtypes.fp4x2:
             # normally linear layers in attn share the same quant config
-            if should_ignore_layer(quant_config, prefix):
+            if not quant_config.resolve(prefix).is_quantized:
                 source_quant_dtype = None
                 quant_config = None
                 base_quant_config = None
@@ -1407,10 +1411,11 @@ class DeepseekV2MLAAttention(nn.Module):
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if quant_config["quant_dtype"] == dtypes.fp8 or (
-                quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()
+            _qkn_dtype = quant_config.resolve(prefix).quant_dtype
+            if _qkn_dtype == dtypes.fp8 or (
+                _qkn_dtype == dtypes.fp4x2 and use_triton_gemm()
             ):
-                self.quant_dtype = quant_config["quant_dtype"]
+                self.quant_dtype = _qkn_dtype
                 self.fuse_qknorm_quant = True
 
     def forward(
@@ -1553,11 +1558,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
+            _input_norm_dtype = quant_config.global_spec.quant_dtype
             if (
-                quant_config["quant_dtype"] == dtypes.fp8
-                or quant_config["quant_dtype"] == dtypes.fp4x2
+                _input_norm_dtype == dtypes.fp8 or _input_norm_dtype == dtypes.fp4x2
             ) and use_triton_gemm():
-                self.quant_dtype = quant_config["quant_dtype"]
+                self.quant_dtype = _input_norm_dtype
                 self.fuse_input_norm_quant = True
                 if self.fuse_ar_input_norm:
                     self.fuse_ar_input_norm = False
@@ -1604,7 +1609,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
+        self.quant_dtype = (
+            quant_config.global_spec.quant_dtype if quant_config else None
+        )
         self.fuse_rmsnorm_quant = (
             ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
         )

@@ -7,14 +7,10 @@ from typing import (
     Protocol,
     Tuple,
     Union,
-    Optional,
 )
 
 import torch
 import os
-import re
-
-from atom.config import QuantizationConfig
 
 import logging
 
@@ -235,53 +231,6 @@ def fast_topk(values, topk, dim):
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
-
-
-def should_ignore_layer(
-    quantization_config: Optional[QuantizationConfig], prefix: str
-) -> bool:
-    """Check whether *prefix* should skip quantization.
-
-    Delegates to ``QuantizationConfig.resolve()`` when available (the new
-    ``LayerQuantSpec``-based path).  Falls back to the legacy exclude-list
-    scan for plain-dict configs.
-    """
-    if quantization_config is None:
-        return True
-    # New path: use resolve() if available
-    if hasattr(quantization_config, "resolve"):
-        spec = quantization_config.resolve(prefix)
-        return not spec.is_quantized
-    # Legacy fallback
-    exclude_layers: List[str] = quantization_config.get("exclude_layers", [])
-    if not exclude_layers:
-        return False
-    for exclude_layer in exclude_layers:
-        if exclude_layer.startswith("re"):
-            regex_pattern = exclude_layer[3:]
-            if re.search(regex_pattern, prefix):
-                return True
-        elif prefix in exclude_layer:
-            return True
-        else:
-            if prefix.split(".")[-1] == exclude_layer:
-                return True
-    return False
-
-
-def get_quant_config_for_layer(
-    quantization_config: Optional[QuantizationConfig], prefix: str
-) -> Optional[QuantizationConfig]:
-    """Return *quantization_config* if *prefix* should be quantized, else None.
-
-    This is the legacy helper — new code should prefer
-    ``quant_config.resolve(prefix)`` directly.
-    """
-    return (
-        None
-        if should_ignore_layer(quantization_config, prefix)
-        else quantization_config
-    )
 
 
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:

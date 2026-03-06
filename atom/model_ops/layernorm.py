@@ -189,10 +189,8 @@ class RMSNorm(nn.Module):
 
         if quant_config is None:
             quant_config = QuantizationConfig()
-        quant_type = quant_config["quant_type"]
-        params_dtype = quant_config["quant_dtype"]
-        self.quant_type = quant_type
-        self.params_dtype = params_dtype
+        self.quant_type = quant_config.global_spec.quant_type
+        self.params_dtype = quant_config.global_spec.quant_dtype
 
     def forward(
         self,
