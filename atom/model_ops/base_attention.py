@@ -168,13 +168,16 @@ def cp_mha_gather_cache(
 
     head_dim = key.shape[2]
     x = 16 // key_cache.element_size()
-    # For k cache layout: [num_blocks, num_heads, page_size, head_dim]
-    assert head_dim == key_cache.shape[3], (
-        "We assume your kv cache layout is [num_blocks, "
-        "page_size, num_heads, head_dim], but got otherwise"
-    )
-    page_size = key_cache.shape[1]
-    num_heads = key_cache.shape[2]
+    if kv_cache_layout == "NHD":
+        # K: [num_blocks, page_size, num_heads, head_dim]
+        assert head_dim == key_cache.shape[3]
+        page_size = key_cache.shape[1]
+        num_heads = key_cache.shape[2]
+    else:
+        # SHUFFLE: K [num_blocks, num_heads, head_dim//x, page_size, x]
+        assert key_cache.dim() == 5 and head_dim == key_cache.shape[2] * key_cache.shape[4]
+        page_size = key_cache.shape[3]
+        num_heads = key_cache.shape[1]
 
     grid = lambda meta: (total_tokens, num_heads)  # noqa: E731
     cp_mha_gather_cache_kernel[grid](

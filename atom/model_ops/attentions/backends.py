@@ -219,6 +219,16 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 self.block_ratio,
             )
             ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
+        num_cached_tokens = None
+        if has_cached:
+            num_cached_tokens = torch.tensor(
+                batch.num_cached_tokens[:bs], dtype=torch.int32, pin_memory=True
+            ).cuda(non_blocking=True)
+            if self.model_runner.rank == 0:
+                logger.info(f"{has_cached=}")
+                logger.info(
+                    f"Prefill batch has {num_cached_tokens.sum().item()} cached tokens and of {sum_scheduled_tokens} total tokens"
+                )
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
             max_seqlen_q=max_seqlen_q,
@@ -226,6 +236,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             min_seqlen_q=min_seqlen_q,
             dropout_p=dropout_p,
             has_cached=has_cached,
+            num_cached_tokens=num_cached_tokens,
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)

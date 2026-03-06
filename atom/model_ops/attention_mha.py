@@ -15,9 +15,14 @@ from torch import nn
 
 from .attention_mla import MLAModules
 
+import logging
+
 from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
 from atom.utils.decorators import mark_trace
+from atom.model_ops.base_attention import cp_mha_gather_cache
+
+logger = logging.getLogger("atom")
 
 
 @PagedAttentionImplDecoratorForPluginMode
@@ -130,6 +135,16 @@ class PagedAttentionImpl(nn.Module):
             and self.q_norm is not None
             and self.k_norm is not None
         ):
+            # fused_qk_norm_rope_cache_quant_shuffle expects V cache layout
+            # [num_blocks, num_kv_heads, block_size//x, head_size, x], not [n, nh, hd, bs]
+            x = 16 // k_cache.element_size()
+            if k_cache.dim() == 5 and v_cache.dim() == 4:
+                n, nh, hd, bs = v_cache.shape
+                v_cache_shuffle = v_cache.view(
+                    n, nh, bs // x, hd, x
+                )
+            else:
+                v_cache_shuffle = v_cache
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
                 num_heads_q=self.num_heads,
@@ -143,7 +158,7 @@ class PagedAttentionImpl(nn.Module):
                 is_neox_style=self.rotary_emb.is_neox_style,
                 pos_ids=position,
                 k_cache=k_cache,
-                v_cache=v_cache,
+                v_cache=v_cache_shuffle,
                 slot_mapping=attn_metadata.slot_mapping,
                 kv_cache_dtype=(
                     "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
@@ -216,7 +231,132 @@ class PagedAttentionImpl(nn.Module):
                     asm_layout=asm_layout,
                 )
 
+        # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
+        if attn_metadata.has_cached:
+            q, k, v, k_cache, v_cache, k_scale, v_scale = self._gather_prefix_and_concat_kv(
+                q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
+            )
+
         return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    def _gather_prefix_and_concat_kv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        attn_metadata,
+    ):
+        """
+        When prefix cache hits, gather cached KV from paged cache and concat with
+        new tokens' k, v for full-sequence attention (e.g. flash_attn).
+        """
+        bs = attn_metadata.cu_seqlens_q.shape[0] - 1
+        cu_seqlens_q = attn_metadata.cu_seqlens_q
+        cu_seqlens_k = attn_metadata.cu_seqlens_k
+        cached_seqlen = attn_metadata.num_cached_tokens  # [bs], from prepare_prefill
+
+        total_cached = cached_seqlen.sum().item()
+
+        num_kv_heads = k.shape[1]
+        head_dim = k.shape[2]
+        device = k.device
+        dtype = k.dtype
+
+        # Build metadata for cp_mha_gather_cache (cached tokens only)
+        # token_to_batch: [0]*cached[0] + [1]*cached[1] + ...
+        # cu_seqlens_kv: [0, cached[0], cached[0]+cached[1], ...]
+        # seq_starts: [0]*bs (prefix starts at position 0)
+        token_to_batch = torch.zeros(
+            total_cached, dtype=torch.int32, device=device
+        )
+        cu_seqlens_kv = [0]
+        for i in range(bs):
+            c = cached_seqlen[i].item()
+            token_to_batch[cu_seqlens_kv[-1] : cu_seqlens_kv[-1] + c] = i
+            cu_seqlens_kv.append(cu_seqlens_kv[-1] + c)
+        cu_seqlens_kv = torch.tensor(cu_seqlens_kv, dtype=torch.int32, device=device)
+        seq_starts = torch.zeros(bs, dtype=torch.int32, device=device)
+
+        k_prefix = torch.empty(
+            (total_cached, num_kv_heads, head_dim), dtype=dtype, device=device
+        )
+        v_prefix = torch.empty(
+            (total_cached, num_kv_heads, head_dim), dtype=dtype, device=device
+        )
+
+        # Convert cache for cp_mha_gather_cache
+        # fused_qk_norm_rope_cache_quant_shuffle: K [n, nh, hd//x, bs, x], V [n, nh, bs//x, hd, x] (SHUFFLE)
+        # fused_qk_rope_reshape_and_cache: K [n, nh, hd//x, bs, x], V [n, nh, hd, bs] -> NHD
+        if k_cache.dim() == 5:
+            x = 16 // k_cache.element_size()
+            n, nh, _, block_size, _ = k_cache.shape
+            if v_cache.dim() == 4:
+                # fused_qk_norm_rope_cache_quant_shuffle: V data in [n, nh, bs//x, hd, x] layout
+                use_shuffle = True
+                k_cache_gather = k_cache
+                v_cache_gather = v_cache.view(n, nh, block_size // x, head_dim, x)
+            else:
+                # fused_qk_rope_reshape_and_cache: V [n, nh, hd, bs] -> NHD
+                use_shuffle = False
+                k_cache_gather = (
+                    k_cache.permute(0, 3, 1, 2, 4)
+                    .contiguous()
+                    .view(n, block_size, nh, head_dim)
+                )
+                v_cache_gather = v_cache.permute(0, 3, 1, 2).contiguous()
+        else:
+            use_shuffle = False
+            k_cache_gather = k_cache
+            v_cache_gather = v_cache
+            block_size = k_cache.shape[1]
+
+        block_tables = attn_metadata.block_tables
+        cp_mha_gather_cache(
+            key_cache=k_cache_gather,
+            value_cache=v_cache_gather,
+            key=k_prefix,
+            value=v_prefix,
+            block_tables=block_tables,
+            k_scales=k_scale,
+            v_scales=v_scale,
+            cu_seqlens_kv=cu_seqlens_kv,
+            token_to_batch=token_to_batch,
+            seq_starts=seq_starts,
+            dequant=self.kv_cache_dtype.startswith("fp8"),
+            kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
+            total_tokens=total_cached,
+        )
+
+        # Build full k, v: for each batch i, [cached_i | new_i]
+        total_tokens = cu_seqlens_k[-1].item()
+        k_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=dtype, device=device
+        )
+        v_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=dtype, device=device
+        )
+
+        cached_offset = 0
+        for i in range(bs):
+            start = cu_seqlens_k[i].item()
+            end = cu_seqlens_k[i + 1].item()
+            cached_i = cached_seqlen[i].item()
+            new_i = end - start - cached_i
+
+            k_full[start : start + cached_i] = k_prefix[cached_offset : cached_offset + cached_i]
+            v_full[start : start + cached_i] = v_prefix[cached_offset : cached_offset + cached_i]
+
+            new_start = cu_seqlens_q[i].item()
+            k_full[start + cached_i : end] = k[new_start : new_start + new_i]
+            v_full[start + cached_i : end] = v[new_start : new_start + new_i]
+
+            cached_offset += cached_i
+
+        return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
 
     @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
