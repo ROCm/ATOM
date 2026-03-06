@@ -136,7 +136,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
         loaded_weights_record = load_model_in_plugin_mode(
-            model=self.model, config=self.model.atom_config, prefix="model."
+            model=self.model, config=self.atom_config, prefix="model."
         )
         return loaded_weights_record
 

@@ -1823,7 +1823,6 @@ class DeepseekV2ForCausalLM(nn.Module):
         layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
     ):
         super().__init__()
-        self.atom_config = atom_config
         config = atom_config.hf_config
         quant_config = atom_config.quant_config
         self.config = config
