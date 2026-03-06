@@ -314,7 +314,10 @@ class LinearBase(nn.Module):
             and param.data.element_size() == loaded_weight.element_size()
         ):
             param.data = param.data.view(loaded_weight.dtype)
-        param.data.copy_(post_process_func(loaded_weight))
+        loaded_weight = post_process_func(loaded_weight)
+        if loaded_weight.shape != param.data.shape and loaded_weight.numel() == param.data.numel():
+            loaded_weight = loaded_weight.reshape(param.data.shape)
+        param.data.copy_(loaded_weight)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -716,9 +719,14 @@ class RowParallelLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if param is not getattr(self, "bias", None):
-            shard_size = param_data.size(self.tp_dim)
             if len(loaded_weight.shape) == 0:
                 loaded_weight = loaded_weight.view(1, 1)
+            if loaded_weight.ndim <= self.tp_dim:
+                # dims < tp_dim (1D per-channel scale with
+                # tp_dim=1)
+                param.weight_loader_process(param_data, loaded_weight)
+                return
+            shard_size = param_data.size(self.tp_dim)
             if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
                 loaded_weight = loaded_weight.repeat(1, self.tp_size)
             start_idx = self.tp_rank * shard_size
@@ -768,6 +776,10 @@ class MergedReplicatedLinear(ReplicatedLinear):
             elif self.quant_type == QuantType.per_Tensor:
                 shard_offset = loaded_shard_id
                 shard_size = 1
+            else:
+                # Per-channel same layout as weights
+                shard_offset = sum(self.output_sizes[:loaded_shard_id])
+                shard_size = self.output_sizes[loaded_shard_id]
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id])
             shard_size = self.output_sizes[loaded_shard_id]
