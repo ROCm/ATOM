@@ -118,7 +118,9 @@ def cp_mha_gather_cache_kernel(
         k_reg = tl.load(key_cache_ptr_offset + k_reg_offset)
         v_reg = tl.load(value_cache_ptr_offset + v_reg_offset)
         if DEQUANT:
-            scale_offset = block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
+            scale_offset = (
+                block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
+            )
             k_scale = tl.load(k_scale_ptr + scale_offset)
             v_scale = tl.load(v_scale_ptr + scale_offset)
             k_reg = k_reg.to(tl.float32) * k_scale
