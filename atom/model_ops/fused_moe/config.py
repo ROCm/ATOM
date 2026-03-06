@@ -198,7 +198,7 @@ class FusedMoEQuantConfig:
         if weight_dtype is None:
             weight_dtype = quant_dtype
 
-        a_shape, w_shape = _quant_flags_to_group_shape(quant_dtype, False, block_shape)
+        a_shape, w_shape = _quant_flags_to_group_shape(quant_dtype, per_act_token_quant, block_shape)
         quant_config = FusedMoEQuantConfig(
             _a1=FusedMoEQuantDesc(quant_dtype, a_shape, a1_scale),
             _a2=FusedMoEQuantDesc(quant_dtype, a_shape, a2_scale),
