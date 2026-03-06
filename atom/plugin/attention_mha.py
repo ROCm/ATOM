@@ -560,13 +560,7 @@ class PagedAttentionImplPluginModeMethods:
             # update the layer kv scale tensor
             self.k_scale = self.kv_scale[0]
             self.v_scale = self.kv_scale[1]
-            one_kv_scale = (
-                torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
-                if self.kv_cache_dtype == "fp8"
-                else 1.0
-            )
-            kv_scale = torch.ones((1,), dtype=torch.float32, device=self.device)
-            self.one_scale = kv_scale
+            self.one_scale = torch.ones((1,), dtype=torch.float32, device=self.device)
             layer.k_scale = self.k_scale
             layer.v_scale = self.v_scale
 
