@@ -191,10 +191,10 @@ def fake_(
     qkv: torch.Tensor,
 ) -> torch.Tensor:
     output_shape = list(q.shape)
-    if use_mla:
-        output_shape[-1] = 7168
     # If we fusion rmsnorm and quant, the input dtype is fp8, but actually we use bf16 for output.
     atom_config = get_current_atom_config()
+    if use_mla:
+        output_shape[-1] = atom_config.hf_config.hidden_size
     output_dtype = atom_config.torch_dtype
     output = torch.zeros(output_shape, dtype=output_dtype, device=q.device)
 
