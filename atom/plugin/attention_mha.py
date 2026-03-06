@@ -134,7 +134,7 @@ class PagedAttentionImplPluginModeMethods:
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
         elif use_triton_attn and self.rotary_emb is not None:
-            
+
             k_scale = v_scale = self.one_scale
             qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
             q, k, v = qkv.split(
@@ -234,8 +234,8 @@ class PagedAttentionImplPluginModeMethods:
 
         per_tensor = False
         if k_scale is not None and k_scale.numel() > 1:
-                k_scale = k_scale.unsqueeze(-1)
-                v_scale = v_scale.unsqueeze(-1)
+            k_scale = k_scale.unsqueeze(-1)
+            v_scale = v_scale.unsqueeze(-1)
         compute_type = (
             torch.bfloat16
             if self.kv_cache_dtype == "bf16" or per_tensor

@@ -1,4 +1,4 @@
-from typing import Optional, Union, Any, Iterable
+from typing import Optional, Union, Any
 
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -33,7 +33,6 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from torch import nn
-from atom.model_loader.loader import load_model_in_plugin_mode
 
 # import torch.distributed as dist
 from transformers import PretrainedConfig

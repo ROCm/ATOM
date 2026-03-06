@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, Iterable
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -36,7 +36,6 @@ from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.moe import FusedMoE
 
-from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.utils import envs
 
 # from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -148,7 +147,7 @@ class OAIAttention(nn.Module):
             attn_output = self.attn(
                 query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
             )
-        else:        
+        else:
             attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output
