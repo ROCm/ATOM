@@ -1,0 +1,93 @@
+ARG BASE_IMAGE="rocm/atom-dev:nightly_202603040155"
+FROM ${BASE_IMAGE}
+
+ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+ARG VLLM_COMMIT="f5d17400303149bbb480f6abfb6f7bb646c1d895"
+ARG MAX_JOBS=64
+ARG INSTALL_LM_EVAL=1
+ARG INSTALL_FASTSAFETENSORS=1
+ARG VENV_PYTHON="/opt/venv/bin/python"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV VLLM_TARGET_DEVICE=rocm
+ENV MAX_JOBS=${MAX_JOBS}
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+WORKDIR /app
+
+RUN echo "========== [1/7] Prepare build tools ==========" \
+    && apt-get update \
+    && apt --fix-broken install -y \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo "========== [2/7] Verify base packages (atom/aiter/mori) ==========" \
+    && "${VENV_PYTHON}" -m pip show atom || true \
+    && "${VENV_PYTHON}" -m pip show amd-aiter || true \
+    && "${VENV_PYTHON}" -m pip show mori || true
+
+RUN echo "========== [3/7] Clone vLLM ==========" \
+    && git clone "${VLLM_REPO}" /app/vllm \
+    && cd /app/vllm \
+    && git checkout "${VLLM_COMMIT}" \
+    && git submodule update --init --recursive \
+    && echo "vLLM commit:" \
+    && git rev-parse HEAD
+
+# Follow vLLM ROCm standard: allow torch/triton override.
+RUN echo "========== [4/7] Install vLLM ROCm build dependencies ==========" \
+    && cd /app/vllm \
+    && "${VENV_PYTHON}" -m pip install --upgrade pip \
+    && "${VENV_PYTHON}" -m pip uninstall -y torch triton torchvision torchaudio || true \
+    && "${VENV_PYTHON}" -m pip install -r requirements/rocm-build.txt
+
+RUN echo "========== [5/7] Build vLLM wheel ==========" \
+    && cd /app/vllm \
+    && VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py clean --all \
+    && MAX_JOBS="${MAX_JOBS}" VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py bdist_wheel --dist-dir=/tmp/vllm-wheels \
+    && ls -lh /tmp/vllm-wheels
+
+RUN echo "========== [6/7] Install vLLM runtime dependencies ==========" \
+    && cd /app/vllm \
+    && "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt \
+    && "${VENV_PYTHON}" -m pip uninstall -y vllm || true \
+    && "${VENV_PYTHON}" -m pip install /tmp/vllm-wheels/*.whl \
+    && "${VENV_PYTHON}" -m pip install uvloop
+
+RUN echo "========== [7/7] Optional tools and final checks ==========" \
+    && if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi \
+    && if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi \
+    && "${VENV_PYTHON}" - <<'PY'
+import importlib.metadata as m
+import glob
+import os
+import torch
+
+print(f"torch.version.hip: {torch.version.hip}")
+print(f"torch.version.cuda: {torch.version.cuda}")
+torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+print(f"torch lib dir: {torch_lib_dir}")
+print(f"libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, 'libtorch_hip.so*'))}")
+if torch.version.hip is None:
+    raise RuntimeError("Torch is not ROCm build (torch.version.hip is None).")
+
+pkgs = [
+    "vllm",
+    "torch",
+    "triton",
+    "torchvision",
+    "torchaudio",
+    "amdsmi",
+    "amd-aiter",
+    "atom",
+    "mori",
+]
+print("Final package versions:")
+for p in pkgs:
+    try:
+        print(f"  {p}: {m.version(p)}")
+    except Exception:
+        print(f"  {p}: <not installed>")
+PY
+
+CMD ["/bin/bash"]
