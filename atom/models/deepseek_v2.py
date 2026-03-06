@@ -1245,9 +1245,21 @@ class DeepseekV2MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
 
+        # Resolve the per-layer quant spec for this attention block.
+        # For mixed-precision models the attention layers may use a
+        # different dtype (e.g. FP8) than the global config (e.g. MXFP4).
+        _attn_spec = (
+            quant_config.resolve(prefix)
+            if quant_config is not None
+            else None
+        )
+        _attn_quant_dtype = (
+            _attn_spec.quant_dtype if _attn_spec is not None else None
+        )
+
         # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains AITER BF16 GEMMs,
         # For FP8 and use_triton_gemm(), fused_qkv_a_proj is AITER-Triton FP8 GEMMs while others remain AITER FP8 GEMMs
-        if quant_config["quant_dtype"] == dtypes.fp4x2:
+        if _attn_quant_dtype == dtypes.fp4x2:
             # normally linear layers in attn share the same quant config
             if should_ignore_layer(quant_config, prefix):
                 source_quant_dtype = None
@@ -1276,6 +1288,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 source_quant_dtype=source_quant_dtype,
+                prefix=f"{prefix}.fused_qkv_a_proj",
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -1407,10 +1420,10 @@ class DeepseekV2MLAAttention(nn.Module):
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if quant_config["quant_dtype"] == dtypes.fp8 or (
-                quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()
+            if _attn_quant_dtype == dtypes.fp8 or (
+                _attn_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
             ):
-                self.quant_dtype = quant_config["quant_dtype"]
+                self.quant_dtype = _attn_quant_dtype
                 self.fuse_qknorm_quant = True
 
     def forward(
