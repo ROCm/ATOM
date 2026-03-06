@@ -6,9 +6,9 @@ import copy
 import hashlib
 import os
 from contextlib import ExitStack
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Literal
 from unittest.mock import patch
-from atom.utils import compilation_counter
+from atom.utils import Range, compilation_counter, envs, logger
 import torch
 import torch._inductor.compile_fx
 import torch.fx as fx
@@ -61,6 +61,7 @@ class CompilerInterface:
         graph: fx.GraphModule,
         example_inputs: list[Any],
         compiler_config: dict[str, Any],
+        compile_range: Range,
         runtime_shape: Optional[int] = None,
         key: Optional[str] = None,
     ) -> tuple[Optional[Callable], Optional[Any]]:
@@ -207,6 +208,7 @@ class InductorAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         compiler_config: dict[str, Any],
+        compile_range: Range,
         runtime_shape: Optional[int] = None,
         key: Optional[str] = None,
     ) -> tuple[Optional[Callable], Optional[Any]]:
@@ -509,6 +511,9 @@ class InductorStandaloneAdaptor(CompilerInterface):
     Use VLLM_USE_STANDALONE_COMPILE to toggle this on or off.
     """
 
+    def __init__(self, save_format: Literal["binary", "unpacked"]) -> None:
+        self.save_format = save_format
+
     name = "inductor_standalone"
 
     def compute_hash(self, vllm_config: Config) -> str:
@@ -528,6 +533,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         compiler_config: dict[str, Any],
+        compile_range: Range,
         runtime_shape: Optional[int] = None,
         key: Optional[str] = None,
     ) -> tuple[Optional[Callable], Optional[Any]]:
@@ -535,32 +541,79 @@ class InductorStandaloneAdaptor(CompilerInterface):
         current_config = {}
         if compiler_config is not None:
             current_config.update(compiler_config)
-        set_inductor_config(current_config, runtime_shape)
+        # set_inductor_config(current_config, compile_range)
+        # set_functorch_config()
 
-        if isinstance(runtime_shape, int):
+        if compile_range.is_single_size():
             dynamic_shapes = "from_example_inputs"
         else:
-            dynamic_shapes = "from_tracing_context"
+            dynamic_shapes = "from_graph"
 
         from torch._inductor import standalone_compile
 
-        # TODO Lirong
-        # with pass_context(runtime_shape):
-        compiled_graph = standalone_compile(
-            graph,
-            example_inputs,
-            dynamic_shapes=dynamic_shapes,
-            options={"config_patches": current_config},
+        supports_aot = is_torch_equal_or_newer("2.10.0")
+
+        if not supports_aot and envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+            logger.error(
+                "CRITICAL: VLLM_USE_MEGA_AOT_ARTIFACT "
+                "is enabled but PyTorch version does not support 'aot' "
+                "parameter in standalone_compile. This requires PyTorch "
+                "2.10.0+. Falling back to non-AOT mode."
+            )
+
+        compile_kwargs = {
+            "dynamic_shapes": dynamic_shapes,
+            "options": {
+                "config_patches": current_config,
+            },
+        }
+
+        use_aot: bool = supports_aot and envs.VLLM_USE_MEGA_AOT_ARTIFACT
+        # only add 'aot' parameter if both supported and enabled...
+        # this will set bundled_autograd_cache
+        # https://github.com/pytorch/pytorch/blob/9bbc5b2905c260adf41bc866a732f9c121a2828a/torch/_inductor/standalone_compile.py#L359 # noqa
+        if use_aot:
+            compile_kwargs["aot"] = True  # type: ignore[assignment]
+
+        # Inductor's pre-grad passes don't do anything for vLLM.
+        ctx = patch(
+            "torch._inductor.compile_fx._recursive_pre_grad_passes",
+            lambda gm, _: gm,
         )
+        with ctx:
+            compiled_graph = standalone_compile(graph, example_inputs, **compile_kwargs)
+
+        if use_aot:
+            from torch._inductor.standalone_compile import AOTCompiledArtifact
+
+            assert isinstance(compiled_graph, AOTCompiledArtifact)
+            assert hasattr(compiled_graph, "serialize")
+            # just return the compiled graph and a key
+            # since we can serialize the bytes using to_bytes
+            # and reload it using the key when reading
+            return compiled_graph, None
 
         # Save the compiled artifact to disk in the specified path
         assert key is not None
         path = os.path.join(self.cache_dir, key)
-        if True:
-            # if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            compiled_graph.save(path=path, format="unpacked")
+
+        def is_saveable_2_10(compiled_artifact):
+            # can just use compiled_artifact.is_saveable in 2.11
+            if compiled_artifact._artifacts is None:
+                return False
+            _, cache_info = compiled_artifact._artifacts
+            return len(cache_info.aot_autograd_artifacts) == 1
+
+        if is_saveable_2_10(compiled_graph):
+            compiled_graph.save(path=path, format=self.save_format)
             compilation_counter.num_compiled_artifacts_saved += 1
-        return compiled_graph, (key, path)
+            return compiled_graph, (key, path)
+        else:
+            logger.warning(
+                "Compiled artifact is not serializable (e.g. multiple aot_autograd "
+                "artifacts or unsupported structure); using in memory only, not saving to cache."
+            )
+            return compiled_graph, None
 
     def load(
         self,
@@ -568,20 +621,20 @@ class InductorStandaloneAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         graph_index: int,
-        runtime_shape: Optional[int] = None,
-    ) -> Callable:
+        # compile_range: Range,
+    ) -> Callable[..., Any]:
         assert isinstance(handle, tuple)
         assert isinstance(handle[0], str)
         assert isinstance(handle[1], str)
         path = handle[1]
         inductor_compiled_graph = torch._inductor.CompiledArtifact.load(
-            path=path, format="unpacked"
+            path=path, format=self.save_format
         )
         from torch._inductor.compile_fx import graph_returns_tuple
 
         returns_tuple = graph_returns_tuple(graph)
 
-        def compiled_graph_wrapper(*args):
+        def compiled_graph_wrapper(*args: Any) -> tuple[Any, ...] | Any:
             graph_output = inductor_compiled_graph(*args)
             # unpack the tuple if needed
             # TODO(rzou): the implication is that we're not

@@ -13,7 +13,7 @@ import time
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence, Union, TypeAlias
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -586,3 +586,35 @@ def getLogger():
 
 
 logger = getLogger()
+
+from pydantic.dataclasses import dataclass
+@dataclass
+class Range:
+    """
+    A range of numbers.
+    Inclusive of start, inclusive of end.
+    """
+
+    start: int
+    end: int
+
+    def is_single_size(self) -> bool:
+        return self.start == self.end
+
+    def __contains__(self, size: int) -> bool:
+        # Inclusive of start, inclusive of end
+        return self.start <= size <= self.end
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Range):
+            return False
+        return self.start == other.start and self.end == other.end
+
+    def __hash__(self) -> int:
+        return hash((self.start, self.end))
+
+    def __str__(self) -> str:
+        return f"({self.start}, {self.end})"
+
+    def __repr__(self) -> str:
+        return self.__str__()

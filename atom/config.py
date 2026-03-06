@@ -7,12 +7,13 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
+from pathlib import Path
 
 import torch
 from aiter import QuantType
 from aiter.utility.dtypes import d_dtypes
-from atom.utils import envs, get_open_port
+from atom.utils import Range, envs, get_open_port, resolve_obj_by_qualname
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
@@ -87,6 +88,65 @@ class CompilationLevel:
     DYNAMO_ONCE = 2
     PIECEWISE = 3
 
+class DynamicShapesType(str, enum.Enum):
+    """Types of dynamic shapes handling in torch.compile().
+    see  Dynamic shapes and vllm guard dropping in torch_compile.md
+    for more details."""
+
+    BACKED = "backed"
+    """Use backed dynamic shapes. torch.compile() guards on backed dynamic
+    shapes and may add guards. Symbols are specialized to 0, 1, or >=2 even
+    without encountering branching on those ranges."""
+
+    UNBACKED = "unbacked"
+    """Use unbacked dynamic shapes. Guaranteed not to be guarded on and not
+    0/1 specialized, but may throw data dependent errors when branches require
+    their value without explicit unbacked handling."""
+
+    BACKED_SIZE_OBLIVIOUS = "backed_size_oblivious"
+    """Experimental flag that treats backed symbols as unbacked when explicit
+    unbacked handling is defined."""
+
+
+class DynamicShapesConfig:
+    """Configuration to control/debug torch compile dynamic shapes."""
+
+    type: DynamicShapesType = DynamicShapesType.BACKED
+    """Controls the type of dynamic shapes handling to use with torch.compile().
+
+    - BACKED: Default PyTorch behavior with potential guards ignored.
+    - UNBACKED: No guards guaranteed (most sound) but may throw
+      data dependent errors.
+    - BACKED_SIZE_OBLIVIOUS: Experimental safer alternative to
+      backed/unbacked.
+    """
+
+    evaluate_guards: bool = False
+    """
+    A debug mode to detect and fail if Dynamo ever specializes a dynamic shape by
+    guarding on it. When True, dynamic shape guards are not dropped from dynamo.
+    And a failure will be triggered if a recompilation ever happens due to that.
+    This mode requires VLLM_USE_BYTECODE_HOOK to be 0.
+    Enabling this allow observing the dynamic shapes guards in the tlparse
+    artifacts also.
+    When type is backed, aot_compile must be disabled for this mode to work.
+    until this change picked up https://github.com/pytorch/pytorch/pull/169239.
+    """
+
+    assume_32_bit_indexing: bool = False
+    """
+    whether all tensor sizes can use 32 bit indexing.
+    `True` requires PyTorch 2.10+
+    """
+
+    def compute_hash(self) -> str:
+        """
+        Provide a hash for DynamicShapesConfig
+        """
+
+        factors = [self.type, self.evaluate_guards, self.assume_32_bit_indexing]
+        return hashlib.sha256(str(factors).encode()).hexdigest()
+
 
 @dataclass
 class CompilationConfig:
@@ -98,6 +158,9 @@ class CompilationConfig:
     - 2: dynamo once.
     - 3: piecewise compilation."""
     # use_cudagraph: bool = field(default_factory=lambda: 0)
+    backend: str = ""
+    """The backend for compilation. It needs to be a string that can be resolved to a callable.
+    """
 
     use_cudagraph: bool = True
 
@@ -112,7 +175,7 @@ class CompilationConfig:
     pattern: [1, 2, 4] + [i for i in range(8, cuda_graph_sizes + 1, 8)]
     3. more than one value (e.g. 1 2 128) is provided, then the capture list
     will follow the provided list."""
-    debug_dump_path: str = ""
+    debug_dump_path: Path | None = None
     """The path to dump the debug information."""
 
     """custom ops that are disabled"""
@@ -121,6 +184,12 @@ class CompilationConfig:
     cache_dir: str = ""
 
     use_inductor: bool = True
+
+    dynamic_shapes_config: DynamicShapesConfig = field(
+        default_factory=DynamicShapesConfig
+    )
+
+    inductor_compile_config: dict = field(default_factory=dict)
 
     # CudaGraph compilation
     cudagraph_mode: Optional[CUDAGraphMode] = None
@@ -181,6 +250,9 @@ class CompilationConfig:
     inductor_compile_config: dict = field(default_factory=dict)
     """Additional configurations for inductor.
     - None: use default configurations."""
+    compile_cache_save_format: Literal["binary", "unpacked"] = field(
+        default_factory=lambda: "binary"
+    )
 
     compile_sizes: Optional[list[Union[int, str]]] = None
     """Sizes to compile for inductor. In addition
@@ -188,6 +260,8 @@ class CompilationConfig:
     specify the sizes for cudagraph capture."""
 
     static_forward_context: dict[str, Any] = field(default_factory=dict, init=False)
+
+    compile_ranges_split_points: list[int] | None = None
 
     def init_with_cudagraph_sizes(self) -> None:
         """To complete the initialization of config,
@@ -213,6 +287,8 @@ class CompilationConfig:
             raise ValueError("level must in 0-3")
         if not self.cuda_graph_sizes:
             self.cuda_graph_sizes = [512]
+        if self.backend == "":
+            self.backend = "inductor"
 
     def compute_hash(self) -> str:
         """
@@ -248,6 +324,54 @@ class CompilationConfig:
                 "aiter.unified_attention_with_output",
                 "aiter.mla_attention",
             ]
+
+    def init_backend(self, vllm_config: "Config") -> str | Callable:
+        """
+        Initialize the backend for the compilation config from a vllm config.
+        Arguments:
+            vllm_config: The vllm config to initialize the backend from.
+        Returns:
+            The backend for the compilation config.
+        """
+        if self.level is None:
+            raise ValueError(
+                "No compilation mode is set. This method should only be "
+                "called via vllm config where the level is set if none is "
+                "provided."
+            )
+        if self.level == CompilationLevel.NO_COMPILATION:
+            raise ValueError("No compilation mode is set.")
+
+        from torch._dynamo.backends.registry import list_backends
+
+        torch_backends = list_backends(exclude_tags=tuple())
+        if self.level in [
+            CompilationLevel.DYNAMO_AS_IS,
+            CompilationLevel.DYNAMO_ONCE,
+        ]:
+            if self.backend in torch_backends:
+                return self.backend
+            return resolve_obj_by_qualname(self.backend)
+
+        assert self.level == CompilationLevel.PIECEWISE
+        if self.backend not in ["eager", "inductor"]:
+            logger.info("Using OOT custom backend for compilation.")
+
+        from atom.utils.backends import VllmBackend
+
+        # TODO[@lucaskabela]: See if we can forward prefix
+        # https://github.com/vllm-project/vllm/issues/27045
+        return VllmBackend(vllm_config)
+
+    def get_compile_ranges(self) -> list[Range]:
+        """Get the compile ranges for the compilation config."""
+        if self.compile_ranges_split_points is None:
+            return []
+        split_points = sorted(set(self.compile_ranges_split_points))
+        return [
+            Range(start=s + 1, end=e)
+            for s, e in zip([0] + split_points[:-1], split_points)
+        ]
 
 
 class QuantizationConfig(dict):
@@ -523,6 +647,13 @@ class SpeculativeConfig:
             self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
         self.hf_config_override(self.draft_model_hf_config)
 
+    def uses_draft_model(self) -> bool:
+        return self.method == "draft_model"
+
+    def use_eagle(self) -> bool:
+        return self.method in ("eagle", "eagle3", "mtp")
+
+
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         if hf_config.model_type == "deepseek_v3":
@@ -678,6 +809,7 @@ class Config:
                 raise ValueError(
                     f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
                 )
+        self._set_compile_ranges()
 
     def compute_hash(self) -> str:
         """
@@ -712,6 +844,56 @@ class Config:
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
+
+    def compile_debug_dump_path(self) -> Path | None:
+        """Returns a rank-aware path for dumping
+        torch.compile debug information.
+        """
+        if self.compilation_config.debug_dump_path is None:
+            return None
+        from aiter.dist.parallel_state import get_tp_group
+        tp_rank = get_tp_group().rank
+        dp_rank = self.parallel_config.data_parallel_rank
+        append_path = f"rank_{tp_rank}_dp_{dp_rank}"
+        path = self.compilation_config.debug_dump_path / append_path
+        return path
+
+    def _set_compile_ranges(self):
+        """
+        Set the compile ranges for the compilation config.
+        """
+        compilation_config = self.compilation_config
+        computed_compile_ranges_split_points = []
+
+        # The upper bound of the compile ranges is the max_num_batched_tokens.
+        # For speculative decoding, the compile range must be extended
+        # - Sequential: + 1 * max_num_seqs (one draft token per iteration)
+        # - Parallel draft: + num_speculative_tokens * max_num_seqs
+        compile_range_end = self.max_num_batched_tokens
+        if compile_range_end is not None:
+            if self.speculative_config is not None and (
+                self.speculative_config.uses_draft_model()
+                or self.speculative_config.use_eagle()
+            ):
+                multiplier = (
+                    1
+                    # self.speculative_config.num_speculative_tokens
+                    # if self.speculative_config.parallel_drafting
+                    # else 1
+                )
+                compile_range_end += multiplier * self.max_num_seqs
+
+            computed_compile_ranges_split_points.append(compile_range_end)
+
+        if compilation_config.compile_ranges_split_points is not None:
+            for x in compilation_config.compile_ranges_split_points:
+                assert isinstance(x, int)
+                assert x > 0, f"Invalid compile range split point: {x}"
+                if compile_range_end is not None and x < compile_range_end and x > 1:
+                    computed_compile_ranges_split_points.append(x)
+        compilation_config.compile_ranges_split_points = sorted(
+            computed_compile_ranges_split_points
+        )
 
 
 _current_atom_config: Optional[Config] = None

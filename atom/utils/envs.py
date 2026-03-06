@@ -42,6 +42,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1"
     )
     == "1",
+    "VLLM_USE_AOT_COMPILE": lambda: os.getenv("VLLM_USE_AOT_COMPILE", "0") == "1",
+    "VLLM_USE_BYTECODE_HOOK": lambda: os.getenv("VLLM_USE_BYTECODE_HOOK", "1") == "1",
+    "VLLM_USE_MEGA_AOT_ARTIFACT": lambda: os.getenv("VLLM_USE_MEGA_AOT_ARTIFACT", "0") == "1",
 }
 
 
