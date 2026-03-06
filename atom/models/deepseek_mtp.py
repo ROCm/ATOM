@@ -56,7 +56,12 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         )
 
         quant_config = atom_config.quant_config
-        if quant_config["quant_dtype"] == dtypes.fp4x2:
+        if quant_config is not None and hasattr(quant_config, "resolve"):
+            _mtp_spec = quant_config.resolve(prefix)
+            if _mtp_spec.quant_dtype == dtypes.fp4x2:
+                # MTP layers don't support FP4 — fall back to unquantized
+                quant_config = QuantizationConfig()
+        elif quant_config is not None and quant_config["quant_dtype"] == dtypes.fp4x2:
             quant_config = QuantizationConfig()
 
         self.mtp_block = DeepseekV2DecoderLayer(
