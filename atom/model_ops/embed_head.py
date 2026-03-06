@@ -3,12 +3,100 @@
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
+from atom.plugin import is_plugin_mode
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
-from atom.plugin import is_plugin_mode
+
+
+@triton.jit
+def _masked_embedding_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    vocab_start_idx,
+    vocab_end_idx,
+    stride_w_row,
+    stride_out_row,
+    N,
+    D,
+    BLOCK_D: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+    if pid_row >= N:
+        return
+
+    token_id = tl.load(x_ptr + pid_row)
+    in_range = (token_id >= vocab_start_idx) & (token_id < vocab_end_idx)
+    local_idx = token_id - vocab_start_idx
+
+    col_start = pid_col * BLOCK_D
+    cols = col_start + tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+
+    emb = tl.load(
+        weight_ptr + local_idx * stride_w_row + cols,
+        mask=in_range & col_mask,
+        other=0.0,
+    )
+
+    tl.store(out_ptr + pid_row * stride_out_row + cols, emb, mask=col_mask)
+
+
+def _masked_embedding_launcher(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    N = x.numel()
+    D = weight.shape[1]
+    BLOCK_D = 1024
+    out = torch.empty(N, D, dtype=weight.dtype, device=weight.device)
+    grid = (N, triton.cdiv(D, BLOCK_D))
+    _masked_embedding_kernel[grid](
+        x,
+        weight,
+        out,
+        vocab_start_idx,
+        vocab_end_idx,
+        weight.stride(0),
+        out.stride(0),
+        N,
+        D,
+        BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
+def _masked_embedding_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    return torch.empty(
+        x.numel(),
+        weight.shape[1],
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_masked_embedding_fake)
+def masked_embedding(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    return _masked_embedding_launcher(x, weight, vocab_start_idx, vocab_end_idx)
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -40,15 +128,24 @@ class VocabParallelEmbedding(nn.Module):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
+        # Torch compile will make logical_and, mask, embedding in a fused triton kernel, but make accuracy issue in MTP.
         if self.tp_size > 1:
-            mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
-            # mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-            x = mask * (x - self.vocab_start_idx)
-        y = F.embedding(x, self.weight)
-        if self.tp_size > 1:
-            y.masked_fill_(~mask.unsqueeze(1), 0)
+            y = masked_embedding(
+                x, self.weight, self.vocab_start_idx, self.vocab_end_idx
+            )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
+        else:
+            y = F.embedding(x, self.weight)
         return y
+        # if self.tp_size > 1:
+        #     mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
+        #     # mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
+        #     x = mask * (x - self.vocab_start_idx)
+        # y = F.embedding(x, self.weight)
+        # if self.tp_size > 1:
+        #     y.masked_fill_(~mask.unsqueeze(1), 0)
+        #     y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
+        # return y
 
 
 class ParallelLMHead(VocabParallelEmbedding):
@@ -78,7 +175,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
-            logits = tensor_model_parallel_all_gather(logits)
+            logits = tensor_model_parallel_all_gather(logits, use_custom=True)
             # all_logits = (
             #     [torch.empty_like(logits) for _ in range(self.tp_size)]
             #     if self.tp_rank == 0

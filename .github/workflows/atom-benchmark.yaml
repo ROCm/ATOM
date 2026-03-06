@@ -102,6 +102,7 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Show Docker containers
         run: docker ps -a
@@ -232,6 +233,7 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Show Docker containers
         run: docker ps -a

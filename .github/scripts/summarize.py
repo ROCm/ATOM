@@ -22,10 +22,22 @@ def main():
 
     in_path = Path(sys.argv[1])
 
-    files = sorted(in_path.glob("*.json"))
-    for json_path in files:
+    # Load all benchmark results first
+    results = []
+    for json_path in in_path.glob("*.json"):
         with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
+        results.append(data)
+
+    # Sort by Model name, then by Max concurrency (numerically)
+    results.sort(
+        key=lambda d: (
+            d.get("model_id", "").split("/")[-1],
+            int(d.get("max_concurrency", 0)),
+        )
+    )
+
+    for data in results:
         row = [
             datetime.datetime.strptime(data.get("date", ""), "%Y%m%d-%H%M%S").strftime(
                 "%Y-%m-%d %H:%M:%S"
