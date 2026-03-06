@@ -475,9 +475,12 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.tp_dim = 0
+        if quant_config is not None and prefix:
+            quant_config = get_quant_config_for_layer(quant_config, prefix)
         super().__init__(
             input_size,
             output_size,
@@ -619,6 +622,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.head_size = head_size
@@ -650,6 +654,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             bias=bias,
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
         )
 
     def weight_loader(
