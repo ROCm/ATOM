@@ -12,7 +12,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from asyncio import AbstractEventLoop
@@ -912,7 +911,7 @@ def main():
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
-    engine = engine_args.create_engine()
+    engine = engine_args.create_engine(tokenizer=tokenizer)
 
     import signal
 
@@ -923,6 +922,7 @@ def main():
         # Wait for ALL descendant processes (including grandchildren like
         # ModelRunners) to exit, so no orphan output leaks to the terminal.
         import psutil
+
         try:
             current = psutil.Process()
             children = current.children(recursive=True)

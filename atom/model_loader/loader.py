@@ -148,6 +148,7 @@ def load_model(
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     params_dict = dict(model.named_parameters())
+
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         disable_mmap = envs.ATOM_DISABLE_MMAP

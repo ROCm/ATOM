@@ -12,6 +12,7 @@ from atom.utils import compilation_counter
 from atom.utils import weak_ref_tensors
 from aiter import logger
 from atom.config import Config, CUDAGraphMode
+from atom.utils.forward_context import get_forward_context
 
 # from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 # from vllm.config import CUDAGraphMode, VllmConfig

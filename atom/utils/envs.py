@@ -21,22 +21,16 @@ documented at the bottom of this file but NOT managed here.
 import os
 from typing import Any, Callable
 
-
 environment_variables: dict[str, Callable[[], Any]] = {
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
-    "ATOM_DP_MASTER_PORT": lambda: int(
-        os.getenv("ATOM_DP_MASTER_PORT", "29500")
-    ),
+    "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # --- Compilation & Execution ---
-    "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0")
-    == "1",
-    "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv(
-        "ATOM_USE_TRITON_MXFP4_BMM", "0"
-    )
+    "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0")
     == "1",
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
@@ -66,14 +60,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     == "1",
     # --- Profiling & Logging ---
-    "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv(
-        "ATOM_TORCH_PROFILER_DIR", None
-    ),
+    "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # --- Model Loading ---
-    "ATOM_DISABLE_MMAP": lambda: os.getenv("ATOM_DISABLE_MMAP", "false")
-    .lower()
+    "ATOM_DISABLE_MMAP": lambda: os.getenv("ATOM_DISABLE_MMAP", "false").lower()
     == "true",
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: os.getenv(

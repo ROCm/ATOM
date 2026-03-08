@@ -59,7 +59,6 @@ class PiecewiseBackend:
 
         self.sym_shape_indices = sym_shape_indices
 
-
         # the entries for different shapes that we need to compile
         self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}
 

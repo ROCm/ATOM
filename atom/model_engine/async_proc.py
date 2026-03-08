@@ -45,6 +45,7 @@ class AsyncIOProc:
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
         # Register atexit to close shared memory even if exit() doesn't complete
         import atexit
+
         atexit.register(self._cleanup_shared_memory)
         # make sure exit handler is set before runner is created
         init_exit_handler(self)
@@ -153,6 +154,7 @@ class AsyncIOProcManager:
         self.still_running = True
         # Register atexit to clean up shared memory even if exit() doesn't complete
         import atexit
+
         atexit.register(self._cleanup_shared_memory)
         init_exit_handler(self)
         for i in range(proc_num):

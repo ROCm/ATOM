@@ -661,7 +661,13 @@ class ModelRunner:
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
         # 3. Release GPU tensors
-        for attr in ("kv_cache", "kv_scale", "index_cache", "mamba_k_cache", "mamba_v_cache"):
+        for attr in (
+            "kv_cache",
+            "kv_scale",
+            "index_cache",
+            "mamba_k_cache",
+            "mamba_v_cache",
+        ):
             if hasattr(self, attr):
                 delattr(self, attr)
         if hasattr(self, "model"):
@@ -894,9 +900,7 @@ class ModelRunner:
         if self.use_mla:
             # MLA: shape [total_layers, blocks, block_size, 576]
             # No kv_scale for MLA
-            block_bytes = (
-                total_num_layers * self.block_size * 576 * kv_dtype_size
-            )
+            block_bytes = total_num_layers * self.block_size * 576 * kv_dtype_size
             if self.is_deepseek_v32:
                 index_dim = hf_config.index_head_dim + 4
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
@@ -911,9 +915,7 @@ class ModelRunner:
             self.num_full_attn = (
                 hf_config.num_hidden_layers // self.full_attention_interval
             )
-            self.num_gdn_attn_state = (
-                hf_config.num_hidden_layers - self.num_full_attn
-            )
+            self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
             num_draft_layers = total_num_layers - hf_config.num_hidden_layers
             full_attn_layers = self.num_full_attn + num_draft_layers
 
@@ -947,8 +949,7 @@ class ModelRunner:
                 self.num_spec_tokens,
             )
             one_layer_byte = (
-                sum(math.prod(subtuple) for subtuple in mamba_shape)
-                * kv_dtype_size
+                sum(math.prod(subtuple) for subtuple in mamba_shape) * kv_dtype_size
             )
             block_bytes += self.num_gdn_attn_state * one_layer_byte
         else:
@@ -995,9 +996,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
-            hf_config.head_dim = (
-                hf_config.hidden_size // hf_config.num_attention_heads
-            )
+            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
         free, total = torch.cuda.mem_get_info()
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -1017,9 +1016,7 @@ class ModelRunner:
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
         # This is independent of other processes on the GPU.
         budget = int(total * config.gpu_memory_utilization)
-        available_for_kv = (
-            budget - peak_torch - cudagraph_overhead - safety_margin
-        )
+        available_for_kv = budget - peak_torch - cudagraph_overhead - safety_margin
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # This prevents OOM when other processes share the GPU.

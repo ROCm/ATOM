@@ -18,12 +18,12 @@ logger = logging.getLogger("atom")
 
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, model, tokenizer=None, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         config = Config(model, **config_kwargs)
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(
             config.model, use_fast=True, trust_remote_code=config.trust_remote_code
         )
         config.bos_token_id = self.tokenizer.bos_token_id

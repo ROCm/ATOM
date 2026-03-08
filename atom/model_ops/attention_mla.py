@@ -5,11 +5,10 @@ import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional
-import triton
-import triton.language as tl
-
 
 import torch
+import triton
+import triton.language as tl
 from aiter import (
     QuantType,
     concat_and_cache_mla,
