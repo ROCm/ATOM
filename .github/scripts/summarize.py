@@ -15,8 +15,8 @@ def main():
         sys.exit(1)
 
     summary_header = """\
-| Date | Backend | Model | Best of | Number of prompts | Request rate | Burstiness | Max concurrency | Duration | Completed | Total input tokens | Total output tokens | Request throughput | Request goodput | Output throughput | Total token throughput | Mean TTFT (ms) | Median TTFT (ms) | Std TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | Median TPOT (ms) | Std TPOT (ms) | P99 TPOT (ms) | Mean ITL (ms) | Median ITL (ms) | Std ITL (ms) | P99 ITL (ms) | Mean E2EL (ms) | Median E2EL (ms) | Std E2EL (ms) | P99 E2EL (ms) |
-| :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |\
+| Date | Backend | Model | ISL | OSL | Best of | Number of prompts | Request rate | Burstiness | Max concurrency | Duration | Completed | Total input tokens | Total output tokens | Request throughput | Request goodput | Output throughput | Total token throughput | Mean TTFT (ms) | Median TTFT (ms) | Std TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | Median TPOT (ms) | Std TPOT (ms) | P99 TPOT (ms) | Mean ITL (ms) | Median ITL (ms) | Std ITL (ms) | P99 ITL (ms) | Mean E2EL (ms) | Median E2EL (ms) | Std E2EL (ms) | P99 E2EL (ms) |
+| :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |\
     """
     print(summary_header)
 
@@ -27,12 +27,21 @@ def main():
     for json_path in in_path.glob("*.json"):
         with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
+        # Parse ISL/OSL from filename if not in JSON
+        # Filename format: {model}-{ISL}-{OSL}-{CONC}-{RATIO}.json
+        if "random_input_len" not in data or "random_output_len" not in data:
+            parts = json_path.stem.rsplit("-", 4)
+            if len(parts) == 5:
+                data.setdefault("random_input_len", int(parts[1]))
+                data.setdefault("random_output_len", int(parts[2]))
         results.append(data)
 
-    # Sort by Model name, then by Max concurrency (numerically)
+    # Sort by Model name, then by ISL, OSL, and Max concurrency (numerically)
     results.sort(
         key=lambda d: (
             d.get("model_id", "").split("/")[-1],
+            int(d.get("random_input_len", 0)),
+            int(d.get("random_output_len", 0)),
             int(d.get("max_concurrency", 0)),
         )
     )
@@ -44,6 +53,8 @@ def main():
             ),
             "ATOM",
             data.get("model_id", "").split("/")[-1],
+            data.get("random_input_len", ""),
+            data.get("random_output_len", ""),
             data.get("best_of", ""),
             data.get("num_prompts", ""),
             data.get("request_rate", ""),

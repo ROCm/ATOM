@@ -68,4 +68,12 @@ if [ "$TYPE" == "benchmark" ]; then
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
     --result-dir=. --result-filename=${RESULT_FILENAME}.json
+
+  # Inject ISL/OSL into result JSON for summary table
+  if [ -f "${RESULT_FILENAME}.json" ]; then
+    jq --argjson isl "$ISL" --argjson osl "$OSL" \
+      '. + {random_input_len: $isl, random_output_len: $osl}' \
+      "${RESULT_FILENAME}.json" > "${RESULT_FILENAME}.tmp" && \
+      mv "${RESULT_FILENAME}.tmp" "${RESULT_FILENAME}.json"
+  fi
 fi
