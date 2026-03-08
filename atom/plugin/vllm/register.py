@@ -1,17 +1,15 @@
-import os
 from typing import Optional
 import logging
 
 import torch
 from atom.plugin.prepare import _set_framework_backbone
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
 # this flag is used to enable the vllm plugin mode
-disable_vllm_plugin = os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
-disable_vllm_plugin_attention = (
-    os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1"
-)
+disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
+disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
 # those 2 models are covering most of dense and moe models
 ATOM_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMForCausalLM"

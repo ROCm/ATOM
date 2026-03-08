@@ -6,7 +6,6 @@ from typing import Any, Callable
 
 import torch.fx as fx
 
-# import vllm.envs as envs
 from atom.utils.backends import VllmBackend
 from atom.utils.decorators import end_monitoring_torch_compile
 from atom.config import Config
@@ -60,7 +59,6 @@ class PiecewiseBackend:
 
         self.sym_shape_indices = sym_shape_indices
 
-        # self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
 
         # the entries for different shapes that we need to compile
         self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}

@@ -6,15 +6,14 @@ and wiring only.
 """
 
 import logging
-import os
+
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
 # This flag is used to enable the vLLM plugin mode.
-disable_vllm_plugin = os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
-disable_vllm_plugin_attention = (
-    os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1"
-)
+disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
+disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
 if not disable_vllm_plugin:
     from vllm.platforms.rocm import RocmPlatform

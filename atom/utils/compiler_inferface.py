@@ -379,10 +379,6 @@ class InductorAdaptor(CompilerInterface):
                 config_patches=current_config,
             )
 
-        # We treat VLLM_DISABLE_COMPILE_CACHE as the overall switch for torch
-        # compilation cache. So turn off the checks if we disable the
-        # compilation cache.
-        # if not envs.VLLM_DISABLE_COMPILE_CACHE:
         if hash_str is None:
             raise RuntimeError(
                 "vLLM failed to compile the model. The most "
@@ -556,10 +552,8 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Save the compiled artifact to disk in the specified path
         assert key is not None
         path = os.path.join(self.cache_dir, key)
-        if True:
-            # if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            compiled_graph.save(path=path, format="unpacked")
-            compilation_counter.num_compiled_artifacts_saved += 1
+        compiled_graph.save(path=path, format="unpacked")
+        compilation_counter.num_compiled_artifacts_saved += 1
         return compiled_graph, (key, path)
 
     def load(

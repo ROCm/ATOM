@@ -20,6 +20,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method
 from atom.config import Config, KVCacheTensor, set_current_atom_config
+from atom.utils import envs
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
@@ -667,7 +668,7 @@ class ModelRunner:
         - Set to "0" or unset to disable these features (default).
         """
         if self.profiler_dir is not None and self.profiler is None:
-            enable_detailed_profiling = os.environ.get("ATOM_PROFILER_MORE", "0") == "1"
+            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
             self.profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,

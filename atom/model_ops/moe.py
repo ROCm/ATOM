@@ -426,14 +426,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
     def _maybe_pad_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        # Pad the weight tensor. This is an optimization on ROCm platform, which
-        # can benefit from tensors located far enough from one another in memory
-        # if (envs.VLLM_ROCM_MOE_PADDING and current_platform.is_rocm()
-        #         and weight.stride(-1) == 1
-        #         and (weight.stride(-2) * weight.element_size()) % 512 == 0):
-        #     num_pad = 256 // weight.element_size()
-        #     weight = F.pad(weight, (0, num_pad), "constant", 0)[..., :-num_pad]
-        #     torch.cuda.empty_cache()
         return weight
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -1511,13 +1503,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         # Lazy import to avoid importing triton too early.
-        # from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-        #     is_rocm_aiter_moe_enabled, shuffle_weights)
-
-        # self.rocm_aiter_moe_enabled = is_rocm_aiter_moe_enabled()
-        # self.rocm_aiter_use_asm = (self.rocm_aiter_moe_enabled
-        #                            and envs.VLLM_ROCM_USE_AITER_ASMMOE)
-
         # TODO (rob): refactor block quant into separate class.
         if self.block_quant:
             assert self.quant_config["is_dynamic"]

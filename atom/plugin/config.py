@@ -1,4 +1,3 @@
-import os
 import sys
 
 from typing import Any, Optional
@@ -6,6 +5,8 @@ from dataclasses import dataclass
 
 import torch
 import logging
+
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 _KNOWN_ISSUE_MAX_NUM_BATCHED_TOKENS_THRESHOLD = 18 * 1024
@@ -43,9 +44,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     vllm_scheduler_config = config.scheduler_config
     vllm_cache_config = config.cache_config
     vllm_parallel_config = config.parallel_config
-    vllm_use_atom_attention = bool(
-        os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "0"
-    )
+    vllm_use_atom_attention = not envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
     # here use the ATOM compilation config, as the ATOM compile policy is used
     # instead of vLLM one for torch compile, while for cuda graph capture,

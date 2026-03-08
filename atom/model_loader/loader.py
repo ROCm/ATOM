@@ -13,6 +13,8 @@ import torch
 from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig
+
+from atom.utils import envs
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from atom.model_loader.weight_utils import (
@@ -148,7 +150,7 @@ def load_model(
     params_dict = dict(model.named_parameters())
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
-        disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false").lower() == "true"
+        disable_mmap = envs.ATOM_DISABLE_MMAP
         for name, weight_tensor in safetensors_weights_iterator(
             model_name_or_path, disable_mmap=disable_mmap
         ):

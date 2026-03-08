@@ -559,7 +559,9 @@ def getLogger():
         logger.setLevel(logging.DEBUG)
 
         console_handler = logging.StreamHandler()
-        if int(os.environ.get("ATOM_LOG_MORE", 0)):
+        from atom.utils import envs as _envs
+
+        if _envs.ATOM_LOG_MORE:
             formatter = logging.Formatter(
                 fmt="[%(name)s %(levelname)s] %(asctime)s.%(msecs)01d - %(processName)s:%(process)d - %(pathname)s:%(lineno)d - %(funcName)s\n%(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
