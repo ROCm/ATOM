@@ -46,6 +46,11 @@ class LLMEngine:
             f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
         )
 
+    def close(self):
+        """Shut down engine and release all GPU resources."""
+        if hasattr(self, "core_mgr"):
+            self.core_mgr.close()
+
     def add_request(
         self,
         prompt_or_tokens_list: List[Union[str, List[int]]],

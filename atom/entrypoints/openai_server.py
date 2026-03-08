@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from asyncio import AbstractEventLoop
@@ -629,7 +630,10 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Server started successfully and ready to accept requests")
     yield
-    # Shutdown (if needed in the future)
+    # Shutdown: release GPU resources (called by uvicorn on graceful exit)
+    logger.info("Server shutting down, releasing resources...")
+    if engine is not None:
+        engine.close()
 
 
 app = FastAPI(title="Atom OpenAI API Server", lifespan=lifespan)
@@ -900,17 +904,40 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"Loading tokenizer from {args.model}...")
+    logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, trust_remote_code=args.trust_remote_code
     )
     model_name = args.model
 
-    print(f"Initializing engine with model {args.model}...")
+    logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
     engine = engine_args.create_engine()
 
-    print(f"Starting server on {args.host}:{args.server_port}...")
+    import signal
+
+    def _sigint_handler(signum, frame):
+        """Handle Ctrl+C: close engine, wait for all processes, then exit."""
+        logger.info("Received SIGINT, shutting down engine...")
+        engine.close()
+        # Wait for ALL descendant processes (including grandchildren like
+        # ModelRunners) to exit, so no orphan output leaks to the terminal.
+        import psutil
+        try:
+            current = psutil.Process()
+            children = current.children(recursive=True)
+            psutil.wait_procs(children, timeout=2)
+            alive = [c for c in children if c.is_running()]
+            for c in alive:
+                c.kill()
+        except psutil.NoSuchProcess:
+            pass
+        logger.info("Engine shutdown complete.")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    logger.info(f"Starting server on {args.host}:{args.server_port}...")
     uvicorn.run(app, host=args.host, port=args.server_port)
 
 

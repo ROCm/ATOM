@@ -654,9 +654,13 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
+        #    Must happen while ops module is still alive for CustomAllreduce cleanup.
+        destroy_dist_env()
+        # 2. Release CUDA graphs
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
-        # Release GPU tensors before destroying distributed env
+        # 3. Release GPU tensors
         for attr in ("kv_cache", "kv_scale", "index_cache", "mamba_k_cache", "mamba_v_cache"):
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -665,7 +669,6 @@ class ModelRunner:
         if hasattr(self, "drafter"):
             del self.drafter
         torch.cuda.empty_cache()
-        destroy_dist_env()
         return True
 
     def start_profiler(self):
