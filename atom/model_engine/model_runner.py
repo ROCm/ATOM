@@ -953,16 +953,18 @@ class ModelRunner:
             )
             block_bytes += self.num_gdn_attn_state * one_layer_byte
         else:
-            # Standard attention: kv_cache [2, layers, blocks, phys_bs, kv_heads, head_dim]
+            # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
+            # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
+            # the standard path (draft layers use separate binding).
             block_bytes = (
                 2
-                * total_num_layers
+                * hf_config.num_hidden_layers
                 * self.block_size
                 * num_kv_heads
                 * hf_config.head_dim
                 * kv_dtype_size
             )
-            # kv_scale: [2, layers, blocks, kv_heads, phys_block_size] float32
+            # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
             block_bytes += (
                 2
                 * hf_config.num_hidden_layers

@@ -916,7 +916,13 @@ def main():
     import signal
 
     def _sigint_handler(signum, frame):
-        """Handle Ctrl+C: close engine, wait for all processes, then exit."""
+        """Handle Ctrl+C: close engine, wait for all processes, then exit.
+
+        This complements the lifespan shutdown (which also calls engine.close()).
+        engine.close() is idempotent (guarded by CoreManager._closed), so
+        double-call from both paths is safe. The handler is needed because
+        lifespan cannot wait for grandchild processes (ModelRunners).
+        """
         logger.info("Received SIGINT, shutting down engine...")
         engine.close()
         # Wait for ALL descendant processes (including grandchildren like

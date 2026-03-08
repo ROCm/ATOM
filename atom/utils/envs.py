@@ -80,7 +80,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
 def is_set(name: str) -> bool:
     """Return True if the env var *name* is explicitly set (even if empty)."""
-    return os.getenv(name) is not None
+    val = os.getenv(name)
+    return val is not None and val != ""
 
 
 def __getattr__(name: str):

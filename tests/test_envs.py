@@ -142,6 +142,6 @@ class TestIsSet:
         monkeypatch.setenv("ATOM_DP_SIZE", "1")
         assert _get_envs().is_set("ATOM_DP_SIZE") is True
 
-    def test_is_set_returns_true_for_empty_string(self, monkeypatch):
+    def test_is_set_returns_false_for_empty_string(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SIZE", "")
-        assert _get_envs().is_set("ATOM_DP_SIZE") is True
+        assert _get_envs().is_set("ATOM_DP_SIZE") is False
