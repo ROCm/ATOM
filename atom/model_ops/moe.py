@@ -14,8 +14,12 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
-from atom.config import Config, QuantizationConfig, get_current_atom_config
-from atom.models.utils import get_quant_config_for_layer
+from atom.config import (
+    Config,
+    QuantizationConfig,
+    get_current_atom_config,
+    LayerQuantConfig,
+)
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
@@ -630,7 +634,7 @@ direct_register_custom_op(
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
-    def __init__(self, quant_config: QuantizationConfig, moe: FusedMoEConfig):
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
         self.quant_type = self.quant_config["quant_type"]
@@ -964,7 +968,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
 class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
-    def __init__(self, quant_config: QuantizationConfig, moe: FusedMoEConfig):
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
         self.quant_type = quant_config["quant_type"]
@@ -1371,7 +1375,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: QuantizationConfig, moe: FusedMoEConfig):
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
         self.quant_type = self.quant_config["quant_type"]
@@ -1462,9 +1466,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    num_experts, hidden_size, dtype=torch.float32
-                ),
+                torch.ones(num_experts, hidden_size, dtype=torch.float32),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
@@ -1525,28 +1527,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _normalize_weights_and_scales(self, layer: nn.Module):
         if not self.need_normalize_e4m3fn_to_e4m3fnuz:
             return
-        w13_weight, w13_weight_scale, w13_input_scale = (
-            normalize_e4m3fn_to_e4m3fnuz(
-                layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
-            )
+        w13_weight, w13_weight_scale, w13_input_scale = normalize_e4m3fn_to_e4m3fnuz(
+            layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
         )
-        w2_weight, w2_weight_scale, w2_input_scale = (
-            normalize_e4m3fn_to_e4m3fnuz(
-                layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
-            )
+        w2_weight, w2_weight_scale, w2_input_scale = normalize_e4m3fn_to_e4m3fnuz(
+            layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
         )
         layer.w13_weight = nn.Parameter(w13_weight, requires_grad=False)
         layer.w13_weight_scale = nn.Parameter(w13_weight_scale, requires_grad=False)
         layer.w2_weight = nn.Parameter(w2_weight, requires_grad=False)
         layer.w2_weight_scale = nn.Parameter(w2_weight_scale, requires_grad=False)
         if w13_input_scale is not None:
-            layer.w13_input_scale = nn.Parameter(
-                w13_input_scale, requires_grad=False
-            )
+            layer.w13_input_scale = nn.Parameter(w13_input_scale, requires_grad=False)
         if w2_input_scale is not None:
-            layer.w2_input_scale = nn.Parameter(
-                w2_input_scale, requires_grad=False
-            )
+            layer.w2_input_scale = nn.Parameter(w2_input_scale, requires_grad=False)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if self.block_quant:
@@ -1561,15 +1555,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self._normalize_weights_and_scales(layer)
 
         if not self.need_normalize_e4m3fn_to_e4m3fnuz:
-            layer.w13_weight = nn.Parameter(
-                layer.w13_weight.data, requires_grad=False
-            )
+            layer.w13_weight = nn.Parameter(layer.w13_weight.data, requires_grad=False)
             layer.w13_weight_scale = nn.Parameter(
                 layer.w13_weight_scale.data, requires_grad=False
             )
-            layer.w2_weight = nn.Parameter(
-                layer.w2_weight.data, requires_grad=False
-            )
+            layer.w2_weight = nn.Parameter(layer.w2_weight.data, requires_grad=False)
             layer.w2_weight_scale = nn.Parameter(
                 layer.w2_weight_scale.data, requires_grad=False
             )
@@ -1631,9 +1621,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
-        layer.w13_weight_scale = torch.nn.Parameter(
-            max_w13_scales, requires_grad=False
-        )
+        layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1850,10 +1838,15 @@ class FusedMoE(torch.nn.Module):
     ):
         super().__init__()
         self.prefix = prefix
-        self.params_dtype = (
-            quant_config["quant_dtype"] if quant_config else torch.get_default_dtype()
+        layer_quant_config = (
+            quant_config.get_layer_quant_config(prefix) if quant_config else None
         )
-        self.quant_config = quant_config
+        self.params_dtype = (
+            layer_quant_config["quant_dtype"]
+            if layer_quant_config
+            else torch.get_default_dtype()
+        )
+        self.layer_quant_config = layer_quant_config
         self.has_bias = has_bias
         # Note: here we guard against accessing the TP and DP groups when
         # uninitialized (this happens when testing)
@@ -1968,28 +1961,28 @@ class FusedMoE(torch.nn.Module):
         )
         self.moe_config = moe
 
-        if quant_config is not None and prefix:
-            quant_config = get_quant_config_for_layer(quant_config, prefix)
-
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
-        quant_method_str = quant_config.get("quant_method", None)
-        if quant_config["quant_type"] == QuantType.No:
+
+        quant_method_str = layer_quant_config.get("quant_method", None)
+        if layer_quant_config["quant_type"] == QuantType.No:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
                 moe
             )
         elif (
             quant_method_str == "compressed-tensors"
-            and quant_config["quant_dtype"] == dtypes.fp8
+            and layer_quant_config["quant_dtype"] == dtypes.fp8
         ):
             # Use CompressedTensorsFp8MoEMethod for compressed-tensors format
-            self.quant_method = CompressedTensorsFp8MoEMethod(quant_config, moe)
-        elif quant_config["quant_dtype"] == dtypes.fp8:
-            self.quant_method = Fp8MoEMethod(quant_config, moe)
-        elif quant_config["quant_dtype"] == dtypes.fp4x2:
-            self.quant_method = Mxfp4MoEMethod(quant_config, moe)
+            self.quant_method = CompressedTensorsFp8MoEMethod(layer_quant_config, moe)
+        elif layer_quant_config["quant_dtype"] == dtypes.fp8:
+            self.quant_method = Fp8MoEMethod(layer_quant_config, moe)
+        elif layer_quant_config["quant_dtype"] == dtypes.fp4x2:
+            self.quant_method = Mxfp4MoEMethod(layer_quant_config, moe)
         else:
-            raise ValueError(f"Unsupported quant dtype: {quant_config['quant_dtype']}")
+            raise ValueError(
+                f"Unsupported quant dtype: {layer_quant_config['quant_dtype']}"
+            )
 
         assert self.quant_method is not None
 
@@ -2273,7 +2266,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str = "",
         expert_id: int = 0,
     ) -> None:
-        if self.quant_config["quant_dtype"] == dtypes.fp4x2 and weight_name == "":
+        if self.layer_quant_config["quant_dtype"] == dtypes.fp4x2 and weight_name == "":
             self.mxf4_merged_weight_loader(param, loaded_weight)
             return
 
@@ -2351,7 +2344,7 @@ class FusedMoE(torch.nn.Module):
             # FusedMoeWeightScaleSupported
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
-            quant_method = self.quant_config["quant_type"]
+            quant_method = self.layer_quant_config["quant_type"]
             if quant_method == QuantType.per_Token:
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,

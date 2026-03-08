@@ -262,16 +262,6 @@ def should_ignore_layer(
     return False
 
 
-def get_quant_config_for_layer(
-    quantization_config: Optional[QuantizationConfig], prefix: str
-) -> Optional[QuantizationConfig]:
-    return (
-        None
-        if should_ignore_layer(quantization_config, prefix)
-        else quantization_config
-    )
-
-
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     """
     Extract the layer index from the module name.

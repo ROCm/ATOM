@@ -19,7 +19,7 @@ def is_rocm_aiter_fusion_shared_expert_enabled() -> bool:
     quant_config = config.quant_config
     is_shared_experts_excluded = False
     is_experts_excluded = False
-    exclude_layers = quant_config["exclude_layers"]
+    exclude_layers = quant_config.exclude_layers
     for layer in exclude_layers:
         if "shared_experts" in layer:
             is_shared_experts_excluded = True
