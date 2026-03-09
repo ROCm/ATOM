@@ -25,7 +25,7 @@ from atom.model_engine.request import RequestOutput
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import AutoTokenizer
 
 from atom.model_engine.llm_engine import _load_tokenizer
 
