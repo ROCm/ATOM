@@ -577,8 +577,8 @@ class MLAAttention(nn.Module):
         if forward_context.context.is_dummy_run:
             # dummy run: skip real attention and return
             output_shape = list(q.shape)
-            output_shape[-1] = 7168
             atom_config = get_current_atom_config()
+            output_shape[-1] = atom_config.hf_config.hidden_size
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output
