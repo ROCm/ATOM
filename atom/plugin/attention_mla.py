@@ -6,9 +6,10 @@ Plugin mode extensions for MLAAttention.
 This module provides additional methods for MLAAttention when running in plugin mode.
 """
 
+import os
 import torch
 import aiter
-from aiter import dtypes
+from aiter import dtypes, QuantType
 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
@@ -156,6 +157,40 @@ class MLAAttentionImplPluginModeMethods:
         k[..., : k_nope.shape[-1]] = k_nope
         k[..., k_nope.shape[-1] :] = k_pe
         return k
+
+    def _v_up_proj(self, x):
+        # Convert from (B, N, L) to (N, B, L)
+        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+        # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
+        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
+        # Convert from (B, N, L) to (N, B, L)
+        if envs.ATOM_USE_TRITON_MXFP4_BMM:
+            output = torch.empty(
+                x.shape[1],
+                x.shape[0],
+                self.W_V.shape[1],
+                device=x.device,
+                dtype=torch.bfloat16,
+            )
+            output = batched_gemm_a16wfp4(
+                x,
+                self.W_V,
+                self.W_V_scale,
+                y=output,
+                transpose_bm=True,
+                prequant=True,
+                y_scale=None,
+            )
+            # x = x.transpose(0, 1).flatten(1, 2)
+            output = output.view(-1, self.num_heads * self.v_head_dim)
+            x = output
+        else:
+            x = _aiter_triton_fp8_bmm(
+                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
+            )
+            # Convert from (B, N, V) to (B, N * V)
+            x = x.reshape(-1, self.num_heads * self.v_head_dim)
+        return x
 
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
@@ -838,11 +873,34 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
         self._pad_v = True
         self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
+        # vllm kv_b_proj return two values (output, bias), so we need to wrap it.
+        if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1":
+
+            def wrap_kv_b_proj(module_instance):
+                orig_impl = module_instance.forward
+
+                def new_forward(*args, **kwargs):
+                    out = orig_impl(*args, **kwargs)
+                    return out, None
+
+                module_instance.forward = new_forward
+                return module_instance
+
+            self.kv_b_proj = wrap_kv_b_proj(self.kv_b_proj)
+            quant_type = self.kv_b_proj.quant_type
+            # vllm will call get_and_maybe_dequant_weights to get the weights,
+            # so we need to set the quant_method value to workaround.
+            if quant_type == QuantType.No:
+                self.kv_b_proj.quant_method = None
+            else:
+                # TODO: support other quant types for fallback path
+                assert False, "Unsupported quant type"
 
 
 def MLAAttentionImplDecoratorForPluginMode(cls):
     method_names = [
         "_concat_k_nope_k_pe_plugin_mode",
+        "_v_up_proj",
         "_flash_attn_varlen_diff_headdims",
         "_run_prefill_new_tokens_plugin_mode",
         "_run_prefill_context_chunk_plugin_mode",

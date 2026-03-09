@@ -74,6 +74,48 @@ def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
     attention.process_weights_after_loading = wrapped
 
 
+def set_default_quant_scales(
+    layer: torch.nn.Module, register_buffer: bool = False
+) -> None:
+    """Sets default quantization scales for the layer."""
+    if register_buffer:
+        layer.register_buffer("_k_scale", torch.tensor(1.0, dtype=torch.float32))
+        layer.register_buffer("_v_scale", torch.tensor(1.0, dtype=torch.float32))
+        layer.register_buffer("_q_scale", torch.tensor(1.0, dtype=torch.float32))
+        layer.register_buffer("_prob_scale", torch.tensor(1.0, dtype=torch.float32))
+    else:
+        layer._k_scale.fill_(1.0)
+        layer._v_scale.fill_(1.0)
+        layer._q_scale.fill_(1.0)
+        layer._prob_scale.fill_(1.0)
+
+    # We also keep q/k/v_scale on host (cpu) memory for attention
+    # backends that require the scales to be on host instead of on device.
+    # e.g. Flashinfer
+    layer._q_scale_float = 1.0
+    layer._k_scale_float = 1.0
+    layer._v_scale_float = 1.0
+    layer._prob_scale_float = 1.0
+
+
+def _replace_vllm_mla_attention_process_weights_after_loading() -> None:
+    try:
+        from vllm.attention.layer import MLAAttention
+    except ImportError:
+        from vllm.model_executor.layers.attention import MLAAttention
+
+    def _process_weights_after_loading(self, act_dtype: torch.dtype):
+        if hasattr(self.impl, "process_weights_after_loading"):
+            if disable_vllm_plugin_attention:
+                self.impl.process_weights_after_loading(act_dtype)
+            else:
+                self.impl.process_weights_after_loading()
+
+        set_default_quant_scales(self, register_buffer=False)
+
+    MLAAttention.process_weights_after_loading = _process_weights_after_loading
+
+
 def register_model() -> None:
     if disable_vllm_plugin:
         logger.info("Disable ATOM model register")
@@ -110,4 +152,5 @@ def register_model() -> None:
         from vllm.model_executor.layers.attention import Attention, MLAAttention
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
+    _replace_vllm_mla_attention_process_weights_after_loading()
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)

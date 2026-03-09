@@ -140,7 +140,7 @@ class MLAAttention(nn.Module):
         )
         self.layer_num = layer_num
 
-    def process_weights_after_loading(self, act_dtype: Optional[torch.dtype] = None):
+    def process_weights_after_loading(self):
         if is_rocm_aiter_fp4bmm_enabled():
             kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj)
             self.W_K, self.W_K_scale, W_V, self.W_V_scale = quark_post_load_weights(
@@ -181,7 +181,7 @@ class MLAAttention(nn.Module):
                 W_V, dtype=dtypes.fp8
             )
 
-    def _v_up_proj(self, x):
+    def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
@@ -213,7 +213,7 @@ class MLAAttention(nn.Module):
             )
             # Convert from (B, N, V) to (B, N * V)
             x = x.reshape(-1, self.num_heads * self.v_head_dim)
-        return x
+        return self.o_proj(x)
 
     def _q_proj_and_k_up_proj(self, x, x_scale=None):
         q_nope, q_pe = (
@@ -419,7 +419,7 @@ class MLAAttention(nn.Module):
             causal=True,
         )
 
-        return output.flatten(start_dim=-2)
+        return self.o_proj(output.flatten(start_dim=-2))
 
     def _forward_prefill_mla(
         self,
@@ -486,7 +486,7 @@ class MLAAttention(nn.Module):
                     None,
                 )
 
-        return self._v_up_proj(o)
+        return self._v_up_proj_and_o_proj(o)
 
     def _forward_decode(
         self,
@@ -561,7 +561,7 @@ class MLAAttention(nn.Module):
             kv_scale=self._k_scale,
         )
 
-        return self._v_up_proj(o)
+        return self._v_up_proj_and_o_proj(o)
 
     def forward_impl_server_mode(
         self,
@@ -582,8 +582,8 @@ class MLAAttention(nn.Module):
         if forward_context.context.is_dummy_run:
             # dummy run: skip real attention and return
             output_shape = list(q.shape)
-            output_shape[-1] = self.num_heads * self.v_head_dim
             atom_config = get_current_atom_config()
+            output_shape[-1] = atom_config.hf_config.hidden_size
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output

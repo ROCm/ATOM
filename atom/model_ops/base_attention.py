@@ -218,7 +218,7 @@ def unified_attention_with_output_base(
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
-        output = self.impl.forward(
+        return self.impl.forward(
             layer=self,
             query=q,
             k_nope=k,
@@ -226,7 +226,6 @@ def unified_attention_with_output_base(
             positions=positions,
             q_scale=q_scale,
         )
-        return self.impl.o_proj(output)
     else:
         return self.impl.forward(
             layer=self,
