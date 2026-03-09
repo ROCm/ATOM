@@ -9,7 +9,12 @@ EXTRA_ARGS=("${@:3}")
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
-  python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${EXTRA_ARGS[@]}" &
+  PROFILER_ARGS=""
+  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
+    PROFILER_ARGS="--torch-profiler-dir /app/trace"
+    echo "Torch profiler enabled, trace output: /app/trace"
+  fi
+  python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" &
   atom_server_pid=$!
 
   echo ""
@@ -58,6 +63,10 @@ if [ "$TYPE" == "benchmark" ]; then
   echo "========== Cloning bench_serving =========="
   git clone https://github.com/kimbochen/bench_serving.git && chmod +x bench_serving/benchmark_serving.py
   echo "========== Running benchmark test =========="
+  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
+    echo "Starting torch profiler..."
+    curl -s -S -X POST http://127.0.0.1:8000/start_profile || echo "Warning: failed to start profiler"
+  fi
   python bench_serving/benchmark_serving.py \
     --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
     --dataset-name=random \
@@ -68,6 +77,26 @@ if [ "$TYPE" == "benchmark" ]; then
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
     --result-dir=. --result-filename=${RESULT_FILENAME}.json
+
+  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
+    echo "Stopping torch profiler..."
+    curl -s -S -X POST http://127.0.0.1:8000/stop_profile || echo "Warning: failed to stop profiler"
+    echo "Waiting for profiler traces to be written to /app/trace ..."
+    for i in $(seq 1 60); do
+      trace_files=$(find /app/trace -name "*.json" -o -name "*.json.gz" 2>/dev/null | head -1)
+      if [ -n "$trace_files" ]; then
+        echo "Profiler trace files found after ${i}s"
+        ls -lhR /app/trace/
+        break
+      fi
+      echo "Waiting for trace files... ($i/60)"
+      sleep 1
+    done
+    if [ -z "$trace_files" ]; then
+      echo "Warning: no profiler trace files found after 60s"
+      ls -lhR /app/trace/ 2>/dev/null || true
+    fi
+  fi
 
   # Inject ISL/OSL into result JSON for summary table
   if [ -f "${RESULT_FILENAME}.json" ]; then

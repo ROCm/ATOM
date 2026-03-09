@@ -21,6 +21,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 import uvicorn
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -904,9 +905,7 @@ def main():
     args = parser.parse_args()
 
     logger.info(f"Loading tokenizer from {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model, trust_remote_code=args.trust_remote_code
-    )
+    tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
     model_name = args.model
 
     logger.info(f"Initializing engine with model {args.model}...")
