@@ -81,7 +81,21 @@ if [ "$TYPE" == "benchmark" ]; then
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
     echo "Stopping torch profiler..."
     curl -s -S -X POST http://127.0.0.1:8000/stop_profile || echo "Warning: failed to stop profiler"
-    echo "Profiler traces should be saved to /app/trace"
+    echo "Waiting for profiler traces to be written to /app/trace ..."
+    for i in $(seq 1 60); do
+      trace_files=$(find /app/trace -name "*.json" -o -name "*.json.gz" 2>/dev/null | head -1)
+      if [ -n "$trace_files" ]; then
+        echo "Profiler trace files found after ${i}s"
+        ls -lhR /app/trace/
+        break
+      fi
+      echo "Waiting for trace files... ($i/60)"
+      sleep 1
+    done
+    if [ -z "$trace_files" ]; then
+      echo "Warning: no profiler trace files found after 60s"
+      ls -lhR /app/trace/ 2>/dev/null || true
+    fi
   fi
 
   # Inject ISL/OSL into result JSON for summary table
