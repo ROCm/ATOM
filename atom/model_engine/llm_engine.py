@@ -16,6 +16,19 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 logger = logging.getLogger("atom")
 
 
+def _load_tokenizer(model: str, trust_remote_code: bool = False):
+    tokenizer = AutoTokenizer.from_pretrained(
+        model, use_fast=True, trust_remote_code=trust_remote_code
+    )
+    probe = "Hello world 你好"
+    if tokenizer.decode(tokenizer.encode(probe), skip_special_tokens=True) != probe:
+        logger.warning(
+            "AutoTokenizer round-trip failed, falling back to PreTrainedTokenizerFast"
+        )
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(model)
+    return tokenizer
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -23,15 +36,7 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         config = Config(model, **config_kwargs)
-        try:
-            self.tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
-        except Exception:
-            logger.warning(
-                "Fast tokenizer not available, falling back to old version AutoTokenizer"
-            )
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                config.model, use_fast=True, trust_remote_code=config.trust_remote_code
-            )
+        self.tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
         config.bos_token_id = self.tokenizer.bos_token_id
         config.eos_token_id = self.tokenizer.eos_token_id
         stop_token_ids = set(config.stop_token_ids)
