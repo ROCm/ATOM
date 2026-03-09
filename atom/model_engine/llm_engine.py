@@ -11,7 +11,7 @@ from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 logger = logging.getLogger("atom")
 
@@ -23,9 +23,15 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         config = Config(model, **config_kwargs)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.model, use_fast=True, trust_remote_code=config.trust_remote_code
-        )
+        try:
+            self.tokenizer = PreTrainedTokenizerFast.from_pretrained(config.model)
+        except Exception:
+            logger.warning(
+                "Fast tokenizer not available, falling back to old version AutoTokenizer"
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                config.model, use_fast=True, trust_remote_code=config.trust_remote_code
+            )
         config.bos_token_id = self.tokenizer.bos_token_id
         config.eos_token_id = self.tokenizer.eos_token_id
         stop_token_ids = set(config.stop_token_ids)
