@@ -80,11 +80,11 @@ jobs:
       - name: Build Docker image 
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
-          docker build --network=host \
+          docker build --pull --network=host \
             --no-cache \
             -t atom_test:ci \
             -f Dockerfile.mod .
-          
+
       - name: Push Docker image
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
@@ -260,7 +260,7 @@ jobs:
       - name: Build Docker image for forked repo
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && github.event.pull_request.head.repo.fork
         run: |
-          docker build --network=host \
+          docker build --pull --network=host \
             --no-cache \
             -t atom_test:ci \
             -f Dockerfile.mod .
