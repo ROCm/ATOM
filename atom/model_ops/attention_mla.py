@@ -442,7 +442,11 @@ class MLAAttention(nn.Module):
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
 
         o = torch.empty(
-            B, self.padded_num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
+            B,
+            self.padded_num_heads,
+            self.kv_lora_rank,
+            dtype=self.dtype,
+            device=q.device,
         )
 
         paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
@@ -516,7 +520,11 @@ class MLAAttention(nn.Module):
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
 
         o = torch.empty(
-            B, self.padded_num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
+            B,
+            self.padded_num_heads,
+            self.kv_lora_rank,
+            dtype=self.dtype,
+            device=q.device,
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)

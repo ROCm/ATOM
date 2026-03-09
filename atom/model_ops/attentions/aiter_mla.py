@@ -50,9 +50,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.num_attention_heads = (
             hf_config.num_attention_heads // get_tp_group().world_size
         )
-        self.padded_num_attention_heads = max(
-            self.num_attention_heads, _MLA_MIN_HEADS
-        )
+        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
 
