@@ -47,7 +47,7 @@ html_theme_options = {
     "titles_only": False,
 }
 
-html_logo = "atom_logo.png"
+html_logo = "assets/atom_logo.png"
 html_favicon = None
 
 # -- Extension configuration -------------------------------------------------
