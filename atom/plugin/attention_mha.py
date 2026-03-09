@@ -75,7 +75,7 @@ class PagedAttentionImplPluginModeMethods:
             # ATOM: [num_blocks, num_kv_heads, head_size, block_size],
             # vLLM: [num_blocks, num_kv_heads, block_size // x, head_size, x],
             v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, head_size, block_size],
+                [num_blocks, num_kv_heads, block_size // x, head_size, x],
                 dtype=v_cache.dtype,
                 device="meta",
             )
@@ -673,7 +673,7 @@ class PagedAttentionImplPluginModeMethods:
                 device="meta",
             )
             v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, head_size, block_size],
+                [num_blocks, num_kv_heads, block_size // x, head_size, x],
                 dtype=v_cache.dtype,
                 device="meta",
             )
