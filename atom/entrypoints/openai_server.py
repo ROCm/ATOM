@@ -25,7 +25,7 @@ from atom.model_engine.request import RequestOutput
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -901,9 +901,13 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading tokenizer from {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model, trust_remote_code=args.trust_remote_code
-    )
+    try:
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(args.model)
+    except Exception:
+        logger.warning("Fast tokenizer not available, falling back to AutoTokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=args.trust_remote_code
+        )
     model_name = args.model
 
     print(f"Initializing engine with model {args.model}...")
