@@ -25,6 +25,10 @@ on:
         description: "Image to use for the benchmark"
         type: string
         default: "rocm/atom-dev:latest"
+      enable_profiler:
+        description: "Enable torch profiler to collect trace for performance debugging"
+        type: boolean
+        default: false
       param_lists:
         description: |
           "Benchmark parameter lists. 
@@ -150,6 +154,7 @@ jobs:
           -e OSL=${{ env.OSL }} \
           -e CONC=${{ env.CONC }} \
           -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
+          -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
@@ -183,11 +188,24 @@ jobs:
           fi
           # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
             echo '========== Running benchmark test =========='
-            RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
             ls -all .
           "
+
+      - name: Copy profiler traces from container
+        if: ${{ inputs.enable_profiler }}
+        run: |
+          docker cp atom-benchmark:/app/trace ./profiler-traces || echo "No profiler traces found"
+          ls -la ./profiler-traces/ 2>/dev/null || true
+
+      - name: Upload profiler traces
+        if: ${{ inputs.enable_profiler }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiler-traces-deepseek-r1-0528-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}
+          path: profiler-traces/
 
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4
@@ -282,6 +300,7 @@ jobs:
           -e CONC=${{ env.CONC }} \
           -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
           -e ATOM_GPT_OSS_MODEL=1 \
+          -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
@@ -315,12 +334,25 @@ jobs:
           fi
           # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
             echo '========== Running benchmark test =========='
-            RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
             ls -all .
           "
-      
+
+      - name: Copy profiler traces from container
+        if: ${{ inputs.enable_profiler }}
+        run: |
+          docker cp atom-benchmark:/app/trace ./profiler-traces || echo "No profiler traces found"
+          ls -la ./profiler-traces/ 2>/dev/null || true
+
+      - name: Upload profiler traces
+        if: ${{ inputs.enable_profiler }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiler-traces-gpt-oss-120b-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}
+          path: profiler-traces/
+
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4
         with:
