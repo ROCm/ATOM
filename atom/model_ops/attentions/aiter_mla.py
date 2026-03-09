@@ -9,7 +9,7 @@ import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -50,6 +50,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.num_attention_heads = (
             hf_config.num_attention_heads // get_tp_group().world_size
         )
+        self.padded_num_attention_heads = max(
+            self.num_attention_heads, _MLA_MIN_HEADS
+        )
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
 
@@ -63,7 +66,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ) = get_mla_metadata_info_v1(
             self.max_bs,
             1,
-            self.num_attention_heads,
+            self.padded_num_attention_heads,
             torch.bfloat16,
             dtypes.d_dtypes[config.kv_cache_dtype],
             is_sparse=self.is_sparse,
@@ -150,7 +153,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 else var["kv_indptr"].gpu[: bs + 1]
             ),
             var["kv_last_page_lens"].gpu[:bs],
-            self.num_attention_heads,
+            self.padded_num_attention_heads,
             1,  # nhead_kv,
             True,
             work_meta_data,

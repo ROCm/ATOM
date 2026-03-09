@@ -39,6 +39,8 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 
 logger = logging.getLogger("atom")
 
+_MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+
 if use_triton_gemm():
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
@@ -112,6 +114,18 @@ class MLAAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype if kv_cache_dtype == "fp8" else "auto"
         self.dtype = dtype
+
+        self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
+        self.head_repeat_factor = self.padded_num_heads // num_heads
+        if self.head_repeat_factor > 1:
+            assert self.padded_num_heads % num_heads == 0, (
+                f"Padded head count ({self.padded_num_heads}) must be divisible "
+                f"by num_heads ({num_heads}) for head repeat"
+            )
+            logger.info(
+                f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
+                f"(repeat factor {self.head_repeat_factor})"
+            )
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -424,8 +438,11 @@ class MLAAttention(nn.Module):
         assert attn_metadata is not None
         B = q.shape[0]
 
+        if self.head_repeat_factor > 1:
+            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+
         o = torch.empty(
-            B, self.num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
+            B, self.padded_num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
         )
 
         paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
@@ -480,6 +497,9 @@ class MLAAttention(nn.Module):
                     None,
                 )
 
+        if self.head_repeat_factor > 1:
+            o = o[:, :: self.head_repeat_factor, :].contiguous()
+
         return self._v_up_proj_and_o_proj(o)
 
     def _forward_decode(
@@ -492,8 +512,11 @@ class MLAAttention(nn.Module):
         assert attn_metadata is not None
         B = q.shape[0]
 
+        if self.head_repeat_factor > 1:
+            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+
         o = torch.empty(
-            B, self.num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
+            B, self.padded_num_heads, self.kv_lora_rank, dtype=self.dtype, device=q.device
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -555,6 +578,9 @@ class MLAAttention(nn.Module):
             kv_scale=self._k_scale,
         )
 
+        if self.head_repeat_factor > 1:
+            o = o[:, :: self.head_repeat_factor, :].contiguous()
+
         return self._v_up_proj_and_o_proj(o)
 
     def forward(
@@ -575,7 +601,6 @@ class MLAAttention(nn.Module):
             and attn_metadata.max_seqlen_k > self.topk_indices_buffer.shape[1]
         )
         if forward_context.context.is_dummy_run:
-            # dummy run: skip real attention and return
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
             output_shape[-1] = atom_config.hf_config.hidden_size
