@@ -78,15 +78,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ) = get_mla_metadata_info_v1(
             self.max_bs,
             1,
-<<<<<<< zlr/glm5
-            self.padded_num_attention_heads,
-            torch.bfloat16,
-            dtypes.d_dtypes[config.kv_cache_dtype],
-=======
             self.num_attention_heads,
             self.dtype_q,
             self.dtype_kv,
->>>>>>> main
             is_sparse=self.is_sparse,
             fast_mode=True,
         )
@@ -169,28 +163,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
-<<<<<<< zlr/glm5
-        get_mla_metadata_v1(
-            var["cu_seqlens_q"].gpu[: bs + 1],
-            (
-                var["sparse_kv_indptr"].gpu[: bs + 1]
-                if self.is_sparse
-                else var["kv_indptr"].gpu[: bs + 1]
-            ),
-            var["kv_last_page_lens"].gpu[:bs],
-            self.padded_num_attention_heads,
-            1,  # nhead_kv,
-            True,
-            work_meta_data,
-            work_info_set,
-            work_indptr,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            page_size=self.block_size,
-            **split_params,
-        )
-=======
         if only_update:
             decode_update_mla_metadata_v1(
                 var["cu_seqlens_q"].gpu[: bs + 1],
@@ -239,7 +211,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype_kv=self.dtype_kv,
                 **split_params,
             )
->>>>>>> main
         return {
             "work_meta_data": work_meta_data,
             "work_info_set": work_info_set,
