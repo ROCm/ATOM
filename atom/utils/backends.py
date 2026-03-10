@@ -201,8 +201,7 @@ class CompilerManager:
         assert compiled_graph is not None, "Failed to compile the graph"
 
         # store the artifact in the cache
-        # if not envs.VLLM_DISABLE_COMPILE_CACHE and handle is not None:
-        if True and handle is not None:
+        if handle is not None:
             self.cache[(runtime_shape, graph_index, self.compiler.name)] = handle
             compilation_counter.num_cache_entries_updated += 1
             self.is_cache_updated = True
@@ -228,6 +227,34 @@ class CompilerManager:
                     str(runtime_shape),
                     self.compiler.name,
                     handle,
+                )
+
+        # When mark-trace is enabled, post-processing may rewrite generated
+        # artifact sources. Force reloading from cache artifact so the current
+        # process uses the rewritten artifact immediately.
+        try:
+            from atom.utils.graph_marker import is_graph_marker_enabled
+
+            force_reload = is_graph_marker_enabled()
+        except Exception:
+            force_reload = False
+        if force_reload and handle is not None and not self.disable_cache:
+            try:
+                reloaded_graph = self.load(
+                    graph, example_inputs, graph_index, runtime_shape
+                )
+                if reloaded_graph is not None:
+                    compiled_graph = reloaded_graph
+                    logger.info(
+                        "Force reloaded compiled graph from cache artifact "
+                        "(graph_index=%s, runtime_shape=%s).",
+                        graph_index,
+                        runtime_shape,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to force reload compiled graph from cache artifact; "
+                    "falling back to in-memory compiled callable."
                 )
 
         # after compiling the last graph, record the end time
@@ -555,9 +582,9 @@ class VllmBackend:
             hash_content = []
             for filepath in forward_code_files:
                 hash_content.append(filepath)
-                if filepath == "<string>":
+                if filepath == "<string>" or filepath == "<frozen os>":
                     # This means the function was dynamically generated, with
-                    # e.g. exec(). We can't actually check these.
+                    # e.g. exec() or frozen os module. We can't actually check these.
                     continue
                 with open(filepath) as f:
                     hash_content.append(f.read())
@@ -596,7 +623,6 @@ class VllmBackend:
         os.makedirs(local_cache_dir, exist_ok=True)
         self.compilation_config.local_cache_dir = local_cache_dir
 
-        # disable_cache = envs.VLLM_DISABLE_COMPILE_CACHE
         disable_cache = False
 
         if disable_cache:

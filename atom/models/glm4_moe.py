@@ -621,17 +621,6 @@ class Glm4MoeForCausalLM(nn.Module, Glm4MixtureOfExperts):
                     return layer_idx + i
         return None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # load weights in plugin mode and discard passed weights generator
-        # here prefix is "model." because Glm4MoeForCausalLM is constructed in model
-        # wrapper class, so the name of loaded weights are prefixed with "model.".
-        # The vLLM will check the name of the loaded weights to make sure all the
-        # weights are loaded correctly
-        loaded_weights_record = load_model_in_plugin_mode(
-            model=self, config=self.atom_config, prefix="model."
-        )
-        return loaded_weights_record
-
 
 def get_spec_layer_idx_from_weight_name(
     config: Glm4MoeConfig, weight_name: str

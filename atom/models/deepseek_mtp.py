@@ -13,7 +13,7 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
 
-# from atom.utils.decorators import support_torch_compile
+from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from .deepseek_v2 import DeepseekV2DecoderLayer
@@ -56,7 +56,8 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         )
 
         quant_config = atom_config.quant_config
-        if quant_config["quant_dtype"] == dtypes.fp4x2:
+        layer_quant_config = quant_config.get_layer_quant_config(prefix)
+        if layer_quant_config["quant_dtype"] == dtypes.fp4x2:
             quant_config = QuantizationConfig()
 
         self.mtp_block = DeepseekV2DecoderLayer(
@@ -150,7 +151,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         return logits
 
 
-# @support_torch_compile
+@support_torch_compile
 class DeepSeekMTP(nn.Module):
 
     def __init__(self, atom_config: Config, prefix: str = ""):

@@ -8,7 +8,7 @@ from torch.overrides import (
     has_torch_function_unary,
     handle_torch_function,
 )
-from atom.config import QuantizationConfig
+from atom.config import QuantizationConfig, LayerQuantConfig
 from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
@@ -187,10 +187,13 @@ class RMSNorm(nn.Module):
         self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
 
-        if quant_config is None:
-            quant_config = QuantizationConfig()
-        quant_type = quant_config["quant_type"]
-        params_dtype = quant_config["quant_dtype"]
+        layer_quant_config = (
+            LayerQuantConfig()
+            if quant_config is None
+            else quant_config.global_quant_config
+        )
+        quant_type = layer_quant_config["quant_type"]
+        params_dtype = layer_quant_config["quant_dtype"]
         self.quant_type = quant_type
         self.params_dtype = params_dtype
 

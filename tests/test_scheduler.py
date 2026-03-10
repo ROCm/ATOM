@@ -129,7 +129,13 @@ class TestPrefixCaching:
         seq1.append_token(2)  # EOS
         sched.postprocess(
             list(sched.running),
-            ScheduledBatchOutput(token_ids={seq1.id: (2,)}, draft_token_ids=None),
+            ScheduledBatchOutput(
+                req_ids=[seq1.id],
+                token_ids=[(2,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
         )
 
         # Second request shares the same prefix, differs in last block
@@ -155,7 +161,13 @@ class TestPrefixCaching:
         seq1.append_token(2)  # EOS
         sched.postprocess(
             list(sched.running),
-            ScheduledBatchOutput(token_ids={seq1.id: (2,)}, draft_token_ids=None),
+            ScheduledBatchOutput(
+                req_ids=[seq1.id],
+                token_ids=[(2,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
         )
 
         seq2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 10, 11])
@@ -163,7 +175,9 @@ class TestPrefixCaching:
         batch2, _ = sched.schedule()
 
         # scheduled_tokens should be the last num_new_tokens of token_ids
-        assert batch2.scheduled_tokens == [[10, 11]]
+        import numpy as np
+
+        np.testing.assert_array_equal(batch2.scheduled_tokens, [10, 11])
 
     def test_no_prefix_cache_full_tokens_scheduled(self, seq_factory):
         """Without prefix caching, all tokens should be scheduled."""
@@ -182,7 +196,13 @@ class TestPrefixCaching:
         seq1.append_token(2)  # EOS
         sched.postprocess(
             list(sched.running),
-            ScheduledBatchOutput(token_ids={seq1.id: (2,)}, draft_token_ids=None),
+            ScheduledBatchOutput(
+                req_ids=[seq1.id],
+                token_ids=[(2,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
         )
 
         seq2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 10, 11])
@@ -218,7 +238,11 @@ class TestPostprocess:
 
     def _output(self, seq_id, tokens):
         return ScheduledBatchOutput(
-            token_ids={seq_id: tuple(tokens)}, draft_token_ids=None
+            req_ids=[seq_id],
+            token_ids=[tuple(tokens)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
         )
 
     def test_appends_token(self, scheduler, seq_factory):
@@ -263,7 +287,13 @@ class TestPostprocess:
         sched.schedule()
         finished = sched.postprocess(
             list(sched.running),
-            ScheduledBatchOutput(token_ids={seq.id: (99,)}, draft_token_ids=None),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(99,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
         )
         assert len(finished) == 1
         assert "stop_99" in finished[0].leave_reason
