@@ -57,7 +57,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
-
+        self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
+        self.dtype_q = self.dtype_kv
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -69,8 +70,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.max_bs,
             1,
             self.num_attention_heads,
-            torch.bfloat16,
-            dtypes.d_dtypes[config.kv_cache_dtype],
+            self.dtype_q,
+            self.dtype_kv,
             is_sparse=self.is_sparse,
             fast_mode=True,
         )
@@ -174,8 +175,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 page_size=self.block_size,
                 kv_granularity=max(self.block_size, 16),
                 max_seqlen_qo=max_q_len,
-                dtype_q=torch.bfloat16,
-                dtype_kv=dtypes.d_dtypes[self.model_runner.config.kv_cache_dtype],
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
                 num_reject_tokens=num_reject_tokens,
             )
         else:
@@ -197,6 +198,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 reduce_final_map,
                 reduce_partial_map,
                 page_size=self.block_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
                 **split_params,
             )
         return {
