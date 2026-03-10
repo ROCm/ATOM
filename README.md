@@ -69,6 +69,8 @@ git clone https://github.com/ROCm/ATOM.git; pip install ./ATOM
 
 ## 📚 Documentation
 
+**Full documentation: [rocm.github.io/ATOM](https://rocm.github.io/ATOM)**
+
 | **Topic** | **Description** | **Guide** |
 |---|---|---|
 | Architecture | System overview, request lifecycle, component design | [Architecture Guide](docs/architecture_guide.md) |

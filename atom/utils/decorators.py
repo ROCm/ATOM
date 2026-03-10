@@ -5,6 +5,7 @@ from typing import Callable, Optional, TypeVar, Union
 import inspect
 import os
 import sys
+from functools import wraps
 from types import CodeType
 from abc import abstractmethod
 from contextlib import contextmanager
@@ -17,12 +18,151 @@ import time
 
 from atom.config import CompilationConfig, Config, CompilationLevel
 
+from atom.utils.graph_marker import graph_marker
+
 # from atom.utils import start_monitoring_torch_compile
 
 _T = TypeVar("_T", bound=type[nn.Module])
 
 context_manager = None
 torch_compile_start_time: float = 0.0
+
+
+def record_function(prefix: Union[str, Callable, None] = None):
+    """
+    Decorator that wraps a function with torch.profiler.record_function.
+
+    Usage:
+    - @record_function
+    - @record_function("my_prefix")
+    """
+
+    def _decorate(func: Callable):
+        # Try to recover the original callable signature even when func is wrapped
+        # by other decorators.
+        base_func = inspect.unwrap(func)
+        try:
+            base_sig = inspect.signature(base_func)
+        except (TypeError, ValueError):
+            base_sig = None
+
+        @wraps(func)
+        def _wrapped(*args, **kwargs):
+            # Keep this decorator no-op unless mark-trace is enabled.
+            from atom.utils.graph_marker import is_graph_marker_enabled
+
+            if not is_graph_marker_enabled():
+                return func(*args, **kwargs)
+
+            # Priority:
+            # 1) explicit decorator prefix: @record_function("xxx")
+            # 2) runtime function argument named "prefix" when non-empty
+            # 3) function name fallback
+            if prefix is not None:
+                span_name = str(prefix)
+            else:
+                span_name = func.__name__
+                runtime_prefix = kwargs.get("prefix")
+                if not (isinstance(runtime_prefix, str) and runtime_prefix):
+                    if base_sig is not None:
+                        try:
+                            bound = base_sig.bind_partial(*args, **kwargs)
+                            runtime_prefix = bound.arguments.get("prefix")
+                        except Exception:
+                            runtime_prefix = None
+                if isinstance(runtime_prefix, str) and runtime_prefix:
+                    span_name = runtime_prefix
+
+            with torch.profiler.record_function(f"{span_name}"):
+                return func(*args, **kwargs)
+
+        return _wrapped
+
+    # Support @record_function without parentheses.
+    if callable(prefix):
+        func = prefix
+        prefix = None
+        return _decorate(func)
+    return _decorate
+
+
+def _graph_marker_first_tensor(obj, name: str):
+    if torch.is_tensor(obj):
+        return graph_marker(obj, name=name), True
+    if isinstance(obj, tuple):
+        out = []
+        marked_any = False
+        for v in obj:
+            if marked_any:
+                out.append(v)
+                continue
+            vv, marked_any = _graph_marker_first_tensor(v, name)
+            out.append(vv)
+        out_t = tuple(out)
+        # namedtuple support
+        if hasattr(obj, "_fields"):
+            return obj.__class__(*out_t), marked_any
+        return out_t, marked_any
+    if isinstance(obj, list):
+        out = []
+        marked_any = False
+        for v in obj:
+            if marked_any:
+                out.append(v)
+                continue
+            vv, marked_any = _graph_marker_first_tensor(v, name)
+            out.append(vv)
+        return out, marked_any
+    if isinstance(obj, dict):
+        out = {}
+        marked_any = False
+        for k, v in obj.items():
+            if marked_any:
+                out[k] = v
+                continue
+            vv, marked_any = _graph_marker_first_tensor(v, name)
+            out[k] = vv
+        return out, marked_any
+    return obj, False
+
+
+def mark_trace(cls):
+    forward = getattr(cls, "forward", None)
+    if forward is None:
+        return cls
+    if getattr(forward, "__mark_trace_wrapped__", False):
+        return cls
+
+    from atom.utils.graph_marker import is_graph_marker_enabled
+
+    def wrapped_forward(self, *args, **kwargs):
+        # When mark-trace is disabled, bypass all wrapping logic entirely
+        if not is_graph_marker_enabled():
+            return forward(self, *args, **kwargs)
+
+        prefix = getattr(self, "prefix", cls.__name__)
+        # Mark only the first tensor across args/kwargs, keeping names stable.
+        args_l = list(args)
+        marked = False
+        for i, a in enumerate(args_l):
+            if marked:
+                break
+            aa, marked = _graph_marker_first_tensor(a, f"{prefix}_start")
+            args_l[i] = aa
+        if not marked:
+            for k, v in list(kwargs.items()):
+                if marked:
+                    break
+                vv, marked = _graph_marker_first_tensor(v, f"{prefix}_start")
+                kwargs[k] = vv
+        args = tuple(args_l)
+        y = forward(self, *args, **kwargs)
+        yy, _ = _graph_marker_first_tensor(y, f"{prefix}_end")
+        return yy
+
+    wrapped_forward.__mark_trace_wrapped__ = True
+    cls.forward = wrapped_forward
+    return cls
 
 
 # We remove it from utils/__init__.py to avoid circular import

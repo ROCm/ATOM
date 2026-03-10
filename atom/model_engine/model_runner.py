@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import time
+from contextlib import nullcontext
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -19,7 +20,9 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
+from torch.profiler import record_function
 from atom.config import Config, KVCacheTensor, set_current_atom_config
+from atom.utils import envs
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
@@ -175,57 +178,59 @@ class tokenIDProcessor:
             None  # Mapped to current batch order
         )
 
-    def _process_token_id(self, token_id) -> tuple[int, ...]:
-        """Helper function: process a single token_id, handling list and non-list cases.
-
-        Optimized: eliminates double traversal (removed 'in' check before 'index').
-        Returns tuple for better performance and immutability.
-        """
-        if isinstance(token_id, list):
-            try:
-                idx = token_id.index(-1)
-                return tuple(token_id[:idx])
-            except ValueError:
-                # No -1 found, return the entire list as tuple
-                return tuple(token_id)
-        else:
-            return (token_id,)
+    @staticmethod
+    def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
+        """Batch process token_ids: vectorized -1 truncation using numpy."""
+        arr = np.array(token_ids, dtype=np.int64)
+        mask = arr == -1
+        if not mask.any():
+            # No -1 sentinel in any row, convert each row to tuple directly
+            return [tuple(row) for row in arr.tolist()]
+        # Per-row: find first -1, truncate
+        # Use argmax on mask; rows without -1 get 0, disambiguate with ~mask.any(axis=1)
+        has_sentinel = mask.any(axis=1)
+        first_neg = mask.argmax(axis=1)
+        result = []
+        rows = arr.tolist()
+        for i, row in enumerate(rows):
+            if has_sentinel[i]:
+                result.append(tuple(row[: first_neg[i]]))
+            else:
+                result.append(tuple(row))
+        return result
 
     def prepare_sampled_ids(
         self,
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-    ) -> dict[int, tuple[int, ...]]:
+    ) -> tuple[list[int], list[tuple[int, ...]]]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
-            ret = {
-                seq_id: self._process_token_id(token_id)
-                for seq_id, token_id in zip(req_ids, token_ids)
-            }
-            ret[-1] = 0  # is_deferred_out flag
-            return ret
+            if token_ids and isinstance(token_ids[0], list):
+                processed = self._batch_process_token_ids(token_ids)
+            else:
+                processed = [(tid,) for tid in token_ids]
+            return req_ids, processed
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
         self.send_to_cpu_async(sampled_token_ids, self.token_ids_cpu, sync_event)
-        token_id_dict = {}
+        req_ids_out: list[int] = []
+        processed_out: list[tuple[int, ...]] = []
         self.prev_req_ids = None
         if self.prev_batch is not None:
             self.prev_req_ids = self.prev_batch.req_ids
-            token_id_dict = {
-                seq_id: self._process_token_id(token_id)
-                for seq_id, token_id in zip(self.prev_req_ids, token_ids)
-            }
-        else:
-            # first time, no previous tokens
-            token_ids = {}
+            req_ids_out = self.prev_req_ids
+            if token_ids and isinstance(token_ids[0], list):
+                processed_out = self._batch_process_token_ids(token_ids)
+            else:
+                processed_out = [(tid,) for tid in token_ids]
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
-        token_id_dict[-1] = 1
 
-        return token_id_dict
+        return req_ids_out, processed_out
 
     def get_token_locations(
         self, batch: ScheduledBatch
@@ -462,6 +467,10 @@ class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
         self.config = config
+        self.mark_trace = getattr(config, "mark_trace", False)
+        from atom.utils.graph_marker import set_graph_marker_enabled
+
+        set_graph_marker_enabled(self.mark_trace)
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
@@ -563,6 +572,11 @@ class ModelRunner:
         )
 
         model_class = resolve_obj_by_qualname(support_model_arch_dict[hf_config.architectures[0]])  # type: ignore
+        # The model construction depends on quant_config,
+        # so we must complete the remapping for layers before constructing the model.
+        config.quant_config.remap_layer_name(
+            config.hf_config, getattr(model_class, "packed_modules_mapping", {})
+        )
         self.model = model_class(config)
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)
@@ -573,7 +587,9 @@ class ModelRunner:
             self.drafter.load_model(self.model)
         torch.set_default_device(self.device)
         self.allocate_forward_vars()
-        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(self)
+        self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
+            model_runner=self
+        )
         self.physical_block_size = self.attn_metadata_builder.block_size
         self.forward_done_event = torch.cuda.Event()
         self.warmup_model()
@@ -584,6 +600,10 @@ class ModelRunner:
 
         if self.config.compilation_config.level == 1:
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
+            if hasattr(self, "drafter"):
+                self.drafter.model = torch.compile(
+                    self.drafter.model, fullgraph=True, backend="eager"
+                )
 
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -610,29 +630,6 @@ class ModelRunner:
         elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
             return True
         return False
-
-    def get_mtp_statistics(self) -> dict:
-        if hasattr(self, "mtp_total_draft_tokens"):
-            acceptance_rate = (
-                self.mtp_total_accepted_tokens / self.mtp_total_draft_tokens
-                if self.mtp_total_draft_tokens > 0
-                else 0.0
-            )
-            return {
-                "total_draft_tokens": self.mtp_total_draft_tokens,
-                "total_accepted_tokens": self.mtp_total_accepted_tokens,
-                "acceptance_rate": acceptance_rate,
-            }
-        return {
-            "total_draft_tokens": 0,
-            "total_accepted_tokens": 0,
-            "acceptance_rate": 0.0,
-        }
-
-    def reset_mtp_statistics(self):
-        if hasattr(self, "mtp_total_draft_tokens"):
-            self.mtp_total_draft_tokens = 0
-            self.mtp_total_accepted_tokens = 0
 
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
@@ -668,9 +665,27 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
+        #    Must happen while ops module is still alive for CustomAllreduce cleanup.
+        destroy_dist_env()
+        # 2. Release CUDA graphs
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
-        destroy_dist_env()
+        # 3. Release GPU tensors
+        for attr in (
+            "kv_cache",
+            "kv_scale",
+            "index_cache",
+            "mamba_k_cache",
+            "mamba_v_cache",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        if hasattr(self, "model"):
+            del self.model
+        if hasattr(self, "drafter"):
+            del self.drafter
+        torch.cuda.empty_cache()
         return True
 
     def start_profiler(self):
@@ -682,7 +697,7 @@ class ModelRunner:
         - Set to "0" or unset to disable these features (default).
         """
         if self.profiler_dir is not None and self.profiler is None:
-            enable_detailed_profiling = os.environ.get("ATOM_PROFILER_MORE", "0") == "1"
+            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
             self.profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,
@@ -696,6 +711,7 @@ class ModelRunner:
                 ),
             )
             self.profiler.__enter__()
+        return True
 
     def stop_profiler(self):
         """Stop profiling for this rank"""
@@ -865,31 +881,40 @@ class ModelRunner:
                 self.max_bs, **i32_kwargs
             )
 
-    def get_num_blocks(self):
-        torch.set_default_device(self.device)
-        config = self.config
-        hf_config = config.hf_config
-        if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
-            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        planned = int(total * config.gpu_memory_utilization)
-        torch.set_default_device("cpu")
+    def _get_num_kv_heads(self):
+        """Return the per-rank number of KV heads."""
+        hf_config = self.config.hf_config
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+            return hf_config.num_key_value_heads // self.world_size
         else:
             assert self.world_size % hf_config.num_key_value_heads == 0
-            num_kv_heads = 1
+            return 1
+
+    def _get_total_num_layers(self):
+        """Return total layer count including draft (MTP) layers."""
+        total = self.config.hf_config.num_hidden_layers
+        if self.config.speculative_config and hasattr(self, "drafter"):
+            draft_hf = self.config.speculative_config.draft_model_hf_config
+            total += getattr(draft_hf, "num_nextn_predict_layers", 1)
+        return total
+
+    def _compute_block_bytes(self):
+        """Compute the TRUE per-block memory cost including all tensors.
+
+        This must match exactly what allocate_kv_cache() allocates.
+        Includes: kv_cache tensor + kv_scale tensor + draft model layers.
+        """
+        config = self.config
+        hf_config = config.hf_config
+        num_kv_heads = self._get_num_kv_heads()
+        total_num_layers = self._get_total_num_layers()
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
         if self.use_mla:
-            block_bytes = (
-                hf_config.num_hidden_layers
-                * self.block_size
-                * 576
-                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-            )
+            # MLA: shape [total_layers, blocks, block_size, 576]
+            # No kv_scale for MLA
+            block_bytes = total_num_layers * self.block_size * 576 * kv_dtype_size
             if self.is_deepseek_v32:
                 index_dim = hf_config.index_head_dim + 4
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
@@ -905,15 +930,26 @@ class ModelRunner:
                 hf_config.num_hidden_layers // self.full_attention_interval
             )
             self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
+            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
+            full_attn_layers = self.num_full_attn + num_draft_layers
 
-            # full attention bytes
+            # full attention kv_cache bytes
             block_bytes = (
                 2
-                * hf_config.num_hidden_layers
+                * full_attn_layers
                 * self.physical_block_size
                 * num_kv_heads
                 * hf_config.head_dim
-                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+                * kv_dtype_size
+            )
+
+            # kv_scale for full attention: [2, full_attn_layers, blocks, kv_heads, phys_block_size] float32
+            block_bytes += (
+                2
+                * full_attn_layers
+                * num_kv_heads
+                * self.physical_block_size
+                * 4  # float32
             )
 
             # gdn attn bytes
@@ -926,35 +962,115 @@ class ModelRunner:
                 hf_config.linear_conv_kernel_dim,
                 self.num_spec_tokens,
             )
-
             one_layer_byte = (
-                sum(math.prod(subtuple) for subtuple in mamba_shape)
-                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+                sum(math.prod(subtuple) for subtuple in mamba_shape) * kv_dtype_size
             )
-            block_bytes = block_bytes + self.num_gdn_attn_state * one_layer_byte
+            block_bytes += self.num_gdn_attn_state * one_layer_byte
         else:
+            # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
+            # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
+            # the standard path (draft layers use separate binding).
             block_bytes = (
                 2
                 * hf_config.num_hidden_layers
                 * self.block_size
                 * num_kv_heads
                 * hf_config.head_dim
-                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+                * kv_dtype_size
             )
-        available_for_kv = min((planned - max(peak, current)), free)
+            # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
+            block_bytes += (
+                2
+                * hf_config.num_hidden_layers
+                * num_kv_heads
+                * self.physical_block_size
+                * 4  # float32
+            )
+        return block_bytes
+
+    def _estimate_cudagraph_overhead(self):
+        """Estimate GPU memory consumed by CUDA graph capture.
+
+        CUDA graphs allocate a shared memory pool for intermediate activations.
+        The pool size is roughly the peak activation memory during a single
+        forward pass. We estimate this from the gap between warmup peak and
+        current (steady-state) allocation.
+
+        Returns 0 when enforce_eager is set (no CUDA graphs).
+        """
+        if self.config.enforce_eager:
+            return 0
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        activation_bytes = max(peak - current, 0)
+        # CUDA graph pool overhead is roughly 20% of single-pass activation
+        # memory due to pooling across multiple captured batch sizes.
+        return int(activation_bytes * 0.2)
+
+    def get_num_blocks(self):
+        torch.set_default_device(self.device)
+        config = self.config
+        hf_config = config.hf_config
+        if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
+            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+
+        free, total = torch.cuda.mem_get_info()
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        # Peak PyTorch usage (high watermark during warmup) — this is memory
+        # consumed by THIS process only (model weights + peak activations).
+        peak_torch = max(peak, current)
+
+        # CUDA graph capture overhead estimate
+        cudagraph_overhead = self._estimate_cudagraph_overhead()
+
+        # Safety margin (2% of total)
+        safety_margin = int(total * 0.02)
+
+        # Budget: this server may use up to gpu_memory_utilization * total.
+        # Subtract our own PyTorch usage + CUDA graph estimate + safety.
+        # This is independent of other processes on the GPU.
+        budget = int(total * config.gpu_memory_utilization)
+        available_for_kv = budget - peak_torch - cudagraph_overhead - safety_margin
+
+        # Physical clamp: never exceed what's actually free on the GPU.
+        # This prevents OOM when other processes share the GPU.
+        available_for_kv = min(available_for_kv, free)
+
+        torch.set_default_device("cpu")
+
+        block_bytes = self._compute_block_bytes()
         num_kvcache_blocks = available_for_kv // block_bytes
+
+        logger.info(
+            f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
+            f"free={free / (1 << 30):.2f}GB, "
+            f"utilization={config.gpu_memory_utilization}, "
+            f"budget={budget / (1 << 30):.2f}GB, "
+            f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
+            f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
+            f"block_bytes={block_bytes}, "
+            f"num_kvcache_blocks={num_kvcache_blocks}"
+        )
+
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
             f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
-            f"but available memory is {free / (1 << 20):.2f}MB "
-            f"(planned: {planned / (1 << 30):.2f}GB ({total/ (1 << 30):.2f}GB*{config.gpu_memory_utilization}), "
-            f"used: {used / (1 << 30):.2f}GB, "
-            f"peak: {peak / (1 << 30):.2f}GB, "
-            f"current: {current / (1 << 30):.2f}GB)"
+            f"but available_for_kv={available_for_kv / (1 << 20):.2f}MB "
+            f"(budget={budget / (1 << 30):.2f}GB, "
+            f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
+            f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"free={free / (1 << 30):.2f}GB)"
         )
         return num_kvcache_blocks
 
     def allocate_kv_cache(self, num_kvcache_blocks):
+        pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
@@ -1187,6 +1303,21 @@ class ModelRunner:
         }
         # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
         set_kv_cache_data(kv_cache_data)
+
+        # Cross-validate: compare estimated vs actual KV cache allocation
+        post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        actual_kv_bytes = post_alloc - pre_alloc
+        expected_kv_bytes = self._compute_block_bytes() * num_kvcache_blocks
+        if expected_kv_bytes > 0:
+            diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
+            if diff_pct > 0.01:
+                logger.warning(
+                    f"KV cache allocation mismatch: "
+                    f"expected={expected_kv_bytes / (1 << 30):.3f}GB, "
+                    f"actual={actual_kv_bytes / (1 << 30):.3f}GB, "
+                    f"diff={diff_pct:.1%}"
+                )
+
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
@@ -1274,7 +1405,7 @@ class ModelRunner:
             self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
                 self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
             )
-        attn_metadata, positions = self.attn_metadata_builder.build(batch, bs)
+        attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
         # graph_bs should be batch size (number of sequences), not token count
@@ -1366,15 +1497,31 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            hidden_states = self.model(input_ids, positions)
+            with (
+                record_function(
+                    f"prefill_bs_{bs}_ctxlens_{forward_context.attn_metadata.context_lens}"
+                )
+                if self.mark_trace
+                else nullcontext()
+            ):
+                hidden_states = self.model(input_ids, positions)
+                logits = self.model.compute_logits(hidden_states)
         else:
-            graph_bs = context.graph_bs
-            max_q_len = forward_context.attn_metadata.max_seqlen_q
-            graph_key = (graph_bs, max_q_len)
-            self.graphs[graph_key].replay()
-            num_tokens = context.batch_size * max_q_len
-            hidden_states = self.forward_vars["outputs"][:num_tokens]
-        logits = self.model.compute_logits(hidden_states)
+            with (
+                record_function(f"decode_step_bs_{bs}")
+                if self.mark_trace
+                else nullcontext()
+            ):
+                graph_bs = context.graph_bs
+                max_q_len = forward_context.attn_metadata.max_seqlen_q
+                graph_key = (graph_bs, max_q_len)
+                self.graphs[graph_key].replay()
+                num_tokens = context.batch_size * max_q_len
+                hidden_states = self.forward_vars["outputs"][:num_tokens]
+                if self.logits_in_graph:
+                    logits = self.graph_logits[graph_key][:num_tokens]
+                else:
+                    logits = self.model.compute_logits(hidden_states)
 
         return logits, hidden_states
 
@@ -1428,7 +1575,7 @@ class ModelRunner:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
         self.forward_done_event.record()
-        token_ids = self.tokenID_processor.prepare_sampled_ids(
+        req_ids_out, token_ids_out = self.tokenID_processor.prepare_sampled_ids(
             batch, sampled_tokens, self.forward_done_event
         )
 
@@ -1444,6 +1591,8 @@ class ModelRunner:
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
+                # self.debug(f"{sampled_tokens=}")
+                # self.debug(f"{next_token_locs=}")
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
@@ -1459,7 +1608,8 @@ class ModelRunner:
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
 
         return ScheduledBatchOutput(
-            token_ids=token_ids,
+            req_ids=req_ids_out,
+            token_ids=token_ids_out,
             draft_token_ids=draft_token_ids,
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
@@ -1537,7 +1687,9 @@ class ModelRunner:
         self.forward_vars["kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
+        self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
         self.graph_pool = None
+        self.logits_in_graph = self.world_size == 1
 
         with graph_capture() as gc:
             capture_range = (
@@ -1562,7 +1714,7 @@ class ModelRunner:
                 )
 
                 attn_metadata, context = (
-                    self.attn_metadata_builder.build_for_cudagraph_capture(bs)
+                    self.attn_metadata_builder.build_for_cudagraph_capture(bs=bs)
                 )
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                 num_tokens += num_pad
@@ -1574,17 +1726,54 @@ class ModelRunner:
                     num_tokens_across_dp=num_tokens_across_dp,
                 )
 
+                # Warmup
                 outputs[:num_tokens] = self.model(
                     input_ids[:num_tokens], positions[:num_tokens]
-                )  # warmup
+                )
+                if self.logits_in_graph:
+                    self.model.compute_logits(outputs[:num_tokens])
 
-                with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
-                    outputs[:num_tokens] = self.model(
-                        input_ids[:num_tokens], positions[:num_tokens]
-                    )  # capture
+                # Capture: include compute_logits only when TP=1 since
+                # ParallelLMHead uses NCCL all_gather which is not
+                # graph-capturable on HIP when TP > 1.
+                with (
+                    record_function(f"capture_graph_bs_{bs}")
+                    if self.mark_trace
+                    else nullcontext()
+                ):
+                    with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
+                        outputs[:num_tokens] = self.model(
+                            input_ids[:num_tokens], positions[:num_tokens]
+                        )
+                        if self.logits_in_graph:
+                            graph_logits = self.model.compute_logits(
+                                outputs[:num_tokens]
+                            )
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
                 self.graphs[(bs, max_q_len)] = graph
+                if self.logits_in_graph:
+                    self.graph_logits[(bs, max_q_len)] = graph_logits
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
+
+        # Post-init memory validation
+        free_after, total_after = torch.cuda.mem_get_info()
+        actual_usage = total_after - free_after
+        target_usage = int(total_after * self.config.gpu_memory_utilization)
+        usage_ratio = actual_usage / total_after
+        logger.info(
+            f"Post-init memory: "
+            f"actual={actual_usage / (1 << 30):.2f}GB ({usage_ratio:.1%}), "
+            f"target={target_usage / (1 << 30):.2f}GB "
+            f"({self.config.gpu_memory_utilization:.0%})"
+        )
+        if usage_ratio > self.config.gpu_memory_utilization + 0.02:
+            logger.warning(
+                f"Actual GPU memory usage ({usage_ratio:.1%}) exceeds target "
+                f"({self.config.gpu_memory_utilization:.0%}) by "
+                f"{(usage_ratio - self.config.gpu_memory_utilization):.1%}. "
+                f"Consider reducing gpu_memory_utilization."
+            )
+
         return time.time() - start_time, self.graph_bs

@@ -45,6 +45,7 @@ class EngineArgs:
     enable_dp_attention: bool = False
     method: Optional[str] = None
     num_speculative_tokens: int = 1
+    mark_trace: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -170,6 +171,11 @@ class EngineArgs:
             help="Apply a delay (of delay factor multiplied by previous"
             "prompt latency) before scheduling next prompt.",
         )
+        parser.add_argument(
+            "--mark-trace",
+            action="store_true",
+            help="Enable graph_marker nodes for tracing/profile instrumentation.",
+        )
 
         return parser
 
@@ -215,6 +221,6 @@ class EngineArgs:
 
         return kwargs
 
-    def create_engine(self) -> LLMEngine:
+    def create_engine(self, tokenizer=None) -> LLMEngine:
         """Create and return an LLMEngine instance with the configured parameters."""
-        return LLMEngine(self.model, **self._get_engine_kwargs())
+        return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())

@@ -5,6 +5,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
+  schedule:
+    # Nightly at 01:00 Beijing time (17:00 UTC)
+    - cron: '0 17 * * *'
   workflow_dispatch:
     inputs:
       deepseek-r1-0528:
@@ -22,6 +25,10 @@ on:
         description: "Image to use for the benchmark"
         type: string
         default: "rocm/atom-dev:latest"
+      enable_profiler:
+        description: "Enable torch profiler to collect trace for performance debugging"
+        type: boolean
+        default: false
       param_lists:
         description: |
           "Benchmark parameter lists. 
@@ -38,11 +45,22 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
+    env:
+      # Nightly params aligned with InferenceX dsr1-fp8 config: 1k1k, 1k8k, 8k1k with multiple concurrency levels
+      NIGHTLY_PARAM_LISTS: "1024,1024,1,0.8;1024,1024,2,0.8;1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,1024,256,0.8;1024,8192,1,0.8;1024,8192,2,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;8192,1024,1,0.8;8192,1024,2,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8"
     steps:
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
-          IFS=';' read -ra SETS <<< "${{ inputs.param_lists }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PARAM_LISTS="${{ env.NIGHTLY_PARAM_LISTS }}"
+            echo "Using nightly param lists (1k1k, 1k8k, 8k1k with multiple concurrency)"
+            echo "PARAM_LISTS: ${PARAM_LISTS}"
+          else
+            PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
+            echo "Using param_lists: ${PARAM_LISTS}"
+          fi
+          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
           MATRIX_JSON="["
           SEP=""
           for SET in "${SETS[@]}"; do
@@ -62,7 +80,7 @@ jobs:
           echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
   deepseek-r1-0528-benchmark:
-    if: ${{ inputs.deepseek-r1-0528 }}
+    if: ${{ github.event_name == 'schedule' || inputs.deepseek-r1-0528 }}
     name: DeepSeek-R1-0528 Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
     needs: [parse-param-lists]
     strategy:
@@ -88,6 +106,7 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Show Docker containers
         run: docker ps -a
@@ -135,16 +154,29 @@ jobs:
           -e OSL=${{ env.OSL }} \
           -e CONC=${{ env.CONC }} \
           -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
+          -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
-          ${{ inputs.image }}
+          ${{ inputs.image || 'rocm/atom-dev:latest' }}
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+              echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
       - name: Run benchmark
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
@@ -154,14 +186,26 @@ jobs:
           else
             model_path="${{ env.MODEL_PATH }}"
           fi
+          # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
+            echo '========== Running benchmark test =========='
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ls -all .
           "
-          echo "========== Running benchmark test =========="
-          docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
-          ls -all .
-          "
+
+      - name: Copy profiler traces from container
+        if: ${{ inputs.enable_profiler }}
+        run: |
+          docker cp atom-benchmark:/app/trace ./profiler-traces || echo "No profiler traces found"
+          ls -la ./profiler-traces/ 2>/dev/null || true
+
+      - name: Upload profiler traces
+        if: ${{ inputs.enable_profiler }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiler-traces-deepseek-r1-0528-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}
+          path: profiler-traces/
 
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4
@@ -176,12 +220,12 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
 
   gpt-oss-120b-benchmark:
-    if: ${{ inputs.gpt-oss-120b }}
+    if: ${{ github.event_name == 'schedule' || inputs.gpt-oss-120b }}
     name: GPT-OSS-120b Benchmark (input=${{ matrix.config.input_length }}, output=${{ matrix.config.output_length }}, conc=${{ matrix.config.concurrency }}, ratio=${{ matrix.config.random_range_ratio }})
     needs: [parse-param-lists]
     strategy:
@@ -207,6 +251,7 @@ jobs:
           if [ -n "$containers" ]; then
             docker kill $containers || true
           fi
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Show Docker containers
         run: docker ps -a
@@ -255,16 +300,29 @@ jobs:
           -e CONC=${{ env.CONC }} \
           -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
           -e ATOM_GPT_OSS_MODEL=1 \
+          -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
-          ${{ inputs.image }}
+          ${{ inputs.image || 'rocm/atom-dev:latest' }}
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Download models
+        run: |
+          if [ -d "/models" ]; then
+            echo "/models directory found, downloading model to /models/${{ env.MODEL_PATH }}"
+            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}"; then
+              echo "Model download failed for '${{ env.MODEL_PATH }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not found, skipping model download"
+          fi
+
       - name: Run benchmark
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
@@ -274,15 +332,27 @@ jobs:
           else
             model_path="${{ env.MODEL_PATH }}"
           fi
+          # Run launch and benchmark in a single exec so the server process is not killed when the first shell exits
           docker exec atom-benchmark bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args }}
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
+            echo '========== Running benchmark test =========='
+            ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
+            ls -all .
           "
-          echo "========== Running benchmark test =========="
-          docker exec atom-benchmark bash -lc "
-          RESULT_FILENAME=${{ env.RESULT_FILENAME }} .github/scripts/atom_test.sh benchmark $model_path
-          ls -all .
-          "
-      
+
+      - name: Copy profiler traces from container
+        if: ${{ inputs.enable_profiler }}
+        run: |
+          docker cp atom-benchmark:/app/trace ./profiler-traces || echo "No profiler traces found"
+          ls -la ./profiler-traces/ 2>/dev/null || true
+
+      - name: Upload profiler traces
+        if: ${{ inputs.enable_profiler }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiler-traces-gpt-oss-120b-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}
+          path: profiler-traces/
+
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4
         with:
@@ -296,7 +366,7 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
 
@@ -315,11 +385,46 @@ jobs:
           pattern: '*'
           merge-multiple: true
           path: .
+
+      - name: Download baseline from previous nightly run
+        id: baseline
+        run: |
+          PREV_RUN_ID=$(gh run list \
+            --workflow="ATOM Benchmark" \
+            --branch=main \
+            --event=schedule \
+            --status=success \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')
+
+          if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
+            echo "Downloading baseline from run #$PREV_RUN_ID"
+            mkdir -p /tmp/baseline
+            gh run download "$PREV_RUN_ID" --dir /tmp/baseline || echo "::warning::Failed to download baseline artifacts"
+            BASELINE_COUNT=$(find /tmp/baseline -name '*.json' | wc -l)
+            echo "Downloaded $BASELINE_COUNT baseline files"
+            echo "baseline_dir=/tmp/baseline" >> $GITHUB_OUTPUT
+          else
+            echo "No previous successful nightly run found"
+            echo "baseline_dir=" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       
       - name: List all benchmark results
         run: |
-          ls -all .
+          echo "=== Current results ==="
+          ls -la *.json 2>/dev/null || echo "No JSON files in current dir"
+          if [ -d "/tmp/baseline" ]; then
+            echo "=== Baseline results ==="
+            find /tmp/baseline -name '*.json' | head -20
+          fi
       
       - name: Summarize benchmark result
         run: |
-          .github/scripts/summarize.py . >> $GITHUB_STEP_SUMMARY
+          BASELINE_ARG=""
+          if [ -n "${{ steps.baseline.outputs.baseline_dir }}" ]; then
+            BASELINE_ARG="--baseline-dir ${{ steps.baseline.outputs.baseline_dir }}"
+          fi
+          .github/scripts/summarize.py . $BASELINE_ARG >> $GITHUB_STEP_SUMMARY

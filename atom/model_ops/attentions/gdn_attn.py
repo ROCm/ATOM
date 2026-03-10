@@ -69,7 +69,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         self,
         model_runner,
     ):
-        super().__init__(model_runner)
+        super().__init__(model_runner=model_runner)
         self.num_spec = 0
         if hasattr(model_runner, "drafter"):
             self.num_spec = model_runner.drafter.mtp_k
@@ -107,8 +107,9 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        self.non_spec_query_start_loc = torch.empty(
-            (self.max_bs + 1,),
+        self.non_spec_query_start_loc = torch.arange(
+            start=0,
+            end=self.max_bs + 1,
             dtype=torch.int32,
             device=self.device,
         )

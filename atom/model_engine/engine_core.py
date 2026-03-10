@@ -63,6 +63,7 @@ class EngineCore:
         self.input_thread.start()
 
         self.profile_enbaled = config.torch_profiler_dir is not None
+        self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
         self._init_data_parallel(config)
 
@@ -83,6 +84,9 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
+                # Start profiler before cudagraph capture only if mark-trace is enabled.
+                if self.profile_enbaled and self.mark_trace:
+                    self.runner_mgr.call_func("start_profiler", wait_out=True)
                 cap_cost, bs = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
@@ -123,15 +127,18 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
-        self.runner_mgr.call_func("exit")
         self.runner_mgr.keep_monitoring = False
+        try:
+            self.runner_mgr.call_func("exit")
+        except Exception:
+            pass  # shared memory may already be freed
         self._send_engine_dead()
         logger.debug(f"{self.label}: model runner exit")
 
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
         self.output_queue.put_nowait([get_exit_sequence()])
-        self.output_thread.join(timeout=5.0)
+        self.output_thread.join(timeout=0.5)
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
@@ -153,10 +160,10 @@ class EngineCore:
         shutdown = False
         while True:
             shutdown = shutdown or self.pull_and_process_input_queue()
+            if shutdown:
+                break
             if not self.scheduler.is_finished():
                 self._process_engine_step()
-            elif shutdown:
-                break
 
     def _process_engine_step(self):
         if not self.scheduler.has_requests():
@@ -284,7 +291,7 @@ class EngineCore:
 
     def start_profiler(self):
         if self.profile_enbaled:
-            self.runner_mgr.call_func("start_profiler")
+            self.runner_mgr.call_func("start_profiler", wait_out=True)
 
     def stop_profiler(self):
         if self.profile_enbaled:
@@ -293,14 +300,8 @@ class EngineCore:
             logger.info("Profiler stopped.")
 
     def print_mtp_statistics(self):
-        stats = self.runner_mgr.call_func("get_mtp_statistics", wait_out=True)
-        if stats and stats.get("total_draft_tokens", 0) > 0:
-            logger.info(f"\n{'='*50}")
-            logger.info("MTP (Multi-Token Prediction) Statistics:")
-            logger.info(f"  Total draft tokens: {stats['total_draft_tokens']}")
-            logger.info(f"  Accepted tokens:    {stats['total_accepted_tokens']}")
-            logger.info(f"  Acceptance rate:    {stats['acceptance_rate']:.2%}")
-            logger.info(f"{'='*50}\n")
+        if self.scheduler.spec_stats is not None:
+            self.scheduler.spec_stats._log()
         else:
             logger.info(
                 "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"

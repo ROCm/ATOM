@@ -12,6 +12,7 @@ from atom.utils import compilation_counter
 from atom.utils import weak_ref_tensors
 from aiter import logger
 from atom.config import Config, CUDAGraphMode
+from atom.utils.forward_context import get_forward_context
 
 # from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 # from vllm.config import CUDAGraphMode, VllmConfig
@@ -82,9 +83,7 @@ class CUDAGraphWrapper:
     runtime inputs into that buffers for replay. We assume implementing them
     is done outside of the wrapper. That is because we do not make any
     assumption on the dynamic shape (batch size) of the runtime inputs, as a
-    trade-off for staying orthogonal to compilation logic. Nevertheless,
-    tracing and checking the input addresses to be consistent during replay is
-    guaranteed when VLLM_LOGGING_LEVEL == "DEBUG".
+    trade-off for staying orthogonal to compilation logic.
     """
 
     def __init__(

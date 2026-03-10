@@ -9,7 +9,13 @@ EXTRA_ARGS=("${@:3}")
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
-  python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${EXTRA_ARGS[@]}" &
+  PROFILER_ARGS=""
+  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
+    PROFILER_ARGS="--torch-profiler-dir /app/trace"
+    echo "Torch profiler enabled, trace output: /app/trace"
+  fi
+  ATOM_SERVER_LOG="/tmp/atom_server.log"
+  python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" 2>&1 | tee "$ATOM_SERVER_LOG" &
   atom_server_pid=$!
 
   echo ""
@@ -58,6 +64,10 @@ if [ "$TYPE" == "benchmark" ]; then
   echo "========== Cloning bench_serving =========="
   git clone https://github.com/kimbochen/bench_serving.git && chmod +x bench_serving/benchmark_serving.py
   echo "========== Running benchmark test =========="
+  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
+    echo "Starting torch profiler..."
+    curl -s -S -X POST http://127.0.0.1:8000/start_profile || echo "Warning: failed to start profiler"
+  fi
   python bench_serving/benchmark_serving.py \
     --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
     --dataset-name=random \
@@ -68,4 +78,34 @@ if [ "$TYPE" == "benchmark" ]; then
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
     --result-dir=. --result-filename=${RESULT_FILENAME}.json
+
+  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
+    echo "Stopping torch profiler..."
+    curl -s -S -X POST http://127.0.0.1:8000/stop_profile || echo "Warning: failed to stop profiler"
+    ATOM_SERVER_LOG="/tmp/atom_server.log"
+    echo "Waiting for 'Profiler stopped.' in server log ..."
+    profiler_done=false
+    for i in $(seq 1 300); do
+      if grep -q "Profiler stopped." "$ATOM_SERVER_LOG" 2>/dev/null; then
+        echo "Profiler stopped after ${i}s"
+        ls -lhR /app/trace/
+        profiler_done=true
+        break
+      fi
+      echo "Waiting for profiler to finish... ($i/300)"
+      sleep 1
+    done
+    if [ "$profiler_done" = false ]; then
+      echo "Warning: 'Profiler stopped.' not found in server log after 300s"
+      ls -lhR /app/trace/ 2>/dev/null || true
+    fi
+  fi
+
+  # Inject ISL/OSL into result JSON for summary table
+  if [ -f "${RESULT_FILENAME}.json" ]; then
+    jq --argjson isl "$ISL" --argjson osl "$OSL" \
+      '. + {random_input_len: $isl, random_output_len: $osl}' \
+      "${RESULT_FILENAME}.json" > "${RESULT_FILENAME}.tmp" && \
+      mv "${RESULT_FILENAME}.tmp" "${RESULT_FILENAME}.json"
+  fi
 fi

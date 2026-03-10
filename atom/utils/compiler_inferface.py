@@ -8,13 +8,12 @@ import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
-from atom.utils import compilation_counter
+
 import torch
 import torch._inductor.compile_fx
 import torch.fx as fx
-
 from atom.config import Config
-from atom.utils import is_torch_equal_or_newer
+from atom.utils import compilation_counter, is_torch_equal_or_newer
 
 
 class CompilerInterface:
@@ -167,6 +166,15 @@ def set_inductor_config(config, runtime_shape):
         # can be beneficial
         config["max_autotune"] = True
         config["coordinate_descent_tuning"] = True
+
+    try:
+        from atom.utils.graph_marker import is_graph_marker_enabled
+
+        if is_graph_marker_enabled():
+            config["size_asserts"] = False
+            config["compile_threads"] = 1
+    except Exception:
+        pass
 
 
 class InductorAdaptor(CompilerInterface):
@@ -379,10 +387,6 @@ class InductorAdaptor(CompilerInterface):
                 config_patches=current_config,
             )
 
-        # We treat VLLM_DISABLE_COMPILE_CACHE as the overall switch for torch
-        # compilation cache. So turn off the checks if we disable the
-        # compilation cache.
-        # if not envs.VLLM_DISABLE_COMPILE_CACHE:
         if hash_str is None:
             raise RuntimeError(
                 "vLLM failed to compile the model. The most "
@@ -395,6 +399,21 @@ class InductorAdaptor(CompilerInterface):
         assert (
             file_path is not None
         ), "failed to get the file path of the compiled graph"
+        # Best-effort post-process the generated wrapper file too (PyTorch <2.8 path).
+        try:
+            # Only run post-processing when mark-trace is enabled (to avoid any
+            # overhead / file churn in default runs).
+            from atom.utils.graph_marker import is_graph_marker_enabled
+
+            if is_graph_marker_enabled():
+                # Local import to avoid extra package-level side effects.
+                from .graph_marker_instrumentation import (
+                    instrument_record_functions_in_file,
+                )
+
+                instrument_record_functions_in_file(file_path, strip_markers=False)
+        except Exception:
+            pass
         return compiled_graph, (hash_str, file_path)
 
     def load(
@@ -556,10 +575,26 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Save the compiled artifact to disk in the specified path
         assert key is not None
         path = os.path.join(self.cache_dir, key)
-        if True:
-            # if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            compiled_graph.save(path=path, format="unpacked")
-            compilation_counter.num_compiled_artifacts_saved += 1
+        compiled_graph.save(path=path, format="unpacked")
+        compilation_counter.num_compiled_artifacts_saved += 1
+
+        # Post-process generated wrapper Python files: wrap regions between
+        # <prefix>_start / <prefix>_end graph markers with record_function("<prefix>").
+        try:
+            # Only run post-processing when mark-trace is enabled (to avoid any
+            # overhead / file churn in default runs).
+            from atom.utils.graph_marker import is_graph_marker_enabled
+
+            if is_graph_marker_enabled():
+                # Local import to avoid extra package-level side effects.
+                from .graph_marker_instrumentation import (
+                    instrument_record_functions_in_dir,
+                )
+
+                instrument_record_functions_in_dir(path, strip_markers=False)
+        except Exception:
+            # Best-effort: never fail compilation due to instrumentation.
+            pass
         return compiled_graph, (key, path)
 
     def load(
