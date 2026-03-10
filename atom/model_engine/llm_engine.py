@@ -31,12 +31,14 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
 
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, model, tokenizer=None, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         config = Config(model, **config_kwargs)
-        self.tokenizer = _load_tokenizer(config.model, config.trust_remote_code)
+        self.tokenizer = tokenizer or _load_tokenizer(
+            config.model, config.trust_remote_code
+        )
         config.bos_token_id = self.tokenizer.bos_token_id
         config.eos_token_id = self.tokenizer.eos_token_id
         stop_token_ids = set(config.stop_token_ids)
@@ -56,6 +58,11 @@ class LLMEngine:
         logger.info(
             f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
         )
+
+    def close(self):
+        """Shut down engine and release all GPU resources."""
+        if hasattr(self, "core_mgr"):
+            self.core_mgr.close()
 
     def add_request(
         self,

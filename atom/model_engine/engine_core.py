@@ -127,15 +127,18 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
-        self.runner_mgr.call_func("exit")
         self.runner_mgr.keep_monitoring = False
+        try:
+            self.runner_mgr.call_func("exit")
+        except Exception:
+            pass  # shared memory may already be freed
         self._send_engine_dead()
         logger.debug(f"{self.label}: model runner exit")
 
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
         self.output_queue.put_nowait([get_exit_sequence()])
-        self.output_thread.join(timeout=5.0)
+        self.output_thread.join(timeout=0.5)
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
@@ -157,10 +160,10 @@ class EngineCore:
         shutdown = False
         while True:
             shutdown = shutdown or self.pull_and_process_input_queue()
+            if shutdown:
+                break
             if not self.scheduler.is_finished():
                 self._process_engine_step()
-            elif shutdown:
-                break
 
     def _process_engine_step(self):
         if not self.scheduler.has_requests():

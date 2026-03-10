@@ -676,15 +676,13 @@ class ParallelConfig:
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
     def __post_init__(self) -> None:
-        # Only override with env vars if not already set to non-default values
-        # This allows programmatic configuration to take precedence
-        import os
-
-        if os.getenv("ATOM_DP_SIZE") is not None:
+        # Only override with env vars if explicitly set.
+        # This allows programmatic configuration to take precedence.
+        if envs.is_set("ATOM_DP_SIZE"):
             self.data_parallel_size = envs.ATOM_DP_SIZE
-        if os.getenv("ATOM_DP_RANK") is not None:
+        if envs.is_set("ATOM_DP_RANK"):
             self.data_parallel_rank = envs.ATOM_DP_RANK
-        if os.getenv("ATOM_DP_RANK_LOCAL") is not None:
+        if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
         # self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
         # self.data_parallel_master_port = get_open_port()
@@ -767,7 +765,9 @@ class Config:
     kv_cache_dtype: str = "bf16"
     enable_prefix_caching: bool = False
     port: int = 8006
-    torch_profiler_dir: str | None = os.getenv("ATOM_TORCH_PROFILER_DIR", None)
+    torch_profiler_dir: str | None = field(
+        default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
+    )
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
@@ -899,10 +899,6 @@ _current_atom_config: Optional[Config] = None
 def set_current_atom_config(atom_config: Config):
     global _current_atom_config
     _current_atom_config = atom_config
-    # for MoE to check
-    import os
-
-    os.environ["ATOM_ENFORCE_EAGER"] = "1" if atom_config.enforce_eager else "0"
 
 
 def get_current_atom_config() -> Config:

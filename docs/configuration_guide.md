@@ -285,7 +285,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_DP_SIZE` | `int` | `1` | Total number of data-parallel groups |
 | `ATOM_DP_MASTER_IP` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 | `ATOM_DP_MASTER_PORT` | `int` | `29500` | Port of the data-parallel master |
-| `ATOM_ENFORCE_EAGER` | `bool` | `False` | Force eager mode globally (also set programmatically by `set_current_atom_config`) |
+| ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | `bool` | `False` | Enable QK-norm + RoPE + cache + quant fusion; enable for Qwen3-MoE models |
 | `ATOM_USE_TRITON_GEMM` | `bool` | `False` | Use Triton-based GEMM kernels instead of default backends |
 | `ATOM_USE_TRITON_MXFP4_BMM` | `bool` | `False` | Use Triton-based MXFP4 batched matrix multiply |

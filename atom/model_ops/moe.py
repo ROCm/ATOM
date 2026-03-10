@@ -430,14 +430,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
     def _maybe_pad_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        # Pad the weight tensor. This is an optimization on ROCm platform, which
-        # can benefit from tensors located far enough from one another in memory
-        # if (envs.VLLM_ROCM_MOE_PADDING and current_platform.is_rocm()
-        #         and weight.stride(-1) == 1
-        #         and (weight.stride(-2) * weight.element_size()) % 512 == 0):
-        #     num_pad = 256 // weight.element_size()
-        #     weight = F.pad(weight, (0, num_pad), "constant", 0)[..., :-num_pad]
-        #     torch.cuda.empty_cache()
         return weight
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

@@ -43,6 +43,10 @@ class AsyncIOProc:
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads = []
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
+        # Register atexit to close shared memory even if exit() doesn't complete
+        import atexit
+
+        atexit.register(self._cleanup_shared_memory)
         # make sure exit handler is set before runner is created
         init_exit_handler(self)
         for addr, q, func in zip(
@@ -68,8 +72,20 @@ class AsyncIOProc:
         logger.debug(f"{self.label}: Shutting down runner...")
         for el in self.runners:
             el.exit()
+        # Close shared memory reader handle to prevent resource_tracker leak
+        self._cleanup_shared_memory()
         for t in self.io_threads:
             t.join(timeout=0.5)
+
+    def _cleanup_shared_memory(self):
+        """Close shared memory handles owned by this process."""
+        if hasattr(self, "rpc_broadcast_mq"):
+            mq = self.rpc_broadcast_mq
+            if hasattr(mq, "buffer") and hasattr(mq.buffer, "shared_memory"):
+                try:
+                    mq.buffer.shared_memory.close()
+                except Exception:
+                    pass
 
     def recv_input_from_socket(self, addr: str, input_queue: queue.Queue):
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -136,6 +152,10 @@ class AsyncIOProcManager:
         )
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         self.still_running = True
+        # Register atexit to clean up shared memory even if exit() doesn't complete
+        import atexit
+
+        atexit.register(self._cleanup_shared_memory)
         init_exit_handler(self)
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
@@ -172,16 +192,34 @@ class AsyncIOProcManager:
         if not self.still_running:
             return
         self.still_running = False
-        # 1. kill all runners
+        # 1. Clean up shared memory BEFORE killing runners —
+        #    unlink only needs the creator, readers don't need to be alive.
+        #    Must happen before CoreManager terminates us (timeout).
+        self._cleanup_shared_memory()
+        # 2. kill all runners
         logger.info(f"{self.label}: shutdown all runners...")
         shutdown_all_processes(self.procs, allowed_seconds=1)
         self.procs = []
-        self.output_thread.join()
+        self.output_thread.join(timeout=1)
         logger.info(f"{self.label}: All runners are shutdown.")
-        # 2. put a None to unblock call_func
+        # 3. put a None to unblock call_func
         self.outputs_queue.put_nowait(SystemExit())
-        # 3. call parent finalizer
+        # 4. call parent finalizer
         self.parent_finalizer()
+
+    def _cleanup_shared_memory(self):
+        """Clean up shared memory (creator side: close + unlink)."""
+        if hasattr(self, "rpc_broadcast_mq"):
+            mq = self.rpc_broadcast_mq
+            if hasattr(mq, "buffer") and hasattr(mq.buffer, "shared_memory"):
+                try:
+                    shm = mq.buffer.shared_memory
+                    if mq.buffer.is_creator:
+                        shm.unlink()
+                        mq.buffer.is_creator = False
+                    shm.close()
+                except Exception:
+                    pass
 
     def process_output_sockets(self, output_address: str):
         output_socket = make_zmq_socket(self.zmq_ctx, output_address, zmq.PULL)

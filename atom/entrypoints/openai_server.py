@@ -21,13 +21,12 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 import uvicorn
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from transformers import AutoTokenizer
-
-from atom.model_engine.llm_engine import _load_tokenizer
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -631,7 +630,10 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Server started successfully and ready to accept requests")
     yield
-    # Shutdown (if needed in the future)
+    # Shutdown: release GPU resources (called by uvicorn on graceful exit)
+    logger.info("Server shutting down, releasing resources...")
+    if engine is not None:
+        engine.close()
 
 
 app = FastAPI(title="Atom OpenAI API Server", lifespan=lifespan)
@@ -902,15 +904,45 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"Loading tokenizer from {args.model}...")
+    logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
     model_name = args.model
 
-    print(f"Initializing engine with model {args.model}...")
+    logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
-    engine = engine_args.create_engine()
+    engine = engine_args.create_engine(tokenizer=tokenizer)
 
-    print(f"Starting server on {args.host}:{args.server_port}...")
+    import signal
+
+    def _sigint_handler(signum, frame):
+        """Handle Ctrl+C: close engine, wait for all processes, then exit.
+
+        This complements the lifespan shutdown (which also calls engine.close()).
+        engine.close() is idempotent (guarded by CoreManager._closed), so
+        double-call from both paths is safe. The handler is needed because
+        lifespan cannot wait for grandchild processes (ModelRunners).
+        """
+        logger.info("Received SIGINT, shutting down engine...")
+        engine.close()
+        # Wait for ALL descendant processes (including grandchildren like
+        # ModelRunners) to exit, so no orphan output leaks to the terminal.
+        import psutil
+
+        try:
+            current = psutil.Process()
+            children = current.children(recursive=True)
+            psutil.wait_procs(children, timeout=2)
+            alive = [c for c in children if c.is_running()]
+            for c in alive:
+                c.kill()
+        except psutil.NoSuchProcess:
+            pass
+        logger.info("Engine shutdown complete.")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    logger.info(f"Starting server on {args.host}:{args.server_port}...")
     uvicorn.run(app, host=args.host, port=args.server_port)
 
 

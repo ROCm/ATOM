@@ -124,23 +124,34 @@ def get_mp_context() -> Union[ForkContext, SpawnContext]:
 
 
 def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
-    # Shutdown the process.
+    # First join any already-exited processes (instant, no wait).
     for proc in procs:
-        if proc.is_alive():
-            proc.terminate()
+        if not proc.is_alive():
+            proc.join(timeout=0)
 
-    # Allow 5 seconds for remaining procs to terminate.
+    # Terminate remaining alive processes.
+    alive = [p for p in procs if p.is_alive()]
+    for proc in alive:
+        proc.terminate()
+
+    # Wait for remaining procs to terminate.
     deadline = time.monotonic() + allowed_seconds
-    for proc in procs:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        if proc.is_alive():
-            proc.join(remaining)
+    for proc in alive:
+        remaining = max(deadline - time.monotonic(), 0)
+        proc.join(remaining)
 
+    # Force kill anything still alive.
     for proc in procs:
         if proc.is_alive() and (pid := proc.pid) is not None:
             kill_process_tree(pid)
+            proc.join(timeout=1)  # wait for kill to take effect
+
+    # Release internal process resources (sentinel semaphores, etc.)
+    for proc in procs:
+        try:
+            proc.close()
+        except (ValueError, OSError):
+            pass
 
 
 def kill_process_tree(pid: int):
@@ -386,7 +397,10 @@ def init_exit_handler(self: Any):
         logger.info(msg)
         self._finalizer()
 
-    signal.signal(signal.SIGINT, signal_handler)
+    # Ignore SIGINT in subprocesses — let the main process handle Ctrl+C
+    # and orchestrate orderly shutdown via SIGTERM. This prevents C++ NCCL
+    # HeartbeatMonitor TCPStore errors caused by ranks exiting independently.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal_handler)
 
 
@@ -559,14 +573,17 @@ def getLogger():
         logger.setLevel(logging.DEBUG)
 
         console_handler = logging.StreamHandler()
-        if int(os.environ.get("ATOM_LOG_MORE", 0)):
+        from atom.utils import envs as _envs
+
+        if _envs.ATOM_LOG_MORE:
             formatter = logging.Formatter(
                 fmt="[%(name)s %(levelname)s] %(asctime)s.%(msecs)01d - %(processName)s:%(process)d - %(pathname)s:%(lineno)d - %(funcName)s\n%(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
         else:
             formatter = logging.Formatter(
-                fmt="[%(name)s] %(message)s",
+                fmt="[%(name)s %(asctime)s] %(message)s",
+                datefmt="%H:%M:%S",
             )
         console_handler.setFormatter(formatter)
         console_handler.setLevel(logging.INFO)

@@ -385,11 +385,46 @@ jobs:
           pattern: '*'
           merge-multiple: true
           path: .
+
+      - name: Download baseline from previous nightly run
+        id: baseline
+        run: |
+          PREV_RUN_ID=$(gh run list \
+            --workflow="ATOM Benchmark" \
+            --branch=main \
+            --event=schedule \
+            --status=success \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')
+
+          if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
+            echo "Downloading baseline from run #$PREV_RUN_ID"
+            mkdir -p /tmp/baseline
+            gh run download "$PREV_RUN_ID" --dir /tmp/baseline || echo "::warning::Failed to download baseline artifacts"
+            BASELINE_COUNT=$(find /tmp/baseline -name '*.json' | wc -l)
+            echo "Downloaded $BASELINE_COUNT baseline files"
+            echo "baseline_dir=/tmp/baseline" >> $GITHUB_OUTPUT
+          else
+            echo "No previous successful nightly run found"
+            echo "baseline_dir=" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       
       - name: List all benchmark results
         run: |
-          ls -all .
+          echo "=== Current results ==="
+          ls -la *.json 2>/dev/null || echo "No JSON files in current dir"
+          if [ -d "/tmp/baseline" ]; then
+            echo "=== Baseline results ==="
+            find /tmp/baseline -name '*.json' | head -20
+          fi
       
       - name: Summarize benchmark result
         run: |
-          .github/scripts/summarize.py . >> $GITHUB_STEP_SUMMARY
+          BASELINE_ARG=""
+          if [ -n "${{ steps.baseline.outputs.baseline_dir }}" ]; then
+            BASELINE_ARG="--baseline-dir ${{ steps.baseline.outputs.baseline_dir }}"
+          fi
+          .github/scripts/summarize.py . $BASELINE_ARG >> $GITHUB_STEP_SUMMARY

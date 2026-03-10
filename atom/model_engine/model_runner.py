@@ -22,6 +22,7 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 from atom.config import Config, KVCacheTensor, set_current_atom_config
+from atom.utils import envs
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
@@ -664,9 +665,27 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
+        #    Must happen while ops module is still alive for CustomAllreduce cleanup.
+        destroy_dist_env()
+        # 2. Release CUDA graphs
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
-        destroy_dist_env()
+        # 3. Release GPU tensors
+        for attr in (
+            "kv_cache",
+            "kv_scale",
+            "index_cache",
+            "mamba_k_cache",
+            "mamba_v_cache",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        if hasattr(self, "model"):
+            del self.model
+        if hasattr(self, "drafter"):
+            del self.drafter
+        torch.cuda.empty_cache()
         return True
 
     def start_profiler(self):
@@ -678,7 +697,7 @@ class ModelRunner:
         - Set to "0" or unset to disable these features (default).
         """
         if self.profiler_dir is not None and self.profiler is None:
-            enable_detailed_profiling = os.environ.get("ATOM_PROFILER_MORE", "0") == "1"
+            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
             self.profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,
@@ -860,31 +879,40 @@ class ModelRunner:
                 self.max_bs, **i32_kwargs
             )
 
-    def get_num_blocks(self):
-        torch.set_default_device(self.device)
-        config = self.config
-        hf_config = config.hf_config
-        if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
-            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        planned = int(total * config.gpu_memory_utilization)
-        torch.set_default_device("cpu")
+    def _get_num_kv_heads(self):
+        """Return the per-rank number of KV heads."""
+        hf_config = self.config.hf_config
         if hf_config.num_key_value_heads >= self.world_size:
             assert hf_config.num_key_value_heads % self.world_size == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+            return hf_config.num_key_value_heads // self.world_size
         else:
             assert self.world_size % hf_config.num_key_value_heads == 0
-            num_kv_heads = 1
+            return 1
+
+    def _get_total_num_layers(self):
+        """Return total layer count including draft (MTP) layers."""
+        total = self.config.hf_config.num_hidden_layers
+        if self.config.speculative_config and hasattr(self, "drafter"):
+            draft_hf = self.config.speculative_config.draft_model_hf_config
+            total += getattr(draft_hf, "num_nextn_predict_layers", 1)
+        return total
+
+    def _compute_block_bytes(self):
+        """Compute the TRUE per-block memory cost including all tensors.
+
+        This must match exactly what allocate_kv_cache() allocates.
+        Includes: kv_cache tensor + kv_scale tensor + draft model layers.
+        """
+        config = self.config
+        hf_config = config.hf_config
+        num_kv_heads = self._get_num_kv_heads()
+        total_num_layers = self._get_total_num_layers()
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
         if self.use_mla:
-            block_bytes = (
-                hf_config.num_hidden_layers
-                * self.block_size
-                * 576
-                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-            )
+            # MLA: shape [total_layers, blocks, block_size, 576]
+            # No kv_scale for MLA
+            block_bytes = total_num_layers * self.block_size * 576 * kv_dtype_size
             if self.is_deepseek_v32:
                 index_dim = hf_config.index_head_dim + 4
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
@@ -900,15 +928,26 @@ class ModelRunner:
                 hf_config.num_hidden_layers // self.full_attention_interval
             )
             self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
+            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
+            full_attn_layers = self.num_full_attn + num_draft_layers
 
-            # full attention bytes
+            # full attention kv_cache bytes
             block_bytes = (
                 2
-                * hf_config.num_hidden_layers
+                * full_attn_layers
                 * self.physical_block_size
                 * num_kv_heads
                 * hf_config.head_dim
-                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+                * kv_dtype_size
+            )
+
+            # kv_scale for full attention: [2, full_attn_layers, blocks, kv_heads, phys_block_size] float32
+            block_bytes += (
+                2
+                * full_attn_layers
+                * num_kv_heads
+                * self.physical_block_size
+                * 4  # float32
             )
 
             # gdn attn bytes
@@ -921,35 +960,115 @@ class ModelRunner:
                 hf_config.linear_conv_kernel_dim,
                 self.num_spec_tokens,
             )
-
             one_layer_byte = (
-                sum(math.prod(subtuple) for subtuple in mamba_shape)
-                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+                sum(math.prod(subtuple) for subtuple in mamba_shape) * kv_dtype_size
             )
-            block_bytes = block_bytes + self.num_gdn_attn_state * one_layer_byte
+            block_bytes += self.num_gdn_attn_state * one_layer_byte
         else:
+            # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
+            # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
+            # the standard path (draft layers use separate binding).
             block_bytes = (
                 2
                 * hf_config.num_hidden_layers
                 * self.block_size
                 * num_kv_heads
                 * hf_config.head_dim
-                * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+                * kv_dtype_size
             )
-        available_for_kv = min((planned - max(peak, current)), free)
+            # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
+            block_bytes += (
+                2
+                * hf_config.num_hidden_layers
+                * num_kv_heads
+                * self.physical_block_size
+                * 4  # float32
+            )
+        return block_bytes
+
+    def _estimate_cudagraph_overhead(self):
+        """Estimate GPU memory consumed by CUDA graph capture.
+
+        CUDA graphs allocate a shared memory pool for intermediate activations.
+        The pool size is roughly the peak activation memory during a single
+        forward pass. We estimate this from the gap between warmup peak and
+        current (steady-state) allocation.
+
+        Returns 0 when enforce_eager is set (no CUDA graphs).
+        """
+        if self.config.enforce_eager:
+            return 0
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        activation_bytes = max(peak - current, 0)
+        # CUDA graph pool overhead is roughly 20% of single-pass activation
+        # memory due to pooling across multiple captured batch sizes.
+        return int(activation_bytes * 0.2)
+
+    def get_num_blocks(self):
+        torch.set_default_device(self.device)
+        config = self.config
+        hf_config = config.hf_config
+        if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
+            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+
+        free, total = torch.cuda.mem_get_info()
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        # Peak PyTorch usage (high watermark during warmup) — this is memory
+        # consumed by THIS process only (model weights + peak activations).
+        peak_torch = max(peak, current)
+
+        # CUDA graph capture overhead estimate
+        cudagraph_overhead = self._estimate_cudagraph_overhead()
+
+        # Safety margin (2% of total)
+        safety_margin = int(total * 0.02)
+
+        # Budget: this server may use up to gpu_memory_utilization * total.
+        # Subtract our own PyTorch usage + CUDA graph estimate + safety.
+        # This is independent of other processes on the GPU.
+        budget = int(total * config.gpu_memory_utilization)
+        available_for_kv = budget - peak_torch - cudagraph_overhead - safety_margin
+
+        # Physical clamp: never exceed what's actually free on the GPU.
+        # This prevents OOM when other processes share the GPU.
+        available_for_kv = min(available_for_kv, free)
+
+        torch.set_default_device("cpu")
+
+        block_bytes = self._compute_block_bytes()
         num_kvcache_blocks = available_for_kv // block_bytes
+
+        logger.info(
+            f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
+            f"free={free / (1 << 30):.2f}GB, "
+            f"utilization={config.gpu_memory_utilization}, "
+            f"budget={budget / (1 << 30):.2f}GB, "
+            f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
+            f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
+            f"block_bytes={block_bytes}, "
+            f"num_kvcache_blocks={num_kvcache_blocks}"
+        )
+
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
             f"At least 1 block ({block_bytes / (1 << 20):.2f}MB) is required, "
-            f"but available memory is {free / (1 << 20):.2f}MB "
-            f"(planned: {planned / (1 << 30):.2f}GB ({total/ (1 << 30):.2f}GB*{config.gpu_memory_utilization}), "
-            f"used: {used / (1 << 30):.2f}GB, "
-            f"peak: {peak / (1 << 30):.2f}GB, "
-            f"current: {current / (1 << 30):.2f}GB)"
+            f"but available_for_kv={available_for_kv / (1 << 20):.2f}MB "
+            f"(budget={budget / (1 << 30):.2f}GB, "
+            f"peak_torch={peak_torch / (1 << 30):.2f}GB, "
+            f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
+            f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"free={free / (1 << 30):.2f}GB)"
         )
         return num_kvcache_blocks
 
     def allocate_kv_cache(self, num_kvcache_blocks):
+        pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
@@ -1182,6 +1301,21 @@ class ModelRunner:
         }
         # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
         set_kv_cache_data(kv_cache_data)
+
+        # Cross-validate: compare estimated vs actual KV cache allocation
+        post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        actual_kv_bytes = post_alloc - pre_alloc
+        expected_kv_bytes = self._compute_block_bytes() * num_kvcache_blocks
+        if expected_kv_bytes > 0:
+            diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
+            if diff_pct > 0.01:
+                logger.warning(
+                    f"KV cache allocation mismatch: "
+                    f"expected={expected_kv_bytes / (1 << 30):.3f}GB, "
+                    f"actual={actual_kv_bytes / (1 << 30):.3f}GB, "
+                    f"diff={diff_pct:.1%}"
+                )
+
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
@@ -1581,4 +1715,24 @@ class ModelRunner:
                     self.graph_logits[(bs, max_q_len)] = graph_logits
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)
+
+        # Post-init memory validation
+        free_after, total_after = torch.cuda.mem_get_info()
+        actual_usage = total_after - free_after
+        target_usage = int(total_after * self.config.gpu_memory_utilization)
+        usage_ratio = actual_usage / total_after
+        logger.info(
+            f"Post-init memory: "
+            f"actual={actual_usage / (1 << 30):.2f}GB ({usage_ratio:.1%}), "
+            f"target={target_usage / (1 << 30):.2f}GB "
+            f"({self.config.gpu_memory_utilization:.0%})"
+        )
+        if usage_ratio > self.config.gpu_memory_utilization + 0.02:
+            logger.warning(
+                f"Actual GPU memory usage ({usage_ratio:.1%}) exceeds target "
+                f"({self.config.gpu_memory_utilization:.0%}) by "
+                f"{(usage_ratio - self.config.gpu_memory_utilization):.1%}. "
+                f"Consider reducing gpu_memory_utilization."
+            )
+
         return time.time() - start_time, self.graph_bs

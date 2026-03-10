@@ -404,6 +404,8 @@ class Scheduler:
                 # )
 
             else:
+                num_rejected = 0
+                num_bonus = 0
                 for token_id in token_ids:
                     seq.append_token(token_id)
             new_tokens = token_ids
