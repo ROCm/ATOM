@@ -170,6 +170,8 @@ class tokenIDProcessor:
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
+        self.num_rejected: Optional[np.ndarray] = None
+        self.num_bonus: Optional[np.ndarray] = None
 
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
@@ -775,7 +777,28 @@ class ModelRunner:
         self.forward_vars["input_ids"].gpu[:bs].zero_()
         input_ids = self.forward_vars["input_ids"].gpu[:bs]
 
-        self.run_model(input_ids)
+        logits, hidden_states = self.run_model(input_ids)
+
+        if hasattr(self, "drafter"):
+            forward_context = get_forward_context()
+            forward_context.context.is_draft = True
+            draft_bs = forward_context.context.graph_bs
+            for i in range(self.drafter.mtp_k):
+                hidden_states = self.drafter.model(
+                    input_ids=torch.zeros(
+                        hidden_states.shape[0],
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    positions=torch.zeros(
+                        hidden_states.shape[0],
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    hidden_states=hidden_states,
+                )
+                if i == 0:
+                    hidden_states = hidden_states[:draft_bs]
 
         reset_forward_context()
         logger.debug(
@@ -814,7 +837,27 @@ class ModelRunner:
         # not exe run_model and synchronize: acc 0.79
 
         with torch.no_grad():
-            self.run_model(input_ids)
+            logits, hidden_states = self.run_model(input_ids)
+
+            if hasattr(self, "drafter"):
+                forward_context = get_forward_context()
+                forward_context.context.is_draft = True
+                for i in range(self.drafter.mtp_k):
+                    hidden_states = self.drafter.model(
+                        input_ids=torch.zeros(
+                            hidden_states.shape[0],
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                        positions=torch.zeros(
+                            hidden_states.shape[0],
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),
+                        hidden_states=hidden_states,
+                    )
+                    if i == 0:
+                        hidden_states = hidden_states[:1]
 
         torch.cuda.synchronize()
 
@@ -1441,7 +1484,7 @@ class ModelRunner:
         actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
-        if not is_prefill and hasattr(self, "drafter"):
+        if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
             scheduled_bs = batch.total_seqs_num_decode
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
                 num_scheduled_tokens[:scheduled_bs],
