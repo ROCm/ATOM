@@ -308,6 +308,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.max_seqlen_k,
             )
 
+        attn_metadata.dtype_q = self.dtype_q
         return attn_metadata, positions
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
@@ -411,6 +412,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_k=max_seqlen_k,
             **ctx,
         )
+        attn_metadata.dtype_q = self.dtype_q
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
         # if self.model_runner.rank == 0:
@@ -444,6 +446,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
             **ctx_mla_ps,
         )
+        attn_matadata.dtype_q = self.dtype_q
         positions = var["positions"].copy_to_gpu(bs * max_q_len)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
