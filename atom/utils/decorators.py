@@ -28,62 +28,46 @@ context_manager = None
 torch_compile_start_time: float = 0.0
 
 
-def record_function(prefix: Union[str, Callable, None] = None):
-    """
-    Decorator that wraps a function with torch.profiler.record_function.
+def _resolve_record_span_name(
+    func: Callable,
+    args,
+    kwargs,
+    explicit_prefix: Optional[str] = None,
+):
+    if explicit_prefix is not None:
+        return str(explicit_prefix)
 
-    Usage:
-    - @record_function
-    - @record_function("my_prefix")
-    """
+    span_name = func.__name__
+    runtime_prefix = kwargs.get("prefix")
+    if isinstance(runtime_prefix, str) and runtime_prefix:
+        return runtime_prefix
 
-    def _decorate(func: Callable):
-        # Try to recover the original callable signature even when func is wrapped
-        # by other decorators.
-        base_func = inspect.unwrap(func)
-        try:
-            base_sig = inspect.signature(base_func)
-        except (TypeError, ValueError):
-            base_sig = None
+    try:
+        base_sig = inspect.signature(inspect.unwrap(func))
+        bound = base_sig.bind_partial(*args, **kwargs)
+        runtime_prefix = bound.arguments.get("prefix")
+    except Exception:
+        runtime_prefix = None
 
-        @wraps(func)
-        def _wrapped(*args, **kwargs):
-            # Keep this decorator no-op unless mark-trace is enabled.
-            from atom.utils.graph_marker import is_graph_marker_enabled
+    if isinstance(runtime_prefix, str) and runtime_prefix:
+        return runtime_prefix
+    return span_name
 
-            if not is_graph_marker_enabled():
-                return func(*args, **kwargs)
 
-            # Priority:
-            # 1) explicit decorator prefix: @record_function("xxx")
-            # 2) runtime function argument named "prefix" when non-empty
-            # 3) function name fallback
-            if prefix is not None:
-                span_name = str(prefix)
-            else:
-                span_name = func.__name__
-                runtime_prefix = kwargs.get("prefix")
-                if not (isinstance(runtime_prefix, str) and runtime_prefix):
-                    if base_sig is not None:
-                        try:
-                            bound = base_sig.bind_partial(*args, **kwargs)
-                            runtime_prefix = bound.arguments.get("prefix")
-                        except Exception:
-                            runtime_prefix = None
-                if isinstance(runtime_prefix, str) and runtime_prefix:
-                    span_name = runtime_prefix
+def _decorate_record_function(func: Callable, prefix: Optional[str] = None):
+    @wraps(func)
+    def _wrapped(*args, **kwargs):
+        # Keep this decorator no-op unless mark-trace is enabled.
+        from atom.utils.graph_marker import is_graph_marker_enabled
 
-            with torch.profiler.record_function(f"{span_name}"):
-                return func(*args, **kwargs)
+        if not is_graph_marker_enabled():
+            return func(*args, **kwargs)
 
-        return _wrapped
+        span_name = _resolve_record_span_name(func, args, kwargs, prefix)
+        with torch.profiler.record_function(f"{span_name}"):
+            return func(*args, **kwargs)
 
-    # Support @record_function without parentheses.
-    if callable(prefix):
-        func = prefix
-        prefix = None
-        return _decorate(func)
-    return _decorate
+    return _wrapped
 
 
 def _graph_marker_first_tensor(obj, name: str):
@@ -126,43 +110,85 @@ def _graph_marker_first_tensor(obj, name: str):
     return obj, False
 
 
-def mark_trace(cls):
-    forward = getattr(cls, "forward", None)
-    if forward is None:
-        return cls
-    if getattr(forward, "__mark_trace_wrapped__", False):
-        return cls
+def _decorate_mark_trace_torch_compile(func: Callable, prefix: Optional[str] = None):
+    if getattr(func, "__mark_trace_wrapped__", False):
+        return func
 
     from atom.utils.graph_marker import is_graph_marker_enabled
 
-    def wrapped_forward(self, *args, **kwargs):
-        # When mark-trace is disabled, bypass all wrapping logic entirely
-        if not is_graph_marker_enabled():
-            return forward(self, *args, **kwargs)
+    owner_name = func.__qualname__.split(".")[0]
+    try:
+        unwrapped = inspect.unwrap(func)
+        params = list(inspect.signature(unwrapped).parameters.values())
+        skip_first_arg = bool(params) and params[0].name in {"self", "cls"}
+    except (TypeError, ValueError):
+        skip_first_arg = False
 
-        prefix = getattr(self, "prefix", cls.__name__)
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        # When mark-trace is disabled, bypass all wrapping logic entirely.
+        if not is_graph_marker_enabled():
+            return func(*args, **kwargs)
+
+        marker_prefix = str(prefix) if prefix is not None else owner_name
+        start_idx = 0
+        if skip_first_arg and args:
+            marker_prefix = (
+                str(prefix)
+                if prefix is not None
+                else getattr(args[0], "prefix", owner_name)
+            )
+            start_idx = 1
+        if prefix is None:
+            runtime_prefix = kwargs.get("prefix")
+            if isinstance(runtime_prefix, str) and runtime_prefix:
+                marker_prefix = runtime_prefix
+
         # Mark only the first tensor across args/kwargs, keeping names stable.
         args_l = list(args)
         marked = False
-        for i, a in enumerate(args_l):
+        for i in range(start_idx, len(args_l)):
             if marked:
                 break
-            aa, marked = _graph_marker_first_tensor(a, f"{prefix}_start")
+            aa, marked = _graph_marker_first_tensor(args_l[i], f"{marker_prefix}_start")
             args_l[i] = aa
         if not marked:
             for k, v in list(kwargs.items()):
                 if marked:
                     break
-                vv, marked = _graph_marker_first_tensor(v, f"{prefix}_start")
+                vv, marked = _graph_marker_first_tensor(v, f"{marker_prefix}_start")
                 kwargs[k] = vv
-        args = tuple(args_l)
-        y = forward(self, *args, **kwargs)
-        yy, _ = _graph_marker_first_tensor(y, f"{prefix}_end")
+
+        y = func(*tuple(args_l), **kwargs)
+        yy, _ = _graph_marker_first_tensor(y, f"{marker_prefix}_end")
         return yy
 
-    wrapped_forward.__mark_trace_wrapped__ = True
-    cls.forward = wrapped_forward
-    return cls
+    wrapped.__mark_trace_wrapped__ = True
+    return wrapped
+
+
+def mark_trace(
+    func: Optional[Callable] = None,
+    *,
+    torch_compile: bool = True,
+    prefix: Optional[str] = None,
+):
+    """
+    Unified trace decorator.
+
+    - torch_compile=True: original graph_marker-based mark_trace behavior.
+    - torch_compile=False: record_function behavior.
+    """
+
+    def _decorate(target: Callable):
+        if torch_compile:
+            return _decorate_mark_trace_torch_compile(target, prefix)
+        return _decorate_record_function(target, prefix)
+
+    # Support both @mark_trace and @mark_trace(...)
+    if func is not None:
+        return _decorate(func)
+    return _decorate
 
 
 # We remove it from utils/__init__.py to avoid circular import

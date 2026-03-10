@@ -24,6 +24,7 @@ from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,
@@ -175,6 +176,7 @@ class MLAAttention(nn.Module):
                 W_V, dtype=dtypes.fp8
             )
 
+    @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
@@ -209,6 +211,7 @@ class MLAAttention(nn.Module):
             x = x.reshape(-1, self.num_heads * self.v_head_dim)
         return self.o_proj(x)
 
+    @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
     def _q_proj_and_k_up_proj(self, x, x_scale=None):
         q_nope, q_pe = (
             self.q_proj(x, x_scale)

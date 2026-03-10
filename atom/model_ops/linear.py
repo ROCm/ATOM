@@ -25,7 +25,7 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
-from atom.utils.decorators import mark_trace, record_function
+from atom.utils.decorators import mark_trace
 
 from atom.model_ops.utils import shuffle_weights
 from atom.utils import envs
@@ -173,7 +173,7 @@ def gemm_a8w8_blockscale_preshuffle_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-@record_function
+@mark_trace(torch_compile=False)
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_preshuffle_fake, mutates_args=[])
 def gemm_a8w8_blockscale_preshuffle_impl(
     x: torch.Tensor,
@@ -193,7 +193,6 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     return y
 
 
-@mark_trace
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -385,6 +384,7 @@ class LinearBase(nn.Module):
         if self.quant_type == QuantType.per_1x32:
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
+    @mark_trace
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:

@@ -9,6 +9,7 @@ from torch.overrides import (
     handle_torch_function,
 )
 from atom.config import QuantizationConfig, LayerQuantConfig
+from atom.utils.decorators import mark_trace
 from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
@@ -197,6 +198,7 @@ class RMSNorm(nn.Module):
         self.quant_type = quant_type
         self.params_dtype = params_dtype
 
+    @mark_trace(prefix="rmsnorm", torch_compile=True)
     def forward(
         self,
         x: torch.Tensor,

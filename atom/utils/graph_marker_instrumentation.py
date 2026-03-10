@@ -269,11 +269,7 @@ def _wrap_region_with_record_function(
     if end_marker_idx <= start_marker_idx + 1:
         return
 
-    # Only add layer prefix if prefix doesn't already contain layer info
-    if layer_id is not None and layer_id >= 0 and "model.layers" not in prefix:
-        tag = f"layer_{layer_id}_{prefix}"
-    else:
-        tag = prefix
+    tag = prefix
     with_line = f'{indent}with record_function("{tag}"):\n'
     insert_at = start_marker_idx + 1
 

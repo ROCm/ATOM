@@ -57,6 +57,14 @@ def should_filter_prefill(name: str) -> bool:
     return any(f in name for f in FILTER_OUT_PREFILL)
 
 
+def is_strict_norm_name(name: str) -> bool:
+    """Match norm module names strictly, not by substring."""
+    if not isinstance(name, str):
+        return False
+    n = name.strip().lower()
+    return n == "layernorm" or n == "rmsnorm"
+
+
 def write_breakdown_xlsx(
     output_xlsx: str,
     rows: List[List[Any]],
@@ -103,7 +111,7 @@ def write_breakdown_xlsx(
     renamed_group_mods = [g[2] for g in main_groups]
     seen_rmsnorm = 0
     for gi, mod in enumerate(renamed_group_mods):
-        if isinstance(mod, str) and "rmsnorm" in mod.lower():
+        if is_strict_norm_name(mod):
             if seen_rmsnorm == 0:
                 renamed_group_mods[gi] = "input_layernorm"
             elif seen_rmsnorm == 1:
@@ -451,7 +459,7 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
     all_norm_indices = [
         i
         for i, item in enumerate(launch_level2_items)
-        if "rmsnorm" in item["level2_event"].get("name", "").lower()
+        if is_strict_norm_name(item["level2_event"].get("name", ""))
     ]
     # Last rmsnorm is final layernorm, not part of transformer layers.
     norm_indices = all_norm_indices[:-1] if len(all_norm_indices) > 0 else []
@@ -483,6 +491,16 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
             f"rows [{mod_start}:{mod_end}) from rmsnorm #{norm_start_idx+1} to #{norm_end_idx+1}"
         )
         print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
+    avg_start_layer = 3
+    avg_end_layer = (len(norm_indices) - 1) // 2
+    if avg_start_layer <= avg_end_layer:
+        print(
+            f"Target layer: {TARGET_LAYER}; AVG layers: [{avg_start_layer}..{avg_end_layer}]"
+        )
+    else:
+        print(
+            f"Target layer: {TARGET_LAYER}; AVG layers: disabled (no eligible layers)"
+        )
 
     # Build launch->kernel mapping by correlation id.
     # Build launch candidates from current prefill thread/range once.
@@ -565,7 +583,6 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
     # AVG rows from layer 3 to last layer.
     avg_rows = None
     avg_layer_rows: List[List[List[Any]]] = []
-    avg_start_layer = 3
     layer = avg_start_layer
     while 2 * layer < len(norm_indices):
         s = norm_indices[2 * layer]
@@ -820,7 +837,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
 
     # Find norm positions (rmsnorm in name)
     all_norm_indices = [
-        i for i, (name, _, _) in enumerate(all_modules) if "rmsnorm" in name.lower()
+        i for i, (name, _, _) in enumerate(all_modules) if is_strict_norm_name(name)
     ]
     # Last rmsnorm is final layernorm, not part of transformer layers.
     norm_indices = all_norm_indices[:-1] if len(all_norm_indices) > 0 else []
@@ -853,6 +870,16 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
     print(
         f"Layer {TARGET_LAYER}: modules [{mod_start}:{mod_end}] (norms at indices {norm_start_idx}, {norm_start_idx+1})"
     )
+    avg_start_layer = 3
+    avg_end_layer = (len(norm_indices) - 1) // 2
+    if avg_start_layer <= avg_end_layer:
+        print(
+            f"Target layer: {TARGET_LAYER}; AVG layers: [{avg_start_layer}..{avg_end_layer}]"
+        )
+    else:
+        print(
+            f"Target layer: {TARGET_LAYER}; AVG layers: disabled (no eligible layers)"
+        )
 
     def build_rows_for_module_range(start: int, end: int) -> List[List[Any]]:
         rows = []
@@ -877,7 +904,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
     # AVG rows from layer 3 to last layer.
     avg_rows = None
     avg_layer_rows: List[List[List[Any]]] = []
-    layer = 3
+    layer = avg_start_layer
     while 2 * layer < len(norm_indices):
         s = norm_indices[2 * layer]
         e_idx = 2 * (layer + 1)
@@ -885,7 +912,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
         avg_layer_rows.append(build_rows_for_module_range(s, e))
         layer += 1
     if avg_layer_rows:
-        avg_rows = build_avg_rows_from_layers(avg_layer_rows, 3, "Decode")
+        avg_rows = build_avg_rows_from_layers(avg_layer_rows, avg_start_layer, "Decode")
         if avg_rows is not None:
             print(f"Decode avg rows: {len(avg_rows)}")
 
