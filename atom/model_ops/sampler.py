@@ -28,6 +28,9 @@ except ImportError:
 # Track whether we've already warned about native sampling being used
 _NATIVE_SAMPLING_WARNING_ISSUED = False
 
+# Epsilon value for numerical stability and to prevent division by 0
+SAMPLER_EPS = 1e-10
+
 
 @lru_cache(maxsize=1)
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
@@ -43,7 +46,7 @@ class Sampler(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.eps = 1e-10
+        self.eps = SAMPLER_EPS
 
     def forward(
         self,
@@ -51,15 +54,17 @@ class Sampler(nn.Module):
         temperatures: torch.Tensor,  # (num_tokens,)
         top_ks: torch.Tensor | None = None,  # (num_tokens,) int32, -1 means disabled
         top_ps: torch.Tensor | None = None,  # (num_tokens,) float32, 1.0 means disabled
+        all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
 
         Args:
             logits: Raw logits from model (num_tokens, vocab_size)
-            temperatures: Temperature for each token (num_tokens,)
+            temperatures: Temperature for each token (num_tokens,), pre-clamped to eps
             top_ks: Top-k value per token, -1 means disabled (num_tokens,)
             top_ps: Top-p value per token, 1.0 means disabled (num_tokens,)
+            all_greedy: True if all requests use greedy sampling (checked on CPU)
 
         Returns:
             Sampled token IDs (num_tokens,)
@@ -69,7 +74,7 @@ class Sampler(nn.Module):
             return self._temperature_sample(logits, temperatures)
 
         # Apply top-k/top-p filtering
-        return self._topk_topp_sample(logits, temperatures, top_ks, top_ps)
+        return self._topk_topp_sample(logits, temperatures, top_ks, top_ps, all_greedy)
 
     def _needs_filtering(
         self,
@@ -105,17 +110,17 @@ class Sampler(nn.Module):
         temperatures: torch.Tensor,
         top_ks: torch.Tensor | None,
         top_ps: torch.Tensor | None,
+        all_greedy: bool,
     ) -> torch.Tensor:
         """Top-K/Top-P sampling with temperature scaling."""
         # Fast path: if ALL requests are greedy (temperature=0), just do argmax
         # This avoids the overhead of softmax and top-k/top-p filtering
-        all_greedy = (temperatures == 0).all()
         if all_greedy:
             return logits.argmax(dim=-1).to(torch.int)
 
         # Apply temperature scaling
-        # Clamp to avoid division by zero; temperature=0 handled separately as greedy
-        scaled_logits = logits / temperatures.unsqueeze(-1).clamp(min=self.eps)
+        # Temperatures are pre-clamped to eps in model_runner.prepare_sample()
+        scaled_logits = logits / temperatures.unsqueeze(-1)
         probs = scaled_logits.softmax(dim=-1, dtype=torch.float32).contiguous()
 
         # model_runner.prepare_sample passes None if filtering not needed for that type

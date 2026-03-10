@@ -27,7 +27,7 @@ from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.sampler import Sampler
+from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
@@ -1440,11 +1440,15 @@ class ModelRunner:
 
     def prepare_sample(
         self, batch: ScheduledBatch
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool]:
         bs = batch.total_seqs_num
 
+        # Check on CPU whether all requests are greedy (temperature=0)
+        all_greedy = (batch.temperatures == 0).all()
+
         temp_buffer = self.forward_vars["temperatures"]
-        temp_buffer.np[:bs] = batch.temperatures
+        # Clamp temperatures on CPU to avoid division by zero in sampler
+        temp_buffer.np[:bs] = np.maximum(batch.temperatures, SAMPLER_EPS)
         temperatures = temp_buffer.copy_to_gpu(bs)
 
         # Check on CPU whether filtering is needed to avoid GPU sync in sampler.
@@ -1474,13 +1478,13 @@ class ModelRunner:
         else:
             top_ps = None
 
-        return temperatures, top_ks, top_ps
+        return temperatures, top_ks, top_ps, all_greedy
 
     def prepare_model(self, batch: ScheduledBatch):
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
-        temperatures, top_ks, top_ps = self.prepare_sample(batch)
+        temperatures, top_ks, top_ps, all_greedy = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         self.prepare_inputs(batch, input_ids)
         return (
@@ -1488,6 +1492,7 @@ class ModelRunner:
             temperatures,
             top_ks,
             top_ps,
+            all_greedy,
         )
 
     def run_model(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1530,15 +1535,18 @@ class ModelRunner:
         batch: ScheduledBatch,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+        all_greedy: bool,
         # following for draft
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
-            sampled_tokens = self.sampler(logits, temperatures, top_ks, top_ps)
+            sampled_tokens = self.sampler(
+                logits, temperatures, top_ks, top_ps, all_greedy
+            )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
         else:
@@ -1553,6 +1561,7 @@ class ModelRunner:
                 temperatures=temperatures,
                 top_ks=top_ks,
                 top_ps=top_ps,
+                all_greedy=all_greedy,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -1618,7 +1627,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        input_ids, temperatures, top_ks, top_ps = self.prepare_model(batch)
+        input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids)
         fwd_output = self.postprocess(
             batch,
@@ -1626,6 +1635,7 @@ class ModelRunner:
             temperatures,
             top_ks,
             top_ps,
+            all_greedy,
             hidden_states,
         )
         reset_forward_context()
