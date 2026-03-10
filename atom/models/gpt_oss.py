@@ -49,7 +49,6 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import GptOssConfig

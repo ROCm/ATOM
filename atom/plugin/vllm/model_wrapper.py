@@ -31,6 +31,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss:GptOssForCausalLM",
+    "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
 }
 
 
@@ -110,6 +111,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
+        # capture. This ensures attention_mla reads correct positions in graph mode.
+        # This is only for mla attention in plugin mode.
+        if "positions" in self.atom_config.compilation_config.static_forward_context:
+            buf = self.atom_config.compilation_config.static_forward_context[
+                "positions"
+            ]
+            buf[: positions.numel()].copy_(positions)
+
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -128,7 +137,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
         loaded_weights_record = load_model_in_plugin_mode(
-            model=self.model, config=self.model.atom_config, prefix="model."
+            model=self.model, config=self.atom_config, prefix="model."
         )
         return loaded_weights_record
 

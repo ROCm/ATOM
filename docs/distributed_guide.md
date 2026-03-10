@@ -306,7 +306,7 @@ The block configuration adapts to the batch type: prefill uses `block_num=128, w
 | `ATOM_DP_SIZE` | int | `1` | Total number of data parallel replicas |
 | `ATOM_DP_MASTER_IP` | str | `127.0.0.1` | IP address for DP Gloo rendezvous |
 | `ATOM_DP_MASTER_PORT` | int | `29500` | Port for DP Gloo rendezvous |
-| `ATOM_ENFORCE_EAGER` | bool | `False` | Disable CUDA graphs (set automatically) |
+| ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `False` | Fuse QK-norm + RoPE + cache quant (for Qwen3-MoE) |
 
 Environment variables in `atom/utils/envs.py` are evaluated lazily via `__getattr__`. If `ATOM_DP_SIZE`, `ATOM_DP_RANK`, or `ATOM_DP_RANK_LOCAL` are set in the environment, they override programmatic `ParallelConfig` defaults in `ParallelConfig.__post_init__()`.

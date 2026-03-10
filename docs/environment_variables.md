@@ -20,7 +20,7 @@ This document describes the environment variables used in the ATOM project.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_ENFORCE_EAGER** | bool | 0 (false) | If set to `1`, use eager mode instead of CUDA Graph for kernel launch. |
+| ~~ATOM_ENFORCE_EAGER~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 
 ---
 

@@ -15,20 +15,21 @@ from aiter import (
     gemm_a8w8_bpreshuffle,
     get_hip_quant,
 )
-from torch import nn
-
-from atom.config import QuantizationConfig, get_current_atom_config, LayerQuantConfig
-from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz, requantize_with_max_scale
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
-from atom.utils.decorators import mark_trace, record_function
-
-from atom.model_ops.utils import shuffle_weights
+from atom.config import QuantizationConfig, get_current_atom_config, LayerQuantConfig
+from atom.model_ops.utils import (
+    normalize_e4m3fn_to_e4m3fnuz,
+    requantize_with_max_scale,
+    shuffle_weights,
+)
 from atom.utils import envs
+from atom.utils.decorators import mark_trace, record_function
+from torch import nn
 
 logger = logging.getLogger("atom")
 
@@ -39,9 +40,9 @@ def use_triton_gemm() -> bool:
 
 if use_triton_gemm():
     try:
-        from aiter.ops.triton.gemm_afp4wfp4 import (
+        from aiter.ops.triton.gemm_afp4wfp4 import (  # noqa: E402
             gemm_afp4wfp4_preshuffle,
-        )  # noqa: E402
+        )
 
         # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
         # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
@@ -312,6 +313,7 @@ class LinearBase(nn.Module):
         if self.weight_scale is not None:
             self.weight_scale.weight_loader = self.weight_loader
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
+        self.quant_func = get_hip_quant(self.quant_type)
 
     @staticmethod
     def weight_loader_process(
@@ -364,8 +366,7 @@ class LinearBase(nn.Module):
             and self.quant_type == QuantType.per_1x32
             and self.params_dtype == torch.float4_e2m1fn_x2
         ):
-            quant_func = get_hip_quant(QuantType.per_1x32)
-            w_q, w_s = quant_func(
+            w_q, w_s = self.quant_func(
                 self.weight.data,
                 quant_dtype=self.params_dtype,
                 shuffle=False,
@@ -397,9 +398,11 @@ class LinearBase(nn.Module):
             )
         else:
             if x_scale is None:
-                quant_func = get_hip_quant(self.quant_type)
+                quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:
-                    quant_func = functools_partial(quant_func, transpose_scale=True)
+                    quant_func = functools_partial(
+                        self.quant_func, transpose_scale=True
+                    )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(
                         x,
