@@ -27,7 +27,6 @@ from atom.model_ops.utils import (
     requantize_with_max_scale,
     shuffle_weights,
 )
-from atom.models.utils import get_quant_config_for_layer
 from atom.utils import envs
 from atom.utils.decorators import mark_trace, record_function
 from torch import nn
