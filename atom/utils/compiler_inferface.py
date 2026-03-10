@@ -8,13 +8,12 @@ import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
-from atom.utils import compilation_counter
+
 import torch
 import torch._inductor.compile_fx
 import torch.fx as fx
-
 from atom.config import Config
-from atom.utils import is_torch_equal_or_newer
+from atom.utils import compilation_counter, is_torch_equal_or_newer
 
 
 class CompilerInterface:
@@ -388,10 +387,6 @@ class InductorAdaptor(CompilerInterface):
                 config_patches=current_config,
             )
 
-        # We treat VLLM_DISABLE_COMPILE_CACHE as the overall switch for torch
-        # compilation cache. So turn off the checks if we disable the
-        # compilation cache.
-        # if not envs.VLLM_DISABLE_COMPILE_CACHE:
         if hash_str is None:
             raise RuntimeError(
                 "vLLM failed to compile the model. The most "
@@ -580,27 +575,26 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Save the compiled artifact to disk in the specified path
         assert key is not None
         path = os.path.join(self.cache_dir, key)
-        if True:
-            # if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            compiled_graph.save(path=path, format="unpacked")
-            compilation_counter.num_compiled_artifacts_saved += 1
-            # Post-process generated wrapper Python files: wrap regions between
-            # <prefix>_start / <prefix>_end graph markers with record_function("<prefix>").
-            try:
-                # Only run post-processing when mark-trace is enabled (to avoid any
-                # overhead / file churn in default runs).
-                from atom.utils.graph_marker import is_graph_marker_enabled
+        compiled_graph.save(path=path, format="unpacked")
+        compilation_counter.num_compiled_artifacts_saved += 1
 
-                if is_graph_marker_enabled():
-                    # Local import to avoid extra package-level side effects.
-                    from .graph_marker_instrumentation import (
-                        instrument_record_functions_in_dir,
-                    )
+        # Post-process generated wrapper Python files: wrap regions between
+        # <prefix>_start / <prefix>_end graph markers with record_function("<prefix>").
+        try:
+            # Only run post-processing when mark-trace is enabled (to avoid any
+            # overhead / file churn in default runs).
+            from atom.utils.graph_marker import is_graph_marker_enabled
 
-                    instrument_record_functions_in_dir(path, strip_markers=False)
-            except Exception:
-                # Best-effort: never fail compilation due to instrumentation.
-                pass
+            if is_graph_marker_enabled():
+                # Local import to avoid extra package-level side effects.
+                from .graph_marker_instrumentation import (
+                    instrument_record_functions_in_dir,
+                )
+
+                instrument_record_functions_in_dir(path, strip_markers=False)
+        except Exception:
+            # Best-effort: never fail compilation due to instrumentation.
+            pass
         return compiled_graph, (key, path)
 
     def load(
