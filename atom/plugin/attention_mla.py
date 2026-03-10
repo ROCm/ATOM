@@ -922,6 +922,8 @@ def MLAAttentionImplDecoratorForPluginMode(cls):
     orig_init = cls.__init__
 
     def new_init(self, *args, **kwargs):
+        if "head_size" in kwargs and "head_dim" not in kwargs:
+            kwargs["head_dim"] = kwargs.pop("head_size")
         orig_init(self, *args, **kwargs)
         _mla_plugin_mode_init(self, *args, **kwargs)
 

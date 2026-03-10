@@ -174,7 +174,7 @@ class PagedAttention(BaseAttention):
             use_mla=self.use_mla,
         )
         impl_cls = self.attn_backend.get_impl_cls()
-        impl_args = dict(
+        self.impl = impl_cls(
             num_heads=num_heads,
             head_dim=head_dim,
             scale=scale,
@@ -191,8 +191,6 @@ class PagedAttention(BaseAttention):
             k_norm=k_norm,
             **kwargs,
         )
-        impl_args["head_size" if self.use_mla else "head_dim"] = head_dim
-        self.impl = impl_cls(**impl_args)
         compilation_config = atom_config.compilation_config
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name
