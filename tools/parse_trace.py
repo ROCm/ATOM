@@ -159,39 +159,65 @@ def _normalize_module_for_avg(name: str) -> str:
 
 
 def build_avg_rows_from_layers(
-    layer_rows_list: List[List[List[Any]]],
-    layer_start_idx: int,
+    layer_rows_list: List[Tuple[int, List[List[Any]]]],
     section_name: str,
 ) -> Optional[List[List[Any]]]:
     """
-    Build AVG rows across layers using layer-3 rows as template.
-    Returns None if any layer cannot be aligned by (module, kernel) sequence.
+    Build AVG rows across layers with fallback:
+    1) try contiguous layers from avg_start_layer.
+    2) if mismatch, retry every other layer: start, start+2, start+4, ...
+    Returns None if still not alignable.
     """
     if not layer_rows_list:
         return []
 
-    base = layer_rows_list[0]
-    base_sig = [(_normalize_module_for_avg(r[0]), r[1]) for r in base]
+    def _try_build(
+        selected_layers: List[Tuple[int, List[List[Any]]]],
+    ) -> Tuple[Optional[List[List[Any]]], Optional[int]]:
+        base_layer, base_rows = selected_layers[0]
+        base_sig = [(_normalize_module_for_avg(r[0]), r[1]) for r in base_rows]
 
-    for rel_idx, rows in enumerate(layer_rows_list[1:], start=1):
-        sig = [(_normalize_module_for_avg(r[0]), r[1]) for r in rows]
-        if sig != base_sig:
-            bad_layer = layer_start_idx + rel_idx
-            print(
-                f"{section_name} avg skipped: layer {bad_layer} does not match layer {layer_start_idx} layout."
+        for layer_idx, rows in selected_layers[1:]:
+            sig = [(_normalize_module_for_avg(r[0]), r[1]) for r in rows]
+            if sig != base_sig:
+                return None, layer_idx
+
+        n = len(selected_layers)
+        avg_rows: List[List[Any]] = []
+        for i, (_, kernel) in enumerate(base_sig):
+            # Keep display style from base layer rows.
+            display_mod = base_rows[i][0]
+            avg_dur = (
+                sum(float(selected_layers[layer_i][1][i][2]) for layer_i in range(n)) / n
             )
-            return None
+            avg_rows.append([display_mod, kernel, avg_dur])
+        return avg_rows, None
 
-    n = len(layer_rows_list)
-    avg_rows: List[List[Any]] = []
-    for i, (mod, kernel) in enumerate(base_sig):
-        # Keep original module display style from layer_start_idx rows.
-        display_mod = base[i][0]
-        avg_dur = (
-            sum(float(layer_rows_list[layer_idx][i][2]) for layer_idx in range(n)) / n
-        )
-        avg_rows.append([display_mod, kernel, avg_dur])
-    return avg_rows
+    start_layer = layer_rows_list[0][0]
+    avg_rows, bad_layer = _try_build(layer_rows_list)
+    if avg_rows is not None:
+        return avg_rows
+
+    print(
+        f"{section_name} avg mismatch: layer {bad_layer} does not match layer {start_layer} layout."
+    )
+    fallback_layers = [
+        item for item in layer_rows_list if (item[0] - start_layer) % 2 == 0
+    ]
+    fallback_indices = [str(layer_idx) for layer_idx, _ in fallback_layers]
+    print(
+        f"{section_name} avg retry with every other layer: {'.'.join(fallback_indices)}"
+    )
+    if len(fallback_layers) < 2:
+        print(f"{section_name} avg skipped: fallback has fewer than 2 layers.")
+        return None
+
+    avg_rows, bad_layer = _try_build(fallback_layers)
+    if avg_rows is not None:
+        return avg_rows
+
+    print(f"{section_name} avg skipped: still mismatch at layer {bad_layer}.")
+    return None
 
 
 # =============================================================================
@@ -491,7 +517,7 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
             f"rows [{mod_start}:{mod_end}) from rmsnorm #{norm_start_idx+1} to #{norm_end_idx+1}"
         )
         print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
-    avg_start_layer = 3
+    avg_start_layer = TARGET_LAYER
     avg_end_layer = (len(norm_indices) - 1) // 2
     if avg_start_layer <= avg_end_layer:
         print(
@@ -582,18 +608,16 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
 
     # AVG rows from layer 3 to last layer.
     avg_rows = None
-    avg_layer_rows: List[List[List[Any]]] = []
+    avg_layer_rows: List[Tuple[int, List[List[Any]]]] = []
     layer = avg_start_layer
     while 2 * layer < len(norm_indices):
         s = norm_indices[2 * layer]
         e_idx = 2 * (layer + 1)
         e = norm_indices[e_idx] if e_idx < len(norm_indices) else final_norm_idx
-        avg_layer_rows.append(build_rows_from_item_range(s, e))
+        avg_layer_rows.append((layer, build_rows_from_item_range(s, e)))
         layer += 1
     if avg_layer_rows:
-        avg_rows = build_avg_rows_from_layers(
-            avg_layer_rows, avg_start_layer, "Prefill"
-        )
+        avg_rows = build_avg_rows_from_layers(avg_layer_rows, "Prefill")
         if avg_rows is not None:
             print(f"Prefill avg rows: {len(avg_rows)}")
 
@@ -870,7 +894,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
     print(
         f"Layer {TARGET_LAYER}: modules [{mod_start}:{mod_end}] (norms at indices {norm_start_idx}, {norm_start_idx+1})"
     )
-    avg_start_layer = 3
+    avg_start_layer = TARGET_LAYER
     avg_end_layer = (len(norm_indices) - 1) // 2
     if avg_start_layer <= avg_end_layer:
         print(
@@ -903,16 +927,16 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
 
     # AVG rows from layer 3 to last layer.
     avg_rows = None
-    avg_layer_rows: List[List[List[Any]]] = []
+    avg_layer_rows: List[Tuple[int, List[List[Any]]]] = []
     layer = avg_start_layer
     while 2 * layer < len(norm_indices):
         s = norm_indices[2 * layer]
         e_idx = 2 * (layer + 1)
         e = norm_indices[e_idx] if e_idx < len(norm_indices) else final_norm_idx
-        avg_layer_rows.append(build_rows_for_module_range(s, e))
+        avg_layer_rows.append((layer, build_rows_for_module_range(s, e)))
         layer += 1
     if avg_layer_rows:
-        avg_rows = build_avg_rows_from_layers(avg_layer_rows, avg_start_layer, "Decode")
+        avg_rows = build_avg_rows_from_layers(avg_layer_rows, "Decode")
         if avg_rows is not None:
             print(f"Decode avg rows: {len(avg_rows)}")
 
