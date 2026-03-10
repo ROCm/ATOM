@@ -24,7 +24,7 @@ from atom.model_ops.topK import (
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
-from typing import Any, Iterable
+from typing import Any
 
 from .utils import (
     IntermediateTensors,
@@ -33,8 +33,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-
-from atom.model_loader.loader import load_model_in_plugin_mode
 
 
 class Glm4MoeMLP(nn.Module):
