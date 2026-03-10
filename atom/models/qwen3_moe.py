@@ -1,4 +1,4 @@
-from typing import Optional, Union, Any, Iterable
+from typing import Optional, Union, Any
 
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -33,7 +33,6 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from torch import nn
-from atom.model_loader.loader import load_model_in_plugin_mode
 
 # import torch.distributed as dist
 from transformers import PretrainedConfig
@@ -521,14 +520,3 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # load weights in plugin mode and discard passed weights generator
-        # here prefix is "model." because Qwen3MoeForCausalLM is constructed in model
-        # wrapper class, so the name of loaded weights are prefixed with "model.".
-        # The vLLM will check the name of the loaded weights to make sure all the
-        # weights are loaded correctly
-        loaded_weights_record = load_model_in_plugin_mode(
-            model=self, config=self.atom_config, prefix="model."
-        )
-        return loaded_weights_record

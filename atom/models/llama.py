@@ -69,7 +69,7 @@ class LlamaMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig,
         bias: bool = False,
         prefix: str = "",
         reduce_results: bool = True,
@@ -99,7 +99,7 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul(
             fused_quant=self.fused_act_quant, quant_config=quant_config
         )
-        self.quant_type = quant_config["quant_type"]
+        self.quant_type = quant_config.global_quant_config["quant_type"]
 
     def forward(self, x, x_scale: Optional[torch.Tensor] = None):
         x = self.gate_up_proj(x, x_scale=x_scale)
@@ -240,8 +240,8 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
+        quant_config: QuantizationConfig,
         cache_config: str = "bf16",
-        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         layer_num: int = 0,
     ) -> None:
@@ -271,7 +271,7 @@ class LlamaDecoderLayer(nn.Module):
             ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
         )
 
-        self.quant_type = quant_config["quant_type"]
+        self.quant_type = quant_config.global_quant_config["quant_type"]
 
         self.self_attn = LlamaAttention(
             config=config,

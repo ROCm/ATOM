@@ -572,6 +572,11 @@ class ModelRunner:
         )
 
         model_class = resolve_obj_by_qualname(support_model_arch_dict[hf_config.architectures[0]])  # type: ignore
+        # The model construction depends on quant_config,
+        # so we must complete the remapping for layers before constructing the model.
+        config.quant_config.remap_layer_name(
+            config.hf_config, getattr(model_class, "packed_modules_mapping", {})
+        )
         self.model = model_class(config)
         torch.set_default_device(None)
         load_model(self.model, config.model, config.hf_config, config.load_dummy)

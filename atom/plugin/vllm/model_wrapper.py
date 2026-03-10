@@ -20,6 +20,7 @@ from vllm.sequence import IntermediateTensors
 
 import atom  # noqa: F401
 from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.model_loader.loader import load_model_in_plugin_mode
 
 import logging
 
@@ -29,6 +30,7 @@ logger = logging.getLogger("atom")
 _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
+    "GptOssForCausalLM": "atom.models.gpt_oss:GptOssForCausalLM",
 }
 
 
@@ -125,7 +127,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        return self.model.load_weights(weights)
+        loaded_weights_record = load_model_in_plugin_mode(
+            model=self.model, config=self.model.atom_config, prefix="model."
+        )
+        return loaded_weights_record
 
     def compute_logits(
         self,

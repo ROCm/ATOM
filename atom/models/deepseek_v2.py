@@ -82,7 +82,6 @@ from atom.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
-    should_ignore_layer,
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -1247,13 +1246,14 @@ class DeepseekV2MLAAttention(nn.Module):
 
         # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains AITER BF16 GEMMs,
         # For FP8 and use_triton_gemm(), fused_qkv_a_proj is AITER-Triton FP8 GEMMs while others remain AITER FP8 GEMMs
-        if quant_config["quant_dtype"] == dtypes.fp4x2:
-            # normally linear layers in attn share the same quant config
-            if should_ignore_layer(quant_config, prefix):
-                source_quant_dtype = None
-                quant_config = None
-                base_quant_config = None
-            elif not use_triton_gemm():
+        q_a_proj_name = (
+            "fused_qkv_a_proj" if self.q_lora_rank is not None else "q_a_proj"
+        )
+        layer_quant_dtype = quant_config.get_layer_quant_config(
+            f"{prefix}.{q_a_proj_name}"
+        )["quant_dtype"]
+        if layer_quant_dtype == dtypes.fp4x2:
+            if not use_triton_gemm():
                 source_quant_dtype = None
                 quant_config = None
                 base_quant_config = None
@@ -1276,7 +1276,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 source_quant_dtype=source_quant_dtype,
-                prefix=f"{prefix}.q_a_proj",
+                prefix=f"{prefix}.fused_qkv_a_proj",
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -1408,10 +1408,10 @@ class DeepseekV2MLAAttention(nn.Module):
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if quant_config["quant_dtype"] == dtypes.fp8 or (
-                quant_config["quant_dtype"] == dtypes.fp4x2 and use_triton_gemm()
+            if layer_quant_dtype == dtypes.fp8 or (
+                layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
             ):
-                self.quant_dtype = quant_config["quant_dtype"]
+                self.quant_dtype = layer_quant_dtype
                 self.fuse_qknorm_quant = True
 
     def forward(
@@ -1550,15 +1550,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         #   1. RMS_Quant fusion is only used for input_layernorm
         #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
         #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm if ENABLE_ALLREDUCE_RMSNORM_FUSION is turned on
-        self.quant_dtype = None
+        self.quant_dtype = (
+            None
+            if quant_config is None
+            else quant_config.global_quant_config["quant_dtype"]
+        )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
             if (
-                quant_config["quant_dtype"] == dtypes.fp8
-                or quant_config["quant_dtype"] == dtypes.fp4x2
+                self.quant_dtype == dtypes.fp8 or self.quant_dtype == dtypes.fp4x2
             ) and use_triton_gemm():
-                self.quant_dtype = quant_config["quant_dtype"]
                 self.fuse_input_norm_quant = True
                 if self.fuse_ar_input_norm:
                     self.fuse_ar_input_norm = False
@@ -1605,7 +1607,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.quant_dtype = quant_config["quant_dtype"] if quant_config else None
         self.fuse_rmsnorm_quant = (
             ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
         )
@@ -1810,12 +1811,6 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
-    # packed_modules_mapping = {
-    #     "q_a_proj" : ("fused_qkv_a_proj", 0),
-    #     "kv_a_proj_with_mqa":  ("fused_qkv_a_proj", 1),
-    #     "gate_proj": ("gate_up_proj", 0),
-    #     "up_proj": ("gate_up_proj", 1),
-    # }
 
     def __init__(
         self,
