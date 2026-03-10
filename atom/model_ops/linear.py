@@ -22,8 +22,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from atom.utils.decorators import mark_trace
-
-from atom.model_ops.utils import shuffle_weights
 from atom.config import QuantizationConfig, get_current_atom_config, LayerQuantConfig
 from atom.model_ops.utils import (
     normalize_e4m3fn_to_e4m3fnuz,
