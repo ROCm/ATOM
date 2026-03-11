@@ -1,13 +1,14 @@
 from typing import Generic, Optional, TypeVar
 import logging
-import os
 
 from dataclasses import dataclass
 
 import torch
 
 from atom.plugin.prepare import is_vllm, is_sglang
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
+from atom.config import get_current_atom_config
+
 from atom.utils.forward_context import Context, AttentionMetaData
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.model_ops.attention_mla import MLAAttention
@@ -643,6 +644,7 @@ class AiterMLACommonPrefillMetadataForPluginMode:
     query_seq_lens: torch.Tensor | None = None
     workspace_buffer: torch.Tensor | None = None
     q_data_type: torch.dtype | None = None
+    output_dtype: torch.dtype | None = None
 
 
 D = TypeVar("D", bound=AiterMLACommonDecodeMetadataForPluginMode)
@@ -1206,6 +1208,7 @@ def AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
 class vllmAiterMLABackendMethods:
     accept_output_buffer: bool = True
     supported_dtypes: list = [torch.float16, torch.bfloat16]
+    forward_includes_kv_cache_update: bool = True
 
     def __init__(self):
         raise TypeError(
@@ -1288,9 +1291,6 @@ def unified_attention_with_output_base_for_plugin_mode(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    from atom.config import get_current_atom_config
-    from atom.utils import envs
-
     atom_config = get_current_atom_config()
     if use_mla:
         # raise NotImplementedError("MLA is not supported for plugin mode for now")
@@ -1300,7 +1300,7 @@ def unified_attention_with_output_base_for_plugin_mode(
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
-        if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1":
+        if envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION:
             k_pe = k_pe.unsqueeze(1)
             if self.rotary_emb is not None:
                 q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(

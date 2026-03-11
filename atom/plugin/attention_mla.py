@@ -424,6 +424,9 @@ class MLAAttentionImplPluginModeMethods:
         # TODO (zyongye): Prefill function hereplugin_metadata
         assert attn_metadata.plugin_metadata.prefill is not None
         assert self.dcp_world_size != -1
+        # prefill_metadata = attn_metadata.plugin_metadata.prefill
+        # from vllm.platforms import current_platform
+        # use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()
 
         has_context = attn_metadata.plugin_metadata.prefill.chunked_context is not None
 
@@ -847,6 +850,43 @@ class MLAAttentionImplPluginModeMethods:
 
         return output_padded
 
+    def forward_mha(
+        self,
+        q,
+        kv_c_normed,
+        k_pe,
+        kv_c_and_k_pe_cache,
+        attn_metadata,
+        k_scale,
+        output,
+    ) -> None:
+        """MHA-style prefill forward pass."""
+        return self._forward_prefill_plugin_mode(
+            q, kv_c_normed, k_pe, kv_c_and_k_pe_cache, attn_metadata, k_scale, output
+        )
+
+    def forward_mqa(
+        self,
+        q,
+        kv_c_and_k_pe_cache,
+        attn_metadata,
+        layer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._forward_decode_plugin_mode(
+            q, kv_c_and_k_pe_cache, attn_metadata, layer
+        )
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        return
+
 
 def _mla_plugin_mode_init(self, *args, **kwargs):
     """Extra initialization for MLAAttentionImpl in plugin mode (vllm)."""
@@ -909,6 +949,9 @@ def MLAAttentionImplDecoratorForPluginMode(cls):
         "_forward_prefill_plugin_mode",
         "_forward_decode_plugin_mode",
         "forward_impl_plugin_mode",
+        "forward_mha",
+        "forward_mqa",
+        "do_kv_cache_update",
     ]
 
     logger.info("Use MLAAttentionImplDecoratorForPluginMode to decorate MLAAttention")
