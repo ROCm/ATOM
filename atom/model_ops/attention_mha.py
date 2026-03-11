@@ -140,9 +140,7 @@ class PagedAttentionImpl(nn.Module):
             x = 16 // k_cache.element_size()
             if k_cache.dim() == 5 and v_cache.dim() == 4:
                 n, nh, hd, bs = v_cache.shape
-                v_cache_shuffle = v_cache.view(
-                    n, nh, bs // x, hd, x
-                )
+                v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
             else:
                 v_cache_shuffle = v_cache
             fused_qk_norm_rope_cache_quant_shuffle(
@@ -233,8 +231,10 @@ class PagedAttentionImpl(nn.Module):
 
         # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
         if attn_metadata.has_cached:
-            q, k, v, k_cache, v_cache, k_scale, v_scale = self._gather_prefix_and_concat_kv(
-                q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
+            q, k, v, k_cache, v_cache, k_scale, v_scale = (
+                self._gather_prefix_and_concat_kv(
+                    q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
+                )
             )
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale
@@ -270,9 +270,7 @@ class PagedAttentionImpl(nn.Module):
         # token_to_batch: [0]*cached[0] + [1]*cached[1] + ...
         # cu_seqlens_kv: [0, cached[0], cached[0]+cached[1], ...]
         # seq_starts: [0]*bs (prefix starts at position 0)
-        token_to_batch = torch.zeros(
-            total_cached, dtype=torch.int32, device=device
-        )
+        token_to_batch = torch.zeros(total_cached, dtype=torch.int32, device=device)
         cu_seqlens_kv = [0]
         for i in range(bs):
             c = cached_seqlen[i].item()
@@ -347,8 +345,12 @@ class PagedAttentionImpl(nn.Module):
             cached_i = cached_seqlen[i].item()
             new_i = end - start - cached_i
 
-            k_full[start : start + cached_i] = k_prefix[cached_offset : cached_offset + cached_i]
-            v_full[start : start + cached_i] = v_prefix[cached_offset : cached_offset + cached_i]
+            k_full[start : start + cached_i] = k_prefix[
+                cached_offset : cached_offset + cached_i
+            ]
+            v_full[start : start + cached_i] = v_prefix[
+                cached_offset : cached_offset + cached_i
+            ]
 
             new_start = cu_seqlens_q[i].item()
             k_full[start + cached_i : end] = k[new_start : new_start + new_i]

@@ -10,7 +10,6 @@ Sends batches of requests that share long common prefixes, then verifies:
 
 import argparse
 import concurrent.futures
-import json
 import re
 import sys
 import time
@@ -125,7 +124,7 @@ def main():
         sys.exit(1)
 
     model = get_model_name(base_url)
-    print(f"=== Prefix Cache Accuracy Test ===")
+    print("=== Prefix Cache Accuracy Test ===")
     print(f"Server: {base_url}")
     print(f"Model: {model}")
     print(f"Questions per round: {len(TEST_QUESTIONS)}")

@@ -175,7 +175,9 @@ def cp_mha_gather_cache(
         num_heads = key_cache.shape[2]
     else:
         # SHUFFLE: K [num_blocks, num_heads, head_dim//x, page_size, x]
-        assert key_cache.dim() == 5 and head_dim == key_cache.shape[2] * key_cache.shape[4]
+        assert (
+            key_cache.dim() == 5 and head_dim == key_cache.shape[2] * key_cache.shape[4]
+        )
         page_size = key_cache.shape[3]
         num_heads = key_cache.shape[1]
 

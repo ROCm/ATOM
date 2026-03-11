@@ -77,6 +77,7 @@ if is_rocm_aiter_fp4bmm_enabled():
 
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 
+
 # MLA Specific Arguments
 @dataclass
 class MLAModules:
@@ -659,9 +660,7 @@ class MLAAttention(nn.Module):
             if use_prefix_cache:
                 total_tokens = attn_metadata.cu_seqlens_k[-1].item()
                 output_dtype = (
-                    dtypes.fp8
-                    if self.kv_cache_dtype.startswith("fp8")
-                    else self.dtype
+                    dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
                 )
                 k_full = torch.empty(
                     (

@@ -7,14 +7,13 @@ from typing import Any, Dict, Generic, Optional, Type, TypeVar
 
 import torch
 from atom.model_engine.scheduler import ScheduledBatch
-
-logger = logging.getLogger("atom")
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData
 from torch import nn
 
+logger = logging.getLogger("atom")
 T = TypeVar("T", bound="BroadcastableModelInput")
 
 
