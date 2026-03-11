@@ -1329,9 +1329,26 @@ class DeepseekV2MLAAttention(nn.Module):
         )
 
         rope_params = config.rope_parameters
-        rope_params["rope_type"] = "deepseek_yarn"
-        rope_theta = rope_params["rope_theta"]
-        rope_scaling = rope_params
+        rope_theta = rope_params.get("rope_theta") or 10000
+        # Only use YaRN scaling when config has it (e.g. DeepSeek with factor/type "yarn").
+        # GLM-5 has no rope_scaling in config -> use default RoPE (no scaling).
+        use_yarn = (
+            rope_params.get("factor", 1.0) not in (1.0, None)
+            or rope_params.get("type") in ("yarn", "deepseek_yarn")
+            or rope_params.get("rope_type") in ("yarn", "deepseek_yarn")
+        )
+        if use_yarn:
+            rope_scaling = dict(rope_params)
+            rope_scaling["rope_type"] = "deepseek_yarn"
+            if "original_max_position_embeddings" not in rope_scaling:
+                factor = float(rope_scaling.get("factor", 1.0))
+                rope_scaling["original_max_position_embeddings"] = (
+                    int(max_position_embeddings / factor)
+                    if factor > 0
+                    else max_position_embeddings
+                )
+        else:
+            rope_scaling = None
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
@@ -1340,9 +1357,9 @@ class DeepseekV2MLAAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=False,
         )
-        if rope_params:
-            mscale_all_dim = rope_params.get("mscale_all_dim", False)
-            scaling_factor = rope_params["factor"]
+        if rope_scaling:
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+            scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
@@ -1897,4 +1914,10 @@ class DeepseekV2ForCausalLM(nn.Module):
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
+    pass
+
+
+class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
+    """GLM 5.0 MoE (structurally similar to DeepSeek v3.2). Reuses DeepseekV2 implementation."""
+
     pass
