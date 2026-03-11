@@ -1,11 +1,7 @@
-from typing import Optional
-import logging
 import functools
 
 import torch
 from atom.utils import envs
-
-logger = logging.getLogger("atom")
 
 
 def set_default_quant_scales(

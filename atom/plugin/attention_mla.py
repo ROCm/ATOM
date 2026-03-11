@@ -414,9 +414,6 @@ class MLAAttentionImplPluginModeMethods:
         # TODO (zyongye): Prefill function hereplugin_metadata
         assert attn_metadata.plugin_metadata.prefill is not None
         assert self.dcp_world_size != -1
-        # prefill_metadata = attn_metadata.plugin_metadata.prefill
-        # from vllm.platforms import current_platform
-        # use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()
 
         has_context = attn_metadata.plugin_metadata.prefill.chunked_context is not None
 

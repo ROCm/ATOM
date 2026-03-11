@@ -1,6 +1,5 @@
 from typing import Optional
 import logging
-import functools
 
 import torch
 from atom.plugin.prepare import _set_framework_backbone
