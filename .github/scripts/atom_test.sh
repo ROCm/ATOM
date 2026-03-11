@@ -20,18 +20,45 @@ if [ "$TYPE" == "launch" ]; then
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
+  # Phase 1: Wait for HTTP server to be up via /health endpoint
   max_retries=30
   retry_interval=60
+  server_up=false
   for ((i=1; i<=max_retries; i++)); do
-      if curl -s http://localhost:8000/v1/completions -o /dev/null; then
-          echo "ATOM server is up."
+      if curl -sf http://localhost:8000/health -o /dev/null; then
+          echo "ATOM server HTTP endpoint is up."
+          server_up=true
           break
       fi
       echo "Waiting for ATOM server to be ready... ($i/$max_retries)"
       sleep $retry_interval
   done
-  if ! curl -s http://localhost:8000/v1/completions -o /dev/null; then
+  if [ "$server_up" = false ]; then
       echo "ATOM server did not start after $((max_retries * retry_interval)) seconds."
+      kill $atom_server_pid
+      exit 1
+  fi
+
+  # Phase 2: Warmup - send a real completion request to ensure model is fully ready
+  # (CUDA graph capture, JIT compilation, etc. may still be in progress after /health returns OK)
+  echo "========== Warming up ATOM server =========="
+  warmup_retries=10
+  warmup_interval=30
+  warmup_done=false
+  for ((i=1; i<=warmup_retries; i++)); do
+      if curl -sf http://localhost:8000/v1/completions \
+          -H "Content-Type: application/json" \
+          -d '{"model":"'"$MODEL_PATH"'","prompt":"hi","max_tokens":1}' \
+          -o /dev/null --max-time 120; then
+          echo "ATOM server warmup completed successfully."
+          warmup_done=true
+          break
+      fi
+      echo "Warmup attempt $i/$warmup_retries failed, retrying in ${warmup_interval}s..."
+      sleep $warmup_interval
+  done
+  if [ "$warmup_done" = false ]; then
+      echo "ATOM server warmup failed after $((warmup_retries * warmup_interval)) seconds."
       kill $atom_server_pid
       exit 1
   fi
@@ -51,7 +78,7 @@ if [ "$TYPE" == "accuracy" ]; then
   mkdir -p accuracy_test_results
   RESULT_FILENAME=accuracy_test_results/$(date +%Y%m%d%H%M%S).json
   lm_eval --model local-completions \
-          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False \
+          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
           --tasks gsm8k \
           --num_fewshot 3 \
           --output_path "${RESULT_FILENAME}"
