@@ -158,6 +158,48 @@ python -m atom.benchmarks.benchmark_serving \
   --result-dir=./ --result-filename=$RESULT_FILENAME.json
 ```
 
+### Profile Analyze
+
+ATOM supports automatic trace collection and analysis, which breaks down GPU kernel durations per module for both **prefill** and **decode** phases and exports the results to Excel (`.xlsx`) files.
+
+#### Step 1: Collect a Trace
+
+Launch the server with `--torch-profiler-dir` to enable the PyTorch profiler and `--mark-trace` to insert per-module annotations into the trace. Set `TORCHINDUCTOR_COMPILE_THREADS=1` to ensure deterministic compilation order.
+
+```bash
+TORCHINDUCTOR_COMPILE_THREADS=1 python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-R1 \
+  --kv_cache_dtype fp8 -tp 8 \
+  --torch-profiler-dir ./trace \
+  --mark-trace
+```
+
+After the server processes requests and shuts down, a `*.json.gz` trace file will be generated in the `--torch-profiler-dir` directory.
+
+#### Step 2: Analyze the Trace
+
+Run `parse_trace.py` on the collected trace file:
+
+```bash
+python ATOM/tools/parse_trace.py ./trace/my_trace.json.gz
+```
+
+This produces two Excel files in the current directory:
+
+| Output File | Description |
+|---|---|
+| `prefill_breakdown.xlsx` | Per-kernel duration breakdown for one prefill layer |
+| `decode_breakdown.xlsx` | Per-kernel duration breakdown for one decode layer |
+
+Each file contains columns: `cpu_module`, `gpu_kernel`, `duration_us`, `sum per module`, plus averaged values across layers.
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--layer N` | `3` | Target transformer layer index to analyze (0-indexed) |
+
+
 ## 📊 Performance
 
 ### Online Serving Throughput
