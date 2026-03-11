@@ -311,11 +311,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
 
-            if attn_metadata.block_tables is None:
-                self.prepare_block_tables(batch)
-                attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+            # kv_indices_generate_triton expects RAW block_tables (physical block ids,
+            # one per block_ratio tokens). When is_sparse, attn_metadata.block_tables
+            # may have been overwritten with block_tables_converted (slot per token).
+            # Always use raw block_tables for kv_indices.
+            self.prepare_block_tables(batch)
+            block_tables_for_kv = var["block_tables"].copy_to_gpu(bs)
             kv_indices_generate_triton(
-                attn_metadata.block_tables,
+                block_tables_for_kv,
                 attn_metadata.kv_indices,
                 attn_metadata.kv_indptr,
                 self.block_ratio,

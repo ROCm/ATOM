@@ -75,258 +75,7 @@ if is_rocm_aiter_fp4bmm_enabled():
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
     from atom.model_ops.utils import quark_post_load_weights
 
-
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _triton_gather_kv_b_proj(
-    batch_size,
-    k_buffer,  # [num_block, block_size, kv_c_dim + kv_pe_dim]
-    k_scale,  # [1] or None
-    kv_indptr,  # [batch_size + 1]
-    kv_indices,  # [total_kv]
-    kv_prefix_sum_context_lens,  # [batch_size + 1]
-    kv_proj_weight,  # [tp_k_head_num * 2 * qk_nope_head_dim, kv_c_dim]
-    kv_proj_scale,  # [tp_k_head_num * 2 * qk_nope_head_dim // 128, kv_c_dim // 128]
-    k_prefix,  # [total_kv, tp_k_head_num * qk_nope_head_dim + kv_pe_dim]
-    v_prefix,  # [total_kv, tp_k_head_num * qk_nope_head_dim]
-    KBlockSize: tl.constexpr,
-    TpNumHeads: tl.constexpr,
-    QkNopeHeadDim: tl.constexpr,
-    KV_CDim: tl.constexpr,
-    KV_PeDim: tl.constexpr,
-    ChunkK: tl.constexpr,
-):
-    stride_k_buffer: tl.constexpr = KBlockSize * (KV_CDim + KV_PeDim)
-    stride_k_prefix: tl.constexpr = TpNumHeads * (QkNopeHeadDim + KV_PeDim)
-    stride_v_prefix: tl.constexpr = TpNumHeads * QkNopeHeadDim
-
-    ScaleKGranularity: tl.constexpr = 128
-    ScaleNGranularity: tl.constexpr = 128
-    KBlocksPerChunkK: tl.constexpr = ChunkK // KBlockSize
-    assert KV_CDim == 4 * ScaleKGranularity
-
-    # ===---------------------------------------------------
-    # Workload Partition
-    # ===---------------------------------------------------
-    pid = tl.program_id(0)
-    pid_batch = pid // TpNumHeads
-    pid_head = pid % TpNumHeads
-
-    kv_block_start = tl.load(kv_indptr + pid_batch)
-    kv_block_end = tl.load(kv_indptr + pid_batch + 1)
-
-    context_start = tl.load(kv_prefix_sum_context_lens + pid_batch)
-    context_end = tl.load(kv_prefix_sum_context_lens + pid_batch + 1)
-
-    total_kv_block = kv_block_end - kv_block_start
-    total_kv_chunk = (total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK
-
-    # ===---------------------------------------------------
-    # Pipeline Start
-    # ===---------------------------------------------------
-    k_type = k_buffer.dtype.element_ty
-    if k_type == tl.bfloat16:
-        k_scalar_scale = 1.0
-    else:
-        k_scalar_scale = tl.load(k_scale)
-
-    k_nope_weight_base_offset = (
-        kv_proj_weight
-        + pid_head * 2 * QkNopeHeadDim * KV_CDim
-        + tl.arange(0, QkNopeHeadDim)[:, None] * KV_CDim
-        + tl.arange(0, ScaleKGranularity)[None, :]
-    )
-    k_nope_scale_base_offset = (
-        kv_proj_scale
-        + pid_head
-        * 2
-        * QkNopeHeadDim
-        * KV_CDim
-        // ScaleKGranularity
-        // ScaleNGranularity
-        + tl.arange(0, QkNopeHeadDim // ScaleNGranularity)
-        * (KV_CDim // ScaleKGranularity)
-    )
-
-    k_nope_weight_0 = tl.load(k_nope_weight_base_offset + 0 * ScaleKGranularity).to(
-        k_type
-    )
-    k_nope_weight_1 = tl.load(k_nope_weight_base_offset + 1 * ScaleKGranularity).to(
-        k_type
-    )
-    k_nope_weight_2 = tl.load(k_nope_weight_base_offset + 2 * ScaleKGranularity).to(
-        k_type
-    )
-    k_nope_weight_3 = tl.load(k_nope_weight_base_offset + 3 * ScaleKGranularity).to(
-        k_type
-    )
-
-    v_nope_weight_0 = tl.load(
-        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 0 * ScaleKGranularity
-    ).to(k_type)
-    v_nope_weight_1 = tl.load(
-        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 1 * ScaleKGranularity
-    ).to(k_type)
-    v_nope_weight_2 = tl.load(
-        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 2 * ScaleKGranularity
-    ).to(k_type)
-    v_nope_weight_3 = tl.load(
-        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 3 * ScaleKGranularity
-    ).to(k_type)
-
-    k_nope_scale_0 = tl.load(k_nope_scale_base_offset + 0)
-    k_nope_scale_1 = tl.load(k_nope_scale_base_offset + 1)
-    k_nope_scale_2 = tl.load(k_nope_scale_base_offset + 2)
-    k_nope_scale_3 = tl.load(k_nope_scale_base_offset + 3)
-
-    v_nope_scale_0 = tl.load(
-        k_nope_scale_base_offset
-        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
-        + 0
-    )
-    v_nope_scale_1 = tl.load(
-        k_nope_scale_base_offset
-        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
-        + 1
-    )
-    v_nope_scale_2 = tl.load(
-        k_nope_scale_base_offset
-        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
-        + 2
-    )
-    v_nope_scale_3 = tl.load(
-        k_nope_scale_base_offset
-        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
-        + 3
-    )
-
-    for chunk_id in range(total_kv_chunk):
-        kv_block_idx = tl.load(
-            kv_indices
-            + kv_block_start
-            + chunk_id * KBlocksPerChunkK
-            + tl.arange(0, ChunkK) // KBlockSize,
-            mask=chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
-            < total_kv_block,
-        )
-        kv_c_data_base_offset = (
-            kv_block_idx[:, None] * stride_k_buffer
-            + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
-            + tl.arange(0, ScaleKGranularity)[None, :]
-        )  # [ChunkK, kv_c_dim]
-
-        accum_k = tl.zeros((ChunkK, QkNopeHeadDim), dtype=tl.float32)
-        accum_v = tl.zeros((ChunkK, QkNopeHeadDim), dtype=tl.float32)
-
-        kv_c_data_0 = tl.load(k_buffer + kv_c_data_base_offset + 0 * ScaleKGranularity)
-        kv_c_data_1 = tl.load(k_buffer + kv_c_data_base_offset + 1 * ScaleKGranularity)
-        kv_c_data_2 = tl.load(k_buffer + kv_c_data_base_offset + 2 * ScaleKGranularity)
-        kv_c_data_3 = tl.load(k_buffer + kv_c_data_base_offset + 3 * ScaleKGranularity)
-        kv_pe_data = tl.load(
-            k_buffer
-            + kv_block_idx[:, None] * stride_k_buffer
-            + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
-            + KV_CDim
-            + tl.arange(0, KV_PeDim)[None, :],
-        )
-
-        accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0
-        accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0
-        accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1
-        accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1
-        accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2
-        accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2
-        accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3
-        accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3
-
-        accum_k *= k_scalar_scale
-        accum_v *= k_scalar_scale
-        kv_pe_data *= k_scalar_scale
-
-        context_mask = (
-            context_start + chunk_id * ChunkK + tl.arange(0, ChunkK) < context_end
-        )
-        tl.store(
-            k_prefix
-            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
-            * stride_k_prefix
-            + pid_head * (QkNopeHeadDim + KV_PeDim)
-            + QkNopeHeadDim
-            + tl.arange(0, KV_PeDim)[None, :],
-            kv_pe_data,
-            mask=context_mask[:, None],
-        )
-        tl.store(
-            k_prefix
-            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
-            * stride_k_prefix
-            + pid_head * (QkNopeHeadDim + KV_PeDim)
-            + tl.arange(0, QkNopeHeadDim)[None, :],
-            accum_k,
-            mask=context_mask[:, None],
-        )
-        tl.store(
-            v_prefix
-            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
-            * stride_v_prefix
-            + pid_head * QkNopeHeadDim
-            + tl.arange(0, QkNopeHeadDim)[None, :],
-            accum_v,
-            mask=context_mask[:, None],
-        )
-
-def gather_kv_b_proj(
-    k_buffer: torch.Tensor,  # [num_block, block_size, hidden_dim]
-    k_scale: torch.Tensor,  # [1]
-    kv_indptr: torch.Tensor,  # [batch_size + 1]
-    kv_indices: torch.Tensor,  # len(kv_indices) = kv_indptr[-1]
-    kv_prefix_sum_context_lens: torch.Tensor,  # [batch_size + 1]
-    kv_proj_weight: torch.Tensor,  # [2 * 128 // TP * 128, 512]
-    kv_proj_scale: torch.Tensor,  # [2 * 128 // TP, 4], blockscale=128 x 128
-    k_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim]
-    v_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim]
-):
-    num_block, block_size, hidden_dim = k_buffer.shape
-    batch_size = kv_indptr.shape[0] - 1
-    weight_n, weight_k = kv_proj_weight.shape
-    scale_n, scale_k = kv_proj_scale.shape
-    total_kv_k, tp_k_head_num_k, qk_nope_pe_dim = k_prefix.shape
-    total_kv_v, tp_k_head_num_v, qk_nope_dim = v_prefix.shape
-
-    scale_k_granularity = weight_k // scale_k
-    scale_n_granularity = weight_n // scale_n
-
-    ChunkK = 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
-
-    assert total_kv_k == total_kv_v
-    assert tp_k_head_num_k == tp_k_head_num_v
-    assert scale_k_granularity == 128
-    assert scale_n_granularity == 128
-    assert ChunkK % block_size == 0
-
-    grid = (batch_size * tp_k_head_num_k,)
-    kernel = _triton_gather_kv_b_proj[grid](
-        batch_size,
-        k_buffer,
-        k_scale,
-        kv_indptr,
-        kv_indices,
-        kv_prefix_sum_context_lens,
-        kv_proj_weight,
-        kv_proj_scale,
-        k_prefix,
-        v_prefix,
-        KBlockSize=block_size,
-        TpNumHeads=tp_k_head_num_k,
-        QkNopeHeadDim=qk_nope_dim,
-        KV_CDim=weight_k,
-        KV_PeDim=qk_nope_pe_dim - qk_nope_dim,
-        ChunkK=ChunkK,
-        num_stages=3,
-    )
+from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 
 # MLA Specific Arguments
 @dataclass
@@ -697,133 +446,6 @@ class MLAAttention(nn.Module):
 
         return self.o_proj(output.flatten(start_dim=-2))
 
-    def _forward_prefill_mha_prefix_cache(
-        self,
-        q: torch.Tensor,
-        k_prefix: torch.Tensor,
-        v_prefix: torch.Tensor,
-        kv_c_normed: torch.Tensor,
-        k_rope: torch.Tensor,
-        attn_metadata: AttentionMetaData,
-    ) -> torch.Tensor:
-        """Prefill MHA with prefix cache (doc §4.3, §4.4): project new tokens,
-        concat [cached | new] per batch, flash attention."""
-        assert attn_metadata is not None and attn_metadata.has_cached
-
-        if k_rope.dim() == 2:
-            k_rope = k_rope.unsqueeze(1)
-
-        # Step 4.3: Project new tokens' latent to k_new, v_new
-        if use_triton_gemm():
-            weight = self.kv_b_proj.weight
-            weight_scale = self.kv_b_proj.weight_scale
-            if (
-                fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
-                and weight.dtype == dtypes.fp8
-            ):
-                weight_shuffled = weight.reshape(
-                    weight.shape[0] // 16, weight.shape[1] * 16
-                )
-                output_dtype = kv_c_normed.dtype
-                quant_func = functools_partial(
-                    get_hip_quant(QuantType.per_1x128), transpose_scale=True
-                )
-                q_input, x_scale = quant_func(
-                    kv_c_normed,
-                    quant_dtype=dtypes.fp8,
-                    scale=getattr(self.kv_b_proj, "input_scale", None),
-                )
-                k_nope_new, v_new = fused_gemm_a8w8_blockscale_preshuffle_split_cat(
-                    q_input,
-                    weight_shuffled,
-                    k_rope.expand((-1, self.num_heads, -1)),
-                    x_scale,
-                    weight_scale,
-                    self.qk_nope_head_dim,
-                    self.v_head_dim,
-                    output_dtype,
-                )
-            else:
-                kv_nope = self.kv_b_proj(kv_c_normed).view(
-                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-                )
-                k_nope_new, v_new = kv_nope.split(
-                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-                )
-            k_new = torch.cat(
-                (k_nope_new, k_rope.expand((*k_nope_new.shape[:-1], -1))), dim=-1
-            )
-        else:
-            kv_nope = self.kv_b_proj(kv_c_normed).view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope_new, v_new = kv_nope.split(
-                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-            )
-            k_new = torch.cat(
-                (k_nope_new, k_rope.expand((*k_nope_new.shape[:-1], -1))), dim=-1
-            )
-
-        # Step 4.4: Concat [cached | new] per batch, flash attention
-        bs = attn_metadata.cu_seqlens_q.shape[0] - 1
-        cu_seqlens_q = attn_metadata.cu_seqlens_q
-        cu_seqlens_k = attn_metadata.cu_seqlens_k
-        num_cached_tokens = attn_metadata.num_cached_tokens
-
-        total_tokens = cu_seqlens_k[-1].item()
-        output_dtype = q.dtype
-        k_full = torch.empty(
-            (total_tokens, self.num_heads, self.qk_head_dim),
-            dtype=output_dtype,
-            device=q.device,
-        )
-        v_full = torch.empty(
-            (total_tokens, self.num_heads, self.v_head_dim),
-            dtype=output_dtype,
-            device=q.device,
-        )
-
-        cached_offset = 0
-        for i in range(bs):
-            start = cu_seqlens_k[i].item()
-            end = cu_seqlens_k[i + 1].item()
-            cached_i = num_cached_tokens[i].item()
-            new_i = end - start - cached_i
-
-            # k_prefix/v_prefix are 2D [total_cached, num_heads*head_dim], reshape to 3D
-            k_full[start : start + cached_i] = (
-                k_prefix[cached_offset : cached_offset + cached_i]
-                .view(cached_i, self.num_heads, self.qk_head_dim)
-                .to(output_dtype)
-            )
-            v_full[start : start + cached_i] = (
-                v_prefix[cached_offset : cached_offset + cached_i]
-                .view(cached_i, self.num_heads, self.v_head_dim)
-                .to(output_dtype)
-            )
-
-            new_start = cu_seqlens_q[i].item()
-            k_full[start + cached_i : end] = k_new[new_start : new_start + new_i]
-            v_full[start + cached_i : end] = v_new[new_start : new_start + new_i]
-
-            cached_offset += cached_i
-
-        output = flash_attn_varlen_func(
-            q=q,
-            k=k_full,
-            v=v_full,
-            cu_seqlens_q=attn_metadata.cu_seqlens_q,
-            cu_seqlens_k=attn_metadata.cu_seqlens_k,
-            max_seqlen_q=attn_metadata.max_seqlen_q,
-            max_seqlen_k=attn_metadata.max_seqlen_k,
-            min_seqlen_q=attn_metadata.min_seqlen_q,
-            dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
-            causal=True,
-        )
-
-        return self.o_proj(output.flatten(start_dim=-2))
-
     def _forward_prefill_mla(
         self,
         q: torch.Tensor,
@@ -1018,85 +640,6 @@ class MLAAttention(nn.Module):
                 and self.qk_nope_head_dim == self.v_head_dim
             )
 
-            # Step 4.1: Build cached-only metadata (doc §4.1)
-            if use_prefix_cache:
-                num_cached_tokens = attn_metadata.num_cached_tokens
-                bs = num_cached_tokens.shape[0]
-                total_cached = num_cached_tokens.sum().item()
-                block_size = kv_cache.shape[1]
-                num_cached_blocks = (
-                    num_cached_tokens.to(q.device) + block_size - 1
-                ) // block_size
-
-                kv_indptr_cached = torch.zeros(
-                    bs + 1, dtype=torch.int32, device=q.device
-                )
-                kv_indptr_cached[1:] = torch.cumsum(num_cached_blocks, dim=0)
-                kv_prefix_sum_context_lens = torch.zeros(
-                    bs + 1, dtype=torch.int32, device=q.device
-                )
-                kv_prefix_sum_context_lens[1:] = torch.cumsum(
-                    num_cached_tokens.to(q.device), dim=0
-                )
-
-                kv_indices_cached = torch.empty(
-                    kv_indptr_cached[-1].item(),
-                    dtype=torch.int32,
-                    device=q.device,
-                )
-                block_tables = attn_metadata.block_tables
-                for i in range(bs):
-                    n = num_cached_blocks[i].item()
-                    if n > 0:
-                        kv_indices_cached[
-                            kv_indptr_cached[i].item() : kv_indptr_cached[
-                                i + 1
-                            ].item()
-                        ] = block_tables[i, :n]
-
-                # Step 4.2: gather_kv_b_proj - Gather + Project (doc §4.2)
-                k_prefix = torch.zeros(
-                    (
-                        total_cached,
-                        self.num_heads
-                        * (self.qk_nope_head_dim + self.qk_rope_head_dim),
-                    ),
-                    device=q.device,
-                    dtype=(
-                        dtypes.fp8
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else self.dtype
-                    ),
-                )
-                v_prefix = torch.zeros(
-                    (
-                        total_cached,
-                        self.num_heads * self.qk_nope_head_dim,
-                    ),
-                    device=q.device,
-                    dtype=(
-                        dtypes.fp8
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else self.dtype
-                    ),
-                )
-
-                gather_kv_b_proj(
-                    kv_cache,
-                    self._k_scale,
-                    kv_indptr_cached,
-                    kv_indices_cached,
-                    kv_prefix_sum_context_lens,
-                    self.kv_b_proj.weight,
-                    self.kv_b_proj.weight_scale,
-                    k_prefix.view(
-                        -1,
-                        self.num_heads,
-                        self.qk_nope_head_dim + self.qk_rope_head_dim,
-                    ),
-                    v_prefix.view(-1, self.num_heads, self.qk_nope_head_dim),
-                )
-
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
@@ -1113,16 +656,57 @@ class MLAAttention(nn.Module):
                     scale=self._k_scale,
                 )
 
-            # Step 4.3-4.4: Concat cached + new, flash attention (doc §4.3, §4.4)
             if use_prefix_cache:
-                output = self._forward_prefill_mha_prefix_cache(
-                    prefill_q,
-                    k_prefix,
-                    v_prefix,
-                    k_nope,
-                    k_rope,
-                    attn_metadata,
+                total_tokens = attn_metadata.cu_seqlens_k[-1].item()
+                output_dtype = (
+                    dtypes.fp8
+                    if self.kv_cache_dtype.startswith("fp8")
+                    else self.dtype
                 )
+                k_full = torch.empty(
+                    (
+                        total_tokens,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    ),
+                    device=q.device,
+                    dtype=output_dtype,
+                )
+                v_full = torch.empty(
+                    (
+                        total_tokens,
+                        self.num_heads,
+                        self.qk_nope_head_dim,
+                    ),
+                    device=q.device,
+                    dtype=output_dtype,
+                )
+
+                gather_kv_b_proj(
+                    kv_cache,
+                    self._k_scale,
+                    attn_metadata.kv_indptr,
+                    attn_metadata.kv_indices,
+                    attn_metadata.cu_seqlens_k,
+                    self.kv_b_proj.weight,
+                    self.kv_b_proj.weight_scale,
+                    k_full,
+                    v_full,
+                )
+                output = flash_attn_varlen_func(
+                    q=prefill_q,
+                    k=k_full,
+                    v=v_full,
+                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                    cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                    max_seqlen_q=attn_metadata.max_seqlen_q,
+                    max_seqlen_k=attn_metadata.max_seqlen_k,
+                    min_seqlen_q=attn_metadata.min_seqlen_q,
+                    dropout_p=attn_metadata.dropout_p,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+                output = self.o_proj(output.flatten(start_dim=-2))
             else:
                 output = self._forward_prefill_mha(
                     prefill_q, k_nope, k_rope, kv_cache, attn_metadata
