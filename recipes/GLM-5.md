@@ -58,6 +58,11 @@ The performance number on 8 ranks is provided as a reference, with the following
 
 | ISL  | OSL  | Concurrency | Num Prompts | Output Throughput (tok/s) | Total Throughput (tok/s) |
 | ---- | ---- | ----------- | ----------- | ------------------------- | ------------------------ |
+| 1024 | 1024 | 4           | 40          | 151.13                    | 303.73                   |
+| 1024 | 1024 | 8           | 80          | 285.37                    | 568.63                   |
+| 1024 | 1024 | 16          | 160         | 528.32                    | 1062.26                  |
+| 1024 | 1024 | 32          | 320         | 925.64                    | 1848.35                  |
+| 1024 | 1024 | 64          | 640         | 1605.75                   | 3212.22                  |
 | 1024 | 1024 | 128         | 1280        | 2738.57                   | 5483.16                  |
 
 Here are the steps to reinstall ATOM/AITER in the docker, if you are trying to verify with other specific commits:
