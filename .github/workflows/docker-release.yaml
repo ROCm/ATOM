@@ -23,11 +23,15 @@ on:
       rccl_branch:
         description: "RCCL branch"
         default: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
+      runner:
+        description: "Runner label to use"
+        type: string
+        default: "linux-atom-mi355-1"
 
 jobs:
   docker-release:
     name: Nightly Docker Release
-    runs-on: linux-atom-mi355-1
+    runs-on: ${{ inputs.runner || 'linux-atom-mi355-1' }}
     strategy:
       fail-fast: false
       matrix:
