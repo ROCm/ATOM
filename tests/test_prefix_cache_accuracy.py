@@ -40,16 +40,46 @@ Answer: Shawn started with 5 toys. If he got 2 toys each from his mom and dad, t
 
 # Test questions with known answers
 TEST_QUESTIONS = [
-    ("A farmer has 17 sheep. He buys 5 more and then sells 8. How many sheep does he have?", 14),
-    ("A store had 45 apples. They sold 12 in the morning and 18 in the afternoon. How many apples are left?", 15),
-    ("Tom has 8 marbles. Jerry has 3 times as many. How many marbles do they have together?", 32),
-    ("A classroom has 6 rows of desks with 5 desks in each row. If 7 desks are removed, how many remain?", 23),
-    ("Sarah baked 24 cookies. She gave 1/3 to her neighbor and ate 4 herself. How many cookies does she have left?", 12),
-    ("A train travels 60 miles per hour for 3 hours, then 40 miles per hour for 2 hours. What is the total distance?", 260),
-    ("Mike has 50 dollars. He spends 15 dollars on lunch and 20 dollars on a book. How much money does he have left?", 15),
-    ("A garden has 9 rose bushes. Each bush has 12 roses. If 25 roses are picked, how many roses remain?", 83),
-    ("Lisa read 35 pages on Monday and twice as many on Tuesday. How many pages did she read in total?", 105),
-    ("A box contains 100 balls. 40 are red, 35 are blue, and the rest are green. How many green balls are there?", 25),
+    (
+        "A farmer has 17 sheep. He buys 5 more and then sells 8. How many sheep does he have?",
+        14,
+    ),
+    (
+        "A store had 45 apples. They sold 12 in the morning and 18 in the afternoon. How many apples are left?",
+        15,
+    ),
+    (
+        "Tom has 8 marbles. Jerry has 3 times as many. How many marbles do they have together?",
+        32,
+    ),
+    (
+        "A classroom has 6 rows of desks with 5 desks in each row. If 7 desks are removed, how many remain?",
+        23,
+    ),
+    (
+        "Sarah baked 24 cookies. She gave 1/3 to her neighbor and ate 4 herself. How many cookies does she have left?",
+        12,
+    ),
+    (
+        "A train travels 60 miles per hour for 3 hours, then 40 miles per hour for 2 hours. What is the total distance?",
+        260,
+    ),
+    (
+        "Mike has 50 dollars. He spends 15 dollars on lunch and 20 dollars on a book. How much money does he have left?",
+        15,
+    ),
+    (
+        "A garden has 9 rose bushes. Each bush has 12 roses. If 25 roses are picked, how many roses remain?",
+        83,
+    ),
+    (
+        "Lisa read 35 pages on Monday and twice as many on Tuesday. How many pages did she read in total?",
+        105,
+    ),
+    (
+        "A box contains 100 balls. 40 are red, 35 are blue, and the rest are green. How many green balls are there?",
+        25,
+    ),
 ]
 
 
@@ -68,7 +98,9 @@ def get_model_name(base_url: str) -> str:
     return resp.json()["data"][0]["id"]
 
 
-def send_completion(prompt: str, max_tokens: int = 256, base_url: str = BASE_URL, model: str = "") -> str:
+def send_completion(
+    prompt: str, max_tokens: int = 256, base_url: str = BASE_URL, model: str = ""
+) -> str:
     """Send a completion request to the server."""
     resp = requests.post(
         f"{base_url}/v1/completions",
@@ -108,7 +140,9 @@ def run_batch(questions, prefix, base_url=BASE_URL, model="", label=""):
 
 def main():
     parser = argparse.ArgumentParser(description="Test prefix cache accuracy")
-    parser.add_argument("--rounds", type=int, default=3, help="Number of rounds to repeat")
+    parser.add_argument(
+        "--rounds", type=int, default=3, help="Number of rounds to repeat"
+    )
     parser.add_argument("--base-url", type=str, default=BASE_URL)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -136,12 +170,20 @@ def main():
 
     for round_num in range(1, args.rounds + 1):
         t0 = time.time()
-        correct, total, results = run_batch(TEST_QUESTIONS, MATH_PREFIX, base_url=base_url, model=model, label=f"Round {round_num}")
+        correct, total, results = run_batch(
+            TEST_QUESTIONS,
+            MATH_PREFIX,
+            base_url=base_url,
+            model=model,
+            label=f"Round {round_num}",
+        )
         elapsed = time.time() - t0
         accuracy = 100.0 * correct / total
         all_round_results.append((correct, total, accuracy, elapsed))
 
-        print(f"Round {round_num}: {correct}/{total} correct ({accuracy:.1f}%) in {elapsed:.1f}s")
+        print(
+            f"Round {round_num}: {correct}/{total} correct ({accuracy:.1f}%) in {elapsed:.1f}s"
+        )
 
         if args.verbose:
             for q, expected, got, ok, resp in results:
