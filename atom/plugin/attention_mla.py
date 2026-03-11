@@ -570,10 +570,12 @@ class MLAAttentionImplPluginModeMethods:
         #     q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
+        if self.head_repeat_factor > 1:
+            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
         B = q.shape[0]
         o = torch.empty(
             B,
-            self.num_heads,
+            self.padded_num_heads,
             self.kv_lora_rank,
             dtype=attn_metadata.plugin_metadata.decode.attn_out_dtype,
             device=q.device,
@@ -621,6 +623,8 @@ class MLAAttentionImplPluginModeMethods:
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
         )
+        if self.head_repeat_factor > 1:
+            o = o[:, :: self.head_repeat_factor, :]
         return o, None
 
     def forward_impl_plugin_mode(
