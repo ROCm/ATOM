@@ -258,7 +258,6 @@ class LayerQuantConfig(dict):
         quant_dtype=torch.bfloat16,
         is_dynamic=True,
         quant_method="",
-        quant_name="",
     ):
         """
         Core components of layer_quant
@@ -268,7 +267,6 @@ class LayerQuantConfig(dict):
         self["quant_dtype"] = quant_dtype if quant_dtype is not None else torch.bfloat16
         self["is_dynamic"] = is_dynamic
         self["quant_method"] = quant_method
-        self["quant_name"] = quant_name
 
 
 class QuantizationConfig:
@@ -282,7 +280,7 @@ class QuantizationConfig:
             self.quant_method = ""
             return
 
-        self.torch_dtype = getattr(config, "torch_dtype", "bf16")
+        self.torch_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         self.hf_quant_config = getattr(config, "quantization_config", None)
         self.global_quant_config = None
         self.layer_quant_config = {}
@@ -317,6 +315,25 @@ class QuantizationConfig:
             )
         else:
             self.parse_other_config()
+
+    def compute_hash(self) -> str:
+        """
+        WARNING: Whenever a new field is added to this config,
+        ensure that it is included in the factors list if
+        it affects the computation graph.
+
+        Provide a hash that uniquely identifies all the configs
+        that affect the structure of the computation
+        graph from input ids/embeddings to the final hidden states,
+        excluding anything before input ids/embeddings and after
+        the final hidden states.
+        """
+        factors: list[Any] = []
+        factors.append(self.global_quant_config)
+        factors.append(self.layer_quant_config)
+        factors.append(self.exclude_layers)
+        hash_value = hashlib.sha256(str(factors).encode()).hexdigest()
+        return hash_value
 
     def get_name(self):
         """
@@ -354,7 +371,7 @@ class QuantizationConfig:
         if input_config:
             # input_dtype = input_config.get("dtype")
             # input_qscheme = cast(str, input_config.get("qscheme"))
-            is_dynamic = cast(bool, input_config.get("is_dynamic"))
+            is_dynamic = cast(bool, input_config.get("is_dynamic", True))
         return LayerQuantConfig(
             quant_type=quant_type,
             quant_dtype=quant_dtype,
@@ -873,9 +890,8 @@ class Config:
 
         # summarize vllm config
         vllm_factors: list[Any] = []
-        # TODO: fix here
-        # if self.quant_config:
-        # vllm_factors.append(self.quant_config.compute_hash())
+        if self.quant_config:
+            vllm_factors.append(self.quant_config.compute_hash())
 
         if self.compilation_config:
             vllm_factors.append(self.compilation_config.compute_hash())

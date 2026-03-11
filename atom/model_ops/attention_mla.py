@@ -621,9 +621,7 @@ class MLAAttention(nn.Module):
                     self.num_heads,
                     self.kv_lora_rank + self.qk_rope_head_dim,
                 ),
-                dtype=(
-                    dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
-                ),
+                dtype=attn_metadata.dtype_q,
                 device=q_nope.device,
             )
             if kv_cache.numel() > 0:

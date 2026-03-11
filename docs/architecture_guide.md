@@ -237,4 +237,4 @@ WAITING ──(scheduled for prefill)──► RUNNING ──(stop condition met
 | `atom/model_engine/request.py` | `RequestOutput` dataclass for streaming callbacks |
 | `atom/model_engine/async_proc.py` | `AsyncIOProcManager` and `AsyncIOProc` for spawning and managing ModelRunner subprocesses |
 | `atom/utils/forward_context.py` | `ForwardContext`, `Context`, `DPMetadata`, `SpecDecodeMetadata`, `AttentionMetaData` dataclasses and global accessors |
-| `atom/config.py` | `Config` master configuration, `ParallelConfig`, `CompilationConfig`, `QuantizationConfig`, `SpeculativeConfig`, `KVCacheTensor` |
+| `atom/config.py` | `Config` master configuration, `ParallelConfig`, `CompilationConfig`, `LayerQuantConfig`, `QuantizationConfig`, `SpeculativeConfig`, `KVCacheTensor` |

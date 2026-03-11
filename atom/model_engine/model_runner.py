@@ -27,7 +27,7 @@ from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
 from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.sampler import Sampler
+from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.eagle import EagleProposer
 from atom.utils import (
     CpuGpuBuffer,
@@ -868,6 +868,8 @@ class ModelRunner:
             "input_ids": self.tokenID_processor.input_ids,
             "positions": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
             "temperatures": CpuGpuBuffer(self.max_bs, **f32_kwargs),
+            "top_ks": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "top_ps": CpuGpuBuffer(self.max_bs, **f32_kwargs),
             # Keep enough space for MTP decode (max_q_len > 1).
             "outputs": torch.empty(
                 self.max_num_batched_tokens, hidden_size, dtype=hidden_type
@@ -1436,23 +1438,61 @@ class ModelRunner:
         )
         return graph_bs
 
-    def prepare_sample(self, batch: ScheduledBatch) -> torch.Tensor:
+    def prepare_sample(
+        self, batch: ScheduledBatch
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool]:
         bs = batch.total_seqs_num
-        buffer = self.forward_vars["temperatures"]
-        buffer.np[:bs] = batch.temperatures
-        return buffer.copy_to_gpu(bs)
+
+        # Check on CPU whether all requests are greedy (temperature=0)
+        all_greedy = (batch.temperatures == 0).all()
+
+        temp_buffer = self.forward_vars["temperatures"]
+        # Clamp temperatures on CPU to avoid division by zero in sampler
+        temp_buffer.np[:bs] = np.maximum(batch.temperatures, SAMPLER_EPS)
+        temperatures = temp_buffer.copy_to_gpu(bs)
+
+        # Check on CPU whether filtering is needed to avoid GPU sync in sampler.
+        # If no filtering needed, return None to skip GPU copy entirely.
+        needs_topk = (batch.top_ks != -1).any()
+        needs_topp = (batch.top_ps < 1.0).any()
+
+        if needs_topk:
+            top_k_buffer = self.forward_vars["top_ks"]
+            top_k_buffer.np[:bs] = batch.top_ks
+            # If all values are the same, only copy one element to save bandwidth
+            if bs > 1 and (batch.top_ks == batch.top_ks[0]).all():
+                top_ks = top_k_buffer.copy_to_gpu(1)
+            else:
+                top_ks = top_k_buffer.copy_to_gpu(bs)
+        else:
+            top_ks = None
+
+        if needs_topp:
+            top_p_buffer = self.forward_vars["top_ps"]
+            top_p_buffer.np[:bs] = batch.top_ps
+            # If all values are the same, only copy one element to save bandwidth
+            if bs > 1 and (batch.top_ps == batch.top_ps[0]).all():
+                top_ps = top_p_buffer.copy_to_gpu(1)
+            else:
+                top_ps = top_p_buffer.copy_to_gpu(bs)
+        else:
+            top_ps = None
+
+        return temperatures, top_ks, top_ps, all_greedy
 
     def prepare_model(self, batch: ScheduledBatch):
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
-        temperatures = self.prepare_sample(batch)
+        temperatures, top_ks, top_ps, all_greedy = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        # self.debug(f"{input_ids=}")
         self.prepare_inputs(batch, input_ids)
         return (
             input_ids,
             temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
         )
 
     def run_model(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1495,13 +1535,18 @@ class ModelRunner:
         batch: ScheduledBatch,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+        all_greedy: bool,
         # following for draft
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
-            sampled_tokens = self.sampler(logits, temperatures)
+            sampled_tokens = self.sampler(
+                logits, temperatures, top_ks, top_ps, all_greedy
+            )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
         else:
@@ -1514,6 +1559,9 @@ class ModelRunner:
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
+                all_greedy=all_greedy,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -1579,12 +1627,15 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        input_ids, temperatures = self.prepare_model(batch)
+        input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids)
         fwd_output = self.postprocess(
             batch,
             logits,
             temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
             hidden_states,
         )
         reset_forward_context()
