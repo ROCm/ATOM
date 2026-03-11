@@ -8,7 +8,6 @@ import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
 from atom.plugin.prepare import is_vllm, is_sglang
-from atom.plugin.vllm.platform import disable_vllm_plugin_attention
 from atom.utils import CpuGpuBuffer, envs
 from atom.config import get_current_atom_config
 
@@ -1388,7 +1387,7 @@ def unified_attention_with_output_base_for_plugin_mode(
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
-        if disable_vllm_plugin_attention:
+        if envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION:
             k_pe = k_pe.unsqueeze(1)
             if self.rotary_emb is not None:
                 q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
