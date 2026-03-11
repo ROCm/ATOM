@@ -17,7 +17,7 @@ from .attention_mla import MLAModules
 
 from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
-
+from atom.utils.decorators import mark_trace
 
 @PagedAttentionImplDecoratorForPluginMode
 class PagedAttentionImpl(nn.Module):
@@ -110,6 +110,7 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache_data = fwd_ctx.kv_cache_data

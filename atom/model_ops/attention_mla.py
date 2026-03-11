@@ -24,6 +24,13 @@ from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+
+concat_and_cache_mla = mark_trace(
+    concat_and_cache_mla, prefix="kv_cache", torch_compile=False
+)
+fused_qk_rope_concat_and_cache_mla = mark_trace(
+    fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
+)
 from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,

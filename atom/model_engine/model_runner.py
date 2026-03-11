@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import time
+import gzip
 from contextlib import nullcontext
 from typing import Any, Optional, Union
 
@@ -688,7 +689,7 @@ class ModelRunner:
         torch.cuda.empty_cache()
         return True
 
-    def start_profiler(self):
+    def start_profiler(self, trace_name: Optional[str] = None):
         """
         Start profiling for this rank.
 
@@ -698,6 +699,33 @@ class ModelRunner:
         """
         if self.profiler_dir is not None and self.profiler is None:
             enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+            model_name = os.path.basename(self.config.model.rstrip("/"))
+            safe_model_name = "".join(
+                c if c.isalnum() or c in ("_", "-", ".") else "_" for c in model_name
+            )
+            worker_name = safe_model_name or "trace"
+            if isinstance(trace_name, str) and trace_name:
+                worker_name = "".join(
+                    c if c.isalnum() or c in ("_", "-", ".") else "_" for c in trace_name
+                )
+            if worker_name == "capture_graph":
+                if safe_model_name:
+                    worker_name = f"{worker_name}_{safe_model_name}"
+            output_prefix = os.path.join(self.profiler_dir, worker_name)
+
+            def _on_trace_ready(prof):
+                # Use a short human-readable timestamp in file name.
+                ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                ms = int((time.time() % 1) * 1000)
+                output_path = f"{output_prefix}_ts_{ts}_{ms:03d}.pt.trace.json.gz"
+                tmp_json_path = output_path[:-3]
+                prof.export_chrome_trace(tmp_json_path)
+                with open(tmp_json_path, "rb") as src, gzip.open(
+                    output_path, "wb"
+                ) as dst:
+                    dst.write(src.read())
+                os.remove(tmp_json_path)
+
             self.profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CPU,
@@ -706,9 +734,7 @@ class ModelRunner:
                 record_shapes=enable_detailed_profiling,
                 with_stack=enable_detailed_profiling,
                 profile_memory=enable_detailed_profiling,
-                on_trace_ready=torch_profiler.tensorboard_trace_handler(
-                    self.profiler_dir, use_gzip=True
-                ),
+                on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
         return True

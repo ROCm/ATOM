@@ -8,6 +8,8 @@ import aiter
 from aiter import dtypes
 from typing import Union, Optional
 
+from atom.utils.decorators import mark_trace
+
 
 def apply_rotary_emb(
     x: torch.Tensor,
@@ -77,6 +79,7 @@ class RotaryEmbedding(nn.Module):
         sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
         return cos, sin
 
+    @mark_trace(prefix="rope_cached")
     def forward(
         self,
         positions: torch.Tensor,

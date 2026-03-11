@@ -12,6 +12,8 @@ import sys
 import bisect
 import argparse
 import re
+import os
+from glob import glob
 from typing import List, Dict, Any, Tuple, Optional
 from openpyxl import Workbook
 
@@ -32,13 +34,6 @@ def load_trace(filepath: str) -> Dict[str, Any]:
     opener = gzip.open if filepath.endswith(".gz") else open
     with opener(filepath, "rt", encoding="utf-8") as f:
         return json.load(f)
-
-
-def is_within(
-    child_ts: float, child_dur: float, parent_ts: float, parent_dur: float
-) -> bool:
-    """Check if child event is within parent's time range."""
-    return child_ts >= parent_ts and (child_ts + child_dur) <= (parent_ts + parent_dur)
 
 
 def is_kernel_launch(name: str) -> bool:
@@ -63,6 +58,42 @@ def is_strict_norm_name(name: str) -> bool:
         return False
     n = name.strip().lower()
     return n == "layernorm" or n == "rmsnorm"
+
+
+def extract_model_name_from_trace_filename(filepath: str) -> Optional[str]:
+    """
+    Extract model name from trace filename prefix before `_ts_`.
+    Examples:
+      - Meta-Llama-3.1-8B-Instruct_ts_... -> Meta-Llama-3.1-8B-Instruct
+      - capture_graph_Meta-Llama-3.1-8B-Instruct_ts_... -> Meta-Llama-3.1-8B-Instruct
+    """
+    base = os.path.basename(filepath)
+    if "_ts_" not in base:
+        return None
+    prefix = base.split("_ts_", 1)[0]
+    if prefix.startswith("capture_graph_"):
+        prefix = prefix[len("capture_graph_") :]
+    return prefix or None
+
+
+def find_capture_graph_trace_path(run_trace_path: str) -> Optional[str]:
+    """
+    Find capture graph trace file in the same directory as the run trace.
+    Pattern: capture_graph_<model>_ts_*.pt.trace.json[.gz]
+    """
+    model_name = extract_model_name_from_trace_filename(run_trace_path)
+    if not model_name:
+        return None
+    trace_dir = os.path.dirname(run_trace_path) or "."
+    pattern = os.path.join(trace_dir, f"capture_graph_{model_name}_ts_*.pt.trace.json*")
+    candidates = sorted(glob(pattern), key=os.path.getmtime, reverse=True)
+    if not candidates:
+        return None
+    run_abs = os.path.abspath(run_trace_path)
+    for fp in candidates:
+        if os.path.abspath(fp) != run_abs:
+            return fp
+    return None
 
 
 def write_breakdown_xlsx(
@@ -311,87 +342,13 @@ class EventIndex:
 
 
 # =============================================================================
-# Legacy functions (for prefill compatibility)
-# =============================================================================
-
-
-def find_events(events: List[Dict], name: str, prefix: bool = False) -> List[Dict]:
-    """Find all duration events (ph='X') with given name, sorted by time."""
-    if prefix:
-        result = [
-            e
-            for e in events
-            if e.get("name", "").startswith(name) and e.get("ph") == "X"
-        ]
-    else:
-        result = [e for e in events if e.get("name") == name and e.get("ph") == "X"]
-    return sorted(result, key=lambda x: x["ts"])
-
-
-def get_gpu_kernels(events: List[Dict], start_ts: float) -> List[Dict]:
-    """Get GPU kernels (cat='kernel') starting from given timestamp."""
-    result = [e for e in events if e.get("cat") == "kernel" and e["ts"] >= start_ts]
-    return sorted(result, key=lambda x: x["ts"])
-
-
-def get_direct_children(parent: Dict, events: List[Dict]) -> List[Dict]:
-    """Get direct children of parent event (excluding nested children)."""
-    p_ts, p_dur = parent["ts"], parent.get("dur", 0)
-
-    candidates = [
-        e
-        for e in events
-        if e.get("ph") == "X"
-        and e is not parent
-        and is_within(e.get("ts", 0), e.get("dur", 0), p_ts, p_dur)
-    ]
-
-    direct = []
-    for c in candidates:
-        c_ts, c_dur = c["ts"], c.get("dur", 0)
-        is_direct = not any(
-            is_within(c_ts, c_dur, o["ts"], o.get("dur", 0))
-            for o in candidates
-            if o is not c
-        )
-        if is_direct:
-            direct.append(c)
-
-    return sorted(direct, key=lambda x: x["ts"])
-
-
-def count_kernel_launches(event: Dict, events: List[Dict]) -> int:
-    """Count kernel launches within event's subtree."""
-    e_ts, e_dur = event["ts"], event.get("dur", 0)
-    return sum(
-        1
-        for e in events
-        if e.get("ph") == "X"
-        and is_kernel_launch(e.get("name", ""))
-        and is_within(e.get("ts", 0), e.get("dur", 0), e_ts, e_dur)
-    )
-
-
-def has_kernel_launch(event: Dict, events: List[Dict]) -> bool:
-    """Check if event's subtree contains any kernel launch."""
-    return count_kernel_launches(event, events) > 0
-
-
-# =============================================================================
 # Parse Functions
 # =============================================================================
 
 
 def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -> None:
     """
-    Parse prefill phase: find the actual prefill event on CPU trace (user_annotation).
-
-    Warmup rule:
-    - If only one prefill exists, it is the actual prefill (no warmup).
-    - If >=2 prefills exist:
-      - If there is a decode_step_bs* event between prefill[0] and prefill[1], prefill[0]
-        is treated as warmup and prefill[1] is the actual prefill.
-      - Otherwise, prefill[0] is the actual prefill.
+    Parse prefill phase from a run trace (no warmup mixed in this trace).
     """
     # CPU side prefill/decode annotations.
     # Accept both legacy "prefill" and traced variants like
@@ -411,33 +368,9 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
         return
 
     actual_prefill_idx = 0
-    warmup_detected = False
-
-    # Only evaluate warmup when there are at least two prefills.
-    if len(prefills) >= 2:
-        first = prefills[0]
-        second = prefills[1]
-        gap_start = first["ts"] + first.get("dur", 0)
-        gap_end = second["ts"]
-
-        # If decode_step_bs appears in [gap_start, gap_end], first prefill is warmup.
-        has_decode_between = any(
-            e.get("ph") == "X"
-            and e.get("cat") == "user_annotation"
-            and e.get("name", "").startswith("decode_step_bs")
-            and gap_start <= e.get("ts", 0) <= gap_end
-            for e in events
-        )
-        if has_decode_between:
-            actual_prefill_idx = 1
-            warmup_detected = True
-
     actual_prefill = prefills[actual_prefill_idx]
     print(f"Found {len(prefills)} prefill events (user_annotation)")
-    if warmup_detected:
-        print("Warmup detected: decode_step_bs found between prefill[0] and prefill[1]")
-    else:
-        print("No warmup prefill detected by rule, using prefill[0]")
+    print("Using first prefill event (run trace has no warmup phase).")
     print(
         f"Using prefill[{actual_prefill_idx}] "
         f"(ts={actual_prefill.get('ts', 0):.0f}, dur={actual_prefill.get('dur', 0):.0f})"
@@ -482,52 +415,11 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
 
     # Layer extraction by rmsnorm positions:
     # each layer has 2 rmsnorm modules, layer N starts at rmsnorm index 2*N (0-based).
-    TARGET_LAYER = target_layer
     all_norm_indices = [
         i
         for i, item in enumerate(launch_level2_items)
         if is_strict_norm_name(item["level2_event"].get("name", ""))
     ]
-    # Last rmsnorm is final layernorm, not part of transformer layers.
-    norm_indices = all_norm_indices[:-1] if len(all_norm_indices) > 0 else []
-    print(
-        f"Found {len(all_norm_indices)} rmsnorm modules in level2-with-launch rows "
-        f"({len(norm_indices)} used for layer split, excluding final layernorm)"
-    )
-
-    mod_start = 0
-    mod_end = 0
-    norm_start_idx = TARGET_LAYER * 2
-    norm_end_idx = (TARGET_LAYER + 1) * 2
-    final_norm_idx = (
-        all_norm_indices[-1] if len(all_norm_indices) > 0 else len(launch_level2_items)
-    )
-    if norm_start_idx >= len(norm_indices):
-        print(
-            f"Not enough rmsnorm modules for layer {TARGET_LAYER}, writing empty XLSX"
-        )
-    else:
-        mod_start = norm_indices[norm_start_idx]
-        mod_end = (
-            norm_indices[norm_end_idx]
-            if norm_end_idx < len(norm_indices)
-            else final_norm_idx
-        )
-        print(
-            f"Layer {TARGET_LAYER} range by rmsnorm: "
-            f"rows [{mod_start}:{mod_end}) from rmsnorm #{norm_start_idx+1} to #{norm_end_idx+1}"
-        )
-        print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
-    avg_start_layer = TARGET_LAYER
-    avg_end_layer = (len(norm_indices) - 1) // 2
-    if avg_start_layer <= avg_end_layer:
-        print(
-            f"Target layer: {TARGET_LAYER}; AVG layers: [{avg_start_layer}..{avg_end_layer}]"
-        )
-    else:
-        print(
-            f"Target layer: {TARGET_LAYER}; AVG layers: disabled (no eligible layers)"
-        )
 
     # Build launch->kernel mapping by correlation id.
     # Build launch candidates from current prefill thread/range once.
@@ -588,42 +480,13 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
             kernels = [k for k in item_kernels[i] if k["name"] not in ("", "N/A")]
             if not kernels:
                 continue
-            if "moe_forward" in mod_name.lower():
-                rows.extend(process_moe_module(mod_name, len(kernels), 0, kernels))
-            else:
-                for k in kernels:
-                    rows.append(
-                        [clean_module_name(mod_name, k["name"]), k["name"], k["dur"]]
-                    )
+            rows.extend(process_module(mod_name, len(kernels), 0, kernels))
         return rows
 
-    # Target layer rows.
-    csv_rows = (
-        build_rows_from_item_range(mod_start, mod_end)
-        if norm_start_idx < len(norm_indices)
-        else []
+    _extract_layer_and_write(
+        all_norm_indices, len(launch_level2_items), target_layer,
+        "Prefill", "prefill", build_rows_from_item_range, output_xlsx,
     )
-    print(f"Layer {TARGET_LAYER} launch->kernel mapping rows: {len(csv_rows)}")
-
-    print(f"Prefill decode-style CSV rows (after filters): {len(csv_rows)}")
-
-    # AVG rows from layer 3 to last layer.
-    avg_rows = None
-    avg_layer_rows: List[Tuple[int, List[List[Any]]]] = []
-    layer = avg_start_layer
-    while 2 * layer < len(norm_indices):
-        s = norm_indices[2 * layer]
-        e_idx = 2 * (layer + 1)
-        e = norm_indices[e_idx] if e_idx < len(norm_indices) else final_norm_idx
-        avg_layer_rows.append((layer, build_rows_from_item_range(s, e)))
-        layer += 1
-    if avg_layer_rows:
-        avg_rows = build_avg_rows_from_layers(avg_layer_rows, "Prefill")
-        if avg_rows is not None:
-            print(f"Prefill avg rows: {len(avg_rows)}")
-
-    # Write XLSX for prefill.
-    write_breakdown_xlsx(output_xlsx, csv_rows, sheet_name="prefill", avg_rows=avg_rows)
 
 
 def clean_module_name(name: str, mapped_kernel_name: str = "") -> str:
@@ -639,30 +502,111 @@ def clean_module_name(name: str, mapped_kernel_name: str = "") -> str:
     if name.startswith("aiter::"):
         name = name[7:]  # len('aiter::') == 7
 
-    # Rename based on keywords (rope takes priority)
-    name_lower = name.lower()
-    if "rope" in name_lower and "cache" in name_lower:
-        return "rope & kv_cache"
-    if "rope" in name_lower:
-        return "rope"
-    if "cache" in name_lower and "gemm" not in name_lower:
-        return "kv_cache"
-
     return name
 
 
-def process_moe_module(
+def _extract_layer_and_write(
+    all_norm_indices: List[int],
+    total_module_count: int,
+    target_layer: int,
+    section_name: str,
+    sheet_name: str,
+    build_rows_fn,
+    output_xlsx: str,
+) -> None:
+    """
+    Shared layer-extraction, AVG computation, and XLSX write logic
+    used by both parse_prefill and parse_decode.
+
+    Args:
+        all_norm_indices: indices of all norm modules (including final layernorm)
+        total_module_count: total number of modules (used as fallback final_norm_idx)
+        target_layer: which layer to extract
+        section_name: "Prefill" or "Decode" for print messages
+        sheet_name: XLSX sheet name
+        build_rows_fn: callable(start, end) -> List[List[Any]]
+        output_xlsx: output file path
+    """
+    norm_indices = all_norm_indices[:-1] if len(all_norm_indices) > 0 else []
+    print(
+        f"Found {len(all_norm_indices)} norm modules "
+        f"({len(norm_indices)} used for layer split, excluding final layernorm)"
+    )
+
+    TARGET_LAYER = target_layer
+    norm_start_idx = TARGET_LAYER * 2
+    norm_end_idx = (TARGET_LAYER + 1) * 2
+    final_norm_idx = (
+        all_norm_indices[-1] if len(all_norm_indices) > 0 else total_module_count
+    )
+
+    mod_start = 0
+    mod_end = 0
+    if norm_start_idx >= len(norm_indices):
+        print(f"Not enough norms for layer {TARGET_LAYER}")
+        if sheet_name == "prefill":
+            print(f"Not enough rmsnorm modules for layer {TARGET_LAYER}, writing empty XLSX")
+        write_breakdown_xlsx(output_xlsx, [], sheet_name=sheet_name)
+        return
+    else:
+        mod_start = norm_indices[norm_start_idx]
+        mod_end = (
+            norm_indices[norm_end_idx]
+            if norm_end_idx < len(norm_indices)
+            else final_norm_idx
+        )
+        print(
+            f"Layer {TARGET_LAYER}: modules [{mod_start}:{mod_end}] "
+            f"(norms at indices {norm_start_idx}, {norm_start_idx+1})"
+        )
+
+    avg_start_layer = TARGET_LAYER
+    avg_end_layer = (len(norm_indices) - 1) // 2
+    if avg_start_layer <= avg_end_layer:
+        print(
+            f"Target layer: {TARGET_LAYER}; AVG layers: [{avg_start_layer}..{avg_end_layer}]"
+        )
+    else:
+        print(
+            f"Target layer: {TARGET_LAYER}; AVG layers: disabled (no eligible layers)"
+        )
+
+    # Target layer rows.
+    rows = build_rows_fn(mod_start, mod_end)
+    print(f"Layer {TARGET_LAYER} rows: {len(rows)}")
+
+    # AVG rows.
+    avg_rows = None
+    avg_layer_rows: List[Tuple[int, List[List[Any]]]] = []
+    layer = avg_start_layer
+    while 2 * layer < len(norm_indices):
+        s = norm_indices[2 * layer]
+        e_idx = 2 * (layer + 1)
+        e = norm_indices[e_idx] if e_idx < len(norm_indices) else final_norm_idx
+        avg_layer_rows.append((layer, build_rows_fn(s, e)))
+        layer += 1
+    if avg_layer_rows:
+        avg_rows = build_avg_rows_from_layers(avg_layer_rows, section_name)
+        if avg_rows is not None:
+            print(f"{section_name} avg rows: {len(avg_rows)}")
+
+    write_breakdown_xlsx(output_xlsx, rows, sheet_name=sheet_name, avg_rows=avg_rows)
+    print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
+    print(f"XLSX written to: {output_xlsx} ({len(rows)} rows)")
+
+
+def process_module(
     mod_name: str, kernel_count: int, start_gpu_idx: int, gpu_kernels: List[Dict]
 ) -> List[List]:
     """
-    Process moe_forward module: categorize kernels by name.
+    Process a module (regular or MoE) and return [display_name, gpu_kernel_name, gpu_dur] rows.
 
+    For moe_forward modules, kernels are categorized:
     - 'moesort' in kernel name -> moe_sort
     - 'topk' in kernel name -> moe_topk
-    - others -> keep original mod_name
-
-    Returns list of [display_name, gpu_kernel_name, gpu_dur] rows.
+    - others -> cleaned module name
     """
+    is_moe = "moe_forward" in mod_name.lower()
     rows = []
     for i in range(kernel_count):
         gpu_idx = start_gpu_idx + i
@@ -672,44 +616,30 @@ def process_moe_module(
             gpu = gpu_kernels[gpu_idx]
             gpu_kernel_name = gpu.get("name", "N/A")
             gpu_dur = gpu.get("dur", 0)
-
-        # Determine category based on kernel name
-        kernel_lower = gpu_kernel_name.lower()
-        if "moesort" in kernel_lower:
-            category = "moe_sort"
-        elif "topk" in kernel_lower:
-            category = "moe_topk"
+        if is_moe:
+            kl = gpu_kernel_name.lower()
+            if "moesort" in kl:
+                display_name = "moe_sort"
+            elif "topk" in kl:
+                display_name = "moe_topk"
+            else:
+                display_name = clean_module_name(mod_name, gpu_kernel_name)
         else:
-            category = clean_module_name(mod_name, gpu_kernel_name)
-
-        # Always show category/module name on each row.
-        display_name = category
-        rows.append([display_name, gpu_kernel_name, gpu_dur])
-
-    return rows
-
-
-def process_regular_module(
-    mod_name: str, kernel_count: int, start_gpu_idx: int, gpu_kernels: List[Dict]
-) -> List[List]:
-    """Process regular module and show module name on every row."""
-    rows = []
-    for i in range(kernel_count):
-        gpu_idx = start_gpu_idx + i
-        gpu_kernel_name = "N/A"
-        gpu_dur = 0
-        if gpu_idx < len(gpu_kernels):
-            gpu = gpu_kernels[gpu_idx]
-            gpu_kernel_name = gpu.get("name", "N/A")
-            gpu_dur = gpu.get("dur", 0)
-        display_name = clean_module_name(mod_name, gpu_kernel_name)
+            display_name = clean_module_name(mod_name, gpu_kernel_name)
         rows.append([display_name, gpu_kernel_name, gpu_dur])
     return rows
 
 
-def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) -> None:
+def parse_decode(
+    run_events: List[Dict],
+    capture_events: List[Dict],
+    output_xlsx: str,
+    target_layer: int = 3,
+) -> None:
     """
-    Parse decode phase: map capture_graph modules to GPU kernels.
+    Parse decode phase:
+    - use run trace for first decode_step and real kernel timings
+    - use capture trace for capture_graph module hierarchy
 
     Output CSV columns: cpu_module, gpu_kernel, duration_us
     """
@@ -718,7 +648,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
     # Find GPU-annotated decode_step events (cat='gpu_user_annotation')
     decode_steps = [
         e
-        for e in events
+        for e in run_events
         if e.get("name", "").startswith("decode_step")
         and e.get("ph") == "X"
         and e.get("cat") == "gpu_user_annotation"
@@ -729,25 +659,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
         print("No decode_step (gpu_user_annotation) events found.")
         return
 
-    # Skip warmup: find first gap > 100ms (warmup/run boundary)
-    # Normal decode gaps are < 5ms, so 100ms is safe threshold
-    WARMUP_GAP_THRESHOLD = 100000  # 100ms in microseconds
-    actual_run_idx = 0
-    found_warmup_boundary = False
-    for i in range(1, len(decode_steps)):
-        gap = decode_steps[i]["ts"] - (
-            decode_steps[i - 1]["ts"] + decode_steps[i - 1].get("dur", 0)
-        )
-        if gap > WARMUP_GAP_THRESHOLD:
-            actual_run_idx = i
-            found_warmup_boundary = True
-            print(f"Warmup/run boundary at [{i-1}]->[{i}], gap={gap/1000:.1f}ms")
-            break
-
-    if not found_warmup_boundary:
-        print("No warmup detected (no gap > 100ms), using first decode_step")
-
-    first_ds = decode_steps[actual_run_idx]
+    first_ds = decode_steps[0]
     first_ds_name = first_ds.get("name", "")
     target_bs: Optional[int] = None
     if "_bs_" in first_ds_name:
@@ -765,12 +677,12 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
 
     # Find matching capture_graph
     capture_graphs = [
-        e for e in events if e.get("name") == target_cg_name and e.get("ph") == "X"
+        e for e in capture_events if e.get("name") == target_cg_name and e.get("ph") == "X"
     ]
     if not capture_graphs and target_bs is not None:
         # Prefer the largest capture_graph_bs_K where K < target_bs.
         lower_bs_candidates: List[Tuple[int, Dict[str, Any]]] = []
-        for e in events:
+        for e in capture_events:
             if e.get("ph") != "X":
                 continue
             n = e.get("name", "")
@@ -791,7 +703,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
         # Fallback: find any capture_graph
         capture_graphs = [
             e
-            for e in events
+            for e in capture_events
             if e.get("name", "").startswith("capture_graph") and e.get("ph") == "X"
         ]
         capture_graphs = sorted(capture_graphs, key=lambda x: x["ts"])
@@ -809,7 +721,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
     cg_end = cg_start + cg.get("dur", 0)
     cg_events = [
         e
-        for e in events
+        for e in capture_events
         if e.get("ph") == "X"
         and e.get("ts", 0) >= cg_start
         and e.get("ts", 0) + e.get("dur", 0) <= cg_end
@@ -823,7 +735,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
 
     gpu_kernels = [
         e
-        for e in events
+        for e in run_events
         if e.get("cat") == "kernel" and ds1_start <= e["ts"] <= ds1_end
     ]
     gpu_kernels = sorted(gpu_kernels, key=lambda x: x["ts"])
@@ -840,6 +752,7 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
 
     # Collect all modules with their kernel info
     all_modules = []  # list of (mod_name, kernel_count, start_gpu_idx)
+    all_module_events = []
     gpu_idx = 0
 
     for child in kernel_children:
@@ -858,94 +771,89 @@ def parse_decode(events: List[Dict], output_xlsx: str, target_layer: int = 3) ->
             mod_name = mod.get("name", "<unknown>")
             kernel_count = idx.count_kernel_launches(mod)
             all_modules.append((mod_name, kernel_count, gpu_idx))
+            all_module_events.append(mod)
             gpu_idx += kernel_count
+
+    # Decode module sequence should start from the first norm module to avoid
+    # wrapper/initialization nodes before the model block.
+    first_norm_module_idx = next(
+        (i for i, (name, _, _) in enumerate(all_modules) if is_strict_norm_name(name)),
+        None,
+    )
+    if first_norm_module_idx is None:
+        print("No norm module found in capture_graph modules.")
+        return
+    if first_norm_module_idx > 0:
+        print(f"Dropped {first_norm_module_idx} leading modules before first norm.")
+    all_modules = all_modules[first_norm_module_idx:]
+    all_module_events = all_module_events[first_norm_module_idx:]
+
+    # Anchor module->kernel alignment by first norm's correlated launch kernel:
+    # 1) find first launch inside first norm and read its correlation/kernel
+    # 2) find same kernel's first occurrence in run decode kernels
+    # 3) rebuild module start indices from that anchor.
+    capture_runtime_launches = [
+        e
+        for e in cg_events
+        if e.get("cat") == "cuda_runtime" and is_kernel_launch(e.get("name", ""))
+    ]
+    capture_runtime_launches.sort(key=lambda x: x.get("ts", 0))
+    capture_launch_ts = [e.get("ts", 0) for e in capture_runtime_launches]
+
+    def _first_kernel_name_in_capture(mod_event: Dict[str, Any]) -> Optional[str]:
+        m_start = mod_event.get("ts", 0)
+        m_end = m_start + mod_event.get("dur", 0)
+        left = bisect.bisect_left(capture_launch_ts, m_start)
+        right = bisect.bisect_right(capture_launch_ts, m_end)
+        for launch in capture_runtime_launches[left:right]:
+            corr = (launch.get("args") or {}).get("correlation")
+            if corr is None:
+                continue
+            kernel_name = (launch.get("args") or {}).get("kernel", "")
+            if kernel_name:
+                return str(kernel_name)
+        return None
+
+    anchor_kernel_name = _first_kernel_name_in_capture(all_module_events[0])
+    if not anchor_kernel_name:
+        raise RuntimeError(
+            "Cannot resolve anchor kernel from first rmsnorm correlation in capture trace."
+        )
+    found = next(
+        (i for i, k in enumerate(gpu_kernels) if k.get("name", "") == anchor_kernel_name),
+        None,
+    )
+    if found is None:
+        raise RuntimeError(
+            f"Anchor kernel '{anchor_kernel_name}' not found in run decode kernels."
+        )
+    anchor_gpu_idx = found
+    print(f"Aligned from first norm kernel: {anchor_kernel_name} at gpu_idx={anchor_gpu_idx}")
+
+    rebuilt_modules = []
+    running_gpu_idx = anchor_gpu_idx
+    for name, count, _ in all_modules:
+        rebuilt_modules.append((name, count, running_gpu_idx))
+        running_gpu_idx += count
+    all_modules = rebuilt_modules
 
     # Find norm positions (rmsnorm in name)
     all_norm_indices = [
         i for i, (name, _, _) in enumerate(all_modules) if is_strict_norm_name(name)
     ]
-    # Last rmsnorm is final layernorm, not part of transformer layers.
-    norm_indices = all_norm_indices[:-1] if len(all_norm_indices) > 0 else []
-    print(
-        f"Found {len(all_norm_indices)} norm modules "
-        f"({len(norm_indices)} used for layer split, excluding final layernorm)"
-    )
-
-    # Extract layer 3 (4th layer, 0-indexed)
-    # Each layer has 2 norms, so layer N starts at norm index 2*N
-    TARGET_LAYER = target_layer
-    norm_start_idx = TARGET_LAYER * 2  # 6 (7th norm, 0-indexed)
-    norm_end_idx = (TARGET_LAYER + 1) * 2  # 8 (9th norm, 0-indexed)
-
-    final_norm_idx = (
-        all_norm_indices[-1] if len(all_norm_indices) > 0 else len(all_modules)
-    )
-    if norm_start_idx >= len(norm_indices):
-        print(f"Not enough norms for layer {TARGET_LAYER}")
-        return
-
-    # Module range for layer 3: from norm_indices[6] to norm_indices[8] (exclusive)
-    mod_start = norm_indices[norm_start_idx]
-    mod_end = (
-        norm_indices[norm_end_idx]
-        if norm_end_idx < len(norm_indices)
-        else final_norm_idx
-    )
-
-    print(
-        f"Layer {TARGET_LAYER}: modules [{mod_start}:{mod_end}] (norms at indices {norm_start_idx}, {norm_start_idx+1})"
-    )
-    avg_start_layer = TARGET_LAYER
-    avg_end_layer = (len(norm_indices) - 1) // 2
-    if avg_start_layer <= avg_end_layer:
-        print(
-            f"Target layer: {TARGET_LAYER}; AVG layers: [{avg_start_layer}..{avg_end_layer}]"
-        )
-    else:
-        print(
-            f"Target layer: {TARGET_LAYER}; AVG layers: disabled (no eligible layers)"
-        )
 
     def build_rows_for_module_range(start: int, end: int) -> List[List[Any]]:
         rows = []
         for mod_name, kernel_count, start_gpu_idx in all_modules[start:end]:
-            if "moe_forward" in mod_name.lower():
-                rows.extend(
-                    process_moe_module(
-                        mod_name, kernel_count, start_gpu_idx, gpu_kernels
-                    )
-                )
-            else:
-                rows.extend(
-                    process_regular_module(
-                        mod_name, kernel_count, start_gpu_idx, gpu_kernels
-                    )
-                )
+            rows.extend(
+                process_module(mod_name, kernel_count, start_gpu_idx, gpu_kernels)
+            )
         return rows
 
-    # Target layer rows.
-    rows = build_rows_for_module_range(mod_start, mod_end)
-
-    # AVG rows from layer 3 to last layer.
-    avg_rows = None
-    avg_layer_rows: List[Tuple[int, List[List[Any]]]] = []
-    layer = avg_start_layer
-    while 2 * layer < len(norm_indices):
-        s = norm_indices[2 * layer]
-        e_idx = 2 * (layer + 1)
-        e = norm_indices[e_idx] if e_idx < len(norm_indices) else final_norm_idx
-        avg_layer_rows.append((layer, build_rows_for_module_range(s, e)))
-        layer += 1
-    if avg_layer_rows:
-        avg_rows = build_avg_rows_from_layers(avg_layer_rows, "Decode")
-        if avg_rows is not None:
-            print(f"Decode avg rows: {len(avg_rows)}")
-
-    # Write XLSX
-    write_breakdown_xlsx(output_xlsx, rows, sheet_name="decode", avg_rows=avg_rows)
-
-    print(f"Layer {TARGET_LAYER} modules: {mod_end - mod_start}")
-    print(f"XLSX written to: {output_xlsx} ({len(rows)} rows)")
+    _extract_layer_and_write(
+        all_norm_indices, len(all_modules), target_layer,
+        "Decode", "decode", build_rows_for_module_range, output_xlsx,
+    )
 
 
 # =============================================================================
@@ -970,10 +878,24 @@ def main():
     filepath = args.filepath
     target_layer = args.layer
 
-    print(f"Loading: {filepath}")
+    print(f"Loading run trace: {filepath}")
     trace = load_trace(filepath)
     events = trace.get("traceEvents", [])
-    print(f"Loaded {len(events)} events\n")
+    print(f"Loaded run events: {len(events)}")
+
+    capture_trace_path = find_capture_graph_trace_path(filepath)
+    if capture_trace_path is None:
+        print(
+            "Warning: matching capture trace not found; decode analysis will fallback "
+            "to current trace for capture_graph hierarchy."
+        )
+        capture_events = events
+    else:
+        print(f"Loading capture trace: {capture_trace_path}")
+        capture_trace = load_trace(capture_trace_path)
+        capture_events = capture_trace.get("traceEvents", [])
+        print(f"Loaded capture events: {len(capture_events)}")
+    print("")
 
     print("=" * 60)
     print("PREFILL ANALYSIS")
@@ -983,7 +905,12 @@ def main():
     print("\n" + "=" * 60)
     print("DECODE ANALYSIS")
     print("=" * 60)
-    parse_decode(events, "decode_breakdown.xlsx", target_layer=target_layer)
+    parse_decode(
+        events,
+        capture_events,
+        "decode_breakdown.xlsx",
+        target_layer=target_layer,
+    )
 
 
 if __name__ == "__main__":

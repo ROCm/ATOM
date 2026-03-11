@@ -29,7 +29,7 @@ from atom.model_ops.utils import (
     shuffle_weights,
 )
 from atom.utils import envs
-from atom.utils.decorators import mark_trace, record_function
+from atom.utils.decorators import mark_trace
 from torch import nn
 
 logger = logging.getLogger("atom")
