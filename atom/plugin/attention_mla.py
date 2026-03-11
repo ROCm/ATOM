@@ -850,32 +850,6 @@ class MLAAttentionImplPluginModeMethods:
 
         return output_padded
 
-    def forward_mha(
-        self,
-        q,
-        kv_c_normed,
-        k_pe,
-        kv_c_and_k_pe_cache,
-        attn_metadata,
-        k_scale,
-        output,
-    ) -> None:
-        """MHA-style prefill forward pass."""
-        return self._forward_prefill_plugin_mode(
-            q, kv_c_normed, k_pe, kv_c_and_k_pe_cache, attn_metadata, k_scale, output
-        )
-
-    def forward_mqa(
-        self,
-        q,
-        kv_c_and_k_pe_cache,
-        attn_metadata,
-        layer,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return self._forward_decode_plugin_mode(
-            q, kv_c_and_k_pe_cache, attn_metadata, layer
-        )
-
     def do_kv_cache_update(
         self,
         kv_c_normed: torch.Tensor,
@@ -949,8 +923,6 @@ def MLAAttentionImplDecoratorForPluginMode(cls):
         "_forward_prefill_plugin_mode",
         "_forward_decode_plugin_mode",
         "forward_impl_plugin_mode",
-        "forward_mha",
-        "forward_mqa",
         "do_kv_cache_update",
     ]
 
