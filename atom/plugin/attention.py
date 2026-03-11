@@ -1388,7 +1388,7 @@ def unified_attention_with_output_base_for_plugin_mode(
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
-        if envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION:
+        if disable_vllm_plugin_attention:
             k_pe = k_pe.unsqueeze(1)
             if self.rotary_emb is not None:
                 q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(

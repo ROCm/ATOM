@@ -1,7 +1,6 @@
 import functools
 
 import torch
-from atom.utils import envs
 from atom.plugin.vllm.platform import disable_vllm_plugin_attention
 
 
