@@ -8,6 +8,7 @@ import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
 from atom.plugin.prepare import is_vllm, is_sglang
+from atom.plugin.vllm.platform import disable_vllm_plugin_attention
 from atom.utils import CpuGpuBuffer, envs
 from atom.config import get_current_atom_config
 
@@ -723,11 +724,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
         reduce_partial_map = var["reduce_partial_map"]
         get_mla_metadata_v1(
             cu_seqlens_q,
-            # (
-            #     var["sparse_kv_indptr"].gpu[: bs + 1]
-            #     if self.is_sparse
-            #     else self.paged_kv_indptr[: bs + 1]
-            # ),
             self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
             self.paged_kv_last_page_len[:bs],
             self.num_attention_heads,

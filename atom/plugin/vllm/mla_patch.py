@@ -2,6 +2,7 @@ import functools
 
 import torch
 from atom.utils import envs
+from atom.plugin.vllm.platform import disable_vllm_plugin_attention
 
 
 def set_default_quant_scales(
@@ -29,6 +30,12 @@ def set_default_quant_scales(
 
 
 def _patch_vllm_mla_attention_process_weights_after_loading(mla_attention_cls) -> None:
+    """
+    We patch the process_weights_after_loading method one reason is that
+    orig_process_weights_after_loading need a act_dtype parameter,
+    but in atom, we don't have this parameter. if disable_vllm_plugin_attention,
+    we will fallback to original vllm attention backend.
+    """
     orig_process_weights_after_loading = mla_attention_cls.process_weights_after_loading
     if getattr(
         orig_process_weights_after_loading,
@@ -39,7 +46,7 @@ def _patch_vllm_mla_attention_process_weights_after_loading(mla_attention_cls) -
 
     @functools.wraps(orig_process_weights_after_loading)
     def _process_weights_after_loading(self, act_dtype: torch.dtype = torch.bfloat16):
-        if envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION:
+        if disable_vllm_plugin_attention:
             return orig_process_weights_after_loading(self, act_dtype)
 
         if hasattr(self.impl, "process_weights_after_loading"):
@@ -56,6 +63,10 @@ def _patch_vllm_mla_attention_process_weights_after_loading(mla_attention_cls) -
 
 
 def _patch_vllm_mla_attention_forward_impl(mla_attention_cls) -> None:
+    """
+    We patch the forward_impl method is to make qk rope and kv cache update
+    can be fused in attention forward pass.
+    """
     orig_forward_impl = mla_attention_cls.forward_impl
     if getattr(orig_forward_impl, "_atom_mla_forward_impl_patched", False):
         return
@@ -72,7 +83,7 @@ def _patch_vllm_mla_attention_forward_impl(mla_attention_cls) -> None:
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION:
+        if disable_vllm_plugin_attention:
             return orig_forward_impl(
                 self,
                 q,

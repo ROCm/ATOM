@@ -843,6 +843,8 @@ class MLAAttentionImplPluginModeMethods:
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
+        # The kv cache update will be handled by the forward_impl_plugin_mode
+        # side for doing fused qk rope and cache update.
         return
 
 
