@@ -13,7 +13,7 @@ from atom.config import get_current_atom_config
 
 from atom.utils.forward_context import Context, AttentionMetaData
 from atom.model_ops.attention_mha import PagedAttentionImpl
-from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
 
 logger = logging.getLogger("atom")
 
@@ -726,7 +726,7 @@ class vllmMLAAttentionMetadataBuilderMethods:
             cu_seqlens_q,
             self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
             self.paged_kv_last_page_len[:bs],
-            self.num_attention_heads,
+            self.padded_num_attention_heads,
             1,  # nhead_kv,
             True,
             work_meta_data,
@@ -1146,6 +1146,7 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             config.model_config.hf_config.num_attention_heads
             // get_tp_group().world_size
         )
+        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
 
@@ -1179,7 +1180,7 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         ) = get_mla_metadata_info_v1(
             max_num_reqs,
             1,
-            self.num_attention_heads,
+            self.padded_num_attention_heads,
             torch.bfloat16,
             dtypes.d_dtypes[config.cache_config.cache_dtype],
             is_sparse=False,  # TODO: support sparse
