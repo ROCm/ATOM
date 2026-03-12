@@ -37,15 +37,35 @@
 
 ## 🛠️ Installation
 
-### 1. Pull Docker Image
+### Option A: Nightly Image (Recommended)
+
+Pre-built image with AITER + ATOM ready to use:
+
+```bash
+docker pull rocm/atom-dev:latest
+
+docker run -it --network=host \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --group-add video \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -v $HOME:/home/$USER \
+  -v /mnt:/mnt \
+  -v /data:/data \
+  --shm-size=16G \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  rocm/atom-dev:latest
+```
+
+### Option B: Build from Base ROCm Image
+
+#### 1. Pull and run the base image
 
 ```bash
 docker pull rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
-```
 
-### 2. Run Docker Container
-
-```bash
 docker run -it --network=host \
   --device=/dev/kfd \
   --device=/dev/dri \
@@ -61,11 +81,11 @@ docker run -it --network=host \
   rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
 ```
 
-### 3. Clone and Setup
+#### 2. Install AITER and ATOM inside the container
 
 ```bash
 pip install amd-aiter
-git clone https://github.com/ROCm/ATOM.git; pip install ./ATOM
+git clone https://github.com/ROCm/ATOM.git && pip install ./ATOM
 ```
 
 ## 📚 Documentation
