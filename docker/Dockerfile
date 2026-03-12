@@ -2,7 +2,86 @@
 ARG BASE_IMAGE="rocm/pytorch:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 
-FROM $BASE_IMAGE
+# --------------------------------------------------------------------
+# OOT image stage: extends an ATOM base image with vLLM + OOT deps.
+# Build with: docker build --target oot_image --build-arg BASE_IMAGE=...
+# --------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS oot_image
+
+ARG MAX_JOBS=64
+ARG VENV_PYTHON="/opt/venv/bin/python"
+ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+ARG VLLM_COMMIT="b31e9326a7d9394aab8c767f8ebe225c65594b60"
+ARG INSTALL_LM_EVAL=1
+ARG INSTALL_FASTSAFETENSORS=1
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV VLLM_TARGET_DEVICE=rocm
+ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
+ENV MAX_JOBS=${MAX_JOBS}
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+WORKDIR /app
+
+RUN echo "========== [OOT 1/7] Prepare build tools ==========" \
+    && apt-get update \
+    && apt --fix-broken install -y \
+    && apt-get install -y --no-install-recommends git ca-certificates ninja-build vim \
+    && mkdir -p /usr/local/bin \
+    && ln -sf "$(command -v ninja)" /usr/local/bin/ninja \
+    && /usr/local/bin/ninja --version \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========" \
+    && "${VENV_PYTHON}" -m pip show atom || true \
+    && "${VENV_PYTHON}" -m pip show amd-aiter || true \
+    && "${VENV_PYTHON}" -m pip show mori || true
+
+RUN echo "========== [OOT 3/7] Clone vLLM ==========" \
+    && git clone "${VLLM_REPO}" /app/vllm \
+    && cd /app/vllm \
+    && git checkout "${VLLM_COMMIT}" \
+    && git submodule update --init --recursive \
+    && echo "vLLM commit:" \
+    && git rev-parse HEAD
+
+RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" \
+    && cd /app/vllm \
+    && "${VENV_PYTHON}" -m pip install --upgrade pip \
+    && sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt \
+    && "${VENV_PYTHON}" -m pip install --no-deps xgrammar==0.1.29 compressed-tensors==0.13.0 loguru \
+    && sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' requirements/rocm.txt \
+    && "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 \
+    && "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
+
+RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" \
+    && cd /opt/rocm/share/amd_smi \
+    && pip wheel . --wheel-dir=dist \
+    && pip install dist/*.whl
+
+RUN echo "========== [OOT 6/7] Build vLLM wheel ==========" \
+    && cd /app/vllm \
+    && VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py clean --all \
+    && MAX_JOBS="${MAX_JOBS}" VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py bdist_wheel --dist-dir=/tmp/vllm-wheels \
+    && ls -lh /tmp/vllm-wheels
+
+RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" \
+    && cd /app/vllm \
+    && "${VENV_PYTHON}" -m pip uninstall -y vllm || true \
+    && "${VENV_PYTHON}" -m pip install /tmp/vllm-wheels/*.whl \
+    && "${VENV_PYTHON}" -m pip install uvloop \
+    && if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi \
+    && if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi \
+    && "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" \
+    && "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom mori || true
+
+CMD ["/bin/bash"]
+
+# --------------------------------------------------------------------
+# ATOM image stage: original Dockerfile flow for atom-dev image.
+# Build with: docker build --target atom_image --build-arg BASE_IMAGE=...
+# --------------------------------------------------------------------
+FROM ${BASE_IMAGE} as atom_image
 
 ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH

@@ -27,6 +27,19 @@ on:
         description: "Runner label to use"
         type: string
         default: "linux-atom-mi355-1"
+      build_oot_image:
+        description: "Build OOT vLLM image"
+        type: boolean
+        default: false
+      oot_base_image:
+        description: "Base image for OOT vLLM (empty means rocm/atom-dev:latest)"
+        default: ""
+      vllm_commit:
+        description: "vLLM commit for OOT image"
+        default: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
+      vllm_version:
+        description: "vLLM version label for OOT image tags"
+        default: "0.17.0"
 
 jobs:
   docker-release:
@@ -46,6 +59,8 @@ jobs:
       RCCL_REPO: "https://github.com/ROCm/rccl.git"
       RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
       GPU_ARCH: "gfx942;gfx950"
+      VLLM_COMMIT: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
+      VLLM_VERSION: "0.17.0"
 
     steps:
       - name: Set HF_TOKEN
@@ -71,6 +86,7 @@ jobs:
         timeout-minutes: 120
         run: |
           docker build --pull --network=host -t atom_release:ci \
+          --target atom_image \
           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
@@ -139,6 +155,36 @@ jobs:
           docker tag atom_release:ci rocm/atom-dev:${TAG}
           docker push rocm/atom-dev:${TAG}
 
+      - name: Build OOT Docker image
+        if: ${{ success() && inputs.build_oot_image == true }}
+        timeout-minutes: 180
+        run: |
+          if [ -n "${{ inputs.oot_base_image }}" ]; then
+            OOT_BASE_IMAGE="${{ inputs.oot_base_image }}"
+          else
+            OOT_BASE_IMAGE="rocm/atom-dev:latest"
+          fi
+
+          echo "Using OOT base image: ${OOT_BASE_IMAGE}"
+          docker pull "${OOT_BASE_IMAGE}"
+          docker build --network=host -t atom_oot_release:ci \
+            --target oot_image \
+            --build-arg BASE_IMAGE="${OOT_BASE_IMAGE}" \
+            --build-arg MAX_JOBS=64 \
+            --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || env.VLLM_COMMIT }}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            --build-arg INSTALL_FASTSAFETENSORS=1 \
+            -f docker/Dockerfile .
+          docker inspect atom_oot_release:ci
+
+      - name: Push OOT Docker image
+        if: ${{ success() && inputs.build_oot_image == true }}
+        run: |
+          VLLM_VER="${{ inputs.vllm_version || env.VLLM_VERSION }}"
+          OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
+          docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
+          docker push rocm/atom-dev:${OOT_TAG}
+
       - name: Clean Up
         if: always()
         run: |
@@ -147,5 +193,7 @@ jobs:
           # Remove build and tagged images to free disk space
           docker rmi atom_release:ci || true
           docker rmi rocm/atom-dev:latest || true
+          docker rmi atom_oot_release:ci || true
           # Remove nightly tagged image if it exists
           docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true
+          docker images "rocm/atom-dev:vllm-v*-nightly_*" -q | xargs -r docker rmi || true

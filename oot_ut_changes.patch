@@ -1,0 +1,1298 @@
+diff --git a/.github/scripts/atom_oot_test.sh b/.github/scripts/atom_oot_test.sh
+new file mode 100644
+index 0000000..dd4a857
+--- /dev/null
++++ b/.github/scripts/atom_oot_test.sh
+@@ -0,0 +1,234 @@
++#!/bin/bash
++set -euo pipefail
++
++# Usage:
++#   .github/scripts/atom_oot_test.sh launch <mode> [model_name]
++#   .github/scripts/atom_oot_test.sh accuracy <mode> [model_name]
++#
++# TYPE:
++#   launch   - launch vLLM server and wait until ready
++#   accuracy - run gsm8k accuracy test (and threshold check)
++#
++# MODE:
++#   ci    - only Kimi-K2
++#   full  - all OOT-supported models
++#
++# Optional model_name can be used to run a single model in full mode.
++
++TYPE=${1:-launch}
++MODE=${2:-ci}
++SELECTED_MODEL=${3:-}
++
++if [[ "$TYPE" != "launch" && "$TYPE" != "accuracy" ]]; then
++  echo "Invalid TYPE: $TYPE. Expected: launch or accuracy"
++  exit 2
++fi
++
++if [[ "$MODE" != "ci" && "$MODE" != "full" ]]; then
++  echo "Invalid MODE: $MODE. Expected: ci or full"
++  exit 2
++fi
++
++MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
++WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
++VLLM_PORT=${VLLM_PORT:-8000}
++VLLM_HOST=${VLLM_HOST:-0.0.0.0}
++VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
++VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_oot.log}
++RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
++ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/oot_accuracy_output.txt}
++
++# Format:
++#   MODEL_NAME|MODEL_PATH|EXTRA_ARGS|THRESHOLD
++# Note: CI runs Kimi-K2 with TP=4 on an 8-GPU runner to reduce runtime and
++# improve CI stability. Full mode uses TP=8 on the same class of runner for
++# higher-fidelity validation.
++CI_MODE_MODELS=(
++  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel|0.90"
++)
++
++FULL_MODE_MODELS=(
++  "Qwen3 Dense|Qwen/Qwen3-8B|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 1|0.70"
++  "Qwen3 MoE|Qwen/Qwen3-235B-A22B-Instruct-2507-FP8|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel|0.87"
++  "DeepSeek-V3 family|deepseek-ai/DeepSeek-R1-0528|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8|0.94"
++  "GPT-OSS|openai/gpt-oss-120b|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3|0.38"
++  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel|0.90"
++)
++
++declare -a ACTIVE_MODELS=()
++if [[ "$MODE" == "ci" ]]; then
++  ACTIVE_MODELS=("${CI_MODE_MODELS[@]}")
++else
++  ACTIVE_MODELS=("${FULL_MODE_MODELS[@]}")
++fi
++
++resolve_model_path() {
++  local model_path="$1"
++  if [[ -f "/models/${model_path}/config.json" ]]; then
++    echo "/models/${model_path}"
++  else
++    echo "${model_path}"
++  fi
++}
++
++wait_server_ready() {
++  local model_name="$1"
++  echo ""
++  echo "========== Waiting for vLLM server (${model_name}) =========="
++  for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
++    if curl -sS "http://127.0.0.1:${VLLM_PORT}/v1/models" >/dev/null; then
++      echo "vLLM server is ready for ${model_name}."
++      return 0
++    fi
++
++    if [[ -f "${VLLM_PID_FILE}" ]]; then
++      local pid
++      pid=$(cat "${VLLM_PID_FILE}")
++      if ! kill -0 "${pid}" 2>/dev/null; then
++        echo "vLLM process exited early for ${model_name}."
++        tail -n 200 "${VLLM_LOG_FILE}" || true
++        return 1
++      fi
++    fi
++
++    echo "Waiting for vLLM server... (${i}/${MAX_WAIT_RETRIES})"
++    sleep "${WAIT_INTERVAL_SEC}"
++  done
++
++  echo "vLLM server did not become ready in time for ${model_name}."
++  tail -n 200 "${VLLM_LOG_FILE}" || true
++  return 1
++}
++
++stop_server() {
++  if [[ -f "${VLLM_PID_FILE}" ]]; then
++    local pid
++    pid=$(cat "${VLLM_PID_FILE}")
++    kill "${pid}" 2>/dev/null || true
++    rm -f "${VLLM_PID_FILE}" || true
++  fi
++}
++
++launch_one_model() {
++  local model_name="$1"
++  local model_path="$2"
++  local extra_args="$3"
++
++  local resolved_model_path
++  resolved_model_path=$(resolve_model_path "${model_path}")
++
++  echo ""
++  echo "========== Launching vLLM server =========="
++  echo "Model name: ${model_name}"
++  echo "Model path: ${resolved_model_path}"
++  echo "Extra args: ${extra_args}"
++
++  export SAFETENSORS_FAST_GPU=1
++  export VLLM_ROCM_USE_AITER=1
++  export VLLM_RPC_TIMEOUT=1800000
++  export VLLM_CACHE_ROOT=/tmp/.cache/vllm
++  export TORCHINDUCTOR_CACHE_DIR=/tmp/.cache/inductor
++  rm -rf /tmp/.cache
++
++  rm -f "${VLLM_PID_FILE}" || true
++
++  nohup vllm serve "${resolved_model_path}" \
++    --host "${VLLM_HOST}" \
++    --port "${VLLM_PORT}" \
++    --async-scheduling \
++    --load-format fastsafetensors \
++    --max-model-len 16384 \
++    ${extra_args} \
++    > "${VLLM_LOG_FILE}" 2>&1 &
++  echo $! > "${VLLM_PID_FILE}"
++  echo "Server PID: $(cat "${VLLM_PID_FILE}")"
++
++  wait_server_ready "${model_name}"
++}
++
++accuracy_one_model() {
++  local model_name="$1"
++  local model_path="$2"
++  local extra_args="$3"
++  local threshold="$4"
++
++  local resolved_model_path
++  resolved_model_path=$(resolve_model_path "${model_path}")
++
++  if ! command -v lm_eval >/dev/null 2>&1; then
++    echo "========== Installing lm-eval =========="
++    pip install 'lm-eval[api]'
++  fi
++
++  mkdir -p "${RESULT_DIR}"
++  local result_file="${RESULT_DIR}/$(date +%Y%m%d%H%M%S)_${model_name// /_}.json"
++
++  echo ""
++  echo "========== Running OOT gsm8k accuracy =========="
++  echo "Model name: ${model_name}"
++  echo "Threshold: ${threshold}"
++
++  lm_eval --model local-completions \
++    --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
++    --tasks gsm8k \
++    --num_fewshot 3 \
++    --output_path "${result_file}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
++
++  local value
++  value=$(python - <<PY
++import json
++with open("${result_file}", "r", encoding="utf-8") as f:
++    data = json.load(f)
++print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
++PY
++)
++
++  echo "Result file: ${result_file}"
++  echo "Flexible extract value: ${value}"
++  echo "Accuracy threshold: ${threshold}"
++
++  python - <<PY
++value = float("${value}")
++threshold = float("${threshold}")
++assert value >= threshold, f"Accuracy failed: {value} < {threshold}"
++print(f"Accuracy passed: {value} >= {threshold}")
++PY
++}
++
++run_for_models() {
++  local action="$1"
++  local matched=0
++
++  for entry in "${ACTIVE_MODELS[@]}"; do
++    IFS='|' read -r model_name model_path extra_args threshold <<< "${entry}"
++
++    if [[ -n "${SELECTED_MODEL}" && "${SELECTED_MODEL}" != "${model_name}" ]]; then
++      continue
++    fi
++    matched=1
++
++    if [[ "${action}" == "launch" ]]; then
++      launch_one_model "${model_name}" "${model_path}" "${extra_args}"
++      break
++    fi
++
++    # accuracy mode: launch + evaluate each selected model, then stop server.
++    launch_one_model "${model_name}" "${model_path}" "${extra_args}"
++    accuracy_one_model "${model_name}" "${model_path}" "${extra_args}" "${threshold}"
++    stop_server
++  done
++
++  if [[ "${matched}" -eq 0 ]]; then
++    echo "No model matched MODE=${MODE}, SELECTED_MODEL=${SELECTED_MODEL}"
++    exit 2
++  fi
++}
++
++trap 'stop_server' EXIT
++
++if [[ "${TYPE}" == "launch" ]]; then
++  run_for_models "launch"
++else
++  run_for_models "accuracy"
++fi
++
+diff --git a/.github/workflows/atom-test.yaml b/.github/workflows/atom-test.yaml
+index 9736f09..51c1932 100644
+--- a/.github/workflows/atom-test.yaml
++++ b/.github/workflows/atom-test.yaml
+@@ -21,7 +21,7 @@ concurrency:
+   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+ 
+ env:
+-  ATOM_BASE_NIGTHLY_IMAGE: rocm/atom-dev:latest
++  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
+   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+ 
+@@ -46,7 +46,7 @@ jobs:
+         if: ${{ !github.event.pull_request.head.repo.fork }}
+         run: |
+           cat <<EOF > Dockerfile.mod
+-          FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
++          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+           RUN pip install -U lm-eval[api]
+           RUN pip show lm-eval || true
+           RUN pip install hf_transfer
+@@ -234,7 +234,7 @@ jobs:
+         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && github.event.pull_request.head.repo.fork
+         run: |
+           cat <<EOF > Dockerfile.mod
+-          FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
++          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+           RUN pip install -U lm-eval[api]
+           RUN pip show lm-eval || true
+           RUN pip install hf_transfer
+@@ -470,3 +470,4 @@ jobs:
+           docker rm "$CONTAINER_NAME" || true
+           # Remove the pre-built image to free disk space on the runner
+           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
++
+diff --git a/.github/workflows/atom-vllm-oot-full-test.yaml b/.github/workflows/atom-vllm-oot-full-test.yaml
+new file mode 100644
+index 0000000..79200b4
+--- /dev/null
++++ b/.github/workflows/atom-vllm-oot-full-test.yaml
+@@ -0,0 +1,268 @@
++name: ATOM vLLM OOT Full Validation
++
++on:
++  workflow_dispatch:
++    inputs:
++      vllm_commit:
++        description: "vLLM commit to validate"
++        # NOTE: For full validation, set this commit explicitly when your PR
++        # adapts ATOM to a newer vLLM version; using an old default commit can
++        # hide real compatibility issues.
++        required: false
++        type: string
++        default: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
++      vllm_version:
++        description: "vLLM version label in image tag"
++        required: false
++        type: string
++        default: "0.17"
++      base_image:
++        description: "ATOM base image for rebuild"
++        required: false
++        type: string
++        default: "rocm/atom-dev:latest"
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: false
++
++env:
++  BASE_IMAGE: ${{ inputs.base_image || 'rocm/atom-dev:latest' }}
++  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
++  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
++  VALIDATION_IMAGE_REPO: rocm/atom-dev
++
++jobs:
++  build-oot-image:
++    name: Build OOT validation image
++    runs-on: linux-atom-mi355-1
++    outputs:
++      oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
++    steps:
++      - name: Checkout ATOM repo
++        uses: actions/checkout@v4
++
++      - name: Docker Login
++        run: |
++          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
++
++      - name: Build ATOM base image from current commit
++        run: |
++          cat <<EOF > Dockerfile.mod
++          FROM ${{ env.BASE_IMAGE }}
++          RUN pip install -U lm-eval[api]
++          RUN pip show lm-eval || true
++          RUN pip install hf_transfer
++          RUN pip show hf_transfer || true
++          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
++          RUN pip uninstall -y amd-aiter
++          RUN pip install --upgrade "pybind11>=3.0.1"
++          RUN pip show pybind11
++          RUN rm -rf /app/aiter-test
++          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
++              cd /app/aiter-test && \\
++              git checkout HEAD && \\
++              git submodule sync && git submodule update --init --recursive && \\
++              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
++          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
++          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
++          RUN pip uninstall -y atom
++          RUN rm -rf /app/ATOM
++          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
++              cd /app/ATOM && \\
++              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
++              pip install -e .
++          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
++          EOF
++
++          docker build --pull --network=host \
++            --no-cache \
++            -t atom_oot_base:ci \
++            -f Dockerfile.mod .
++
++      - name: Build OOT vLLM image from rebuilt ATOM base
++        id: meta
++        run: |
++          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-vllm-validation-${GITHUB_COMMIT_SHA}-${{ github.run_id }}"
++          docker build --network=host \
++            --no-cache \
++            --target oot_image \
++            -t "${OOT_IMAGE_TAG}" \
++            --build-arg BASE_IMAGE="atom_oot_base:ci" \
++            --build-arg MAX_JOBS=64 \
++            --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || 'b31e9326a7d9394aab8c767f8ebe225c65594b60' }}" \
++            --build-arg INSTALL_LM_EVAL=1 \
++            --build-arg INSTALL_FASTSAFETENSORS=1 \
++            -f docker/Dockerfile .
++
++          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
++
++      - name: Push OOT validation image
++        run: |
++          docker push "${{ steps.meta.outputs.oot_image_tag }}"
++
++  plugin-ut:
++    name: Plugin UT (OOT image)
++    needs: [build-oot-image]
++    runs-on: linux-atom-mi355-1
++    timeout-minutes: 60
++    steps:
++      - name: Checkout ATOM repo
++        uses: actions/checkout@v4
++
++      - name: Docker Login
++        run: |
++          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
++
++      - name: Pull built OOT image
++        run: |
++          docker pull "${{ needs.build-oot-image.outputs.oot_image_tag }}"
++
++      - name: Run all plugin unit tests
++        run: |
++          docker run --rm \
++            -v "${{ github.workspace }}:/workspace" \
++            -w /workspace \
++            "${{ needs.build-oot-image.outputs.oot_image_tag }}" \
++            bash -lc "pytest -q tests/plugin"
++
++  oot-model-accuracy:
++    name: OOT Model Accuracy (${{ matrix.model_name }})
++    needs: [build-oot-image, plugin-ut]
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          # This matrix targets model architectures supported by ATOM OOT plugin.
++          - model_name: "Qwen3 Dense"
++            model_path: "Qwen/Qwen3-8B"
++            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 1"
++            env_vars: ""
++            runner: linux-atom-mi355-1
++          - model_name: "Qwen3 MoE"
++            model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
++            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
++            env_vars: ""
++            runner: atom-mi355-8gpu.predownload
++          - model_name: "DeepSeek-V3 family"
++            model_path: "deepseek-ai/DeepSeek-R1-0528"
++            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
++            env_vars: ""
++            runner: atom-mi355-8gpu.predownload
++          - model_name: "GPT-OSS"
++            model_path: "openai/gpt-oss-120b"
++            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
++            env_vars: |
++              ATOM_GPT_OSS_MODEL=1
++            runner: linux-atom-mi355-4
++          - model_name: "Kimi-K2"
++            model_path: "amd/Kimi-K2-Thinking-MXFP4"
++            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
++            env_vars: ""
++            runner: atom-mi355-8gpu.predownload
++    runs-on: ${{ matrix.runner }}
++    timeout-minutes: 240
++    env:
++      CONTAINER_NAME: atom_vllm_oot_validation_${{ strategy.job-index }}
++      OOT_IMAGE_TAG: ${{ needs.build-oot-image.outputs.oot_image_tag }}
++    steps:
++      - name: Checkout ATOM repo
++        uses: actions/checkout@v4
++
++      - name: Docker Login
++        run: |
++          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
++
++      - name: Pull built OOT image
++        run: |
++          docker pull "${OOT_IMAGE_TAG}"
++
++      - name: Clean up old containers
++        run: |
++          containers=$(docker ps -q)
++          if [ -n "$containers" ]; then
++            docker kill $containers || true
++          fi
++          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
++
++      - name: Start validation container
++        run: |
++          if [ -f "/etc/podinfo/gha-render-devices" ]; then
++            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
++          else
++            DEVICE_FLAG="--device /dev/dri"
++          fi
++
++          if [ -d "/models" ]; then
++            MODEL_MOUNT="-v /models:/models"
++          else
++            MODEL_MOUNT=""
++          fi
++
++          cat > /tmp/oot_env_file.txt << 'EOF'
++          ${{ matrix.env_vars }}
++          EOF
++
++          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
++            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
++            $MODEL_MOUNT \
++            -w /workspace \
++            --ipc=host --group-add video \
++            --shm-size=16G \
++            --privileged \
++            --cap-add=SYS_PTRACE \
++            --security-opt seccomp=unconfined \
++            --ulimit memlock=-1 \
++            --ulimit stack=67108864 \
++            --env-file /tmp/oot_env_file.txt \
++            -e HF_TOKEN="${HF_TOKEN:-}" \
++            --name "$CONTAINER_NAME" \
++            "${OOT_IMAGE_TAG}"
++        env:
++          GITHUB_WORKSPACE: ${{ github.workspace }}
++
++      - name: Pre-download model if /models exists
++        run: |
++          if [ -d "/models" ] && [ ! -f "/models/${{ matrix.model_path }}/config.json" ]; then
++            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
++          else
++            echo "Skip model pre-download"
++          fi
++
++      - name: Run OOT launch and gsm8k accuracy via script (full mode)
++        timeout-minutes: 120
++        run: |
++          docker exec "$CONTAINER_NAME" bash -lc "
++            set -euo pipefail
++            bash .github/scripts/atom_oot_test.sh accuracy full '${{ matrix.model_name }}'
++          "
++
++      - name: Collect summary
++        if: success()
++        run: |
++          echo "OOT gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
++          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
++
++      - name: Collect artifacts
++        if: always()
++        run: |
++          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
++          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
++          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
++
++      - name: Upload model artifacts
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: oot-validation-${{ matrix.model_name }}-${{ github.run_id }}
++          path: |
++            vllm_oot.log
++            oot_accuracy_output.txt
++            oot_accuracy_results
++
++      - name: Cleanup
++        if: always()
++        run: |
++          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
++          docker stop "$CONTAINER_NAME" || true
++          docker rm "$CONTAINER_NAME" || true
+diff --git a/.github/workflows/atom-vllm-oot-test.yaml b/.github/workflows/atom-vllm-oot-test.yaml
+new file mode 100644
+index 0000000..cba67f6
+--- /dev/null
++++ b/.github/workflows/atom-vllm-oot-test.yaml
+@@ -0,0 +1,203 @@
++name: ATOM vLLM OOT Test
++
++on:
++  push:
++    branches: [main]
++  pull_request:
++    branches: [main]  # Triggers on PRs targeting `main`
++    types: [opened, synchronize, reopened, ready_for_review]
++    paths-ignore:
++      - '**/*.md'
++      - 'docs/**'
++      - 'LICENSE'
++      - '.gitignore'
++  schedule:
++    # Nightly at 00:00 Beijing time (16:00 UTC)
++    - cron: '0 16 * * *'
++  workflow_dispatch:
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
++
++env:
++  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
++  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
++  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
++
++jobs:
++  pre-checks:
++    uses: ./.github/workflows/pre-checks.yaml
++    with:
++      black: true
++      ruff: true
++
++  atom-vllm-oot:
++    needs: [pre-checks]
++    if: ${{ needs.pre-checks.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
++    name: ATOM vLLM OOT Test
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          # Keep CI runtime under control: enable only one OOT model for now.
++          - model_name: "Kimi-K2-Thinking-MXFP4"
++            model_path: "amd/Kimi-K2-Thinking-MXFP4"
++            runner: atom-mi355-8gpu.predownload
++    runs-on: ${{ matrix.runner }}
++    timeout-minutes: 180
++    env:
++      CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
++      OOT_IMAGE_TAG: atom_vllm_oot_test:${{ github.sha }}-${{ strategy.job-index }}
++      VLLM_COMMIT: b31e9326a7d9394aab8c767f8ebe225c65594b60
++      VLLM_VERSION: "0.17"
++
++    steps:
++      - name: Clean up containers and workspace
++        run: |
++          echo "=== Cleaning up containers on $(hostname) ==="
++          containers=$(docker ps -q)
++          if [ -n "$containers" ]; then
++            docker kill $containers || true
++          fi
++          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
++          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
++
++      - name: Checkout ATOM repo
++        uses: actions/checkout@v4
++
++      - name: Build ATOM base image
++        run: |
++          cat <<EOF > Dockerfile.mod
++          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
++          RUN pip install -U lm-eval[api]
++          RUN pip show lm-eval || true
++          RUN pip install hf_transfer
++          RUN pip show hf_transfer || true
++          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
++          RUN pip uninstall -y amd-aiter
++          RUN pip install --upgrade "pybind11>=3.0.1"
++          RUN pip show pybind11
++          RUN rm -rf /app/aiter-test
++          RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \\
++              cd /app/aiter-test && \\
++              git checkout HEAD && \\
++              git submodule sync && git submodule update --init --recursive && \\
++              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
++          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
++          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
++          RUN pip uninstall -y atom
++          RUN rm -rf /app/ATOM
++          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
++              cd /app/ATOM && \\
++              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
++              pip install -e .
++          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
++          EOF
++
++          docker build --pull --network=host \
++            --no-cache \
++            -t atom_oot_base:ci \
++            -f Dockerfile.mod .
++
++      - name: Build OOT vLLM image
++        run: |
++          docker build --network=host \
++            --no-cache \
++            --target oot_image \
++            -t "${OOT_IMAGE_TAG}" \
++            --build-arg BASE_IMAGE="atom_oot_base:ci" \
++            --build-arg MAX_JOBS=64 \
++            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
++            --build-arg INSTALL_LM_EVAL=1 \
++            --build-arg INSTALL_FASTSAFETENSORS=1 \
++            -f docker/Dockerfile .
++
++      - name: Run all plugin unit tests
++        run: |
++          docker run --rm \
++            -v "${{ github.workspace }}:/workspace" \
++            -w /workspace \
++            "$OOT_IMAGE_TAG" \
++            bash -lc "pytest -q tests/plugin"
++
++      - name: Start OOT test container
++        run: |
++          if [ -f "/etc/podinfo/gha-render-devices" ]; then
++            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
++          else
++            DEVICE_FLAG="--device /dev/dri"
++          fi
++
++          if [ -d "/models" ]; then
++            MODEL_MOUNT="-v /models:/models"
++          else
++            echo "Warning: /models directory not found on runner; skipping /models mount."
++            MODEL_MOUNT=""
++          fi
++
++          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
++            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
++            $MODEL_MOUNT \
++            -w /workspace \
++            --ipc=host --group-add video \
++            --shm-size=16G \
++            --privileged \
++            --cap-add=SYS_PTRACE \
++            -e HF_TOKEN="${HF_TOKEN:-}" \
++            --security-opt seccomp=unconfined \
++            --ulimit memlock=-1 \
++            --ulimit stack=67108864 \
++            --name "$CONTAINER_NAME" \
++            "$OOT_IMAGE_TAG"
++        env:
++          GITHUB_WORKSPACE: ${{ github.workspace }}
++
++      - name: Download model if needed
++        if: success()
++        run: |
++          if [ -d "/models" ] && [ ! -f "/models/${{ matrix.model_path }}/config.json" ]; then
++            echo "Downloading model to /models/${{ matrix.model_path }}"
++            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
++          else
++            echo "Skip model download"
++          fi
++
++      - name: Run OOT launch and gsm8k accuracy via script (ci mode)
++        if: success()
++        timeout-minutes: 90
++        run: |
++          docker exec "$CONTAINER_NAME" bash -lc "
++            set -euo pipefail
++            bash .github/scripts/atom_oot_test.sh accuracy ci
++          "
++
++      - name: Collect OOT accuracy summary
++        if: success()
++        run: |
++          echo "OOT Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
++          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
++
++      - name: Collect OOT logs and results
++        if: always()
++        run: |
++          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
++          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
++          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
++
++      - name: Upload OOT artifacts
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: oot-${{ matrix.model_name }}-artifacts
++          path: |
++            vllm_oot.log
++            oot_accuracy_output.txt
++            oot_accuracy_results
++
++      - name: Clean up OOT test
++        if: always()
++        run: |
++          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
++          docker stop "$CONTAINER_NAME" || true
++          docker rm "$CONTAINER_NAME" || true
+diff --git a/.github/workflows/docker-release.yaml b/.github/workflows/docker-release.yaml
+index a233045..aad79fe 100644
+--- a/.github/workflows/docker-release.yaml
++++ b/.github/workflows/docker-release.yaml
+@@ -27,6 +27,19 @@ on:
+         description: "Runner label to use"
+         type: string
+         default: "atom-mi355-8gpu.predownload"
++      build_oot_image:
++        description: "Build OOT vLLM image"
++        type: boolean
++        default: false
++      oot_base_image:
++        description: "Base image for OOT vLLM (empty means rocm/atom-dev:latest)"
++        default: ""
++      vllm_commit:
++        description: "vLLM commit for OOT image"
++        default: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
++      vllm_version:
++        description: "vLLM version label for OOT image tags"
++        default: "0.17.0"
+ 
+ jobs:
+   docker-release:
+@@ -46,6 +59,8 @@ jobs:
+       RCCL_REPO: "https://github.com/ROCm/rccl.git"
+       RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
+       GPU_ARCH: "gfx942;gfx950"
++      VLLM_COMMIT: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
++      VLLM_VERSION: "0.17.0"
+ 
+     steps:
+       - name: Checkout ATOM repo
+@@ -68,6 +83,7 @@ jobs:
+         timeout-minutes: 120
+         run: |
+           docker build --pull --network=host -t atom_release:ci \
++          --target atom_image \
+           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
+           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
+           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
+@@ -136,6 +152,36 @@ jobs:
+           docker tag atom_release:ci rocm/atom-dev:${TAG}
+           docker push rocm/atom-dev:${TAG}
+ 
++      - name: Build OOT Docker image
++        if: ${{ success() && inputs.build_oot_image == true }}
++        timeout-minutes: 180
++        run: |
++          if [ -n "${{ inputs.oot_base_image }}" ]; then
++            OOT_BASE_IMAGE="${{ inputs.oot_base_image }}"
++          else
++            OOT_BASE_IMAGE="rocm/atom-dev:latest"
++          fi
++
++          echo "Using OOT base image: ${OOT_BASE_IMAGE}"
++          docker pull "${OOT_BASE_IMAGE}"
++          docker build --network=host -t atom_oot_release:ci \
++            --target oot_image \
++            --build-arg BASE_IMAGE="${OOT_BASE_IMAGE}" \
++            --build-arg MAX_JOBS=64 \
++            --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || env.VLLM_COMMIT }}" \
++            --build-arg INSTALL_LM_EVAL=1 \
++            --build-arg INSTALL_FASTSAFETENSORS=1 \
++            -f docker/Dockerfile .
++          docker inspect atom_oot_release:ci
++
++      - name: Push OOT Docker image
++        if: ${{ success() && inputs.build_oot_image == true }}
++        run: |
++          VLLM_VER="${{ inputs.vllm_version || env.VLLM_VERSION }}"
++          OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
++          docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
++          docker push rocm/atom-dev:${OOT_TAG}
++
+       - name: Clean Up
+         if: always()
+         run: |
+@@ -144,5 +190,7 @@ jobs:
+           # Remove build and tagged images to free disk space
+           docker rmi atom_release:ci || true
+           docker rmi rocm/atom-dev:latest || true
++          docker rmi atom_oot_release:ci || true
+           # Remove nightly tagged image if it exists
+           docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true
++          docker images "rocm/atom-dev:vllm-v*-nightly_*" -q | xargs -r docker rmi || true
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 85c99da..7d4f0a5 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -2,7 +2,86 @@
+ ARG BASE_IMAGE="rocm/pytorch:latest"
+ ARG GPU_ARCH="gfx942;gfx950"
+ 
+-FROM $BASE_IMAGE
++# --------------------------------------------------------------------
++# OOT image stage: extends an ATOM base image with vLLM + OOT deps.
++# Build with: docker build --target oot_image --build-arg BASE_IMAGE=...
++# --------------------------------------------------------------------
++FROM ${BASE_IMAGE} AS oot_image
++
++ARG MAX_JOBS=64
++ARG VENV_PYTHON="/opt/venv/bin/python"
++ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
++ARG VLLM_COMMIT="b31e9326a7d9394aab8c767f8ebe225c65594b60"
++ARG INSTALL_LM_EVAL=1
++ARG INSTALL_FASTSAFETENSORS=1
++
++ENV DEBIAN_FRONTEND=noninteractive
++ENV PATH="/opt/venv/bin:${PATH}"
++ENV VLLM_TARGET_DEVICE=rocm
++ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
++ENV MAX_JOBS=${MAX_JOBS}
++ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
++WORKDIR /app
++
++RUN echo "========== [OOT 1/7] Prepare build tools ==========" \
++    && apt-get update \
++    && apt --fix-broken install -y \
++    && apt-get install -y --no-install-recommends git ca-certificates ninja-build vim \
++    && mkdir -p /usr/local/bin \
++    && ln -sf "$(command -v ninja)" /usr/local/bin/ninja \
++    && /usr/local/bin/ninja --version \
++    && rm -rf /var/lib/apt/lists/*
++
++RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========" \
++    && "${VENV_PYTHON}" -m pip show atom || true \
++    && "${VENV_PYTHON}" -m pip show amd-aiter || true \
++    && "${VENV_PYTHON}" -m pip show mori || true
++
++RUN echo "========== [OOT 3/7] Clone vLLM ==========" \
++    && git clone "${VLLM_REPO}" /app/vllm \
++    && cd /app/vllm \
++    && git checkout "${VLLM_COMMIT}" \
++    && git submodule update --init --recursive \
++    && echo "vLLM commit:" \
++    && git rev-parse HEAD
++
++RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" \
++    && cd /app/vllm \
++    && "${VENV_PYTHON}" -m pip install --upgrade pip \
++    && sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt \
++    && "${VENV_PYTHON}" -m pip install --no-deps xgrammar==0.1.29 compressed-tensors==0.13.0 loguru \
++    && sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' requirements/rocm.txt \
++    && "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 \
++    && "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
++
++RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" \
++    && cd /opt/rocm/share/amd_smi \
++    && pip wheel . --wheel-dir=dist \
++    && pip install dist/*.whl
++
++RUN echo "========== [OOT 6/7] Build vLLM wheel ==========" \
++    && cd /app/vllm \
++    && VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py clean --all \
++    && MAX_JOBS="${MAX_JOBS}" VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py bdist_wheel --dist-dir=/tmp/vllm-wheels \
++    && ls -lh /tmp/vllm-wheels
++
++RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" \
++    && cd /app/vllm \
++    && "${VENV_PYTHON}" -m pip uninstall -y vllm || true \
++    && "${VENV_PYTHON}" -m pip install /tmp/vllm-wheels/*.whl \
++    && "${VENV_PYTHON}" -m pip install uvloop \
++    && if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi \
++    && if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi \
++    && "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" \
++    && "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom mori || true
++
++CMD ["/bin/bash"]
++
++# --------------------------------------------------------------------
++# ATOM image stage: original Dockerfile flow for atom-dev image.
++# Build with: docker build --target atom_image --build-arg BASE_IMAGE=...
++# --------------------------------------------------------------------
++FROM ${BASE_IMAGE} as atom_image
+ 
+ ARG GPU_ARCH
+ ENV GPU_ARCH_LIST=$GPU_ARCH
+diff --git a/docker/plugin/Dockerfile_OOT_vLLM b/docker/plugin/Dockerfile_OOT_vLLM
+deleted file mode 100644
+index a02e50c..0000000
+--- a/docker/plugin/Dockerfile_OOT_vLLM
++++ /dev/null
+@@ -1,105 +0,0 @@
+-ARG BASE_IMAGE="rocm/atom-dev:latest"
+-FROM ${BASE_IMAGE}
+-
+-ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+-ARG VLLM_COMMIT="b31e9326a7d9394aab8c767f8ebe225c65594b60"
+-ARG MAX_JOBS=64
+-ARG INSTALL_LM_EVAL=1
+-ARG INSTALL_FASTSAFETENSORS=1
+-ARG VENV_PYTHON="/opt/venv/bin/python"
+-
+-ENV DEBIAN_FRONTEND=noninteractive
+-ENV PATH="/opt/venv/bin:${PATH}"
+-ENV VLLM_TARGET_DEVICE=rocm
+-ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
+-ENV MAX_JOBS=${MAX_JOBS}
+-ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+-WORKDIR /app
+-
+-RUN echo "========== [1/7] Prepare build tools ==========" \
+-    && apt-get update \
+-    && apt --fix-broken install -y \
+-    && apt-get install -y --no-install-recommends git ca-certificates ninja-build vim \
+-    && mkdir -p /usr/local/bin \
+-    && ln -sf "$(command -v ninja)" /usr/local/bin/ninja \
+-    && /usr/local/bin/ninja --version \
+-    && rm -rf /var/lib/apt/lists/*
+-
+-RUN echo "========== [2/7] Verify base packages (atom/aiter/mori) ==========" \
+-    && "${VENV_PYTHON}" -m pip show atom || true \
+-    && "${VENV_PYTHON}" -m pip show amd-aiter || true \
+-    && "${VENV_PYTHON}" -m pip show mori || true
+-
+-RUN echo "========== [3/7] Clone vLLM ==========" \
+-    && git clone "${VLLM_REPO}" /app/vllm \
+-    && cd /app/vllm \
+-    && git checkout "${VLLM_COMMIT}" \
+-    && git submodule update --init --recursive \
+-    && echo "vLLM commit:" \
+-    && git rev-parse HEAD
+-
+-# Follow vLLM ROCm standard but DO NOT reinstall torch as already existing.
+-RUN echo "========== [4/7] Install vLLM ROCm build dependencies ==========" \
+-    && cd /app/vllm \
+-    && "${VENV_PYTHON}" -m pip install --upgrade pip \
+-    && sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt \
+-    && "${VENV_PYTHON}" -m pip install --no-deps xgrammar==0.1.29 compressed-tensors==0.13.0 loguru \
+-    && sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' requirements/rocm.txt \
+-    && "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 \
+-    && "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
+-
+-
+-RUN echo "========== [5/7] Build and install amd-smi wheel ==========" \
+-    && cd /opt/rocm/share/amd_smi \
+-    && pip wheel . --wheel-dir=dist \
+-    && pip install dist/*.whl
+-
+-RUN echo "========== [6/7] Build vLLM wheel ==========" \
+-    && cd /app/vllm \
+-    && VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py clean --all \
+-    && MAX_JOBS="${MAX_JOBS}" VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py bdist_wheel --dist-dir=/tmp/vllm-wheels \
+-    && ls -lh /tmp/vllm-wheels
+-
+-RUN echo "========== [7/7] Install vLLM runtime dependencies ==========" \
+-    && cd /app/vllm \
+-    && "${VENV_PYTHON}" -m pip uninstall -y vllm || true \
+-    && "${VENV_PYTHON}" -m pip install /tmp/vllm-wheels/*.whl \
+-    && "${VENV_PYTHON}" -m pip install uvloop
+-
+-RUN echo "========== [8/8] Optional tools and final checks ==========" \
+-    && if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi \
+-    && if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi \
+-    && "${VENV_PYTHON}" - <<'PY'
+-import importlib.metadata as m
+-import glob
+-import os
+-import torch
+-
+-print(f"torch.version.hip: {torch.version.hip}")
+-print(f"torch.version.cuda: {torch.version.cuda}")
+-torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+-print(f"torch lib dir: {torch_lib_dir}")
+-print(f"libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, 'libtorch_hip.so*'))}")
+-if torch.version.hip is None:
+-    raise RuntimeError("Torch is not ROCm build (torch.version.hip is None).")
+-
+-pkgs = [
+-    "vllm",
+-    "torch",
+-    "triton",
+-    "torchvision",
+-    "torchaudio",
+-    "amdsmi",
+-    "amd-aiter",
+-    "atom",
+-    "mori",
+-]
+-print("Final package versions:")
+-for p in pkgs:
+-    try:
+-        print(f"  {p}: {m.version(p)}")
+-    except Exception:
+-        print(f"  {p}: <not installed>")
+-PY
+-
+-CMD ["/bin/bash"]
+diff --git a/docker/plugin/build_OOT_vLLM.sh b/docker/plugin/build_OOT_vLLM.sh
+deleted file mode 100644
+index a87483c..0000000
+--- a/docker/plugin/build_OOT_vLLM.sh
++++ /dev/null
+@@ -1,90 +0,0 @@
+-#!/usr/bin/env bash
+-set -euo pipefail
+-
+-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+-LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
+-LOG_FILE="${LOG_FILE:-${LOG_DIR}/build_OOT_vLLM_$(date +%Y%m%d_%H%M%S).log}"
+-
+-mkdir -p "${LOG_DIR}"
+-# Mirror all stdout/stderr to terminal and log file.
+-exec > >(tee -a "${LOG_FILE}") 2>&1
+-
+-DOCKERFILE_PATH="${SCRIPT_DIR}/Dockerfile_OOT_vLLM"
+-BASE_IMAGE="${BASE_IMAGE:-rocm/atom-dev:latest}"
+-VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
+-VLLM_COMMIT="${VLLM_COMMIT:-b31e9326a7d9394aab8c767f8ebe225c65594b60}"
+-VLLM_VERSION="${VLLM_VERSION:-0.17}"
+-VLLM_COMMIT_SHORT="$(printf '%s' "${VLLM_COMMIT}" | cut -c1-6)"
+-IMAGE_REPO="${IMAGE_REPO:-rocm/atom-vllm-dev}"
+-IMAGE_TAG="${IMAGE_TAG:-${IMAGE_REPO}:v${VLLM_VERSION}-${VLLM_COMMIT_SHORT}}"
+-MAX_JOBS="${MAX_JOBS:-64}"
+-INSTALL_LM_EVAL="${INSTALL_LM_EVAL:-1}"
+-PULL_BASE_IMAGE="${PULL_BASE_IMAGE:-1}"
+-BUILD_NO_CACHE="${BUILD_NO_CACHE:-1}"
+-
+-print_banner() {
+-  echo "============================================================"
+-  echo "$1"
+-  echo "============================================================"
+-}
+-
+-print_banner "Build vLLM on top of ATOM base image"
+-echo "Log file        : ${LOG_FILE}"
+-echo "Dockerfile      : ${DOCKERFILE_PATH}"
+-echo "Build context   : ${REPO_ROOT}"
+-echo "Target image    : ${IMAGE_TAG}"
+-echo "Base image      : ${BASE_IMAGE}"
+-echo "vLLM repo       : ${VLLM_REPO}"
+-echo "vLLM version    : ${VLLM_VERSION}"
+-echo "vLLM commit     : ${VLLM_COMMIT}"
+-echo "commit short    : ${VLLM_COMMIT_SHORT}"
+-echo "MAX_JOBS        : ${MAX_JOBS}"
+-echo "INSTALL_LM_EVAL : ${INSTALL_LM_EVAL}"
+-echo "BUILD_NO_CACHE  : ${BUILD_NO_CACHE}"
+-echo
+-echo "Build plan:"
+-echo "  Step 1/4: (optional) pull base image"
+-echo "  Step 2/4: check/remove existing target image"
+-echo "  Step 3/4: build image from Dockerfile_OOT_vLLM"
+-echo "  Step 4/4: print final image info"
+-echo
+-
+-if [[ "${PULL_BASE_IMAGE}" == "1" ]]; then
+-  print_banner "Step 1/4 - Pull base image: ${BASE_IMAGE}"
+-  docker pull "${BASE_IMAGE}"
+-else
+-  print_banner "Step 1/4 - Skip base image pull (PULL_BASE_IMAGE=${PULL_BASE_IMAGE})"
+-fi
+-
+-print_banner "Step 2/4 - Check whether target image already exists"
+-if docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+-  echo "Target image already exists: ${IMAGE_TAG}"
+-  docker image inspect "${IMAGE_TAG}" --format 'Existing image -> ID={{.Id}}  Created={{.Created}}'
+-  echo "Removing existing target image: ${IMAGE_TAG}"
+-  docker image rm -f "${IMAGE_TAG}"
+-else
+-  echo "Target image does not exist yet: ${IMAGE_TAG}"
+-fi
+-echo
+-
+-print_banner "Step 3/4 - Build target image: ${IMAGE_TAG}"
+-NO_CACHE_FLAG=""
+-if [[ "${BUILD_NO_CACHE}" == "1" ]]; then
+-  NO_CACHE_FLAG="--no-cache"
+-fi
+-
+-DOCKER_BUILDKIT=1 docker build \
+-  ${NO_CACHE_FLAG} \
+-  -f "${DOCKERFILE_PATH}" \
+-  -t "${IMAGE_TAG}" \
+-  --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+-  --build-arg "VLLM_REPO=${VLLM_REPO}" \
+-  --build-arg "VLLM_COMMIT=${VLLM_COMMIT}" \
+-  --build-arg "MAX_JOBS=${MAX_JOBS}" \
+-  --build-arg "INSTALL_LM_EVAL=${INSTALL_LM_EVAL}" \
+-  "$@" \
+-  "${REPO_ROOT}"
+-
+-print_banner "Step 4/4 - Build completed"
+-docker image inspect "${IMAGE_TAG}" --format 'Image={{.RepoTags}}  ID={{.Id}}  Created={{.Created}}'
+diff --git a/tests/plugin/test_plugin_config_translation.py b/tests/plugin/test_plugin_config_translation.py
+new file mode 100644
+index 0000000..d85fcf8
+--- /dev/null
++++ b/tests/plugin/test_plugin_config_translation.py
+@@ -0,0 +1,82 @@
++import pytest
++
++import atom.plugin.config as plugin_config
++
++
++class _Obj:
++    def __init__(self, **kwargs):
++        for k, v in kwargs.items():
++            setattr(self, k, v)
++
++
++class _FakeConfig:
++    def __init__(self, **kwargs):
++        for k, v in kwargs.items():
++            setattr(self, k, v)
++
++
++class _FakeCompilationConfig:
++    def __init__(self, level, use_cudagraph, cudagraph_mode):
++        self.level = level
++        self.use_cudagraph = use_cudagraph
++        self.cudagraph_mode = cudagraph_mode
++
++
++def _patch_atom_config_module(monkeypatch):
++    import atom.config as atom_config_module
++
++    monkeypatch.setattr(atom_config_module, "Config", _FakeConfig, raising=False)
++    monkeypatch.setattr(
++        atom_config_module, "CompilationConfig", _FakeCompilationConfig, raising=False
++    )
++
++
++def test_generate_from_vllm_translates_core_fields(monkeypatch):
++    _patch_atom_config_module(monkeypatch)
++    monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0")
++
++    vllm_cfg = _Obj(
++        model_config=_Obj(model="m1", max_model_len=4096),
++        scheduler_config=_Obj(max_num_batched_tokens=2048, max_num_seqs=8),
++        cache_config=_Obj(
++            gpu_memory_utilization=0.5,
++            block_size=16,
++            num_gpu_blocks=1024,
++            cache_dtype="auto",
++            enable_prefix_caching=True,
++        ),
++        parallel_config=_Obj(
++            rank=1, tensor_parallel_size=2, enable_expert_parallel=False
++        ),
++        compilation_config=_Obj(mode=3),
++        quant_config=_Obj(name="q"),
++    )
++
++    cfg = plugin_config._generate_atom_config_from_vllm_config(vllm_cfg)
++
++    assert cfg.model == "m1"
++    assert cfg.max_num_batched_tokens == 2048
++    assert cfg.max_num_seqs == 8
++    assert cfg.max_model_len == 4096
++    assert cfg.tensor_parallel_size == 2
++    assert cfg.enforce_eager is True
++    assert cfg.compilation_config.level == 3
++    assert cfg.plugin_config.is_plugin_mode is True
++    assert cfg.plugin_config.is_vllm is True
++    assert cfg.plugin_config.is_sglang is False
++    assert cfg.plugin_config.vllm_use_atom_attention is True
++
++
++def test_generate_atom_config_requires_plugin_mode(monkeypatch):
++    import atom.plugin.config as config_module
++    import atom.plugin as plugin_module
++    import atom.config as atom_config_module
++
++    monkeypatch.setattr(plugin_module, "is_vllm", lambda: False, raising=False)
++    monkeypatch.setattr(plugin_module, "is_sglang", lambda: False, raising=False)
++    monkeypatch.setattr(
++        atom_config_module, "set_current_atom_config", lambda _cfg: None, raising=False
++    )
++
++    with pytest.raises(ValueError, match="running in plugin mode"):
++        config_module.generate_atom_config_for_plugin_mode(config=None)
+diff --git a/tests/plugin/test_plugin_env_flags.py b/tests/plugin/test_plugin_env_flags.py
+new file mode 100644
+index 0000000..6760cc3
+--- /dev/null
++++ b/tests/plugin/test_plugin_env_flags.py
+@@ -0,0 +1,18 @@
++import importlib
++
++
++def test_disable_vllm_plugin_flag_disables_platform(monkeypatch):
++    # ATOM_DISABLE_VLLM_PLUGIN takes precedence:
++    # when it is 1, vLLM should not get ATOM platform/attention at all.
++    for disable_attention in ("0", "1"):
++        monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN", "1")
++        monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", disable_attention)
++
++        import atom.plugin.vllm.platform as platform_module
++        import atom.plugin.vllm.register as register_module
++
++        importlib.reload(platform_module)
++        importlib.reload(register_module)
++
++        assert platform_module.ATOMPlatform is None
++        assert register_module.register_platform() is None
+diff --git a/tests/plugin/test_plugin_mode_status.py b/tests/plugin/test_plugin_mode_status.py
+new file mode 100644
+index 0000000..6ce6e2e
+--- /dev/null
++++ b/tests/plugin/test_plugin_mode_status.py
+@@ -0,0 +1,36 @@
++import pytest
++
++from atom.plugin import prepare as plugin_prepare
++
++
++@pytest.fixture(autouse=True)
++def _reset_framework_state():
++    # Autouse fixture: pytest runs this before/after every test.
++    plugin_prepare._set_framework_backbone("atom")
++    yield
++    plugin_prepare._set_framework_backbone("atom")
++
++
++def test_default_mode_is_server_mode():
++    assert plugin_prepare.is_plugin_mode() is False
++    assert plugin_prepare.is_vllm() is False
++    assert plugin_prepare.is_sglang() is False
++
++
++def test_set_framework_to_vllm():
++    plugin_prepare._set_framework_backbone("vllm")
++    assert plugin_prepare.is_plugin_mode() is True
++    assert plugin_prepare.is_vllm() is True
++    assert plugin_prepare.is_sglang() is False
++
++
++def test_set_framework_to_sgl_alias():
++    plugin_prepare._set_framework_backbone("sgl")
++    assert plugin_prepare.is_plugin_mode() is True
++    assert plugin_prepare.is_vllm() is False
++    assert plugin_prepare.is_sglang() is True
++
++
++def test_set_framework_unsupported_raises():
++    with pytest.raises(ValueError, match="Unsupported framework"):
++        plugin_prepare._set_framework_backbone("tensorflow")

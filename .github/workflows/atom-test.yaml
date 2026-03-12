@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  ATOM_BASE_NIGTHLY_IMAGE: rocm/atom-dev:latest
+  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -46,7 +46,7 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
+          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -234,7 +234,7 @@ jobs:
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && github.event.pull_request.head.repo.fork
         run: |
           cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
+          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -470,3 +470,4 @@ jobs:
           docker rm "$CONTAINER_NAME" || true
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
+
