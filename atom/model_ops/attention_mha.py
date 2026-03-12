@@ -251,39 +251,26 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata,
     ):
         """
-        When prefix cache hits, gather cached KV from paged cache and concat with
-        new tokens' k, v for full-sequence attention (e.g. flash_attn).
+        When prefix cache hits, gather full KV (cached + new) from paged cache in
+        one pass. New tokens are already written by fused_qk_rope_reshape_and_cache.
+        Same flow as gather_kv_b_proj: write new first, then read cached+new together.
+        token_to_batch, seq_starts are built in prepare_prefill.
         """
-        bs = attn_metadata.cu_seqlens_q.shape[0] - 1
-        cu_seqlens_q = attn_metadata.cu_seqlens_q
         cu_seqlens_k = attn_metadata.cu_seqlens_k
-        cached_seqlen = attn_metadata.num_cached_tokens  # [bs], from prepare_prefill
-
-        total_cached = cached_seqlen.sum().item()
+        total_tokens = cu_seqlens_k[-1].item()
+        token_to_batch = attn_metadata.token_to_batch
+        seq_starts = attn_metadata.seq_starts
 
         num_kv_heads = k.shape[1]
         head_dim = k.shape[2]
         device = k.device
         dtype = k.dtype
 
-        # Build metadata for cp_mha_gather_cache (cached tokens only)
-        # token_to_batch: [0]*cached[0] + [1]*cached[1] + ...
-        # cu_seqlens_kv: [0, cached[0], cached[0]+cached[1], ...]
-        # seq_starts: [0]*bs (prefix starts at position 0)
-        token_to_batch = torch.zeros(total_cached, dtype=torch.int32, device=device)
-        cu_seqlens_kv = [0]
-        for i in range(bs):
-            c = cached_seqlen[i].item()
-            token_to_batch[cu_seqlens_kv[-1] : cu_seqlens_kv[-1] + c] = i
-            cu_seqlens_kv.append(cu_seqlens_kv[-1] + c)
-        cu_seqlens_kv = torch.tensor(cu_seqlens_kv, dtype=torch.int32, device=device)
-        seq_starts = torch.zeros(bs, dtype=torch.int32, device=device)
-
-        k_prefix = torch.empty(
-            (total_cached, num_kv_heads, head_dim), dtype=dtype, device=device
+        k_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=dtype, device=device
         )
-        v_prefix = torch.empty(
-            (total_cached, num_kv_heads, head_dim), dtype=dtype, device=device
+        v_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=dtype, device=device
         )
 
         # Convert cache for cp_mha_gather_cache
@@ -316,47 +303,18 @@ class PagedAttentionImpl(nn.Module):
         cp_mha_gather_cache(
             key_cache=k_cache_gather,
             value_cache=v_cache_gather,
-            key=k_prefix,
-            value=v_prefix,
+            key=k_full,
+            value=v_full,
             block_tables=block_tables,
             k_scales=k_scale,
             v_scales=v_scale,
-            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_kv=cu_seqlens_k,
             token_to_batch=token_to_batch,
             seq_starts=seq_starts,
             dequant=self.kv_cache_dtype.startswith("fp8"),
             kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
-            total_tokens=total_cached,
+            total_tokens=total_tokens,
         )
-
-        # Build full k, v: for each batch i, [cached_i | new_i]
-        total_tokens = cu_seqlens_k[-1].item()
-        k_full = torch.empty(
-            (total_tokens, num_kv_heads, head_dim), dtype=dtype, device=device
-        )
-        v_full = torch.empty(
-            (total_tokens, num_kv_heads, head_dim), dtype=dtype, device=device
-        )
-
-        cached_offset = 0
-        for i in range(bs):
-            start = cu_seqlens_k[i].item()
-            end = cu_seqlens_k[i + 1].item()
-            cached_i = cached_seqlen[i].item()
-            new_i = end - start - cached_i
-
-            k_full[start : start + cached_i] = k_prefix[
-                cached_offset : cached_offset + cached_i
-            ]
-            v_full[start : start + cached_i] = v_prefix[
-                cached_offset : cached_offset + cached_i
-            ]
-
-            new_start = cu_seqlens_q[i].item()
-            k_full[start + cached_i : end] = k[new_start : new_start + new_i]
-            v_full[start + cached_i : end] = v[new_start : new_start + new_i]
-
-            cached_offset += cached_i
 
         return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
 

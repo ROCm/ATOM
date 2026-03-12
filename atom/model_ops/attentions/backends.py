@@ -116,6 +116,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ),
             "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
+            "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
         }
         if self.block_ratio > 1:
             attn_metadata["block_tables_converted"] = CpuGpuBuffer(
@@ -128,6 +130,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             torch.arange(0, self.max_bs + 1, step=1, dtype=torch.int32)
         )
         attn_metadata["cu_seqlens_q"].copy_to_gpu()
+        attn_metadata["seq_starts"].cpu.zero_()
+        attn_metadata["seq_starts"].copy_to_gpu()
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
@@ -208,6 +212,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         ]
         if has_cached:
             vars_used.append(("block_tables", bs))
+            vars_used.append(("seq_starts", bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         if self.block_ratio > 1 and "block_tables" in ctx:
@@ -219,6 +224,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             )
             ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         num_cached_tokens = None
+        token_to_batch = None
         if has_cached:
             num_cached_tokens = torch.tensor(
                 batch.num_cached_tokens[:bs], dtype=torch.int32, pin_memory=True
@@ -228,6 +234,16 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 logger.info(
                     f"Prefill batch has {num_cached_tokens.sum().item()} cached tokens and of {sum_scheduled_tokens} total tokens"
                 )
+            # Build metadata for cp_mha_gather_cache (full sequence: cached + new)
+            # token_to_batch: [0]*len0 + [1]*len1 + ...
+            total_tokens = cu_seqlens_k[-1]
+            token_to_batch = torch.zeros(
+                total_tokens, dtype=torch.int32, device=self.device
+            )
+            for i in range(bs):
+                start = cu_seqlens_k[i]
+                end = cu_seqlens_k[i + 1]
+                token_to_batch[start:end] = i
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
             max_seqlen_q=max_seqlen_q,
@@ -236,6 +252,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             dropout_p=dropout_p,
             has_cached=has_cached,
             num_cached_tokens=num_cached_tokens,
+            token_to_batch=token_to_batch,
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)

@@ -691,6 +691,7 @@ class MLAAttention(nn.Module):
                     self.kv_b_proj.weight_scale,
                     k_full,
                     v_full,
+                    weight_preshuffle=True,
                 )
                 output = flash_attn_varlen_func(
                     q=prefill_q,
