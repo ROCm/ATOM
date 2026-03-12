@@ -25,12 +25,6 @@ from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
-concat_and_cache_mla = mark_trace(
-    concat_and_cache_mla, prefix="kv_cache", torch_compile=False
-)
-fused_qk_rope_concat_and_cache_mla = mark_trace(
-    fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
-)
 from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,
@@ -46,6 +40,13 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 from atom.plugin import is_plugin_mode
 
 from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
+
+concat_and_cache_mla = mark_trace(
+    concat_and_cache_mla, prefix="kv_cache", torch_compile=False
+)
+fused_qk_rope_concat_and_cache_mla = mark_trace(
+    fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
+)
 
 # torch.set_printoptions(threshold=10_000)
 

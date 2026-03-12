@@ -13,12 +13,8 @@ from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from typing import TYPE_CHECKING, Optional
 from atom.utils import envs
-from atom.utils.decorators import mark_trace
 from atom.model_ops.base_attention import cp_mha_gather_cache
 
-fused_qk_norm_rope_cache_quant_shuffle = mark_trace(
-    fused_qk_norm_rope_cache_quant_shuffle, prefix="rope_and_cache"
-)
 import logging
 
 logger = logging.getLogger("atom")
