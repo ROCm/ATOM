@@ -93,10 +93,11 @@ jobs:
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
           docker push $IMAGE_TAG
 
-      - name: Success message
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+      - name: Clean up build images
+        if: ${{ !github.event.pull_request.head.repo.fork && always() }}
         run: |
-          echo "Successfully prepared image: $IMAGE_TAG"
+          docker rmi "atom_test:ci" || true
+          docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
 
   atom:
     needs: [pre-checks, build_atom_image]
@@ -467,3 +468,5 @@ jobs:
           fi
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
+          # Remove the pre-built image to free disk space on the runner
+          docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
