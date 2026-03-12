@@ -21,7 +21,7 @@ from openpyxl import Workbook
 FILTER_OUT = ["fill_"]
 
 # Sampling-related modules and low-level ops to filter out in prefill
-FILTER_OUT_PREFILL = ["aten::", "aiter::gemm_a16w16", "aiter::mixed_sample"]
+FILTER_OUT_PREFILL = ["aiter::mixed_sample"]
 
 
 # =============================================================================
