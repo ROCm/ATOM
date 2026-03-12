@@ -484,8 +484,13 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
         return rows
 
     _extract_layer_and_write(
-        all_norm_indices, len(launch_level2_items), target_layer,
-        "Prefill", "prefill", build_rows_from_item_range, output_xlsx,
+        all_norm_indices,
+        len(launch_level2_items),
+        target_layer,
+        "Prefill",
+        "prefill",
+        build_rows_from_item_range,
+        output_xlsx,
     )
 
 
@@ -545,7 +550,9 @@ def _extract_layer_and_write(
     if norm_start_idx >= len(norm_indices):
         print(f"Not enough norms for layer {TARGET_LAYER}")
         if sheet_name == "prefill":
-            print(f"Not enough rmsnorm modules for layer {TARGET_LAYER}, writing empty XLSX")
+            print(
+                f"Not enough rmsnorm modules for layer {TARGET_LAYER}, writing empty XLSX"
+            )
         write_breakdown_xlsx(output_xlsx, [], sheet_name=sheet_name)
         return
     else:
@@ -677,7 +684,9 @@ def parse_decode(
 
     # Find matching capture_graph
     capture_graphs = [
-        e for e in capture_events if e.get("name") == target_cg_name and e.get("ph") == "X"
+        e
+        for e in capture_events
+        if e.get("name") == target_cg_name and e.get("ph") == "X"
     ]
     if not capture_graphs and target_bs is not None:
         # Prefer the largest capture_graph_bs_K where K < target_bs.
@@ -820,7 +829,11 @@ def parse_decode(
             "Cannot resolve anchor kernel from first rmsnorm correlation in capture trace."
         )
     found = next(
-        (i for i, k in enumerate(gpu_kernels) if k.get("name", "") == anchor_kernel_name),
+        (
+            i
+            for i, k in enumerate(gpu_kernels)
+            if k.get("name", "") == anchor_kernel_name
+        ),
         None,
     )
     if found is None:
@@ -828,7 +841,9 @@ def parse_decode(
             f"Anchor kernel '{anchor_kernel_name}' not found in run decode kernels."
         )
     anchor_gpu_idx = found
-    print(f"Aligned from first norm kernel: {anchor_kernel_name} at gpu_idx={anchor_gpu_idx}")
+    print(
+        f"Aligned from first norm kernel: {anchor_kernel_name} at gpu_idx={anchor_gpu_idx}"
+    )
 
     rebuilt_modules = []
     running_gpu_idx = anchor_gpu_idx
@@ -851,8 +866,13 @@ def parse_decode(
         return rows
 
     _extract_layer_and_write(
-        all_norm_indices, len(all_modules), target_layer,
-        "Decode", "decode", build_rows_for_module_range, output_xlsx,
+        all_norm_indices,
+        len(all_modules),
+        target_layer,
+        "Decode",
+        "decode",
+        build_rows_for_module_range,
+        output_xlsx,
     )
 
 

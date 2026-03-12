@@ -19,6 +19,7 @@ from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
 from atom.utils.decorators import mark_trace
 
+
 @PagedAttentionImplDecoratorForPluginMode
 class PagedAttentionImpl(nn.Module):
     """

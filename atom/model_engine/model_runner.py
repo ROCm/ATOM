@@ -706,7 +706,8 @@ class ModelRunner:
             worker_name = safe_model_name or "trace"
             if isinstance(trace_name, str) and trace_name:
                 worker_name = "".join(
-                    c if c.isalnum() or c in ("_", "-", ".") else "_" for c in trace_name
+                    c if c.isalnum() or c in ("_", "-", ".") else "_"
+                    for c in trace_name
                 )
             if worker_name == "capture_graph":
                 if safe_model_name:
@@ -720,9 +721,10 @@ class ModelRunner:
                 output_path = f"{output_prefix}_ts_{ts}_{ms:03d}.pt.trace.json.gz"
                 tmp_json_path = output_path[:-3]
                 prof.export_chrome_trace(tmp_json_path)
-                with open(tmp_json_path, "rb") as src, gzip.open(
-                    output_path, "wb"
-                ) as dst:
+                with (
+                    open(tmp_json_path, "rb") as src,
+                    gzip.open(output_path, "wb") as dst,
+                ):
                     dst.write(src.read())
                 os.remove(tmp_json_path)
 
