@@ -149,7 +149,7 @@ jobs:
           -e HF_TOKEN="${HF_TOKEN:-}" \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
-          --pull \
+          --pull always \
           --ulimit stack=67108864 \
           -e ISL=${{ env.ISL }} \
           -e OSL=${{ env.OSL }} \
