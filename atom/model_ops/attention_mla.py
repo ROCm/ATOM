@@ -36,6 +36,7 @@ from torch import nn
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
+from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
@@ -74,8 +75,6 @@ if is_rocm_aiter_fp4bmm_enabled():
     # from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import  batched_gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
     from atom.model_ops.utils import quark_post_load_weights
-
-from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 
 
 # MLA Specific Arguments
