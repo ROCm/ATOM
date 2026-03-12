@@ -156,6 +156,7 @@ jobs:
           -e CONC=${{ env.CONC }} \
           -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
           -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+          -e ATOM_DISABLE_MMAP=true \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
@@ -302,6 +303,7 @@ jobs:
           -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
           -e ATOM_GPT_OSS_MODEL=1 \
           -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+          -e ATOM_DISABLE_MMAP=true \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom-benchmark \
