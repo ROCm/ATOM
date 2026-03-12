@@ -25,6 +25,12 @@ if [ "$TYPE" == "launch" ]; then
   retry_interval=60
   server_up=false
   for ((i=1; i<=max_retries; i++)); do
+      if ! kill -0 $atom_server_pid 2>/dev/null; then
+          echo "ATOM server process exited unexpectedly."
+          echo "Last 50 lines of server log:"
+          tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
+          exit 1
+      fi
       if curl -sf http://localhost:8000/health -o /dev/null; then
           echo "ATOM server HTTP endpoint is up."
           server_up=true
@@ -46,6 +52,12 @@ if [ "$TYPE" == "launch" ]; then
   warmup_interval=30
   warmup_done=false
   for ((i=1; i<=warmup_retries; i++)); do
+      if ! kill -0 $atom_server_pid 2>/dev/null; then
+          echo "ATOM server process exited unexpectedly during warmup."
+          echo "Last 50 lines of server log:"
+          tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
+          exit 1
+      fi
       if curl -sf http://localhost:8000/v1/completions \
           -H "Content-Type: application/json" \
           -d '{"model":"'"$MODEL_PATH"'","prompt":"hi","max_tokens":1}' \
