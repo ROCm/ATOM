@@ -266,13 +266,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         self.block_ratio,
                     )
                     attn_metadata.block_tables = var["block_tables_converted"].gpu[:bs]
-            var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
-                np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
-            )
             counts = var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
-            var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
-                var["cu_seqlens_q"].np[:bs], counts
-            )
+            if attn_metadata.has_cached:
+                # Full context (cached + new): use cu_seqlens_k for indexer
+                cu_seqlens_k_np = attn_metadata.cu_seqlens_k.cpu().numpy()
+                var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
+                    cu_seqlens_k_np[:-1], counts
+                )
+                var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = np.repeat(
+                    cu_seqlens_k_np[1:], counts
+                )
+            else:
+                var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
+                    np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
+                )
+                var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
+                    var["cu_seqlens_q"].np[:bs], counts
+                )
             attn_metadata.cu_seqlen_ks = var["cu_seqlen_ks"].copy_to_gpu(
                 sum_scheduled_tokens
             )
@@ -286,9 +296,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 :sum_scheduled_tokens
             ]
 
+            # Per-query req_id: token_id 0..sum_scheduled_tokens-1 maps to batch id.
+            # Use counts (new tokens per batch), not context_lens (full seq len).
             attn_metadata.token_to_seq_idxs = torch.repeat_interleave(
                 torch.arange(bs, dtype=torch.int32, device=self.device),
-                attn_metadata.context_lens,
+                torch.tensor(counts, dtype=torch.int64, device=self.device),
             )
             var["sparse_kv_indptr"].np[0] = 0
             var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
@@ -303,6 +315,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         if hasattr(self.model_runner, "drafter") or attn_metadata.has_cached:
+            # Populate kv_last_page_lens for full sequence (needed for MLA prefill with
+            # prefix cache; decode does the same)
+            if self.model_runner.block_size != 1:
+                var["kv_last_page_lens"].np[:bs] = np.asarray(
+                    batch.last_block_num_tokens[:bs], dtype=np.int32
+                )
+            else:
+                var["kv_last_page_lens"].np[:bs] = 1
+            var["kv_last_page_lens"].copy_to_gpu()
+
             attn_metadata.kv_indices = var["kv_indices"].gpu
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
             attn_metadata.kv_indptr[0] = 0

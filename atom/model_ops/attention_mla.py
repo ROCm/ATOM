@@ -478,7 +478,7 @@ class MLAAttention(nn.Module):
                 attn_metadata.token_to_seq_idxs,
                 self.topk_indices_buffer[:B],
                 attn_metadata.block_tables,
-                attn_metadata.cu_seqlens_q,
+                attn_metadata.cu_seqlens_k,
                 NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
             )
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q

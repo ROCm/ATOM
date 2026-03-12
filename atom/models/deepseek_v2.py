@@ -969,11 +969,17 @@ def sparse_attn_indexer(
             return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
-        total_seq_lens = hidden_states.shape[0]
-        k_fp8 = torch.empty(
-            [total_seq_lens, head_dim], device=k.device, dtype=dtypes.fp8
+        num_tokens = hidden_states.shape[0]
+        # When has_cached, gather full KV (cached + new) for indexer top-k
+        total_kv = (
+            prefill_metadata.cu_seqlens_k[-1].item()
+            if prefill_metadata.has_cached
+            else num_tokens
         )
-        k_scale = torch.empty([total_seq_lens, 1], device=k.device, dtype=torch.float32)
+        k_fp8 = torch.empty(
+            [total_kv, head_dim], device=k.device, dtype=dtypes.fp8
+        )
+        k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
         if prefill_metadata.block_tables.shape[0] < num_prefills:
             new_shape = (num_prefills, prefill_metadata.block_tables.shape[1])
             prefill_metadata.block_tables = torch.full(
@@ -987,12 +993,12 @@ def sparse_attn_indexer(
             k_fp8,
             k_scale.view(dtypes.fp8),
             prefill_metadata.block_tables,
-            prefill_metadata.cu_seqlens_q,
-            # num_prefills,
+            prefill_metadata.cu_seqlens_k
+            if prefill_metadata.has_cached
+            else prefill_metadata.cu_seqlens_q,
         )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
-        num_tokens = hidden_states.shape[0]
         logits = fp8_mqa_logits(
             Q=q_fp8[num_decode_tokens:num_tokens],
             KV=k_fp8,
