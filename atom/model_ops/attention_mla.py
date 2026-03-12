@@ -47,6 +47,8 @@ concat_and_cache_mla = mark_trace(
 fused_qk_rope_concat_and_cache_mla = mark_trace(
     fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
 )
+mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
+mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
 # torch.set_printoptions(threshold=10_000)
 

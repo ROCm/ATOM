@@ -216,6 +216,7 @@ class PagedAttentionImpl(nn.Module):
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
+    @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -292,6 +293,7 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    @mark_trace(prefix="paged_attention_asm", torch_compile=False)
     def paged_attention_asm(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -314,6 +316,7 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    @mark_trace(prefix="paged_attention_persistent_asm", torch_compile=False)
     def paged_attention_persistent_asm(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -343,6 +346,7 @@ class PagedAttentionImpl(nn.Module):
 
         return output
 
+    @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):

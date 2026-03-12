@@ -450,7 +450,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
     ) -> FusedMoEQuantConfig | None:
         return FUSED_MOE_UNQUANTIZED_CONFIG
 
-    @mark_trace(prefix="unquantized_moe")
+    @mark_trace(prefix="unquantized_moe", torch_compile=False)
     def apply(
         self,
         layer: torch.nn.Module,
@@ -859,7 +859,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
-    @mark_trace(prefix="mxfp4_moe")
+    @mark_trace(prefix="mxfp4_moe", torch_compile=False)
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1274,7 +1274,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             block_shape=block_shape,
         )
 
-    @mark_trace(prefix="compressed_fp8_moe")
+    @mark_trace(prefix="compressed_fp8_moe", torch_compile=False)
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1639,7 +1639,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_shape=None,
             )
 
-    @mark_trace(prefix="fp8_moe")
+    @mark_trace(prefix="fp8_moe", torch_compile=False)
     def apply(
         self,
         layer: torch.nn.Module,

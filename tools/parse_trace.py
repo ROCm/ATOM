@@ -470,11 +470,21 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
                 kernels.append({"name": k.get("name", "N/A"), "dur": k.get("dur", 0)})
         item_kernels.append(kernels)
 
+    def _resolve_moe_child_name_prefill(event: Dict[str, Any]) -> str:
+        mod_name = event.get("name", "<unknown>")
+        if "moe" not in mod_name.lower():
+            return mod_name
+        children = prefill_idx.get_direct_children(event)
+        children_with_launch = [c for c in children if prefill_idx.has_kernel_launch(c)]
+        if children_with_launch:
+            return children_with_launch[0].get("name", mod_name)
+        return mod_name
+
     def build_rows_from_item_range(start: int, end: int) -> List[List[Any]]:
         rows = []
         for i in range(start, end):
             item = launch_level2_items[i]
-            mod_name = item["level2_event"].get("name", "<unknown>")
+            mod_name = _resolve_moe_child_name_prefill(item["level2_event"])
             if should_filter_prefill(mod_name):
                 continue
             kernels = [k for k in item_kernels[i] if k["name"] not in ("", "N/A")]
@@ -605,15 +615,7 @@ def _extract_layer_and_write(
 def process_module(
     mod_name: str, kernel_count: int, start_gpu_idx: int, gpu_kernels: List[Dict]
 ) -> List[List]:
-    """
-    Process a module (regular or MoE) and return [display_name, gpu_kernel_name, gpu_dur] rows.
-
-    For moe_forward modules, kernels are categorized:
-    - 'moesort' in kernel name -> moe_sort
-    - 'topk' in kernel name -> moe_topk
-    - others -> cleaned module name
-    """
-    is_moe = "moe_forward" in mod_name.lower()
+    """Process a module and return [display_name, gpu_kernel_name, gpu_dur] rows."""
     rows = []
     for i in range(kernel_count):
         gpu_idx = start_gpu_idx + i
@@ -623,16 +625,7 @@ def process_module(
             gpu = gpu_kernels[gpu_idx]
             gpu_kernel_name = gpu.get("name", "N/A")
             gpu_dur = gpu.get("dur", 0)
-        if is_moe:
-            kl = gpu_kernel_name.lower()
-            if "moesort" in kl:
-                display_name = "moe_sort"
-            elif "topk" in kl:
-                display_name = "moe_topk"
-            else:
-                display_name = clean_module_name(mod_name, gpu_kernel_name)
-        else:
-            display_name = clean_module_name(mod_name, gpu_kernel_name)
+        display_name = clean_module_name(mod_name, gpu_kernel_name)
         rows.append([display_name, gpu_kernel_name, gpu_dur])
     return rows
 
@@ -764,6 +757,16 @@ def parse_decode(
     all_module_events = []
     gpu_idx = 0
 
+    def _resolve_moe_child_name_decode(event: Dict[str, Any]) -> str:
+        mod_name = event.get("name", "<unknown>")
+        if "moe" not in mod_name.lower():
+            return mod_name
+        children = idx.get_direct_children(event)
+        children_with_launch = [c for c in children if idx.has_kernel_launch(c)]
+        if children_with_launch:
+            return children_with_launch[0].get("name", mod_name)
+        return mod_name
+
     for child in kernel_children:
         child_name = child.get("name", "")
         if should_filter(child_name):
@@ -777,7 +780,7 @@ def parse_decode(
         modules = sub_kernel_children if sub_kernel_children else [child]
 
         for mod in modules:
-            mod_name = mod.get("name", "<unknown>")
+            mod_name = _resolve_moe_child_name_decode(mod)
             kernel_count = idx.count_kernel_launches(mod)
             all_modules.append((mod_name, kernel_count, gpu_idx))
             all_module_events.append(mod)
