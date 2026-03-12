@@ -24,6 +24,7 @@ from atom.model_ops.topK import (
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
+from typing import Any
 
 from .utils import (
     IntermediateTensors,
@@ -197,7 +198,7 @@ class Glm4MoeAttention(nn.Module):
         qkv_bias: bool = False,
         use_qk_norm: bool = False,
         cache_config: str = "bf16",
-        quant_config: QuantizationConfig | None = None,
+        atom_config: Config | None = None,
         prefix: str = "",
         rope_theta: float = 10000,
         layer_num: int = 0,
@@ -231,7 +232,7 @@ class Glm4MoeAttention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
-            quant_config=quant_config,
+            quant_config=atom_config.quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
 
@@ -239,7 +240,7 @@ class Glm4MoeAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=atom_config.quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -254,12 +255,12 @@ class Glm4MoeAttention(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
         )
         self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             kv_cache_dtype=cache_config,
-            quant_config=quant_config,
+            config=atom_config,
             prefix=f"{prefix}.attn",
             layer_num=layer_num,
             use_mla=False,
@@ -274,6 +275,7 @@ class Glm4MoeAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        **model_kwargs: dict[str, Any] | None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -286,7 +288,7 @@ class Glm4MoeAttention(nn.Module):
             )
 
         # q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, positions)
+        attn_output = self.attn(q, k, v, positions, **model_kwargs)
         output = self.o_proj(attn_output)
         return output
 
@@ -295,8 +297,7 @@ class Glm4MoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Glm4MoeConfig,
-        cache_config: str = "bf16",
-        quant_config: QuantizationConfig | None = None,
+        atom_config: Config | None = None,
         prefix: str = "",
         layer_num: int = 0,
         enable_eplb: bool = False,
@@ -320,8 +321,8 @@ class Glm4MoeDecoderLayer(nn.Module):
             head_dim=config.head_dim,
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=config.attention_bias,
-            cache_config=cache_config,
-            quant_config=quant_config,
+            cache_config=atom_config.kv_cache_dtype,
+            atom_config=atom_config,
             prefix=f"{prefix}.self_attn",
             use_qk_norm=config.use_qk_norm,
             rope_theta=rope_theta,
@@ -334,7 +335,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         ):
             self.mlp = Glm4MoE(
                 config=config,
-                quant_config=quant_config,
+                quant_config=atom_config.quant_config,
                 prefix=f"{prefix}.mlp",
                 enable_eplb=enable_eplb,
             )
@@ -343,7 +344,7 @@ class Glm4MoeDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=atom_config.quant_config,
                 prefix=f"{prefix}.mlp",
             )
 
@@ -358,13 +359,16 @@ class Glm4MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        **model_kwargs: dict[str, Any] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states, **model_kwargs
+        )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -373,6 +377,7 @@ class Glm4MoeDecoderLayer(nn.Module):
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
+        "positions": -1,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
     }
@@ -382,8 +387,6 @@ class Glm4MoeModel(nn.Module):
         super().__init__()
 
         config = atom_config.hf_config
-        cache_config = atom_config.kv_cache_dtype
-        quant_config = atom_config.quant_config
         self.config = config
 
         self.vocab_size = config.vocab_size
@@ -401,8 +404,7 @@ class Glm4MoeModel(nn.Module):
             config.num_hidden_layers,
             lambda prefix, layer_num=None: Glm4MoeDecoderLayer(
                 config=config,
-                cache_config=cache_config,
-                quant_config=quant_config,
+                atom_config=atom_config,
                 prefix=prefix,
                 layer_num=layer_num,
             ),
@@ -427,6 +429,7 @@ class Glm4MoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -440,7 +443,9 @@ class Glm4MoeModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, **model_kwargs
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -525,6 +530,7 @@ class Glm4MoeForCausalLM(nn.Module, Glm4MixtureOfExperts):
 
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
+        self.atom_config = atom_config
         config = atom_config.hf_config
         quant_config = atom_config.quant_config
         self.config = config
@@ -577,9 +583,10 @@ class Glm4MoeForCausalLM(nn.Module, Glm4MixtureOfExperts):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
         )
         return hidden_states
 

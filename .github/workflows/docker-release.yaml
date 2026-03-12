@@ -2,7 +2,7 @@ name: Nightly Docker Release
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # Every day at 09:00 Beijing Time (UTC+8)
+    - cron: '0 14 * * *'  # Every day at 22:00 Beijing Time (UTC+8)
   workflow_dispatch:
     inputs:
       atom_repo:
@@ -23,11 +23,15 @@ on:
       rccl_branch:
         description: "RCCL branch"
         default: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
+      runner:
+        description: "Runner label to use"
+        type: string
+        default: "atom-mi355-8gpu.predownload"
 
 jobs:
   docker-release:
     name: Nightly Docker Release
-    runs-on: linux-atom-mi355-1
+    runs-on: ${{ inputs.runner || 'atom-mi355-8gpu.predownload' }}
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +70,6 @@ jobs:
           docker build --pull --network=host -t atom_release:ci \
           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
-          --build-arg MAX_JOBS=64 \
           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
           --build-arg ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}" \
           --build-arg AITER_REPO="${{ inputs.aiter_repo || env.AITER_REPO }}" \
@@ -136,5 +139,10 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          docker stop atom_release || true
-          docker rm atom_release || true
+          docker stop atom_release_ci || true
+          docker rm atom_release_ci || true
+          # Remove build and tagged images to free disk space
+          docker rmi atom_release:ci || true
+          docker rmi rocm/atom-dev:latest || true
+          # Remove nightly tagged image if it exists
+          docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true

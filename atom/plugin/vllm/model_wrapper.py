@@ -32,6 +32,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss:GptOssForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
+    "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
 }
 
 

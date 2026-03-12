@@ -2,6 +2,7 @@ import logging
 
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
+from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang
 
@@ -10,6 +11,7 @@ logger = logging.getLogger("atom")
 _ATOM_SUPPORTED_MODELS = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+    "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
 }
 
 

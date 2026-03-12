@@ -1,21 +1,25 @@
 from typing import Generic, Optional, TypeVar
 import logging
-import os
 
 from dataclasses import dataclass
 
 import torch
 
+from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter.dist.parallel_state import get_tp_group
 from atom.plugin.prepare import is_vllm, is_sglang
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
+from atom.config import get_current_atom_config
+
 from atom.utils.forward_context import Context, AttentionMetaData
 from atom.model_ops.attention_mha import PagedAttentionImpl
-from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
 
 logger = logging.getLogger("atom")
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 
 
 @dataclass
@@ -643,6 +647,7 @@ class AiterMLACommonPrefillMetadataForPluginMode:
     query_seq_lens: torch.Tensor | None = None
     workspace_buffer: torch.Tensor | None = None
     q_data_type: torch.dtype | None = None
+    output_dtype: torch.dtype | None = None
 
 
 D = TypeVar("D", bound=AiterMLACommonDecodeMetadataForPluginMode)
@@ -699,6 +704,49 @@ class vllmMLAAttentionMetadataBuilderMethods:
             "Its methods are meant to be added to other classes via decorators."
         )
 
+    # TODO: support mtp and sparse
+    def _set_mla_persistent_worker_buffers(
+        self, bs: int, cu_seqlens_q: torch.Tensor, max_q_len: int = 1
+    ):
+        split_params = {
+            "kv_granularity": max(self.block_size, 16),
+            "max_seqlen_qo": max_q_len,
+            "uni_seqlen_qo": max_q_len,
+            "fast_mode": 1,
+            "max_split_per_batch": 16,
+        }
+        var = self.mla_persistent_metadata
+        work_meta_data = var["work_meta_data"]
+        work_info_set = var["work_info_set"]
+        work_indptr = var["work_indptr"]
+        reduce_indptr = var["reduce_indptr"]
+        reduce_final_map = var["reduce_final_map"]
+        reduce_partial_map = var["reduce_partial_map"]
+        get_mla_metadata_v1(
+            cu_seqlens_q,
+            self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
+            self.paged_kv_last_page_len[:bs],
+            self.padded_num_attention_heads,
+            1,  # nhead_kv,
+            True,
+            work_meta_data,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            page_size=self.block_size,
+            **split_params,
+        )
+        return {
+            "work_meta_data": work_meta_data,
+            "work_info_set": work_info_set,
+            "work_indptr": work_indptr,
+            "reduce_indptr": reduce_indptr,
+            "reduce_final_map": reduce_final_map,
+            "reduce_partial_map": reduce_partial_map,
+        }
+
     def _build_decode(
         self,
         block_table_tensor: torch.Tensor,
@@ -733,34 +781,29 @@ class vllmMLAAttentionMetadataBuilderMethods:
         qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_qo_len = qo_len.max().item()
 
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-            num_actual_pages = paged_kv_indices.size(0)
+        num_actual_pages = paged_kv_indices.size(0)
 
-            self.paged_kv_indices[:num_actual_pages].copy_(
-                paged_kv_indices, non_blocking=True
-            )
-            self.paged_kv_indices[num_actual_pages:].fill_(-1)
-            paged_kv_indices = self.paged_kv_indices[:num_actual_pages]
+        self.paged_kv_indices[:num_actual_pages].copy_(
+            paged_kv_indices, non_blocking=True
+        )
+        self.paged_kv_indices[num_actual_pages:].fill_(-1)
+        paged_kv_indices = self.paged_kv_indices[:num_actual_pages]
 
-            self.paged_kv_indptr[: 1 + num_reqs].copy_(
-                paged_kv_indptr, non_blocking=True
-            )
-            self.paged_kv_indptr[1 + num_reqs :].fill_(paged_kv_indptr[-1])
-            paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
+        self.paged_kv_indptr[: 1 + num_reqs].copy_(paged_kv_indptr, non_blocking=True)
+        self.paged_kv_indptr[1 + num_reqs :].fill_(paged_kv_indptr[-1])
+        paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-            # paged_kv_last_page_len already uses the pre-initialized buffer slice
-            # (set above), so no copy needed - buffer is always 1s.
+        # paged_kv_last_page_len already uses the pre-initialized buffer slice
+        # (set above), so no copy needed - buffer is always 1s.
 
-            self.qo_indptr[: 1 + num_reqs].copy_(
-                query_start_loc_device, non_blocking=True
-            )
-            self.qo_indptr[1 + num_reqs :] = query_start_loc_device[-1]
-            qo_indptr = self.qo_indptr[: 1 + num_reqs]
+        self.qo_indptr[: 1 + num_reqs].copy_(query_start_loc_device, non_blocking=True)
+        self.qo_indptr[1 + num_reqs :] = query_start_loc_device[-1]
+        qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        else:
-            qo_indptr = torch.arange(
-                0, num_reqs + 1, step=1, dtype=torch.int32, device=device
-            )
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
+            num_reqs, query_start_loc_device, 1
+        )
+        self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(
             block_table=block_table_tensor,
@@ -1056,11 +1099,15 @@ class vllmMLAAttentionMetadataBuilderMethods:
             decode=decode_metadata,
         )
 
+        # TODO: support mtp
+        ctx_mla_ps = self.mla_persistent_metadata
+
         attn_metadata = AttentionMetaData(
             max_seqlen_q=common_attn_metadata.max_query_len,
             block_tables=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             plugin_metadata=attn_metadata_for_plugin_mode,
+            **ctx_mla_ps,
         )
         return attn_metadata
 
@@ -1095,6 +1142,13 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         max_num_pages_per_req = self.vllm_config.model_config.max_model_len
         max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
+        self.num_attention_heads = (
+            config.model_config.hf_config.num_attention_heads
+            // get_tp_group().world_size
+        )
+        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        self.block_size = kv_cache_spec.block_size
+        self.max_bs = max_num_reqs
 
         # Preparing persistent buffers
         # TODO: we can disambiguate between decode and mixed-prefill decode here
@@ -1107,17 +1161,54 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             max_num_reqs, dtype=torch.int32, device=device
         )
 
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-            self.paged_kv_indptr = torch.zeros(
-                max_num_reqs + 1, dtype=torch.int32, device=device
-            )
-            self.paged_kv_indices = torch.zeros(
-                max_num_pages, dtype=torch.int32, device=device
-            )
+        self.paged_kv_indptr = torch.zeros(
+            max_num_reqs + 1, dtype=torch.int32, device=device
+        )
+        self.paged_kv_indices = torch.zeros(
+            max_num_pages, dtype=torch.int32, device=device
+        )
 
-            self.qo_indptr = torch.zeros(
-                max_num_reqs + 1, dtype=torch.int32, device=device
-            )
+        self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
+
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            max_num_reqs,
+            1,
+            self.padded_num_attention_heads,
+            torch.bfloat16,
+            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            is_sparse=False,  # TODO: support sparse
+            fast_mode=True,
+        )
+
+        self.mla_persistent_metadata = {
+            "work_meta_data": torch.empty(
+                work_meta_data_size, dtype=work_meta_data_type, device=self.device
+            ),
+            "work_indptr": torch.empty(
+                work_indptr_size, dtype=work_indptr_type, device=self.device
+            ),
+            "work_info_set": torch.empty(
+                work_info_set_size, dtype=work_info_set_type, device=self.device
+            ),
+            "reduce_indptr": torch.empty(
+                reduce_indptr_size, dtype=reduce_indptr_type, device=self.device
+            ),
+            "reduce_final_map": torch.empty(
+                reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
+            ),
+            "reduce_partial_map": torch.empty(
+                reduce_partial_map_size,
+                dtype=reduce_partial_map_type,
+                device=self.device,
+            ),
+        }
 
     return init_method_under_plugin_mode
 
@@ -1206,6 +1297,7 @@ def AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
 class vllmAiterMLABackendMethods:
     accept_output_buffer: bool = True
     supported_dtypes: list = [torch.float16, torch.bfloat16]
+    forward_includes_kv_cache_update: bool = True
 
     def __init__(self):
         raise TypeError(
@@ -1288,9 +1380,6 @@ def unified_attention_with_output_base_for_plugin_mode(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    from atom.config import get_current_atom_config
-    from atom.utils import envs
-
     atom_config = get_current_atom_config()
     if use_mla:
         # raise NotImplementedError("MLA is not supported for plugin mode for now")
@@ -1300,7 +1389,7 @@ def unified_attention_with_output_base_for_plugin_mode(
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
-        if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1":
+        if disable_vllm_plugin_attention:
             k_pe = k_pe.unsqueeze(1)
             if self.rotary_emb is not None:
                 q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
