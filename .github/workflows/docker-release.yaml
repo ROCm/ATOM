@@ -26,12 +26,12 @@ on:
       runner:
         description: "Runner label to use"
         type: string
-        default: "atom-mi355-8gpu.predownload"
+        default: "linux-atom-mi355-1"
 
 jobs:
   docker-release:
     name: Nightly Docker Release
-    runs-on: ${{ inputs.runner || 'atom-mi355-8gpu.predownload' }}
+    runs-on: ${{ inputs.runner || 'linux-atom-mi355-1' }}
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +48,9 @@ jobs:
       GPU_ARCH: "gfx942;gfx950"
 
     steps:
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
+
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
 
