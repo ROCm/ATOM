@@ -158,39 +158,29 @@ class MLAAttentionImplPluginModeMethods:
         k[..., k_nope.shape[-1] :] = k_pe
         return k
 
-    def _v_up_proj(self, x):
+    def _v_up_proj(self, x, out):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+        out = out.view(-1, self.num_heads, self.v_head_dim)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
         # Convert from (B, N, L) to (N, B, L)
         if envs.ATOM_USE_TRITON_MXFP4_BMM:
-            output = torch.empty(
-                x.shape[1],
-                x.shape[0],
-                self.W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
-            output = batched_gemm_a16wfp4(
+            out = batched_gemm_a16wfp4(
                 x,
                 self.W_V,
                 self.W_V_scale,
-                y=output,
+                y=out,
                 transpose_bm=True,
                 prequant=True,
                 y_scale=None,
             )
             # x = x.transpose(0, 1).flatten(1, 2)
-            output = output.view(-1, self.num_heads * self.v_head_dim)
-            x = output
+            x = out.view(-1, self.num_heads * self.v_head_dim)
         else:
             x = _aiter_triton_fp8_bmm(
-                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
+                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
             )
-            # Convert from (B, N, V) to (B, N * V)
-            x = x.reshape(-1, self.num_heads * self.v_head_dim)
-        return x
 
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
@@ -570,10 +560,12 @@ class MLAAttentionImplPluginModeMethods:
         #     q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
+        if self.head_repeat_factor > 1:
+            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
         B = q.shape[0]
         o = torch.empty(
             B,
-            self.num_heads,
+            self.padded_num_heads,
             self.kv_lora_rank,
             dtype=attn_metadata.plugin_metadata.decode.attn_out_dtype,
             device=q.device,
@@ -621,6 +613,8 @@ class MLAAttentionImplPluginModeMethods:
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
         )
+        if self.head_repeat_factor > 1:
+            o = o[:, :: self.head_repeat_factor, :]
         return o, None
 
     def forward_impl_plugin_mode(
@@ -840,12 +834,22 @@ class MLAAttentionImplPluginModeMethods:
                 )
 
             # v_up projection
-            # self._v_up_proj(attn_out, out=output[:num_decode_tokens])
-            # TODO: remove this copy.
-            out_up_proj = self._v_up_proj(attn_out)
-            output[:num_decode_tokens] = out_up_proj
+            self._v_up_proj(attn_out, out=output[:num_decode_tokens])
 
         return output_padded
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        # The kv cache update will be handled by the forward_impl_plugin_mode
+        # side for doing fused qk rope and cache update.
+        return
 
 
 def _mla_plugin_mode_init(self, *args, **kwargs):
@@ -909,6 +913,7 @@ def MLAAttentionImplDecoratorForPluginMode(cls):
         "_forward_prefill_plugin_mode",
         "_forward_decode_plugin_mode",
         "forward_impl_plugin_mode",
+        "do_kv_cache_update",
     ]
 
     logger.info("Use MLAAttentionImplDecoratorForPluginMode to decorate MLAAttention")

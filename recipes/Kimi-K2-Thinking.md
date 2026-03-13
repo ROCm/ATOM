@@ -94,6 +94,15 @@ Here is the reference value when deploying on 4 ranks:
 ```
 
 ### Serving on 8xMI355 GPUs
-Running the model with parallelism of 8 ranks will fail for now, since some kernels are not applicable in this case, i.e., num_heads=8 for each rank (64 heads in total):
-- get_mla_metadata_info_v1() assertion fail when num_heads=8.
-- Existing MLA decode kernel doesn't support num_heads=8.
+
+```bash
+#!/bin/bash
+export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+python -m atom.entrypoints.openai_server --model amd/Kimi-K2-Thinking-MXFP4 --trust-remote-code -tp 8 --kv_cache_dtype fp8
+```
+
+With TP8, each rank handles 8 attention heads (64 total). ATOM uses a head-repeat
+mechanism to pad queries to 16 heads before the AITER MLA decode kernel and folds
+the output back, satisfying the kernel's minimum head-count requirement without
+affecting numerical results.

@@ -33,6 +33,7 @@ logger = logging.getLogger("atom")
 
 # Constants
 DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_K = -1
 DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_TOKENS = 256
 CHAT_COMPLETION_OBJECT = "chat.completion"
@@ -64,6 +65,7 @@ class ChatCompletionRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = None
     prompt: Optional[List[ChatMessage]] = None  # Accept 'prompt' as alias
     temperature: Optional[float] = DEFAULT_TEMPERATURE
+    top_k: Optional[int] = DEFAULT_TOP_K
     top_p: Optional[float] = DEFAULT_TOP_P
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     stop: Optional[List[str]] = None
@@ -87,6 +89,7 @@ class CompletionRequest(BaseModel):
     model: Optional[str] = None
     prompt: str
     temperature: Optional[float] = DEFAULT_TEMPERATURE
+    top_k: Optional[int] = DEFAULT_TOP_K
     top_p: Optional[float] = DEFAULT_TOP_P
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     stop: Optional[List[str]] = None
@@ -254,9 +257,13 @@ def _build_sampling_params(
     max_tokens: int,
     stop_strings: Optional[List[str]],
     ignore_eos: bool,
+    top_k: int = -1,
+    top_p: float = 1.0,
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
         max_tokens=max_tokens,
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
@@ -671,6 +678,8 @@ async def chat_completions(request: ChatCompletionRequest):
             max_tokens=request.max_tokens,
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
+            top_k=request.top_k,
+            top_p=request.top_p,
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -753,6 +762,8 @@ async def completions(request: CompletionRequest):
             max_tokens=request.max_tokens,
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
+            top_k=request.top_k,
+            top_p=request.top_p,
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"

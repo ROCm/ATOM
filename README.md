@@ -26,6 +26,7 @@
 | [DeepSeek V2/V3](https://huggingface.co/deepseek-ai) | `DeepseekV3ForCausalLM` | MoE | MLA attention, MTP speculative decoding |
 | [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1) | `MixtralForCausalLM` | MoE | 8 experts, top-2 routing |
 | [GLM-4-MoE](https://huggingface.co/THUDM) | `Glm4MoeForCausalLM` | MoE | |
+| [GLM-5](https://huggingface.co/zai-org/GLM-5-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA attention, similar to DeepSeek v3.2. See [recipe](recipes/GLM-5.md) |
 | [GPT-OSS](https://huggingface.co/openai) | `GptOssForCausalLM` | MoE | Sliding window + attention sinks |
 | [Kimi-K2](https://huggingface.co/moonshotai/Kimi-K2-Thinking) | via `--trust-remote-code` | MoE | See [recipe](recipes/Kimi-K2-Thinking.md) |
 
@@ -86,6 +87,7 @@ git clone https://github.com/ROCm/ATOM.git; pip install ./ATOM
 
 - [Qwen3-235B-A22B](recipes/Qwen3-235b.md) -- TP8 + EP with FP8 KV cache
 - [Kimi-K2-Thinking](recipes/Kimi-K2-Thinking.md) -- MXFP4 MoE on 4 GPUs
+- [GLM-5](recipes/GLM-5.md) -- FP8 MoE with MLA on 8 GPUs
 
 ## 💡 Usage
 

@@ -138,6 +138,7 @@ class EagleProposer:
             draft_token_ids[:, i] = new_draft_ids
 
             if i < self.mtp_k - 1:
+                do_attn_metadata_update = not context.is_prefill
                 if i == 0:
                     attn_metadata.max_seqlen_q = 1
                     kv_indptr = var["kv_indptr"].gpu[: bs + 1]
@@ -160,7 +161,11 @@ class EagleProposer:
                 # update metadata
                 attn_metadata.max_seqlen_k += 1
                 workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
-                    bs, attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k
+                    bs,
+                    attn_metadata.max_seqlen_q,
+                    attn_metadata.max_seqlen_k,
+                    only_update=do_attn_metadata_update,
+                    num_reject_tokens=num_reject_tokens if i == 0 else None,
                 )
                 for k, v in workinfos.items():
                     attn_metadata.__dict__[k] = v

@@ -397,3 +397,34 @@ class TestRemapLayerName:
         qcfg.remap_layer_name(hf)
 
         assert qcfg.exclude_layers.count("model.layers.0.gate_up_proj") == 1
+
+
+class TestComputeHash:
+    def test_hash_is_deterministic(self):
+        qcfg = QuantizationConfig(config=None)
+        h1 = qcfg.compute_hash()
+        h2 = qcfg.compute_hash()
+        assert h1 == h2
+        assert isinstance(h1, str) and len(h1) == 64
+
+    def test_different_configs_produce_different_hashes(self):
+        qcfg1 = QuantizationConfig(config=None)
+        qcfg2 = QuantizationConfig(config=None)
+        qcfg2.global_quant_config = LayerQuantConfig(
+            quant_type=QuantType.per_Token, quant_dtype=FP8
+        )
+        assert qcfg1.compute_hash() != qcfg2.compute_hash()
+
+    def test_exclude_layers_affect_hash(self):
+        qcfg1 = QuantizationConfig(config=None)
+        qcfg2 = QuantizationConfig(config=None)
+        qcfg2.exclude_layers = ["lm_head"]
+        assert qcfg1.compute_hash() != qcfg2.compute_hash()
+
+    def test_layer_quant_config_affects_hash(self):
+        qcfg1 = QuantizationConfig(config=None)
+        qcfg2 = QuantizationConfig(config=None)
+        qcfg2.layer_quant_config = {
+            "*.mlp.*": LayerQuantConfig(quant_type=QuantType.per_1x32)
+        }
+        assert qcfg1.compute_hash() != qcfg2.compute_hash()
