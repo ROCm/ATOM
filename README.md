@@ -176,14 +176,14 @@ TORCHINDUCTOR_COMPILE_THREADS=1 python -m atom.entrypoints.openai_server \
   --mark-trace
 ```
 
-After the server processes requests and shuts down, a `*.json.gz` trace file will be generated in the `--torch-profiler-dir` directory.
+After the server processes requests and shuts down, two `*.json.gz` trace files will be generated in the `--torch-profiler-dir` directory.
 
 #### Step 2: Analyze the Trace
 
-Run `parse_trace.py` on the collected trace file:
+Run `parse_trace.py` on the collected trace file(use it on trace file start with the model name):
 
 ```bash
-python ATOM/tools/parse_trace.py ./trace/my_trace.json.gz
+python ATOM/tools/parse_trace.py ./trace/model_name_ts_*.json.gz
 ```
 
 This produces two Excel files in the current directory:
