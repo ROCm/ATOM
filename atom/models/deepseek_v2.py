@@ -976,9 +976,7 @@ def sparse_attn_indexer(
             if prefill_metadata.has_cached
             else num_tokens
         )
-        k_fp8 = torch.empty(
-            [total_kv, head_dim], device=k.device, dtype=dtypes.fp8
-        )
+        k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
         k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
         if prefill_metadata.block_tables.shape[0] < num_prefills:
             new_shape = (num_prefills, prefill_metadata.block_tables.shape[1])
@@ -993,9 +991,11 @@ def sparse_attn_indexer(
             k_fp8,
             k_scale.view(dtypes.fp8),
             prefill_metadata.block_tables,
-            prefill_metadata.cu_seqlens_k
-            if prefill_metadata.has_cached
-            else prefill_metadata.cu_seqlens_q,
+            (
+                prefill_metadata.cu_seqlens_k
+                if prefill_metadata.has_cached
+                else prefill_metadata.cu_seqlens_q
+            ),
         )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
