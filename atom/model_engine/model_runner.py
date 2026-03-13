@@ -1532,21 +1532,13 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            with (
-                record_function(
-                    f"prefill_bs_{bs}_ctxlens_{forward_context.attn_metadata.context_lens}"
-                )
-                if self.mark_trace
-                else nullcontext()
+            with record_function(
+                f"prefill_bs_{bs}_ctxlens_{forward_context.attn_metadata.context_lens}"
             ):
                 hidden_states = self.model(input_ids, positions)
                 logits = self.model.compute_logits(hidden_states)
         else:
-            with (
-                record_function(f"decode_step_bs_{bs}")
-                if self.mark_trace
-                else nullcontext()
-            ):
+            with record_function(f"decode_step_bs_{bs}"):
                 graph_bs = context.graph_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
                 graph_key = (graph_bs, max_q_len)
