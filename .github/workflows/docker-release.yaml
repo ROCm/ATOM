@@ -182,8 +182,11 @@ jobs:
         run: |
           VLLM_VER="${{ inputs.vllm_version || env.VLLM_VERSION }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
+          OOT_LATEST_TAG="vllm-latest"
           docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
           docker push rocm/atom-dev:${OOT_TAG}
+          docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
+          docker push rocm/atom-dev:${OOT_LATEST_TAG}
 
       - name: Clean Up
         if: always()
@@ -197,3 +200,4 @@ jobs:
           # Remove nightly tagged image if it exists
           docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true
           docker images "rocm/atom-dev:vllm-v*-nightly_*" -q | xargs -r docker rmi || true
+          docker rmi rocm/atom-dev:vllm-latest || true
