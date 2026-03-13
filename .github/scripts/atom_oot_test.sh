@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
-#   accuracy - run gsm8k accuracy test (and threshold check)
+#   accuracy - run gsm8k accuracy test and save result JSON
 #
 # MODE:
 #   ci    - only Kimi-K2
@@ -39,20 +39,20 @@ RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
 ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/oot_accuracy_output.txt}
 
 # Format:
-#   MODEL_NAME|MODEL_PATH|EXTRA_ARGS|THRESHOLD
+#   MODEL_NAME|MODEL_PATH|EXTRA_ARGS
 # Note: CI runs Kimi-K2 with TP=4 on an 8-GPU runner to reduce runtime and
 # improve CI stability. Full mode uses TP=8 on the same class of runner for
 # higher-fidelity validation.
 CI_MODE_MODELS=(
-  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel|0.90"
+  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel"
 )
 
 FULL_MODE_MODELS=(
-  "Qwen3 Dense|Qwen/Qwen3-8B|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 1|0.70"
-  "Qwen3 MoE|Qwen/Qwen3-235B-A22B-Instruct-2507-FP8|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel|0.87"
-  "DeepSeek-V3 family|deepseek-ai/DeepSeek-R1-0528|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8|0.94"
-  "GPT-OSS|openai/gpt-oss-120b|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3|0.38"
-  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel|0.90"
+  "Qwen3 Dense|Qwen/Qwen3-8B|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 1"
+  "Qwen3 MoE|Qwen/Qwen3-235B-A22B-Instruct-2507-FP8|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
+  "DeepSeek-V3 family|deepseek-ai/DeepSeek-R1-0528|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
+  "GPT-OSS|openai/gpt-oss-120b|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
+  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
 )
 
 declare -a ACTIVE_MODELS=()
@@ -150,7 +150,6 @@ accuracy_one_model() {
   local model_name="$1"
   local model_path="$2"
   local extra_args="$3"
-  local threshold="$4"
 
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${model_path}")
@@ -161,18 +160,49 @@ accuracy_one_model() {
   fi
 
   mkdir -p "${RESULT_DIR}"
-  local result_file="${RESULT_DIR}/$(date +%Y%m%d%H%M%S)_${model_name// /_}.json"
+  local run_tag
+  run_tag="$(date +%Y%m%d%H%M%S)_${model_name// /_}"
+  local output_path="${RESULT_DIR}/${run_tag}"
 
   echo ""
   echo "========== Running OOT gsm8k accuracy =========="
   echo "Model name: ${model_name}"
-  echo "Threshold: ${threshold}"
 
   lm_eval --model local-completions \
     --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
     --tasks gsm8k \
     --num_fewshot 3 \
-    --output_path "${result_file}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+    --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+
+  # lm-eval output layout differs across versions: output_path may be a file
+  # or a directory containing one/more JSON files. Follow native CI style:
+  # resolve the latest generated JSON first, then parse metrics from it.
+  local result_file=""
+  result_file=$(python - <<PY
+from pathlib import Path
+
+candidate_roots = [Path("${output_path}"), Path("${RESULT_DIR}")]
+json_candidates = []
+for root in candidate_roots:
+    if root.is_file() and root.suffix == ".json":
+        json_candidates.append(root)
+    elif root.is_dir():
+        for p in root.rglob("*.json"):
+            if p.is_file():
+                json_candidates.append(p)
+
+if not json_candidates:
+    print("")
+else:
+    latest = max(json_candidates, key=lambda p: p.stat().st_mtime)
+    print(str(latest))
+PY
+)
+
+  if [[ -z "${result_file}" || ! -f "${result_file}" ]]; then
+    echo "ERROR: No results JSON file found under ${output_path} or ${RESULT_DIR}"
+    return 2
+  fi
 
   local value
   value=$(python - <<PY
@@ -185,14 +215,6 @@ PY
 
   echo "Result file: ${result_file}"
   echo "Flexible extract value: ${value}"
-  echo "Accuracy threshold: ${threshold}"
-
-  python - <<PY
-value = float("${value}")
-threshold = float("${threshold}")
-assert value >= threshold, f"Accuracy failed: {value} < {threshold}"
-print(f"Accuracy passed: {value} >= {threshold}")
-PY
 }
 
 run_for_models() {
@@ -200,7 +222,7 @@ run_for_models() {
   local matched=0
 
   for entry in "${ACTIVE_MODELS[@]}"; do
-    IFS='|' read -r model_name model_path extra_args threshold <<< "${entry}"
+    IFS='|' read -r model_name model_path extra_args <<< "${entry}"
 
     if [[ -n "${SELECTED_MODEL}" && "${SELECTED_MODEL}" != "${model_name}" ]]; then
       continue
@@ -214,7 +236,7 @@ run_for_models() {
 
     # accuracy mode: launch + evaluate each selected model, then stop server.
     launch_one_model "${model_name}" "${model_path}" "${extra_args}"
-    accuracy_one_model "${model_name}" "${model_path}" "${extra_args}" "${threshold}"
+    accuracy_one_model "${model_name}" "${model_path}" "${extra_args}"
     stop_server
   done
 

@@ -43,6 +43,7 @@ jobs:
           # Keep CI runtime under control: enable only one OOT model for now.
           - model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
+            accuracy_test_threshold: 0.90
             runner: atom-mi355-8gpu.predownload
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -171,6 +172,48 @@ jobs:
             set -euo pipefail
             bash .github/scripts/atom_oot_test.sh accuracy ci
           "
+
+      - name: Check OOT accuracy test results
+        if: success()
+        run: |
+          result_file=$(docker exec "$CONTAINER_NAME" bash -lc "
+            python - <<'PY'
+from pathlib import Path
+
+roots = [Path('/tmp/oot_accuracy_results')]
+json_candidates = []
+for root in roots:
+    if root.is_file() and root.suffix == '.json':
+        json_candidates.append(root)
+    elif root.is_dir():
+        json_candidates.extend([p for p in root.rglob('*.json') if p.is_file()])
+
+if not json_candidates:
+    print('')
+else:
+    latest = max(json_candidates, key=lambda p: p.stat().st_mtime)
+    print(str(latest))
+PY
+          ")
+
+          if [ -z "$result_file" ]; then
+            echo "ERROR: No results JSON file found in /tmp/oot_accuracy_results"
+            exit 2
+          fi
+
+          echo "RESULT_FILE: $result_file"
+          flexible_extract_value=$(docker exec "$CONTAINER_NAME" bash -lc "jq '.results.gsm8k[\"exact_match,flexible-extract\"]' '$result_file'")
+          echo "Flexible extract value: $flexible_extract_value"
+          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          if [ "$result" -eq 1 ]; then
+            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 1
+          else
+            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 0
+          fi
 
       - name: Collect OOT accuracy summary
         if: success()

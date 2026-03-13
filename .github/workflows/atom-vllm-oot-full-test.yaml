@@ -137,27 +137,32 @@ jobs:
           - model_name: "Qwen3 Dense"
             model_path: "Qwen/Qwen3-8B"
             extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 1"
+            accuracy_test_threshold: 0.70
             env_vars: ""
             runner: linux-atom-mi355-1
           - model_name: "Qwen3 MoE"
             model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
             extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
+            accuracy_test_threshold: 0.87
             env_vars: ""
             runner: atom-mi355-8gpu.predownload
           - model_name: "DeepSeek-V3 family"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
+            accuracy_test_threshold: 0.94
             env_vars: ""
             runner: atom-mi355-8gpu.predownload
           - model_name: "GPT-OSS"
             model_path: "openai/gpt-oss-120b"
             extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
+            accuracy_test_threshold: 0.38
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
             runner: linux-atom-mi355-4
           - model_name: "Kimi-K2"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
+            accuracy_test_threshold: 0.90
             env_vars: ""
             runner: atom-mi355-8gpu.predownload
     runs-on: ${{ matrix.runner }}
@@ -236,6 +241,48 @@ jobs:
             set -euo pipefail
             bash .github/scripts/atom_oot_test.sh accuracy full '${{ matrix.model_name }}'
           "
+
+      - name: Check OOT accuracy test results
+        if: success()
+        run: |
+          result_file=$(docker exec "$CONTAINER_NAME" bash -lc "
+            python - <<'PY'
+from pathlib import Path
+
+roots = [Path('/tmp/oot_accuracy_results')]
+json_candidates = []
+for root in roots:
+    if root.is_file() and root.suffix == '.json':
+        json_candidates.append(root)
+    elif root.is_dir():
+        json_candidates.extend([p for p in root.rglob('*.json') if p.is_file()])
+
+if not json_candidates:
+    print('')
+else:
+    latest = max(json_candidates, key=lambda p: p.stat().st_mtime)
+    print(str(latest))
+PY
+          ")
+
+          if [ -z "$result_file" ]; then
+            echo "ERROR: No results JSON file found in /tmp/oot_accuracy_results"
+            exit 2
+          fi
+
+          echo "RESULT_FILE: $result_file"
+          flexible_extract_value=$(docker exec "$CONTAINER_NAME" bash -lc "jq '.results.gsm8k[\"exact_match,flexible-extract\"]' '$result_file'")
+          echo "Flexible extract value: $flexible_extract_value"
+          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          if [ "$result" -eq 1 ]; then
+            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 1
+          else
+            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 0
+          fi
 
       - name: Collect summary
         if: success()
