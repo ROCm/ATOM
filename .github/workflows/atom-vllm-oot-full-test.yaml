@@ -245,17 +245,22 @@ jobs:
       - name: Check OOT accuracy test results
         if: success()
         run: |
-          result_file=$(docker exec "$CONTAINER_NAME" bash -lc "
-            python -c \"from pathlib import Path; root = Path('/tmp/oot_accuracy_results'); c = []; c.extend([p for p in root.rglob('*.json') if p.is_file()]) if root.is_dir() else None; c.append(root) if root.is_file() and root.suffix == '.json' else None; print(str(max(c, key=lambda p: p.stat().st_mtime)) if c else '')\"
-          ")
+          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          result_file=$(python - <<'PY'
+from pathlib import Path
+root = Path("oot_accuracy_results")
+candidates = [p for p in root.rglob("*.json") if p.is_file()] if root.exists() else []
+print(str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else "")
+PY
+          )
 
           if [ -z "$result_file" ]; then
-            echo "ERROR: No results JSON file found in /tmp/oot_accuracy_results"
+            echo "ERROR: No results JSON file found in oot_accuracy_results/"
             exit 2
           fi
 
           echo "RESULT_FILE: $result_file"
-          flexible_extract_value=$(docker exec "$CONTAINER_NAME" bash -lc "jq '.results.gsm8k[\"exact_match,flexible-extract\"]' '$result_file'")
+          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
           echo "Flexible extract value: $flexible_extract_value"
           echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
 
