@@ -177,23 +177,7 @@ jobs:
         if: success()
         run: |
           result_file=$(docker exec "$CONTAINER_NAME" bash -lc "
-            python - <<'PY'
-from pathlib import Path
-
-roots = [Path('/tmp/oot_accuracy_results')]
-json_candidates = []
-for root in roots:
-    if root.is_file() and root.suffix == '.json':
-        json_candidates.append(root)
-    elif root.is_dir():
-        json_candidates.extend([p for p in root.rglob('*.json') if p.is_file()])
-
-if not json_candidates:
-    print('')
-else:
-    latest = max(json_candidates, key=lambda p: p.stat().st_mtime)
-    print(str(latest))
-PY
+            python -c \"from pathlib import Path; root = Path('/tmp/oot_accuracy_results'); c = []; c.extend([p for p in root.rglob('*.json') if p.is_file()]) if root.is_dir() else None; c.append(root) if root.is_file() and root.suffix == '.json' else None; print(str(max(c, key=lambda p: p.stat().st_mtime)) if c else '')\"
           ")
 
           if [ -z "$result_file" ]; then
