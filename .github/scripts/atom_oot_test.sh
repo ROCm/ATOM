@@ -194,6 +194,7 @@ accuracy_one_model() {
   local model_name="$1"
   local model_path="$2"
   local extra_args="$3"
+  local flat_result_file=""
 
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${model_path}")
@@ -207,6 +208,7 @@ accuracy_one_model() {
   local run_tag
   run_tag="$(date +%Y%m%d%H%M%S)_${model_name// /_}"
   local output_path="${RESULT_DIR}/${run_tag}"
+  flat_result_file="${RESULT_DIR}/${run_tag}.json"
 
   echo ""
   echo "========== Running OOT gsm8k accuracy =========="
@@ -248,14 +250,15 @@ PY
     return 2
   fi
 
+  # Flatten the result into RESULT_DIR so workflow-side checks can use the
+  # same simple `ls`-based lookup as atom-test without depending on Python.
+  if [[ "${result_file}" != "${flat_result_file}" ]]; then
+    cp -f "${result_file}" "${flat_result_file}"
+    result_file="${flat_result_file}"
+  fi
+
   local value
-  value=$(python - <<PY
-import json
-with open("${result_file}", "r", encoding="utf-8") as f:
-    data = json.load(f)
-print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
-PY
-)
+  value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "${result_file}")
 
   echo "Result file: ${result_file}"
   echo "Flexible extract value: ${value}"

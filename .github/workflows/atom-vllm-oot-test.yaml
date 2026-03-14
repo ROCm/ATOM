@@ -209,9 +209,8 @@ jobs:
         if: success()
         run: |
           docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
-          result_file=$(python -c "from pathlib import Path; root = Path('oot_accuracy_results'); c = [p for p in root.rglob('*.json') if p.is_file()] if root.exists() else []; print(str(max(c, key=lambda p: p.stat().st_mtime)) if c else '')")
-
-          if [ -z "$result_file" ]; then
+          result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
             echo "ERROR: No results JSON file found in oot_accuracy_results/"
             exit 2
           fi
