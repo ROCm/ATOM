@@ -18,6 +18,12 @@
 
 ## Server Setup
 
+- **[CRITICAL] Verify server is truly running with GPU loaded** — `curl /health` returning OK is NOT sufficient. A stale process or partial startup can respond to HTTP while the model is not loaded. Always verify with:
+  ```bash
+  # Both checks must pass:
+  curl -sf http://localhost:8000/v1/models          # API responds with model name
+  rocm-smi --showmemuse | grep "GPU Memory Allocated"  # VRAM% > 0
+  ```
 - **Set** `AITER_LOG_LEVEL=WARNING` to suppress aiter kernel-level log flooding (this is an aiter library env var, not ATOM's)
 - **Kill old servers before starting new ones.** Check `rocm-smi` for VRAM usage — leftover processes hold GPU memory
 - **Detect server hangs:** Use polling (`grep -q` in a loop with timeout), never blocking `tail -f | grep` which hangs indefinitely if the process crashes
@@ -79,7 +85,7 @@
 
 ## ForwardContext
 
-- **"Forward context is not set":** `set_forward_context()` was not called before model forward. Lifecycle bug — check `ModelRunner` forward path. See CLAUDE.md "Forward Context Pattern" for lifecycle details
+- **"Forward context is not set":** `set_forward_context()` was not called before model forward. Lifecycle bug — check `ModelRunner` forward path in `model_runner.py`
 - **[COMMON] DP metadata wrong:** `DPMetadata.make()` does CPU `all_reduce` via Gloo. If one rank has 0 tokens, `local_size` is clamped to 1. Mismatch causes NCCL hang. **Diagnose:** Log `num_tokens_across_dp` before `DPMetadata.make()` at `forward_context.py`. Check if any rank shows 0 tokens unexpectedly
 - **Stale context after exception:** If forward throws, `reset_forward_context()` may not be called. **Fix:** Always wrap forward in try/finally
 
@@ -112,7 +118,7 @@
 ## Testing & Validation
 
 - **Quick smoke test:** `python -m atom.examples.simple_inference --model <model> --kv_cache_dtype fp8` — runs 4 prompts with profiling, prints MTP stats. Good for verifying end-to-end inference, sampling, and speculative decoding in one shot
-- **Unit tests:** `cd /app/ATOM && pytest tests/test_scheduler.py -v`
+- **Unit tests:** `pytest tests/test_scheduler.py -v`
 - **Accuracy:** `lm_eval --model local-completions --tasks gsm8k --num_fewshot 5` (see CLAUDE.md for full command)
 - **Test stubs:** `conftest.py` mocks GPU/ZMQ/HF dependencies — unit tests run without a GPU
 
