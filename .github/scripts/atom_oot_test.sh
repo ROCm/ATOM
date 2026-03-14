@@ -42,9 +42,12 @@ VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
 VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_oot.log}
 RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
 ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/oot_accuracy_output.txt}
+STREAM_VLLM_LOGS=${STREAM_VLLM_LOGS:-1}
+KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
+LAST_VLLM_LOG_LINE=0
 
 # Default model format:
 #   MODEL_NAME|MODEL_PATH|EXTRA_ARGS
@@ -85,21 +88,42 @@ resolve_model_path() {
   fi
 }
 
+emit_new_vllm_logs() {
+  if [[ "${STREAM_VLLM_LOGS}" != "1" || ! -f "${VLLM_LOG_FILE}" ]]; then
+    return 0
+  fi
+
+  local current_line_count
+  current_line_count=$(wc -l < "${VLLM_LOG_FILE}")
+  if (( current_line_count <= LAST_VLLM_LOG_LINE )); then
+    return 0
+  fi
+
+  echo ""
+  echo "========== New vLLM log output =========="
+  sed -n "$((LAST_VLLM_LOG_LINE + 1)),${current_line_count}p" "${VLLM_LOG_FILE}" || true
+  LAST_VLLM_LOG_LINE=${current_line_count}
+}
+
 wait_server_ready() {
   local model_name="$1"
   echo ""
   echo "========== Waiting for vLLM server (${model_name}) =========="
   for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
-    if curl -sS "http://127.0.0.1:${VLLM_PORT}/v1/models" >/dev/null; then
+    if curl -fsS "http://127.0.0.1:${VLLM_PORT}/v1/models" >/dev/null 2>&1; then
+      emit_new_vllm_logs
       echo "vLLM server is ready for ${model_name}."
       return 0
     fi
+
+    emit_new_vllm_logs
 
     if [[ -f "${VLLM_PID_FILE}" ]]; then
       local pid
       pid=$(cat "${VLLM_PID_FILE}")
       if ! kill -0 "${pid}" 2>/dev/null; then
         echo "vLLM process exited early for ${model_name}."
+        emit_new_vllm_logs
         tail -n 200 "${VLLM_LOG_FILE}" || true
         return 1
       fi
@@ -110,6 +134,7 @@ wait_server_ready() {
   done
 
   echo "vLLM server did not become ready in time for ${model_name}."
+  emit_new_vllm_logs
   tail -n 200 "${VLLM_LOG_FILE}" || true
   return 1
 }
@@ -265,7 +290,15 @@ run_for_models() {
   fi
 }
 
-trap 'stop_server' EXIT
+cleanup_on_exit() {
+  if [[ "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ]]; then
+    echo "Keeping vLLM server alive for follow-up steps."
+    return 0
+  fi
+  stop_server
+}
+
+trap 'cleanup_on_exit' EXIT
 
 if [[ "${TYPE}" == "launch" ]]; then
   run_for_models "launch"

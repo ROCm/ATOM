@@ -165,25 +165,34 @@ jobs:
       - name: Download model if needed
         if: success()
         run: |
-          if [ -d "/models" ] && [ ! -f "/models/${{ matrix.model_path }}/config.json" ]; then
-            echo "Downloading model to /models/${{ matrix.model_path }}"
-            docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
+          if [ -d "/models" ]; then
+            if [ ! -f "/models/${{ matrix.model_path }}/config.json" ]; then
+              echo "Downloading model to /models/${{ matrix.model_path }}"
+              docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
+            else
+              echo "Model already exists under /models; skip pre-download"
+            fi
           else
-            echo "Skip model download"
+            echo "/models directory not found; warming Hugging Face cache inside container"
+            docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }}"
           fi
 
       - name: Run OOT launch and gsm8k accuracy via script (ci mode)
         if: success()
-        timeout-minutes: 90
+        timeout-minutes: 120
         env:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
+          MAX_WAIT_RETRIES: "120"
+          STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
+            -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
               bash .github/scripts/atom_oot_test.sh accuracy ci
