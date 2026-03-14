@@ -191,6 +191,22 @@ jobs:
         run: |
           docker pull "${OOT_IMAGE_TAG}"
 
+      - name: Prepare model cache directory
+        run: |
+          if [ -d "/models" ]; then
+            MODEL_CACHE_HOST_DIR="/models"
+            echo "Using pre-provisioned model cache: ${MODEL_CACHE_HOST_DIR}"
+          elif [ -d "/data" ]; then
+            MODEL_CACHE_HOST_DIR="/data/models"
+            mkdir -p "${MODEL_CACHE_HOST_DIR}"
+            echo "Using persistent model cache under /data: ${MODEL_CACHE_HOST_DIR}"
+          else
+            MODEL_CACHE_HOST_DIR="${HOME}/.cache/atom-models"
+            mkdir -p "${MODEL_CACHE_HOST_DIR}"
+            echo "Using fallback model cache under home directory: ${MODEL_CACHE_HOST_DIR}"
+          fi
+          echo "MODEL_CACHE_HOST_DIR=${MODEL_CACHE_HOST_DIR}" >> "$GITHUB_ENV"
+
       - name: Clean up old containers
         run: |
           containers=$(docker ps -q)
@@ -207,11 +223,8 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
-          if [ -d "/models" ]; then
-            MODEL_MOUNT="-v /models:/models"
-          else
-            MODEL_MOUNT=""
-          fi
+          MODEL_MOUNT="-v ${MODEL_CACHE_HOST_DIR}:/models"
+          echo "Mounting model cache: ${MODEL_CACHE_HOST_DIR} -> /models"
 
           cat > /tmp/oot_env_file.txt << 'EOF'
           ${{ matrix.env_vars }}
@@ -237,15 +250,11 @@ jobs:
 
       - name: Pre-download model if /models exists
         run: |
-          if [ -d "/models" ]; then
-            if [ ! -f "/models/${{ matrix.model_path }}/config.json" ]; then
-              docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
-            else
-              echo "Model already exists under /models; skip pre-download"
-            fi
+          if [ ! -f "${MODEL_CACHE_HOST_DIR}/${{ matrix.model_path }}/config.json" ]; then
+            echo "Downloading model to ${MODEL_CACHE_HOST_DIR}/${{ matrix.model_path }}"
+            docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
           else
-            echo "/models directory not found; warming Hugging Face cache inside container"
-            docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }}"
+            echo "Model already exists under ${MODEL_CACHE_HOST_DIR}/${{ matrix.model_path }}; skip pre-download"
           fi
 
       - name: Run OOT launch and gsm8k accuracy via script (full mode)
