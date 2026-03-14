@@ -191,21 +191,24 @@ jobs:
         run: |
           docker pull "${OOT_IMAGE_TAG}"
 
-      - name: Prepare model cache directory
+      - name: Prepare model cache mount
         run: |
           if [ -d "/models" ]; then
-            MODEL_CACHE_HOST_DIR="/models"
-            echo "Using pre-provisioned model cache: ${MODEL_CACHE_HOST_DIR}"
+            MODEL_CACHE_MOUNT="-v /models:/models"
+            MODEL_CACHE_DESC="/models (pre-provisioned host path)"
           elif [ -d "/data" ]; then
-            MODEL_CACHE_HOST_DIR="/data/models"
-            mkdir -p "${MODEL_CACHE_HOST_DIR}"
-            echo "Using persistent model cache under /data: ${MODEL_CACHE_HOST_DIR}"
+            mkdir -p /data/models
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (persistent host path)"
           else
-            MODEL_CACHE_HOST_DIR="${HOME}/.cache/atom-models"
-            mkdir -p "${MODEL_CACHE_HOST_DIR}"
-            echo "Using fallback model cache under home directory: ${MODEL_CACHE_HOST_DIR}"
+            MODEL_CACHE_VOLUME="atom_oot_model_cache"
+            docker volume create "${MODEL_CACHE_VOLUME}" >/dev/null
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_VOLUME}:/models"
+            MODEL_CACHE_DESC="docker volume ${MODEL_CACHE_VOLUME}"
           fi
-          echo "MODEL_CACHE_HOST_DIR=${MODEL_CACHE_HOST_DIR}" >> "$GITHUB_ENV"
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
+          echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
       - name: Clean up old containers
         run: |
@@ -223,8 +226,8 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
-          MODEL_MOUNT="-v ${MODEL_CACHE_HOST_DIR}:/models"
-          echo "Mounting model cache: ${MODEL_CACHE_HOST_DIR} -> /models"
+          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
+          echo "Mounting model cache: ${MODEL_CACHE_DESC} -> /models"
 
           cat > /tmp/oot_env_file.txt << 'EOF'
           ${{ matrix.env_vars }}
@@ -250,12 +253,18 @@ jobs:
 
       - name: Pre-download model if /models exists
         run: |
-          if [ ! -f "${MODEL_CACHE_HOST_DIR}/${{ matrix.model_path }}/config.json" ]; then
-            echo "Downloading model to ${MODEL_CACHE_HOST_DIR}/${{ matrix.model_path }}"
-            docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
-          else
-            echo "Model already exists under ${MODEL_CACHE_HOST_DIR}/${{ matrix.model_path }}; skip pre-download"
-          fi
+          docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            cache_dir=/models/${{ matrix.model_path }}
+            cache_sentinel=\${cache_dir}/.atom_download_complete
+            if [ -f \"\${cache_sentinel}\" ] && [ -f \"\${cache_dir}/config.json\" ]; then
+              echo \"Model already exists under \${cache_dir}; skip pre-download\"
+            else
+              echo \"Syncing model cache under \${cache_dir}\"
+              hf download ${{ matrix.model_path }} --local-dir \"\${cache_dir}\"
+              touch \"\${cache_sentinel}\"
+            fi
+          "
 
       - name: Run OOT launch and gsm8k accuracy via script (full mode)
         timeout-minutes: 120
