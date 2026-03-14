@@ -49,6 +49,7 @@ RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
     locales
 
 RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
+    rm -rf /app/mori && \
     git clone https://github.com/ROCm/mori.git /app/mori && \
     cd /app/mori && \
     git checkout $MORI_COMMIT && \
@@ -68,6 +69,7 @@ RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
     pip install cmake
 
 RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
+    rm -rf $RCCL_SRC_DIR && \
     git clone "$RCCL_REPO" $RCCL_SRC_DIR \
     && cd $RCCL_SRC_DIR \
     && git checkout "$RCCL_BRANCH" \
@@ -84,6 +86,7 @@ RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
     pip uninstall -y triton
 
 RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
+    rm -rf /triton-test && \
     git clone --depth=1 --branch release/internal/3.5.x https://github.com/ROCm/triton.git /triton-test && \
   cd /triton-test && \
   pip install -r python/requirements.txt && \
@@ -101,6 +104,7 @@ RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
     pip uninstall -y aiter || true
 
 RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
+    rm -rf /app/aiter-test && \
     git clone $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
     pip install -r requirements.txt && \
@@ -117,6 +121,7 @@ RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
     pip uninstall -y atom || true
 
 RUN if [ "${SKIP_ATOM_NATIVE_BUILD}" = "true" ]; then exit 0; fi && \
+    rm -rf /app/ATOM && \
     git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
