@@ -258,7 +258,17 @@ PY
   fi
 
   local value
-  value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "${result_file}")
+  if command -v jq >/dev/null 2>&1; then
+    value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "${result_file}")
+  else
+    value=$(python - <<PY
+import json
+with open("${result_file}", "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
+PY
+)
+  fi
 
   echo "Result file: ${result_file}"
   echo "Flexible extract value: ${value}"

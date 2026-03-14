@@ -149,7 +149,7 @@ RUN if [ "${BUILD_OOT_IMAGE}" != "true" ]; then exit 0; fi && \
     echo "========== [OOT 1/7] Prepare build tools ==========" && \
     apt-get update && \
     apt --fix-broken install -y && \
-    apt-get install -y --no-install-recommends ca-certificates ninja-build vim && \
+    apt-get install -y --no-install-recommends ca-certificates jq ninja-build vim && \
     mkdir -p /usr/local/bin && \
     ln -sf "$(command -v ninja)" /usr/local/bin/ninja && \
     /usr/local/bin/ninja --version && \
