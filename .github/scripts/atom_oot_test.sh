@@ -5,6 +5,11 @@ set -euo pipefail
 #   .github/scripts/atom_oot_test.sh launch <mode> [model_name]
 #   .github/scripts/atom_oot_test.sh accuracy <mode> [model_name]
 #
+# Alternatively, pass a single model explicitly through environment variables:
+#   OOT_MODEL_NAME
+#   OOT_MODEL_PATH
+#   OOT_EXTRA_ARGS
+#
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
 #   accuracy - run gsm8k accuracy test and save result JSON
@@ -37,26 +42,35 @@ VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
 VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_oot.log}
 RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
 ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/oot_accuracy_output.txt}
+EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
+EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
+EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
 
-# Format:
+# Default model format:
 #   MODEL_NAME|MODEL_PATH|EXTRA_ARGS
-# Note: CI runs Kimi-K2 with TP=4 on an 8-GPU runner to reduce runtime and
-# improve CI stability. Full mode uses TP=8 on the same class of runner for
-# higher-fidelity validation.
+# Default lists are kept for ad hoc/manual runs. CI workflows pass the exact
+# current matrix entry via OOT_MODEL_* env vars so model coverage does not drift
+# when the workflow matrix changes.
 CI_MODE_MODELS=(
-  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel"
+  "Kimi-K2-Thinking-MXFP4|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel"
 )
 
 FULL_MODE_MODELS=(
-  "Qwen3 Dense|Qwen/Qwen3-8B|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 1"
   "Qwen3 MoE|Qwen/Qwen3-235B-A22B-Instruct-2507-FP8|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
-  "DeepSeek-V3 family|deepseek-ai/DeepSeek-R1-0528|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
-  "GPT-OSS|openai/gpt-oss-120b|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
+  "DeepSeek-R1 FP8|deepseek-ai/DeepSeek-R1-0528|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
+  "DeepSeek-R1 MXFP4|amd/DeepSeek-R1-0528-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
+  "GPT-OSS|openai/gpt-oss-120b|--trust-remote-code --kv-cache-dtype fp8 --gpu-memory-utilization 0.3"
   "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
 )
 
 declare -a ACTIVE_MODELS=()
-if [[ "$MODE" == "ci" ]]; then
+if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
+  if [[ -z "${EXPLICIT_MODEL_NAME}" || -z "${EXPLICIT_MODEL_PATH}" ]]; then
+    echo "OOT_MODEL_NAME and OOT_MODEL_PATH must both be set when using explicit model overrides."
+    exit 2
+  fi
+  ACTIVE_MODELS=("${EXPLICIT_MODEL_NAME}|${EXPLICIT_MODEL_PATH}|${EXPLICIT_EXTRA_ARGS}")
+elif [[ "$MODE" == "ci" ]]; then
   ACTIVE_MODELS=("${CI_MODE_MODELS[@]}")
 else
   ACTIVE_MODELS=("${FULL_MODE_MODELS[@]}")
@@ -113,9 +127,14 @@ launch_one_model() {
   local model_name="$1"
   local model_path="$2"
   local extra_args="$3"
+  local -a extra_arg_array=()
 
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${model_path}")
+
+  if [[ -n "${extra_args}" ]]; then
+    read -r -a extra_arg_array <<< "${extra_args}"
+  fi
 
   echo ""
   echo "========== Launching vLLM server =========="
@@ -138,7 +157,7 @@ launch_one_model() {
     --async-scheduling \
     --load-format fastsafetensors \
     --max-model-len 16384 \
-    ${extra_args} \
+    "${extra_arg_array[@]}" \
     > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"
   echo "Server PID: $(cat "${VLLM_PID_FILE}")"

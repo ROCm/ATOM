@@ -86,7 +86,8 @@ jobs:
         id: meta
         run: |
           OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-vllm-validation-${GITHUB_COMMIT_SHA}-${{ github.run_id }}"
-          docker build --pull --network=host \
+          # BASE_IMAGE is built in the previous step and only exists locally on this runner.
+          docker build --network=host \
             --no-cache \
             -t "${OOT_IMAGE_TAG}" \
             --build-arg BASE_IMAGE="atom_oot_base:ci" \
@@ -136,7 +137,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # This matrix targets model architectures supported by ATOM OOT plugin.
+          # Keep this matrix as the single source of truth for OOT full
+          # validation coverage. The test script consumes the current matrix
+          # entry via OOT_MODEL_* env vars to avoid drift.
           - model_name: "Qwen3 MoE"
             model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
             extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
@@ -180,6 +183,9 @@ jobs:
       - name: Docker Login
         run: |
           docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
 
       - name: Pull built OOT image
         run: |
@@ -232,18 +238,26 @@ jobs:
       - name: Pre-download model if /models exists
         run: |
           if [ -d "/models" ] && [ ! -f "/models/${{ matrix.model_path }}/config.json" ]; then
-            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
+            docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
           else
             echo "Skip model pre-download"
           fi
 
       - name: Run OOT launch and gsm8k accuracy via script (full mode)
         timeout-minutes: 120
+        env:
+          OOT_MODEL_NAME: ${{ matrix.model_name }}
+          OOT_MODEL_PATH: ${{ matrix.model_path }}
+          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "
-            set -euo pipefail
-            bash .github/scripts/atom_oot_test.sh accuracy full '${{ matrix.model_name }}'
-          "
+          docker exec \
+            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
+            -e OOT_MODEL_PATH="${OOT_MODEL_PATH}" \
+            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              bash .github/scripts/atom_oot_test.sh accuracy full
+            "
 
       - name: Check OOT accuracy test results
         if: success()

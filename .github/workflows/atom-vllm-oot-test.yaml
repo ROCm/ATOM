@@ -23,7 +23,7 @@ concurrency:
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
   pre-checks:
@@ -43,6 +43,7 @@ jobs:
           # Keep CI runtime under control: enable only one OOT model for now.
           - model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
+            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel"
             accuracy_test_threshold: 0.90
             runner: linux-atom-mi355-4
     runs-on: ${{ matrix.runner }}
@@ -66,6 +67,9 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
+
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
 
       - name: Generate OOT base Dockerfile
         run: |
@@ -105,7 +109,8 @@ jobs:
 
       - name: Build OOT vLLM image
         run: |
-          docker build --pull --network=host \
+          # BASE_IMAGE is built in the previous step and only exists locally on this runner.
+          docker build --network=host \
             --no-cache \
             -t "${OOT_IMAGE_TAG}" \
             --build-arg BASE_IMAGE="atom_oot_base:ci" \
@@ -162,7 +167,7 @@ jobs:
         run: |
           if [ -d "/models" ] && [ ! -f "/models/${{ matrix.model_path }}/config.json" ]; then
             echo "Downloading model to /models/${{ matrix.model_path }}"
-            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
+            docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"
           else
             echo "Skip model download"
           fi
@@ -170,11 +175,19 @@ jobs:
       - name: Run OOT launch and gsm8k accuracy via script (ci mode)
         if: success()
         timeout-minutes: 90
+        env:
+          OOT_MODEL_NAME: ${{ matrix.model_name }}
+          OOT_MODEL_PATH: ${{ matrix.model_path }}
+          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "
-            set -euo pipefail
-            bash .github/scripts/atom_oot_test.sh accuracy ci
-          "
+          docker exec \
+            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
+            -e OOT_MODEL_PATH="${OOT_MODEL_PATH}" \
+            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              bash .github/scripts/atom_oot_test.sh accuracy ci
+            "
 
       - name: Check OOT accuracy test results
         if: success()
