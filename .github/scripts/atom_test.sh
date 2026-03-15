@@ -9,6 +9,9 @@ EXTRA_ARGS=("${@:3}")
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
+  # Clear stale compile cache to avoid NameError from outdated generated code
+  echo "Clearing compile cache..."
+  rm -rf ~/.cache/atom/*
   PROFILER_ARGS=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
     PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"
