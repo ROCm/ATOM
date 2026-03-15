@@ -373,10 +373,10 @@ function detectRegressions() {
 }
 const regressions = detectRegressions();
 
-// Extract unique filter values
-const allModels = [...new Set(Object.values(latestConfigs).map(c => c.model))].sort();
-const allIslOsl = [...new Set(Object.values(latestConfigs).map(c => c.islOsl))].sort();
-const allConc = [...new Set(Object.values(latestConfigs).map(c => c.conc))].sort((a, b) => a - b);
+// Extract unique filter values from ALL runs (not just latest) so historical models are always visible
+const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[0]))].sort();
+const allIslOsl = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))].sort();
+const allConc = [...new Set(Object.keys(historyMap).map(k => +k.split('|')[2]))].sort((a, b) => a - b);
 
 /* ================================================================
    3. STATE
@@ -715,7 +715,7 @@ function renderPerformanceTab() {
   });
 
   if (entries.length === 0) {
-    container.innerHTML = '<div class="chart-empty">No data matches the current filters.</div>';
+    container.innerHTML = '<div class="chart-empty">No data in the latest run for the selected filters. Try the Trends or Data &amp; Trace tab for historical data.</div>';
     return;
   }
 
@@ -900,7 +900,7 @@ function renderTradeoffTab() {
   destroyChartsIn(container);
   const fc = filteredConfigs();
   const entries = Object.entries(fc);
-  if (entries.length === 0) { container.innerHTML = '<div class="chart-empty">No data matches the current filters.</div>'; return; }
+  if (entries.length === 0) { container.innerHTML = '<div class="chart-empty">No data in the latest run for the selected filters. Try the Trends or Data &amp; Trace tab for historical data.</div>'; return; }
 
   // Group by model+ISL/OSL for scatter series
   const seriesMap = {};
