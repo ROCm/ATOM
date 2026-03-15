@@ -11,7 +11,7 @@ if [ "$TYPE" == "launch" ]; then
   echo "========== Launching ATOM server =========="
   PROFILER_ARGS=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
-    PROFILER_ARGS="--torch-profiler-dir /app/trace"
+    PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"
     echo "Torch profiler enabled, trace output: /app/trace"
   fi
   ATOM_SERVER_LOG="/tmp/atom_server.log"
@@ -96,6 +96,14 @@ if [ "$TYPE" == "accuracy" ]; then
           --output_path "${RESULT_FILENAME}"
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
   chmod -R 777 accuracy_test_results
+fi
+
+if [ "$TYPE" == "stop" ]; then
+  echo ""
+  echo "========== Stopping ATOM server =========="
+  pkill -f 'atom.entrypoints' || true
+  sleep 5
+  echo "Server stopped."
 fi
 
 if [ "$TYPE" == "benchmark" ]; then

@@ -451,69 +451,81 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Re-run regressed configs with profiler
+      - name: Prepare regression configs
+        id: prepare
+        run: |
+          python3 .github/scripts/regression_rerun.py \
+            regression_report.json \
+            .github/benchmark/models.json \
+            -o /tmp/regression_configs.txt
+
+          if [ -s /tmp/regression_configs.txt ]; then
+            echo "has_configs=true" >> $GITHUB_OUTPUT
+            echo "=== Configs to profile ==="
+            cat -n /tmp/regression_configs.txt
+          else
+            echo "has_configs=false" >> $GITHUB_OUTPUT
+            echo "No regression configs generated"
+          fi
+
+      - name: Download models
+        if: steps.prepare.outputs.has_configs == 'true'
+        run: |
+          cut -d'|' -f1 /tmp/regression_configs.txt | sort -u | while read MODEL_PATH; do
+            echo "=== Downloading $MODEL_PATH ==="
+            if [ -d "/models" ]; then
+              docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
+                "hf download $MODEL_PATH --local-dir /models/$MODEL_PATH" \
+                || echo "::warning::Failed to download $MODEL_PATH, will use HF online"
+            fi
+          done
+
+      - name: Run configs with profiler
+        if: steps.prepare.outputs.has_configs == 'true'
         timeout-minutes: 60
         run: |
           set -euo pipefail
 
-          # Generate action plan from regression report + model registry
-          python3 .github/scripts/regression_rerun.py \
-            regression_report.json \
-            .github/benchmark/models.json \
-            -o /tmp/regression_actions.txt
+          # Track current server to avoid unnecessary restarts
+          CURRENT_SERVER=""
 
-          if [ ! -s /tmp/regression_actions.txt ]; then
-            echo "No regression actions generated, skipping"
-            exit 0
-          fi
+          while IFS='|' read -r MODEL_PATH SERVER_ARGS BENCH_ARGS ISL OSL CONC; do
+            if [ -d "/models" ]; then MODEL_DIR="/models/$MODEL_PATH"; else MODEL_DIR="$MODEL_PATH"; fi
+            SERVER_KEY="$MODEL_PATH|$SERVER_ARGS"
 
-          cat /tmp/regression_actions.txt
+            # Launch server if model/args changed (same pattern as benchmark job)
+            if [ "$SERVER_KEY" != "$CURRENT_SERVER" ]; then
+              [ -n "$CURRENT_SERVER" ] && \
+                docker exec atom-regression bash -lc ".github/scripts/atom_test.sh stop"
+              echo "=== Launching: $MODEL_DIR $SERVER_ARGS ==="
+              docker exec atom-regression bash -lc "set -euo pipefail
+                ENABLE_TORCH_PROFILER=1 \
+                .github/scripts/atom_test.sh launch $MODEL_DIR $SERVER_ARGS"
+              CURRENT_SERVER="$SERVER_KEY"
+            fi
 
-          # State: track current server args across LAUNCH/BENCHMARK
-          CURRENT_SERVER_ARGS=""
+            # Run benchmark with profiler (same pattern as benchmark job)
+            echo "=== Profiling: ISL=$ISL OSL=$OSL CONC=$CONC ==="
+            docker exec atom-regression bash -lc "
+              ENABLE_TORCH_PROFILER=1 \
+              ISL=$ISL OSL=$OSL CONC=$CONC \
+              RANDOM_RANGE_RATIO=0.8 \
+              NUM_PROMPTS_OVERRIDE=\$((${CONC}*2)) \
+              RESULT_FILENAME=regression-${ISL}-${OSL}-${CONC} \
+              BENCH_EXTRA_ARGS='$BENCH_ARGS' \
+              SERVER_ARGS='$SERVER_ARGS' \
+              .github/scripts/atom_test.sh benchmark $MODEL_DIR"
+          done < /tmp/regression_configs.txt
 
-          # Execute actions
-          while IFS='|' read -r ACTION ARG1 ARG2 ARG3 ARG4 ARG5; do
-            case "$ACTION" in
-              DOWNLOAD)
-                echo "=== Downloading model: $ARG1 ==="
-                if [ -d "/models" ]; then
-                  docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
-                    "hf download $ARG1 --local-dir /models/$ARG1" || echo "::warning::Failed to download $ARG1, will use HF online"
-                fi
-                ;;
-              LAUNCH)
-                echo "=== Launching server: $ARG1 args: $ARG2 ==="
-                CURRENT_SERVER_ARGS="$ARG2"
-                if [ -d "/models" ]; then MODEL_DIR="/models/$ARG1"; else MODEL_DIR="$ARG1"; fi
-                docker exec atom-regression bash -lc "set -euo pipefail
-                  pkill -f 'atom.entrypoints' || true; sleep 3
-                  .github/scripts/atom_test.sh launch $MODEL_DIR $ARG2"
-                ;;
-              BENCHMARK)
-                echo "=== Profiling: $ARG1 ISL=$ARG2 OSL=$ARG3 CONC=$ARG4 ==="
-                if [ -d "/models" ]; then MODEL_DIR="/models/$ARG1"; else MODEL_DIR="$ARG1"; fi
-                docker exec atom-regression bash -lc "
-                  ENABLE_TORCH_PROFILER=1 \
-                  ISL=$ARG2 OSL=$ARG3 CONC=$ARG4 \
-                  RANDOM_RANGE_RATIO=0.8 \
-                  NUM_PROMPTS_OVERRIDE=\$((${ARG4}*2)) \
-                  RESULT_FILENAME=regression-${ARG2}-${ARG3}-${ARG4} \
-                  BENCH_EXTRA_ARGS='$ARG5' \
-                  SERVER_ARGS='$CURRENT_SERVER_ARGS' \
-                  .github/scripts/atom_test.sh benchmark $MODEL_DIR"
-                ;;
-              STOP)
-                echo "=== Stopping server ==="
-                docker exec atom-regression bash -lc "pkill -f 'atom.entrypoints' || true; sleep 5"
-                ;;
-            esac
-          done < /tmp/regression_actions.txt
+          # Stop last server
+          docker exec atom-regression bash -lc ".github/scripts/atom_test.sh stop"
 
-          # Wait for trace compression
-          echo "Waiting for trace files..."
+      - name: Wait for trace completion
+        if: steps.prepare.outputs.has_configs == 'true'
+        run: |
           for i in $(seq 1 60); do
-            TMP_COUNT=$(docker exec atom-regression bash -lc "find /app/trace -name '*.tmp' 2>/dev/null | wc -l" || echo "0")
+            TMP_COUNT=$(docker exec atom-regression bash -lc \
+              "find /app/trace -name '*.tmp' 2>/dev/null | wc -l" || echo "0")
             [ "$TMP_COUNT" -eq 0 ] && echo "Traces ready after ${i}s" && break
             sleep 1
           done

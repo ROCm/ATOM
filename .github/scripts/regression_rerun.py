@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Generate regression re-run actions from a regression report and model registry.
+"""Generate regression re-run configs from a regression report and model registry.
 
 Reads regression_report.json (from summarize.py) and models.json (model config
-registry), then outputs a pipe-delimited action file consumed by the CI workflow.
+registry), selects the top-N most regressed configs, resolves their full model
+config (server args, bench args), and outputs a flat config list.
+
+The output is consumed by the CI workflow's "Run configs with profiler" step,
+which uses the same atom_test.sh launch/benchmark pattern as the benchmark job.
 
 Usage:
     python3 regression_rerun.py REPORT_JSON MODELS_JSON [-o OUTPUT] [--top-n 3]
 
-Output format (one action per line):
-    DOWNLOAD|<hf_path>
-    LAUNCH|<hf_path>|<server_args>
-    BENCHMARK|<hf_path>|<ISL>|<OSL>|<CONC>|<bench_args>
-    STOP
+Output format (pipe-delimited, one config per line, sorted by model+args for grouping):
+    <model_path>|<server_args>|<bench_args>|<isl>|<osl>|<conc>
 """
 
 import argparse
@@ -60,8 +61,8 @@ def _regression_severity(r):
     return min(throughput_pct, -tpot_pct)
 
 
-def generate_actions(report_path, models_path, top_n=3):
-    """Generate action lines from regression report and model registry."""
+def generate_configs(report_path, models_path, top_n=3):
+    """Generate flat config list from regression report and model registry."""
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
     models = json.loads(Path(models_path).read_text(encoding="utf-8"))
 
@@ -73,53 +74,31 @@ def generate_actions(report_path, models_path, top_n=3):
     regressions.sort(key=_regression_severity)
     regressions = regressions[:top_n]
 
-    # Group by model config (same server instance can run multiple benchmarks)
-    groups = {}
+    configs = []
     for r in regressions:
-        config = _find_model_config(r, models)
-        if config is None:
+        model_cfg = _find_model_config(r, models)
+        if model_cfg is None:
             print(
                 f"WARNING: No model config found for {r.get('model', '?')}, skipping",
                 file=sys.stderr,
             )
             continue
 
-        # Group key: path + suffix (determines unique server instance)
-        key = (config["path"], config.get("suffix", ""))
-        if key not in groups:
-            groups[key] = {
-                "config": config,
-                "benchmarks": [],
+        configs.append(
+            {
+                "model_path": model_cfg["path"],
+                "server_args": model_cfg.get("args", ""),
+                "bench_args": model_cfg.get("bench_args", ""),
+                "isl": r["isl"],
+                "osl": r["osl"],
+                "conc": r["conc"],
             }
-        groups[key]["benchmarks"].append(r)
+        )
 
-    # Generate actions
-    actions = []
-    seen_downloads = set()
-    for (path, _suffix), group in groups.items():
-        config = group["config"]
-
-        # DOWNLOAD (deduplicate by HF path)
-        if path not in seen_downloads:
-            actions.append(f"DOWNLOAD|{path}")
-            seen_downloads.add(path)
-
-        # LAUNCH with profiler args appended
-        server_args = config.get("args", "")
-        profiler_args = "--torch-profiler-dir /app/trace --mark-trace"
-        full_args = f"{server_args} {profiler_args}".strip()
-        actions.append(f"LAUNCH|{path}|{full_args}")
-
-        # BENCHMARK for each regressed config
-        bench_args = config.get("bench_args", "")
-        for r in group["benchmarks"]:
-            actions.append(
-                f"BENCHMARK|{path}|{r['isl']}|{r['osl']}|{r['conc']}|{bench_args}"
-            )
-
-        actions.append("STOP")
-
-    return actions
+    # Sort by model_path + server_args so same-server configs are adjacent
+    # (allows the YAML loop to group server launches)
+    configs.sort(key=lambda c: (c["model_path"], c["server_args"]))
+    return configs
 
 
 def main():
@@ -135,16 +114,23 @@ def main():
     )
     args = parser.parse_args()
 
-    actions = generate_actions(args.report, args.models, args.top_n)
+    configs = generate_configs(args.report, args.models, args.top_n)
 
-    if not actions:
+    if not configs:
         print("No regressions to re-run", file=sys.stderr)
         return
 
-    output = "\n".join(actions) + "\n"
+    lines = []
+    for c in configs:
+        lines.append(
+            f"{c['model_path']}|{c['server_args']}|{c['bench_args']}"
+            f"|{c['isl']}|{c['osl']}|{c['conc']}"
+        )
+
+    output = "\n".join(lines) + "\n"
     if args.output:
         Path(args.output).write_text(output, encoding="utf-8")
-        print(f"Wrote {len(actions)} actions to {args.output}", file=sys.stderr)
+        print(f"Wrote {len(lines)} configs to {args.output}", file=sys.stderr)
     else:
         sys.stdout.write(output)
 
