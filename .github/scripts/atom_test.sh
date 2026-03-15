@@ -101,6 +101,7 @@ fi
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
   echo "========== Running benchmark test =========="
+  RESULT_FILENAME=${RESULT_FILENAME:-benchmark_result}
   PROFILE_ARG=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
     PROFILE_ARG="--profile"
@@ -111,7 +112,7 @@ if [ "$TYPE" == "benchmark" ]; then
     --dataset-name=random \
     --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
     --max-concurrency=$CONC \
-    --num-prompts=$(( $CONC * 10 )) \
+    --num-prompts=${NUM_PROMPTS_OVERRIDE:-$(( $CONC * 10 ))} \
     --trust-remote-code \
     --num-warmups=1 \
     --request-rate=inf --ignore-eos \

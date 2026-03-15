@@ -83,47 +83,28 @@ jobs:
         run: |
           echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
+  load-models:
+    name: Load model configs
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.load.outputs.models_json }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: load
+        run: echo "models_json=$(jq -c . .github/benchmark/models.json)" >> $GITHUB_OUTPUT
+
   benchmark:
     name: ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
-    needs: [parse-param-lists]
-    if: always() && needs.parse-param-lists.result == 'success'
+    needs: [parse-param-lists, load-models]
+    if: >-
+      always()
+      && needs.parse-param-lists.result == 'success'
+      && needs.load-models.result == 'success'
     strategy:
       fail-fast: false
       matrix:
         config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
-        model:
-          - display: "DeepSeek-R1-0528"
-            path: "deepseek-ai/DeepSeek-R1-0528"
-            prefix: "deepseek-r1-0528"
-            args: "--kv_cache_dtype fp8 -tp 8"
-            bench_args: ""
-            suffix: ""
-            runner: "atom-mi355-8gpu.predownload"
-            env_vars: ""
-          - display: "DeepSeek-R1-0528 MTP3"
-            path: "deepseek-ai/DeepSeek-R1-0528"
-            prefix: "deepseek-r1-0528"
-            args: "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3"
-            bench_args: "--use-chat-template"
-            suffix: "-mtp3"
-            runner: "atom-mi355-8gpu.predownload"
-            env_vars: ""
-          - display: "GLM-5-FP8"
-            path: "zai-org/GLM-5-FP8"
-            prefix: "glm-5-fp8"
-            args: "--kv_cache_dtype fp8 -tp 8"
-            bench_args: ""
-            suffix: ""
-            runner: "atom-mi355-8gpu.predownload"
-            env_vars: ""
-          - display: "gpt-oss-120b"
-            path: "openai/gpt-oss-120b"
-            prefix: "gpt-oss-120b"
-            args: "--kv_cache_dtype fp8"
-            bench_args: ""
-            suffix: ""
-            runner: "atom-mi355-8gpu.predownload"
-            env_vars: ""
+        model: ${{ fromJson(needs.load-models.outputs.models_json) }}
         exclude:
           # Skip low-concurrency MTP runs to limit CI time
           - model: { suffix: "-mtp3" }
@@ -469,136 +450,72 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Download models for regressed configs
-        run: |
-          # Extract unique model HF paths from regression report
-          python3 -c "
-          import json, re
-          report = json.load(open('regression_report.json'))
-          # Model display names like 'DeepSeek-R1-0528' or 'DeepSeek-R1-0528-mtp3'
-          # Map back to HF paths (strip variant suffix)
-          models = set()
-          for r in report.get('regressions', []):
-              name = re.sub(r'-mtp\d*$', '', r.get('model', ''))
-              models.add(name)
-          for m in models:
-              print(m)
-          " | while read MODEL_NAME; do
-            echo "Downloading $MODEL_NAME..."
-            if [ -d "/models" ]; then
-              # Try common HF orgs
-              for org in deepseek-ai openai zai-org amd; do
-                docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
-                  "hf download ${org}/${MODEL_NAME} --local-dir /models/${org}/${MODEL_NAME}" 2>/dev/null && break || true
-              done
-            fi
-          done
-
       - name: Re-run regressed configs with profiler
         timeout-minutes: 60
         run: |
           set -euo pipefail
 
-          # Pick the top 3 most regressed configs, grouped by variant (server args differ)
-          python3 -c "
-          import json, sys
-          report = json.load(open('regression_report.json'))
-          regressions = report.get('regressions', [])
-          if not regressions:
-              print('No regressions to analyze')
-              sys.exit(0)
-          regressions.sort(key=lambda r: min(
-              r['metrics'].get('output_throughput', {}).get('pct', 0),
-              -r['metrics'].get('mean_tpot_ms', {}).get('pct', 0)
-          ))
-          for r in regressions[:3]:
-              is_mtp = 'mtp' in r.get('model', '').lower()
-              print(f\"Regressed: {r['model']} {r['isl']}/{r['osl']} c={r['conc']} mtp={is_mtp}\")
-          json.dump(regressions[:3], open('regressed_configs.json', 'w'))
-          "
+          # Generate action plan from regression report + model registry
+          python3 .github/scripts/regression_rerun.py \
+            regression_report.json \
+            .github/benchmark/models.json \
+            -o /tmp/regression_actions.txt
 
-          # Group regressed configs by model+variant and profile each group
-          python3 << 'PYEOF'
-          import json, re
-          configs = json.load(open('regressed_configs.json'))
-          # Group by base model name (strip mtp suffix) + mtp flag
-          groups = {}
-          for c in configs:
-              model = c.get('model', '')
-              is_mtp = 'mtp' in model.lower()
-              base_model = re.sub(r'-mtp\d*$', '', model)
-              key = f"{base_model}|{'mtp' if is_mtp else 'base'}"
-              if key not in groups:
-                  groups[key] = {
-                      "base_model": base_model,
-                      "server_args": "--method mtp --num-speculative-tokens 3" if is_mtp else "",
-                      "bench_args": "--use-chat-template" if is_mtp else "",
-                      "configs": []
-                  }
-              groups[key]["configs"].append(c)
-          result = list(groups.values())
-          json.dump(result, open('regression_groups.json', 'w'))
-          print(f"Groups: {len(result)}")
-          for g in result:
-              print(f"  {g['base_model']} ({len(g['configs'])} configs, server_args: {g['server_args'] or 'default'})")
-          PYEOF
+          if [ ! -s /tmp/regression_actions.txt ]; then
+            echo "No regression actions generated, skipping"
+            exit 0
+          fi
 
-          # For each group: find model path, launch server, profile, stop
-          python3 -c "
-          import json
-          for g in json.load(open('regression_groups.json')):
-              bm = g['base_model']
-              sa = g['server_args']
-              ba = g['bench_args']
-              configs = ' '.join(f\"{c['isl']},{c['osl']},{c['conc']}\" for c in g['configs'])
-              print(f\"{bm}|{sa}|{ba}|{configs}\")
-          " | while IFS='|' read BASE_MODEL SERVER_ARGS BENCH_ARGS CONFIG_LIST; do
-            echo "========== Model: $BASE_MODEL  Server args: ${SERVER_ARGS:-default} =========="
-            # Find model path on runner
-            if [ -d "/models" ]; then
-              MODEL_PATH=$(find /models -maxdepth 2 -type d -name "$BASE_MODEL" | head -1)
-              [ -z "$MODEL_PATH" ] && MODEL_PATH="$BASE_MODEL"
-            else
-              MODEL_PATH="$BASE_MODEL"
-            fi
-            ARGS="--kv_cache_dtype fp8 -tp 8 --torch-profiler-dir /app/trace --mark-trace ${SERVER_ARGS}"
-            docker exec atom-regression bash -lc "set -euo pipefail
-              pkill -f 'atom.entrypoints' || true; sleep 3
-              .github/scripts/atom_test.sh launch $MODEL_PATH $ARGS
-            "
+          cat /tmp/regression_actions.txt
 
-            for cfg in $CONFIG_LIST; do
-              IFS=',' read ISL OSL CONC <<< "$cfg"
-              echo "========== Profiling ISL=$ISL OSL=$OSL CONC=$CONC =========="
-              NUM_PROMPTS=$((CONC * 2))
-              docker exec atom-regression bash -lc "
-                python -m atom.benchmarks.benchmark_serving \
-                  --model=$MODEL_PATH --backend=vllm --base-url=http://localhost:8000 \
-                  --dataset-name=random \
-                  --random-input-len=$ISL --random-output-len=$OSL \
-                  --random-range-ratio=0.8 \
-                  --max-concurrency=$CONC \
-                  --num-prompts=$NUM_PROMPTS \
-                  --trust-remote-code --num-warmups=1 \
-                  --request-rate=inf --ignore-eos \
-                  --profile $BENCH_ARGS
-              "
-            done
-          done
+          # State: track current server args across LAUNCH/BENCHMARK
+          CURRENT_SERVER_ARGS=""
 
-          # Wait for trace gzip compression to complete
-          echo "Waiting for trace files to finish writing..."
+          # Execute actions
+          while IFS='|' read -r ACTION ARG1 ARG2 ARG3 ARG4 ARG5; do
+            case "$ACTION" in
+              DOWNLOAD)
+                echo "=== Downloading model: $ARG1 ==="
+                if [ -d "/models" ]; then
+                  docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
+                    "hf download $ARG1 --local-dir /models/$ARG1" || echo "::warning::Failed to download $ARG1, will use HF online"
+                fi
+                ;;
+              LAUNCH)
+                echo "=== Launching server: $ARG1 args: $ARG2 ==="
+                CURRENT_SERVER_ARGS="$ARG2"
+                if [ -d "/models" ]; then MODEL_DIR="/models/$ARG1"; else MODEL_DIR="$ARG1"; fi
+                docker exec atom-regression bash -lc "set -euo pipefail
+                  pkill -f 'atom.entrypoints' || true; sleep 3
+                  .github/scripts/atom_test.sh launch $MODEL_DIR $ARG2"
+                ;;
+              BENCHMARK)
+                echo "=== Profiling: $ARG1 ISL=$ARG2 OSL=$ARG3 CONC=$ARG4 ==="
+                if [ -d "/models" ]; then MODEL_DIR="/models/$ARG1"; else MODEL_DIR="$ARG1"; fi
+                docker exec atom-regression bash -lc "
+                  ENABLE_TORCH_PROFILER=1 \
+                  ISL=$ARG2 OSL=$ARG3 CONC=$ARG4 \
+                  RANDOM_RANGE_RATIO=0.8 \
+                  NUM_PROMPTS_OVERRIDE=\$((${ARG4}*2)) \
+                  RESULT_FILENAME=regression-${ARG2}-${ARG3}-${ARG4} \
+                  BENCH_EXTRA_ARGS='$ARG5' \
+                  SERVER_ARGS='$CURRENT_SERVER_ARGS' \
+                  .github/scripts/atom_test.sh benchmark $MODEL_DIR"
+                ;;
+              STOP)
+                echo "=== Stopping server ==="
+                docker exec atom-regression bash -lc "pkill -f 'atom.entrypoints' || true; sleep 5"
+                ;;
+            esac
+          done < /tmp/regression_actions.txt
+
+          # Wait for trace compression
+          echo "Waiting for trace files..."
           for i in $(seq 1 60); do
-            TMP_COUNT=$(docker exec atom-regression bash -lc "find /app/trace -name '*.tmp' 2>/dev/null | wc -l")
-            if [ "$TMP_COUNT" -eq 0 ]; then
-              echo "Trace files ready after ${i}s"
-              break
-            fi
+            TMP_COUNT=$(docker exec atom-regression bash -lc "find /app/trace -name '*.tmp' 2>/dev/null | wc -l" || echo "0")
+            [ "$TMP_COUNT" -eq 0 ] && echo "Traces ready after ${i}s" && break
             sleep 1
           done
-
-          # Stop server
-          docker exec atom-regression bash -lc "pkill -f 'atom.entrypoints' || true; sleep 5"
 
       - name: Copy profiler traces from container
         if: always()

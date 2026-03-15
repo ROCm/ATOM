@@ -233,6 +233,7 @@ def print_regression_report(current_results, baseline_results):
             regressions.append(
                 {
                     "model": model,
+                    "model_id": data.get("model_id", ""),
                     "isl": isl,
                     "osl": osl,
                     "conc": conc,
