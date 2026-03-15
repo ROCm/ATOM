@@ -398,9 +398,10 @@ jobs:
           git push origin gh-pages
           git checkout "$CURRENT_SHA"
 
-  regression-analysis:
+  # ---------- Regression re-run (GPU, only on regression) ----------
+  regression-rerun:
     if: always() && needs.summarize-benchmark-result.outputs.has_regression == 'true'
-    name: Regression Analysis (profiler trace collection)
+    name: Re-run regressed configs with profiler
     needs: [summarize-benchmark-result]
     runs-on: atom-mi355-8gpu.predownload
     steps:
@@ -530,51 +531,102 @@ jobs:
             sleep 1
           done
 
-      - name: Copy profiler traces from container
+      - name: Copy and upload profiler traces
         if: always()
         run: |
           docker cp atom-regression:/app/trace ./regression-traces 2>/dev/null || echo "No traces found"
           ls -lhR ./regression-traces/ 2>/dev/null || true
 
-      - name: Analyze traces with parse_trace.py + summary
+      - name: Upload regression traces
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-traces-${{ github.run_id }}
+          path: regression-traces/
+
+      - name: Clean Up
         if: always()
         run: |
-          mkdir -p regression-analysis
+          docker stop atom-regression || true
+          docker rm atom-regression || true
+
+  # ---------- Profiler analysis (lightweight, runs on regression OR manual profiler) ----------
+  profiler-analysis:
+    if: >-
+      always()
+      && (needs.regression-rerun.result == 'success'
+          || inputs.enable_profiler == true)
+    name: Profiler trace analysis
+    needs: [benchmark, summarize-benchmark-result, regression-rerun]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download regression traces
+        if: needs.regression-rerun.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: regression-traces-${{ github.run_id }}
+          path: profiler-traces/
+
+      - name: Download benchmark profiler traces
+        if: needs.regression-rerun.result != 'success'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: profiler-traces-*
+          merge-multiple: true
+          path: profiler-traces/
+
+      - name: Analyze traces
+        run: |
+          mkdir -p profiler-analysis
           pip install -q openpyxl 2>/dev/null || true
-          for rank_dir in regression-traces/rank_*/; do
+
+          TRACE_DIRS=$(find profiler-traces -type d -name "rank_*" 2>/dev/null || true)
+          if [ -z "$TRACE_DIRS" ]; then
+            echo "No rank directories found in profiler-traces/"
+            ls -lhR profiler-traces/ 2>/dev/null || true
+            exit 0
+          fi
+
+          for rank_dir in $TRACE_DIRS; do
             rank=$(basename "$rank_dir")
             RUN_TRACE=$(find "$rank_dir" -name "*.pt.trace.json.gz" ! -name "capture_graph_*" | sort | tail -1)
             if [ -n "$RUN_TRACE" ]; then
               echo "=== Analyzing $rank: $RUN_TRACE ==="
-              # Kernel breakdown XLSX
-              cd regression-analysis
+              cd profiler-analysis
               python ../tools/parse_trace.py "../$RUN_TRACE" --layer 3 2>&1 | tee "${rank}_analysis.log" || true
               for f in prefill_breakdown.xlsx decode_breakdown.xlsx; do
                 [ -f "$f" ] && mv "$f" "${rank}_${f}"
               done
               cd ..
-              # Performance summary report (only rank_0)
               if [ "$rank" = "rank_0" ]; then
                 python tools/analyze_trace_summary.py "$RUN_TRACE" \
-                  --output regression-analysis/performance_summary.md 2>&1 || true
+                  --output profiler-analysis/performance_summary.md 2>&1 || true
                 echo "=== Performance Summary ==="
-                cat regression-analysis/performance_summary.md
+                cat profiler-analysis/performance_summary.md
               fi
             fi
           done
-          ls -la regression-analysis/ 2>/dev/null || true
+          ls -la profiler-analysis/ 2>/dev/null || true
 
-      - name: Upload regression traces and analysis
+      - name: Upload analysis results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: regression-traces-${{ github.run_id }}
-          path: |
-            regression-traces/
-            regression-analysis/
+          name: profiler-analysis-${{ github.run_id }}
+          path: profiler-analysis/
 
-      - name: Create GitHub Issue with regression report
-        if: always()
+      - name: Download regression report
+        if: needs.regression-rerun.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: regression-report
+        continue-on-error: true
+
+      - name: Create GitHub Issue for regression
+        if: needs.regression-rerun.result == 'success'
         uses: actions/github-script@v7
         with:
           script: |
@@ -594,6 +646,10 @@ jobs:
               return `| ${r.model} | ${r.isl}/${r.osl} | ${r.conc} | ${throughput.current?.toFixed(1) || 'N/A'} | ${throughput.baseline?.toFixed(1) || 'N/A'} | ${throughput.pct?.toFixed(1) || 'N/A'}% | ${tpot.current?.toFixed(2) || 'N/A'} | ${tpot.baseline?.toFixed(2) || 'N/A'} | ${tpot.pct?.toFixed(1) || 'N/A'}% |`;
             }).join('\n');
 
+            let summary = 'Summary not available';
+            try { summary = fs.readFileSync('profiler-analysis/performance_summary.md', 'utf8'); }
+            catch(e) { /* ignore */ }
+
             const body = `## Performance Regression Detected
 
             **Commit:** \`${context.sha.substring(0, 8)}\`
@@ -609,10 +665,7 @@ jobs:
             ### Performance Summary
 
             \`\`\`
-            ${(() => {
-              try { return require('fs').readFileSync('regression-analysis/performance_summary.md', 'utf8'); }
-              catch(e) { return 'Summary not available'; }
-            })()}
+            ${summary}
             \`\`\`
 
             ### Profiler Traces
@@ -621,7 +674,7 @@ jobs:
             Open in [Perfetto UI](https://ui.perfetto.dev/) or Chrome \`chrome://tracing\` for analysis.
 
             ### Next Steps
-            1. Download \`regression-traces-${context.runId}\` artifact
+            1. Download \`profiler-analysis-${context.runId}\` artifact
             2. Open trace files in Perfetto UI
             3. Compare kernel durations against previous traces
             4. Identify bottleneck changes
@@ -634,9 +687,3 @@ jobs:
               body: body,
               labels: ['performance', 'regression']
             });
-
-      - name: Clean Up
-        if: always()
-        run: |
-          docker stop atom-regression || true
-          docker rm atom-regression || true
