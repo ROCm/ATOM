@@ -658,9 +658,8 @@ class MLAAttention(nn.Module):
 
             if use_prefix_cache:
                 total_tokens = attn_metadata.cu_seqlens_k[-1].item()
-                output_dtype = (
-                    dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
-                )
+                # k_full/v_full are used for attention compute; gather_kv_b_proj reads
+                # fp8 from cache and dequantizes internally, so output must be model dtype
                 k_full = torch.empty(
                     (
                         total_tokens,
@@ -668,7 +667,7 @@ class MLAAttention(nn.Module):
                         self.qk_nope_head_dim + self.qk_rope_head_dim,
                     ),
                     device=q.device,
-                    dtype=output_dtype,
+                    dtype=self.dtype,
                 )
                 v_full = torch.empty(
                     (
@@ -677,7 +676,7 @@ class MLAAttention(nn.Module):
                         self.qk_nope_head_dim,
                     ),
                     device=q.device,
-                    dtype=output_dtype,
+                    dtype=self.dtype,
                 )
 
                 gather_kv_b_proj(
