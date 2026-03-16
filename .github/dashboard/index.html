@@ -351,9 +351,13 @@ for (const run of allRuns) {
   }
 }
 
-// Latest run configs
+// For each config, take the most recent data point across all runs
+// This ensures all models appear even if the latest run only tested a subset
 const latestRun = allRuns[0];
-const latestConfigs = latestRun ? parseRunConfigs(latestRun) : {};
+const latestConfigs = {};
+for (const [key, history] of Object.entries(historyMap)) {
+  latestConfigs[key] = history[0]; // history is sorted desc by date
+}
 
 // Detect regressions: compare to most recent previous value for same config
 function detectRegressions() {
@@ -715,27 +719,34 @@ function renderPerformanceTab() {
   });
 
   if (entries.length === 0) {
-    container.innerHTML = '<div class="chart-empty">No data in the latest run for the selected filters. Try the Trends or Data &amp; Trace tab for historical data.</div>';
+    container.innerHTML = '<div class="chart-empty">No data matches the current filters.</div>';
     return;
   }
 
   // --- Bar Chart ---
   const pm = PERF_METRICS.find(m => m.key === state.perfMetric) || PERF_METRICS[0];
-  const MAX_BARS = 20;
-  // Keep model→ISL/OSL→conc grouping (same as table), just take top N
-  const barEntries = entries.slice(0, MAX_BARS);
-  const labels = barEntries.map(([, c]) => `${c.model} ${c.islOsl} c=${c.conc}`);
-  const values = barEntries.map(([, c]) => c[pm.key] || 0);
-  const barConcList = [...new Set(barEntries.map(([, c]) => c.conc))];
-  const bgColors = barEntries.map(([k, c]) => getBarColor(c.model, c.conc, barConcList));
-  const bdColors = barEntries.map(([k, c]) => regressions[k] ? 'rgba(240,85,69,0.8)' : getModelColor(c.model).border);
-  const bdWidths = barEntries.map(([k]) => regressions[k] ? 2.5 : 1.5);
+  // Aggregate: group by model × ISL/OSL, pick best value per group
+  const barGroups = {};
+  for (const [key, cfg] of entries) {
+    const gKey = `${cfg.model}|${cfg.islOsl}`;
+    const val = cfg[pm.key];
+    if (val == null) continue;
+    const isBetter = pm.lower ? (val < (barGroups[gKey]?.val ?? Infinity)) : (val > (barGroups[gKey]?.val ?? -Infinity));
+    if (!barGroups[gKey] || isBetter) barGroups[gKey] = { key, cfg, val, conc: cfg.conc };
+  }
+  const barEntries = Object.values(barGroups).sort((a, b) => a.cfg.model.localeCompare(b.cfg.model) || a.cfg.islOsl.localeCompare(b.cfg.islOsl));
+  const labels = barEntries.map(e => `${e.cfg.model} ${e.cfg.islOsl}`);
+  const values = barEntries.map(e => e.val);
+  const barConcList = [...new Set(barEntries.map(e => e.conc))];
+  const bgColors = barEntries.map(e => getBarColor(e.cfg.model, e.conc, barConcList));
+  const bdColors = barEntries.map(e => regressions[e.key] ? 'rgba(240,85,69,0.8)' : getModelColor(e.cfg.model).border);
+  const bdWidths = barEntries.map(e => regressions[e.key] ? 2.5 : 1.5);
 
   // Metric selector + legend
   const metricBtns = PERF_METRICS.map(m =>
     `<button class="sel-btn ${m.key === state.perfMetric ? 'active' : ''}" data-metric="${m.key}">${m.label}</button>`
   ).join('');
-  const barModels = [...new Set(barEntries.map(([, c]) => c.model))];
+  const barModels = [...new Set(barEntries.map(e => e.cfg.model))];
   const legendHTML = barModels.map(m => {
     const h = getModelHue(m);
     return `<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px;font-size:11px;color:var(--text-secondary)"><span style="width:10px;height:10px;border-radius:2px;background:hsla(${h},50%,72%,0.6);border:1px solid hsla(${h},55%,65%,0.5);display:inline-block"></span>${m}</span>`;
@@ -795,9 +806,6 @@ function renderPerformanceTab() {
     html += `<tr class="detail-row" data-detail="${key}"><td colspan="12">${buildDetailHTML(key, cfg)}</td></tr>`;
   }
   html += '</tbody></table></div>';
-  if (entries.length > MAX_BARS) {
-    html = html.replace('</h3>', ` (top ${MAX_BARS} of ${entries.length})</h3>`);
-  }
 
   container.innerHTML = html;
 
@@ -813,8 +821,14 @@ function renderPerformanceTab() {
       layout: { padding: { top: 24 } },
       plugins: {
         legend: { display: false },
-        tooltip: { ...chartTooltipOpts(), callbacks: { title: (items) => labels[items[0].dataIndex], label: (item) => ' ' + fmtNum(item.raw, pm.key === 'TPOT' ? 2 : 1) + ' ' + pm.unit } },
-        datalabels: { display: values.length <= 12, color: '#9ea0b2', anchor: 'end', align: 'top', clip: false, font: { size: 10, family: '"SF Mono", monospace' }, formatter: v => fmtCompact(v, pm.key === 'TPOT' ? 2 : 0) }
+        tooltip: { ...chartTooltipOpts(), callbacks: {
+          title: (items) => labels[items[0].dataIndex],
+          label: (item) => {
+            const e = barEntries[item.dataIndex];
+            return ` ${fmtNum(item.raw, pm.key === 'TPOT' ? 2 : 1)} ${pm.unit} (best at c=${e.conc})`;
+          }
+        }},
+        datalabels: { display: values.length <= 16, color: '#9ea0b2', anchor: 'end', align: 'top', clip: false, font: { size: 10, family: '"SF Mono", monospace' }, formatter: v => fmtCompact(v, pm.key === 'TPOT' ? 2 : 0) }
       },
       scales: {
         x: { grid: { display: false }, ticks: { color: '#8a8da0', maxRotation: 45, font: { size: 10 }, callback: function(val) { const l = this.getLabelForValue(val); return l.length > 28 ? l.slice(0, 26) + '…' : l; } } },
@@ -822,8 +836,8 @@ function renderPerformanceTab() {
       },
       onClick: (_e, elems) => {
         if (!elems.length) return;
-        const key = Object.keys(fc).sort((a, b) => (fc[b].throughput || 0) - (fc[a].throughput || 0))[elems[0].index];
-        if (key) showPopover(key, fc[key]);
+        const e = barEntries[elems[0].index];
+        if (e) showPopover(e.key, e.cfg);
       }
     }
   });
@@ -900,7 +914,7 @@ function renderTradeoffTab() {
   destroyChartsIn(container);
   const fc = filteredConfigs();
   const entries = Object.entries(fc);
-  if (entries.length === 0) { container.innerHTML = '<div class="chart-empty">No data in the latest run for the selected filters. Try the Trends or Data &amp; Trace tab for historical data.</div>'; return; }
+  if (entries.length === 0) { container.innerHTML = '<div class="chart-empty">No data matches the current filters.</div>'; return; }
 
   // Group by model+ISL/OSL for scatter series
   const seriesMap = {};
@@ -1131,6 +1145,12 @@ function renderTrendsTab() {
       card.innerHTML += '<div class="chart-empty">No historical data for this model and metric.</div>';
       continue;
     }
+    if (datasets.length > 8) {
+      const note = document.createElement('div');
+      note.style.cssText = 'font-size:11px;color:var(--text-tertiary);margin-bottom:4px';
+      note.textContent = `${datasets.length} configs — hover to identify, use filters to narrow down`;
+      card.insertBefore(note, wrap);
+    }
 
     new Chart(canvas, {
       type: 'line', data: { labels: orderedLabels, datasets },
@@ -1138,7 +1158,9 @@ function renderTrendsTab() {
         responsive: true, maintainAspectRatio: false,
         layout: { padding: { top: 8 } },
         plugins: {
-          legend: { labels: { color: '#9ea0b2', font: { size: 10 }, boxWidth: 10 } },
+          legend: datasets.length <= 8
+            ? { labels: { color: '#9ea0b2', font: { size: 10 }, boxWidth: 10 } }
+            : { display: false },
           tooltip: { ...chartTooltipOpts(), callbacks: {
             title: (items) => {
               const lbl = orderedLabels[items[0].dataIndex];
