@@ -85,7 +85,7 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils.decorators import support_torch_compile
+from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
@@ -278,7 +278,7 @@ def _fused_rms_fp8_group_quant(
     )
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
-
+@mark_trace(prefix="rmsnorm_quant", torch_compile=True)
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -516,7 +516,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
         k_pe = k_pe_reduced_out
     return q_c, q_c_scale, kv_c_normed, k_pe
 
-
+@mark_trace(prefix="qkv_a_proj_reduce_rmsnorm", torch_compile=True)
 @torch_compile_guard(
     gen_fake=_fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8_fake, mutates_args=[]
 )

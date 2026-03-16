@@ -22,6 +22,7 @@ FILTER_OUT = ["fill_"]
 
 # Sampling-related modules and low-level ops to filter out in prefill
 FILTER_OUT_PREFILL = ["aiter::mixed_sample"]
+STRICT_NORM_NAMES = ["layernorm", "rmsnorm", "rmsnorm_quant"]
 
 
 # =============================================================================
@@ -57,7 +58,7 @@ def is_strict_norm_name(name: str) -> bool:
     if not isinstance(name, str):
         return False
     n = name.strip().lower()
-    return n == "layernorm" or n == "rmsnorm"
+    return n in STRICT_NORM_NAMES
 
 
 def extract_model_name_from_trace_filename(filepath: str) -> Optional[str]:
