@@ -84,14 +84,22 @@ def generate_configs(report_path, models_path, top_n=3):
             )
             continue
 
+        isl, osl, conc = r.get("isl"), r.get("osl"), r.get("conc")
+        if None in (isl, osl, conc):
+            print(
+                f"WARNING: skipping {r.get('model', '?')} — missing isl/osl/conc",
+                file=sys.stderr,
+            )
+            continue
+
         configs.append(
             {
                 "model_path": model_cfg["path"],
                 "server_args": model_cfg.get("args", ""),
                 "bench_args": model_cfg.get("bench_args", ""),
-                "isl": r["isl"],
-                "osl": r["osl"],
-                "conc": r["conc"],
+                "isl": isl,
+                "osl": osl,
+                "conc": conc,
                 "env_vars": model_cfg.get("env_vars", ""),
                 "prefix": model_cfg.get("prefix", ""),
             }

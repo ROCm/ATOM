@@ -152,16 +152,14 @@ jobs:
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: |
-              ATOM_GPT_OSS_MODEL=1
+            env_vars: ""
             accuracy_test_threshold: "0.38"
             runner: linux-atom-mi355-1
             run_on_pr: true
           - model_name: "gpt-oss-120b (2 GPUs)"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
-            env_vars: |
-              ATOM_GPT_OSS_MODEL=1
+            env_vars: ""
             accuracy_test_threshold: "0.38"
             runner: linux-atom-mi355-4
             run_on_pr: false

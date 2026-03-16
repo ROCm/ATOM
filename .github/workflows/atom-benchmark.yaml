@@ -651,14 +651,14 @@ jobs:
           path: profiler-analysis/
 
       - name: Download regression report
-        if: needs.regression-rerun.result == 'success'
+        if: needs.summarize-benchmark-result.outputs.has_regression == 'true'
         uses: actions/download-artifact@v8
         with:
           name: regression-report
         continue-on-error: true
 
       - name: Create GitHub Issue for regression
-        if: needs.regression-rerun.result == 'success'
+        if: needs.summarize-benchmark-result.outputs.has_regression == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -679,8 +679,14 @@ jobs:
             }).join('\n');
 
             let summary = 'Summary not available';
-            try { summary = fs.readFileSync('profiler-analysis/performance_summary.md', 'utf8'); }
-            catch(e) { /* ignore */ }
+            try {
+              const dirs = fs.readdirSync('profiler-analysis').filter(d =>
+                fs.statSync(`profiler-analysis/${d}`).isDirectory());
+              for (const d of dirs) {
+                const p = `profiler-analysis/${d}/performance_summary.md`;
+                if (fs.existsSync(p)) { summary = fs.readFileSync(p, 'utf8'); break; }
+              }
+            } catch(e) { /* ignore */ }
 
             const body = `## Performance Regression Detected
 
