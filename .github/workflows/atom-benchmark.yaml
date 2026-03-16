@@ -485,51 +485,75 @@ jobs:
         if: steps.prepare.outputs.has_configs == 'true'
         timeout-minutes: 60
         run: |
-          set -euo pipefail
+          set -uo pipefail  # no -e: allow per-config failure without aborting loop
 
           # Track current server to avoid unnecessary restarts
           CURRENT_SERVER=""
+          FAIL_COUNT=0
+          TOTAL_COUNT=0
 
-          while IFS='|' read -r MODEL_PATH SERVER_ARGS BENCH_ARGS ISL OSL CONC; do
+          while IFS='|' read -r MODEL_PATH SERVER_ARGS BENCH_ARGS ISL OSL CONC ENV_VARS PREFIX; do
+            TOTAL_COUNT=$((TOTAL_COUNT + 1))
             if [ -d "/models" ]; then MODEL_DIR="/models/$MODEL_PATH"; else MODEL_DIR="$MODEL_PATH"; fi
-            SERVER_KEY="$MODEL_PATH|$SERVER_ARGS"
+            SERVER_KEY="$MODEL_PATH|$SERVER_ARGS|$ENV_VARS"
+            TRACE_SUBDIR="${PREFIX}${ISL}-${OSL}-${CONC}"
 
-            # Launch server if model/args changed (same pattern as benchmark job)
+            # Launch server if model/args/env changed
             if [ "$SERVER_KEY" != "$CURRENT_SERVER" ]; then
-              [ -n "$CURRENT_SERVER" ] && \
-                docker exec atom-regression bash -lc ".github/scripts/atom_test.sh stop"
+              if [ -n "$CURRENT_SERVER" ]; then
+                docker exec atom-regression bash -lc \
+                  "TORCH_PROFILER_DIR=/app/trace .github/scripts/atom_test.sh stop"
+              fi
               echo "=== Launching: $MODEL_DIR $SERVER_ARGS ==="
-              docker exec atom-regression bash -lc "set -euo pipefail
+              if ! docker exec atom-regression bash -lc "set -euo pipefail
+                $ENV_VARS \
                 ENABLE_TORCH_PROFILER=1 \
-                .github/scripts/atom_test.sh launch $MODEL_DIR $SERVER_ARGS"
+                .github/scripts/atom_test.sh launch $MODEL_DIR $SERVER_ARGS"; then
+                echo "::error::Server launch failed for $MODEL_PATH, skipping remaining configs for this model"
+                CURRENT_SERVER=""
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                continue
+              fi
               CURRENT_SERVER="$SERVER_KEY"
             fi
 
-            # Run benchmark with profiler (same pattern as benchmark job)
-            echo "=== Profiling: ISL=$ISL OSL=$OSL CONC=$CONC ==="
+            # Per-config trace directory to avoid overwrites
             docker exec atom-regression bash -lc "
+              mkdir -p /app/trace/$TRACE_SUBDIR"
+
+            # Run benchmark with profiler
+            echo "=== Profiling: $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC ==="
+            if ! docker exec atom-regression bash -lc "
+              $ENV_VARS \
               ENABLE_TORCH_PROFILER=1 \
               ISL=$ISL OSL=$OSL CONC=$CONC \
               RANDOM_RANGE_RATIO=0.8 \
-              NUM_PROMPTS_OVERRIDE=\$((${CONC}*2)) \
-              RESULT_FILENAME=regression-${ISL}-${OSL}-${CONC} \
+              NUM_PROMPTS_OVERRIDE=$((CONC*2)) \
+              RESULT_FILENAME=regression-${PREFIX}-${ISL}-${OSL}-${CONC} \
               BENCH_EXTRA_ARGS='$BENCH_ARGS' \
               SERVER_ARGS='$SERVER_ARGS' \
-              .github/scripts/atom_test.sh benchmark $MODEL_DIR"
+              .github/scripts/atom_test.sh benchmark $MODEL_DIR"; then
+              echo "::warning::Benchmark failed for $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              continue
+            fi
+
+            # Move trace files into per-config subdir (before next config overwrites)
+            docker exec atom-regression bash -lc "
+              for d in /app/trace/rank_*; do
+                [ -d \"\$d\" ] && mv \"\$d\" /app/trace/$TRACE_SUBDIR/ 2>/dev/null || true
+              done"
+
           done < /tmp/regression_configs.txt
 
-          # Stop last server
-          docker exec atom-regression bash -lc ".github/scripts/atom_test.sh stop"
+          # Stop last server (includes trace wait + GPU memory release)
+          if [ -n "$CURRENT_SERVER" ]; then
+            docker exec atom-regression bash -lc \
+              "TORCH_PROFILER_DIR=/app/trace .github/scripts/atom_test.sh stop"
+          fi
 
-      - name: Wait for trace completion
-        if: steps.prepare.outputs.has_configs == 'true'
-        run: |
-          for i in $(seq 1 60); do
-            TMP_COUNT=$(docker exec atom-regression bash -lc \
-              "find /app/trace -name '*.tmp' 2>/dev/null | wc -l" || echo "0")
-            [ "$TMP_COUNT" -eq 0 ] && echo "Traces ready after ${i}s" && break
-            sleep 1
-          done
+          echo "=== Regression re-run complete: $((TOTAL_COUNT - FAIL_COUNT))/$TOTAL_COUNT succeeded ==="
+          [ "$FAIL_COUNT" -gt 0 ] && echo "::warning::$FAIL_COUNT/$TOTAL_COUNT configs failed"
 
       - name: Copy and upload profiler traces
         if: always()
@@ -554,7 +578,8 @@ jobs:
   profiler-analysis:
     if: >-
       always()
-      && (needs.regression-rerun.result == 'success'
+      && (needs.regression-rerun.result != 'cancelled'
+          && needs.regression-rerun.result != 'skipped'
           || inputs.enable_profiler == true)
     name: Profiler trace analysis
     needs: [benchmark, summarize-benchmark-result, regression-rerun]
@@ -583,33 +608,40 @@ jobs:
           mkdir -p profiler-analysis
           pip install -q openpyxl 2>/dev/null || true
 
-          TRACE_DIRS=$(find profiler-traces -type d -name "rank_*" 2>/dev/null || true)
-          if [ -z "$TRACE_DIRS" ]; then
-            echo "No rank directories found in profiler-traces/"
+          # Find all config subdirectories containing rank_* dirs
+          # Structure: profiler-traces/<config-name>/rank_0/*.gz
+          CONFIG_DIRS=$(find profiler-traces -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+          if [ -z "$CONFIG_DIRS" ]; then
+            echo "No config directories found in profiler-traces/"
             ls -lhR profiler-traces/ 2>/dev/null || true
             exit 0
           fi
 
-          for rank_dir in $TRACE_DIRS; do
-            rank=$(basename "$rank_dir")
-            RUN_TRACE=$(find "$rank_dir" -name "*.pt.trace.json.gz" ! -name "capture_graph_*" | sort | tail -1)
-            if [ -n "$RUN_TRACE" ]; then
-              echo "=== Analyzing $rank: $RUN_TRACE ==="
-              cd profiler-analysis
-              python ../tools/parse_trace.py "../$RUN_TRACE" --layer 3 2>&1 | tee "${rank}_analysis.log" || true
-              for f in prefill_breakdown.xlsx decode_breakdown.xlsx; do
-                [ -f "$f" ] && mv "$f" "${rank}_${f}"
-              done
-              cd ..
-              if [ "$rank" = "rank_0" ]; then
-                python tools/analyze_trace_summary.py "$RUN_TRACE" \
-                  --output profiler-analysis/performance_summary.md 2>&1 || true
-                echo "=== Performance Summary ==="
-                cat profiler-analysis/performance_summary.md
-              fi
+          for config_dir in $CONFIG_DIRS; do
+            config=$(basename "$config_dir")
+            echo ""
+            echo "========== Config: $config =========="
+            mkdir -p "profiler-analysis/$config"
+
+            # Analyze rank_0 trace (representative for kernel breakdown + summary)
+            RANK0_TRACE=$(find "$config_dir/rank_0" -name "*.pt.trace.json.gz" ! -name "capture_graph_*" 2>/dev/null | sort | tail -1)
+            if [ -z "$RANK0_TRACE" ]; then
+              echo "No rank_0 trace found for $config, skipping"
+              continue
             fi
+
+            echo "=== Analyzing: $RANK0_TRACE ==="
+            cd "profiler-analysis/$config"
+            python ../../tools/parse_trace.py "../../$RANK0_TRACE" --layer 3 2>&1 | tee analysis.log || true
+            python ../../tools/analyze_trace_summary.py "../../$RANK0_TRACE" \
+              --output performance_summary.md 2>&1 || true
+            if [ -f performance_summary.md ]; then
+              echo "=== Performance Summary ($config) ==="
+              cat performance_summary.md
+            fi
+            cd ../..
           done
-          ls -la profiler-analysis/ 2>/dev/null || true
+          ls -laR profiler-analysis/ 2>/dev/null || true
 
       - name: Upload analysis results
         if: always()

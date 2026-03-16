@@ -12,7 +12,7 @@ Usage:
     python3 regression_rerun.py REPORT_JSON MODELS_JSON [-o OUTPUT] [--top-n 3]
 
 Output format (pipe-delimited, one config per line, sorted by model+args for grouping):
-    <model_path>|<server_args>|<bench_args>|<isl>|<osl>|<conc>
+    <model_path>|<server_args>|<bench_args>|<isl>|<osl>|<conc>|<env_vars>|<prefix>
 """
 
 import argparse
@@ -92,6 +92,8 @@ def generate_configs(report_path, models_path, top_n=3):
                 "isl": r["isl"],
                 "osl": r["osl"],
                 "conc": r["conc"],
+                "env_vars": model_cfg.get("env_vars", ""),
+                "prefix": model_cfg.get("prefix", ""),
             }
         )
 
@@ -125,6 +127,7 @@ def main():
         lines.append(
             f"{c['model_path']}|{c['server_args']}|{c['bench_args']}"
             f"|{c['isl']}|{c['osl']}|{c['conc']}"
+            f"|{c['env_vars']}|{c['prefix']}"
         )
 
     output = "\n".join(lines) + "\n"

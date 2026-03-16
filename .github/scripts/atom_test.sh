@@ -104,8 +104,45 @@ fi
 if [ "$TYPE" == "stop" ]; then
   echo ""
   echo "========== Stopping ATOM server =========="
+
+  # Wait for trace files to finish writing (before killing the server process)
+  TRACE_DIR="${TORCH_PROFILER_DIR:-/app/trace}"
+  if [ -d "$TRACE_DIR" ]; then
+    echo "Waiting for trace files to finish writing..."
+    for i in $(seq 1 120); do
+      TMP_COUNT=$(find "$TRACE_DIR" -name '*.tmp' 2>/dev/null | wc -l)
+      if [ "$TMP_COUNT" -eq 0 ]; then
+        echo "Trace files ready after ${i}s"
+        break
+      fi
+      [ "$i" -eq 120 ] && echo "WARNING: trace .tmp files still present after 120s"
+      sleep 1
+    done
+  fi
+
+  # Kill server processes
   pkill -f 'atom.entrypoints' || true
-  sleep 5
+  sleep 2
+  pkill -9 -f 'multiprocessing.spawn' || true
+  pkill -9 -f 'multiprocessing.resource_tracker' || true
+
+  # Wait for GPU memory to release
+  echo "Waiting for GPU memory to release..."
+  for i in $(seq 1 60); do
+    USED_GPUS=$(rocm-smi --showmemuse 2>/dev/null | grep "VRAM%" | awk '{print $NF}' | awk '$1 > 0' | wc -l 2>/dev/null || echo "0")
+    if [ "$USED_GPUS" -eq 0 ]; then
+      echo "GPU memory released after ${i}s"
+      break
+    fi
+    if [ "$i" -eq 60 ]; then
+      echo "WARNING: GPU memory still in use after 60s, force killing GPU processes"
+      rocm-smi --showpidgpus 2>&1 | grep -oP 'PID \K\d+' | while read pid; do
+        kill -9 "$pid" 2>/dev/null || true
+      done
+      sleep 5
+    fi
+    sleep 1
+  done
   echo "Server stopped."
 fi
 
