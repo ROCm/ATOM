@@ -251,20 +251,18 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Pre-download model if /models exists
+      - name: Download model if needed
         run: |
-          docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "
-            set -euo pipefail
-            cache_dir=/models/${{ matrix.model_path }}
-            cache_sentinel=\${cache_dir}/.atom_download_complete
-            if [ -f \"\${cache_sentinel}\" ] && [ -f \"\${cache_dir}/config.json\" ]; then
-              echo \"Model already exists under \${cache_dir}; skip pre-download\"
-            else
-              echo \"Syncing model cache under \${cache_dir}\"
-              hf download ${{ matrix.model_path }} --local-dir \"\${cache_dir}\"
-              touch \"\${cache_sentinel}\"
+          model_dir="/models/${{ matrix.model_path }}"
+          if docker exec "$CONTAINER_NAME" bash -lc "[ -f \"$model_dir/config.json\" ]"; then
+            echo "Model already exists under ${model_dir}; skip download"
+          else
+            echo "Model not found under ${model_dir}; downloading model"
+            if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir \"$model_dir\""; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
             fi
-          "
+          fi
 
       - name: Run OOT launch and gsm8k accuracy via script (full mode)
         timeout-minutes: 120
