@@ -23,6 +23,7 @@ FILTER_OUT = ["fill_"]
 # Sampling-related modules and low-level ops to filter out in prefill
 FILTER_OUT_PREFILL = ["aiter::mixed_sample"]
 STRICT_NORM_NAMES = ["layernorm", "rmsnorm", "rmsnorm_quant"]
+SPECIAL_KERNEL_LAUNCH_NAMES = ["hipmemcpyasync"]
 
 
 # =============================================================================
@@ -38,9 +39,9 @@ def load_trace(filepath: str) -> Dict[str, Any]:
 
 
 def is_kernel_launch(name: str) -> bool:
-    """Check if name is a kernel launch (contains 'launch' and 'kernel')."""
+    """Check if name is a kernel launch or equivalent runtime op."""
     n = name.lower()
-    return "launch" in n and "kernel" in n
+    return ("launch" in n and "kernel" in n) or n in SPECIAL_KERNEL_LAUNCH_NAMES
 
 
 def should_filter(name: str) -> bool:
