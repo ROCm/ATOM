@@ -498,9 +498,7 @@ class MLAAttention(nn.Module):
                     paged_kv_indices,
                     kv_last_page_lens,
                     max_q_len,
-                    self.scale,
-                    0.0,
-                    None,
+                    sm_scale=self.scale,
                     q_scale=self._q_scale,
                     kv_scale=self._k_scale,
                 )
