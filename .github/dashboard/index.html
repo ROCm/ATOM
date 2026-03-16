@@ -219,7 +219,7 @@
 <div class="container">
   <header>
     <div class="header-left">
-      <img class="header-logo" src="https://raw.githubusercontent.com/ROCm/ATOM/main/docs/assets/atom_logo.png" alt="ATOM" onerror="this.style.display='none'">
+      <img class="header-logo" src="atom_logo.png" alt="ATOM" onerror="this.style.display='none'">
       <div>
         <h1>Benchmark Dashboard</h1>
         <div class="meta"><span id="last-update"></span> · <a id="repo-link" target="_blank"></a></div>
@@ -723,43 +723,45 @@ function renderPerformanceTab() {
     return;
   }
 
-  // --- Bar Chart ---
+  // --- Bar Charts: one per model ---
   const pm = PERF_METRICS.find(m => m.key === state.perfMetric) || PERF_METRICS[0];
-  // Aggregate: group by model × ISL/OSL, pick best value per group
-  const barGroups = {};
-  for (const [key, cfg] of entries) {
-    const gKey = `${cfg.model}|${cfg.islOsl}`;
-    const val = cfg[pm.key];
-    if (val == null) continue;
-    const isBetter = pm.lower ? (val < (barGroups[gKey]?.val ?? Infinity)) : (val > (barGroups[gKey]?.val ?? -Infinity));
-    if (!barGroups[gKey] || isBetter) barGroups[gKey] = { key, cfg, val, conc: cfg.conc };
-  }
-  const barEntries = Object.values(barGroups).sort((a, b) => a.cfg.model.localeCompare(b.cfg.model) || a.cfg.islOsl.localeCompare(b.cfg.islOsl));
-  const labels = barEntries.map(e => `${e.cfg.model} ${e.cfg.islOsl}`);
-  const values = barEntries.map(e => e.val);
-  const barConcList = [...new Set(barEntries.map(e => e.conc))];
-  const bgColors = barEntries.map(e => getBarColor(e.cfg.model, e.conc, barConcList));
-  const bdColors = barEntries.map(e => regressions[e.key] ? 'rgba(240,85,69,0.8)' : getModelColor(e.cfg.model).border);
-  const bdWidths = barEntries.map(e => regressions[e.key] ? 2.5 : 1.5);
-
-  // Metric selector + legend
   const metricBtns = PERF_METRICS.map(m =>
     `<button class="sel-btn ${m.key === state.perfMetric ? 'active' : ''}" data-metric="${m.key}">${m.label}</button>`
   ).join('');
-  const barModels = [...new Set(barEntries.map(e => e.cfg.model))];
-  const legendHTML = barModels.map(m => {
-    const h = getModelHue(m);
-    return `<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px;font-size:11px;color:var(--text-secondary)"><span style="width:10px;height:10px;border-radius:2px;background:hsla(${h},50%,72%,0.6);border:1px solid hsla(${h},55%,65%,0.5);display:inline-block"></span>${m}</span>`;
-  }).join('') + (Object.keys(regressions).length ? '<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--text-secondary)"><span style="width:10px;height:10px;border-radius:2px;background:var(--bg-tertiary);border:2px solid rgba(240,85,69,0.8);display:inline-block"></span>Regression</span>' : '');
 
-  let html = `<div class="chart-card hero">
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
-      <h3 style="margin:0">${pm.label} — Model Comparison</h3>
-      <div class="model-selector" style="margin:0">${metricBtns}</div>
-    </div>
-    <div style="margin-bottom:8px">${legendHTML}</div>
-    <div class="chart-wrap"><canvas id="perf-bar"></canvas></div>
-  </div>`;
+  // Group entries by model
+  const byModel = {};
+  for (const [key, cfg] of entries) {
+    if (!byModel[cfg.model]) byModel[cfg.model] = [];
+    byModel[cfg.model].push([key, cfg]);
+  }
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:var(--gap-md)">
+    <h3 style="margin:0;font-size:13px;color:var(--text-tertiary)">${pm.label} — Model Comparison</h3>
+    <div class="model-selector" style="margin:0">${metricBtns}</div>
+  </div><div class="chart-grid">`;
+
+  let chartIdx = 0;
+  for (const [model, modelEntries] of Object.entries(byModel)) {
+    const color = getModelColor(model);
+    const concList = [...new Set(modelEntries.map(([, c]) => c.conc))];
+    const sortedEntries = modelEntries.sort((a, b) => a[1].islOsl.localeCompare(b[1].islOsl) || a[1].conc - b[1].conc);
+    const mLabels = sortedEntries.map(([, c]) => `${c.islOsl} c=${c.conc}`);
+    const mValues = sortedEntries.map(([, c]) => c[pm.key] || 0);
+    const mBgColors = sortedEntries.map(([, c]) => getBarColor(model, c.conc, concList));
+    const mBdColors = sortedEntries.map(([k]) => regressions[k] ? 'rgba(240,85,69,0.8)' : color.border);
+    const mBdWidths = sortedEntries.map(([k]) => regressions[k] ? 2.5 : 1.5);
+    const avgVal = mValues.length ? mValues.reduce((a, b) => a + b, 0) / mValues.length : null;
+
+    html += `<div class="chart-card${Object.keys(byModel).length <= 2 ? ' hero' : ''}">
+      <h3 style="color:${color.text}">${model}</h3>
+      <div class="chart-wrap"><canvas id="perf-bar-${chartIdx}"></canvas></div>
+    </div>`;
+    // Store data for chart creation after innerHTML
+    byModel[model]._chartData = { id: `perf-bar-${chartIdx}`, labels: mLabels, values: mValues, bgColors: mBgColors, bdColors: mBdColors, bdWidths: mBdWidths, avgVal, sortedEntries };
+    chartIdx++;
+  }
+  html += '</div>';
 
   // --- Table ---
   html += `<div style="overflow-x:auto"><table class="perf-table"><thead><tr>
@@ -809,38 +811,37 @@ function renderPerformanceTab() {
 
   container.innerHTML = html;
 
-  // Create bar chart
-  const ctx = document.getElementById('perf-bar');
-  const avgVal = values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
-  new Chart(ctx, {
-    type: 'bar',
-    data: { labels, datasets: [{ data: values, backgroundColor: bgColors, borderColor: bdColors, borderWidth: bdWidths, borderRadius: 4 }] },
-    plugins: [avgLinePlugin(avgVal, 'avg ' + fmtCompact(avgVal, pm.key === 'TPOT' ? 2 : 0))],
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      layout: { padding: { top: 24 } },
-      plugins: {
-        legend: { display: false },
-        tooltip: { ...chartTooltipOpts(), callbacks: {
-          title: (items) => labels[items[0].dataIndex],
-          label: (item) => {
-            const e = barEntries[item.dataIndex];
-            return ` ${fmtNum(item.raw, pm.key === 'TPOT' ? 2 : 1)} ${pm.unit} (best at c=${e.conc})`;
-          }
-        }},
-        datalabels: { display: values.length <= 16, color: '#9ea0b2', anchor: 'end', align: 'top', clip: false, font: { size: 10, family: '"SF Mono", monospace' }, formatter: v => fmtCompact(v, pm.key === 'TPOT' ? 2 : 0) }
-      },
-      scales: {
-        x: { grid: { display: false }, ticks: { color: '#8a8da0', maxRotation: 45, font: { size: 10 }, callback: function(val) { const l = this.getLabelForValue(val); return l.length > 28 ? l.slice(0, 26) + '…' : l; } } },
-        y: { grid: chartGridOpts(), title: { display: true, text: pm.label + ' (' + pm.unit + ')', color: '#8a8da0' }, ticks: { color: '#8a8da0' }, grace: '5%' }
-      },
-      onClick: (_e, elems) => {
-        if (!elems.length) return;
-        const e = barEntries[elems[0].index];
-        if (e) showPopover(e.key, e.cfg);
+  // Create bar charts (one per model)
+  for (const [model, modelEntries] of Object.entries(byModel)) {
+    const cd = modelEntries._chartData;
+    if (!cd) continue;
+    new Chart(document.getElementById(cd.id), {
+      type: 'bar',
+      data: { labels: cd.labels, datasets: [{ data: cd.values, backgroundColor: cd.bgColors, borderColor: cd.bdColors, borderWidth: cd.bdWidths, borderRadius: 4 }] },
+      plugins: [avgLinePlugin(cd.avgVal, 'avg ' + fmtCompact(cd.avgVal, pm.key === 'TPOT' ? 2 : 0))],
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        layout: { padding: { top: 24 } },
+        plugins: {
+          legend: { display: false },
+          tooltip: { ...chartTooltipOpts(), callbacks: {
+            title: (items) => cd.labels[items[0].dataIndex],
+            label: (item) => ` ${fmtNum(item.raw, pm.key === 'TPOT' ? 2 : 1)} ${pm.unit}`
+          }},
+          datalabels: { display: cd.values.length <= 16, color: '#9ea0b2', anchor: 'end', align: 'top', clip: false, font: { size: 10, family: '"SF Mono", monospace' }, formatter: v => fmtCompact(v, pm.key === 'TPOT' ? 2 : 0) }
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { color: '#8a8da0', maxRotation: 45, font: { size: 10 } } },
+          y: { grid: chartGridOpts(), title: { display: true, text: pm.unit, color: '#8a8da0' }, ticks: { color: '#8a8da0' }, grace: '5%' }
+        },
+        onClick: (_e, elems) => {
+          if (!elems.length) return;
+          const [key, cfg] = cd.sortedEntries[elems[0].index];
+          if (key) showPopover(key, cfg);
+        }
       }
-    }
-  });
+    });
+  }
 
   // Table row expand — detail rows stop propagation so clicks inside don't collapse
   container.querySelectorAll('tr.detail-row').forEach(dr => {
@@ -943,15 +944,18 @@ function renderTradeoffTab() {
   html += '</div>';
   container.innerHTML = html;
 
-  // Hero scatter
+  // Hero scatter — sort points by x so connecting lines don't zigzag
   const heroDS = [];
   for (const [sKey, s] of Object.entries(seriesMap)) {
     if (s.points.length === 0) continue;
+    // Sort all parallel arrays by x value
+    const indices = s.points.map((_, i) => i).sort((a, b) => s.points[a].x - s.points[b].x);
+    const sorted = { points: indices.map(i => s.points[i]), concLabels: indices.map(i => s.concLabels[i]), configKeys: indices.map(i => s.configKeys[i]) };
     const color = getModelColor(s.model);
     heroDS.push({
-      label: sKey, data: s.points, borderColor: color.border, backgroundColor: color.bg,
+      label: sKey, data: sorted.points, borderColor: color.border, backgroundColor: color.bg,
       borderWidth: 2, pointRadius: 5, pointHoverRadius: 7, showLine: true, fill: false,
-      _concLabels: s.concLabels, _configKeys: s.configKeys
+      _concLabels: sorted.concLabels, _configKeys: sorted.configKeys
     });
   }
   if (heroDS.length) {
@@ -1006,8 +1010,10 @@ function buildSimpleScatter(canvasId, configs, xMetric, yMetric, xLabel, yLabel)
   const datasets = [];
   for (const [sKey, s] of Object.entries(seriesMap)) {
     if (!s.points.length) continue;
+    // Sort by x so lines don't zigzag
+    const indices = s.points.map((_, i) => i).sort((a, b) => s.points[a].x - s.points[b].x);
     const color = getModelColor(s.model);
-    datasets.push({ label: sKey, data: s.points, borderColor: color.border, backgroundColor: color.bg, borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, showLine: true, fill: false, _concLabels: s.concLabels, _configKeys: s.configKeys });
+    datasets.push({ label: sKey, data: indices.map(i => s.points[i]), borderColor: color.border, backgroundColor: color.bg, borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, showLine: true, fill: false, _concLabels: indices.map(i => s.concLabels[i]), _configKeys: indices.map(i => s.configKeys[i]) });
   }
   if (!datasets.length) return;
   new Chart(document.getElementById(canvasId), {

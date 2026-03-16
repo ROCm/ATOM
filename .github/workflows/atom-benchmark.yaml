@@ -385,12 +385,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           CURRENT_SHA=$(git rev-parse HEAD)
-          # Save dashboard template before switching branches
+          # Save dashboard assets before switching branches
           cp .github/dashboard/index.html /tmp/dashboard_index.html
+          cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
           git fetch origin gh-pages
           git checkout gh-pages
-          # Replace auto-generated index.html with custom dashboard
+          # Replace auto-generated index.html with custom dashboard + logo
           cp /tmp/dashboard_index.html benchmark-dashboard/index.html
+          cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
           git add benchmark-dashboard/
           git diff --cached --quiet || git commit -m "Update benchmark data and dashboard"
           git push origin gh-pages
