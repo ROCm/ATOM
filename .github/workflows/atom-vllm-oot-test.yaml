@@ -181,7 +181,7 @@ jobs:
         if: success()
         run: |
           model_dir="/models/${{ matrix.model_path }}"
-          if docker exec "$CONTAINER_NAME" bash -lc "[ -f \"$model_dir/config.json\" ]"; then
+          if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"$model_dir\" ] && [ -f \"$model_dir/config.json\" ]"; then
             echo "Model already exists under ${model_dir}; skip download"
           else
             echo "Model not found under ${model_dir}; downloading model"
@@ -189,6 +189,17 @@ jobs:
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
+          fi
+
+      - name: Resolve OOT model path
+        if: success()
+        run: |
+          if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"/models/${{ matrix.model_path }}\" ] && [ -f \"/models/${{ matrix.model_path }}/config.json\" ]"; then
+            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using pre-downloaded model path: /models/${{ matrix.model_path }}"
+          else
+            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using model id: ${{ matrix.model_path }}"
           fi
 
       - name: Run OOT launch and gsm8k accuracy via script (ci mode)
@@ -203,7 +214,7 @@ jobs:
         run: |
           docker exec \
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
-            -e OOT_MODEL_PATH="${OOT_MODEL_PATH}" \
+            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \

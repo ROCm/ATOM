@@ -81,7 +81,9 @@ fi
 
 resolve_model_path() {
   local model_path="$1"
-  if [[ -f "/models/${model_path}/config.json" ]]; then
+  if [[ "${model_path}" = /* ]]; then
+    echo "${model_path}"
+  elif [[ -f "/models/${model_path}/config.json" ]]; then
     echo "/models/${model_path}"
   else
     echo "${model_path}"
