@@ -132,20 +132,21 @@ jobs:
 
       - name: Prepare model cache mount
         run: |
-          if [ -d "/models" ]; then
-            MODEL_CACHE_MOUNT="-v /models:/models"
+          model_path="${{ matrix.model_path }}"
+          if [ -d "/models/${model_path}" ] && [ -f "/models/${model_path}/config.json" ]; then
+            MODEL_CACHE_HOST_ROOT="/models"
             MODEL_CACHE_DESC="/models (pre-provisioned host path)"
-          elif [ -d "/data" ]; then
-            mkdir -p /data/models
-            MODEL_CACHE_MOUNT="-v /data/models:/models"
-            MODEL_CACHE_DESC="/data/models (persistent host path)"
+          elif [ -d "/data/models/${model_path}" ] && [ -f "/data/models/${model_path}/config.json" ]; then
+            MODEL_CACHE_HOST_ROOT="/data/models"
+            MODEL_CACHE_DESC="/data/models (pre-provisioned host path)"
           else
-            MODEL_CACHE_VOLUME="atom_oot_model_cache"
-            docker volume create "${MODEL_CACHE_VOLUME}" >/dev/null
-            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_VOLUME}:/models"
-            MODEL_CACHE_DESC="docker volume ${MODEL_CACHE_VOLUME}"
+            mkdir -p "/models/${model_path}"
+            MODEL_CACHE_HOST_ROOT="/models"
+            MODEL_CACHE_DESC="/models (download target)"
           fi
+          MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_HOST_ROOT}:/models"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "Model cache host root: ${MODEL_CACHE_HOST_ROOT}"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
