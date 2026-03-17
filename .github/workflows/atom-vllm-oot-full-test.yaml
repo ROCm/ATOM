@@ -193,20 +193,39 @@ jobs:
       - name: Prepare model cache mount
         run: |
           model_path="${{ matrix.model_path }}"
+          MODEL_CACHE_HOST_ROOT=""
+          MODEL_CACHE_MOUNT=""
+          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
+
           if [ -d "/models/${model_path}" ] && [ -f "/models/${model_path}/config.json" ]; then
             MODEL_CACHE_HOST_ROOT="/models"
             MODEL_CACHE_DESC="/models (pre-provisioned host path)"
           elif [ -d "/data/models/${model_path}" ] && [ -f "/data/models/${model_path}/config.json" ]; then
             MODEL_CACHE_HOST_ROOT="/data/models"
             MODEL_CACHE_DESC="/data/models (pre-provisioned host path)"
-          else
-            mkdir -p "/models/${model_path}"
+          elif [ -d "/models" ] && [ -w "/models" ]; then
             MODEL_CACHE_HOST_ROOT="/models"
-            MODEL_CACHE_DESC="/models (download target)"
+            MODEL_CACHE_DESC="/models (writable host path)"
+          elif [ -d "/data/models" ] && [ -w "/data/models" ]; then
+            MODEL_CACHE_HOST_ROOT="/data/models"
+            MODEL_CACHE_DESC="/data/models (writable host path)"
           fi
-          MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_HOST_ROOT}:/models"
+
+          if [ -n "${MODEL_CACHE_HOST_ROOT}" ]; then
+            if mkdir -p "${MODEL_CACHE_HOST_ROOT}/${model_path}"; then
+              MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_HOST_ROOT}:/models"
+              echo "Model cache host root: ${MODEL_CACHE_HOST_ROOT}"
+            else
+              MODEL_CACHE_HOST_ROOT=""
+              MODEL_CACHE_DESC="container-local /models (no writable host cache mount)"
+            fi
+          fi
+
+          if [ -z "${MODEL_CACHE_MOUNT}" ]; then
+            echo "No writable host model cache found; using container-local /models."
+          fi
+
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
-          echo "Model cache host root: ${MODEL_CACHE_HOST_ROOT}"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
@@ -227,7 +246,7 @@ jobs:
           fi
 
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
-          echo "Mounting model cache: ${MODEL_CACHE_DESC} -> /models"
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
           cat > /tmp/oot_env_file.txt << 'EOF'
           ${{ matrix.env_vars }}
