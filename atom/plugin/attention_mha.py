@@ -557,6 +557,8 @@ class PagedAttentionImplPluginModeMethods:
         # usually it is created when cuda graph capture for decode phase
         if self.kv_cache_dtype == "fp8":
             if self.k_scale is None or self.v_scale is None:
+                # origin kv_scale is 1 in attention layer.
+                self.one_scale = self.kv_scale
                 self.kv_scale = torch.zeros(
                     2,
                     num_blocks,
@@ -568,7 +570,6 @@ class PagedAttentionImplPluginModeMethods:
             # update the layer kv scale tensor
             self.k_scale = self.kv_scale[0]
             self.v_scale = self.kv_scale[1]
-            self.one_scale = torch.ones((1,), dtype=torch.float32, device=self.device)
             layer.k_scale = self.k_scale
             layer.v_scale = self.v_scale
 
