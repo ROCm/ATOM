@@ -1,0 +1,42 @@
+[
+  {
+    "display": "DeepSeek-R1-0528",
+    "path": "deepseek-ai/DeepSeek-R1-0528",
+    "prefix": "deepseek-r1-0528",
+    "args": "--kv_cache_dtype fp8 -tp 8",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "DeepSeek-R1-0528 MTP3",
+    "path": "deepseek-ai/DeepSeek-R1-0528",
+    "prefix": "deepseek-r1-0528",
+    "args": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",
+    "bench_args": "--use-chat-template",
+    "suffix": "-mtp3",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "GLM-5-FP8",
+    "path": "zai-org/GLM-5-FP8",
+    "prefix": "glm-5-fp8",
+    "args": "--kv_cache_dtype fp8 -tp 8",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "gpt-oss-120b",
+    "path": "openai/gpt-oss-120b",
+    "prefix": "gpt-oss-120b",
+    "args": "--kv_cache_dtype fp8",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  }
+]

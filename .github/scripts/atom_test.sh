@@ -9,9 +9,12 @@ EXTRA_ARGS=("${@:3}")
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
+  # Clear stale compile cache to avoid NameError from outdated generated code
+  echo "Clearing compile cache..."
+  rm -rf ~/.cache/atom/*
   PROFILER_ARGS=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
-    PROFILER_ARGS="--torch-profiler-dir /app/trace"
+    PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"
     echo "Torch profiler enabled, trace output: /app/trace"
   fi
   ATOM_SERVER_LOG="/tmp/atom_server.log"
@@ -98,9 +101,55 @@ if [ "$TYPE" == "accuracy" ]; then
   chmod -R 777 accuracy_test_results
 fi
 
+if [ "$TYPE" == "stop" ]; then
+  echo ""
+  echo "========== Stopping ATOM server =========="
+
+  # Wait for trace files to finish writing (before killing the server process)
+  TRACE_DIR="${TORCH_PROFILER_DIR:-/app/trace}"
+  if [ -d "$TRACE_DIR" ]; then
+    echo "Waiting for trace files to finish writing..."
+    for i in $(seq 1 120); do
+      TMP_COUNT=$(find "$TRACE_DIR" -name '*.tmp' 2>/dev/null | wc -l)
+      if [ "$TMP_COUNT" -eq 0 ]; then
+        echo "Trace files ready after ${i}s"
+        break
+      fi
+      [ "$i" -eq 120 ] && echo "WARNING: trace .tmp files still present after 120s"
+      sleep 1
+    done
+  fi
+
+  # Kill server processes
+  pkill -f 'atom.entrypoints' || true
+  sleep 2
+  pkill -9 -f 'multiprocessing.spawn' || true
+  pkill -9 -f 'multiprocessing.resource_tracker' || true
+
+  # Wait for GPU memory to release
+  echo "Waiting for GPU memory to release..."
+  for i in $(seq 1 60); do
+    USED_GPUS=$(rocm-smi --showmemuse 2>/dev/null | grep "VRAM%" | awk '{print $NF}' | awk '$1 > 0' | wc -l 2>/dev/null || echo "0")
+    if [ "$USED_GPUS" -eq 0 ]; then
+      echo "GPU memory released after ${i}s"
+      break
+    fi
+    if [ "$i" -eq 60 ]; then
+      echo "WARNING: GPU memory still in use after 60s, force killing GPU processes"
+      rocm-smi --showpidgpus 2>&1 | grep -oP 'PID \K\d+' | while read pid; do
+        kill -9 "$pid" 2>/dev/null || true
+      done
+      sleep 5
+    fi
+    sleep 1
+  done
+  echo "Server stopped."
+fi
+
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
   echo "========== Running benchmark test =========="
+  RESULT_FILENAME=${RESULT_FILENAME:-benchmark_result}
   PROFILE_ARG=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
     PROFILE_ARG="--profile"
@@ -111,7 +160,7 @@ if [ "$TYPE" == "benchmark" ]; then
     --dataset-name=random \
     --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
     --max-concurrency=$CONC \
-    --num-prompts=$(( $CONC * 10 )) \
+    --num-prompts=${NUM_PROMPTS_OVERRIDE:-$(( $CONC * 10 ))} \
     --trust-remote-code \
     --num-warmups=1 \
     --request-rate=inf --ignore-eos \

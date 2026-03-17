@@ -83,47 +83,28 @@ jobs:
         run: |
           echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
+  load-models:
+    name: Load model configs
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.load.outputs.models_json }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: load
+        run: echo "models_json=$(jq -c . .github/benchmark/models.json)" >> $GITHUB_OUTPUT
+
   benchmark:
     name: ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
-    needs: [parse-param-lists]
-    if: always() && needs.parse-param-lists.result == 'success'
+    needs: [parse-param-lists, load-models]
+    if: >-
+      always()
+      && needs.parse-param-lists.result == 'success'
+      && needs.load-models.result == 'success'
     strategy:
       fail-fast: false
       matrix:
         config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
-        model:
-          - display: "DeepSeek-R1-0528"
-            path: "deepseek-ai/DeepSeek-R1-0528"
-            prefix: "deepseek-r1-0528"
-            args: "--kv_cache_dtype fp8 -tp 8"
-            bench_args: ""
-            suffix: ""
-            runner: "atom-mi355-8gpu.predownload"
-            env_vars: ""
-          - display: "DeepSeek-R1-0528 MTP3"
-            path: "deepseek-ai/DeepSeek-R1-0528"
-            prefix: "deepseek-r1-0528"
-            args: "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3"
-            bench_args: "--use-chat-template"
-            suffix: "-mtp3"
-            runner: "atom-mi355-8gpu.predownload"
-            env_vars: ""
-          - display: "GLM-5-FP8"
-            path: "zai-org/GLM-5-FP8"
-            prefix: "glm-5-fp8"
-            args: "--kv_cache_dtype fp8 -tp 8"
-            bench_args: ""
-            suffix: ""
-            runner: "atom-mi355-8gpu.predownload"
-            env_vars: ""
-          - display: "gpt-oss-120b"
-            path: "openai/gpt-oss-120b"
-            prefix: "gpt-oss-120b"
-            args: "--kv_cache_dtype fp8"
-            bench_args: ""
-            suffix: ""
-            runner: "atom-mi355-8gpu.predownload"
-            env_vars: ""
+        model: ${{ fromJson(needs.load-models.outputs.models_json) }}
         exclude:
           # Skip low-concurrency MTP runs to limit CI time
           - model: { suffix: "-mtp3" }
@@ -150,10 +131,11 @@ jobs:
             echo "enabled=true" >> $GITHUB_OUTPUT
           else
             # Map model prefix to workflow input
+            # Note: inputs are boolean; "|| 'true'" would swallow explicit false
             case "${{ matrix.model.prefix }}" in
-              deepseek-r1-0528) echo "enabled=${{ inputs.deepseek-r1-0528 || 'true' }}" >> $GITHUB_OUTPUT ;;
-              glm-5-fp8) echo "enabled=${{ inputs.glm-5-fp8 || 'true' }}" >> $GITHUB_OUTPUT ;;
-              gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b || 'true' }}" >> $GITHUB_OUTPUT ;;
+              deepseek-r1-0528) echo "enabled=${{ inputs.deepseek-r1-0528 }}" >> $GITHUB_OUTPUT ;;
+              glm-5-fp8) echo "enabled=${{ inputs.glm-5-fp8 }}" >> $GITHUB_OUTPUT ;;
+              gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> $GITHUB_OUTPUT ;;
               *) echo "enabled=true" >> $GITHUB_OUTPUT ;;
             esac
           fi
@@ -403,20 +385,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           CURRENT_SHA=$(git rev-parse HEAD)
-          # Save dashboard template before switching branches
+          # Save dashboard assets before switching branches
           cp .github/dashboard/index.html /tmp/dashboard_index.html
+          cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
           git fetch origin gh-pages
           git checkout gh-pages
-          # Replace auto-generated index.html with custom dashboard
+          # Replace auto-generated index.html with custom dashboard + logo
           cp /tmp/dashboard_index.html benchmark-dashboard/index.html
+          cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
           git add benchmark-dashboard/
           git diff --cached --quiet || git commit -m "Update benchmark data and dashboard"
           git push origin gh-pages
           git checkout "$CURRENT_SHA"
 
-  regression-analysis:
+  # ---------- Regression re-run (GPU, only on regression) ----------
+  regression-rerun:
     if: always() && needs.summarize-benchmark-result.outputs.has_regression == 'true'
-    name: Regression Analysis (profiler trace collection)
+    name: Re-run regressed configs with profiler
     needs: [summarize-benchmark-result]
     runs-on: atom-mi355-8gpu.predownload
     steps:
@@ -467,182 +452,213 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Download models for regressed configs
+      - name: Prepare regression configs
+        id: prepare
         run: |
-          # Extract unique model HF paths from regression report
-          python3 -c "
-          import json, re
-          report = json.load(open('regression_report.json'))
-          # Model display names like 'DeepSeek-R1-0528' or 'DeepSeek-R1-0528-mtp3'
-          # Map back to HF paths (strip variant suffix)
-          models = set()
-          for r in report.get('regressions', []):
-              name = re.sub(r'-mtp\d*$', '', r.get('model', ''))
-              models.add(name)
-          for m in models:
-              print(m)
-          " | while read MODEL_NAME; do
-            echo "Downloading $MODEL_NAME..."
+          python3 .github/scripts/regression_rerun.py \
+            regression_report.json \
+            .github/benchmark/models.json \
+            -o /tmp/regression_configs.txt
+
+          if [ -s /tmp/regression_configs.txt ]; then
+            echo "has_configs=true" >> $GITHUB_OUTPUT
+            echo "=== Configs to profile ==="
+            cat -n /tmp/regression_configs.txt
+          else
+            echo "has_configs=false" >> $GITHUB_OUTPUT
+            echo "No regression configs generated"
+          fi
+
+      - name: Download models
+        if: steps.prepare.outputs.has_configs == 'true'
+        run: |
+          cut -d'|' -f1 /tmp/regression_configs.txt | sort -u | while read MODEL_PATH; do
+            echo "=== Downloading $MODEL_PATH ==="
             if [ -d "/models" ]; then
-              # Try common HF orgs
-              for org in deepseek-ai openai zai-org amd; do
-                docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
-                  "hf download ${org}/${MODEL_NAME} --local-dir /models/${org}/${MODEL_NAME}" 2>/dev/null && break || true
-              done
+              docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
+                "hf download $MODEL_PATH --local-dir /models/$MODEL_PATH" \
+                || echo "::warning::Failed to download $MODEL_PATH, will use HF online"
             fi
           done
 
-      - name: Re-run regressed configs with profiler
+      - name: Run configs with profiler
+        if: steps.prepare.outputs.has_configs == 'true'
         timeout-minutes: 60
         run: |
-          set -euo pipefail
+          set -uo pipefail  # no -e: allow per-config failure without aborting loop
 
-          # Pick the top 3 most regressed configs, grouped by variant (server args differ)
-          python3 -c "
-          import json, sys
-          report = json.load(open('regression_report.json'))
-          regressions = report.get('regressions', [])
-          if not regressions:
-              print('No regressions to analyze')
-              sys.exit(0)
-          regressions.sort(key=lambda r: min(
-              r['metrics'].get('output_throughput', {}).get('pct', 0),
-              -r['metrics'].get('mean_tpot_ms', {}).get('pct', 0)
-          ))
-          for r in regressions[:3]:
-              is_mtp = 'mtp' in r.get('model', '').lower()
-              print(f\"Regressed: {r['model']} {r['isl']}/{r['osl']} c={r['conc']} mtp={is_mtp}\")
-          json.dump(regressions[:3], open('regressed_configs.json', 'w'))
-          "
+          # Track current server to avoid unnecessary restarts
+          CURRENT_SERVER=""
+          FAIL_COUNT=0
+          TOTAL_COUNT=0
 
-          # Group regressed configs by model+variant and profile each group
-          python3 << 'PYEOF'
-          import json, re
-          configs = json.load(open('regressed_configs.json'))
-          # Group by base model name (strip mtp suffix) + mtp flag
-          groups = {}
-          for c in configs:
-              model = c.get('model', '')
-              is_mtp = 'mtp' in model.lower()
-              base_model = re.sub(r'-mtp\d*$', '', model)
-              key = f"{base_model}|{'mtp' if is_mtp else 'base'}"
-              if key not in groups:
-                  groups[key] = {
-                      "base_model": base_model,
-                      "server_args": "--method mtp --num-speculative-tokens 3" if is_mtp else "",
-                      "bench_args": "--use-chat-template" if is_mtp else "",
-                      "configs": []
-                  }
-              groups[key]["configs"].append(c)
-          result = list(groups.values())
-          json.dump(result, open('regression_groups.json', 'w'))
-          print(f"Groups: {len(result)}")
-          for g in result:
-              print(f"  {g['base_model']} ({len(g['configs'])} configs, server_args: {g['server_args'] or 'default'})")
-          PYEOF
+          while IFS='|' read -r MODEL_PATH SERVER_ARGS BENCH_ARGS ISL OSL CONC ENV_VARS PREFIX; do
+            TOTAL_COUNT=$((TOTAL_COUNT + 1))
+            if [ -d "/models" ]; then MODEL_DIR="/models/$MODEL_PATH"; else MODEL_DIR="$MODEL_PATH"; fi
+            SERVER_KEY="$MODEL_PATH|$SERVER_ARGS|$ENV_VARS"
+            TRACE_SUBDIR="${PREFIX}${ISL}-${OSL}-${CONC}"
 
-          # For each group: find model path, launch server, profile, stop
-          python3 -c "
-          import json
-          for g in json.load(open('regression_groups.json')):
-              bm = g['base_model']
-              sa = g['server_args']
-              ba = g['bench_args']
-              configs = ' '.join(f\"{c['isl']},{c['osl']},{c['conc']}\" for c in g['configs'])
-              print(f\"{bm}|{sa}|{ba}|{configs}\")
-          " | while IFS='|' read BASE_MODEL SERVER_ARGS BENCH_ARGS CONFIG_LIST; do
-            echo "========== Model: $BASE_MODEL  Server args: ${SERVER_ARGS:-default} =========="
-            # Find model path on runner
-            if [ -d "/models" ]; then
-              MODEL_PATH=$(find /models -maxdepth 2 -type d -name "$BASE_MODEL" | head -1)
-              [ -z "$MODEL_PATH" ] && MODEL_PATH="$BASE_MODEL"
-            else
-              MODEL_PATH="$BASE_MODEL"
+            # Launch server if model/args/env changed
+            if [ "$SERVER_KEY" != "$CURRENT_SERVER" ]; then
+              if [ -n "$CURRENT_SERVER" ]; then
+                docker exec atom-regression bash -lc \
+                  "TORCH_PROFILER_DIR=/app/trace .github/scripts/atom_test.sh stop"
+              fi
+              echo "=== Launching: $MODEL_DIR $SERVER_ARGS ==="
+              if ! docker exec atom-regression bash -lc "set -euo pipefail
+                $ENV_VARS \
+                ENABLE_TORCH_PROFILER=1 \
+                .github/scripts/atom_test.sh launch $MODEL_DIR $SERVER_ARGS"; then
+                echo "::error::Server launch failed for $MODEL_PATH, skipping remaining configs for this model"
+                CURRENT_SERVER=""
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                continue
+              fi
+              CURRENT_SERVER="$SERVER_KEY"
             fi
-            ARGS="--kv_cache_dtype fp8 -tp 8 --torch-profiler-dir /app/trace --mark-trace ${SERVER_ARGS}"
-            docker exec atom-regression bash -lc "set -euo pipefail
-              pkill -f 'atom.entrypoints' || true; sleep 3
-              .github/scripts/atom_test.sh launch $MODEL_PATH $ARGS
-            "
 
-            for cfg in $CONFIG_LIST; do
-              IFS=',' read ISL OSL CONC <<< "$cfg"
-              echo "========== Profiling ISL=$ISL OSL=$OSL CONC=$CONC =========="
-              NUM_PROMPTS=$((CONC * 2))
-              docker exec atom-regression bash -lc "
-                python -m atom.benchmarks.benchmark_serving \
-                  --model=$MODEL_PATH --backend=vllm --base-url=http://localhost:8000 \
-                  --dataset-name=random \
-                  --random-input-len=$ISL --random-output-len=$OSL \
-                  --random-range-ratio=0.8 \
-                  --max-concurrency=$CONC \
-                  --num-prompts=$NUM_PROMPTS \
-                  --trust-remote-code --num-warmups=1 \
-                  --request-rate=inf --ignore-eos \
-                  --profile $BENCH_ARGS
-              "
-            done
-          done
+            # Per-config trace directory to avoid overwrites
+            docker exec atom-regression bash -lc "
+              mkdir -p /app/trace/$TRACE_SUBDIR"
 
-          # Wait for trace gzip compression to complete
-          echo "Waiting for trace files to finish writing..."
-          for i in $(seq 1 60); do
-            TMP_COUNT=$(docker exec atom-regression bash -lc "find /app/trace -name '*.tmp' 2>/dev/null | wc -l")
-            if [ "$TMP_COUNT" -eq 0 ]; then
-              echo "Trace files ready after ${i}s"
-              break
+            # Run benchmark with profiler
+            echo "=== Profiling: $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC ==="
+            if ! docker exec atom-regression bash -lc "
+              $ENV_VARS \
+              ENABLE_TORCH_PROFILER=1 \
+              ISL=$ISL OSL=$OSL CONC=$CONC \
+              RANDOM_RANGE_RATIO=0.8 \
+              NUM_PROMPTS_OVERRIDE=$((CONC*2)) \
+              RESULT_FILENAME=regression-${PREFIX}-${ISL}-${OSL}-${CONC} \
+              BENCH_EXTRA_ARGS='$BENCH_ARGS' \
+              SERVER_ARGS='$SERVER_ARGS' \
+              .github/scripts/atom_test.sh benchmark $MODEL_DIR"; then
+              echo "::warning::Benchmark failed for $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              continue
             fi
-            sleep 1
-          done
 
-          # Stop server
-          docker exec atom-regression bash -lc "pkill -f 'atom.entrypoints' || true; sleep 5"
+            # Move trace files into per-config subdir (before next config overwrites)
+            docker exec atom-regression bash -lc "
+              for d in /app/trace/rank_*; do
+                [ -d \"\$d\" ] && mv \"\$d\" /app/trace/$TRACE_SUBDIR/ 2>/dev/null || true
+              done"
 
-      - name: Copy profiler traces from container
+          done < /tmp/regression_configs.txt
+
+          # Stop last server (includes trace wait + GPU memory release)
+          if [ -n "$CURRENT_SERVER" ]; then
+            docker exec atom-regression bash -lc \
+              "TORCH_PROFILER_DIR=/app/trace .github/scripts/atom_test.sh stop"
+          fi
+
+          echo "=== Regression re-run complete: $((TOTAL_COUNT - FAIL_COUNT))/$TOTAL_COUNT succeeded ==="
+          [ "$FAIL_COUNT" -gt 0 ] && echo "::warning::$FAIL_COUNT/$TOTAL_COUNT configs failed"
+
+      - name: Copy and upload profiler traces
         if: always()
         run: |
           docker cp atom-regression:/app/trace ./regression-traces 2>/dev/null || echo "No traces found"
           ls -lhR ./regression-traces/ 2>/dev/null || true
 
-      - name: Analyze traces with parse_trace.py + summary
-        if: always()
-        run: |
-          mkdir -p regression-analysis
-          pip install -q openpyxl 2>/dev/null || true
-          for rank_dir in regression-traces/rank_*/; do
-            rank=$(basename "$rank_dir")
-            RUN_TRACE=$(find "$rank_dir" -name "*.pt.trace.json.gz" ! -name "capture_graph_*" | sort | tail -1)
-            if [ -n "$RUN_TRACE" ]; then
-              echo "=== Analyzing $rank: $RUN_TRACE ==="
-              # Kernel breakdown XLSX
-              cd regression-analysis
-              python ../tools/parse_trace.py "../$RUN_TRACE" --layer 3 2>&1 | tee "${rank}_analysis.log" || true
-              for f in prefill_breakdown.xlsx decode_breakdown.xlsx; do
-                [ -f "$f" ] && mv "$f" "${rank}_${f}"
-              done
-              cd ..
-              # Performance summary report (only rank_0)
-              if [ "$rank" = "rank_0" ]; then
-                python tools/analyze_trace_summary.py "$RUN_TRACE" \
-                  --output regression-analysis/performance_summary.md 2>&1 || true
-                echo "=== Performance Summary ==="
-                cat regression-analysis/performance_summary.md
-              fi
-            fi
-          done
-          ls -la regression-analysis/ 2>/dev/null || true
-
-      - name: Upload regression traces and analysis
+      - name: Upload regression traces
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: regression-traces-${{ github.run_id }}
-          path: |
-            regression-traces/
-            regression-analysis/
+          path: regression-traces/
 
-      - name: Create GitHub Issue with regression report
+      - name: Clean Up
         if: always()
+        run: |
+          docker stop atom-regression || true
+          docker rm atom-regression || true
+
+  # ---------- Profiler analysis (lightweight, runs on regression OR manual profiler) ----------
+  profiler-analysis:
+    if: >-
+      always()
+      && (needs.regression-rerun.result != 'cancelled'
+          && needs.regression-rerun.result != 'skipped'
+          || inputs.enable_profiler == true)
+    name: Profiler trace analysis
+    needs: [benchmark, summarize-benchmark-result, regression-rerun]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download regression traces
+        if: needs.regression-rerun.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: regression-traces-${{ github.run_id }}
+          path: profiler-traces/
+
+      - name: Download benchmark profiler traces
+        if: needs.regression-rerun.result != 'success'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: profiler-traces-*
+          merge-multiple: true
+          path: profiler-traces/
+
+      - name: Analyze traces
+        run: |
+          mkdir -p profiler-analysis
+          pip install -q openpyxl 2>/dev/null || true
+
+          # Find all config subdirectories containing rank_* dirs
+          # Structure: profiler-traces/<config-name>/rank_0/*.gz
+          CONFIG_DIRS=$(find profiler-traces -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+          if [ -z "$CONFIG_DIRS" ]; then
+            echo "No config directories found in profiler-traces/"
+            ls -lhR profiler-traces/ 2>/dev/null || true
+            exit 0
+          fi
+
+          for config_dir in $CONFIG_DIRS; do
+            config=$(basename "$config_dir")
+            echo ""
+            echo "========== Config: $config =========="
+            mkdir -p "profiler-analysis/$config"
+
+            # Analyze rank_0 trace (representative for kernel breakdown + summary)
+            RANK0_TRACE=$(find "$config_dir/rank_0" -name "*.pt.trace.json.gz" ! -name "capture_graph_*" 2>/dev/null | sort | tail -1)
+            if [ -z "$RANK0_TRACE" ]; then
+              echo "No rank_0 trace found for $config, skipping"
+              continue
+            fi
+
+            echo "=== Analyzing: $RANK0_TRACE ==="
+            cd "profiler-analysis/$config"
+            python ../../tools/parse_trace.py "../../$RANK0_TRACE" --layer 3 2>&1 | tee analysis.log || true
+            python ../../tools/analyze_trace_summary.py "../../$RANK0_TRACE" \
+              --output performance_summary.md 2>&1 || true
+            if [ -f performance_summary.md ]; then
+              echo "=== Performance Summary ($config) ==="
+              cat performance_summary.md
+            fi
+            cd ../..
+          done
+          ls -laR profiler-analysis/ 2>/dev/null || true
+
+      - name: Upload analysis results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: profiler-analysis-${{ github.run_id }}
+          path: profiler-analysis/
+
+      - name: Download regression report
+        if: needs.summarize-benchmark-result.outputs.has_regression == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: regression-report
+        continue-on-error: true
+
+      - name: Create GitHub Issue for regression
+        if: needs.summarize-benchmark-result.outputs.has_regression == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -662,6 +678,16 @@ jobs:
               return `| ${r.model} | ${r.isl}/${r.osl} | ${r.conc} | ${throughput.current?.toFixed(1) || 'N/A'} | ${throughput.baseline?.toFixed(1) || 'N/A'} | ${throughput.pct?.toFixed(1) || 'N/A'}% | ${tpot.current?.toFixed(2) || 'N/A'} | ${tpot.baseline?.toFixed(2) || 'N/A'} | ${tpot.pct?.toFixed(1) || 'N/A'}% |`;
             }).join('\n');
 
+            let summary = 'Summary not available';
+            try {
+              const dirs = fs.readdirSync('profiler-analysis').filter(d =>
+                fs.statSync(`profiler-analysis/${d}`).isDirectory());
+              for (const d of dirs) {
+                const p = `profiler-analysis/${d}/performance_summary.md`;
+                if (fs.existsSync(p)) { summary = fs.readFileSync(p, 'utf8'); break; }
+              }
+            } catch(e) { /* ignore */ }
+
             const body = `## Performance Regression Detected
 
             **Commit:** \`${context.sha.substring(0, 8)}\`
@@ -677,10 +703,7 @@ jobs:
             ### Performance Summary
 
             \`\`\`
-            ${(() => {
-              try { return require('fs').readFileSync('regression-analysis/performance_summary.md', 'utf8'); }
-              catch(e) { return 'Summary not available'; }
-            })()}
+            ${summary}
             \`\`\`
 
             ### Profiler Traces
@@ -689,7 +712,7 @@ jobs:
             Open in [Perfetto UI](https://ui.perfetto.dev/) or Chrome \`chrome://tracing\` for analysis.
 
             ### Next Steps
-            1. Download \`regression-traces-${context.runId}\` artifact
+            1. Download \`profiler-analysis-${context.runId}\` artifact
             2. Open trace files in Perfetto UI
             3. Compare kernel durations against previous traces
             4. Identify bottleneck changes
@@ -702,9 +725,3 @@ jobs:
               body: body,
               labels: ['performance', 'regression']
             });
-
-      - name: Clean Up
-        if: always()
-        run: |
-          docker stop atom-regression || true
-          docker rm atom-regression || true
