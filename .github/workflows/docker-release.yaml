@@ -32,7 +32,7 @@ on:
         type: boolean
         default: false
       oot_base_image:
-        description: "Base ATOM image for OOT vLLM (empty means rocm/atom-dev:latest)"
+        description: "Base ATOM image for OOT vLLM (empty means the atom_release:ci image built in this job)"
         default: ""
       vllm_commit:
         description: "vLLM commit for OOT image"
@@ -86,6 +86,7 @@ jobs:
         timeout-minutes: 120
         run: |
           docker build --pull --network=host -t atom_release:ci \
+          --target atom_image \
           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
           --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
@@ -160,16 +161,14 @@ jobs:
         run: |
           if [ -n "${{ inputs.oot_base_image }}" ]; then
             OOT_BASE_IMAGE="${{ inputs.oot_base_image }}"
+            docker pull "${OOT_BASE_IMAGE}"
           else
-            OOT_BASE_IMAGE="rocm/atom-dev:latest"
+            OOT_BASE_IMAGE="atom_release:ci"
           fi
-
           echo "Using OOT base image: ${OOT_BASE_IMAGE}"
-          docker pull "${OOT_BASE_IMAGE}"
           docker build --network=host -t atom_oot_release:ci \
-            --build-arg BASE_IMAGE="${OOT_BASE_IMAGE}" \
-            --build-arg BUILD_OOT_IMAGE=true \
-            --build-arg SKIP_ATOM_NATIVE_BUILD=true \
+            --target atom_oot \
+            --build-arg OOT_BASE_IMAGE="${OOT_BASE_IMAGE}" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || env.VLLM_COMMIT }}" \
             --build-arg INSTALL_LM_EVAL=1 \

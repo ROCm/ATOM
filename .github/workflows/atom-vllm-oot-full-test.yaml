@@ -86,13 +86,12 @@ jobs:
         id: meta
         run: |
           OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-vllm-validation-${GITHUB_COMMIT_SHA}-${{ github.run_id }}"
-          # BASE_IMAGE is built in the previous step and only exists locally on this runner.
+          # OOT_BASE_IMAGE is built in the previous step and only exists locally on this runner.
           docker build --network=host \
             --no-cache \
             -t "${OOT_IMAGE_TAG}" \
-            --build-arg BASE_IMAGE="atom_oot_base:ci" \
-            --build-arg BUILD_OOT_IMAGE=true \
-            --build-arg SKIP_ATOM_NATIVE_BUILD=true \
+            --target atom_oot \
+            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || 'b31e9326a7d9394aab8c767f8ebe225c65594b60' }}" \
             --build-arg INSTALL_LM_EVAL=1 \
