@@ -46,6 +46,7 @@ def cp_mha_gather_cache_kernel(
     x,
     max_block_num,
     DEQUANT: tl.constexpr,
+    PER_TOKEN_QUANT: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     CACHE_FORMAT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -87,8 +88,15 @@ def cp_mha_gather_cache_kernel(
         k_reg = tl.load(key_cache_ptr_offset + col_offsets)
         v_reg = tl.load(value_cache_ptr_offset + col_offsets)
         if DEQUANT:
-            k_scale = tl.load(k_scale_ptr)
-            v_scale = tl.load(v_scale_ptr)
+            if not PER_TOKEN_QUANT:
+                k_scale = 1.0
+                v_scale = 1.0
+            else:
+                scale_offset = (
+                    block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
+                )
+                k_scale = tl.load(k_scale_ptr + scale_offset)
+                v_scale = tl.load(v_scale_ptr + scale_offset)
             k_dtype = k_reg.dtype
             v_dtype = v_reg.dtype
             k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
@@ -118,11 +126,15 @@ def cp_mha_gather_cache_kernel(
         k_reg = tl.load(key_cache_ptr_offset + k_reg_offset)
         v_reg = tl.load(value_cache_ptr_offset + v_reg_offset)
         if DEQUANT:
-            scale_offset = (
-                block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
-            )
-            k_scale = tl.load(k_scale_ptr + scale_offset)
-            v_scale = tl.load(v_scale_ptr + scale_offset)
+            if PER_TOKEN_QUANT:
+                k_scale = 1.0
+                v_scale = 1.0
+            else:
+                scale_offset = (
+                    block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
+                )
+                k_scale = tl.load(k_scale_ptr + scale_offset)
+                v_scale = tl.load(v_scale_ptr + scale_offset)
             k_reg = k_reg.to(tl.float32) * k_scale
             v_reg = v_reg.to(tl.float32) * v_scale
         tl.store(key_ptr_offset + col_offsets, k_reg)
@@ -143,6 +155,7 @@ def cp_mha_gather_cache(
     dequant: bool,
     kv_cache_layout: str,
     total_tokens: int,
+    per_token_quant: bool = True,
 ):
     assert kv_cache_layout in [
         "NHD",
@@ -150,6 +163,7 @@ def cp_mha_gather_cache(
     ], "kv_cache_layout only support NHD, SHUFFLE"
     if dequant:
         assert k_scales is not None and v_scales is not None
+
     head_dim = key.shape[2]
     x = 16 // key_cache.element_size()
     # For k cache layout: [num_blocks, num_heads, page_size, head_dim]
@@ -177,6 +191,7 @@ def cp_mha_gather_cache(
         x,
         block_tables.size(1),
         DEQUANT=dequant,
+        PER_TOKEN_QUANT=per_token_quant,
         PAGE_SIZE=page_size,
         CACHE_FORMAT=kv_cache_layout,
         BLOCK_SIZE=head_dim,

@@ -455,6 +455,7 @@ class PagedAttentionImplPluginModeMethods:
                 dequant=self.kv_cache_dtype.startswith("fp8"),
                 kv_cache_layout="SHUFFLE",
                 total_tokens=total_token_per_batch[chunk_idx],
+                per_token_quant=self.per_token_quant,
             )
 
             suf_out, suf_lse = aiter.flash_attn_varlen_func(
@@ -557,8 +558,6 @@ class PagedAttentionImplPluginModeMethods:
         # usually it is created when cuda graph capture for decode phase
         if self.kv_cache_dtype == "fp8":
             if self.k_scale is None or self.v_scale is None:
-                # origin kv_scale is 1 in attention layer.
-                self.one_scale = self.kv_scale
                 self.kv_scale = torch.zeros(
                     2,
                     num_blocks,
