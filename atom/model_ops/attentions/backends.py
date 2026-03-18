@@ -201,6 +201,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var["slot_mapping"].np[:sum_scheduled_tokens] = -1
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
         var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
+        var["cu_seqlens_k"].np[: bs + 1] = cu_seqlens_k
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
         var["context_lens"].np[:bs] = batch.context_lens[:bs]
         min_seqlen_q = 0

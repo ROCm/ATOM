@@ -94,7 +94,7 @@ class BlockManager:
                 cache_miss = True
             if cache_miss:
                 needed_free += 1
-        return len(self.free_block_ids_set) >= needed_free
+        return len(self.free_block_ids_set) >= needed_free + seq.num_mamba_blocks
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
