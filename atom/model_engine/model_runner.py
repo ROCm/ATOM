@@ -774,7 +774,9 @@ class ModelRunner:
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
-        num_tokens_original = 1
+        # num_tokens_original = 1
+        mtp_factor = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
+        num_tokens_original = mtp_factor
 
         seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
         seq.status = SequenceStatus.RUNNING
