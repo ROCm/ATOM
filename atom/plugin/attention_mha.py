@@ -135,7 +135,7 @@ class PagedAttentionImplPluginModeMethods:
             )
         elif use_triton_attn and self.rotary_emb is not None:
 
-            k_scale = v_scale = self.one_scale
+            k_scale = v_scale = self.per_tensor_scale
             self.per_token_quant = False
             qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
             q, k, v = qkv.split(
@@ -351,6 +351,7 @@ class PagedAttentionImplPluginModeMethods:
             dequant=self.kv_cache_dtype.startswith("fp8"),
             kv_cache_layout="NHD",
             total_tokens=swa_total_tokens,
+            per_token_quant=self.per_token_quant,
         )
 
         sliding_window = (
@@ -559,6 +560,8 @@ class PagedAttentionImplPluginModeMethods:
         # usually it is created when cuda graph capture for decode phase
         if self.kv_cache_dtype == "fp8":
             if self.k_scale is None or self.v_scale is None:
+                # origin kv_scale is per tensor scale of value one.
+                self.per_tensor_scale = self.kv_scale
                 self.kv_scale = torch.zeros(
                     2,
                     num_blocks,

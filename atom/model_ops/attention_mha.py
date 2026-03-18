@@ -60,12 +60,12 @@ class PagedAttentionImpl(nn.Module):
         self.k_scale = self.v_scale = None
         self.device = "cuda:" + str(torch.cuda.current_device())
         self.layer_num = layer_num
-        self.one_scale_float = (
+        self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
             if self.kv_cache_dtype == "fp8"
             else 1.0
         )
-        self.one_scale = torch.tensor(self.one_scale_float, dtype=torch.float32)
+        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -158,7 +158,7 @@ class PagedAttentionImpl(nn.Module):
             )
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
-            k_scale = v_scale = self.one_scale
+            k_scale = v_scale = self.kv_scale
 
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
@@ -421,8 +421,8 @@ class PagedAttentionImpl(nn.Module):
             block_table=block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.one_scale.expand(descale_shape),
-            v_descale=self.one_scale.expand(descale_shape),
+            k_descale=self.kv_scale.expand(descale_shape),
+            v_descale=self.kv_scale.expand(descale_shape),
             sinks=self.sinks,
         )
 

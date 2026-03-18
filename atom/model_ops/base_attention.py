@@ -88,15 +88,16 @@ def cp_mha_gather_cache_kernel(
         k_reg = tl.load(key_cache_ptr_offset + col_offsets)
         v_reg = tl.load(value_cache_ptr_offset + col_offsets)
         if DEQUANT:
-            if not PER_TOKEN_QUANT:
-                k_scale = 1.0
-                v_scale = 1.0
-            else:
+            if PER_TOKEN_QUANT:
                 scale_offset = (
                     block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
                 )
                 k_scale = tl.load(k_scale_ptr + scale_offset)
                 v_scale = tl.load(v_scale_ptr + scale_offset)
+            else:
+                # per-tensor: one scale per ptr, no offset
+                k_scale = tl.load(k_scale_ptr)
+                v_scale = tl.load(v_scale_ptr)
             k_dtype = k_reg.dtype
             v_dtype = v_reg.dtype
             k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
@@ -127,14 +128,15 @@ def cp_mha_gather_cache_kernel(
         v_reg = tl.load(value_cache_ptr_offset + v_reg_offset)
         if DEQUANT:
             if PER_TOKEN_QUANT:
-                k_scale = 1.0
-                v_scale = 1.0
-            else:
                 scale_offset = (
                     block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
                 )
                 k_scale = tl.load(k_scale_ptr + scale_offset)
                 v_scale = tl.load(v_scale_ptr + scale_offset)
+            else:
+                # per-tensor: one scale per ptr, no offset
+                k_scale = tl.load(k_scale_ptr)
+                v_scale = tl.load(v_scale_ptr)
             k_reg = k_reg.to(tl.float32) * k_scale
             v_reg = v_reg.to(tl.float32) * v_scale
         tl.store(key_ptr_offset + col_offsets, k_reg)
