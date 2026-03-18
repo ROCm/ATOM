@@ -254,23 +254,25 @@ class PagedAttentionImpl(nn.Module):
         When prefix cache hits, gather full KV (cached + new) from paged cache in
         one pass. New tokens are already written by fused_qk_rope_reshape_and_cache.
         Same flow as gather_kv_b_proj: write new first, then read cached+new together.
-        token_to_batch, seq_starts are built in prepare_prefill.
         """
         cu_seqlens_k = attn_metadata.cu_seqlens_k
         total_tokens = attn_metadata.total_kv
-        token_to_batch = attn_metadata.token_to_batch
-        seq_starts = attn_metadata.seq_starts
+        bs = attn_metadata.context_lens.shape[0]
+        token_to_batch = torch.repeat_interleave(
+            torch.arange(
+                bs, dtype=torch.int32, device=attn_metadata.context_lens.device
+            ),
+            attn_metadata.context_lens.long(),
+        )
 
         num_kv_heads = k.shape[1]
         head_dim = k.shape[2]
-        device = k.device
-        dtype = k.dtype
 
         k_full = torch.empty(
-            (total_tokens, num_kv_heads, head_dim), dtype=dtype, device=device
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
         )
         v_full = torch.empty(
-            (total_tokens, num_kv_heads, head_dim), dtype=dtype, device=device
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
         )
 
         # Convert cache for cp_mha_gather_cache
@@ -310,7 +312,7 @@ class PagedAttentionImpl(nn.Module):
             v_scales=v_scale,
             cu_seqlens_kv=cu_seqlens_k,
             token_to_batch=token_to_batch,
-            seq_starts=seq_starts,
+            seq_starts=attn_metadata.seq_starts,
             dequant=self.kv_cache_dtype.startswith("fp8"),
             kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
             total_tokens=total_tokens,

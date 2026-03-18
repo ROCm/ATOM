@@ -193,7 +193,6 @@ class AttentionMetaData:
     has_cached: bool = False
     total_kv: Optional[int] = None
     num_cached_tokens: Optional[torch.Tensor] = None
-    token_to_batch: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
 
     # only used for plugin mode to store the metadata for attn
@@ -229,13 +228,11 @@ class AttentionMetaData:
         has_cached: bool = False,
         total_kv: Optional[int] = None,
         num_cached_tokens: Optional[torch.Tensor] = None,
-        token_to_batch: Optional[torch.Tensor] = None,
         seq_starts: Optional[torch.Tensor] = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens
-        self.token_to_batch = token_to_batch
         self.seq_starts = seq_starts
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_k = cu_seqlens_k

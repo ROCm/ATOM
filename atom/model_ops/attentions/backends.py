@@ -224,27 +224,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             )
             ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         num_cached_tokens = None
-        token_to_batch = None
         if has_cached:
             num_cached_tokens = torch.tensor(
                 batch.num_cached_tokens[:bs], dtype=torch.int32, pin_memory=True
             ).cuda(non_blocking=True)
-            if self.model_runner.rank == 0:
-                logger.info(f"{has_cached=}")
-                logger.info(
-                    f"Prefill batch has {num_cached_tokens.sum().item()} cached tokens and of {sum_scheduled_tokens} total tokens"
-                )
-            # Build metadata for cp_mha_gather_cache (full sequence: cached + new)
-            # token_to_batch: [0]*len0 + [1]*len1 + ...
-            total_tokens = cu_seqlens_k[-1]
-            token_to_batch = torch.zeros(
-                total_tokens, dtype=torch.int32, device=self.device
-            )
-            for i in range(bs):
-                start = cu_seqlens_k[i]
-                end = cu_seqlens_k[i + 1]
-                token_to_batch[start:end] = i
-        total_kv = int(cu_seqlens_k[-1]) if has_cached else sum_scheduled_tokens
+            total_tokens = sum(batch.context_lens[:bs])
+        total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
             max_seqlen_q=max_seqlen_q,
@@ -254,7 +239,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             has_cached=has_cached,
             total_kv=total_kv,
             num_cached_tokens=num_cached_tokens,
-            token_to_batch=token_to_batch,
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)

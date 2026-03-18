@@ -997,6 +997,7 @@ def sparse_attn_indexer(
         )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
+        num_tokens = hidden_states.shape[0]
         logits = fp8_mqa_logits(
             Q=q_fp8[num_decode_tokens:num_tokens],
             KV=k_fp8,
