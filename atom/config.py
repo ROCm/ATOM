@@ -1012,6 +1012,7 @@ class Config:
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
+    runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
