@@ -136,6 +136,7 @@ class PagedAttentionImplPluginModeMethods:
         elif use_triton_attn and self.rotary_emb is not None:
 
             k_scale = v_scale = self.one_scale
+            self.per_token_quant = False
             qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
             q, k, v = qkv.split(
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
