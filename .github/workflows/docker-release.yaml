@@ -85,7 +85,7 @@ jobs:
       - name: Build Docker image
         timeout-minutes: 180
         run: |
-          docker build --pull --network=host -t atom_release:ci \
+          DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
           --target atom_image \
           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
