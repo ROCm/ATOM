@@ -257,7 +257,7 @@ class PagedAttentionImpl(nn.Module):
         token_to_batch, seq_starts are built in prepare_prefill.
         """
         cu_seqlens_k = attn_metadata.cu_seqlens_k
-        total_tokens = cu_seqlens_k[-1].item()
+        total_tokens = attn_metadata.total_kv
         token_to_batch = attn_metadata.token_to_batch
         seq_starts = attn_metadata.seq_starts
 

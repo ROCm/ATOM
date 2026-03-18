@@ -969,12 +969,10 @@ def sparse_attn_indexer(
             return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
-        num_tokens = hidden_states.shape[0]
+        total_seq_lens = hidden_states.shape[0]
         # When has_cached, gather full KV (cached + new) for indexer top-k
         total_kv = (
-            prefill_metadata.cu_seqlens_k[-1].item()
-            if prefill_metadata.has_cached
-            else num_tokens
+            prefill_metadata.total_kv if prefill_metadata.has_cached else total_seq_lens
         )
         k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
         k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)

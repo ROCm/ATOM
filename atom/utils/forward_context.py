@@ -191,6 +191,7 @@ class AttentionMetaData:
 
     # for prefix cache
     has_cached: bool = False
+    total_kv: Optional[int] = None
     num_cached_tokens: Optional[torch.Tensor] = None
     token_to_batch: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
@@ -226,11 +227,13 @@ class AttentionMetaData:
         token_to_seq_idxs: Optional[torch.Tensor] = None,
         plugin_metadata: Optional["MetadataForPluginMode"] = None,
         has_cached: bool = False,
+        total_kv: Optional[int] = None,
         num_cached_tokens: Optional[torch.Tensor] = None,
         token_to_batch: Optional[torch.Tensor] = None,
         seq_starts: Optional[torch.Tensor] = None,
     ):
         self.has_cached = has_cached
+        self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens
         self.token_to_batch = token_to_batch
         self.seq_starts = seq_starts

@@ -244,6 +244,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 start = cu_seqlens_k[i]
                 end = cu_seqlens_k[i + 1]
                 token_to_batch[start:end] = i
+        total_kv = int(cu_seqlens_k[-1]) if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
             max_seqlen_q=max_seqlen_q,
@@ -251,6 +252,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             min_seqlen_q=min_seqlen_q,
             dropout_p=dropout_p,
             has_cached=has_cached,
+            total_kv=total_kv,
             num_cached_tokens=num_cached_tokens,
             token_to_batch=token_to_batch,
             **ctx,
