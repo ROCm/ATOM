@@ -1140,7 +1140,10 @@ class Indexer(nn.Module):
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = ReplicatedLinear(
-            hidden_size, self.n_head, quant_config=None, prefix=f"{prefix}.weights_proj"
+            hidden_size,
+            self.n_head,
+            quant_config=quant_config,
+            prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
 
@@ -1264,7 +1267,7 @@ class DeepseekV2MLAAttention(nn.Module):
         )
         layer_quant_dtype = quant_config.get_layer_quant_config(
             f"{prefix}.{q_a_proj_name}"
-        )["quant_dtype"]
+        ).quant_dtype
         if layer_quant_dtype == dtypes.fp4x2:
             if not use_triton_gemm():
                 source_quant_dtype = None
@@ -1276,9 +1279,7 @@ class DeepseekV2MLAAttention(nn.Module):
         else:
             source_quant_dtype = None
             # Check exclude patterns (e.g. W4A8 checkpoints exclude attention)
-            if quant_config is not None and quant_config.should_ignore_layer_quant(
-                prefix
-            ):
+            if quant_config is not None and quant_config._is_excluded(prefix):
                 quant_config = None
                 base_quant_config = None
             else:
@@ -1603,7 +1604,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.quant_dtype = (
             None
             if quant_config is None
-            else quant_config.global_quant_config["quant_dtype"]
+            else quant_config.get_layer_quant_config(prefix).quant_dtype
         )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION

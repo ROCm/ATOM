@@ -111,7 +111,7 @@ class OAIAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.num_attention_heads,
             total_num_kv_heads=self.num_key_value_heads,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
             bias=True,
         )
@@ -119,7 +119,7 @@ class OAIAttention(nn.Module):
         self.o_proj = RowParallelLinear(
             input_size=self.num_attention_heads * self.head_dim,
             output_size=self.hidden_size,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             bias=True,
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
