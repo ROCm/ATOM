@@ -83,7 +83,7 @@ jobs:
           echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
 
       - name: Build Docker image
-        timeout-minutes: 120
+        timeout-minutes: 180
         run: |
           docker build --pull --network=host -t atom_release:ci \
           --target atom_image \
