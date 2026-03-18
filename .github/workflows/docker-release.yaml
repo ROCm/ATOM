@@ -25,8 +25,15 @@ on:
         default: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
       runner:
         description: "Runner label to use"
-        type: string
+        type: choice
         default: "linux-atom-mi355-1"
+        options:
+          - linux-atom-mi355-1
+          - build-only-atom
+      skip_tests:
+        description: "Skip test step"
+        type: boolean
+        default: false
       build_oot_image:
         description: "Build OOT vLLM image"
         type: boolean
@@ -99,6 +106,7 @@ jobs:
           docker inspect atom_release:ci
 
       - name: Test Docker image
+        if: ${{ inputs.skip_tests != true }}
         timeout-minutes: 60
         run: |
           echo "Clean up containers..."
