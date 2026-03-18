@@ -30,6 +30,7 @@ on:
         options:
           - linux-atom-mi355-1
           - build-only-atom
+          - atom-mi355-8gpu.predownload
       skip_tests:
         description: "Skip test step"
         type: boolean
