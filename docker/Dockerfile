@@ -181,21 +181,18 @@ COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
 RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
     rm -rf /tmp/rccl
 
-# Triton: copy installed package from build stage
-# Note: COPY overwrites /opt/venv, so we merge carefully.
-# Triton installs into site-packages; mori is already there from the COPY above.
-# We copy only the triton-specific additions to avoid clobbering mori.
-COPY --from=build_triton /opt/venv/lib/python3.12/site-packages/triton /opt/venv/lib/python3.12/site-packages/triton
-COPY --from=build_triton /opt/venv/lib/python3.12/site-packages/triton-*.dist-info /opt/venv/lib/python3.12/site-packages/
-RUN pip show triton || true
+# Triton: copy package from build stage into current venv
+# Use RUN --mount to avoid COPY glob issues, and preserve mori already in venv
+RUN --mount=from=build_triton,source=/opt/venv/lib/python3.12/site-packages,target=/triton-pkgs \
+    cp -a /triton-pkgs/triton /opt/venv/lib/python3.12/site-packages/ && \
+    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.12/site-packages/ && \
+    pip show triton
 
-# Aiter: copy compiled source tree + register editable install
+# Aiter: copy compiled source tree + re-register editable install
+# (pip install -e creates egg-link automatically, no need to COPY them)
 COPY --from=build_aiter /app/aiter-test /app/aiter-test
-COPY --from=build_aiter /opt/venv/lib/python3.12/site-packages/amd_aiter.egg-link /opt/venv/lib/python3.12/site-packages/ 2>/dev/null || true
-COPY --from=build_aiter /opt/venv/lib/python3.12/site-packages/amd-aiter.egg-link /opt/venv/lib/python3.12/site-packages/ 2>/dev/null || true
-COPY --from=build_aiter /opt/venv/lib/python3.12/site-packages/easy-install.pth /opt/venv/lib/python3.12/site-packages/ 2>/dev/null || true
-RUN cd /app/aiter-test && pip install -e . --no-build-isolation 2>/dev/null || true
-RUN pip show amd-aiter || true
+RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
+    pip show amd-aiter
 
 # ATOM: lightweight install (no compilation needed)
 RUN git clone $ATOM_REPO /app/ATOM && \
