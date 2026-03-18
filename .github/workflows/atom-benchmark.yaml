@@ -18,6 +18,10 @@ on:
         description: "Benchmark GLM-5-FP8"
         type: boolean
         default: true
+      deepseek-r1-0528-mxfp4:
+        description: "Benchmark DeepSeek-R1-0528 MXFP4-MTP3"
+        type: boolean
+        default: true
       gpt-oss-120b:
         description: "Benchmark gpt-oss-120b"
         type: boolean
@@ -134,6 +138,7 @@ jobs:
             # Note: inputs are boolean; "|| 'true'" would swallow explicit false
             case "${{ matrix.model.prefix }}" in
               deepseek-r1-0528) echo "enabled=${{ inputs.deepseek-r1-0528 }}" >> $GITHUB_OUTPUT ;;
+              deepseek-r1-0528-mxfp4) echo "enabled=${{ inputs.deepseek-r1-0528-mxfp4 }}" >> $GITHUB_OUTPUT ;;
               glm-5-fp8) echo "enabled=${{ inputs.glm-5-fp8 }}" >> $GITHUB_OUTPUT ;;
               gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> $GITHUB_OUTPUT ;;
               *) echo "enabled=true" >> $GITHUB_OUTPUT ;;
