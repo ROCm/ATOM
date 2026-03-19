@@ -181,8 +181,8 @@ class ScheduledBatch:
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
         ]
-        self.temperatures = [seq.temperature for seq in seqs.values()]
-        self.context_lens = [seq.num_tokens for seq in seqs.values()]
+        self.temperatures = np.asarray([seq.temperature for seq in seqs.values()], dtype=np.float32)
+        self.context_lens = np.asarray([seq.num_tokens for seq in seqs.values()], dtype=np.int32)
 
         # Build the flat scheduled-token array
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
