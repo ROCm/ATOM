@@ -15,7 +15,9 @@ support_model_arch_dict = {
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
+    "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
+    "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
 }
 ```
 
@@ -34,9 +36,11 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `DeepseekV3ForCausalLM` | `atom.models.deepseek_v2` | `DeepseekV2ForCausalLM` | Yes | Yes | MLA attention, LoRA-compressed QKV, FusedMoE with shared experts, FP4/FP8 fused kernels |
 | `DeepseekV32ForCausalLM` | `atom.models.deepseek_v2` | `DeepseekV2ForCausalLM` | Yes | Yes | Same as above with V3.2 index-based top-k routing |
 | `GptOssForCausalLM` | `atom.models.gpt_oss` | `GptOssForCausalLM` | Yes | No | GQA, RoPE, sliding window attention (every other layer), attention sinks, bias in QKV and MoE |
+| `GlmMoeDsaForCausalLM` | `atom.models.deepseek_v2` | `GlmMoeDsaForCausalLM` | Yes | Yes | Reuses `DeepseekV2ForCausalLM` — GLM-5 is structurally similar to DeepSeek V3.2 |
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe` | `Glm4MoeForCausalLM` | Yes | No | GQA, partial RoPE (0.5 factor), QK norm, shared+routed experts, sigmoid scoring, grouped top-k |
+| `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
 
-**Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`) is not in the registry -- it is used exclusively as a speculative draft model for DeepSeek multi-token prediction and is loaded separately.
+**Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`) and `Qwen3NextMTP` (`atom.models.qwen3_next_mtp`) are not in the registry -- they are used exclusively as speculative draft models and are loaded separately.
 
 ---
 
@@ -107,6 +111,11 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Normalization:** RMSNorm with eps=1e-5, post-attention norm uses `x_pad_to_multiple=256`.
 - **Pipeline parallelism:** Supports auxiliary hidden state layers for EAGLE3 speculative decoding (`get_eagle3_aux_hidden_state_layers`).
 
+### GLM-5 / GlmMoeDsa (`GlmMoeDsaForCausalLM`)
+
+- **Architecture:** Reuses `DeepseekV2ForCausalLM` entirely — GLM-5 is structurally similar to DeepSeek V3.2.
+- **Implementation:** Pass-through subclass with no overrides. All MLA, MoE, and fusion behaviors are inherited from `DeepseekV2ForCausalLM`.
+
 ### GLM4-MoE (`Glm4MoeForCausalLM`)
 
 - **Architecture:** MoE transformer with GQA, shared + routed experts, partial RoPE.
@@ -114,6 +123,15 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Attention:** `Glm4MoeAttention` with optional QK norm (`use_qk_norm`), partial rotary factor of 0.5.
 - **MoE:** `Glm4MoE` with sigmoid scoring, `e_score_correction_bias`, grouped top-k routing (`n_group`, `topk_group`), routed scaling factor. Shared experts handled separately or fused into `FusedMoE` via `is_rocm_aiter_fusion_shared_expert_enabled()`. Expert parallelism (EP) support built in.
 - **Inherits:** `Glm4MixtureOfExperts` mixin for MoE metadata management and expert load balancing (EPLB) support.
+
+### Qwen3-Next (`Qwen3NextForCausalLM`)
+
+- **Architecture:** Hybrid MoE transformer with two attention types: full attention (`Qwen3NextAttention`) and Gated DeltaNet linear attention (`Qwen3NextGatedDeltaNet`). Layer type is determined by `config.layer_types`.
+- **Layer structure:** `Qwen3NextDecoderLayer` containing either full attention or linear attention, plus either `Qwen3NextSparseMoeBlock` (MoE layers) or `Qwen3NextMLP` (dense layers).
+- **Attention:** Full attention layers use `QKVParallelLinear` with QK norm, RoPE, GQA. Linear attention layers use `QKVZBAParallelLinear` for fused QKVZ+BA projections with Gated DeltaNet recurrence.
+- **MoE:** `Qwen3NextSparseMoeBlock` with `FusedMoE`, shared expert fusion support.
+- **Normalization:** Uses `GemmaRMSNorm` (aliased as `Qwen3NextRMSNorm`).
+- **MTP:** Separate draft model in `atom/models/qwen3_next_mtp.py` (`Qwen3NextMTP`).
 
 ---
 
@@ -315,6 +333,8 @@ The `DeepSeekMTP` model serves as a speculative draft model:
 | `atom/models/mixtral.py` | Mixtral model: `MixtralForCausalLM`, `MixtralModel`, `MixtralDecoderLayer`, `MixtralAttention`, `MixtralMoE` |
 | `atom/models/gpt_oss.py` | GPT-OSS model: `GptOssForCausalLM`, `GptOssModel`, `TransformerBlock`, `OAIAttention`, `MLPBlock` |
 | `atom/models/glm4_moe.py` | GLM4-MoE model: `Glm4MoeForCausalLM`, `Glm4MoeModel`, `Glm4MoeDecoderLayer`, `Glm4MoeAttention`, `Glm4MoE`, `Glm4MoeMLP` |
-| `atom/models/utils.py` | Model utilities: `IntermediateTensors`, `PPMissingLayer`, `make_layers`, `maybe_prefix`, `extract_layer_index`, `should_ignore_layer`, `get_quant_config_for_layer` |
+| `atom/models/qwen3_next.py` | Qwen3-Next model: `Qwen3NextForCausalLM`, `Qwen3NextModel`, `Qwen3NextDecoderLayer`, `Qwen3NextAttention`, `Qwen3NextGatedDeltaNet`, `Qwen3NextSparseMoeBlock`, `Qwen3NextMLP` |
+| `atom/models/qwen3_next_mtp.py` | Qwen3-Next MTP draft model |
+| `atom/models/utils.py` | Model utilities: `IntermediateTensors`, `PPMissingLayer`, `make_layers`, `maybe_prefix`, `extract_layer_index` |
 | `atom/model_loader/loader.py` | Weight loading: `load_model`, `safetensors_weights_iterator`, `default_weight_loader` |
 | `atom/model_loader/weight_utils.py` | Weight utilities: `download_weights_from_hf`, `set_weight_attrs`, `filter_duplicate_safetensors_files` |

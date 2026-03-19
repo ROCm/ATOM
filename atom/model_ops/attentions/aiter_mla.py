@@ -7,10 +7,15 @@ from typing import Type
 
 import numpy as np
 import torch
-from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter import (
+    dtypes,
+    get_mla_metadata_info_v1,
+    get_mla_metadata_v1,
+    decode_update_mla_metadata_v1,
+)
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -20,6 +25,10 @@ from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
+from atom.plugin.prepare import is_plugin_mode
+from atom.plugin.attention import AiterMLAAttentionMetadataBuilderDecoratorForPluginMode
+from atom.plugin.attention import AiterBackendDecoratorForPluginMode
+
 logger = logging.getLogger("atom")
 
 
@@ -27,10 +36,11 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
+@AiterBackendDecoratorForPluginMode
 class AiterMLABackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
-        return "ROCM_AITER_MLA"
+        return "ROCM_AITER_MLA" if not is_plugin_mode() else "CUSTOM"
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLAMetadataBuilder"]:
@@ -41,19 +51,26 @@ class AiterMLABackend(AttentionBackend):
         return MLAAttention
 
 
+@AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(
+    default_base_class=CommonAttentionBuilder
+)
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
         self.block_size = 1
-        super().__init__(model_runner)
+        CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
         self.num_attention_heads = (
             hf_config.num_attention_heads // get_tp_group().world_size
         )
+        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
+        self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
+        self.dtype_q = self.dtype_kv
 
+        max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -63,10 +80,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
             self.max_bs,
-            1,
-            self.num_attention_heads,
-            torch.bfloat16,
-            dtypes.d_dtypes[config.kv_cache_dtype],
+            max_seqlen_qo,
+            self.padded_num_attention_heads,
+            self.dtype_q,
+            self.dtype_kv,
             is_sparse=self.is_sparse,
             fast_mode=True,
         )
@@ -96,7 +113,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
             "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
-                self.max_bs * self.max_num_blocks_per_seq // self.block_ratio,
+                self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             ),
             "kv_last_page_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
@@ -128,7 +145,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.model_runner.forward_vars.update(mla_metadata)
 
-    def set_mla_persistent_worker_buffers(self, bs: int, max_q_len: int):
+    def set_mla_persistent_worker_buffers(
+        self,
+        bs: int,
+        max_q_len: int,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor = None,
+    ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
@@ -143,26 +166,54 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
-        get_mla_metadata_v1(
-            var["cu_seqlens_q"].gpu[: bs + 1],
-            (
-                var["sparse_kv_indptr"].gpu[: bs + 1]
-                if self.is_sparse
-                else var["kv_indptr"].gpu[: bs + 1]
-            ),
-            var["kv_last_page_lens"].gpu[:bs],
-            self.num_attention_heads,
-            1,  # nhead_kv,
-            True,
-            work_meta_data,
-            work_info_set,
-            work_indptr,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            page_size=self.block_size,
-            **split_params,
-        )
+        if only_update:
+            decode_update_mla_metadata_v1(
+                var["cu_seqlens_q"].gpu[: bs + 1],
+                (
+                    var["sparse_kv_indptr"].gpu[: bs + 1]
+                    if self.is_sparse
+                    else var["kv_indptr"].gpu[: bs + 1]
+                ),
+                var["kv_last_page_lens"].gpu[:bs],
+                self.padded_num_attention_heads,
+                1,  # nhead_kv,
+                True,
+                work_meta_data,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                page_size=self.block_size,
+                kv_granularity=max(self.block_size, 16),
+                max_seqlen_qo=max_q_len,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
+                num_reject_tokens=num_reject_tokens,
+            )
+        else:
+            get_mla_metadata_v1(
+                var["cu_seqlens_q"].gpu[: bs + 1],
+                (
+                    var["sparse_kv_indptr"].gpu[: bs + 1]
+                    if self.is_sparse
+                    else var["kv_indptr"].gpu[: bs + 1]
+                ),
+                var["kv_last_page_lens"].gpu[:bs],
+                self.padded_num_attention_heads,
+                1,  # nhead_kv,
+                True,
+                work_meta_data,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                page_size=self.block_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
+                **split_params,
+            )
         return {
             "work_meta_data": work_meta_data,
             "work_info_set": work_info_set,
@@ -172,7 +223,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "reduce_partial_map": reduce_partial_map,
         }
 
-    def prepare_mtp_decode(self, bs: int, max_seqlen_q: int, max_seqlen_k: int):
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor = None,
+    ):
         var = self.model_runner.forward_vars
         kv_indptr = var["kv_indptr"].gpu[: bs + 1]
         if self.is_sparse:
@@ -188,10 +246,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             max_seqlen_k,
         )
-        return self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
+        return self.set_mla_persistent_worker_buffers(
+            bs, max_seqlen_q, only_update, num_reject_tokens
+        )
 
     def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = super().prepare_prefill(batch)
+        attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
@@ -249,7 +309,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
                 attn_metadata.context_lens, 0
             )
+            if attn_metadata.block_tables is None:
+                self.prepare_block_tables(batch)
+                attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+            kv_indices_generate_triton(
+                attn_metadata.block_tables,
+                attn_metadata.kv_indices,
+                attn_metadata.kv_indptr,
+                self.block_ratio,
+                attn_metadata.max_seqlen_k,
+            )
 
+        attn_metadata.dtype_q = self.dtype_q
         return attn_metadata, positions
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
@@ -262,39 +333,40 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
-        if max_seqlen_q > 1:
-            # Get num_rejected (already mapped to current batch order in prepare_input_ids)
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
-                context_lens -= num_rejected
-                num_blocks = cdiv(context_lens, self.model_runner.block_size)
-                block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
+        if not batch.is_dummy_run:
+            if max_seqlen_q > 1:
+                # Get num_rejected (already mapped to current batch order in prepare_input_ids)
+                num_rejected = self.model_runner.tokenID_processor.num_rejected
+                if num_rejected is not None:
+                    context_lens -= num_rejected
+                    num_blocks = cdiv(context_lens, self.model_runner.block_size)
+                    block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
 
-            slot_mapping = [
-                block_table[pos // self.model_runner.block_size]
-                * self.model_runner.block_size
-                + (pos % self.model_runner.block_size)
-                for block_table, seq_len in zip(block_tables, context_lens)
-                for pos in range(seq_len - max_seqlen_q, seq_len)
-            ]
-        else:
-            slot_mapping = [
-                block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                for block_table, last_block_num in zip(
-                    block_tables, batch.last_block_num_tokens
-                )
-            ]
+                slot_mapping = [
+                    block_table[pos // self.model_runner.block_size]
+                    * self.model_runner.block_size
+                    + (pos % self.model_runner.block_size)
+                    for block_table, seq_len in zip(block_tables, context_lens)
+                    for pos in range(seq_len - max_seqlen_q, seq_len)
+                ]
+            else:
+                slot_mapping = [
+                    block_table[-1] * self.model_runner.block_size + last_block_num - 1
+                    for block_table, last_block_num in zip(
+                        block_tables, batch.last_block_num_tokens
+                    )
+                ]
         positions = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
 
-        sum_scheduled_tokens = batch.total_tokens_num_decode
+        # Use scheduled_bs since in dummy run, total_seqs_num_decode is 1.
+        sum_scheduled_tokens = scheduled_bs * max_seqlen_q
         var["slot_mapping"].np[: bs * max_seqlen_q] = -1
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
-        # var["context_lens"].np[scheduled_bs:bs] = 0
 
         self.prepare_block_tables(batch)
 
@@ -316,16 +388,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1]
 
-        # def prepare_kv_indices():
-        #     dst = var["kv_indices"].np
-        #     offset = 0
-        #     for bt in block_tables:
-        #         n = len(bt)
-        #         dst[offset : offset + n] = bt
-        #         offset += n
-
         def prepare_kv_indices():
-            
             var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
                 itertools.chain.from_iterable(batch.block_tables),
                 dtype=np.int32,
@@ -345,12 +408,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ("cu_seqlens_q", bs + 1),
             ("kv_indptr", bs + 1),
             ("block_tables", bs),
-            # ("kv_indices", sum_blocks),
             ("kv_last_page_lens", bs),
         ]
         if self.is_sparse:
-            # self.prepare_block_tables(batch)
-            # vars_used.append(("block_tables", bs))
             index_topk = self.index_topk
             sparse_context_lens = np.clip(var["context_lens"].np[:bs], None, index_topk)
             var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
@@ -374,24 +434,25 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             max_seqlen_k,
         )
-        if self.block_ratio > 1:
-            if "block_tables" in ctx:
-                block_table_convert_triton(
-                    var["block_tables"].gpu[:bs],
-                    var["block_tables_converted"].gpu[:bs],
-                    var["context_lens"].gpu[:bs],
-                    self.block_ratio,
-                )
-                ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
+        # if self.block_ratio > 1:
+        #     if "block_tables" in ctx:
+        #         block_table_convert_triton(
+        #             var["block_tables"].gpu[:bs],
+        #             var["block_tables_converted"].gpu[:bs],
+        #             var["context_lens"].gpu[:bs],
+        #             self.block_ratio,
+        #         )
+        #         ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             **ctx,
         )
+        attn_metadata.dtype_q = self.dtype_q
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
-        # if str(positions.device) == "cuda:0":
+        # if self.model_runner.rank == 0:
         #     logger.info(f"context_lens: {ctx['context_lens']}")
         #     # logger.info(f"{positions=}")
         #     # for el, var in ctx.items():
@@ -412,7 +473,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_q=max_q_len,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
-            kv_indices=var["kv_indices"].gpu[:],
+            kv_indices=var["kv_indices"].gpu,
             kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],
             sparse_kv_indptr=sparse_kv_indptr,
             block_tables_converted=(
@@ -422,6 +483,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
             **ctx_mla_ps,
         )
+        attn_matadata.dtype_q = self.dtype_q
         positions = var["positions"].copy_to_gpu(bs * max_q_len)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs

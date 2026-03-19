@@ -334,7 +334,39 @@ class CoreManager:
 
         for thread in self.output_threads:
             if thread and thread.is_alive():
-                thread.join(timeout=5.0)
+                thread.join(timeout=0.5)
+
+        # Wait for EngineCore processes to exit gracefully.
+        # Use a single deadline so all processes share the grace period
+        # instead of sequential per-process timeouts.  This prevents early
+        # process exits from destroying the NCCL TCPStore while later
+        # processes' HeartbeatMonitor threads still depend on it.
+        import time
+
+        deadline = time.monotonic() + 5
+        for proc in self.engine_core_processes:
+            if proc is not None and proc.is_alive():
+                remaining = max(deadline - time.monotonic(), 0)
+                proc.join(timeout=remaining)
+
+        # Terminate any that are still alive.
+        for proc in self.engine_core_processes:
+            if proc is not None and proc.is_alive():
+                proc.terminate()
+        for proc in self.engine_core_processes:
+            if proc is not None and proc.is_alive():
+                proc.join(timeout=1)
+
+        # Final join + close to release sentinel semaphores
+        for proc in self.engine_core_processes:
+            if proc is not None:
+                if proc.is_alive():
+                    proc.kill()
+                proc.join(timeout=1)
+                try:
+                    proc.close()
+                except (ValueError, OSError):
+                    pass
 
         logger.info(f"{self.label}: All EngineCores shut down")
 

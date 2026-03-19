@@ -16,11 +16,20 @@ This document describes the environment variables used in the ATOM project.
 
 ---
 
-## Execution Mode
+## Model Loading
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_ENFORCE_EAGER** | bool | 0 (false) | If set to `1`, use eager mode instead of CUDA Graph for kernel launch. |
+| **ATOM_DISABLE_MMAP** | bool | false | If set to `true`, disable memory-mapped file loading for model weights. Useful in containerized environments where mmap may cause issues. |
+
+---
+
+## Plugin Mode
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
+| **ATOM_DISABLE_VLLM_PLUGIN_ATTENTION** | bool | 0 (false) | If set to `1`, disable only the vLLM attention plugin while keeping other plugins active. |
 
 ---
 

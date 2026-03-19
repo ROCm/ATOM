@@ -21,6 +21,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 import uvicorn
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -32,6 +33,7 @@ logger = logging.getLogger("atom")
 
 # Constants
 DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_K = -1
 DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_TOKENS = 256
 CHAT_COMPLETION_OBJECT = "chat.completion"
@@ -63,6 +65,7 @@ class ChatCompletionRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = None
     prompt: Optional[List[ChatMessage]] = None  # Accept 'prompt' as alias
     temperature: Optional[float] = DEFAULT_TEMPERATURE
+    top_k: Optional[int] = DEFAULT_TOP_K
     top_p: Optional[float] = DEFAULT_TOP_P
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     stop: Optional[List[str]] = None
@@ -86,6 +89,7 @@ class CompletionRequest(BaseModel):
     model: Optional[str] = None
     prompt: str
     temperature: Optional[float] = DEFAULT_TEMPERATURE
+    top_k: Optional[int] = DEFAULT_TOP_K
     top_p: Optional[float] = DEFAULT_TOP_P
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     stop: Optional[List[str]] = None
@@ -257,9 +261,13 @@ def _build_sampling_params(
     max_tokens: int,
     stop_strings: Optional[List[str]],
     ignore_eos: bool,
+    top_k: int = -1,
+    top_p: float = 1.0,
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
         max_tokens=max_tokens,
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
@@ -662,7 +670,10 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Server started successfully and ready to accept requests")
     yield
-    # Shutdown (if needed in the future)
+    # Shutdown: release GPU resources (called by uvicorn on graceful exit)
+    logger.info("Server shutting down, releasing resources...")
+    if engine is not None:
+        engine.close()
 
 
 app = FastAPI(title="Atom OpenAI API Server", lifespan=lifespan)
@@ -700,6 +711,8 @@ async def chat_completions(request: ChatCompletionRequest):
             max_tokens=request.max_tokens,
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
+            top_k=request.top_k,
+            top_p=request.top_p,
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -782,6 +795,8 @@ async def completions(request: CompletionRequest):
             max_tokens=request.max_tokens,
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
+            top_k=request.top_k,
+            top_p=request.top_p,
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -950,17 +965,45 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"Loading tokenizer from {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model, trust_remote_code=args.trust_remote_code
-    )
+    logger.info(f"Loading tokenizer from {args.model}...")
+    tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
     model_name = args.model
 
-    print(f"Initializing engine with model {args.model}...")
+    logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
-    engine = engine_args.create_engine()
+    engine = engine_args.create_engine(tokenizer=tokenizer)
 
-    print(f"Starting server on {args.host}:{args.server_port}...")
+    import signal
+
+    def _sigint_handler(signum, frame):
+        """Handle Ctrl+C: close engine, wait for all processes, then exit.
+
+        This complements the lifespan shutdown (which also calls engine.close()).
+        engine.close() is idempotent (guarded by CoreManager._closed), so
+        double-call from both paths is safe. The handler is needed because
+        lifespan cannot wait for grandchild processes (ModelRunners).
+        """
+        logger.info("Received SIGINT, shutting down engine...")
+        engine.close()
+        # Wait for ALL descendant processes (including grandchildren like
+        # ModelRunners) to exit, so no orphan output leaks to the terminal.
+        import psutil
+
+        try:
+            current = psutil.Process()
+            children = current.children(recursive=True)
+            psutil.wait_procs(children, timeout=2)
+            alive = [c for c in children if c.is_running()]
+            for c in alive:
+                c.kill()
+        except psutil.NoSuchProcess:
+            pass
+        logger.info("Engine shutdown complete.")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    logger.info(f"Starting server on {args.host}:{args.server_port}...")
     uvicorn.run(app, host=args.host, port=args.server_port)
 
 

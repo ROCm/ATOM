@@ -201,8 +201,7 @@ class CompilerManager:
         assert compiled_graph is not None, "Failed to compile the graph"
 
         # store the artifact in the cache
-        # if not envs.VLLM_DISABLE_COMPILE_CACHE and handle is not None:
-        if True and handle is not None:
+        if handle is not None:
             self.cache[(runtime_shape, graph_index, self.compiler.name)] = handle
             compilation_counter.num_cache_entries_updated += 1
             self.is_cache_updated = True
@@ -230,6 +229,34 @@ class CompilerManager:
                     handle,
                 )
 
+        # When mark-trace is enabled, post-processing may rewrite generated
+        # artifact sources. Force reloading from cache artifact so the current
+        # process uses the rewritten artifact immediately.
+        try:
+            from atom.utils.graph_marker import is_graph_marker_enabled
+
+            force_reload = is_graph_marker_enabled()
+        except Exception:
+            force_reload = False
+        if force_reload and handle is not None and not self.disable_cache:
+            try:
+                reloaded_graph = self.load(
+                    graph, example_inputs, graph_index, runtime_shape
+                )
+                if reloaded_graph is not None:
+                    compiled_graph = reloaded_graph
+                    logger.info(
+                        "Force reloaded compiled graph from cache artifact "
+                        "(graph_index=%s, runtime_shape=%s).",
+                        graph_index,
+                        runtime_shape,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to force reload compiled graph from cache artifact; "
+                    "falling back to in-memory compiled callable."
+                )
+
         # after compiling the last graph, record the end time
         if graph_index == num_graphs - 1:
             now = time.time()
@@ -255,6 +282,24 @@ class SplitItem:
     graph: fx.GraphModule
 
 
+# used to judge whether the node should be split or not
+def _split_judge_func(node: fx.Node) -> bool:
+    # ATOM use mark_spliting_op to mark the attn as splitting op
+    if node.op == "call_function" and (
+        hasattr(node.target, "spliting_op") and (node.target.spliting_op)
+    ):
+        return True
+
+    # When plugin mode(vLLM), the attention impl op is registered
+    # as unified_attention
+    from atom.plugin import is_vllm
+
+    if is_vllm() and "unified_attention" in node.name:
+        return True
+
+    return False
+
+
 def split_graph(
     graph: fx.GraphModule, ops: list[str]
 ) -> tuple[fx.GraphModule, list[SplitItem]]:
@@ -265,9 +310,7 @@ def split_graph(
     for node in graph.graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
-        if node.op == "call_function" and (
-            hasattr(node.target, "spliting_op") and (node.target.spliting_op)
-        ):
+        if _split_judge_func(node):
             subgraph_id += 1
             node_to_subgraph_id[node] = subgraph_id
             split_op_graphs.append(subgraph_id)
@@ -539,9 +582,9 @@ class VllmBackend:
             hash_content = []
             for filepath in forward_code_files:
                 hash_content.append(filepath)
-                if filepath == "<string>":
+                if filepath == "<string>" or filepath == "<frozen os>":
                     # This means the function was dynamically generated, with
-                    # e.g. exec(). We can't actually check these.
+                    # e.g. exec() or frozen os module. We can't actually check these.
                     continue
                 with open(filepath) as f:
                     hash_content.append(f.read())
@@ -580,7 +623,6 @@ class VllmBackend:
         os.makedirs(local_cache_dir, exist_ok=True)
         self.compilation_config.local_cache_dir = local_cache_dir
 
-        # disable_cache = envs.VLLM_DISABLE_COMPILE_CACHE
         disable_cache = False
 
         if disable_cache:

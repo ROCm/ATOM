@@ -47,7 +47,8 @@ class SpecStats:
 
     def __init__(self, mtp_k: int, log_interval: int = 1000):
         self.mtp_k = mtp_k
-        self._log_interval = log_interval
+        # Log every log_interval decode steps (in terms of draft tokens)
+        self._log_interval = log_interval * mtp_k
         self.total_draft_tokens: int = 0
         self.distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
         # Per-interval tracking
@@ -62,7 +63,7 @@ class SpecStats:
         self.distribution[num_bonus] += 1
         self._interval_distribution[num_bonus] += 1
 
-        if self.total_draft_tokens % self._log_interval < self.mtp_k:
+        if self.total_draft_tokens % self._log_interval == 0:
             self._log()
             self._reset_interval()
 
@@ -102,8 +103,13 @@ class SpecStats:
 
     def _log(self) -> None:
         ts = self.total_steps
+        if ts == 0:
+            return
         # Interval stats
         iv_steps = sum(self._interval_distribution.values())
+        if iv_steps == 0:
+            self._reset_interval()
+            return
         iv_accepted = sum(k * v for k, v in self._interval_distribution.items())
         iv_rate = (
             iv_accepted / self._interval_draft_tokens
@@ -169,6 +175,8 @@ class ScheduledBatch:
         self.mamba_block_tables = [
             seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table
         ]
+        self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
+        self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
 
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
@@ -226,18 +234,26 @@ class ScheduledBatchOutput:
 
     def __init__(
         self,
-        token_ids: dict[int, tuple[int, ...]],
-        num_rejected: np.ndarray,
-        num_bonus: np.ndarray,
+        req_ids: list[int],
+        token_ids: list[tuple[int, ...]],
+        num_rejected: Optional[np.ndarray],
+        num_bonus: Optional[np.ndarray],
         draft_token_ids: Optional[np.ndarray],
         is_deferred_out: bool = False,
     ):
-        self.is_deferred_out = is_deferred_out
-        self.req_ids = list(token_ids.keys())
+        self.req_ids = req_ids
         self.token_ids = token_ids
         self.draft_token_ids = draft_token_ids
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
+        self.is_deferred_out = is_deferred_out
+        self._req_id_to_idx: Optional[dict[int, int]] = None
+
+    def get_idx(self, req_id: int) -> Optional[int]:
+        """O(1) lookup of request index by id."""
+        if self._req_id_to_idx is None:
+            self._req_id_to_idx = {rid: i for i, rid in enumerate(self.req_ids)}
+        return self._req_id_to_idx.get(req_id)
 
 
 class Scheduler:
@@ -312,7 +328,7 @@ class Scheduler:
         num_batched_tokens = 0
         skipped_waiting_requests: deque[Sequence] = deque()
         num_scheduled_tokens: list[int] = []
-        scheduled_spec_decode_tokens: dict[int, list[int]] = {}
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
         if not self.running and not self.waiting:
             return None
@@ -363,6 +379,7 @@ class Scheduler:
                 continue
 
             num_seqs_prefill += 1
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
@@ -477,15 +494,13 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
-            if seq.id not in fwd_output.req_ids:
+            idx = fwd_output.get_idx(seq.id)
+            if idx is None:
                 continue
-            token_ids = prev_token_ids[seq.id]
+            token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if self.spec_stats:
                 self.spec_stats.update(num_new_token)
-            idx = fwd_output.req_ids.index(seq.id)
-            # TODO(deferred): deferred output path needs further validation
-            num_rejected = 0
             if is_deferred_out or self.use_spec:
                 num_rejected = fwd_output.num_rejected[idx]
                 num_bonus = fwd_output.num_bonus[idx]
@@ -496,12 +511,14 @@ class Scheduler:
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
             else:
+                num_rejected = 0
+                num_bonus = 0
                 for token_id in token_ids:
                     seq.append_token(token_id)
             new_tokens = token_ids
 
             if self.mtp_k > 0:
-                idx = fwd_output.req_ids.index(seq.id)
+                # idx already resolved above via get_idx
                 seq.spec_token_ids = draft_token_ids[idx]
 
             if seq.num_completion_tokens == 1 and seq.first_token_time == 0.0:

@@ -15,8 +15,16 @@ from torch import nn
 
 from .attention_mla import MLAModules
 
+from atom.plugin.prepare import is_plugin_mode, is_vllm
+from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
+from atom.utils.decorators import mark_trace
 
-class Attention(nn.Module):
+
+@PagedAttentionImplDecoratorForPluginMode
+class PagedAttentionImpl(nn.Module):
+    """
+    Attention paged implementation
+    """
 
     def __init__(
         self,
@@ -24,11 +32,15 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        alibi_slopes: list[float] | None,
+        sliding_window: Optional[int] = None,
         kv_cache_dtype="bf16",
+        logits_soft_cap: float | None = None,
+        attn_type=None,
+        kv_sharing_target_layer_name: int | None = None,
         layer_num=0,
         mla_modules: Optional[MLAModules] = None,
         sinks: Optional[nn.Parameter] = None,
-        sliding_window: Optional[int] = None,
         rotary_emb: Optional[torch.nn.Module] = None,
         q_norm: Optional[torch.nn.Module] = None,
         k_norm: Optional[torch.nn.Module] = None,
@@ -37,12 +49,16 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
+        # for upper framework, it uses head_size in built-in methods
+        self.head_size = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.alibi_slopes = alibi_slopes
         self.k_cache = self.v_cache = torch.tensor([])
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
+        self.device = "cuda:" + str(torch.cuda.current_device())
         self.layer_num = layer_num
         self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
@@ -50,13 +66,18 @@ class Attention(nn.Module):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
 
-    def forward(
+        # for plugin mode(vllm), the query quant is disabled for now
+        if is_vllm():
+            self.supports_quant_query_input = False
+
+    def forward_impl_server_mode(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -91,6 +112,7 @@ class Attention(nn.Module):
 
         return o
 
+    @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache_data = fwd_ctx.kv_cache_data
@@ -135,6 +157,7 @@ class Attention(nn.Module):
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
         elif use_triton_attn and self.rotary_emb is not None:
+            self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
 
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
@@ -195,6 +218,7 @@ class Attention(nn.Module):
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
+    @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -271,6 +295,7 @@ class Attention(nn.Module):
 
         return o
 
+    @mark_trace(prefix="paged_attention_asm", torch_compile=False)
     def paged_attention_asm(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -293,6 +318,7 @@ class Attention(nn.Module):
 
         return o
 
+    @mark_trace(prefix="paged_attention_persistent_asm", torch_compile=False)
     def paged_attention_persistent_asm(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -322,6 +348,7 @@ class Attention(nn.Module):
 
         return output
 
+    @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -369,13 +396,7 @@ class Attention(nn.Module):
         # value:  [num_blocks, 1, num_kv_heads, head_size]
 
         attn_metadata = fwd_ctx.attn_metadata
-        ctx = fwd_ctx.context
-
         block_tables = attn_metadata.block_tables
-        if ctx.is_prefill:
-            k_cache = k.unsqueeze(1)
-            v_cache = v.unsqueeze(1)
-            block_tables = attn_metadata.fake_block_tables
 
         o = torch.empty_like(q)
         descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
@@ -422,3 +443,39 @@ class Attention(nn.Module):
                 if atom_config.kv_cache_block_size == 1024:
                     return self.paged_attention_persistent_asm
                 return self.paged_attention_asm
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor = None,
+        attn_metadata=None,
+        position: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor] = None,
+        qkv: torch.Tensor = None,
+        output: torch.Tensor = None,
+        **kwargs,
+    ):
+        if is_plugin_mode():
+            # forward impl method are added by the decorator
+            # PagedAttentionImplDecoratorForPluginMode
+            return self.forward_impl_plugin_mode(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                position=position,
+                q_scale=q_scale,
+                qkv=qkv,
+            )
+        else:
+            # only for server mode, keep the original method
+            o = self.forward_impl_server_mode(
+                q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
+            )
+
+            return o

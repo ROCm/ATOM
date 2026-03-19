@@ -79,6 +79,9 @@ class AsyncIOProc:
         self.kv_queue: queue.Queue | None = None
 
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
+        import atexit
+
+        atexit.register(self._cleanup_shared_memory)
         init_exit_handler(self)
 
         # Start I/O threads for primary input/output
@@ -115,8 +118,20 @@ class AsyncIOProc:
         logger.debug(f"{self.label}: Shutting down runner...")
         for el in self.runners:
             el.exit()
+        # Close shared memory reader handle to prevent resource_tracker leak
+        self._cleanup_shared_memory()
         for t in self.io_threads:
             t.join(timeout=0.5)
+
+    def _cleanup_shared_memory(self):
+        """Close shared memory handles owned by this process."""
+        if hasattr(self, "rpc_broadcast_mq"):
+            mq = self.rpc_broadcast_mq
+            if hasattr(mq, "buffer") and hasattr(mq.buffer, "shared_memory"):
+                try:
+                    mq.buffer.shared_memory.close()
+                except Exception:
+                    pass
 
     def recv_input_from_socket(self, addr: str, input_queue: queue.Queue):
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -156,8 +171,7 @@ class AsyncIOProc:
                     continue
                 out = func(*args)
                 if out is not None:
-                    # Route output to the appropriate channel
-                    if func_name not in self._KV_FUNC_NAMES:
+                    if self.io_addrs[1] is not None and func_name not in self._KV_FUNC_NAMES:
                         self.io_queues[1].put_nowait(out)
                     if self.kv_queue is not None and func_name in self._KV_FUNC_NAMES:
                         self.kv_queue.put_nowait(out)
@@ -205,6 +219,10 @@ class AsyncIOProcManager:
         )
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         self.still_running = True
+        # Register atexit to clean up shared memory even if exit() doesn't complete
+        import atexit
+
+        atexit.register(self._cleanup_shared_memory)
         init_exit_handler(self)
 
         # KV output aggregation infrastructure
@@ -265,19 +283,34 @@ class AsyncIOProcManager:
         if not self.still_running:
             return
         self.still_running = False
-        # 1. Terminate all worker processes
+        self._cleanup_shared_memory()
         logger.info(f"{self.label}: shutdown all runners...")
+        for proc in self.procs:
+            if proc.is_alive():
+                proc.join(timeout=5)
         shutdown_all_processes(self.procs, allowed_seconds=1)
         self.procs = []
-        # 2. Wait for output threads to exit
-        self.output_thread.join()
+        self.output_thread.join(timeout=1)
         for thread in self.kv_output_threads:
             thread.join(timeout=0.5)
         logger.info(f"{self.label}: All runners are shutdown.")
-        # 3. Signal SystemExit to unblock call_func
         self.outputs_queue.put_nowait(SystemExit())
-        # 4. Call parent finalizer
+
         self.parent_finalizer()
+
+    def _cleanup_shared_memory(self):
+        """Clean up shared memory (creator side: close + unlink)."""
+        if hasattr(self, "rpc_broadcast_mq"):
+            mq = self.rpc_broadcast_mq
+            if hasattr(mq, "buffer") and hasattr(mq.buffer, "shared_memory"):
+                try:
+                    shm = mq.buffer.shared_memory
+                    if mq.buffer.is_creator:
+                        shm.unlink()
+                        mq.buffer.is_creator = False
+                    shm.close()
+                except Exception:
+                    pass
 
     def process_output_sockets(self, output_address: str):
         """Receive results from rank 0's primary output channel."""

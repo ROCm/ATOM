@@ -45,7 +45,11 @@ __pycache__
 # editor
 .vscode
 
+# claude local settings (personal permissions, not for repo)
+.claude/settings.local.json
+
 # debug folder
 debug
 aiter_logs
 *.log
+.claude/plan/
