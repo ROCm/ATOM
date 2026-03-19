@@ -119,7 +119,7 @@
        TABLES — Conditional Formatting
        ============================================================ */
     .perf-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .table-watermark { position: relative; }
+    .table-watermark { position: relative; overflow-x: auto; max-width: 100%; }
     .perf-table th { text-align: left; padding: 8px 10px; border-bottom: 2px solid var(--border); color: var(--text-tertiary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; position: sticky; top: var(--header-h, 52px); background: var(--bg-secondary); z-index: 10; }
     .perf-table th.num { text-align: right; }
     .perf-table td { padding: 7px 10px; border-bottom: 1px solid var(--border-light); }
@@ -335,12 +335,12 @@ Chart.register({
 Chart.defaults.plugins.legend.onHover = function(e, item, legend) {
   legend.chart._legendFocusIndex = item.datasetIndex;
   legend.chart.draw();
-  e.native.target.style.cursor = 'pointer';
+  if (e.native?.target) e.native.target.style.cursor = 'pointer';
 };
 Chart.defaults.plugins.legend.onLeave = function(e, item, legend) {
   legend.chart._legendFocusIndex = null;
   legend.chart.draw();
-  e.native.target.style.cursor = 'default';
+  if (e.native?.target) e.native.target.style.cursor = 'default';
 };
 
 // Watermark plugin: draw ATOM logo as faded background on all charts
@@ -474,7 +474,7 @@ function filteredConfigs() {
    4. UTILITY FUNCTIONS
    ================================================================ */
 // ISL/OSL compact format: "1024/1024" → "1k/1k", "8192/1024" → "8k/1k"
-function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? (+n / 1024) + 'k' : n); }
+function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+n / 1024).toPrecision(3)) + 'k' : n); }
 
 // Model family grouping: "DeepSeek-R1-0528-mtp3" → family "DeepSeek-R1-0528", variant "mtp3"
 function modelFamily(name) {
@@ -781,7 +781,9 @@ function renderActiveTab() {
 /* ================================================================
    9. PERFORMANCE TAB
    ================================================================ */
+let _perfChartRAF = null;
 function renderPerformanceTab() {
+  if (_perfChartRAF) { cancelAnimationFrame(_perfChartRAF); _perfChartRAF = null; }
   const container = document.getElementById('tab-performance');
   destroyChartsIn(container);
   const fc = filteredConfigs();
@@ -888,7 +890,11 @@ function renderPerformanceTab() {
   _bindPerfTableEvents(container, byModel);
 
   // Defer chart creation to next frame so table renders first
-  requestAnimationFrame(() => _createPerfCharts(byModel, pm));
+  _perfChartRAF = requestAnimationFrame(() => {
+    _perfChartRAF = null;
+    if (!document.getElementById(Object.values(byModel)[0]?._chartData?.id)) return;
+    _createPerfCharts(byModel, pm);
+  });
 }
 
 function _createPerfCharts(byModel, pm) {
@@ -1020,8 +1026,9 @@ function renderTradeoffTab() {
   const tradeoffFamilies = Object.keys(familyMap).sort();
 
   let html = '<div class="chart-grid">';
-  for (const fam of tradeoffFamilies) {
-    const safeId = fam.replace(/[^a-zA-Z0-9]/g, '');
+  for (let fi = 0; fi < tradeoffFamilies.length; fi++) {
+    const fam = tradeoffFamilies[fi];
+    const safeId = fi + '-' + fam.replace(/[^a-zA-Z0-9]/g, '');
     const famLabel = familyMap[fam].size > 1 ? fam + ' family' : fam;
     html += `<div class="chart-card half"><h3>${famLabel} — Interactive vs Token Throughput</h3><div class="chart-wrap"><canvas id="hero-${safeId}"></canvas></div></div>`;
     html += `<div class="chart-card half"><h3>${famLabel} — Concurrency Scaling</h3><div class="chart-wrap"><canvas id="scaling-${safeId}"></canvas></div></div>`;
@@ -1030,8 +1037,9 @@ function renderTradeoffTab() {
   container.innerHTML = html;
 
   // Per-family charts (e.g. DeepSeek base + mtp3 in same chart)
-  for (const fam of tradeoffFamilies) {
-    const safeId = fam.replace(/[^a-zA-Z0-9]/g, '');
+  for (let fi = 0; fi < tradeoffFamilies.length; fi++) {
+    const fam = tradeoffFamilies[fi];
+    const safeId = fi + '-' + fam.replace(/[^a-zA-Z0-9]/g, '');
     const famModels = [...familyMap[fam]].sort();
     const famConfigs = {};
     for (const [key, cfg] of entries) {
@@ -1187,7 +1195,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
   if (!datasets.length) return;
 
   // Concurrency values for x-axis ticks
-  const allConcs = [...new Set(Object.values(byKey).flatMap(s => s.tputPoints.map(p => p.x)))].sort((a, b) => a - b);
+  const allConcs = [...new Set(Object.values(byKey).flatMap(s => [...s.tputPoints, ...s.tpotPoints].map(p => p.x)))].sort((a, b) => a - b);
 
   new Chart(document.getElementById(canvasId), {
     type: 'scatter', data: { datasets },
