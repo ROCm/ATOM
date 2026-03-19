@@ -278,6 +278,7 @@ def _fused_rms_fp8_group_quant(
     )
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
+
 @mark_trace(prefix="rmsnorm_quant", torch_compile=True)
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
@@ -515,6 +516,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
     if k_pe_reduced_out is not None:
         k_pe = k_pe_reduced_out
     return q_c, q_c_scale, kv_c_normed, k_pe
+
 
 @mark_trace(prefix="qkv_a_proj_reduce_rmsnorm", torch_compile=True)
 @torch_compile_guard(
