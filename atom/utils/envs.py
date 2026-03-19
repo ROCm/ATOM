@@ -39,20 +39,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0"
     )
     == "1",
-    "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: os.getenv(
-        "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1"
+    # Master switch for RMSNorm + quantization fusion (all models)
+    "ATOM_ENABLE_RMSNORM_QUANT_FUSION": lambda: os.getenv(
+        "ATOM_ENABLE_RMSNORM_QUANT_FUSION", "1"
     )
     == "1",
+    # Deprecated: falls back to ATOM_ENABLE_RMSNORM_QUANT_FUSION when unset
+    "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: os.getenv(
+        "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
+        os.getenv("ATOM_ENABLE_RMSNORM_QUANT_FUSION", "1"),
+    )
+    == "1",
+    # Deprecated: falls back to ATOM_ENABLE_RMSNORM_QUANT_FUSION when unset
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: os.getenv(
-        "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1"
+        "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
+        os.getenv("ATOM_ENABLE_RMSNORM_QUANT_FUSION", "1"),
     )
     == "1",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv(
         "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1"
     )
     == "1",
+    # Deprecated: use ATOM_ENABLE_RMSNORM_QUANT_FUSION instead
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: os.getenv(
-        "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1"
+        "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
+        os.getenv("ATOM_ENABLE_RMSNORM_QUANT_FUSION", "1"),
     )
     == "1",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: os.getenv(

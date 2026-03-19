@@ -25,6 +25,12 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter import (
     QuantType,
 )
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
+
+try:
+    from aiter import dtypes as _aiter_dtypes
+except ImportError:
+    _aiter_dtypes = None
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -169,6 +175,216 @@ def mxfp4_rms_quant_fuse(
     return x_quant, x_scale, residual_out
 
 
+# ---------------------------------------------------------------------------
+# Group-quant fused RMSNorm kernels (moved from deepseek_v2.py)
+# ---------------------------------------------------------------------------
+
+
+def _fuse_rmsnorm_fp4_quant_fake(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: Optional[float] = None,
+    res1: Optional[torch.Tensor] = None,
+    shuffle: bool = True,
+    scale_shuffle_padding: bool = True,
+    output_unquantized_inp1: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n1 = x1.shape
+    n2 = x2.shape[1] if x2 is not None else 0
+
+    out1_quantized = torch.empty((m, n1 // 2), dtype=torch.uint8, device=x1.device)
+    scale_n_valid = (n1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    scale_m = ((m + 255) // 256) * 256
+    scale_n = ((scale_n_valid + 7) // 8) * 8
+    out1_bs = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=x1.device)
+
+    out2 = None
+    if x2 is not None:
+        out2 = torch.empty((m, n2), dtype=x1.dtype, device=x1.device)
+    out_res1 = None
+    if res1 is not None:
+        out_res1 = torch.empty((m, n1), dtype=x1.dtype, device=x1.device)
+    out1_unquantized = None
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
+def _fused_rms_fp8_group_quant_fake(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: Optional[float] = None,
+    res1: Optional[torch.Tensor] = None,
+    dtype_quant: "torch.dtype | None" = None,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if dtype_quant is None and _aiter_dtypes is not None:
+        dtype_quant = _aiter_dtypes.fp8
+    m, n1 = x1.shape
+    out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
+    out1_bs = torch.empty(
+        (m, (n1 + group_size - 1) // group_size), dtype=torch.float32, device=x1.device
+    )
+    if transpose_scale:
+        out1_bs = out1_bs.transpose(0, 1).contiguous().view(*out1_bs.shape)
+    out1_unquantized = None
+    if output_unquantized_inp1:
+        out1_unquantized = torch.empty_like(x1)
+    out2 = None
+    if x2 is not None:
+        _, n2 = x2.shape
+        out2 = torch.empty((m, n2), dtype=x1.dtype, device=x1.device)
+    out_res1 = None
+    if res1 is not None:
+        out_res1 = torch.empty((m, n1), dtype=x1.dtype, device=x1.device)
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
+@torch_compile_guard(gen_fake=_fuse_rmsnorm_fp4_quant_fake)
+def _fuse_rmsnorm_fp4_quant(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: Optional[float] = None,
+    res1: Optional[torch.Tensor] = None,
+    shuffle: bool = True,
+    scale_shuffle_padding: bool = True,
+    output_unquantized_inp1: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+
+    m = x1.shape[0]
+    shuffle_bool = shuffle and (m >= MXFP4_QUANT_BLOCK_SIZE)
+
+    (out1_quantized, out1_bs), _out1_unquantized, out2, out_res1 = (
+        fused_rms_mxfp4_quant(
+            x1=x1,
+            x1_weight=x1_weight,
+            x1_epsilon=x1_epsilon,
+            x2=x2,
+            x2_weight=x2_weight,
+            x2_epsilon=0.0 if x2_epsilon is None else x2_epsilon,
+            res1=res1,
+            shuffle=shuffle_bool,
+            scale_shuffle_padding=scale_shuffle_padding,
+            output_unquantized_inp1=output_unquantized_inp1,
+        )
+    )
+    out1_unquantized = None
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
+@torch_compile_guard(gen_fake=_fused_rms_fp8_group_quant_fake)
+def _fused_rms_fp8_group_quant(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: Optional[float] = None,
+    res1: Optional[torch.Tensor] = None,
+    dtype_quant: "torch.dtype | None" = None,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
+    if dtype_quant is None and _aiter_dtypes is not None:
+        dtype_quant = _aiter_dtypes.fp8
+
+    (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = (
+        fused_rms_fp8_group_quant(
+            x1,
+            x1_weight,
+            x1_epsilon,
+            x2,
+            x2_weight,
+            x2_epsilon,
+            group_size,
+            dtype_quant,
+            res1,
+            output_unquantized_inp1,
+            transpose_scale,
+        )
+    )
+    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
+def fuse_rmsnorm_group_quant(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: Optional[float] = None,
+    res1: Optional[torch.Tensor] = None,
+    dtype_quant: "torch.dtype | None" = None,
+    shuffle: bool = True,
+    scale_shuffle_padding: bool = False,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = False,
+):
+    """Dispatch fused RMSNorm + group quantization to the correct kernel.
+
+    Supports FP8 per-group and MXFP4 quantization. Optionally normalizes a
+    second tensor (x2) and fuses residual-add (res1) in the same kernel call.
+
+    Returns: (out1_quantized, out1_scale), out1_unquantized, out2_normed, residual_out
+    """
+    if _aiter_dtypes is None:
+        raise RuntimeError("aiter.dtypes not available")
+
+    if dtype_quant is None:
+        dtype_quant = _aiter_dtypes.fp8
+
+    if dtype_quant == _aiter_dtypes.fp4x2:
+        out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
+            _fuse_rmsnorm_fp4_quant(
+                x1,
+                x1_weight,
+                x1_epsilon,
+                x2,
+                x2_weight,
+                x2_epsilon,
+                res1,
+                shuffle,
+                scale_shuffle_padding,
+                output_unquantized_inp1,
+            )
+        )
+    elif dtype_quant == _aiter_dtypes.fp8:
+        out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
+            _fused_rms_fp8_group_quant(
+                x1,
+                x1_weight,
+                x1_epsilon,
+                x2,
+                x2_weight,
+                x2_epsilon,
+                res1,
+                dtype_quant,
+                group_size,
+                output_unquantized_inp1,
+                transpose_scale,
+            )
+        )
+    else:
+        raise ValueError(
+            f"No fused rmsnorm quant kernel available for quant dtype: {dtype_quant}."
+        )
+    return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
+
+
 class RMSNorm(nn.Module):
     def __init__(
         self,
@@ -178,6 +394,8 @@ class RMSNorm(nn.Module):
         fused_allreduce: bool = False,
         fused_quant: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        transpose_scale: bool = False,
+        shuffle: bool = True,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -187,6 +405,8 @@ class RMSNorm(nn.Module):
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.transpose_scale = transpose_scale
+        self.shuffle = shuffle
 
         layer_quant_config = (
             LayerQuantConfig()
@@ -197,6 +417,27 @@ class RMSNorm(nn.Module):
         params_dtype = layer_quant_config["quant_dtype"]
         self.quant_type = quant_type
         self.params_dtype = params_dtype
+
+        # Determine the fused quant path based on quant_config:
+        # - "group": FP8 per-group (per_1x128/per_Token) or MXFP4 group (fp4x2)
+        # - "per_tensor": FP8 per-tensor static (requires x_scale at forward time)
+        # - "simple_mxfp4": MXFP4 simple (per_1x32 without group quant)
+        # - None: no quantization fusion
+        self._quant_path = None
+        if fused_quant and _aiter_dtypes is not None:
+            if params_dtype == _aiter_dtypes.fp8 and quant_type in (
+                QuantType.per_1x128,
+                QuantType.per_Token,
+            ):
+                self._quant_path = "group"
+            elif (
+                params_dtype == _aiter_dtypes.fp8 and quant_type == QuantType.per_Tensor
+            ):
+                self._quant_path = "per_tensor"
+            elif params_dtype == _aiter_dtypes.fp4x2:
+                self._quant_path = "group"
+            elif quant_type == QuantType.per_1x32:
+                self._quant_path = "simple_mxfp4"
 
     @mark_trace(prefix="rmsnorm", torch_compile=True)
     def forward(
@@ -228,66 +469,138 @@ class RMSNorm(nn.Module):
                 self.eps,
             )
             return x, residual
-        else:
-            if x_scale is not None and self.use_fused_quant:
-                from aiter.ops.triton.fused_fp8_quant import (
-                    fused_rms_fp8_per_tensor_static_quant,
-                )
-                import aiter as rocm_aiter
 
-                rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
-
-                # static FP8 quantization
-                if residual is None:
-                    x, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
-                        x,
-                        self.weight,
-                        self.eps,
-                        x_scale,
-                        None,
-                        None,
-                        self.eps,
-                        dtype_quant=rocm_aiter_fp8_dtype,
-                        res1=None,
-                    )
-                    return (x, x_scale)
-                else:
-                    x, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
-                        x,
-                        self.weight,
-                        self.eps,
-                        x_scale,
-                        None,
-                        None,
-                        self.eps,
-                        dtype_quant=rocm_aiter_fp8_dtype,
-                        res1=residual,
-                    )
-                    return (x, x_scale), residual
-            elif self.use_fused_quant and (
-                x_scale is None and self.quant_type.value == QuantType.per_1x32.value
-            ):
-                if residual is None:
-                    x, x_scale, _ = mxfp4_rms_quant_fuse(
-                        x, self.weight, self.eps, shuffle=True
-                    )
-                    return x, x_scale
-                else:
-                    x, x_scale, residual = mxfp4_rms_quant_fuse(
-                        x, self.weight, self.eps, shuffle=True, res1=residual
-                    )
-                    return (x, x_scale), residual
+        # --- Fused quant paths (dispatched by _quant_path) ---
+        if self._quant_path == "group":
+            # FP8 per-group or MXFP4 group quantization
+            (x_quant, x_scale), _, _, res_out = fuse_rmsnorm_group_quant(
+                x,
+                self.weight,
+                self.eps,
+                res1=residual,
+                dtype_quant=self.params_dtype,
+                shuffle=self.shuffle,
+                scale_shuffle_padding=self.shuffle,
+                group_size=128,
+                transpose_scale=self.transpose_scale,
+            )
+            if residual is None:
+                return (x_quant, x_scale)
             else:
-                if residual is None:
-                    # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
-                    x = rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
-                    return x
-                else:
-                    # return self.add_rms_forward(x, residual)
-                    x, residual = rmsnorm2d_fwd_with_add_(
-                        x, self.weight, residual, self.eps, self.dim
-                    )
-                    return x, residual
+                return (x_quant, x_scale), res_out
+
+        if self._quant_path == "per_tensor" and x_scale is not None:
+            from aiter.ops.triton.fused_fp8_quant import (
+                fused_rms_fp8_per_tensor_static_quant,
+            )
+            import aiter as rocm_aiter
+
+            rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+            if residual is None:
+                x, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
+                    x,
+                    self.weight,
+                    self.eps,
+                    x_scale,
+                    None,
+                    None,
+                    self.eps,
+                    dtype_quant=rocm_aiter_fp8_dtype,
+                    res1=None,
+                )
+                return (x, x_scale)
+            else:
+                x, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
+                    x,
+                    self.weight,
+                    self.eps,
+                    x_scale,
+                    None,
+                    None,
+                    self.eps,
+                    dtype_quant=rocm_aiter_fp8_dtype,
+                    res1=residual,
+                )
+                return (x, x_scale), residual
+
+        if self._quant_path == "simple_mxfp4":
+            if residual is None:
+                x, x_scale, _ = mxfp4_rms_quant_fuse(
+                    x, self.weight, self.eps, shuffle=self.shuffle
+                )
+                return x, x_scale
+            else:
+                x, x_scale, residual = mxfp4_rms_quant_fuse(
+                    x, self.weight, self.eps, shuffle=self.shuffle, res1=residual
+                )
+                return (x, x_scale), residual
+
+        # --- Plain RMSNorm (no fusion) ---
+        if residual is None:
+            x = rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+            return x
+        else:
+            x, residual = rmsnorm2d_fwd_with_add_(
+                x, self.weight, residual, self.eps, self.dim
+            )
+            return x, residual
+
+
+class DualRMSNorm(nn.Module):
+    """Fused dual RMSNorm + quantization for two inputs.
+
+    Uses a single AITER kernel call to normalize both tensors and quantize
+    the first, reducing kernel launch overhead vs two separate RMSNorm calls.
+    In MLA attention, normalizes q_c via q_a_layernorm and kv_c via
+    kv_a_layernorm in one fused call.
+
+    Does NOT own weight parameters — references existing RMSNorm modules'
+    weights so that checkpoint loading works correctly.
+    """
+
+    def __init__(
+        self,
+        norm1: RMSNorm,
+        norm2: RMSNorm,
+        quant_config: Optional[QuantizationConfig] = None,
+        transpose_scale: bool = False,
+        shuffle: bool = False,
+    ) -> None:
+        super().__init__()
+        self.norm1 = norm1
+        self.norm2 = norm2
+        self.transpose_scale = transpose_scale
+        self.shuffle = shuffle
+
+        layer_quant_config = (
+            LayerQuantConfig()
+            if quant_config is None
+            else quant_config.global_quant_config
+        )
+        self.params_dtype = layer_quant_config["quant_dtype"]
+
+    def forward(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+    ) -> tuple:
+        """Normalize x1 and x2, quantize x1.
+
+        Returns: (x1_quant, x1_scale), x2_normed
+        """
+        (x1_quant, x1_scale), _, x2_normed, _ = fuse_rmsnorm_group_quant(
+            x1,
+            self.norm1.weight,
+            self.norm1.eps,
+            x2=x2,
+            x2_weight=self.norm2.weight,
+            x2_epsilon=self.norm2.eps,
+            dtype_quant=self.params_dtype,
+            shuffle=self.shuffle,
+            group_size=128,
+            transpose_scale=self.transpose_scale,
+        )
+        return (x1_quant, x1_scale), x2_normed
 
 
 class RMSNormGated(nn.Module):

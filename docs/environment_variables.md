@@ -50,12 +50,13 @@ This document describes the environment variables used in the ATOM project.
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION** | bool | 1 (true) | If set to `1`, fuse allreduce with RMSNorm in tensor parallel mode. |
 
-### DeepSeek-style
+### RMSNorm + Quantization Fusion
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse RMSNorm with quantization. |
-| **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
+| **ATOM_ENABLE_RMSNORM_QUANT_FUSION** | bool | 1 (true) | Master switch for all RMSNorm + quantization fusion paths (all models). |
+| **ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION** | bool | (master switch) | *Deprecated.* Override for DeepSeek input layernorm fusion. Falls back to `ATOM_ENABLE_RMSNORM_QUANT_FUSION` when unset. |
+| **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | (master switch) | *Deprecated.* Override for DeepSeek QK-norm fusion. Falls back to `ATOM_ENABLE_RMSNORM_QUANT_FUSION` when unset. |
 
 ### Qwen3-MoE style
 

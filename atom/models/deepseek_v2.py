@@ -43,11 +43,9 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import (
     fused_reduce_rms_fp8_group_quant,
-    fused_rms_fp8_group_quant,
 )
 from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
-    fused_rms_mxfp4_quant,
 )
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.rotary_embedding import get_rope
@@ -61,7 +59,7 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules, is_rocm_aiter_fp4bmm_enabled
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import LayerNorm, RMSNorm
+from atom.model_ops.layernorm import DualRMSNorm, LayerNorm, RMSNorm  # noqa: F401
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -116,220 +114,6 @@ if use_triton_gemm():
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
-
-
-def _fuse_rmsnorm_fp4_quant_fake(
-    x1: torch.Tensor,
-    x1_weight: torch.Tensor,
-    x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
-    shuffle: bool = True,
-    scale_shuffle_padding: bool = True,
-    output_unquantized_inp1: bool = False,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    m, n1 = x1.shape
-    n2 = x2.shape[1] if x2 is not None else 0
-
-    out1_quantized = torch.empty((m, n1 // 2), dtype=torch.uint8, device=x1.device)
-
-    scale_n_valid = (n1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-
-    scale_m = ((m + 255) // 256) * 256
-    scale_n = ((scale_n_valid + 7) // 8) * 8
-
-    out1_bs = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=x1.device)
-
-    out2 = None
-    if x2 is not None:
-        out2 = torch.empty((m, n2), dtype=x1.dtype, device=x1.device)
-
-    out_res1 = None
-    if res1 is not None:
-        out_res1 = torch.empty((m, n1), dtype=x1.dtype, device=x1.device)
-
-    out1_unquantized = None
-    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
-
-
-def _fused_rms_fp8_group_quant_fake(
-    x1: torch.Tensor,
-    x1_weight: torch.Tensor,
-    x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
-    dtype_quant: torch.dtype = dtypes.fp8,
-    group_size: int = 128,
-    output_unquantized_inp1: bool = False,
-    transpose_scale: bool = False,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    m, n1 = x1.shape
-    out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
-    out1_bs = torch.empty(
-        (m, (n1 + group_size - 1) // group_size), dtype=torch.float32, device=x1.device
-    )
-    if transpose_scale:
-        out1_bs = out1_bs.transpose(0, 1).contiguous().view(*out1_bs.shape)
-    out1_unquantized = None
-    if output_unquantized_inp1:
-        out1_unquantized = torch.empty_like(x1)
-    out2 = None
-    if x2 is not None:
-        _, n2 = x2.shape
-        out2 = torch.empty((m, n2), dtype=x1.dtype, device=x1.device)
-    out_res1 = None
-    if res1 is not None:
-        out_res1 = torch.empty((m, n1), dtype=x1.dtype, device=x1.device)
-    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
-
-
-@torch_compile_guard(gen_fake=_fuse_rmsnorm_fp4_quant_fake)
-def _fuse_rmsnorm_fp4_quant(
-    x1: torch.Tensor,
-    x1_weight: torch.Tensor,
-    x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
-    shuffle: bool = True,
-    scale_shuffle_padding: bool = True,
-    output_unquantized_inp1: bool = False,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    m = x1.shape[0]
-
-    shuffle_bool = shuffle and (m >= MXFP4_QUANT_BLOCK_SIZE)
-
-    (out1_quantized, out1_bs), _out1_unquantized, out2, out_res1 = (
-        fused_rms_mxfp4_quant(
-            x1=x1,
-            x1_weight=x1_weight,
-            x1_epsilon=x1_epsilon,
-            x2=x2,
-            x2_weight=x2_weight,
-            x2_epsilon=0.0 if x2_epsilon is None else x2_epsilon,
-            res1=res1,
-            shuffle=shuffle_bool,
-            scale_shuffle_padding=scale_shuffle_padding,
-            output_unquantized_inp1=output_unquantized_inp1,
-        )
-    )
-
-    out1_unquantized = None
-    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
-
-
-@torch_compile_guard(gen_fake=_fused_rms_fp8_group_quant_fake)
-def _fused_rms_fp8_group_quant(
-    x1: torch.Tensor,
-    x1_weight: torch.Tensor,
-    x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
-    dtype_quant: torch.dtype = dtypes.fp8,
-    group_size: int = 128,
-    output_unquantized_inp1: bool = False,
-    transpose_scale: bool = False,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = (
-        fused_rms_fp8_group_quant(
-            x1,
-            x1_weight,
-            x1_epsilon,
-            x2,
-            x2_weight,
-            x2_epsilon,
-            group_size,
-            dtype_quant,
-            res1,
-            output_unquantized_inp1,
-            transpose_scale,
-        )
-    )
-    return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
-
-
-def _fuse_rmsnorm_quant(
-    x1: torch.Tensor,
-    x1_weight: torch.Tensor,
-    x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
-    x2_epsilon: Optional[float] = None,
-    res1: Optional[torch.Tensor] = None,
-    dtype_quant: torch.dtype = dtypes.fp8,
-    shuffle: bool = True,
-    scale_shuffle_padding: bool = False,
-    group_size: int = 128,
-    output_unquantized_inp1: bool = False,
-    transpose_scale: bool = False,
-):
-    if dtype_quant == dtypes.fp4x2:
-        out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
-            _fuse_rmsnorm_fp4_quant(
-                x1,
-                x1_weight,
-                x1_epsilon,
-                x2,
-                x2_weight,
-                x2_epsilon,
-                res1,
-                shuffle,
-                scale_shuffle_padding,
-                output_unquantized_inp1,
-            )
-        )
-    elif dtype_quant == dtypes.fp8:
-        out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
-            _fused_rms_fp8_group_quant(
-                x1,
-                x1_weight,
-                x1_epsilon,
-                x2,
-                x2_weight,
-                x2_epsilon,
-                res1,
-                dtype_quant,
-                group_size,
-                output_unquantized_inp1,
-                transpose_scale,
-            )
-        )
-    else:
-        raise ValueError(
-            f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}."
-        )
-    return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
 
 
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
@@ -1420,16 +1204,21 @@ class DeepseekV2MLAAttention(nn.Module):
             prefix=prefix,
         )
 
-        # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if FP8 or (use_triton_gemm() and FP4),
         self.prefix = prefix
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
-            if layer_quant_dtype == dtypes.fp8 or (
-                layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
-            ):
+            if layer_quant_dtype in (dtypes.fp8, dtypes.fp4x2):
                 self.quant_dtype = layer_quant_dtype
                 self.fuse_qknorm_quant = True
+                # DualRMSNorm: fused dual norm + quant for both FP8 and FP4 paths
+                self.qk_layernorm = DualRMSNorm(
+                    self.q_a_layernorm,
+                    self.kv_a_layernorm,
+                    quant_config=quant_config,
+                    transpose_scale=True,
+                    shuffle=False,
+                )
 
     def forward(
         self,
@@ -1477,24 +1266,8 @@ class DeepseekV2MLAAttention(nn.Module):
                 if self.fuse_qknorm_quant:
                     (
                         (hidden_states_or_q_c, hidden_states_or_q_c_scale),
-                        _,
                         kv_c_normed,
-                        _,
-                    ) = _fuse_rmsnorm_quant(
-                        q_c,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.eps,
-                        kv_c,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.eps,
-                        None,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=False,
-                        scale_shuffle_padding=False,
-                        group_size=128,
-                        output_unquantized_inp1=False,
-                        transpose_scale=True,
-                    )
+                    ) = self.qk_layernorm(q_c, kv_c)
                 else:
                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
@@ -1562,11 +1335,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
-        # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on self.fuse_input_norm_quant is turned on only if use_triton_gemm and (FP8 or FP4),
-        # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
+        # input_layernorm fusion requires use_triton_gemm() (unlike QK-norm DualRMSNorm which works without it).
+        # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block ensures:
         #   1. RMS_Quant fusion is only used for input_layernorm
-        #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
-        #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm if ENABLE_ALLREDUCE_RMSNORM_FUSION is turned on
+        #   2. reduce_results is re-enabled for feed forward layers (MOE/MLP), since AR_RMS is disabled at the start of the next layer
+        #   3. AR_RMS is turned off for input_layernorm but still enabled for post_attention_layernorm
         self.quant_dtype = (
             None
             if quant_config is None
@@ -1588,7 +1361,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 if layer_idx == 0:
                     logger.info(
-                        "Info: Because ATOM_USE_TRITON_GEMM is not turned on in DeepSeek-R1, ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned off automatically"
+                        "Info: ATOM_USE_TRITON_GEMM is off, input_layernorm RMSNorm+quant fusion disabled (QK-norm DualRMSNorm fusion still active)"
                     )
 
         if (
@@ -1617,6 +1390,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             fused_allreduce=self.fuse_ar_input_norm
             and self.layer_idx > 0
             and not is_mtp_block,
+            fused_quant=self.fuse_input_norm_quant,
+            quant_config=quant_config,
+            transpose_scale=True,
+            shuffle=True,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -1624,9 +1401,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.fuse_rmsnorm_quant = (
-            ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION and self.quant_dtype is not None
-        )
 
     def forward(
         self,
@@ -1634,57 +1408,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Self Attention
-        if self.fuse_input_norm_quant:
-            assert self.quant_dtype is not None
-            weight = self.input_layernorm.weight
-            eps = self.input_layernorm.eps
-            if residual is None:
-                residual = hidden_states
-                (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
-                    _fuse_rmsnorm_quant(
-                        hidden_states,
-                        weight,
-                        eps,
-                        None,
-                        None,
-                        None,
-                        None,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
-                        group_size=128,
-                        output_unquantized_inp1=False,
-                        transpose_scale=True,
-                    )
-                )
-            else:
-                (hidden_states_quant, hidden_states_quant_scale), _, _, residual = (
-                    _fuse_rmsnorm_quant(
-                        hidden_states,
-                        weight,
-                        eps,
-                        None,
-                        None,
-                        None,
-                        residual,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
-                        group_size=128,
-                        output_unquantized_inp1=False,
-                        transpose_scale=True,
-                    )
-                )
-
-            hidden_states = (hidden_states_quant, hidden_states_quant_scale)
-
+        # Self Attention — unified through RMSNorm.forward()
+        # fused_quant path returns (quant, scale) or ((quant, scale), residual)
+        # plain/allreduce path returns tensor or (tensor, residual)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.self_attn(
             positions=positions,

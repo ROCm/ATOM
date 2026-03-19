@@ -18,6 +18,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `MLAAttention` | `attention_mla.py` | `mla_decode_fwd`, `mla_prefill_fwd`, `concat_and_cache_mla`, `fused_qk_rope_concat_and_cache_mla` | Multi-head latent attention |
 | `FusedMoE` | `moe.py` | `aiter.fused_moe.fused_moe`, `asm_moe` | Mixture of experts |
 | `RMSNorm` | `layernorm.py` | `rmsnorm2d_fwd`, `rmsnorm2d_fwd_with_add`, `fused_add_rmsnorm_pad` | RMS normalization |
+| `DualRMSNorm` | `layernorm.py` | `fuse_rmsnorm_group_quant` | Fused dual RMSNorm + quant (MLA q/kv norms) |
 | `LayerNorm` | `layernorm.py` | `layernorm2d_fwd`, `layernorm2d_fwd_with_add` | Layer normalization |
 | `SiluAndMul` | `activation.py` | `aiter.silu_and_mul` | SiLU gated activation |
 | `VocabParallelEmbedding` | `embed_head.py` | `F.embedding` + TP all-reduce | Vocab embedding |
@@ -353,7 +354,22 @@ RMSNorm(
 )
 ```
 
-### 5.2 `LayerNorm` (`layernorm.py`)
+### 5.2 `DualRMSNorm` (`layernorm.py`)
+
+`DualRMSNorm` fuses normalization of two tensors (e.g. q_c and kv_c in MLA) and quantization of the first into a single `fuse_rmsnorm_group_quant` kernel call. It references existing `RMSNorm` modules' weights rather than creating its own, so checkpoint loading works correctly.
+
+```python
+DualRMSNorm(
+    norm1: RMSNorm,          # e.g. q_a_layernorm
+    norm2: RMSNorm,          # e.g. kv_a_layernorm
+    quant_config: Optional[QuantizationConfig] = None,
+    transpose_scale: bool = False,
+    shuffle: bool = False,
+)
+# forward(x1, x2) -> ((x1_quant, x1_scale), x2_normed)
+```
+
+### 5.3 `LayerNorm` (`layernorm.py`)
 
 `LayerNorm` wraps `layernorm2d_fwd` and `layernorm2d_fwd_with_add` (with bias support):
 
@@ -482,6 +498,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 |---|---|---|---|
 | RMSNorm + FP8 quant | RMSNorm, per-tensor FP8 static quant | `RMSNorm(fused_quant=True)` + `x_scale` | `fused_rms_fp8_per_tensor_static_quant` |
 | RMSNorm + MXFP4 quant | RMSNorm, per-1x32 MXFP4 quant | `RMSNorm(fused_quant=True)` + `QuantType.per_1x32` | `fused_rms_mxfp4_quant` |
+| Dual RMSNorm + quant | Normalize q_c + kv_c, quantize q_c | `DualRMSNorm` (MLA, FP8/FP4) | `fuse_rmsnorm_group_quant` |
 | RMSNorm + add + pad | Residual add, RMSNorm, output padding | `RMSNorm(x_pad_to_multiple>0)` | `fused_add_rmsnorm_pad` |
 | AllReduce + RMSNorm | TP all-reduce, RMSNorm | `RMSNorm(fused_allreduce=True)` | `tensor_model_parallel_fused_allreduce_rmsnorm` |
 | SiLU + mul + FP8 quant | SiLU activation, multiply, FP8 quant | `SiluAndMul(fused_quant=True)` + `x_scale` | `fused_silu_mul_fp8_per_tensor_static_quant` |
@@ -504,7 +521,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 |---|---|
 | `linear.py` | `LinearBase`, `ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`, `MergedColumnParallelLinear`, `ReplicatedLinear`, `MergedReplicatedLinear` |
 | `activation.py` | `SiluAndMul` with fused FP8/MXFP4 quantization |
-| `layernorm.py` | `RMSNorm`, `LayerNorm` with fused allreduce/quant/pad variants |
+| `layernorm.py` | `RMSNorm`, `DualRMSNorm`, `LayerNorm` with fused allreduce/quant/pad variants; group-quant dispatch (`fuse_rmsnorm_group_quant`) |
 | `base_attention.py` | Top-level `Attention` dispatcher with custom op registration |
 | `attention_mha.py` | MHA implementation: prefill (flash), decode (ASM/Triton paged attention) |
 | `attention_mla.py` | `MLAAttention`, `MLAModules` -- DeepSeek MLA with compressed KV |
