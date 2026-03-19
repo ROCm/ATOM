@@ -560,14 +560,22 @@ jobs:
           echo "=== Regression re-run complete: $((TOTAL_COUNT - FAIL_COUNT))/$TOTAL_COUNT succeeded ==="
           [ "$FAIL_COUNT" -gt 0 ] && echo "::warning::$FAIL_COUNT/$TOTAL_COUNT configs failed"
 
-      - name: Copy and upload profiler traces
+      - name: Copy profiler traces from container
+        id: copy-traces
         if: always()
         run: |
           docker cp atom-regression:/app/trace ./regression-traces 2>/dev/null || echo "No traces found"
-          ls -lhR ./regression-traces/ 2>/dev/null || true
+          TRACE_COUNT=$(find ./regression-traces -name "*.json.gz" -o -name "*.pt.trace.*" 2>/dev/null | wc -l)
+          echo "trace_count=$TRACE_COUNT" >> $GITHUB_OUTPUT
+          if [ "$TRACE_COUNT" -gt 0 ]; then
+            echo "Found $TRACE_COUNT trace files"
+            ls -lhR ./regression-traces/
+          else
+            echo "::warning::No trace files found in container — profiler may not have produced output"
+          fi
 
       - name: Upload regression traces
-        if: always()
+        if: always() && steps.copy-traces.outputs.trace_count > 0
         uses: actions/upload-artifact@v7
         with:
           name: regression-traces-${{ github.run_id }}
@@ -596,6 +604,7 @@ jobs:
       - name: Download regression traces
         if: needs.regression-rerun.result == 'success'
         uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
           name: regression-traces-${{ github.run_id }}
           path: profiler-traces/
@@ -603,6 +612,7 @@ jobs:
       - name: Download benchmark profiler traces
         if: needs.regression-rerun.result != 'success'
         uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
           pattern: profiler-traces-*
           merge-multiple: true
