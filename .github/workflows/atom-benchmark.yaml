@@ -565,7 +565,7 @@ jobs:
         if: always()
         run: |
           docker cp atom-regression:/app/trace ./regression-traces 2>/dev/null || echo "No traces found"
-          TRACE_COUNT=$(find ./regression-traces -name "*.json.gz" -o -name "*.pt.trace.*" 2>/dev/null | wc -l)
+          TRACE_COUNT=$(find ./regression-traces -type f \( -name "*.json.gz" -o -name "*.pt.trace.*" \) 2>/dev/null | wc -l | tr -d ' ')
           echo "trace_count=$TRACE_COUNT" >> $GITHUB_OUTPUT
           if [ "$TRACE_COUNT" -gt 0 ]; then
             echo "Found $TRACE_COUNT trace files"
@@ -575,7 +575,7 @@ jobs:
           fi
 
       - name: Upload regression traces
-        if: always() && steps.copy-traces.outputs.trace_count > 0
+        if: always() && fromJSON(steps.copy-traces.outputs.trace_count) > 0
         uses: actions/upload-artifact@v7
         with:
           name: regression-traces-${{ github.run_id }}
