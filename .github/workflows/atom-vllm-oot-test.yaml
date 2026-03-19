@@ -26,7 +26,25 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
+  check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: Check Pre Checkin Signal
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download and check pre-checkin signal
+        run: bash ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   atom-vllm-oot:
+    needs: [check-signal]
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: ATOM vLLM OOT Test
     strategy:
@@ -60,35 +78,6 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
-
-      - name: Run Black
-        uses: psf/black@stable
-
-      - name: Set up Python environment
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip3 install ruff
-
-      - name: Install reviewdog
-        uses: reviewdog/action-setup@e04ffabe3898a0af8d0fb1af00c188831c4b5893
-
-      - name: Run ruff with reviewdog
-        env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ruff check . \
-            --output-format=rdjson \
-            --exit-zero \
-            --no-fix \
-          | reviewdog \
-            -f=rdjson \
-            -name="ruff" \
-            -reporter=github-pr-review \
-            -filter-mode=diff_context \
-            -fail-on-error=true
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
