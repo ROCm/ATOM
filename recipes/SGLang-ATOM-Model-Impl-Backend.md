@@ -2,10 +2,10 @@
 ATOM can work as model implementation backend of popular framework, like SGLang. The users can launch the server like before and specify an extra argument to enable the ATOM model backend, where the optimized implementation of the required target model will be provided to SGLang to execute. When ATOM working under this mode, both framework-level features from SGLang and latest model-level fusion kernels from ATOM/AITER can be combined together to achieve the competitive performance.
 
 - Here is a detailed design slide for this feature: https://amdcloud-my.sharepoint.com/:p:/g/personal/zejchen_amd_com/IQCFdvmEeLTWT7ysApmZv_hVAfw2nTo8iesJZGblHS0evqQ?e=hjnIDM
-- Here is the RFC to introduce the ATOM as model impl backend into SGLang: TODO
+- RFC for ATOM as model impl backend in SGLang: https://github.com/sgl-project/sglang/pull/16944
 
 ## Preparing environment for SGLang with ATOM model backend
-Here is the PR to introduce ATOM into SGLang: https://github.com/sgl-project/sglang/pull/16944, when this PR would be merged, the official SGLang can be used, but for now you need to use develop vllm branch
+The SGLang integration PR is currently open at https://github.com/sgl-project/sglang/pull/16944. Once merged, the official SGLang can be used directly.
 Pull the latest docker from SGLang official nightly docker for ROCm from https://hub.docker.com/r/rocm/sgl-dev/tags
 ```bash
 docker pull rocm/sgl-dev:v0.5.8-rocm720-mi35x-20260130-preview

@@ -112,3 +112,9 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+
+    # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
+    # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives
+    from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
+
+    apply_graph_capture_patch()

@@ -9,9 +9,12 @@ EXTRA_ARGS=("${@:3}")
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
+  # Clear stale compile cache to avoid NameError from outdated generated code
+  echo "Clearing compile cache..."
+  rm -rf ~/.cache/atom/*
   PROFILER_ARGS=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
-    PROFILER_ARGS="--torch-profiler-dir /app/trace"
+    PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"
     echo "Torch profiler enabled, trace output: /app/trace"
   fi
   ATOM_SERVER_LOG="/tmp/atom_server.log"
@@ -98,53 +101,86 @@ if [ "$TYPE" == "accuracy" ]; then
   chmod -R 777 accuracy_test_results
 fi
 
+if [ "$TYPE" == "stop" ]; then
+  echo ""
+  echo "========== Stopping ATOM server =========="
+
+  # Wait for trace files to finish writing (before killing the server process)
+  TRACE_DIR="${TORCH_PROFILER_DIR:-/app/trace}"
+  if [ -d "$TRACE_DIR" ]; then
+    echo "Waiting for trace files to finish writing..."
+    for i in $(seq 1 120); do
+      TMP_COUNT=$(find "$TRACE_DIR" -name '*.tmp' 2>/dev/null | wc -l)
+      if [ "$TMP_COUNT" -eq 0 ]; then
+        echo "Trace files ready after ${i}s"
+        break
+      fi
+      [ "$i" -eq 120 ] && echo "WARNING: trace .tmp files still present after 120s"
+      sleep 1
+    done
+  fi
+
+  # Kill server processes
+  pkill -f 'atom.entrypoints' || true
+  sleep 2
+  pkill -9 -f 'multiprocessing.spawn' || true
+  pkill -9 -f 'multiprocessing.resource_tracker' || true
+
+  # Wait for GPU memory to release
+  echo "Waiting for GPU memory to release..."
+  for i in $(seq 1 60); do
+    USED_GPUS=$(rocm-smi --showmemuse 2>/dev/null | grep "VRAM%" | awk '{print $NF}' | awk '$1 > 0' | wc -l 2>/dev/null || echo "0")
+    if [ "$USED_GPUS" -eq 0 ]; then
+      echo "GPU memory released after ${i}s"
+      break
+    fi
+    if [ "$i" -eq 60 ]; then
+      echo "WARNING: GPU memory still in use after 60s, force killing GPU processes"
+      rocm-smi --showpidgpus 2>&1 | grep -oP 'PID \K\d+' | while read pid; do
+        kill -9 "$pid" 2>/dev/null || true
+      done
+      sleep 5
+    fi
+    sleep 1
+  done
+  echo "Server stopped."
+fi
+
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
-  echo "========== Cloning bench_serving =========="
-  git clone https://github.com/kimbochen/bench_serving.git && chmod +x bench_serving/benchmark_serving.py
   echo "========== Running benchmark test =========="
+  RESULT_FILENAME=${RESULT_FILENAME:-benchmark_result}
+  PROFILE_ARG=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
-    echo "Starting torch profiler..."
-    curl -s -S -X POST http://127.0.0.1:8000/start_profile || echo "Warning: failed to start profiler"
+    PROFILE_ARG="--profile"
+    echo "Profiling enabled via --profile flag"
   fi
-  python bench_serving/benchmark_serving.py \
+  python -m atom.benchmarks.benchmark_serving \
     --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
     --dataset-name=random \
     --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
     --max-concurrency=$CONC \
-    --num-prompts=$(( $CONC * 10 )) \
+    --num-prompts=${NUM_PROMPTS_OVERRIDE:-$(( $CONC * 10 ))} \
     --trust-remote-code \
+    --num-warmups=1 \
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
-    --result-dir=. --result-filename=${RESULT_FILENAME}.json
-
-  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
-    echo "Stopping torch profiler..."
-    curl -s -S -X POST http://127.0.0.1:8000/stop_profile || echo "Warning: failed to stop profiler"
-    ATOM_SERVER_LOG="/tmp/atom_server.log"
-    echo "Waiting for 'Profiler stopped.' in server log ..."
-    profiler_done=false
-    for i in $(seq 1 300); do
-      if grep -q "Profiler stopped." "$ATOM_SERVER_LOG" 2>/dev/null; then
-        echo "Profiler stopped after ${i}s"
-        ls -lhR /app/trace/
-        profiler_done=true
-        break
-      fi
-      echo "Waiting for profiler to finish... ($i/300)"
-      sleep 1
-    done
-    if [ "$profiler_done" = false ]; then
-      echo "Warning: 'Profiler stopped.' not found in server log after 300s"
-      ls -lhR /app/trace/ 2>/dev/null || true
-    fi
-  fi
+    --result-dir=. --result-filename=${RESULT_FILENAME}.json \
+    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-}
 
   # Inject ISL/OSL into result JSON for summary table
   if [ -f "${RESULT_FILENAME}.json" ]; then
-    jq --argjson isl "$ISL" --argjson osl "$OSL" \
-      '. + {random_input_len: $isl, random_output_len: $osl}' \
-      "${RESULT_FILENAME}.json" > "${RESULT_FILENAME}.tmp" && \
-      mv "${RESULT_FILENAME}.tmp" "${RESULT_FILENAME}.json"
+    python3 -c "
+import json, re
+with open('${RESULT_FILENAME}.json') as f:
+    d = json.load(f)
+d['random_input_len'] = int('${ISL}')
+d['random_output_len'] = int('${OSL}')
+tp_match = re.search(r'-tp\s+(\d+)', '${SERVER_ARGS:-}')
+if tp_match:
+    d['tensor_parallel_size'] = int(tp_match.group(1))
+with open('${RESULT_FILENAME}.json', 'w') as f:
+    json.dump(d, f, indent=2)
+"
   fi
 fi

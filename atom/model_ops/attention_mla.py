@@ -22,9 +22,10 @@ from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
+from atom.plugin import is_plugin_mode
+from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-
 from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,
@@ -35,11 +36,6 @@ from torch import nn
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
-
-
-from atom.plugin import is_plugin_mode
-
-from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
 
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
@@ -138,10 +134,12 @@ class MLAAttention(nn.Module):
                 f"Padded head count ({self.padded_num_heads}) must be divisible "
                 f"by num_heads ({num_heads}) for head repeat"
             )
-            logger.info(
-                f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
-                f"(repeat factor {self.head_repeat_factor})"
-            )
+            if not getattr(MLAAttention, "_head_repeat_logged", False):
+                MLAAttention._head_repeat_logged = True
+                logger.info(
+                    f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
+                    f"(repeat factor {self.head_repeat_factor})"
+                )
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -498,9 +496,7 @@ class MLAAttention(nn.Module):
                     paged_kv_indices,
                     kv_last_page_lens,
                     max_q_len,
-                    self.scale,
-                    0.0,
-                    None,
+                    sm_scale=self.scale,
                     q_scale=self._q_scale,
                     kv_scale=self._k_scale,
                 )
@@ -565,7 +561,7 @@ class MLAAttention(nn.Module):
         #     q_scale = kv_scale = self.one_scale
 
         dp_size = get_dp_group().world_size
-        use_persistent_mode = not (dp_size > 1 and self.kv_cache_dtype == "fp8")
+        use_persistent_mode = not (dp_size > 1)
 
         if not use_persistent_mode:
             # DP : disable persistent mode to avoid overflow
@@ -602,6 +598,7 @@ class MLAAttention(nn.Module):
             reduce_partial_map=reduce_partial_map,
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
+            return_lse=True,
         )
 
         if self.head_repeat_factor > 1:

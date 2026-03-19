@@ -1,0 +1,290 @@
+name: ATOM vLLM OOT Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  schedule:
+    # Nightly at 00:00 Beijing time (16:00 UTC)
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+
+jobs:
+  atom-vllm-oot:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: ATOM vLLM OOT Test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Keep CI runtime under control: enable only one OOT model for now.
+          - model_name: "Kimi-K2-Thinking-MXFP4"
+            model_path: "amd/Kimi-K2-Thinking-MXFP4"
+            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel"
+            accuracy_test_threshold: 0.90
+            runner: atom-mi355-8gpu.predownload
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
+      OOT_IMAGE_TAG: atom_vllm_oot_test:${{ github.sha }}-${{ strategy.job-index }}
+      VLLM_COMMIT: b31e9326a7d9394aab8c767f8ebe225c65594b60
+      VLLM_VERSION: "0.17"
+
+    steps:
+      - name: Clean up containers and workspace
+        run: |
+          echo "=== Cleaning up containers on $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
+
+      - name: Generate OOT base Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+          RUN pip install -U lm-eval[api]
+          RUN pip show lm-eval || true
+          RUN pip install hf_transfer
+          RUN pip show hf_transfer || true
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y amd-aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          RUN rm -rf /app/aiter-test
+          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
+              cd /app/aiter-test && \\
+              git checkout HEAD && \\
+              git submodule sync && git submodule update --init --recursive && \\
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
+          RUN pip uninstall -y atom
+          RUN rm -rf /app/ATOM
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
+              cd /app/ATOM && \\
+              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
+              pip install -e .
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
+
+      - name: Build OOT base image
+        run: |
+          docker build --pull --network=host \
+            --no-cache \
+            -t atom_oot_base:ci \
+            -f Dockerfile.mod .
+
+      - name: Build OOT vLLM image
+        run: |
+          # OOT_BASE_IMAGE is built in the previous step and only exists locally on this runner.
+          docker build --network=host \
+            --no-cache \
+            -t "${OOT_IMAGE_TAG}" \
+            --target atom_oot \
+            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            --build-arg MAX_JOBS=64 \
+            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            --build-arg INSTALL_FASTSAFETENSORS=1 \
+            -f docker/Dockerfile .
+
+      - name: Run all plugin unit tests
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "$OOT_IMAGE_TAG" \
+            bash -lc "pytest -q tests/plugin"
+
+      - name: Prepare model cache mount
+        run: |
+          model_path="${{ matrix.model_path }}"
+          MODEL_CACHE_HOST_ROOT=""
+          MODEL_CACHE_MOUNT=""
+          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
+
+          if [ -d "/models/${model_path}" ] && [ -f "/models/${model_path}/config.json" ]; then
+            MODEL_CACHE_HOST_ROOT="/models"
+            MODEL_CACHE_DESC="/models (pre-provisioned host path)"
+          elif [ -d "/data/models/${model_path}" ] && [ -f "/data/models/${model_path}/config.json" ]; then
+            MODEL_CACHE_HOST_ROOT="/data/models"
+            MODEL_CACHE_DESC="/data/models (pre-provisioned host path)"
+          elif [ -d "/models" ] && [ -w "/models" ]; then
+            MODEL_CACHE_HOST_ROOT="/models"
+            MODEL_CACHE_DESC="/models (writable host path)"
+          elif [ -d "/data/models" ] && [ -w "/data/models" ]; then
+            MODEL_CACHE_HOST_ROOT="/data/models"
+            MODEL_CACHE_DESC="/data/models (writable host path)"
+          fi
+
+          if [ -n "${MODEL_CACHE_HOST_ROOT}" ]; then
+            if mkdir -p "${MODEL_CACHE_HOST_ROOT}/${model_path}"; then
+              MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_HOST_ROOT}:/models"
+              echo "Model cache host root: ${MODEL_CACHE_HOST_ROOT}"
+            else
+              MODEL_CACHE_HOST_ROOT=""
+              MODEL_CACHE_DESC="container-local /models (no writable host cache mount)"
+            fi
+          fi
+
+          if [ -z "${MODEL_CACHE_MOUNT}" ]; then
+            echo "No writable host model cache found; using container-local /models."
+          fi
+
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
+          echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+
+      - name: Start OOT test container
+        run: |
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            $MODEL_MOUNT \
+            -w /workspace \
+            --ipc=host --group-add video \
+            --shm-size=16G \
+            --privileged \
+            --cap-add=SYS_PTRACE \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            --name "$CONTAINER_NAME" \
+            "$OOT_IMAGE_TAG"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Download model if needed
+        if: success()
+        run: |
+          model_dir="/models/${{ matrix.model_path }}"
+          if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"$model_dir\" ] && [ -f \"$model_dir/config.json\" ]"; then
+            echo "Model already exists under ${model_dir}; skip download"
+          else
+            echo "Model not found under ${model_dir}; downloading model"
+            if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir \"$model_dir\""; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
+            fi
+          fi
+
+      - name: Resolve OOT model path
+        if: success()
+        run: |
+          if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"/models/${{ matrix.model_path }}\" ] && [ -f \"/models/${{ matrix.model_path }}/config.json\" ]"; then
+            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using pre-downloaded model path: /models/${{ matrix.model_path }}"
+          else
+            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using model id: ${{ matrix.model_path }}"
+          fi
+
+      - name: Run OOT launch and gsm8k accuracy via script (ci mode)
+        if: success()
+        timeout-minutes: 120
+        env:
+          OOT_MODEL_NAME: ${{ matrix.model_name }}
+          OOT_MODEL_PATH: ${{ matrix.model_path }}
+          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
+          MAX_WAIT_RETRIES: "120"
+          STREAM_VLLM_LOGS: "1"
+        run: |
+          docker exec \
+            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
+            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
+            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
+            -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              bash .github/scripts/atom_oot_test.sh accuracy ci
+            "
+
+      - name: Check OOT accuracy test results
+        if: success()
+        run: |
+          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+            echo "ERROR: No results JSON file found in oot_accuracy_results/"
+            exit 2
+          fi
+
+          echo "RESULT_FILE: $result_file"
+          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
+          echo "Flexible extract value: $flexible_extract_value"
+          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          if [ "$result" -eq 1 ]; then
+            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 1
+          else
+            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 0
+          fi
+
+      - name: Collect OOT accuracy summary
+        if: success()
+        run: |
+          echo "OOT Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Collect OOT logs and results
+        if: always()
+        run: |
+          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
+          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+
+      - name: Upload OOT artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oot-${{ matrix.model_name }}-artifacts
+          path: |
+            vllm_oot.log
+            oot_accuracy_output.txt
+            oot_accuracy_results
+
+      - name: Clean up OOT test
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          docker stop "$CONTAINER_NAME" || true
+          docker rm "$CONTAINER_NAME" || true

@@ -196,8 +196,13 @@ class AsyncIOProcManager:
         #    unlink only needs the creator, readers don't need to be alive.
         #    Must happen before CoreManager terminates us (timeout).
         self._cleanup_shared_memory()
-        # 2. kill all runners
+        # 2. Wait for runners to exit cleanly (they received "exit" RPC
+        #    from EngineCore and need time to call destroy_dist_env so
+        #    all NCCL ranks shut down without TCPStore errors).
         logger.info(f"{self.label}: shutdown all runners...")
+        for proc in self.procs:
+            if proc.is_alive():
+                proc.join(timeout=5)
         shutdown_all_processes(self.procs, allowed_seconds=1)
         self.procs = []
         self.output_thread.join(timeout=1)

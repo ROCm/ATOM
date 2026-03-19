@@ -85,8 +85,13 @@ class SpecStats:
 
     def _log(self) -> None:
         ts = self.total_steps
+        if ts == 0:
+            return
         # Interval stats
         iv_steps = sum(self._interval_distribution.values())
+        if iv_steps == 0:
+            self._reset_interval()
+            return
         iv_accepted = sum(k * v for k, v in self._interval_distribution.items())
         iv_rate = (
             iv_accepted / self._interval_draft_tokens

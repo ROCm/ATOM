@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -42,7 +42,7 @@ jobs:
           make html
 
       - name: Upload documentation artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: documentation
           path: docs/_build/html/
@@ -58,7 +58,7 @@ jobs:
 
     steps:
       - name: Download documentation artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: documentation
           path: ./html
@@ -68,4 +68,5 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./html
+          destination_dir: docs
           commit_message: 'docs: deploy documentation'

@@ -68,6 +68,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
+
+        max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -77,7 +79,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
             self.max_bs,
-            1,
+            max_seqlen_qo,
             self.padded_num_attention_heads,
             self.dtype_q,
             self.dtype_kv,
@@ -330,33 +332,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
-        if max_seqlen_q > 1:
-            # Get num_rejected (already mapped to current batch order in prepare_input_ids)
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
-                context_lens -= num_rejected
-                num_blocks = cdiv(context_lens, self.model_runner.block_size)
-                block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
+        if not batch.is_dummy_run:
+            if max_seqlen_q > 1:
+                # Get num_rejected (already mapped to current batch order in prepare_input_ids)
+                num_rejected = self.model_runner.tokenID_processor.num_rejected
+                if num_rejected is not None:
+                    context_lens -= num_rejected
+                    num_blocks = cdiv(context_lens, self.model_runner.block_size)
+                    block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
 
-            slot_mapping = [
-                block_table[pos // self.model_runner.block_size]
-                * self.model_runner.block_size
-                + (pos % self.model_runner.block_size)
-                for block_table, seq_len in zip(block_tables, context_lens)
-                for pos in range(seq_len - max_seqlen_q, seq_len)
-            ]
-        else:
-            slot_mapping = [
-                block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                for block_table, last_block_num in zip(
-                    block_tables, batch.last_block_num_tokens
-                )
-            ]
+                slot_mapping = [
+                    block_table[pos // self.model_runner.block_size]
+                    * self.model_runner.block_size
+                    + (pos % self.model_runner.block_size)
+                    for block_table, seq_len in zip(block_tables, context_lens)
+                    for pos in range(seq_len - max_seqlen_q, seq_len)
+                ]
+            else:
+                slot_mapping = [
+                    block_table[-1] * self.model_runner.block_size + last_block_num - 1
+                    for block_table, last_block_num in zip(
+                        block_tables, batch.last_block_num_tokens
+                    )
+                ]
         positions = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
 
-        sum_scheduled_tokens = batch.total_tokens_num_decode
+        # Use scheduled_bs since in dummy run, total_seqs_num_decode is 1.
+        sum_scheduled_tokens = scheduled_bs * max_seqlen_q
         var["slot_mapping"].np[: bs * max_seqlen_q] = -1
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping

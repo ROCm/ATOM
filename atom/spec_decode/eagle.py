@@ -8,6 +8,7 @@ from atom.config import CompilationLevel, Config
 from atom.model_loader.loader import load_model
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import SpecDecodeMetadata, get_forward_context
+from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
 
@@ -123,56 +124,57 @@ class EagleProposer:
         # return draft_token_ids.fill_(1) # for debug
         var = self.runner.forward_vars
         for i in range(self.mtp_k):
-            ret_hidden_states = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-            sample_hidden_states = (
-                torch.index_select(ret_hidden_states, 0, last_token_indices)
-                if i == 0
-                else ret_hidden_states
-            )
-            logits = self.model.compute_logits(sample_hidden_states)
-            new_draft_ids = logits.argmax(dim=-1)
-            draft_token_ids[:, i] = new_draft_ids
-
-            if i < self.mtp_k - 1:
-                do_attn_metadata_update = not context.is_prefill
-                if i == 0:
-                    attn_metadata.max_seqlen_q = 1
-                    kv_indptr = var["kv_indptr"].gpu[: bs + 1]
-                    kv_indices = var["kv_indices"].gpu
-                    slot_mapping = var["slot_mapping"].gpu[
-                        : bs * attn_metadata.max_seqlen_q
-                    ]
-                    kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
-                    cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
-                    attn_metadata.kv_indptr = kv_indptr
-                    attn_metadata.kv_indices = kv_indices
-                    attn_metadata.cu_seqlens_q = cu_seqlens_q
-                    attn_metadata.slot_mapping = slot_mapping
-                    attn_metadata.kv_last_page_lens = kv_last_page_lens
-                    cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
-                    kv_indptr[1 : bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
-                    positions = torch.gather(positions, 0, last_token_indices)
-                    context.is_prefill = False
-
-                # update metadata
-                attn_metadata.max_seqlen_k += 1
-                workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
-                    bs,
-                    attn_metadata.max_seqlen_q,
-                    attn_metadata.max_seqlen_k,
-                    only_update=do_attn_metadata_update,
-                    num_reject_tokens=num_reject_tokens if i == 0 else None,
+            with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
+                ret_hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
                 )
-                for k, v in workinfos.items():
-                    attn_metadata.__dict__[k] = v
-                slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
-                input_ids = new_draft_ids
-                positions += 1
-                hidden_states = sample_hidden_states
+                sample_hidden_states = (
+                    torch.index_select(ret_hidden_states, 0, last_token_indices)
+                    if i == 0
+                    else ret_hidden_states
+                )
+                logits = self.model.compute_logits(sample_hidden_states)
+                new_draft_ids = logits.argmax(dim=-1)
+                draft_token_ids[:, i] = new_draft_ids
+
+                if i < self.mtp_k - 1:
+                    do_attn_metadata_update = not context.is_prefill
+                    if i == 0:
+                        attn_metadata.max_seqlen_q = 1
+                        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+                        kv_indices = var["kv_indices"].gpu
+                        slot_mapping = var["slot_mapping"].gpu[
+                            : bs * attn_metadata.max_seqlen_q
+                        ]
+                        kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+                        cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
+                        attn_metadata.kv_indptr = kv_indptr
+                        attn_metadata.kv_indices = kv_indices
+                        attn_metadata.cu_seqlens_q = cu_seqlens_q
+                        attn_metadata.slot_mapping = slot_mapping
+                        attn_metadata.kv_last_page_lens = kv_last_page_lens
+                        cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
+                        kv_indptr[1 : bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
+                        positions = torch.gather(positions, 0, last_token_indices)
+                        context.is_prefill = False
+
+                    # update metadata
+                    attn_metadata.max_seqlen_k += 1
+                    workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
+                        bs,
+                        attn_metadata.max_seqlen_q,
+                        attn_metadata.max_seqlen_k,
+                        only_update=do_attn_metadata_update,
+                        num_reject_tokens=num_reject_tokens if i == 0 else None,
+                    )
+                    for k, v in workinfos.items():
+                        attn_metadata.__dict__[k] = v
+                    slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
+                    input_ids = new_draft_ids
+                    positions += 1
+                    hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]

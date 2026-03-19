@@ -1,5 +1,10 @@
 <div align="center" id="logo">
 <img src="docs/assets/atom_logo.png" alt="logo" width="400" margin="10px"></img>
+
+[![CI](https://github.com/ROCm/ATOM/actions/workflows/atom-test.yaml/badge.svg)](https://github.com/ROCm/ATOM/actions/workflows/atom-test.yaml)
+[![Benchmark](https://github.com/ROCm/ATOM/actions/workflows/atom-benchmark.yaml/badge.svg)](https://github.com/ROCm/ATOM/actions/workflows/atom-benchmark.yaml)
+[![Dashboard](https://img.shields.io/badge/Performance-Dashboard-blue)](https://rocm.github.io/ATOM/benchmark-dashboard/)
+
 </div>
 
 --------------------------------------------------------------------------------
@@ -23,10 +28,11 @@
 | [Llama](https://huggingface.co/meta-llama) | `LlamaForCausalLM` | Dense | Llama 2, Llama 3, Llama 3.1 |
 | [Qwen3](https://huggingface.co/Qwen) | `Qwen3ForCausalLM` | Dense | |
 | [Qwen3-MoE](https://huggingface.co/Qwen) | `Qwen3MoeForCausalLM` | MoE | 128 experts, top-8 routing |
+| [Qwen3-Next](https://huggingface.co/Qwen) | `Qwen3NextForCausalLM` | MoE | Hybrid full attention + Gated DeltaNet |
 | [DeepSeek V2/V3](https://huggingface.co/deepseek-ai) | `DeepseekV3ForCausalLM` | MoE | MLA attention, MTP speculative decoding |
 | [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1) | `MixtralForCausalLM` | MoE | 8 experts, top-2 routing |
 | [GLM-4-MoE](https://huggingface.co/THUDM) | `Glm4MoeForCausalLM` | MoE | |
-| [GLM-5](https://huggingface.co/zai-org/GLM-5-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA attention, similar to DeepSeek v3.2. See [recipe](recipes/GLM-5.md) |
+| [GLM-5](https://huggingface.co/zai-org/GLM-5-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA attention, similar to DeepSeek V3.2. See [recipe](recipes/GLM-5.md) |
 | [GPT-OSS](https://huggingface.co/openai) | `GptOssForCausalLM` | MoE | Sliding window + attention sinks |
 | [Kimi-K2](https://huggingface.co/moonshotai/Kimi-K2-Thinking) | via `--trust-remote-code` | MoE | See [recipe](recipes/Kimi-K2-Thinking.md) |
 
@@ -88,27 +94,6 @@ pip install amd-aiter
 git clone https://github.com/ROCm/ATOM.git && pip install ./ATOM
 ```
 
-## 📚 Documentation
-
-**Full documentation: [rocm.github.io/ATOM](https://rocm.github.io/ATOM)**
-
-| **Topic** | **Description** | **Guide** |
-|---|---|---|
-| Architecture | System overview, request lifecycle, component design | [Architecture Guide](docs/architecture_guide.md) |
-| Configuration | Config classes, CLI arguments, environment variables | [Configuration Guide](docs/configuration_guide.md) |
-| Model Support | Supported models, weight loading, adding new architectures | [Model Support Guide](docs/model_support_guide.md) |
-| Model Operations | AITER kernel integration, linear/attention/MoE/norm wrappers | [Model Ops Guide](docs/model_ops_guide.md) |
-| Scheduling & KV Cache | Batch scheduling, block allocation, prefix caching | [Scheduling Guide](docs/scheduling_kv_cache_guide.md) |
-| Compilation | torch.compile levels, CUDA graphs, piecewise compilation | [Compilation Guide](docs/compilation_cudagraph_guide.md) |
-| Distributed | Tensor/data/expert parallelism, multi-GPU deployment | [Distributed Guide](docs/distributed_guide.md) |
-| Serving & Benchmarks | OpenAI API server, benchmarking, profiling, speculative decoding | [Serving Guide](docs/serving_benchmarking_guide.md) |
-
-**Deployment Recipes:**
-
-- [Qwen3-235B-A22B](recipes/Qwen3-235b.md) -- TP8 + EP with FP8 KV cache
-- [Kimi-K2-Thinking](recipes/Kimi-K2-Thinking.md) -- MXFP4 MoE on 4 GPUs
-- [GLM-5](recipes/GLM-5.md) -- FP8 MoE with MLA on 8 GPUs
-
 ## 💡 Usage
 
 ### Basic Example
@@ -131,125 +116,134 @@ python -m atom.entrypoints.openai_server --model Qwen/Qwen3-0.6B --kv_cache_dtyp
 
 # Multi-GPU with tensor parallelism
 python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8
+
+# With MTP speculative decoding
+python -m atom.entrypoints.openai_server --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8 \
+  --method mtp --num-speculative-tokens 3
 ```
 
-### Profiling
+## 📊 Performance
 
-Profile offline inference:
+### Live Benchmark Dashboard
 
-```bash
-python -m atom.examples.profile_offline --model Qwen/Qwen3-0.6B --kv_cache_dtype fp8
-```
+**[rocm.github.io/ATOM/benchmark-dashboard](https://rocm.github.io/ATOM/benchmark-dashboard/)**
 
-With custom input/output lengths:
+The dashboard tracks nightly performance across models and configurations:
 
-```bash
-python -m atom.examples.profile_offline --model Qwen/Qwen3-0.6B --kv_cache_dtype fp8 \
-  --random-input --input-length 1024 --output-length 32
-```
+- **Interactive vs Throughput** — tok/s/user vs tok/s/gpu tradeoff across concurrency levels
+- **Throughput & Latency trends** — Output throughput, TTFT, TPOT over time, grouped by model
+- **Regression detection** — Automatic alerts when throughput drops >5% or latency increases >10%
+- **Profiler trace collection** — On regression, automatically re-runs with PyTorch profiler and uploads traces
 
-Profile a running server:
+Models tracked: DeepSeek-R1-0528 (BF16 & MTP3), GLM-5-FP8, gpt-oss-120b
 
-```bash
-curl -s -S -X POST http://127.0.0.1:8000/start_profile
-# ... run your workload ...
-curl -s -S -X POST http://127.0.0.1:8000/stop_profile
-```
+### Online Serving Throughput
+
+![DS R1 Performance](./docs/assets/ds_r1_performance.png)
+
+For more information, visit [InferenceX](https://inferencex.semianalysis.com/).
 
 ### Benchmarking
 
 Run an online throughput benchmark against a running server:
 
 ```bash
-MODEL=deepseek-ai/DeepSeek-R1
-ISL=1024
-OSL=1024
-CONC=128
-PORT=8000
-RESULT_FILENAME=Deepseek-R1-result
-
 python -m atom.benchmarks.benchmark_serving \
-  --model=$MODEL --backend=vllm --base-url=http://localhost:$PORT \
+  --model=deepseek-ai/DeepSeek-R1 --backend=vllm --base-url=http://localhost:8000 \
   --dataset-name=random \
-  --random-input-len=$ISL --random-output-len=$OSL \
-  --random-range-ratio 0.8 \
-  --num-prompts=$(( $CONC * 10 )) \
-  --max-concurrency=$CONC \
+  --random-input-len=1024 --random-output-len=1024 \
+  --random-range-ratio=0.8 \
+  --num-prompts=1280 --max-concurrency=128 \
   --request-rate=inf --ignore-eos \
-  --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
-  --result-dir=./ --result-filename=$RESULT_FILENAME.json
+  --save-result --percentile-metrics="ttft,tpot,itl,e2el"
 ```
 
-### Profile Analyze
+### Profiling & Trace Analysis
 
-ATOM supports automatic trace collection and analysis, which breaks down GPU kernel durations per module for both **prefill** and **decode** phases and exports the results to Excel (`.xlsx`) files.
+#### Collect a Trace
 
-#### Step 1: Collect a Trace
-
-Launch the server with `--torch-profiler-dir` to enable the PyTorch profiler and `--mark-trace` to insert per-module annotations into the trace. Set `TORCHINDUCTOR_COMPILE_THREADS=1` to ensure deterministic compilation order.
+Launch the server with `--torch-profiler-dir` and `--mark-trace`:
 
 ```bash
-TORCHINDUCTOR_COMPILE_THREADS=1 python -m atom.entrypoints.openai_server \
-  --model deepseek-ai/DeepSeek-R1 \
-  --kv_cache_dtype fp8 -tp 8 \
-  --torch-profiler-dir ./trace \
-  --mark-trace
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-R1 --kv_cache_dtype fp8 -tp 8 \
+  --torch-profiler-dir ./trace --mark-trace
 ```
 
-After the server processes requests and shuts down, two `*.json.gz` trace files will be generated in the `--torch-profiler-dir` directory.
-
-#### Step 2: Analyze the Trace
-
-Run `parse_trace.py` on the collected trace file(use it on trace file start with the model name):
+Collect traces via benchmark `--profile` flag (auto start/stop):
 
 ```bash
-python ATOM/tools/parse_trace.py ./trace/model_name_ts_*.json.gz
+python -m atom.benchmarks.benchmark_serving \
+  --model=deepseek-ai/DeepSeek-R1 --backend=vllm --base-url=http://localhost:8000 \
+  --dataset-name=random --random-input-len=1024 --random-output-len=1024 \
+  --num-prompts=128 --max-concurrency=128 \
+  --request-rate=inf --ignore-eos --profile
 ```
 
-This produces two Excel files in the current directory:
+Or control profiling manually on a running server:
 
-| Output File | Description |
+```bash
+curl -X POST http://127.0.0.1:8000/start_profile
+# ... run your workload ...
+curl -X POST http://127.0.0.1:8000/stop_profile
+```
+
+#### Analyze the Trace
+
+```bash
+# Kernel breakdown per layer → Excel
+python tools/parse_trace.py ./trace/rank_0/DeepSeek-R1_ts_*.json.gz --layer 3
+
+# Performance summary → Markdown report
+python tools/analyze_trace_summary.py ./trace/rank_0/DeepSeek-R1_ts_*.json.gz
+```
+
+| Output | Description |
 |---|---|
-| `prefill_breakdown.xlsx` | Per-kernel duration breakdown for one prefill layer |
-| `decode_breakdown.xlsx` | Per-kernel duration breakdown for one decode layer |
-
-Each file contains columns: `cpu_module`, `gpu_kernel`, `duration_us`, `sum per module`, plus averaged values across layers.
-
-**Options:**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--layer N` | `3` | Target transformer layer index to analyze (0-indexed) |
-
-
-## 📊 Performance
-
-### Online Serving Throughput
-
-![DS R1 Performance](./docs/assets/ds_r1_performance.png)
-
-For more information, visit [InferenceMAX](https://inferencemax.semianalysis.com/).
+| `prefill_breakdown.xlsx` | Per-kernel duration, call count, pct%, module grouping, cross-layer averages |
+| `decode_breakdown.xlsx` | Same for decode phase, with CUDAGraph kernel mapping |
+| `performance_summary.md` | Prefill/decode/draft step timing, iteration breakdown |
 
 ### Accuracy Validation
 
-Install `lm-eval` to test model accuracy:
-
 ```bash
 pip install lm-eval[api]
-```
 
-Start a server, then run the evaluation:
-
-```bash
-python -m atom.entrypoints.openai_server --model meta-llama/Meta-Llama-3-8B --kv_cache_dtype fp8
-```
-
-```bash
+# Start server, then run evaluation
 lm_eval --model local-completions \
-        --model_args model=meta-llama/Meta-Llama-3-8B,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
-        --tasks gsm8k \
-        --num_fewshot 5
+  --model_args model=meta-llama/Meta-Llama-3-8B,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+  --tasks gsm8k --num_fewshot 5
 ```
+
+## 📚 Documentation
+
+**Full documentation: [rocm.github.io/ATOM/docs](https://rocm.github.io/ATOM/docs)**
+
+| Topic | Description | Guide |
+|---|---|---|
+| Architecture | System overview, request lifecycle, component design | [Architecture Guide](docs/architecture_guide.md) |
+| Configuration | Config classes, CLI arguments, environment variables | [Configuration Guide](docs/configuration_guide.md) |
+| Model Support | Supported models, weight loading, adding new architectures | [Model Support Guide](docs/model_support_guide.md) |
+| Model Operations | AITER kernel integration, linear/attention/MoE/norm wrappers | [Model Ops Guide](docs/model_ops_guide.md) |
+| Scheduling & KV Cache | Batch scheduling, block allocation, prefix caching | [Scheduling Guide](docs/scheduling_kv_cache_guide.md) |
+| Compilation | torch.compile levels, CUDA graphs, piecewise compilation | [Compilation Guide](docs/compilation_cudagraph_guide.md) |
+| Distributed | Tensor/data/expert parallelism, multi-GPU deployment | [Distributed Guide](docs/distributed_guide.md) |
+| Serving & Benchmarks | OpenAI API server, benchmarking, profiling, speculative decoding | [Serving Guide](docs/serving_benchmarking_guide.md) |
+| Environment Variables | All `ATOM_*` variable definitions | [Env Vars](docs/environment_variables.md) |
+
+**Deployment Recipes:**
+
+- [DeepSeek-R1](recipes/DeepSeek-R1.md) — BF16/MXFP4 with MTP speculative decoding on 8 GPUs
+- [Qwen3-235B-A22B](recipes/Qwen3-235b.md) — TP8 + EP with FP8 KV cache
+- [Qwen3-Next](recipes/Qwen3-Next.md) — Hybrid GDN + MoE architecture
+- [Kimi-K2-Thinking](recipes/Kimi-K2-Thinking.md) — MXFP4 MoE on 4 GPUs
+- [GLM-5](recipes/GLM-5.md) — FP8 MoE with MLA on 8 GPUs
+- [GPT-OSS-120B](recipes/GPT-OSS.md) — Single GPU or DP+EP on 2 GPUs
+
+**Framework Integration:**
+
+- [vLLM Plugin Backend](recipes/vLLM-ATOM-OOT-Plugin-Backend.md) — ATOM as out-of-tree plugin for vLLM
+- [SGLang Model Backend](recipes/SGLang-ATOM-Model-Impl-Backend.md) — ATOM as model implementation backend for SGLang
 
 ## Acknowledgements
 

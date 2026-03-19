@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  ATOM_BASE_NIGTHLY_IMAGE: rocm/atom-dev:latest
+  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -40,13 +40,13 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         if: ${{ !github.event.pull_request.head.repo.fork }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Generate Dockerfile
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
+          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -90,7 +90,7 @@ jobs:
         run: |
           IMAGE_TAG=rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           docker tag atom_test:ci $IMAGE_TAG
-          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
           docker push $IMAGE_TAG
 
       - name: Clean up build images
@@ -152,16 +152,14 @@ jobs:
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: |
-              ATOM_GPT_OSS_MODEL=1
+            env_vars: ""
             accuracy_test_threshold: "0.38"
             runner: linux-atom-mi355-1
             run_on_pr: true
           - model_name: "gpt-oss-120b (2 GPUs)"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
-            env_vars: |
-              ATOM_GPT_OSS_MODEL=1
+            env_vars: ""
             accuracy_test_threshold: "0.38"
             runner: linux-atom-mi355-4
             run_on_pr: false
@@ -223,18 +221,18 @@ jobs:
 
       - name: Checkout ATOM repo
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       
       - name: Docker Login
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && !github.event.pull_request.head.repo.fork
         run: |
-          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Generate Dockerfile for forked repo
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && github.event.pull_request.head.repo.fork
         run: |
           cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_NIGTHLY_IMAGE }}
+          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -451,7 +449,7 @@ jobs:
 
       - name: Upload output
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.model_name }}_atom_test_output.txt
           path: atom_test_output.txt
@@ -470,3 +468,4 @@ jobs:
           docker rm "$CONTAINER_NAME" || true
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
+

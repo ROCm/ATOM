@@ -331,7 +331,10 @@ class LinearBase(nn.Module):
             and loaded_weight.numel() == param.data.numel()
         ):
             loaded_weight = loaded_weight.reshape(param.data.shape)
-        param.data.copy_(loaded_weight)
+        if param.data.dtype != dtypes.fp4x2:
+            param.data.copy_(loaded_weight)
+        else:
+            param.data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data

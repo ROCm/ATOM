@@ -98,6 +98,108 @@ def find_capture_graph_trace_path(run_trace_path: str) -> Optional[str]:
     return None
 
 
+_LLVM_CXXFILT_PATH: Optional[str] = None
+_DEMANGLE_CACHE: Dict[str, str] = {}
+
+
+def _find_llvm_cxxfilt() -> Optional[str]:
+    """Find llvm-cxxfilt binary (supports HIP/ROCm mangled names)."""
+    global _LLVM_CXXFILT_PATH
+    if _LLVM_CXXFILT_PATH is not None:
+        return _LLVM_CXXFILT_PATH or None
+
+    import shutil
+    import subprocess
+
+    # Check PATH first
+    path = shutil.which("llvm-cxxfilt")
+    if path:
+        _LLVM_CXXFILT_PATH = path
+        return path
+
+    # Check known install paths before resorting to find
+    known_paths = [
+        "/opt/rocm/llvm/bin/llvm-cxxfilt",
+        "/usr/bin/llvm-cxxfilt",
+        "/usr/local/bin/llvm-cxxfilt",
+    ]
+    for p in known_paths:
+        if os.path.isfile(p):
+            _LLVM_CXXFILT_PATH = p
+            return p
+
+    # Fallback: search common locations with depth limit
+    search_dirs = ["/root/.triton/llvm", "/opt/rocm"]
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    "find",
+                    d,
+                    "-maxdepth",
+                    "5",
+                    "-name",
+                    "llvm-cxxfilt",
+                    "-type",
+                    "f",
+                    "-print",
+                    "-quit",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            found = result.stdout.strip()
+            if found:
+                _LLVM_CXXFILT_PATH = found
+                return found
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+
+    _LLVM_CXXFILT_PATH = ""
+    return None
+
+
+def _demangle_batch(names: list[str]) -> None:
+    """Batch demangle C++ mangled names using a single llvm-cxxfilt call."""
+    mangled = [n for n in names if n.startswith("_Z") and n not in _DEMANGLE_CACHE]
+    if not mangled:
+        return
+
+    cxxfilt = _find_llvm_cxxfilt()
+    if not cxxfilt:
+        for n in mangled:
+            _DEMANGLE_CACHE[n] = n
+        return
+
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [cxxfilt],
+            input="\n".join(mangled),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        demangled_list = result.stdout.strip().split("\n")
+        for orig, dem in zip(mangled, demangled_list):
+            _DEMANGLE_CACHE[orig] = dem.strip() if dem.strip() else orig
+    except (subprocess.TimeoutExpired, OSError):
+        for n in mangled:
+            _DEMANGLE_CACHE[n] = n
+
+
+def _demangle_kernel_name(name: str) -> str:
+    """Demangle C++ mangled kernel name (uses cache populated by _demangle_batch)."""
+    if name in _DEMANGLE_CACHE:
+        return _DEMANGLE_CACHE[name]
+    _DEMANGLE_CACHE[name] = name
+    return name
+
+
 def write_breakdown_xlsx(
     output_xlsx: str,
     rows: List[List[Any]],
@@ -106,13 +208,21 @@ def write_breakdown_xlsx(
 ) -> None:
     """
     Write XLSX breakdown with columns:
-    cpu_module, gpu_kernel, duration_us, sum per module,
+    cpu_module, gpu_kernel, duration_us, pct%, sum per module, module_pct%,
     avg duration_us, avg sum per module.
 
-    The 1st/4th columns are merged for contiguous identical modules.
+    Also writes a 'kernel_summary' sheet with aggregated kernel statistics.
+
+    The 1st/5th columns are merged for contiguous identical modules.
     AVG columns are appended to the right in the same table.
     """
     wb = Workbook()
+    # Batch demangle all kernel names upfront (single subprocess call)
+    all_kernels = [r[1] for r in rows]
+    if avg_rows:
+        all_kernels.extend(r[1] for r in avg_rows)
+    _demangle_batch(all_kernels)
+
     ws = wb.active
     ws.title = sheet_name
     ws.append(
@@ -120,11 +230,15 @@ def write_breakdown_xlsx(
             "cpu_module",
             "gpu_kernel",
             "duration_us",
+            "pct%",
             "sum per module",
+            "module_pct%",
             "avg duration_us",
             "avg sum per module",
         ]
     )
+
+    total_duration = sum(float(r[2]) for r in rows) if rows else 0.0
 
     def build_groups(block_rows: List[List[Any]]) -> List[Tuple[int, int, str, float]]:
         groups: List[Tuple[int, int, str, float]] = []
@@ -159,30 +273,75 @@ def write_breakdown_xlsx(
                 avg_sum_by_row[i] = total
 
     data_start_row = ws.max_row + 1
-    for gi, (start, end, _, total) in enumerate(main_groups):
+    for gi, (start, end, _, mod_total) in enumerate(main_groups):
         renamed_mod = renamed_group_mods[gi]
+        mod_pct = (mod_total / total_duration * 100) if total_duration > 0 else 0
         for idx in range(start, end + 1):
             _, kernel, dur = rows[idx]
+            dur_f = float(dur)
+            pct = (dur_f / total_duration * 100) if total_duration > 0 else 0
             avg_dur = (
                 float(avg_rows[idx][2]) if avg_rows and idx < len(avg_rows) else ""
             )
             avg_sum = avg_sum_by_row.get(idx, "")
-            ws.append([renamed_mod, kernel, dur, total, avg_dur, avg_sum])
+            ws.append(
+                [
+                    renamed_mod,
+                    _demangle_kernel_name(kernel),
+                    dur,
+                    round(pct, 1),
+                    mod_total,
+                    round(mod_pct, 1),
+                    avg_dur,
+                    avg_sum,
+                ]
+            )
 
     for start, end, _, _ in main_groups:
         if end > start:
             r1 = data_start_row + start
             r2 = data_start_row + end
             ws.merge_cells(start_row=r1, start_column=1, end_row=r2, end_column=1)
-            ws.merge_cells(start_row=r1, start_column=4, end_row=r2, end_column=4)
+            ws.merge_cells(start_row=r1, start_column=5, end_row=r2, end_column=5)
+            ws.merge_cells(start_row=r1, start_column=6, end_row=r2, end_column=6)
             if avg_rows:
-                ws.merge_cells(start_row=r1, start_column=6, end_row=r2, end_column=6)
+                ws.merge_cells(start_row=r1, start_column=8, end_row=r2, end_column=8)
 
-    total_duration = sum(float(r[2]) for r in rows) if rows else 0.0
     total_avg_duration = sum(float(r[2]) for r in avg_rows) if avg_rows else ""
-    ws.append(["TOTAL", "", total_duration, "", total_avg_duration, ""])
+    ws.append(["TOTAL", "", total_duration, 100.0, "", 100.0, total_avg_duration, ""])
+
+    # --- Kernel Summary Sheet ---
+    if rows:
+        _write_kernel_summary_sheet(wb, rows, total_duration)
 
     wb.save(output_xlsx)
+
+
+def _write_kernel_summary_sheet(
+    wb: "Workbook",
+    rows: List[List[Any]],
+    total_duration: float,
+) -> None:
+    """Write a kernel_summary sheet: aggregated stats by kernel name."""
+    ws = wb.create_sheet("kernel_summary")
+    ws.append(["gpu_kernel", "calls", "total_duration_us", "avg_duration_us", "pct%"])
+
+    kernel_stats: Dict[str, List[float]] = {}
+    for _, kernel, dur in rows:
+        short_name = _demangle_kernel_name(kernel)
+        kernel_stats.setdefault(short_name, []).append(float(dur))
+
+    # Sort by total duration descending
+    sorted_kernels = sorted(kernel_stats.items(), key=lambda x: sum(x[1]), reverse=True)
+
+    for kernel_name, durations in sorted_kernels:
+        total_dur = sum(durations)
+        count = len(durations)
+        avg_dur = total_dur / count
+        pct = (total_dur / total_duration * 100) if total_duration > 0 else 0
+        ws.append(
+            [kernel_name, count, round(total_dur, 3), round(avg_dur, 3), round(pct, 1)]
+        )
 
 
 def _normalize_module_for_avg(name: str) -> str:
@@ -352,13 +511,12 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
     """
     Parse prefill phase from a run trace (no warmup mixed in this trace).
     """
-    # CPU side prefill/decode annotations.
-    # Accept both legacy "prefill" and traced variants like
-    # "prefill_bs_1_ctxlens_tensor([417], ...)".
+    # CPU side prefill annotations.
+    # Matches "prefill[bs=1 tok=115 ctx=115]" format.
     prefills = [
         e
         for e in events
-        if (e.get("name") == "prefill" or e.get("name", "").startswith("prefill_bs_"))
+        if e.get("name", "").startswith("prefill[")
         and e.get("ph") == "X"
         and e.get("cat") == "user_annotation"
     ]
@@ -513,7 +671,11 @@ def clean_module_name(name: str, mapped_kernel_name: str = "") -> str:
         "",
         "N/A",
     ):
-        name = mapped_kernel_name
+        name = _demangle_kernel_name(mapped_kernel_name)
+
+    # Demangle mangled C++ names
+    if name.startswith("_Z"):
+        name = _demangle_kernel_name(name)
 
     # Remove 'aiter::' prefix if present
     if name.startswith("aiter::"):
@@ -640,41 +802,38 @@ def parse_decode(
 ) -> None:
     """
     Parse decode phase:
-    - use run trace for first decode_step and real kernel timings
+    - use run trace for first decode and real kernel timings
     - use capture trace for capture_graph module hierarchy
 
     Output CSV columns: cpu_module, gpu_kernel, duration_us
     """
     print("Building event index...")
 
-    # Find GPU-annotated decode_step events (cat='gpu_user_annotation')
-    decode_steps = [
+    # Find GPU-annotated decode events (cat='gpu_user_annotation')
+    decodes = [
         e
         for e in run_events
-        if e.get("name", "").startswith("decode_step")
+        if e.get("name", "").startswith("decode[")
         and e.get("ph") == "X"
         and e.get("cat") == "gpu_user_annotation"
     ]
-    decode_steps = sorted(decode_steps, key=lambda x: x["ts"])
+    decodes = sorted(decodes, key=lambda x: x["ts"])
 
-    if not decode_steps:
-        print("No decode_step (gpu_user_annotation) events found.")
+    if not decodes:
+        print("No decode (gpu_user_annotation) events found.")
         return
 
-    first_ds = decode_steps[0]
+    first_ds = decodes[0]
     first_ds_name = first_ds.get("name", "")
     target_bs: Optional[int] = None
-    if "_bs_" in first_ds_name:
-        bs = first_ds_name.split("_bs_")[-1]
-        target_cg_name = f"capture_graph_bs_{bs}"
-        try:
-            target_bs = int(bs)
-        except ValueError:
-            target_bs = None
+    bs_match = re.search(r"bs=(\d+)", first_ds_name)
+    if bs_match:
+        target_bs = int(bs_match.group(1))
+        target_cg_name = f"capture_graph_bs_{target_bs}"
     else:
         target_cg_name = "capture_graph"
 
-    print(f"First decode_step: {first_ds_name}")
+    print(f"First decode: {first_ds_name}")
     print(f"Looking for: {target_cg_name}")
 
     # Find matching capture_graph
@@ -733,7 +892,7 @@ def parse_decode(
     print(f"Events in capture_graph: {len(cg_events)}")
     idx = EventIndex(cg_events)
 
-    # Get GPU kernels from first decode_step (within its duration)
+    # Get GPU kernels from first decode (within its duration)
     ds1_start = first_ds["ts"]
     ds1_end = ds1_start + first_ds.get("dur", 0)
 
@@ -743,7 +902,7 @@ def parse_decode(
         if e.get("cat") == "kernel" and ds1_start <= e["ts"] <= ds1_end
     ]
     gpu_kernels = sorted(gpu_kernels, key=lambda x: x["ts"])
-    print(f"First decode_step (tid={first_ds.get('tid')}): {first_ds_name}")
+    print(f"First decode (tid={first_ds.get('tid')}): {first_ds_name}")
     print(
         f"  Range: {ds1_start:.0f} ~ {ds1_end:.0f} (dur={first_ds.get('dur', 0):.0f})"
     )
