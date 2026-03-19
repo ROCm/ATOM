@@ -36,7 +36,7 @@ on:
         type: boolean
         default: false
       build_oot_image:
-        description: "Build OOT vLLM image"
+        description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT)"
         type: boolean
         default: false
       oot_base_image:
@@ -165,7 +165,7 @@ jobs:
           docker push rocm/atom-dev:${TAG}
 
       - name: Build OOT Docker image
-        if: ${{ success() && inputs.build_oot_image == true }}
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true) }}
         timeout-minutes: 180
         run: |
           if [ -n "${{ inputs.oot_base_image }}" ]; then
@@ -186,7 +186,7 @@ jobs:
           docker inspect atom_oot_release:ci
 
       - name: Push OOT Docker image
-        if: ${{ success() && inputs.build_oot_image == true }}
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true) }}
         run: |
           VLLM_VER="${{ inputs.vllm_version || env.VLLM_VERSION }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
