@@ -4,17 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]  # Triggers on PRs targeting `main`
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
-  schedule:
-    # Nightly at 00:00 Beijing time (16:00 UTC)
-    - cron: '0 16 * * *'
+
   workflow_dispatch:
+  schedule:
+    - cron: '0 22 * * *'  # 6:00 AM Beijing Time (UTC+8)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
