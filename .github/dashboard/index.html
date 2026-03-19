@@ -119,7 +119,7 @@
        TABLES — Conditional Formatting
        ============================================================ */
     .perf-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .table-watermark { position: relative; overflow-x: auto; max-width: 100%; }
+    .table-watermark { position: relative; }
     .perf-table th { text-align: left; padding: 8px 10px; border-bottom: 2px solid var(--border); color: var(--text-tertiary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; position: sticky; top: var(--header-h, 52px); background: var(--bg-secondary); z-index: 10; }
     .perf-table th.num { text-align: right; }
     .perf-table td { padding: 7px 10px; border-bottom: 1px solid var(--border-light); }
@@ -776,6 +776,7 @@ function renderActiveTab() {
     case 'trends': renderTrendsTab(); break;
     case 'data': renderDataTab(); break;
   }
+  requestAnimationFrame(updateHeaderHeight);
 }
 
 /* ================================================================
