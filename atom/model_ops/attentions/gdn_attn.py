@@ -7,7 +7,7 @@ from typing import Type
 import numpy as np
 import torch
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_gdn import GatedDetlaNet
+from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, Context
 
@@ -24,8 +24,8 @@ class GDNAttentionBackend(AiterBackend):
         return GDNAttentionMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["GatedDetlaNet"]:
-        return GatedDetlaNet
+    def get_impl_cls() -> Type["GatedDeltaNet"]:
+        return GatedDeltaNet
 
 
 @dataclass

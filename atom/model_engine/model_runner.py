@@ -170,6 +170,8 @@ class tokenIDProcessor:
         self.mapped_bonus_list: Optional[list[int]] = (
             None  # Mapped to current batch order
         )
+        self.num_rejected: Optional[np.ndarray] = None
+        self.num_bonus: Optional[np.ndarray] = None
 
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
@@ -745,20 +747,46 @@ class ModelRunner:
         if self.rank == 0:
             logger.info(*args)
 
+    def _run_dummy_drafter(self, hidden_states, draft_bs=None):
+        """Run drafter forward for DP synchronization (no real proposal)."""
+        if not hasattr(self, "drafter"):
+            return
+        forward_context = get_forward_context()
+        forward_context.context.is_draft = True
+        if draft_bs is None:
+            draft_bs = forward_context.context.graph_bs
+        for i in range(self.drafter.mtp_k):
+            hidden_states = self.drafter.model(
+                input_ids=torch.zeros(
+                    hidden_states.shape[0],
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                positions=torch.zeros(
+                    hidden_states.shape[0],
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                hidden_states=hidden_states,
+            )
+            if i == 0:
+                hidden_states = hidden_states[:draft_bs]
+
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
-        num_tokens_original = 1
+        # num_tokens_original = 1
+        mtp_factor = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
+        num_tokens_original = mtp_factor
 
         seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
-        bs = 1
 
         dummy_batch = ScheduledBatch(
             seqs={seq.id: seq},
             num_scheduled_tokens=np.array([num_tokens_original], dtype=np.int32),
-            total_tokens_num=num_tokens_original,  # original value
+            total_tokens_num=num_tokens_original,
             total_tokens_num_decode=num_tokens_original,
             total_seqs_num=1,
             total_seqs_num_decode=1,
@@ -766,34 +794,26 @@ class ModelRunner:
         )
 
         bs = self.prepare_inputs(dummy_batch)
-        actual_num_tokens = dummy_batch.total_tokens_num
-
-        # self.tokenID_processor.input_ids.np[:actual_num_tokens] = [0] * actual_num_tokens
-        # self.tokenID_processor.input_ids.copy_to_gpu(actual_num_tokens)
-        # input_ids = self.tokenID_processor.input_ids.gpu[:actual_num_tokens]
-        # input_ids = torch.zeros(actual_num_tokens, dtype=torch.int32, device=self.device)
         self.forward_vars["input_ids"].gpu[:bs].zero_()
         input_ids = self.forward_vars["input_ids"].gpu[:bs]
 
-        self.run_model(input_ids)
+        logits, hidden_states = self.run_model(input_ids)
+        self._run_dummy_drafter(hidden_states)
 
         reset_forward_context()
         logger.debug(
-            f"{self.label}: dummy batch executed with {actual_num_tokens} tokens"
+            f"{self.label}: dummy batch executed with {dummy_batch.total_tokens_num} tokens"
         )
         return True
 
     def dummy_prefill_execution(self, num_tokens: int):
-        """
-        Execute dummy prefill batch for DP synchronization.
-        """
+        """Execute dummy prefill batch for DP synchronization."""
         if num_tokens <= 0:
             num_tokens = 1
         seq = Sequence([0] * num_tokens, block_size=self.block_size)
-        seqs = {seq.id: seq}
 
         dummy_batch = ScheduledBatch(
-            seqs=seqs,
+            seqs={seq.id: seq},
             num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
             total_tokens_num=num_tokens,
             total_tokens_num_prefill=num_tokens,
@@ -803,21 +823,14 @@ class ModelRunner:
         )
 
         bs = self.prepare_inputs(dummy_batch)
-
-        # self.tokenID_processor.input_ids.np[:num_tokens] = [0] * num_tokens
-        # self.tokenID_processor.input_ids.copy_to_gpu(num_tokens)
-        # input_ids = self.tokenID_processor.input_ids.gpu[:num_tokens]
-        # input_ids= torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
         self.forward_vars["input_ids"].gpu[:bs].zero_()
         input_ids = self.forward_vars["input_ids"].gpu[:bs]
 
-        # not exe run_model and synchronize: acc 0.79
-
         with torch.no_grad():
-            self.run_model(input_ids)
+            logits, hidden_states = self.run_model(input_ids)
+            self._run_dummy_drafter(hidden_states, draft_bs=1)
 
         torch.cuda.synchronize()
-
         reset_forward_context()
 
         logger.info(
@@ -1441,7 +1454,7 @@ class ModelRunner:
         actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
-        if not is_prefill and hasattr(self, "drafter"):
+        if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
             scheduled_bs = batch.total_seqs_num_decode
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
                 num_scheduled_tokens[:scheduled_bs],

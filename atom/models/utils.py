@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from typing import TypeVar
 from typing import (
     Dict,
     List,
@@ -8,13 +10,17 @@ from typing import (
     Tuple,
     Union,
 )
-
+from contextlib import contextmanager
+from typing_extensions import overload
 import torch
+import torch.nn as nn
+from torch.nn.modules.module import register_module_module_registration_hook
 import os
 
 
 import logging
 
+T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +45,26 @@ class PPMissingLayer(torch.nn.Identity):
         """
         input = args[0] if args else next(iter(kwargs.values()))
         return (input,) if self.return_tuple else input
+
+
+class StageMissingLayer(nn.Module):
+    def __init__(self, stage_name: str, module: nn.Module | None = None) -> None:
+        super().__init__()
+
+        self.stage_name = stage_name
+
+        # Don't register this as a child module in order to
+        # avoid missing keys when loading weights
+        self.__dict__["module"] = module
+
+    def __getattr__(self, name: str):
+        return getattr(self.__dict__["module"], name)
+
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError(f"{self} should not be called")
+
+    def extra_repr(self) -> str:
+        return f"stage_name={self.stage_name!r}"
 
 
 def get_pp_indices(
@@ -266,3 +292,105 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
             else int_vals[0]
         )
         return layer_index
+
+
+@contextmanager
+def collect_children(
+    module: nn.Module,
+    *,
+    targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
+):
+    """
+    Within this context, collect all direct child assignments to `module`,
+    returning a list of children names that is internally updated until the
+    context is exited.
+
+    If `targets` is set, instead collect descendents of `module`
+    that are an instance of `targets`, even if they aren't direct children.
+    """
+    children_names = list[str]()
+
+    if targets is None:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if module_ is module:
+                children_names.append(name)
+
+        with register_module_module_registration_hook(hook):
+            yield children_names
+    else:
+        yield children_names
+
+        for name, module_ in module.named_modules():
+            if isinstance(module_, targets):
+                children_names.append(name)
+
+
+@contextmanager
+def no_init_weights(
+    module: nn.Module,
+    placeholder: Callable[[nn.Module], nn.Module],
+    *,
+    targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
+):
+    """
+    Within this context, prevent weight initialization from using device memory and
+    replace direct child assignments to `module` with the result of `placeholder()`.
+
+    If `targets` is set, instead prevent weight initialization and
+    replace assignments where the child is an instance of `targets`,
+    even if they aren't direct children of `module`.
+    """
+    if targets is None:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if module_ is module:
+                return placeholder(submodule)
+
+            return submodule
+
+        with register_module_module_registration_hook(hook), torch.device("meta"):
+            yield
+    else:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if isinstance(module_, targets):
+                submodule.to("meta")  # Free memory
+            if isinstance(submodule, targets):
+                submodule.to("meta")  # Free memory
+                return placeholder(submodule)
+
+            return submodule
+
+        # Not all descendents are targeted, so we can't use a blanket
+        # `torch.device("meta")` context
+        with register_module_module_registration_hook(hook):
+            yield
+
+
+@overload
+def common_prefix(items: Sequence[str]) -> str: ...
+
+
+@overload
+def common_prefix(items: Sequence[Sequence[T]]) -> Sequence[T]: ...
+
+
+def common_prefix(items: Sequence[Sequence[T] | str]) -> Sequence[T] | str:
+    """Find the longest prefix common to all items."""
+    if len(items) == 0:
+        return []
+    if len(items) == 1:
+        return items[0]
+
+    shortest = min(items, key=len)
+    if not shortest:
+        return shortest[:0]
+
+    for match_len in range(1, len(shortest) + 1):
+        match = shortest[:match_len]
+        for item in items:
+            if item[:match_len] != match:
+                return shortest[: match_len - 1]
+
+    return shortest

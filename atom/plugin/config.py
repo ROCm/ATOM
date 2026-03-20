@@ -21,6 +21,7 @@ class PluginConfig:
     is_sglang: bool = False
 
     # vllm specific
+    vllm_config: Any = None
     vllm_scheduler_config: Any = None
     vllm_cache_config: Any = None
     vllm_quant_config: Any = None
@@ -68,6 +69,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         is_vllm=True,
         is_sglang=False,
         # vllm specific
+        vllm_config=config,
         vllm_scheduler_config=vllm_scheduler_config,
         vllm_cache_config=vllm_cache_config,
         vllm_quant_config=vllm_quant_config,

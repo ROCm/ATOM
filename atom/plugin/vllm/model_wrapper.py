@@ -11,6 +11,9 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import (
     SupportsPP,
     SupportsQuant,
+    SupportsMultiModal,
+    SupportsMRoPE,
+    MultiModalEmbeddings,
 )
 from vllm.model_executor.models.interfaces_base import (
     VllmModel,
@@ -33,6 +36,8 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "GptOssForCausalLM": "atom.models.gpt_oss:GptOssForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
 }
 
 
@@ -154,3 +159,47 @@ class ATOMForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...
 
 
 class ATOMMoEForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...
+
+
+class ATOMForConditionalGeneration(
+    ATOMModelBase, VllmModelForTextGeneration, SupportsMultiModal, SupportsMRoPE
+):
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        """
+        Get the placeholder text for the `i`th `modality` item in the prompt.
+        """
+        raise NotImplementedError
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        return self.model.embed_multimodal(**kwargs)
+
+    def configure_mm_token_handling(self, vocab_size, mm_token_ids):
+        return self.model.configure_mm_token_handling(vocab_size, mm_token_ids)
+
+    def get_language_model(self):
+        return self.model.get_language_model()
+
+    def get_num_mm_encoder_tokens(self, num_image_tokens):
+        return self.model.get_num_mm_encoder_tokens(num_image_tokens)
+
+    def get_num_mm_connector_tokens(self, num_vision_tokens):
+        return self.model.get_num_mm_connector_tokens(num_vision_tokens)
+
+    def embed_input_ids(
+        self, input_ids, multimodal_embeddings=None, *, is_multimodal=None
+    ):
+        return self.model.embed_input_ids(
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
+
+    def _embed_text_input_ids(self, input_ids, embed_input_ids, *, is_multimodal):
+        return self.model._embed_text_input_ids(
+            input_ids, embed_input_ids, is_multimodal=is_multimodal
+        )
+
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        return self.model.get_mrope_input_positions(input_tokens, mm_features)

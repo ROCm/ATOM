@@ -85,7 +85,7 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils.decorators import support_torch_compile
+from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
@@ -279,6 +279,7 @@ def _fused_rms_fp8_group_quant(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
+@mark_trace(prefix="rmsnorm_quant", torch_compile=True)
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -517,6 +518,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
+@mark_trace(prefix="qkv_a_proj_reduce_rmsnorm", torch_compile=True)
 @torch_compile_guard(
     gen_fake=_fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8_fake, mutates_args=[]
 )
@@ -968,10 +970,12 @@ def sparse_attn_indexer(
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
         total_seq_lens = hidden_states.shape[0]
-        k_fp8 = torch.empty(
-            [total_seq_lens, head_dim], device=k.device, dtype=dtypes.fp8
+        # When has_cached, gather full KV (cached + new) for indexer top-k
+        total_kv = (
+            prefill_metadata.total_kv if prefill_metadata.has_cached else total_seq_lens
         )
-        k_scale = torch.empty([total_seq_lens, 1], device=k.device, dtype=torch.float32)
+        k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
+        k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
         if prefill_metadata.block_tables.shape[0] < num_prefills:
             new_shape = (num_prefills, prefill_metadata.block_tables.shape[1])
             prefill_metadata.block_tables = torch.full(
@@ -985,8 +989,11 @@ def sparse_attn_indexer(
             k_fp8,
             k_scale.view(dtypes.fp8),
             prefill_metadata.block_tables,
-            prefill_metadata.cu_seqlens_q,
-            # num_prefills,
+            (
+                prefill_metadata.cu_seqlens_k
+                if prefill_metadata.has_cached
+                else prefill_metadata.cu_seqlens_q
+            ),
         )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke

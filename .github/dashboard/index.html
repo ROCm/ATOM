@@ -26,6 +26,7 @@
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg-primary); color: var(--text-secondary); }
+    body::after { content: ''; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 240px; height: 60px; background: url('atom_logo.png') no-repeat center/contain; opacity: 0.04; pointer-events: none; z-index: 0; }
     .container { max-width: 1440px; margin: 0 auto; padding: var(--gap-lg); }
     a { color: var(--ui-bright); text-decoration: none; }
     a:hover { text-decoration: underline; }
@@ -118,7 +119,11 @@
        TABLES — Conditional Formatting
        ============================================================ */
     .perf-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .perf-table th { text-align: left; padding: 8px 10px; border-bottom: 2px solid var(--border); color: var(--text-tertiary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; position: sticky; top: 0; background: var(--bg-secondary); }
+    .table-watermark { position: relative; }
+    .perf-table th { text-align: left; padding: 8px 10px; border-bottom: 2px solid var(--border); color: var(--text-tertiary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; background: var(--bg-secondary); }
+    .floating-header { position: fixed; z-index: 40; background: var(--bg-secondary); border-bottom: 2px solid var(--border); overflow: hidden; display: none; }
+    .floating-header table { border-collapse: collapse; }
+    .floating-header th { text-align: left; padding: 8px 10px; color: var(--text-tertiary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
     .perf-table th.num { text-align: right; }
     .perf-table td { padding: 7px 10px; border-bottom: 1px solid var(--border-light); }
     .perf-table td.num { text-align: right; font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; }
@@ -206,7 +211,7 @@
       .kpi-card .kpi-value { font-size: 22px; }
       .filter-bar { width: 100%; }
       .tabs { overflow-x: auto; }
-      .perf-table { display: block; overflow-x: auto; }
+      .table-watermark { overflow-x: auto; }
       .detail-box { grid-template-columns: 1fr; }
     }
     @media (max-width: 480px) {
@@ -255,8 +260,8 @@
 <!-- Popover -->
 <div class="popover-overlay" id="popover-overlay"><div class="popover" id="popover"></div></div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js" integrity="sha384-y49Zu59jZHJL/PLKgZPv3k2WI9c0Yp3pWB76V8OBVCb0QBKS8l4Ff3YslzHVX76Y" crossorigin="anonymous"></script>
 <script src="data.js"></script>
 <script>
 'use strict';
@@ -298,12 +303,70 @@ function getBarColor(model, conc, concList) {
   return `hsla(${h}, 50%, 72%, ${alpha.toFixed(2)})`;
 }
 
+// Chart color constants (match CSS --text-tertiary / --text-secondary)
+const C_TICK = '#8a8da0';    // axis ticks, labels
+const C_LEGEND = '#9ea0b2';  // legend text, datalabels
+const C_TOOLTIP_BG = '#141519';
+const C_TOOLTIP_BD = '#303140';
+const C_TOOLTIP_TITLE = '#eef0f6';
+const C_TOOLTIP_BODY = '#bfc1d0';
+
 // Register datalabels globally but disable by default
 if (typeof ChartDataLabels !== 'undefined') Chart.register(ChartDataLabels);
 Chart.defaults.plugins.datalabels = { display: false };
-Chart.defaults.color = '#8a8da0';
+Chart.defaults.color = C_TICK;
 Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
 Chart.defaults.font.size = 11;
+
+// Legend hover plugin: fade non-hovered datasets via canvas globalAlpha
+Chart.register({
+  id: 'legendFocus',
+  beforeDatasetDraw(chart, args) {
+    if (chart._legendFocusIndex == null) return;
+    if (args.index !== chart._legendFocusIndex) {
+      chart.ctx.save();
+      chart.ctx.globalAlpha = 0.12;
+    }
+  },
+  afterDatasetDraw(chart, args) {
+    if (chart._legendFocusIndex == null) return;
+    if (args.index !== chart._legendFocusIndex) {
+      chart.ctx.restore();
+    }
+  }
+});
+Chart.defaults.plugins.legend.onHover = function(e, item, legend) {
+  legend.chart._legendFocusIndex = item.datasetIndex;
+  legend.chart.draw();
+  if (e.native?.target) e.native.target.style.cursor = 'pointer';
+};
+Chart.defaults.plugins.legend.onLeave = function(e, item, legend) {
+  legend.chart._legendFocusIndex = null;
+  legend.chart.draw();
+  if (e.native?.target) e.native.target.style.cursor = 'default';
+};
+
+// Watermark plugin: draw ATOM logo as faded background on all charts
+const _watermarkImg = new Image();
+_watermarkImg.src = document.querySelector('.header-logo')?.src || 'atom_logo.png';
+Chart.register({
+  id: 'watermark',
+  beforeDraw(chart) {
+    if (!_watermarkImg.complete || !_watermarkImg.naturalWidth) return;
+    const { ctx, chartArea: area } = chart;
+    if (!area) return;
+    const maxW = (area.right - area.left) * 0.4;
+    const scale = maxW / _watermarkImg.naturalWidth;
+    const w = _watermarkImg.naturalWidth * scale;
+    const h = _watermarkImg.naturalHeight * scale;
+    const x = area.left + (area.right - area.left - w) / 2;
+    const y = area.top + (area.bottom - area.top - h) / 2;
+    ctx.save();
+    ctx.globalAlpha = 0.07;
+    ctx.drawImage(_watermarkImg, x, y, w, h);
+    ctx.restore();
+  }
+});
 
 const REGRESSION_THRESHOLD = 0.05; // 5%
 
@@ -413,6 +476,19 @@ function filteredConfigs() {
 /* ================================================================
    4. UTILITY FUNCTIONS
    ================================================================ */
+// ISL/OSL compact format: "1024/1024" → "1k/1k", "8192/1024" → "8k/1k"
+function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+n / 1024).toPrecision(3)) + 'k' : n); }
+
+// Model family grouping: "DeepSeek-R1-0528-mtp3" → family "DeepSeek-R1-0528", variant "mtp3"
+function modelFamily(name) {
+  const m = name.match(/^([A-Za-z][\w]*(?:-[A-Za-z0-9]+){1,3}?)(?:[-_](?:mtp|MTP|moe|MoE|MXFP|mxfp).*)?$/);
+  return m ? m[1] : name;
+}
+function modelVariant(name) {
+  const fam = modelFamily(name);
+  return name === fam ? 'base' : name.slice(fam.length).replace(/^[-_]+/, '');
+}
+
 function fmtNum(v, dec) { return v != null ? v.toLocaleString(undefined, { minimumFractionDigits: dec, maximumFractionDigits: dec }) : '—'; }
 // Compact format: 13960 → "14.0K", 1350 → "1,350" (only abbreviate ≥ 10K)
 function fmtCompact(v, dec) {
@@ -483,7 +559,7 @@ function avgLinePlugin(avgValue, label, color) {
   };
 }
 function chartTooltipOpts() {
-  return { backgroundColor: '#141519', borderColor: '#303140', borderWidth: 1, titleColor: '#eef0f6', bodyColor: '#bfc1d0', cornerRadius: 6, padding: 12 };
+  return { backgroundColor: C_TOOLTIP_BG, borderColor: C_TOOLTIP_BD, borderWidth: 1, titleColor: C_TOOLTIP_TITLE, bodyColor: C_TOOLTIP_BODY, cornerRadius: 6, padding: 12 };
 }
 
 /* ================================================================
@@ -533,7 +609,7 @@ function renderFilters() {
       <div class="filter-dropdown" id="fd-${d.id}">
         <label><input type="checkbox" value="__all__" ${allSelected ? 'checked' : ''}> All</label>
         <div class="sep"></div>
-        ${d.options.map(o => `<label><input type="checkbox" value="${o}" ${sel.includes(o) ? 'checked' : ''}> ${o}</label>`).join('')}
+        ${d.options.map(o => `<label><input type="checkbox" value="${o}" ${sel.includes(o) ? 'checked' : ''}> ${d.id === 'islOsl' ? fmtIslOsl(o) : o}</label>`).join('')}
       </div>`;
     bar.appendChild(group);
   }
@@ -638,13 +714,13 @@ function renderKPICards() {
       <div class="kpi-label">Peak Total Throughput</div>
       <div class="kpi-value">${peakTput != null ? fmtCompact(peakTput, 0) : '—'} <span class="kpi-unit">tok/s</span></div>
       <div class="kpi-trend">${trendHTML(peakTput, peakTputPrev, false)}</div>
-      <div class="kpi-sub">${peakTputCfg ? peakTputCfg.model + ' ' + peakTputCfg.islOsl + ' c=' + peakTputCfg.conc : ''}</div>
+      <div class="kpi-sub">${peakTputCfg ? peakTputCfg.model + ' ' + fmtIslOsl(peakTputCfg.islOsl) + ' c=' + peakTputCfg.conc : ''}</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Best TPOT (Lowest)</div>
       <div class="kpi-value">${bestTpot != null ? fmtNum(bestTpot, 2) : '—'} <span class="kpi-unit">ms</span></div>
       <div class="kpi-trend">${trendHTML(bestTpot, bestTpotPrev, true)}</div>
-      <div class="kpi-sub">${bestTpotCfg ? bestTpotCfg.model + ' ' + bestTpotCfg.islOsl + ' c=' + bestTpotCfg.conc : ''}</div>
+      <div class="kpi-sub">${bestTpotCfg ? bestTpotCfg.model + ' ' + fmtIslOsl(bestTpotCfg.islOsl) + ' c=' + bestTpotCfg.conc : ''}</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Test Matrix</div>
@@ -703,12 +779,15 @@ function renderActiveTab() {
     case 'trends': renderTrendsTab(); break;
     case 'data': renderDataTab(); break;
   }
+  requestAnimationFrame(setupFloatingHeader);
 }
 
 /* ================================================================
    9. PERFORMANCE TAB
    ================================================================ */
+let _perfChartRAF = null;
 function renderPerformanceTab() {
+  if (_perfChartRAF) { cancelAnimationFrame(_perfChartRAF); _perfChartRAF = null; }
   const container = document.getElementById('tab-performance');
   destroyChartsIn(container);
   const fc = filteredConfigs();
@@ -746,7 +825,7 @@ function renderPerformanceTab() {
     const color = getModelColor(model);
     const concList = [...new Set(modelEntries.map(([, c]) => c.conc))];
     const sortedEntries = modelEntries.sort((a, b) => a[1].islOsl.localeCompare(b[1].islOsl) || a[1].conc - b[1].conc);
-    const mLabels = sortedEntries.map(([, c]) => `${c.islOsl} c=${c.conc}`);
+    const mLabels = sortedEntries.map(([, c]) => `${fmtIslOsl(c.islOsl)} c=${c.conc}`);
     const mValues = sortedEntries.map(([, c]) => c[pm.key] || 0);
     const mBgColors = sortedEntries.map(([, c]) => getBarColor(model, c.conc, concList));
     const mBdColors = sortedEntries.map(([k]) => regressions[k] ? 'rgba(240,85,69,0.8)' : color.border);
@@ -764,7 +843,7 @@ function renderPerformanceTab() {
   html += '</div>';
 
   // --- Table ---
-  html += `<div style="overflow-x:auto"><table class="perf-table"><thead><tr>
+  html += `<div class="table-watermark"><table class="perf-table"><thead><tr>
     <th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th>
     <th class="num">Total Tput (tok/s)</th><th class="num">Output Tput (tok/s)</th>
     <th class="num">Interac.</th>
@@ -792,7 +871,7 @@ function renderPerformanceTab() {
     const modelTextColor = getModelColor(cfg.model).text;
     html += `<tr class="${reg ? 'regression' : ''}" data-key="${key}">
       <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${cfg.model}</td>
-      <td>${cfg.islOsl}</td>
+      <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
       <td class="num">${cfg._gpu_count || '—'}</td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${totalTputPct}%;background:rgba(63,185,80,0.12)"></div><span class="data-bar-text">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</span></td>
@@ -811,7 +890,18 @@ function renderPerformanceTab() {
 
   container.innerHTML = html;
 
-  // Create bar charts (one per model)
+  // Bind table events immediately (fast, no chart rendering)
+  _bindPerfTableEvents(container, byModel);
+
+  // Defer chart creation to next frame so table renders first
+  _perfChartRAF = requestAnimationFrame(() => {
+    _perfChartRAF = null;
+    if (!document.getElementById(Object.values(byModel)[0]?._chartData?.id)) return;
+    _createPerfCharts(byModel, pm);
+  });
+}
+
+function _createPerfCharts(byModel, pm) {
   for (const [model, modelEntries] of Object.entries(byModel)) {
     const cd = modelEntries._chartData;
     if (!cd) continue;
@@ -825,14 +915,15 @@ function renderPerformanceTab() {
         plugins: {
           legend: { display: false },
           tooltip: { ...chartTooltipOpts(), callbacks: {
-            title: (items) => cd.labels[items[0].dataIndex],
-            label: (item) => ` ${fmtNum(item.raw, pm.key === 'TPOT' ? 2 : 1)} ${pm.unit}`
+            title: (items) => model + ' · ' + cd.labels[items[0].dataIndex],
+            label: (item) => ` ${pm.label}: ${fmtNum(item.raw, pm.key === 'TPOT' ? 2 : 1)} ${pm.unit}`,
+            afterBody: () => '\nClick for details'
           }},
-          datalabels: { display: cd.values.length <= 16, color: '#9ea0b2', anchor: 'end', align: 'top', clip: false, font: { size: 10, family: '"SF Mono", monospace' }, formatter: v => fmtCompact(v, pm.key === 'TPOT' ? 2 : 0) }
+          datalabels: { display: cd.values.length <= 16, color: C_LEGEND, anchor: 'end', align: 'top', clip: false, font: { size: 10, family: '"SF Mono", monospace' }, formatter: v => fmtCompact(v, pm.key === 'TPOT' ? 2 : 0) }
         },
         scales: {
-          x: { grid: { display: false }, ticks: { color: '#8a8da0', maxRotation: 45, font: { size: 10 } } },
-          y: { grid: chartGridOpts(), title: { display: true, text: pm.unit, color: '#8a8da0' }, ticks: { color: '#8a8da0' }, grace: '5%' }
+          x: { grid: { display: false }, ticks: { color: C_TICK, maxRotation: 45, font: { size: 10 } } },
+          y: { grid: chartGridOpts(), title: { display: true, text: pm.unit, color: C_TICK }, ticks: { color: C_TICK }, grace: '5%' }
         },
         onClick: (_e, elems) => {
           if (!elems.length) return;
@@ -842,8 +933,9 @@ function renderPerformanceTab() {
       }
     });
   }
+}
 
-  // Table row expand — detail rows stop propagation so clicks inside don't collapse
+function _bindPerfTableEvents(container, byModel) {
   container.querySelectorAll('tr.detail-row').forEach(dr => {
     dr.addEventListener('click', (e) => e.stopPropagation());
   });
@@ -854,16 +946,12 @@ function renderPerformanceTab() {
       if (detail) { detail.classList.toggle('expanded'); row.classList.toggle('row-open'); }
     });
   });
-
-  // Trend jump buttons
   container.querySelectorAll('.trend-jump').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       switchToTrends(btn.dataset.model);
     });
   });
-
-  // Metric selector for bar chart
   container.querySelectorAll('.sel-btn[data-metric]').forEach(btn => {
     btn.addEventListener('click', () => {
       state.perfMetric = btn.dataset.metric;
@@ -932,68 +1020,108 @@ function renderTradeoffTab() {
     }
   }
 
+  // Group models into families
+  const familyMap = {};
+  for (const [, cfg] of entries) {
+    const fam = modelFamily(cfg.model);
+    if (!familyMap[fam]) familyMap[fam] = new Set();
+    familyMap[fam].add(cfg.model);
+  }
+  const tradeoffFamilies = Object.keys(familyMap).sort();
+
   let html = '<div class="chart-grid">';
-
-  // Hero: Interactive vs Token Throughput
-  html += '<div class="chart-card hero"><h3>Interactive Performance vs Token Throughput</h3><div class="chart-wrap"><canvas id="tradeoff-hero"></canvas></div></div>';
-
-  // Tput vs TPOT
-  html += '<div class="chart-card half"><h3>Output Throughput vs TPOT</h3><div class="chart-wrap"><canvas id="tradeoff-tpot"></canvas></div></div>';
-  // Tput vs TTFT
-  html += '<div class="chart-card half"><h3>Output Throughput vs TTFT</h3><div class="chart-wrap"><canvas id="tradeoff-ttft"></canvas></div></div>';
+  for (let fi = 0; fi < tradeoffFamilies.length; fi++) {
+    const fam = tradeoffFamilies[fi];
+    const safeId = fi + '-' + fam.replace(/[^a-zA-Z0-9]/g, '');
+    const famLabel = familyMap[fam].size > 1 ? fam + ' family' : fam;
+    html += `<div class="chart-card half"><h3>${famLabel} — Interactive vs Token Throughput</h3><div class="chart-wrap"><canvas id="hero-${safeId}"></canvas></div></div>`;
+    html += `<div class="chart-card half"><h3>${famLabel} — Concurrency Scaling</h3><div class="chart-wrap"><canvas id="scaling-${safeId}"></canvas></div></div>`;
+  }
   html += '</div>';
   container.innerHTML = html;
 
-  // Hero scatter — sort points by x so connecting lines don't zigzag
-  const heroDS = [];
-  for (const [sKey, s] of Object.entries(seriesMap)) {
-    if (s.points.length === 0) continue;
-    // Sort all parallel arrays by x value
-    const indices = s.points.map((_, i) => i).sort((a, b) => s.points[a].x - s.points[b].x);
-    const sorted = { points: indices.map(i => s.points[i]), concLabels: indices.map(i => s.concLabels[i]), configKeys: indices.map(i => s.configKeys[i]) };
-    const color = getModelColor(s.model);
-    heroDS.push({
-      label: sKey, data: sorted.points, borderColor: color.border, backgroundColor: color.bg,
-      borderWidth: 2, pointRadius: 5, pointHoverRadius: 7, showLine: true, fill: false,
-      _concLabels: sorted.concLabels, _configKeys: sorted.configKeys
-    });
-  }
-  if (heroDS.length) {
-    new Chart(document.getElementById('tradeoff-hero'), {
-      type: 'scatter', data: { datasets: heroDS },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        layout: { padding: { top: 8, right: 12 } },
-        plugins: {
-          legend: { labels: { color: '#9ea0b2', font: { size: 11 }, boxWidth: 12 } },
-          tooltip: { ...chartTooltipOpts(), callbacks: {
-            title: (items) => heroDS[items[0].datasetIndex].label,
-            label: (item) => {
-              const ds = heroDS[item.datasetIndex];
-              const conc = ds._concLabels[item.dataIndex] || '?';
-              return ` c=${conc}: ${(+item.parsed.x).toFixed(1)} tok/s/user, ${(+item.parsed.y).toFixed(0)} tok/s/gpu`;
-            },
-            afterBody: () => '\nClick to trace →'
-          }}
-        },
-        scales: {
-          x: { grid: chartGridOpts(), title: { display: true, text: 'Interactive (tok/s/user = 1000/TPOT)', color: '#9ea0b2' }, ticks: { color: '#8a8da0' }, grace: '5%' },
-          y: { grid: chartGridOpts(), title: { display: true, text: 'Token Throughput (tok/s/gpu)', color: '#9ea0b2' }, ticks: { color: '#8a8da0' }, grace: '5%' }
-        },
-        onClick: (_e, elems) => {
-          if (!elems.length) return;
-          const ds = heroDS[elems[0].datasetIndex];
-          const key = ds._configKeys?.[elems[0].index];
-          if (key) { const cfg = latestConfigs[key]; if (cfg) showPopover(key, cfg); }
-        }
-      }
-    });
-  }
+  // Per-family charts (e.g. DeepSeek base + mtp3 in same chart)
+  for (let fi = 0; fi < tradeoffFamilies.length; fi++) {
+    const fam = tradeoffFamilies[fi];
+    const safeId = fi + '-' + fam.replace(/[^a-zA-Z0-9]/g, '');
+    const famModels = [...familyMap[fam]].sort();
+    const famConfigs = {};
+    for (const [key, cfg] of entries) {
+      if (famModels.includes(cfg.model)) famConfigs[key] = cfg;
+    }
 
-  // Tput vs TPOT scatter
-  buildSimpleScatter('tradeoff-tpot', fc, 'throughput', 'TPOT', 'Output Throughput (tok/s)', 'TPOT (ms)');
-  // Tput vs TTFT scatter
-  buildSimpleScatter('tradeoff-ttft', fc, 'throughput', 'TTFT', 'Output Throughput (tok/s)', 'TTFT (ms)');
+    // Interactive vs Token Throughput scatter — all variants in one chart
+    const heroDS = [];
+    for (const [sKey, s] of Object.entries(seriesMap)) {
+      if (!famModels.includes(s.model) || s.points.length === 0) continue;
+      const indices = s.points.map((_, i) => i).sort((a, b) => s.points[a].x - s.points[b].x);
+      const color = getModelColor(s.model);
+      heroDS.push({
+        label: modelVariant(s.model) + ' ' + fmtIslOsl(sKey.split(' ').slice(1).join(' ')), data: indices.map(i => s.points[i]),
+        borderColor: color.border, backgroundColor: color.bg,
+        borderWidth: 2, pointRadius: 5, pointHoverRadius: 7, showLine: true, fill: false,
+        _concLabels: indices.map(i => s.concLabels[i]), _configKeys: indices.map(i => s.configKeys[i])
+      });
+    }
+    heroDS.sort((a, b) => a.label.localeCompare(b.label));
+    const heroConcPlugin = {
+      id: 'heroConcLabels_' + safeId,
+      afterDatasetsDraw(chart) {
+        const ctx = chart.ctx;
+        ctx.save();
+        ctx.font = '8px -apple-system, sans-serif';
+        const focus = chart._legendFocusIndex;
+        chart.data.datasets.forEach((ds, di) => {
+          if (!ds._concLabels) return;
+          const meta = chart.getDatasetMeta(di);
+          ctx.globalAlpha = (focus != null && focus !== di) ? 0.12 : 1;
+          ctx.fillStyle = ds.borderColor;
+          meta.data.forEach((pt, pi) => {
+            if (ds.data[pi] == null) return;
+            ctx.fillText('c' + ds._concLabels[pi], pt.x + 5, pt.y - 5);
+          });
+        });
+        ctx.restore();
+      }
+    };
+    if (heroDS.length) {
+      new Chart(document.getElementById('hero-' + safeId), {
+        type: 'scatter', data: { datasets: heroDS },
+        plugins: [heroConcPlugin],
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          layout: { padding: { top: 8, right: 12 } },
+          plugins: {
+            legend: heroDS.length <= 8 ? { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } } : { display: false },
+            tooltip: { ...chartTooltipOpts(), callbacks: {
+              title: (items) => {
+                const ds = heroDS[items[0].datasetIndex];
+                return ds.label + ' · c=' + (ds._concLabels[items[0].dataIndex] || '?');
+              },
+              label: (item) => [
+                ` Interactive:  ${fmtNum(item.parsed.x, 1)} tok/s/user`,
+                ` Token Tput:   ${fmtNum(item.parsed.y, 0)} tok/s/gpu`,
+              ],
+              afterBody: () => '\nClick for details'
+            }}
+          },
+          scales: {
+            x: { grid: chartGridOpts(), title: { display: true, text: 'Interactive (tok/s/user)', color: C_TICK }, ticks: { color: C_TICK }, grace: '5%' },
+            y: { grid: chartGridOpts(), title: { display: true, text: 'Token Tput (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '5%' }
+          },
+          onClick: (_e, elems) => {
+            if (!elems.length) return;
+            const ds = heroDS[elems[0].datasetIndex];
+            const key = ds._configKeys?.[elems[0].index];
+            if (key) { const cfg = latestConfigs[key]; if (cfg) showPopover(key, cfg); }
+          }
+        }
+      });
+    }
+
+    // Concurrency Scaling — all variants in one chart
+    buildConcurrencyScaling('scaling-' + safeId, famConfigs, fam, famModels);
+  }
 }
 
 function buildSimpleScatter(canvasId, configs, xMetric, yMetric, xLabel, yLabel) {
@@ -1022,19 +1150,118 @@ function buildSimpleScatter(canvasId, configs, xMetric, yMetric, xLabel, yLabel)
       responsive: true, maintainAspectRatio: false,
       layout: { padding: { top: 8, right: 12 } },
       plugins: {
-        legend: { labels: { color: '#9ea0b2', font: { size: 10 }, boxWidth: 10 } },
+        legend: datasets.length <= 8 ? { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } } : { display: false },
         tooltip: { ...chartTooltipOpts(), callbacks: {
           title: (items) => datasets[items[0].datasetIndex].label,
           label: (item) => {
             const ds = datasets[item.datasetIndex];
             return ` c=${ds._concLabels[item.dataIndex] || '?'}: ${xLabel.split(' ')[0]}=${(+item.parsed.x).toFixed(1)}, ${yLabel.split(' ')[0]}=${(+item.parsed.y).toFixed(2)}`;
           },
-          afterBody: () => '\nClick to view details →'
+          afterBody: () => '\nClick for details'
         }}
       },
       scales: {
-        x: { grid: chartGridOpts(), title: { display: true, text: xLabel, color: '#8a8da0' }, ticks: { color: '#8a8da0' }, grace: '5%' },
-        y: { grid: chartGridOpts(), title: { display: true, text: yLabel, color: '#8a8da0' }, ticks: { color: '#8a8da0' }, grace: '5%' }
+        x: { grid: chartGridOpts(), title: { display: true, text: xLabel, color: C_TICK }, ticks: { color: C_TICK }, grace: '5%' },
+        y: { grid: chartGridOpts(), title: { display: true, text: yLabel, color: C_TICK }, ticks: { color: C_TICK }, grace: '5%' }
+      },
+      onClick: (_e, elems) => {
+        if (!elems.length) return;
+        const ds = datasets[elems[0].datasetIndex];
+        const key = ds._configKeys?.[elems[0].index];
+        if (key) { const cfg = latestConfigs[key]; if (cfg) showPopover(key, cfg); }
+      }
+    }
+  });
+}
+
+function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
+  // Group by model+ISL/OSL, dual metric: throughput (left Y) + TPOT (right Y)
+  if (!famModels) famModels = [familyName];
+  const byKey = {}; // key: "model|islOsl"
+  for (const [key, cfg] of Object.entries(configs)) {
+    const sKey = `${cfg.model}|${cfg.islOsl}`;
+    if (!byKey[sKey]) byKey[sKey] = { model: cfg.model, islOsl: cfg.islOsl, tputPoints: [], tpotPoints: [], tputKeys: [], tpotKeys: [] };
+    if (cfg.throughput != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg.throughput }); byKey[sKey].tputKeys.push(key); }
+    if (cfg.TPOT != null) { byKey[sKey].tpotPoints.push({ x: cfg.conc, y: cfg.TPOT }); byKey[sKey].tpotKeys.push(key); }
+  }
+
+  const datasets = [];
+  const seriesKeys = Object.keys(byKey).sort();
+  const dashPatterns = [[], [6, 3], [2, 2], [8, 4, 2, 4]];
+
+  for (let i = 0; i < seriesKeys.length; i++) {
+    const s = byKey[seriesKeys[i]];
+    const dash = dashPatterns[i % dashPatterns.length];
+    const h = getModelHue(s.model);
+    const variantLabel = famModels.length > 1 ? `${modelVariant(s.model)} ${fmtIslOsl(s.islOsl)}` : fmtIslOsl(s.islOsl);
+    // Throughput: use model color
+    if (s.tputPoints.length) {
+      const sorted = s.tputPoints.map((_, j) => j).sort((a, b) => s.tputPoints[a].x - s.tputPoints[b].x);
+      datasets.push({
+        label: `${variantLabel} Tput`, data: sorted.map(j => s.tputPoints[j]),
+        borderColor: `hsl(${h}, 55%, 65%)`, backgroundColor: `hsla(${h}, 55%, 65%, 0.1)`,
+        borderWidth: 2, borderDash: dash, pointRadius: 4, pointHoverRadius: 6,
+        showLine: true, fill: false, tension: 0.2, yAxisID: 'y',
+        _configKeys: sorted.map(j => s.tputKeys[j])
+      });
+    }
+    // TPOT: use hue-shifted color
+    if (s.tpotPoints.length) {
+      const sorted = s.tpotPoints.map((_, j) => j).sort((a, b) => s.tpotPoints[a].x - s.tpotPoints[b].x);
+      datasets.push({
+        label: `${variantLabel} TPOT`, data: sorted.map(j => s.tpotPoints[j]),
+        borderColor: `hsl(${(h + 120) % 360}, 45%, 65%)`, backgroundColor: `hsla(${(h + 120) % 360}, 45%, 65%, 0.1)`,
+        borderWidth: 2, borderDash: dash, pointRadius: 3, pointHoverRadius: 5,
+        showLine: true, fill: false, tension: 0.2, yAxisID: 'y2',
+        pointStyle: 'triangle',
+        _configKeys: sorted.map(j => s.tpotKeys[j])
+      });
+    }
+  }
+  if (!datasets.length) return;
+
+  // Concurrency values for x-axis ticks
+  const allConcs = [...new Set(Object.values(byKey).flatMap(s => [...s.tputPoints, ...s.tpotPoints].map(p => p.x)))].sort((a, b) => a - b);
+
+  new Chart(document.getElementById(canvasId), {
+    type: 'scatter', data: { datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      layout: { padding: { top: 8, right: 8 } },
+      plugins: {
+        legend: datasets.length <= 8 ? { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10, usePointStyle: true } } : { display: false },
+        tooltip: { ...chartTooltipOpts(), callbacks: {
+          title: (items) => {
+            const ds = datasets[items[0].datasetIndex];
+            return ds.label.replace(/ (Tput|TPOT)$/, '') + ' · c=' + items[0].parsed.x;
+          },
+          label: (item) => {
+            const isTPOT = item.dataset.yAxisID === 'y2';
+            return isTPOT
+              ? ` TPOT:        ${fmtNum(item.parsed.y, 2)} ms`
+              : ` Throughput:  ${fmtNum(item.parsed.y, 1)} tok/s`;
+          },
+          afterBody: () => '\nClick for details'
+        }}
+      },
+      scales: {
+        x: {
+          type: 'logarithmic',
+          grid: chartGridOpts(),
+          title: { display: true, text: 'Concurrency', color: C_TICK },
+          ticks: { color: C_TICK, callback: function(v) { return allConcs.includes(v) ? v : ''; } },
+          afterBuildTicks: function(axis) { axis.ticks = allConcs.map(v => ({ value: v })); }
+        },
+        y: {
+          position: 'left', grid: chartGridOpts(),
+          title: { display: true, text: 'Throughput (tok/s)', color: C_TICK },
+          ticks: { color: C_TICK }, grace: '5%'
+        },
+        y2: {
+          position: 'right', grid: { drawOnChartArea: false },
+          title: { display: true, text: 'TPOT (ms)', color: C_TICK },
+          ticks: { color: C_TICK }, grace: '5%'
+        }
       },
       onClick: (_e, elems) => {
         if (!elems.length) return;
@@ -1123,7 +1350,7 @@ function renderTrendsTab() {
       // Respect global ISL/OSL and Concurrency filters
       if (!state.filters.islOsl.includes(parts[1])) continue;
       if (!state.filters.conc.includes(+parts[2])) continue;
-      const seriesLabel = parts[1] + ' c=' + parts[2];
+      const seriesLabel = fmtIslOsl(parts[1]) + ' c=' + parts[2];
       const color = getModelColor(state.trendModel);
       // Use hue variation for different configs of same model
       const hueShift = (parseInt(parts[2]) * 37) % 60 - 30;
@@ -1143,9 +1370,15 @@ function renderTrendsTab() {
         label: seriesLabel, data,
         borderColor: color.border, backgroundColor: color.bg,
         borderWidth: 2, pointRadius: 3, pointHoverRadius: 5, fill: false, spanGaps: true, tension: 0.1,
-        _configKey: key, _pointMap: pointMap
+        _configKey: key, _pointMap: pointMap, _conc: parts[2]
       });
     }
+
+    // Sort by ISL/OSL then concurrency (numeric)
+    datasets.sort((a, b) => {
+      const ka = a._configKey.split('|'), kb = b._configKey.split('|');
+      return ka[1].localeCompare(kb[1]) || (+ka[2]) - (+kb[2]);
+    });
 
     if (datasets.length === 0) {
       card.innerHTML += '<div class="chart-empty">No historical data for this model and metric.</div>';
@@ -1158,27 +1391,63 @@ function renderTrendsTab() {
       card.insertBefore(note, wrap);
     }
 
+    // Plugin: draw concurrency labels at last data point (Total Tput only)
+    const concLabelPlugin = met.key === 'Total Tput' && datasets.length <= 12 ? {
+      id: 'concLabels_' + Math.random(),
+      afterDatasetsDraw(chart) {
+        const ctx = chart.ctx;
+        ctx.save();
+        ctx.font = '9px -apple-system, sans-serif';
+        ctx.textAlign = 'left';
+        const focus = chart._legendFocusIndex;
+        chart.data.datasets.forEach((ds, di) => {
+          if (!ds._conc) return;
+          const meta = chart.getDatasetMeta(di);
+          ctx.globalAlpha = (focus != null && focus !== di) ? 0.12 : 1;
+          // Find last visible (non-null) point
+          for (let i = meta.data.length - 1; i >= 0; i--) {
+            if (ds.data[i] != null) {
+              const pt = meta.data[i];
+              ctx.fillStyle = ds.borderColor;
+              ctx.fillText('c' + ds._conc, pt.x + 6, pt.y + 3);
+              break;
+            }
+          }
+        });
+        ctx.restore();
+      }
+    } : null;
+
     new Chart(canvas, {
       type: 'line', data: { labels: orderedLabels, datasets },
+      plugins: concLabelPlugin ? [concLabelPlugin] : [],
       options: {
         responsive: true, maintainAspectRatio: false,
-        layout: { padding: { top: 8 } },
+        layout: { padding: { top: 8, right: concLabelPlugin ? 50 : 8 } },
         plugins: {
           legend: datasets.length <= 8
-            ? { labels: { color: '#9ea0b2', font: { size: 10 }, boxWidth: 10 } }
+            ? { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } }
             : { display: false },
           tooltip: { ...chartTooltipOpts(), callbacks: {
             title: (items) => {
+              const ds = items[0].dataset;
               const lbl = orderedLabels[items[0].dataIndex];
-              return (labelToCid[lbl] || '') + ' · ' + fmtDate(commitDateMap[lbl]);
+              return ds.label + ' · ' + (labelToCid[lbl] || '');
             },
-            label: (item) => ' ' + item.dataset.label + ': ' + fmtNum(item.raw, 2) + ' ' + met.unit,
-            afterBody: () => '\nClick to trace →'
-          }}
+            label: (item) => {
+              const lbl = orderedLabels[item.dataIndex];
+              return [
+                ` ${met.title}:  ${fmtNum(item.raw, met.key === 'TPOT' ? 2 : 1)} ${met.unit}`,
+                ` Date:  ${fmtDate(commitDateMap[lbl])}`
+              ];
+            },
+            afterBody: () => '\nClick to trace'
+          }},
+          datalabels: { display: false }
         },
         scales: {
-          x: { grid: chartGridOpts(), title: { display: true, text: 'Commit', color: '#8a8da0' }, ticks: { color: '#8a8da0' } },
-          y: { grid: chartGridOpts(), title: { display: true, text: met.unit, color: '#8a8da0' }, ticks: { color: '#8a8da0' } }
+          x: { grid: chartGridOpts(), title: { display: true, text: 'Commit', color: C_TICK }, ticks: { color: C_TICK } },
+          y: { grid: chartGridOpts(), title: { display: true, text: met.unit, color: C_TICK }, ticks: { color: C_TICK } }
         },
         onClick: (_e, elems) => {
           if (!elems.length) return;
@@ -1270,7 +1539,7 @@ function renderDataTab() {
 }
 
 function renderDataTable() {
-  let html = `<div style="overflow-x:auto"><table class="perf-table"><thead><tr>
+  let html = `<div class="table-watermark"><table class="perf-table"><thead><tr>
     <th>Date</th><th>Commit</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th>
     <th class="num">Throughput (tok/s)</th><th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th><th>Run</th>
   </tr></thead><tbody>`;
@@ -1287,7 +1556,7 @@ function renderDataTable() {
         <td>${fmtDate(cfg.date)}</td>
         <td><a href="${cfg.commit.url || '#'}" target="_blank">${commitId}</a></td>
         <td class="model-name" style="color:${getModelColor(cfg.model).text}">${cfg.model}</td>
-        <td>${cfg.islOsl}</td>
+        <td>${fmtIslOsl(cfg.islOsl)}</td>
         <td class="num">${cfg.conc}</td>
         <td class="num">${cfg._gpu_count || '—'}</td>
         <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
@@ -1336,13 +1605,13 @@ function renderTimeline() {
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td class="model-name" style="color:${getModelColor(cfg.model).text}">${cfg.model}</td><td>${cfg.islOsl}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td>
+        <td class="model-name" style="color:${getModelColor(cfg.model).text}">${cfg.model}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td>
         <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
       </tr>`;
     }
-    html += '</tbody></table></div></div>';
+    html += '</tbody></table></div></div></div>';
   }
   html += '</div>';
   return html;
@@ -1398,7 +1667,7 @@ function showPopover(key, cfg) {
 
   const pop = document.getElementById('popover');
   pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
-    <h3>${cfg.model} ${cfg.islOsl} c=${cfg.conc}</h3>
+    <h3>${cfg.model} ${fmtIslOsl(cfg.islOsl)} c=${cfg.conc}</h3>
     <div class="pop-row"><span class="pop-key">Total Throughput</span><span class="pop-val">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) + ' tok/s ' + trendHTML(cfg['Total Tput'], prev?.['Total Tput'], false) : '—'}</span></div>
     <div class="pop-row"><span class="pop-key">Output Throughput</span><span class="pop-val">${fmtNum(cfg.throughput, 1)} tok/s ${trendHTML(cfg.throughput, prev?.throughput, false)}</span></div>
     <div class="pop-row"><span class="pop-key">TPOT</span><span class="pop-val">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) + ' ms ' + trendHTML(cfg.TPOT, prev?.TPOT, true) : '—'}</span></div>
@@ -1477,6 +1746,72 @@ readFromHash();
 renderFilters();
 renderKPICards();
 renderActiveTab();
+
+// Floating table header — works regardless of overflow-x on ancestors
+let _floatingEl = null;
+let _floatingCleanup = null;
+function setupFloatingHeader() {
+  // Clean up previous listeners
+  if (_floatingCleanup) { _floatingCleanup(); _floatingCleanup = null; }
+  if (_floatingEl) { _floatingEl.remove(); _floatingEl = null; }
+  // Find the visible main table (Performance or Data tab)
+  const table = document.querySelector('.tab-content.active .perf-table');
+  if (!table) return;
+  const thead = table.querySelector('thead');
+  if (!thead) return;
+
+  const headerH = document.querySelector('header')?.offsetHeight || 52;
+  const wrapper = table.closest('.table-watermark');
+
+  function onScroll() {
+    const tableRect = table.getBoundingClientRect();
+    const wrapperRect = wrapper ? wrapper.getBoundingClientRect() : tableRect;
+    const theadRect = thead.getBoundingClientRect();
+    const tbodyEnd = table.querySelector('tbody')?.getBoundingClientRect().bottom || tableRect.bottom;
+    const shouldShow = tableRect.top < headerH && tbodyEnd > headerH + 40;
+
+    if (shouldShow) {
+      if (!_floatingEl) {
+        _floatingEl = document.createElement('div');
+        _floatingEl.className = 'floating-header';
+        document.body.appendChild(_floatingEl);
+      }
+      // Clone thead and sync column widths
+      const ths = thead.querySelectorAll('th');
+      const cloneTable = document.createElement('table');
+      cloneTable.className = 'perf-table';
+      const cloneThead = thead.cloneNode(true);
+      cloneThead.querySelectorAll('th').forEach((th, i) => {
+        th.style.width = ths[i].offsetWidth + 'px';
+        th.style.minWidth = ths[i].offsetWidth + 'px';
+      });
+      cloneTable.appendChild(cloneThead);
+      _floatingEl.innerHTML = '';
+      _floatingEl.appendChild(cloneTable);
+      _floatingEl.style.display = 'block';
+      _floatingEl.style.top = headerH + 'px';
+      _floatingEl.style.left = wrapperRect.left + 'px';
+      _floatingEl.style.width = wrapperRect.width + 'px';
+      // Sync horizontal scroll
+      if (wrapper && wrapper.scrollLeft) {
+        cloneTable.style.marginLeft = -wrapper.scrollLeft + 'px';
+      }
+    } else if (_floatingEl) {
+      _floatingEl.style.display = 'none';
+    }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  if (wrapper) wrapper.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll, { passive: true });
+  // Store cleanup
+  _floatingCleanup = () => {
+    window.removeEventListener('scroll', onScroll);
+    window.removeEventListener('resize', onScroll);
+    if (wrapper) wrapper.removeEventListener('scroll', onScroll);
+    if (_floatingEl) { _floatingEl.remove(); _floatingEl = null; }
+  };
+  onScroll();
+}
 
 // Browser back/forward — re-apply hash state (skip if we triggered it ourselves)
 window.addEventListener('hashchange', () => {

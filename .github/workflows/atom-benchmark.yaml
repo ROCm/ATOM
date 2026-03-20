@@ -18,6 +18,10 @@ on:
         description: "Benchmark GLM-5-FP8"
         type: boolean
         default: true
+      deepseek-r1-0528-mxfp4:
+        description: "Benchmark DeepSeek-R1-0528 MXFP4-MTP3"
+        type: boolean
+        default: true
       gpt-oss-120b:
         description: "Benchmark gpt-oss-120b"
         type: boolean
@@ -134,6 +138,7 @@ jobs:
             # Note: inputs are boolean; "|| 'true'" would swallow explicit false
             case "${{ matrix.model.prefix }}" in
               deepseek-r1-0528) echo "enabled=${{ inputs.deepseek-r1-0528 }}" >> $GITHUB_OUTPUT ;;
+              deepseek-r1-0528-mxfp4) echo "enabled=${{ inputs.deepseek-r1-0528-mxfp4 }}" >> $GITHUB_OUTPUT ;;
               glm-5-fp8) echo "enabled=${{ inputs.glm-5-fp8 }}" >> $GITHUB_OUTPUT ;;
               gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> $GITHUB_OUTPUT ;;
               *) echo "enabled=true" >> $GITHUB_OUTPUT ;;
@@ -555,14 +560,22 @@ jobs:
           echo "=== Regression re-run complete: $((TOTAL_COUNT - FAIL_COUNT))/$TOTAL_COUNT succeeded ==="
           [ "$FAIL_COUNT" -gt 0 ] && echo "::warning::$FAIL_COUNT/$TOTAL_COUNT configs failed"
 
-      - name: Copy and upload profiler traces
+      - name: Copy profiler traces from container
+        id: copy-traces
         if: always()
         run: |
           docker cp atom-regression:/app/trace ./regression-traces 2>/dev/null || echo "No traces found"
-          ls -lhR ./regression-traces/ 2>/dev/null || true
+          TRACE_COUNT=$(find ./regression-traces -type f \( -name "*.json.gz" -o -name "*.pt.trace.*" \) 2>/dev/null | wc -l | tr -d ' ')
+          echo "trace_count=$TRACE_COUNT" >> $GITHUB_OUTPUT
+          if [ "$TRACE_COUNT" -gt 0 ]; then
+            echo "Found $TRACE_COUNT trace files"
+            ls -lhR ./regression-traces/
+          else
+            echo "::warning::No trace files found in container — profiler may not have produced output"
+          fi
 
       - name: Upload regression traces
-        if: always()
+        if: always() && fromJSON(steps.copy-traces.outputs.trace_count) > 0
         uses: actions/upload-artifact@v7
         with:
           name: regression-traces-${{ github.run_id }}
@@ -591,6 +604,7 @@ jobs:
       - name: Download regression traces
         if: needs.regression-rerun.result == 'success'
         uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
           name: regression-traces-${{ github.run_id }}
           path: profiler-traces/
@@ -598,6 +612,7 @@ jobs:
       - name: Download benchmark profiler traces
         if: needs.regression-rerun.result != 'success'
         uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
           pattern: profiler-traces-*
           merge-multiple: true

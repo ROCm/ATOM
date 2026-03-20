@@ -26,7 +26,25 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
+  check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: Check Pre Checkin Signal
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download and check pre-checkin signal
+        run: bash ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   atom-vllm-oot:
+    needs: [check-signal]
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: ATOM vLLM OOT Test
     strategy:
@@ -56,7 +74,7 @@ jobs:
             docker kill $containers || true
           fi
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
@@ -120,7 +138,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             "$OOT_IMAGE_TAG" \
-            bash -lc "pytest -q tests/plugin"
+            bash -lc "pytest -q tests/plugin -o cache_dir=/tmp/.pytest_cache"
 
       - name: Prepare model cache mount
         run: |

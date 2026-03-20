@@ -74,41 +74,40 @@ RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && 
 
 CMD ["/bin/bash"]
 
-FROM ${BASE_IMAGE} AS atom_image
+# ====================================================================
+# ATOM image: multi-stage parallel build
+#
+# BuildKit runs independent stages in parallel:
+#   base ──┬── build_mori   ──┐
+#          ├── build_rccl   ──┤
+#          ├── build_triton ──┼── atom_image (merge + ATOM install)
+#          └── build_aiter  ──┘
+# ====================================================================
+
+# --------------------------------------------------------------------
+# Stage 0: Common base (apt + pip foundations, shared by all builders)
+# --------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS base
 
 ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
-ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
-ARG ATOM_COMMIT="HEAD"
-ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="HEAD"
+
+RUN pip install --upgrade pip && \
+    apt-get update && \
+    apt --fix-broken install -y && \
+    apt-get install -y \
+        git cython3 ibverbs-utils openmpi-bin libopenmpi-dev \
+        libpci-dev cmake libdw1 locales && \
+    rm -rf /var/lib/apt/lists/*
+
+# --------------------------------------------------------------------
+# Stage 1: MORI — parallel
+# --------------------------------------------------------------------
+FROM base AS build_mori
 ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
-ARG PREBUILD_KERNELS=1
-ARG MAX_JOBS
 
-RUN pip install --upgrade pip
-
-RUN pip install lm-eval[api]
-
-RUN pip show lm-eval || true
-
-# Install MORI (Modular RDMA Interface)
-# https://github.com/ROCm/mori
-RUN apt-get update && apt --fix-broken install -y
-
-RUN apt-get update && apt-get install -y \
-    git \
-    cython3 \
-    ibverbs-utils \
-    openmpi-bin \
-    libopenmpi-dev \
-    libpci-dev \
-    cmake \
-    libdw1 \
-    locales
-
-RUN rm -rf /app/mori && \
+RUN echo "========== [Parallel] Building MORI ==========" && \
     git clone https://github.com/ROCm/mori.git /app/mori && \
     cd /app/mori && \
     git checkout $MORI_COMMIT && \
@@ -116,62 +115,90 @@ RUN rm -rf /app/mori && \
     git submodule update --init --recursive && \
     python setup.py install
 
-RUN pip show mori || true
-
-
-# Update RCCL
+# --------------------------------------------------------------------
+# Stage 2: RCCL — parallel
+# --------------------------------------------------------------------
+FROM base AS build_rccl
 ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
 ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
-ARG RCCL_SRC_DIR="/app/rccl/"
-RUN pip install cmake
 
-RUN rm -rf $RCCL_SRC_DIR && \
-    git clone "$RCCL_REPO" $RCCL_SRC_DIR \
-    && cd $RCCL_SRC_DIR \
-    && git checkout "$RCCL_BRANCH" \
-    && ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
+RUN echo "========== [Parallel] Building RCCL ==========" && \
+    pip install cmake && \
+    git clone "$RCCL_REPO" /app/rccl && \
+    cd /app/rccl && \
+    git checkout "$RCCL_BRANCH" && \
+    ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
 
-RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all $RCCL_SRC_DIR/build/release/*.deb && rm -rf $RCCL_SRC_DIR/build
+# --------------------------------------------------------------------
+# Stage 3: Triton — parallel
+# --------------------------------------------------------------------
+FROM base AS build_triton
 
-# Update Triton
-RUN pip show triton || true
-
-RUN pip uninstall -y triton
-
-RUN rm -rf /triton-test && \
-    git clone --depth=1 --branch release/internal/3.5.x https://github.com/ROCm/triton.git /triton-test && \
+RUN echo "========== [Parallel] Building Triton ==========" && \
+    pip uninstall -y triton && \
+    git clone --depth=1 --branch release/internal/3.5.x \
+        https://github.com/ROCm/triton.git /triton-test && \
     cd /triton-test && \
     pip install -r python/requirements.txt && \
     pip install filecheck && \
     MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
 
-RUN pip show triton || true
+# --------------------------------------------------------------------
+# Stage 4: Aiter — parallel
+# --------------------------------------------------------------------
+FROM base AS build_aiter
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT="HEAD"
+ARG PREBUILD_KERNELS=1
+ARG MAX_JOBS
 
-# Install Aiter
-RUN mkdir -p /app
-
-RUN pip uninstall -y aiter || true
-
-RUN rm -rf /app/aiter-test && \
-    git clone $AITER_REPO /app/aiter-test && \
+RUN echo "========== [Parallel] Building Aiter ==========" && \
+    git clone --depth 1 $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
     git submodule sync && git submodule update --init --recursive && \
-    MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+    MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
+    GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 
-RUN pip show amd-aiter || true
+# --------------------------------------------------------------------
+# Stage 5: Final merge — collect all build artifacts + install ATOM
+# --------------------------------------------------------------------
+FROM base AS atom_image
+ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
+ARG ATOM_COMMIT="HEAD"
 
+# pip packages (lm-eval is lightweight, install directly)
+RUN pip install lm-eval[api]
 
-# Install ATOM
-RUN pip uninstall -y atom || true
+# MORI: copy installed package from build stage
+COPY --from=build_mori /opt/venv /opt/venv
+COPY --from=build_mori /app/mori /app/mori
+RUN pip show mori || true
 
-RUN rm -rf /app/ATOM && \
-    git clone $ATOM_REPO /app/ATOM && \
+# RCCL: install .deb from build stage
+COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
+RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
+    rm -rf /tmp/rccl
+
+# Triton: copy package from build stage into current venv
+# Use RUN --mount to avoid COPY glob issues, and preserve mori already in venv
+RUN --mount=from=build_triton,source=/opt/venv/lib/python3.12/site-packages,target=/triton-pkgs \
+    cp -a /triton-pkgs/triton /opt/venv/lib/python3.12/site-packages/ && \
+    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.12/site-packages/ && \
+    pip show triton
+
+# Aiter: copy compiled source tree + re-register editable install
+# (pip install -e creates egg-link automatically, no need to COPY them)
+COPY --from=build_aiter /app/aiter-test /app/aiter-test
+RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
+    pip show amd-aiter
+
+# ATOM: lightweight install (no compilation needed)
+RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     pip install -e .
-
 RUN pip show atom || true
 
 CMD ["/bin/bash"]

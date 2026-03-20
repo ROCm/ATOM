@@ -19,7 +19,7 @@ from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
-from atom.plugin import is_plugin_mode
+from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 
 logger = logging.getLogger("atom")
@@ -257,7 +257,9 @@ class LayerQuantConfig(dict):
         quant_type=QuantType.No,
         quant_dtype=torch.bfloat16,
         is_dynamic=True,
-        quant_method="",
+        quant_method=None,
+        exclude_layers: Optional[list[str]] = None,
+        packed_modules_mapping=None,
     ):
         """
         Core components of layer_quant
@@ -267,10 +269,12 @@ class LayerQuantConfig(dict):
         self["quant_dtype"] = quant_dtype if quant_dtype is not None else torch.bfloat16
         self["is_dynamic"] = is_dynamic
         self["quant_method"] = quant_method
+        self["exclude_layers"] = exclude_layers if exclude_layers is not None else []
+        self["packed_modules_mapping"] = packed_modules_mapping
 
 
 class QuantizationConfig:
-    def __init__(self, config: PretrainedConfig = None):
+    def __init__(self, config: PretrainedConfig = None, maybe_vllm_config=None):
         if config is None:
             self.torch_dtype = torch.bfloat16
             self.hf_quant_config = None
@@ -278,6 +282,7 @@ class QuantizationConfig:
             self.layer_quant_config = {}
             self.exclude_layers = []
             self.quant_method = ""
+            self.maybe_vllm_config = None
             return
 
         self.torch_dtype = getattr(config, "torch_dtype", torch.bfloat16)
@@ -285,6 +290,7 @@ class QuantizationConfig:
         self.global_quant_config = None
         self.layer_quant_config = {}
         self.exclude_layers = []
+        self.maybe_vllm_config = maybe_vllm_config
 
         if self.hf_quant_config is None:
             self.global_quant_config = LayerQuantConfig(
@@ -315,6 +321,15 @@ class QuantizationConfig:
             )
         else:
             self.parse_other_config()
+
+        if len(self.exclude_layers) == 0 and maybe_vllm_config is not None:
+            self.exclude_layers = maybe_vllm_config.quant_config.ignored_layers
+        self.packed_modules_mapping = None
+        if maybe_vllm_config is not None:
+            # hf_to_atom_mapper = maybe_vllm_config.quant_config.vllm_hf_mapper
+            self.packed_modules_mapping = (
+                maybe_vllm_config.quant_config.packed_modules_mapping
+            )
 
     def compute_hash(self) -> str:
         """
@@ -473,6 +488,18 @@ class QuantizationConfig:
         self, layer_name: str, ignore_str: str, check_contains: bool = False
     ) -> bool:
         """Match the target string or regular expression"""
+
+        # Replace layer name if packed_modules_mapping is offered
+        proj_name = layer_name.split(".")[-1]
+        if self.packed_modules_mapping is not None:
+            for ori_param, (
+                model_param,
+                shard_id,
+            ) in self.packed_modules_mapping.items():
+                if proj_name in model_param:
+                    layer_name = layer_name.replace(proj_name, ori_param)
+                    break
+
         if ignore_str.startswith("re:"):
             # case "re:model.layers.*self_attn.*", remove the 're:' prefix
             pattern = ignore_str[3:]
@@ -594,7 +621,21 @@ def get_hf_config(model: str) -> PretrainedConfig:
             # code_revision=code_revision,
             token=_get_hf_token(),
         )
-    return AutoConfig.from_pretrained(model)
+    try:
+        hf_config = AutoConfig.from_pretrained(model)
+    except ValueError as e:
+        # For the unsupported model in current transformers, try vllm if in plugin mode
+        if is_vllm():
+            from vllm.transformers_utils.config import get_config
+            from vllm.transformers_utils.gguf_utils import (
+                maybe_patch_hf_config_from_gguf,
+            )
+
+            hf_config = get_config(model, trust_remote_code=True)
+            hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
+        else:
+            raise e
+    return hf_config
 
 
 def get_generation_config(model: str) -> GenerationConfig:
@@ -833,7 +874,10 @@ class Config:
                 eos_ids := getattr(self.generation_config, "eos_token_id", None)
             ) is not None:
                 self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
-        self.quant_config = QuantizationConfig(self.hf_config)
+        self.quant_config = QuantizationConfig(
+            self.hf_config,
+            self.plugin_config.vllm_config if self.plugin_config is not None else None,
+        )
         hf_config_max_position_embeddings = getattr(
             self.hf_config, "max_position_embeddings", 8192
         )

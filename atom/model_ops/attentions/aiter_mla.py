@@ -68,6 +68,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
+
+        max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -77,7 +79,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
             self.max_bs,
-            1,
+            max_seqlen_qo,
             self.padded_num_attention_heads,
             self.dtype_q,
             self.dtype_kv,
@@ -264,13 +266,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         self.block_ratio,
                     )
                     attn_metadata.block_tables = var["block_tables_converted"].gpu[:bs]
-            var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
-                np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
-            )
             counts = var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
-            var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
-                var["cu_seqlens_q"].np[:bs], counts
-            )
+            if attn_metadata.has_cached:
+                # Full context (cached + new): use cu_seqlens_k for indexer
+                var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
+                    var["cu_seqlens_k"].np[:-1], counts
+                )
+                var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = np.repeat(
+                    var["cu_seqlens_k"].np[1:], counts
+                )
+            else:
+                var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
+                    np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
+                )
+                var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
+                    var["cu_seqlens_q"].np[:bs], counts
+                )
             attn_metadata.cu_seqlen_ks = var["cu_seqlen_ks"].copy_to_gpu(
                 sum_scheduled_tokens
             )
@@ -284,9 +295,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 :sum_scheduled_tokens
             ]
 
+            # Per-query req_id: token_id 0..sum_scheduled_tokens-1 maps to batch id.
+            # Use counts (new tokens per batch), not context_lens (full seq len).
             attn_metadata.token_to_seq_idxs = torch.repeat_interleave(
                 torch.arange(bs, dtype=torch.int32, device=self.device),
-                attn_metadata.context_lens,
+                torch.tensor(counts, dtype=torch.int64, device=self.device),
             )
             var["sparse_kv_indptr"].np[0] = 0
             var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
@@ -300,17 +313,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sum_scheduled_tokens + 1
             )
 
-        if hasattr(self.model_runner, "drafter"):
+        if hasattr(self.model_runner, "drafter") or attn_metadata.has_cached:
+            # Populate kv_last_page_lens for full sequence (needed for MLA prefill with
+            # prefix cache; decode does the same)
+            if self.model_runner.block_size != 1:
+                var["kv_last_page_lens"].np[:bs] = np.asarray(
+                    batch.last_block_num_tokens[:bs], dtype=np.int32
+                )
+            else:
+                var["kv_last_page_lens"].np[:bs] = 1
+            var["kv_last_page_lens"].copy_to_gpu()
+
             attn_metadata.kv_indices = var["kv_indices"].gpu
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+            attn_metadata.kv_indptr[0] = 0
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
                 attn_metadata.context_lens, 0
             )
-            if attn_metadata.block_tables is None:
-                self.prepare_block_tables(batch)
-                attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+            attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+
+            # kv_indices_generate_triton expects RAW block_tables (physical block ids,
+            # one per block_ratio tokens). When is_sparse, attn_metadata.block_tables
+            # may have been overwritten with block_tables_converted (slot per token).
+            # Always use raw block_tables for kv_indices.
+            self.prepare_block_tables(batch)
+            block_tables_for_kv = var["block_tables"].copy_to_gpu(bs)
             kv_indices_generate_triton(
-                attn_metadata.block_tables,
+                block_tables_for_kv,
                 attn_metadata.kv_indices,
                 attn_metadata.kv_indptr,
                 self.block_ratio,
@@ -330,33 +359,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
-        if max_seqlen_q > 1:
-            # Get num_rejected (already mapped to current batch order in prepare_input_ids)
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
-                context_lens -= num_rejected
-                num_blocks = cdiv(context_lens, self.model_runner.block_size)
-                block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
+        if not batch.is_dummy_run:
+            if max_seqlen_q > 1:
+                # Get num_rejected (already mapped to current batch order in prepare_input_ids)
+                num_rejected = self.model_runner.tokenID_processor.num_rejected
+                if num_rejected is not None:
+                    context_lens -= num_rejected
+                    num_blocks = cdiv(context_lens, self.model_runner.block_size)
+                    block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
 
-            slot_mapping = [
-                block_table[pos // self.model_runner.block_size]
-                * self.model_runner.block_size
-                + (pos % self.model_runner.block_size)
-                for block_table, seq_len in zip(block_tables, context_lens)
-                for pos in range(seq_len - max_seqlen_q, seq_len)
-            ]
-        else:
-            slot_mapping = [
-                block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                for block_table, last_block_num in zip(
-                    block_tables, batch.last_block_num_tokens
-                )
-            ]
+                slot_mapping = [
+                    block_table[pos // self.model_runner.block_size]
+                    * self.model_runner.block_size
+                    + (pos % self.model_runner.block_size)
+                    for block_table, seq_len in zip(block_tables, context_lens)
+                    for pos in range(seq_len - max_seqlen_q, seq_len)
+                ]
+            else:
+                slot_mapping = [
+                    block_table[-1] * self.model_runner.block_size + last_block_num - 1
+                    for block_table, last_block_num in zip(
+                        block_tables, batch.last_block_num_tokens
+                    )
+                ]
         positions = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
 
-        sum_scheduled_tokens = batch.total_tokens_num_decode
+        # Use scheduled_bs since in dummy run, total_seqs_num_decode is 1.
+        sum_scheduled_tokens = scheduled_bs * max_seqlen_q
         var["slot_mapping"].np[: bs * max_seqlen_q] = -1
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping

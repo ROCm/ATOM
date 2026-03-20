@@ -40,16 +40,22 @@ def use_triton_gemm() -> bool:
 
 if use_triton_gemm():
     try:
-        from aiter.ops.triton.gemm_afp4wfp4 import (  # noqa: E402
-            gemm_afp4wfp4_preshuffle,
-        )
-
-        # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
         # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
+        from aiter.ops.triton.gemm_afp4wfp4 import (
+            gemm_afp4wfp4_preshuffle,
+        )  # noqa: E402
     except ImportError as e:
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
-    gemm_a8w8_blockscale_bpreshuffle_triton = None
+
+    # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton w8a8 GEMM not available: {e}")
+        gemm_a8w8_blockscale_bpreshuffle_triton = None
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
@@ -549,8 +555,43 @@ class MergedColumnParallelLinear(LinearBase):
         )
 
     def weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | tuple[int, ...],
     ):
+        # Support loading multiple consecutive shards in a single tensor.
+        # This mirrors vLLM's behavior for packed modules like QKV.
+        if isinstance(loaded_shard_id, tuple):
+            if len(loaded_shard_id) == 0:
+                raise ValueError("loaded_shard_id tuple cannot be empty")
+            if any(idx < 0 or idx >= len(self.output_sizes) for idx in loaded_shard_id):
+                raise ValueError(
+                    f"Invalid shard id in {loaded_shard_id}; "
+                    f"valid range is [0, {len(self.output_sizes) - 1}]"
+                )
+            if len(loaded_shard_id) > 1 and any(
+                b - a != 1 for a, b in zip(loaded_shard_id[:-1], loaded_shard_id[1:])
+            ):
+                raise ValueError(
+                    "Shard id with multiple indices should be consecutive. "
+                    f"Got shard id {loaded_shard_id}."
+                )
+
+            # Split loaded_weight by the requested shard sizes (pre-TP),
+            # then load each shard individually.
+            shard_sizes = [self.output_sizes[i] for i in loaded_shard_id]
+            current_offset = 0
+            for shard_id, shard_size in zip(loaded_shard_id, shard_sizes):
+                if param is getattr(self, "weight_scale", None) or param is getattr(
+                    self, "input_scale", None
+                ):
+                    shard_size //= 128
+                shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
+                self.weight_loader(param, shard, shard_id)
+                current_offset += shard_size
+            return
+
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -609,7 +650,7 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
     ):
         param_data = param.data
-        assert loaded_shard_id in ["qkvz", "ba"]
+        assert loaded_shard_id in ["qkvz", "ba", "qkv", "z", "b", "a"]
         if loaded_shard_id == "qkvz":
             shard_size = (
                 2 * self.num_k_heads * self.head_k_dim
@@ -617,11 +658,40 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
             )
             shard_offset = 0
             shard_rank = self.tp_rank
+        elif loaded_shard_id == "qkv":
+            shard_size = (
+                2 * self.num_k_heads * self.head_k_dim
+                + self.num_v_heads * self.head_v_dim
+            )
+            shard_offset = 0
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "z":
+            shard_size = self.num_v_heads * self.head_v_dim
+            shard_offset = (
+                2 * self.num_k_heads * self.head_k_dim
+                + self.num_v_heads * self.head_v_dim
+            )
+            shard_rank = self.tp_rank
         elif loaded_shard_id == "ba":
             shard_size = 2 * self.num_v_heads
             shard_offset = (
                 2 * self.num_k_heads * self.head_k_dim
                 + 2 * self.num_v_heads * self.head_v_dim
+            )
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "b":
+            shard_size = self.num_v_heads
+            shard_offset = (
+                2 * self.num_k_heads * self.head_k_dim
+                + 2 * self.num_v_heads * self.head_v_dim
+            )
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "a":
+            shard_size = self.num_v_heads
+            shard_offset = (
+                2 * self.num_k_heads * self.head_k_dim
+                + 2 * self.num_v_heads * self.head_v_dim
+                + self.num_v_heads
             )
             shard_rank = self.tp_rank
 

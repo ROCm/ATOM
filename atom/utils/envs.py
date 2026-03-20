@@ -75,6 +75,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0"
     ).lower()
     == "1",
+    "ATOM_USE_CUSTOM_ALL_GATHER": lambda: os.getenv(
+        "ATOM_USE_CUSTOM_ALL_GATHER", "1"
+    ).lower()
+    == "1",
 }
 
 

@@ -46,6 +46,7 @@ def cp_mha_gather_cache_kernel(
     x,
     max_block_num,
     DEQUANT: tl.constexpr,
+    PER_TOKEN_QUANT: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     CACHE_FORMAT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -87,8 +88,16 @@ def cp_mha_gather_cache_kernel(
         k_reg = tl.load(key_cache_ptr_offset + col_offsets)
         v_reg = tl.load(value_cache_ptr_offset + col_offsets)
         if DEQUANT:
-            k_scale = tl.load(k_scale_ptr)
-            v_scale = tl.load(v_scale_ptr)
+            if PER_TOKEN_QUANT:
+                scale_offset = (
+                    block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
+                )
+                k_scale = tl.load(k_scale_ptr + scale_offset)
+                v_scale = tl.load(v_scale_ptr + scale_offset)
+            else:
+                # per-tensor: one scale per ptr, no offset
+                k_scale = tl.load(k_scale_ptr)
+                v_scale = tl.load(v_scale_ptr)
             k_dtype = k_reg.dtype
             v_dtype = v_reg.dtype
             k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
@@ -118,11 +127,16 @@ def cp_mha_gather_cache_kernel(
         k_reg = tl.load(key_cache_ptr_offset + k_reg_offset)
         v_reg = tl.load(value_cache_ptr_offset + v_reg_offset)
         if DEQUANT:
-            scale_offset = (
-                block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
-            )
-            k_scale = tl.load(k_scale_ptr + scale_offset)
-            v_scale = tl.load(v_scale_ptr + scale_offset)
+            if PER_TOKEN_QUANT:
+                scale_offset = (
+                    block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
+                )
+                k_scale = tl.load(k_scale_ptr + scale_offset)
+                v_scale = tl.load(v_scale_ptr + scale_offset)
+            else:
+                # per-tensor: one scale per ptr, no offset
+                k_scale = tl.load(k_scale_ptr)
+                v_scale = tl.load(v_scale_ptr)
             k_reg = k_reg.to(tl.float32) * k_scale
             v_reg = v_reg.to(tl.float32) * v_scale
         tl.store(key_ptr_offset + col_offsets, k_reg)
@@ -143,6 +157,7 @@ def cp_mha_gather_cache(
     dequant: bool,
     kv_cache_layout: str,
     total_tokens: int,
+    per_token_quant: bool = True,
 ):
     assert kv_cache_layout in [
         "NHD",
@@ -150,15 +165,21 @@ def cp_mha_gather_cache(
     ], "kv_cache_layout only support NHD, SHUFFLE"
     if dequant:
         assert k_scales is not None and v_scales is not None
+
     head_dim = key.shape[2]
     x = 16 // key_cache.element_size()
-    # For k cache layout: [num_blocks, num_heads, page_size, head_dim]
-    assert head_dim == key_cache.shape[3], (
-        "We assume your kv cache layout is [num_blocks, "
-        "page_size, num_heads, head_dim], but got otherwise"
-    )
-    page_size = key_cache.shape[1]
-    num_heads = key_cache.shape[2]
+    if kv_cache_layout == "NHD":
+        # K: [num_blocks, page_size, num_heads, head_dim]
+        assert head_dim == key_cache.shape[3]
+        page_size = key_cache.shape[1]
+        num_heads = key_cache.shape[2]
+    else:
+        # SHUFFLE: K [num_blocks, num_heads, head_dim//x, page_size, x]
+        assert (
+            key_cache.dim() == 5 and head_dim == key_cache.shape[2] * key_cache.shape[4]
+        )
+        page_size = key_cache.shape[3]
+        num_heads = key_cache.shape[1]
 
     grid = lambda meta: (total_tokens, num_heads)  # noqa: E731
     cp_mha_gather_cache_kernel[grid](
@@ -177,6 +198,7 @@ def cp_mha_gather_cache(
         x,
         block_tables.size(1),
         DEQUANT=dequant,
+        PER_TOKEN_QUANT=per_token_quant,
         PAGE_SIZE=page_size,
         CACHE_FORMAT=kv_cache_layout,
         BLOCK_SIZE=head_dim,
@@ -263,7 +285,8 @@ def linear_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.impl.forward(mixed_qkv, b, a, core_attn_out)
+    ret = self.impl.forward(mixed_qkv, b, a, core_attn_out, layer_name)
+    return ret
 
 
 class BaseAttention(nn.Module, ABC):
@@ -338,6 +361,7 @@ class LinearAttention(nn.Module):
         self.activation = activation
         self.layer_num = layer_num
         self.base_linear_attention = None
+        self.prefix = prefix
 
         atom_config = get_current_atom_config()
         block_size = atom_config.kv_cache_block_size

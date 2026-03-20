@@ -185,25 +185,47 @@ def _iter_py_files(root: str) -> Iterable[str]:
                 yield os.path.join(dirpath, fn)
 
 
+def _initial_docstring_span(lines: list[str]) -> Optional[tuple[int, int]]:
+    """
+    Best-effort detection of the initial module docstring / leading triple-quoted
+    block, including variants like r\"\"\"...\"\"\" and '''...'''.
+    """
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = re.match(r'^(?:[rRuUbBfF]+)?(?P<quote>"""|\'\'\')', stripped)
+        if not m:
+            return None
+        quote = m.group("quote")
+        if quote in stripped[m.end() :]:
+            return (i, i)
+        for j in range(i + 1, len(lines)):
+            if quote in lines[j]:
+                return (i, j)
+        return (i, len(lines) - 1)
+    return None
+
+
 def _ensure_record_function_import(lines: list[str]) -> None:
-    # If already imported or referenced via qualified name, do nothing.
+    doc_span = _initial_docstring_span(lines)
+
+    def _iter_code_lines() -> Iterable[tuple[int, str]]:
+        for i, line in enumerate(lines):
+            if doc_span is not None and doc_span[0] <= i <= doc_span[1]:
+                continue
+            yield i, line
+
+    # If already imported or referenced via qualified name in real code, do nothing.
     if any(
         ("record_function" in line and ("import" in line or "from torch" in line))
-        for line in lines
+        for _, line in _iter_code_lines()
     ):
         return
 
     # Insert `from torch.profiler import record_function` after the first
     # real `import torch` line outside the initial docstring.
-    in_doc = False
-    for i, line in enumerate(lines):
-        if i == 0 and line.lstrip().startswith('"""'):
-            in_doc = True
-        if in_doc and line.rstrip().endswith('"""') and i != 0:
-            in_doc = False
-            continue
-        if in_doc:
-            continue
+    for i, line in _iter_code_lines():
         if re.match(r"^\s*import\s+torch\b", line):
             lines.insert(i + 1, "from torch.profiler import record_function\n")
             return
@@ -212,6 +234,8 @@ def _ensure_record_function_import(lines: list[str]) -> None:
     insert_at = 0
     if lines and lines[0].startswith("#!"):
         insert_at = 1
+    if doc_span is not None:
+        insert_at = max(insert_at, doc_span[1] + 1)
     lines.insert(insert_at, "from torch.profiler import record_function\n")
 
 

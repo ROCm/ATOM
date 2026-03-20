@@ -124,7 +124,7 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [16, 32]
+        return [16]
 
     @staticmethod
     def get_kv_cache_shape(

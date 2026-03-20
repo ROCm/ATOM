@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generic, Optional, Type, TypeVar
 
@@ -12,6 +13,7 @@ from atom.utils.block_convert import block_table_convert_triton
 from atom.utils.forward_context import AttentionMetaData
 from torch import nn
 
+logger = logging.getLogger("atom")
 T = TypeVar("T", bound="BroadcastableModelInput")
 
 
@@ -114,6 +116,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ),
             "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            # seq_starts for cp_mha_gather_cache: always zeros (prefix at position 0)
+            "seq_starts": CpuGpuBuffer(self.max_bs, **i32_kwargs),
         }
         if self.block_ratio > 1:
             attn_metadata["block_tables_converted"] = CpuGpuBuffer(
@@ -126,6 +130,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             torch.arange(0, self.max_bs + 1, step=1, dtype=torch.int32)
         )
         attn_metadata["cu_seqlens_q"].copy_to_gpu()
+        attn_metadata["seq_starts"].cpu.zero_()
+        attn_metadata["seq_starts"].copy_to_gpu()
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
@@ -141,18 +147,23 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
         positions = []
+        cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        has_cached = False
         # seqs = list(batch.seqs.values())
         # seqs = seqs[:bs]
         for i in range(bs):
             seqlen = batch.context_lens[i]
             cached_seqlen = batch.num_cached_tokens[i]
+            if cached_seqlen > 0:
+                has_cached = True
             positions.extend(list(range(cached_seqlen, seqlen)))
             seqlen_q = seqlen - cached_seqlen
             seqlen_k = seqlen
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
@@ -166,18 +177,31 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ) // self.model_runner.block_size
             last_block_tokens = batch.last_block_num_tokens[i]
             block_table = batch.block_tables[i]
-            for i in range(num_cached_blocks, num_blocks):
-                start = block_table[i] * self.model_runner.block_size
-                if i != num_blocks - 1:
+            for blk_idx in range(num_cached_blocks, num_blocks):
+                start = block_table[blk_idx] * self.model_runner.block_size
+                if blk_idx != num_blocks - 1:
                     end = start + self.model_runner.block_size
                 else:
                     end = start + last_block_tokens
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > batch.total_tokens_num:  # prefix cache
+        if has_cached:
             self.prepare_block_tables(batch)
+        # Validate metadata consistency
+        assert (
+            len(positions) == sum_scheduled_tokens
+        ), f"positions length {len(positions)} != sum_scheduled_tokens {sum_scheduled_tokens}"
+        if batch.block_tables:
+            assert (
+                len(slot_mapping) == sum_scheduled_tokens
+            ), f"slot_mapping length {len(slot_mapping)} != sum_scheduled_tokens {sum_scheduled_tokens}"
+        assert (
+            cu_seqlens_q[-1] == sum_scheduled_tokens
+        ), f"cu_seqlens_q[-1]={cu_seqlens_q[-1]} != sum_scheduled_tokens={sum_scheduled_tokens}"
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["slot_mapping"].np[:sum_scheduled_tokens] = -1
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
+        var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
+        var["cu_seqlens_k"].np[: bs + 1] = cu_seqlens_k
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
         var["context_lens"].np[:bs] = batch.context_lens[:bs]
         min_seqlen_q = 0
@@ -187,6 +211,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ("slot_mapping", sum_scheduled_tokens),
             ("context_lens", bs),
         ]
+        if has_cached:
+            vars_used.append(("block_tables", bs))
+            vars_used.append(("seq_starts", bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         if self.block_ratio > 1 and "block_tables" in ctx:
@@ -197,12 +224,22 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 self.block_ratio,
             )
             ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
+        num_cached_tokens = None
+        if has_cached:
+            num_cached_tokens = torch.tensor(
+                batch.num_cached_tokens[:bs], dtype=torch.int32, pin_memory=True
+            ).cuda(non_blocking=True)
+            total_tokens = sum(batch.context_lens[:bs])
+        total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             min_seqlen_q=min_seqlen_q,
             dropout_p=dropout_p,
+            has_cached=has_cached,
+            total_kv=total_kv,
+            num_cached_tokens=num_cached_tokens,
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
