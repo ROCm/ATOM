@@ -33,13 +33,6 @@ ATOM Documentation
 
    vllm_plugin_backend_guide
 
-vLLM OOT Plugin Backend
------------------------
-
-ATOM documentation includes a dedicated guide for the vLLM OOT Plugin Backend. It covers the OOT design, plugin registration flow, supported models, deployment steps, and the execution flow SVG embedded in the docs page.
-
-* :doc:`Open the dedicated guide <vllm_plugin_backend_guide>`
-
 .. toctree::
    :maxdepth: 2
    :caption: API Reference

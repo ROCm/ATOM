@@ -1,6 +1,6 @@
-# Qwen3-235B-A22B with ATOM vLLM OOT Platform
+# Qwen3-235B-A22B with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Qwen3-235B-A22B-Instruct-2507-FP8` with the ATOM vLLM out-of-tree platform. For background on the OOT backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Qwen3-235B-A22B-Instruct-2507-FP8` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
 ## Step 1: Pull the OOT Docker
 
@@ -10,7 +10,7 @@ docker pull rocm/atom-dev:vllm-latest
 
 ## Step 2: Launch vLLM Server
 
-The vLLM OOT plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
 ```bash
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1

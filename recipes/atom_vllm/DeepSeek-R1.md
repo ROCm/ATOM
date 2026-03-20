@@ -3,7 +3,7 @@
 This recipe shows how to run `deepseek-ai/DeepSeek-R1-0528` or `amd/DeepSeek-R1-0528-MXFP4` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
 ## Step 1: Pull the OOT Docker
-ATOM will release the docker nightly. Users can refer to https://hub.docker.com/r/rocm/atom/ to check the docker. We suggest using the newest docker to get the latest feature and performance.
+
 ```bash
 docker pull rocm/atom-dev:vllm-latest
 ```
@@ -13,7 +13,7 @@ docker pull rocm/atom-dev:vllm-latest
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, users can refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
 ### Deepseek with FP8
-Users can use this command to launch server on AMD Instinct MI308X, MI300X and MI325 platforms.
+Users can use this command to launch server on AMD Instinct MI300X, MI325X and MI355X platforms.
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-R1-0528 \

@@ -1,10 +1,10 @@
-# Kimi-K2-Thinking with ATOM vLLM OOT Platform
+# Kimi-K2-Thinking with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Kimi-K2-Thinking` with the ATOM vLLM out-of-tree platform. For background on the OOT backend, see [vLLM OOT Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Kimi-K2-Thinking` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
 This model uses remote code, so the launch command keeps `--trust-remote-code`.
-## Step 1: Pull the ATOM vLLM Docker
-ATOM will release the docker nightly. Users can refer to https://hub.docker.com/r/rocm/atom/ to check the docker. We suggest using the newest docker to get the latest feature and performance.
+
+## Step 1: Pull the OOT Docker
 
 ```bash
 docker pull rocm/atom-dev:vllm-latest
@@ -20,7 +20,7 @@ vllm serve amd/Kimi-K2-Thinking-MXFP4 \
     --host localhost \
     --port 8000 \
     --trust-remote-code \
-    --tensor-parallel-size 4 \
+    --tensor-parallel-size 8 \
     --kv-cache-dtype fp8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \
