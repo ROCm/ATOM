@@ -127,7 +127,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             "${{ needs.build-oot-image.outputs.oot_image_tag }}" \
-            bash -lc "pytest -q tests/plugin"
+            bash -lc "pytest -q tests/plugin -o cache_dir=/tmp/.pytest_cache"
 
   oot-model-accuracy:
     name: OOT Model Accuracy (${{ matrix.model_name }})
