@@ -195,6 +195,8 @@ RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
     pip show amd-aiter
 
 # ATOM: lightweight install (no compilation needed)
+# CACHEBUST invalidates only this layer so parallel stages stay cached
+ARG CACHEBUST=1
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
