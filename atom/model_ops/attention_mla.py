@@ -19,6 +19,7 @@ from aiter import (
 )
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
@@ -36,7 +37,6 @@ from torch import nn
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
-from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
@@ -599,7 +599,6 @@ class MLAAttention(nn.Module):
             reduce_partial_map=reduce_partial_map,
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
-            return_lse=True,
         )
 
         if self.head_repeat_factor > 1:
