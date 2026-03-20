@@ -144,7 +144,7 @@ The following table shows how vLLM config fields map to ATOM `Config` fields:
 
 - **CUDA graphs** — In plugin mode, ATOM sets `enforce_eager=True` and
   `use_cudagraph=False` in its own `Config`, meaning ATOM's CUDA graph capture
-  and replay logic is completely disabled. CUDA graph management is fully
+  and replay logic are completely disabled. CUDA graph management is fully
   delegated to vLLM — vLLM decides when to capture, which batch sizes to graph,
   and how to replay. ATOM's attention backends cooperate by implementing
   `build_for_cudagraph_capture()` so that vLLM can capture ATOM kernels inside
@@ -187,50 +187,6 @@ on the model's attention type:
 Setting `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` causes `ATOMPlatform` to delegate
 back to the parent `RocmPlatform.get_attn_backend_cls()`, restoring vLLM's
 built-in ROCm attention path.
-
-### 3.2 Backend–vLLM Contract
-
-Each ATOM backend fulfills vLLM's `AttentionBackend` interface by providing:
-
-- **Attention implementation class** — `PagedAttentionImpl` for MHA or
-   `MLAAttention` for MLA. These are ATOM's own attention implementations
-   decorated at import time with plugin-mode methods (via
-   `PagedAttentionImplDecoratorForPluginMode` / `MLAAttentionImplDecoratorForPluginMode`)
-   so they expose the `forward_impl_plugin_mode` entry point that vLLM calls.
-
-- **Metadata builder class** — translates vLLM's `CommonAttentionMetadata` into
-   the metadata structure the ATOM kernels expect. The builders are similarly
-   decorated (via `AiterAttentionMetadataBuilderDecoratorForPluginMode` /
-   `AiterMLAAttentionMetadataBuilderDecoratorForPluginMode`) to inherit from
-   vLLM's `AttentionMetadataBuilder` while injecting ATOM-specific `build()`
-   logic.
-
-- **Static properties** — `get_kv_cache_shape`, `get_supported_kernel_block_sizes`,
-   `get_supported_head_sizes`, etc. These tell vLLM how to allocate and manage
-   KV cache blocks in the format ATOM's kernels expect.
-
-### 3.3 Key Design Points
-
-- **Decorator-based injection** — ATOM does not fork or subclass vLLM's attention
-  classes directly. Instead, Python decorators dynamically replace base classes
-  and inject methods at import time, keeping ATOM's attention code decoupled from
-  vLLM's internal class hierarchy.
-
-- **`forward_includes_kv_cache_update = True`** — both backends declare that the
-  KV cache write happens inside the forward pass. This tells vLLM to skip its
-  separate cache-update step and gives ATOM full control over the
-  RoPE → cache → attention pipeline.
-
-- **`accept_output_buffer`** — set to `False` for MHA (ATOM allocates its own
-  output tensor) and `True` for MLA (vLLM provides the output buffer). This
-  reflects the different memory-management needs of each attention type.
-
-- **Extend workspace** — the MHA metadata builder allocates an `extend_workspace`
-  buffer outside of vLLM's memory accounting for chunked-prefill KV gathering.
-  If you encounter OOM during chunked prefill, consider lowering
-  `gpu_memory_utilization`.
-
-
 
 ## 4. Supported Models
 Currently, the plugin backend supports the following model architectures:
@@ -349,23 +305,3 @@ export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
 | `ATOM_DISABLE_VLLM_PLUGIN` | bool | `0` (false) | Set to `1` to disable the entire ATOM vLLM plugin (platform + model registration). vLLM runs in pure ROCm mode. |
 | `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION` | bool | `0` (false) | Set to `1` to disable only ATOM's attention backends. ATOM models are still used, but attention falls back to vLLM's default ROCm backend. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion in attention. Recommended for Qwen3-MoE models. |
-
-
-## Source Files
-
-| File | Description |
-|------|-------------|
-| `atom/plugin/__init__.py` | Public API: `is_vllm`, `is_plugin_mode` |
-| `atom/plugin/prepare.py` | Framework detection and `_CURRENT_FRAMEWORK` state management |
-| `atom/plugin/config.py` | `PluginConfig` dataclass, `generate_atom_config_for_plugin_mode()`, vLLM config translator |
-| `atom/plugin/register.py` | `set_attn_cls()`, `init_aiter_dist()` |
-| `atom/plugin/attention.py` | vLLM attention metadata builders, backend decorators, `unified_attention_with_output_base_for_plugin_mode` |
-| `atom/plugin/attention_mha.py` | MHA `PagedAttentionImpl` plugin-mode decorator |
-| `atom/plugin/attention_mla.py` | MLA plugin-mode methods and `MLAAttentionImplDecoratorForPluginMode` |
-| `atom/plugin/moe.py` | `FusedMoEDecoratorForPluginMode` — renames `FusedMoE` to `ATOMFusedMoE` in vLLM |
-| `atom/plugin/vllm/__init__.py` | vLLM sub-package exports: `register_model`, `register_platform` |
-| `atom/plugin/vllm/register.py` | `register_platform()`, `register_model()`, model registry overrides, attention patches |
-| `atom/plugin/vllm/platform.py` | `ATOMPlatform` — `RocmPlatform` subclass selecting ATOM attention backends |
-| `atom/plugin/vllm/model_wrapper.py` | `ATOMModelBase`, `ATOMForCausalLM`, `ATOMMoEForCausalLM` — vLLM model wrappers |
-| `atom/plugin/vllm/mla_patch.py` | Patches vLLM `MLAAttention.process_weights_after_loading` and `forward_impl` |
-| `pyproject.toml` | Entry point declarations for `vllm.platform_plugins` and `vllm.general_plugins` |
