@@ -141,7 +141,7 @@ jobs:
             atom_release:ci
               
           docker exec atom_release_ci bash -c \
-            "huggingface-cli logout --yes 2>/dev/null; \
+            "rm -f ~/.cache/huggingface/token 2>/dev/null; \
              python3 -m atom.examples.simple_inference \
                --model meta-llama/Meta-Llama-3-8B-Instruct \
                --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_release_output.txt
