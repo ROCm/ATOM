@@ -3,16 +3,18 @@
 
 Reads regression_report.json (from summarize.py) and models.json (model config
 registry), selects the top-N most regressed configs, resolves their full model
-config (server args, bench args), and outputs a flat config list.
+config (server args, bench args), and outputs configs for CI.
 
-The output is consumed by the CI workflow's "Run configs with profiler" step,
-which uses the same atom_test.sh launch/benchmark pattern as the benchmark job.
+Two output modes:
+  --output (-o)        Flat pipe-delimited text (legacy, one config per line)
+  --output-matrix      JSON array grouped by model for GitHub Actions matrix
 
 Usage:
-    python3 regression_rerun.py REPORT_JSON MODELS_JSON [-o OUTPUT] [--top-n 3]
+    # Flat output (legacy)
+    python3 regression_rerun.py REPORT MODELS -o configs.txt [--top-n 3]
 
-Output format (pipe-delimited, one config per line, sorted by model+args for grouping):
-    <model_path>|<server_args>|<bench_args>|<isl>|<osl>|<conc>|<env_vars>|<prefix>
+    # Matrix output (grouped by model for parallel CI)
+    python3 regression_rerun.py REPORT MODELS --output-matrix matrix.json [--top-n 3]
 """
 
 import argparse
@@ -111,11 +113,76 @@ def generate_configs(report_path, models_path, top_n=3):
     return configs
 
 
+def generate_matrix(report_path, models_path, top_n=3):
+    """Generate a GitHub Actions matrix JSON grouped by model server key.
+
+    Each matrix cell represents a unique (model_path, server_args, env_vars)
+    group. Configs within the same group share a server and run sequentially.
+    Different groups run in parallel as separate matrix cells.
+
+    Returns a list of dicts, each with:
+      - model_path, server_args, env_vars, runner, prefix: scalar fields
+      - configs: JSON string of [{isl, osl, conc, bench_args, prefix}, ...]
+    """
+    configs = generate_configs(report_path, models_path, top_n)
+    if not configs:
+        return []
+
+    # Group by server key (same key = same server launch)
+    groups = {}
+    for c in configs:
+        key = (c["model_path"], c["server_args"], c["env_vars"])
+        groups.setdefault(key, []).append(c)
+
+    # Load models.json to look up runner field
+    models = json.loads(Path(models_path).read_text(encoding="utf-8"))
+
+    matrix = []
+    for (model_path, server_args, env_vars), group_configs in groups.items():
+        # Find runner from models.json (first matching model)
+        runner = "atom-mi355-8gpu.predownload"
+        for m in models:
+            if m["path"] == model_path and m.get("args", "") == server_args:
+                runner = m.get("runner", runner)
+                break
+
+        # Use prefix from first config (all configs in group share model)
+        prefix = group_configs[0]["prefix"]
+
+        matrix.append(
+            {
+                "model_path": model_path,
+                "server_args": server_args,
+                "env_vars": env_vars,
+                "runner": runner,
+                "prefix": prefix,
+                "configs": json.dumps(
+                    [
+                        {
+                            "isl": c["isl"],
+                            "osl": c["osl"],
+                            "conc": c["conc"],
+                            "bench_args": c["bench_args"],
+                            "prefix": c["prefix"],
+                        }
+                        for c in group_configs
+                    ]
+                ),
+            }
+        )
+
+    return matrix
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", help="Path to regression_report.json")
     parser.add_argument("models", help="Path to models.json")
-    parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+    parser.add_argument("-o", "--output", help="Flat pipe-delimited output file")
+    parser.add_argument(
+        "--output-matrix",
+        help="GitHub Actions matrix JSON output file (grouped by model)",
+    )
     parser.add_argument(
         "--top-n",
         type=int,
@@ -123,6 +190,16 @@ def main():
         help="Max regressed configs to re-run (default: 3)",
     )
     args = parser.parse_args()
+
+    if args.output_matrix:
+        matrix = generate_matrix(args.report, args.models, args.top_n)
+        output = json.dumps(matrix)
+        Path(args.output_matrix).write_text(output, encoding="utf-8")
+        print(
+            f"Wrote {len(matrix)} matrix cells to {args.output_matrix}",
+            file=sys.stderr,
+        )
+        return
 
     configs = generate_configs(args.report, args.models, args.top_n)
 
