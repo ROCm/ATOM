@@ -199,6 +199,13 @@ jobs:
             accuracy_test_threshold: "0.87"
             runner: atom-mi355-8gpu.predownload
             run_on_pr: false
+          - model_name: "Kimi-K2.5-MXFP4"
+            model_path: "amd/Kimi-K2.5-MXFP4"
+            extraArgs: "--kv_cache_dtype fp8 -tp 4 --trust-remote-code"
+            env_vars: "HSA_NO_SCRATCH_RECLAIM=1"
+            accuracy_test_threshold: "0.93"
+            runner: atom-mi355-8gpu.predownload
+            run_on_pr: false
           - model_name: "Qwen3-Next-80B-A3B-Thinking"
             model_path: "Qwen/Qwen3-Next-80B-A3B-Thinking"
             extraArgs: "-tp 8"

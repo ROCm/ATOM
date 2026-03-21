@@ -26,6 +26,10 @@ on:
         description: "Benchmark gpt-oss-120b"
         type: boolean
         default: true
+      kimi-k25-mxfp4:
+        description: "Benchmark Kimi-K2.5-MXFP4"
+        type: boolean
+        default: true
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
@@ -134,15 +138,13 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "enabled=true" >> $GITHUB_OUTPUT
           else
-            # Map model prefix to workflow input
-            # Note: inputs are boolean; "|| 'true'" would swallow explicit false
-            case "${{ matrix.model.prefix }}" in
-              deepseek-r1-0528) echo "enabled=${{ inputs.deepseek-r1-0528 }}" >> $GITHUB_OUTPUT ;;
-              deepseek-r1-0528-mxfp4) echo "enabled=${{ inputs.deepseek-r1-0528-mxfp4 }}" >> $GITHUB_OUTPUT ;;
-              glm-5-fp8) echo "enabled=${{ inputs.glm-5-fp8 }}" >> $GITHUB_OUTPUT ;;
-              gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> $GITHUB_OUTPUT ;;
-              *) echo "enabled=true" >> $GITHUB_OUTPUT ;;
-            esac
+            # Look up workflow input by model prefix; default to true for unknown models
+            ENABLED=$(echo '${{ toJson(inputs) }}' | python3 -c "
+          import json, sys
+          inputs = json.load(sys.stdin)
+          print(str(inputs.get('${{ matrix.model.prefix }}', True)).lower())
+          ")
+            echo "enabled=${ENABLED}" >> $GITHUB_OUTPUT
           fi
 
       - name: Kill all Docker containers
