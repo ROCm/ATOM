@@ -274,7 +274,12 @@ class LayerQuantConfig(dict):
 
 
 class QuantizationConfig:
-    def __init__(self, config: PretrainedConfig = None, maybe_vllm_config=None):
+    def __init__(
+        self,
+        config: PretrainedConfig = None,
+        maybe_vllm_config=None,
+        online_quant_config: Optional[dict] = None,
+    ):
         if config is None:
             self.torch_dtype = torch.bfloat16
             self.hf_quant_config = None
@@ -297,10 +302,21 @@ class QuantizationConfig:
                 quant_type=QuantType.No, quant_dtype=self.torch_dtype
             )
             self.quant_method = ""
-            return
+        else:
+            self.quant_method = self.hf_quant_config.get("quant_method", "")
 
-        self.quant_method = self.hf_quant_config.get("quant_method", "")
-        if self.quant_method == "quark":
+        # Online quantization: re-quantize float / FP8 / MXFP4 models at load time
+        self.online_quant = False
+        self.online_quant_config_raw = online_quant_config
+        if online_quant_config is not None and self.quant_method in [
+            "", "fp8", "mxfp4"
+        ]:
+            self.online_quant = True
+            self.resolve_online_quant_config(online_quant_config)
+
+        if self.quant_method == "":
+            return
+        elif self.quant_method == "quark":
             layer_quant_config_dict = cast(
                 dict[str, Any], self.hf_quant_config.get("layer_quant_config", {})
             )
@@ -347,6 +363,10 @@ class QuantizationConfig:
         factors.append(self.global_quant_config)
         factors.append(self.layer_quant_config)
         factors.append(self.exclude_layers)
+        if self.online_quant:
+            factors.append(self.online_global_qconfig_dict)
+            factors.append(self.online_layer_qconfig_dict)
+            factors.append(self.online_exclude_layers_list)
         hash_value = hashlib.sha256(str(factors).encode()).hexdigest()
         return hash_value
 
@@ -475,13 +495,15 @@ class QuantizationConfig:
         )
         self.exclude_layers = exclude_layers
 
-    def should_ignore_layer_quant(self, layer_name: str) -> bool:
+    def should_ignore_layer_quant(
+        self, layer_name: str, exclude_layers: list[str]
+    ) -> bool:
         # TODO: solve fused_mapping case
-        if layer_name is None or not self.exclude_layers:
+        if layer_name is None or not exclude_layers:
             return False
         return any(
             self.is_equal_or_regex_match(layer_name, ignore_str)
-            for ignore_str in self.exclude_layers
+            for ignore_str in exclude_layers
         )
 
     def is_equal_or_regex_match(
@@ -513,33 +535,49 @@ class QuantizationConfig:
             return True
         return False
 
-    def get_layer_quant_config(self, layer_name: str) -> LayerQuantConfig:
-        if self.should_ignore_layer_quant(layer_name=layer_name):
+    def get_layer_quant_config(
+        self, layer_name: str, use_online_quant: bool = False
+    ) -> LayerQuantConfig:
+        """Return the effective quant config for *layer_name*.
+
+        When *use_online_quant* is ``True``, the online quantization
+        config tables are consulted instead of the offline ones.
+        """
+        if use_online_quant:
+            layer_quant_config = self.online_layer_qconfig_dict
+            global_quant_config = self.online_global_qconfig_dict
+            exclude_layers = self.online_exclude_layers_list
+        else:
+            layer_quant_config = self.layer_quant_config
+            global_quant_config = self.global_quant_config
+            exclude_layers = self.exclude_layers
+        if self.should_ignore_layer_quant(
+            layer_name=layer_name, exclude_layers=exclude_layers
+        ):
             # return unquantized config
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
         # layer quant config
-        layer_quant_config = None
-        if self.layer_quant_config:
-
+        quant_config = None
+        if layer_quant_config:
             def _matches_pattern(layer_name, pattern):
                 if "*" not in pattern:
                     return layer_name in pattern
                 return fnmatch.fnmatch(layer_name, pattern)
 
-            for name_pattern, config in self.layer_quant_config.items():
+            for name_pattern, config in layer_quant_config.items():
                 if _matches_pattern(layer_name, name_pattern):
-                    layer_quant_config = config
+                    quant_config = config
 
-        layer_quant_config = (
-            self.global_quant_config
-            if layer_quant_config is None
-            else layer_quant_config
+        quant_config = (
+            global_quant_config
+            if quant_config is None
+            else quant_config
         )
         # TODO: if use_aiter, we can customize the quantization format here, such as dpsk
         # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains AITER BF16 GEMMs,
         # For FP8 and use_triton_gemm(), fused_qkv_a_proj is AITER-Triton FP8 GEMMs while others remain AITER FP8 GEMMs
 
-        return layer_quant_config
+        return quant_config
 
     def remap_layer_name(
         self, hf_config: PretrainedConfig, packed_modules_mapping: dict | None = None
@@ -593,6 +631,93 @@ class QuantizationConfig:
         for name in self.exclude_layers:
             new_exclude.extend(_remap_layer_name(name))
         self.exclude_layers = list(dict.fromkeys(new_exclude))
+        if self.online_quant:
+            new_online_layer_quant = {}
+            for layer_name, layer_qconfig in self.online_layer_qconfig_dict.items():
+                for remapped in _remap_layer_name(layer_name):
+                    new_online_layer_quant[remapped] = layer_qconfig
+            self.online_layer_qconfig_dict = new_online_layer_quant
+
+            new_online_exclude = []
+            for name in self.online_exclude_layers_list:
+                new_online_exclude.extend(_remap_layer_name(name))
+            self.online_exclude_layers_list = list(
+                dict.fromkeys(new_online_exclude)
+            )
+
+    def resolve_online_quant_config(self, online_quant_config: dict) -> None:
+        """Parse the user-facing online quantization dict and populate
+        ``online_global_qconfig_dict``, ``online_layer_qconfig_dict``,
+        and ``online_exclude_layers_list``.
+
+        Supported format strings:
+        - ``"ptpc_fp8"``  — per-tensor-per-channel FP8
+        - ``"ptpt_fp8"``  — per-tensor-per-tensor FP8
+        - ``"mxfp4"``     — microscaling FP4 (block size 32)
+        """
+        SCHEME_MAP = {
+            "ptpc": QuantType.per_Token,
+            "ptpt": QuantType.per_Tensor,
+        }
+
+        def _parse_online_quant_format(quant_format_str: str) -> LayerQuantConfig:
+            quant_format_str = quant_format_str.strip().lower()
+            quant_type = None
+            dtype_str = None
+
+            if quant_format_str.startswith("mx"):
+                quant_type = QuantType.per_1x32
+                dtype_str = quant_format_str[2:]
+            else:
+                parts = quant_format_str.split("_", 1)
+                if len(parts) == 2 and parts[0] in SCHEME_MAP:
+                    quant_type = SCHEME_MAP[parts[0]]
+                    dtype_str = parts[1]
+                else:
+                    raise ValueError(
+                        f"Unsupported online quant format: '{quant_format_str}'. "
+                        f"Expected '<scheme>_<dtype>' (e.g. ptpc_fp8) or 'mx<dtype>' (e.g. mxfp4)."
+                    )
+
+            dtype_str = dtype_str.split("_")[0]
+            if dtype_str.endswith("4"):
+                dtype_str += "x2"
+            quant_dtype = d_dtypes[dtype_str]
+
+            return LayerQuantConfig(
+                quant_type=quant_type,
+                quant_dtype=quant_dtype,
+                is_dynamic=True,
+                quant_method="quark",
+            )
+
+        global_quant_str = online_quant_config.get("global_quant_config", "")
+        if global_quant_str:
+            self.online_global_qconfig_dict = _parse_online_quant_format(
+                global_quant_str
+            )
+        else:
+            self.online_global_qconfig_dict = LayerQuantConfig(
+                quant_dtype=self.torch_dtype
+            )
+
+        layer_quant_dict = online_quant_config.get("layer_quant_config", {})
+        self.online_layer_qconfig_dict = {}
+        if isinstance(layer_quant_dict, dict):
+            for layer_pattern, quant_str in layer_quant_dict.items():
+                self.online_layer_qconfig_dict[layer_pattern] = (
+                    _parse_online_quant_format(quant_str)
+                )
+
+        exclude_layer = online_quant_config.get("exclude_layer", [])
+        if isinstance(exclude_layer, str):
+            self.online_exclude_layers_list = (
+                [exclude_layer] if exclude_layer else []
+            )
+        elif isinstance(exclude_layer, list):
+            self.online_exclude_layers_list = exclude_layer
+        else:
+            self.online_exclude_layers_list = []
 
 
 _CONFIG_REGISTRY: dict[str, str] = {
@@ -877,6 +1002,8 @@ class Config:
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
+    # only for quark_online_quantization
+    online_quant_config: Optional[dict] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -913,6 +1040,7 @@ class Config:
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.plugin_config.vllm_config if self.plugin_config is not None else None,
+            self.online_quant_config
         )
         hf_config_max_position_embeddings = getattr(
             self.hf_config, "max_position_embeddings", 8192

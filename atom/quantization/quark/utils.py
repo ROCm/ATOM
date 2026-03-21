@@ -4,7 +4,9 @@
 from collections.abc import Iterable
 from typing import Any
 import regex as re
-
+import triton  
+import triton.language as tl  
+import torch
 
 def deep_compare(dict1: Any, dict2: Any) -> bool:
     if type(dict1) is not type(dict2):
@@ -49,3 +51,45 @@ def _is_equal_or_regex_match(
     elif target == value:
         return True
     return False
+
+
+@triton.jit
+def _weight_dequant_kernel(  # type: ignore[no-untyped-def]
+    x_ptr,
+    s_ptr,
+    y_ptr,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):  # type: ignore[no-untyped-def]
+    """
+    Triton kernel for dequantizing FP8 weights using scaling factors.
+
+    This kernel is provided by deepseek-ai for efficient FP8 weight dequantization.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n = tl.cdiv(N, BLOCK_SIZE)
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+    s = tl.load(s_ptr + pid_m * n + pid_n)
+    y = x * s
+    tl.store(y_ptr + offs, y, mask=mask)
+
+def weight_dequant_fp8(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    Dequantize FP8 weight tensor using inverse scale with Triton kernel.
+    """
+    assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
+    assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
+    M, N = x.size()
+    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
+        return (triton.cdiv(M, meta["BLOCK_SIZE"]), triton.cdiv(N, meta["BLOCK_SIZE"]))
+
+    _weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+    return y
