@@ -543,6 +543,9 @@ jobs:
 
             docker exec atom-regression bash -lc "mkdir -p /app/trace/$TRACE_SUBDIR"
 
+            # Record profiler stop count before benchmark (to detect new completions)
+            STOP_COUNT_BEFORE=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null || echo 0)
+
             echo "=== Profiling: $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC ==="
             if ! docker exec atom-regression bash -lc "
               ${{ matrix.cell.env_vars }} \
@@ -559,14 +562,18 @@ jobs:
               continue
             fi
 
-            # Wait for profiler trace to finish writing, then move into per-config subdir
+            # Wait for engine core to finish exporting profiler trace (blocks inference)
+            # See .claude/plan/profiler-async-refactor.md for long-term fix
+            for i in $(seq 1 300); do
+              STOP_COUNT=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null || echo 0)
+              [ "$STOP_COUNT" -gt "$STOP_COUNT_BEFORE" ] && echo "Profiler trace export done after ${i}s" && break
+              [ "$i" -eq 1 ] && echo "Waiting for profiler trace export..."
+              [ "$i" -eq 300 ] && echo "WARNING: Profiler did not finish after 300s, proceeding anyway"
+              sleep 1
+            done
+
+            # Move trace files into per-config subdir
             docker exec atom-regression bash -lc "
-              for i in \$(seq 1 60); do
-                TMP_COUNT=\$(find /app/trace/rank_* -name '*.tmp' 2>/dev/null | wc -l)
-                [ \"\$TMP_COUNT\" -eq 0 ] && break
-                [ \"\$i\" -eq 1 ] && echo 'Waiting for trace .tmp files...'
-                sleep 1
-              done
               for d in /app/trace/rank_*; do
                 [ -d \"\$d\" ] && mv \"\$d\" /app/trace/$TRACE_SUBDIR/ 2>/dev/null || true
               done"
