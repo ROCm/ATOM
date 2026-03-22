@@ -672,12 +672,12 @@ class Scheduler:
         return self.has_unfinished_requests()
 
     def get_next_batch_info(self) -> tuple[bool, int]:
-        if self.waiting:
-            # new request is waiting, will do prefill
-            seq = self.waiting[0]
-            num_tokens = seq.num_tokens - seq.num_cached_tokens
-            return (True, num_tokens)
-        elif self.running:
+        for seq in self.waiting:
+            if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                num_tokens = seq.num_tokens - seq.num_cached_tokens
+                return (True, num_tokens)
+
+        if self.running:
             # decode
             num_tokens = len(self.running)
             return (False, num_tokens)

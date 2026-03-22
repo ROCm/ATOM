@@ -27,11 +27,7 @@ from atom.mesh.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 class KVConnectorBase(ABC):
     """Worker-side KV connector interface (one instance per TP rank)."""
 
-    @property
-    @abstractmethod
-    def is_producer(self) -> bool:
-        """Whether this engine acts as a KV producer (prefill side)."""
-        ...
+    is_producer: bool
 
     @abstractmethod
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
@@ -61,11 +57,7 @@ class KVConnectorBase(ABC):
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface."""
 
-    @property
-    @abstractmethod
-    def is_producer(self) -> bool:
-        """Whether this engine acts as a KV producer (prefill side)."""
-        ...
+    is_producer: bool
 
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
