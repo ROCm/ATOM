@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from atom.disaggregation.kvoutput_aggregator import KVConnectorOutput, KVOutputAggregator
+from atom.mesh.disaggregation.kvoutput_aggregator import KVConnectorOutput, KVOutputAggregator
 def test_kv_aggregator():
     print("Test 1: Basic scenario")
     aggregator = KVOutputAggregator(world_size=8)

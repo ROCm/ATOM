@@ -16,8 +16,8 @@ disaggregated prefill/decode engine instances.  It handles:
 
 Usage::
 
-    python -m atom.disaggregation.proxy
-    python -m atom.disaggregation.proxy --port 10001
+    python -m atom.mesh.disaggregation.proxy
+    python -m atom.mesh.disaggregation.proxy --port 10001
 """
 
 import asyncio

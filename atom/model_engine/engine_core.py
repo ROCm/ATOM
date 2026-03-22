@@ -20,7 +20,7 @@ from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
 
-from atom.disaggregation.kvoutput_aggregator import KVOutputAggregator
+from atom.mesh.disaggregation.kvoutput_aggregator import KVOutputAggregator
 
 logger = logging.getLogger("atom")
 

@@ -25,7 +25,7 @@ from threading import Thread
 import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
-from atom.disaggregation.kvoutput_aggregator import KVOutputAggregator
+from atom.mesh.disaggregation.kvoutput_aggregator import KVOutputAggregator
 from atom.utils import (
     get_mp_context,
     get_open_zmq_ipc_path,
