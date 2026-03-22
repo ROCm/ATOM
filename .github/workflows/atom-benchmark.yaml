@@ -264,14 +264,16 @@ jobs:
       - name: Download baseline from previous nightly run
         id: baseline
         run: |
+          # Use the most recent completed nightly run (regardless of success/failure)
+          # because even failed runs have valid per-model benchmark artifacts.
+          # Only requiring --status=success misses baselines when any single job fails.
           PREV_RUN_ID=$(gh run list \
             --workflow="ATOM Benchmark" \
             --branch=main \
             --event=schedule \
-            --status=success \
-            --limit=1 \
-            --json databaseId \
-            --jq '.[0].databaseId // empty')
+            --limit=5 \
+            --json databaseId,status \
+            --jq '[.[] | select(.status == "completed")][0].databaseId // empty')
 
           if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
             echo "Downloading baseline from run #$PREV_RUN_ID"
@@ -281,7 +283,7 @@ jobs:
             echo "Downloaded $BASELINE_COUNT baseline files"
             echo "baseline_dir=/tmp/baseline" >> $GITHUB_OUTPUT
           else
-            echo "No previous successful nightly run found"
+            echo "No previous completed nightly run found"
             echo "baseline_dir=" >> $GITHUB_OUTPUT
           fi
         env:
