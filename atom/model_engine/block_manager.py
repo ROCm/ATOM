@@ -8,7 +8,6 @@ import xxhash
 from atom.config import Config
 from atom.model_engine.sequence import Sequence
 
-FAKE_REMOTE_HASH = 100001
 
 
 class Block:
@@ -129,6 +128,9 @@ class BlockManager:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
+        # Note: in disaggregated (P/D) mode the scheduler skips this call on
+        # the first decode step after remote prefill, because blocks were
+        # already allocated during the KV transfer phase.
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         seq_len = len(seq)
