@@ -1,69 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Unit tests for KVConnectorScheduler (scheduler-side connector).
-
-These tests mock the heavy GPU/RDMA imports so they run on CPU-only
-machines.  Only the scheduler-side logic is exercised — no RDMA or
-torch.distributed calls are made.
-"""
+"""Unit tests for KVConnectorScheduler (scheduler-side connector)."""
 
 from __future__ import annotations
 
-import sys
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-# ---------------------------------------------------------------------------
-# Mock heavy modules before importing the engine module.
-# ---------------------------------------------------------------------------
-
-_MOCKS: dict[str, types.ModuleType] = {}
-
-
-def _ensure_mock(name: str) -> types.ModuleType:
-    if name not in sys.modules:
-        mod = types.ModuleType(name)
-        sys.modules[name] = mod
-        _MOCKS[name] = mod
-    return sys.modules[name]
-
-
-# torch / torch.distributed
-_ensure_mock("torch")
-sys.modules["torch"].distributed = MagicMock()
-sys.modules["torch"].tensor = MagicMock()
-sys.modules["torch"].Tensor = MagicMock
-
-# mori.io
-mori_pkg = _ensure_mock("mori")
-mori_io = _ensure_mock("mori.io")
-for attr in (
-    "BackendType", "EngineDesc", "IOEngine", "IOEngineConfig",
-    "MemoryDesc", "PollCqMode", "RdmaBackendConfig",
-):
-    setattr(mori_io, attr, MagicMock())
-
-# msgspec
-_ensure_mock("msgspec")
-sys.modules["msgspec"].Struct = type("Struct", (), {
-    "__init_subclass__": classmethod(lambda cls, **kw: None),
-})
-
-# aiter.dist.parallel_state
-_ensure_mock("aiter")
-_ensure_mock("aiter.dist")
-_ensure_mock("aiter.dist.parallel_state")
-sys.modules["aiter.dist.parallel_state"].get_dp_group = MagicMock()
-sys.modules["aiter.dist.parallel_state"].get_tp_group = MagicMock()
-
-# atom.config — provide a minimal Config stub
-_ensure_mock("atom.config")
-
-
-# Now safe to import
 from atom.mesh.disaggregation.kv_transfer_engine import (
     KVConnectorScheduler,
     Role,
