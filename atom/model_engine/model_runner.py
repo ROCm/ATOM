@@ -1718,7 +1718,10 @@ class ModelRunner:
     @torch.inference_mode()
     def async_proc_aggregation(self) -> KVConnectorOutput:
         """Collect finished send/recv status from the KV connector."""
-        done_sending, done_recving = get_kvconnector().get_finished()
+        connector = get_kvconnector()
+        if connector is None:
+            return KVConnectorOutput(finished_sending=[], finished_recving=[])
+        done_sending, done_recving = connector.get_finished()
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
         )

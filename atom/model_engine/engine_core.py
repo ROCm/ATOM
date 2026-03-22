@@ -60,6 +60,18 @@ class EngineCore:
         )
         self.output_thread.start()
 
+        # Start input thread BEFORE _init_data_parallel so that CoreManager
+        # can receive the input socket connection and proceed to start the
+        # remaining DP ranks.  Without this, _init_data_parallel blocks on
+        # rendezvous waiting for all DP ranks, but they haven't been spawned
+        # yet because CoreManager is still waiting for *this* rank's socket.
+        # The READY signal (sent at the end of __init__) gates actual request
+        # processing, so starting the input thread early is safe.
+        self.input_thread = threading.Thread(
+            target=self.process_input_sockets, args=(self.input_address,), daemon=True
+        )
+        self.input_thread.start()
+
         self.profile_enbaled = config.torch_profiler_dir is not None
         self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
@@ -106,18 +118,9 @@ class EngineCore:
 
         self.scheduler = Scheduler(config)
 
-        # Start input thread AFTER model is loaded so the "ready" signal
-        # is sent only when the engine is truly ready to accept requests
-        self.input_thread = threading.Thread(
-            target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        )
-        self.input_thread.start()
-
-        self.kv_aggregator = KVOutputAggregator(world_size=config.tensor_parallel_size)
-
-        # We can not start input thread here since dp need to sync with other ranks,
-        # Otherwise, DP will hang always.
-        # Thus we add new signal READY to notify CoreManager
+        self.kv_transfer_enabled = bool(config.kv_transfer_config)
+        if self.kv_transfer_enabled:
+            self.kv_aggregator = KVOutputAggregator(world_size=config.tensor_parallel_size)
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
@@ -174,14 +177,17 @@ class EngineCore:
                 self._process_engine_step()
 
     def _process_engine_step(self):
-        scheduled_batch, seqs = self.scheduler.schedule()
+        result = self.scheduler.schedule()
+        if result is None:
+            return False
+        scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
-        if scheduled_batch.connector_meta_output is not None:
+        if self.kv_transfer_enabled and scheduled_batch.connector_meta_output is not None:
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
             )
@@ -193,9 +199,10 @@ class EngineCore:
                 "forward", scheduled_batch, wait_out=True
             )
 
-        # Aggregate KV transfer status from all workers
-        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
-        self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
+        if self.kv_transfer_enabled:
+            kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+            self.scheduler._update_from_kv_xfer_finished(kvoutput)
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
