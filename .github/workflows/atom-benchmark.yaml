@@ -57,39 +57,31 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
-    env:
-      # Nightly params aligned with InferenceX dsr1-fp8 config: 1k1k, 1k8k, 8k1k with multiple concurrency levels
-      NIGHTLY_PARAM_LISTS: "1024,1024,1,0.8;1024,1024,2,0.8;1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,1024,256,0.8;1024,8192,1,0.8;1024,8192,2,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;8192,1024,1,0.8;8192,1024,2,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8"
     steps:
+      - uses: actions/checkout@v6
+
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            PARAM_LISTS="${{ env.NIGHTLY_PARAM_LISTS }}"
-            echo "Using nightly param lists (1k1k, 1k8k, 8k1k with multiple concurrency)"
-            echo "PARAM_LISTS: ${PARAM_LISTS}"
+            echo "Using nightly param lists from .github/benchmark/nightly_params.json"
+            # Expand grouped format (isl/osl + concurrency array) into flat matrix
+            MATRIX_JSON=$(jq -c '[.[] | . as $group | .concurrency[] | {input_length: $group.isl, output_length: $group.osl, concurrency: ., random_range_ratio: $group.random_range_ratio}]' .github/benchmark/nightly_params.json)
           else
             PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
             echo "Using param_lists: ${PARAM_LISTS}"
+            IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
+            MATRIX_JSON="["
+            SEP=""
+            for SET in "${SETS[@]}"; do
+              IFS=',' read -ra PARAMS <<< "$SET"
+              MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${PARAMS[0]},\"output_length\":${PARAMS[1]},\"concurrency\":${PARAMS[2]},\"random_range_ratio\":${PARAMS[3]}}"
+              SEP=","
+            done
+            MATRIX_JSON="${MATRIX_JSON}]"
           fi
-          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
-          MATRIX_JSON="["
-          SEP=""
-          for SET in "${SETS[@]}"; do
-            IFS=',' read -ra PARAMS <<< "$SET"
-            INPUT_LEN="${PARAMS[0]}"
-            OUTPUT_LEN="${PARAMS[1]}"
-            CONCURRENCY="${PARAMS[2]}"
-            RANDOM_RANGE_RATIO="${PARAMS[3]}"
-            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
-            SEP=","
-          done
-          MATRIX_JSON="${MATRIX_JSON}]"
+          echo "Matrix JSON: ${MATRIX_JSON}"
           echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
-      
-      - name: Print matrix JSON
-        run: |
-          echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
   load-models:
     name: Load model configs
