@@ -381,8 +381,11 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
     """Get or lazily initialize the global KV connector instance.
 
     The connector is role-dependent:
-      - ``"worker"``: Returns a ``KVConnector`` (worker-side, per TP rank).
-      - ``"scheduler"``: Returns a ``KVConnectorScheduler`` (scheduler-side).
+      - ``"worker"``: Returns a :class:`KVConnectorBase` (worker-side, per TP rank).
+      - ``"scheduler"``: Returns a :class:`KVConnectorSchedulerBase` (scheduler-side).
+
+    The concrete backend is selected by :class:`KVConnectorFactory` based on
+    ``config.kv_transfer_config["kv_connector"]`` (default: ``"moriio"``).
 
     Args:
         role: Either ``"worker"`` or ``"scheduler"``.
@@ -408,15 +411,15 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
             return None
 
         if _global_kvconnector is None:
-            from atom.mesh.disaggregation.kv_transfer_engine import KVConnector
+            from atom.mesh.disaggregation import KVConnectorFactory
 
-            _global_kvconnector = KVConnector(config)
+            _global_kvconnector = KVConnectorFactory.create_connector(config, role="worker")
             _logger.debug("Initialized global KVConnector at tp_rank %d", tp_rank)
 
     elif role == "scheduler":
-        from atom.mesh.disaggregation.kv_transfer_engine import KVConnectorScheduler
+        from atom.mesh.disaggregation import KVConnectorFactory
 
-        _global_kvconnector_scheduler = KVConnectorScheduler(config)
+        _global_kvconnector_scheduler = KVConnectorFactory.create_connector(config, role="scheduler")
         _logger.debug("Initialized global KVConnectorScheduler")
         return _global_kvconnector_scheduler
 

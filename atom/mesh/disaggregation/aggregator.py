@@ -10,7 +10,6 @@ view of which requests have completed across *all* workers.
 
 This module provides:
 
-- :class:`KVConnectorOutput`: Per-worker transfer status dataclass.
 - :class:`KVOutputAggregator`: Combines per-worker outputs into a single
   scheduler-level view using a countdown-based approach.
 """
@@ -18,39 +17,12 @@ This module provides:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
+
+from atom.mesh.disaggregation.types import KVConnectorOutput
 
 logger = logging.getLogger("atom")
 
-__all__ = ["KVConnectorOutput", "KVOutputAggregator"]
-
-
-@dataclass
-class KVConnectorOutput:
-    """Per-worker snapshot of finished KV cache transfers.
-
-    Each TP worker produces one of these per scheduler step.  The
-    :class:`KVOutputAggregator` combines them to determine which
-    request IDs have finished on *all* workers.
-
-    Attributes:
-        finished_sending: Request IDs whose KV send completed on this worker.
-        finished_recving: Request IDs whose KV receive completed on this worker.
-    """
-
-    finished_sending: set[str] = field(default_factory=set)
-    finished_recving: set[str] = field(default_factory=set)
-
-    def is_empty(self) -> bool:
-        """Return True if no transfers finished on this worker."""
-        return not self.finished_sending and not self.finished_recving
-
-    def __repr__(self) -> str:
-        return (
-            f"KVConnectorOutput(sending={self.finished_sending}, "
-            f"recving={self.finished_recving})"
-        )
+__all__ = ["KVOutputAggregator"]
 
 
 class KVOutputAggregator:
@@ -98,7 +70,6 @@ class KVOutputAggregator:
         if not worker_outputs:
             return KVConnectorOutput()
 
-        # Collect all unique IDs reported in this round
         all_sending_ids: set[str] = set()
         all_recving_ids: set[str] = set()
         for wo in worker_outputs:
@@ -107,7 +78,6 @@ class KVOutputAggregator:
             if wo.finished_recving:
                 all_recving_ids.update(wo.finished_recving)
 
-        # Initialize counters for newly seen request IDs
         for rid in all_sending_ids:
             if rid not in self._remaining_sending:
                 self._remaining_sending[rid] = self._world_size
@@ -116,7 +86,6 @@ class KVOutputAggregator:
             if rid not in self._remaining_recving:
                 self._remaining_recving[rid] = self._world_size
 
-        # Decrement counters based on each worker's report
         for wo in worker_outputs:
             if wo.finished_sending:
                 for rid in wo.finished_sending:
@@ -128,7 +97,6 @@ class KVOutputAggregator:
                     if rid in self._remaining_recving:
                         self._remaining_recving[rid] -= 1
 
-        # Harvest IDs whose counters have reached zero
         done_sending = {
             rid for rid, cnt in self._remaining_sending.items() if cnt <= 0
         }
@@ -136,7 +104,6 @@ class KVOutputAggregator:
             rid for rid, cnt in self._remaining_recving.items() if cnt <= 0
         }
 
-        # Clean up completed entries
         for rid in done_sending:
             del self._remaining_sending[rid]
         for rid in done_recving:

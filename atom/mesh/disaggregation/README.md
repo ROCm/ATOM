@@ -52,9 +52,9 @@ across the tensor-parallel group.
 #### 1. Start the Proxy
 
 ```bash
-python -m atom.disaggregation.proxy
+python -m atom.mesh.disaggregation.proxy
 # or with custom port:
-python -m atom.disaggregation.proxy --port 10001
+python -m atom.mesh.disaggregation.proxy --port 10001
 ```
 
 #### 2. Start the Prefill Node
@@ -111,7 +111,7 @@ Key differences from TP-only mode:
 Same as TP-only:
 
 ```bash
-python -m atom.disaggregation.proxy --port 10001
+python -m atom.mesh.disaggregation.proxy --port 10001
 ```
 
 #### 2. Start the Prefill Node

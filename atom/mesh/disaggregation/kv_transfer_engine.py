@@ -26,19 +26,14 @@ Architecture::
 
 from __future__ import annotations
 
-import contextlib
-import ipaddress
 import logging
 import queue
-import socket
 import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterator, Optional
-from urllib.parse import urlparse
+from typing import Any, Optional
 
 import msgpack
 import msgspec
@@ -48,7 +43,24 @@ import torch.distributed as dist
 import zmq
 
 from atom.config import Config
+from atom.mesh.disaggregation.base import KVConnectorBase, KVConnectorSchedulerBase
+from atom.mesh.disaggregation.types import (
+    ConnectorMetadata,
+    EngineId,
+    KVConnectorOutput,
+    RemoteAllocInfo,
+    RemoteMeta,
+    ReqId,
+    ReqMeta,
+    TransferId,
+)
 from atom.model_engine.sequence import Sequence
+from atom.utils import (
+    get_open_port,
+    make_zmq_path,
+    make_zmq_socket,
+    zmq_socket_ctx,
+)
 from atom.utils.network import get_ip
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
@@ -78,14 +90,6 @@ except ImportError:
         "Install the mori package to enable RDMA transfers."
     )
 
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
-
-EngineId = str
-ReqId = str
-TransferId = int
-
 
 # ---------------------------------------------------------------------------
 # Msgspec metadata structs
@@ -106,44 +110,6 @@ class MoRIIOAgentMetadata(
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
-
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ReqMeta:
-    """Per-request metadata needed for KV cache transfer.
-
-    Captures both local and remote block locations together with
-    networking information to reach the remote engine.
-    """
-
-    local_block_ids: list[int]
-    remote_block_ids: list[int]
-    remote_host: str
-    remote_port: int
-    remote_handshake_port: int
-    remote_engine_id: str
-    tp_size: int
-    remote_dp_size: int
-    remote_dp_rank: int = 0
-    # Producer and consumer may assign different seq_ids to the same
-    # logical request.  ``transfer_id`` keeps them correlated so the
-    # producer can free its blocks after the consumer acknowledges receipt.
-    transfer_id: int = 0
-
-
-@dataclass
-class RemoteAllocInfo:
-    """Allocation information received from the remote (decode) side."""
-
-    block_ids: list[int] = field(default_factory=list)
-    writes_done: int = 0
-    decode_dp_rank: int = 0
-    transfer_offset: tuple[list[int], list[int], list[int]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -255,61 +221,8 @@ class MoRIIOConstants:
     ABORT_REQUEST_TIMEOUT = 3600
 
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
-
-
-def is_valid_ipv6_address(address: str) -> bool:
-    """Check whether *address* is a valid IPv6 address string."""
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
-
-
-def make_zmq_path(scheme: str, host: str, port: int | None = None) -> str:
-    """Make a ZMQ path from its parts.
-
-    Args:
-        scheme: The ZMQ transport scheme (e.g. tcp, ipc, inproc).
-        host: The host - can be an IPv4 address, IPv6 address, or hostname.
-        port: Optional port number, only used for TCP sockets.
-
-    Returns:
-        A properly formatted ZMQ path string.
-    """
-    if port is None:
-        return f"{scheme}://{host}"
-    if is_valid_ipv6_address(host):
-        return f"{scheme}://[{host}]:{port}"
-    return f"{scheme}://{host}:{port}"
-
-
 def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return (dp_rank) * tp_size + tp_rank
-
-
-@dataclass
-class KVConnectorOutput:
-    """Aggregated transfer status returned from each worker to the scheduler.
-
-    ``finished_sending`` and ``finished_recving`` hold the *request IDs* of
-    transfers that have completed on *this* worker.  The scheduler-side
-    aggregator combines outputs from all TP workers to determine globally
-    completed transfers.
-    """
-
-    finished_sending: set[str] | None = None
-    finished_recving: set[str] | None = None
-
-    # How many finished notifications should be expected per request.
-    # Used by handshake-based connectors for the KVOutputAggregator.
-    expected_finished_count: int = 0
-
-    def is_empty(self) -> bool:
-        return not self.finished_sending and not self.finished_recving
 
 
 # ===================================================================
@@ -482,11 +395,11 @@ class MoRIIOWrapper:
             path = make_zmq_path("tcp", host, self.notify_port)
             logger.info("Node starting to listen notify from path = %s", path)
 
-            with zmq_ctx(zmq.ROUTER, path) as sock:
+            with _zmq_ctx(zmq.ROUTER, path) as sock:
                 while True:
                     try:
                         identity, msg = sock.recv_multipart()
-                        self._handle_message(msg)
+                        self._dispatch_message(msg)
                     except Exception as e:
                         logger.error("Error processing message: %s", e)
                         raise ValueError(f"Error processing message: {e}") from e
@@ -605,78 +518,6 @@ class MoRIIOWrapper:
             except Exception as e:
                 logger.warning("Error closing socket for %s: %s", path, e)
         self._sockets.clear()
-        
-@dataclass
-class RemoteMeta:
-    """Minimal metadata describing a remote block allocation."""
-
-    block_ids: list[int]
-    host: str
-    port: int
-    engine_id: str
-    request_id: str
-
-
-# ===================================================================
-# ConnectorMetadata — scheduler <-> worker transfer descriptor
-# ===================================================================
-
-
-class ConnectorMetadata:
-    """Snapshot of pending KV transfer requests, passed from scheduler to workers.
-
-    The scheduler populates this each step with new receive / save requests,
-    and the worker-side :class:`KVConnector` consumes it in
-    :meth:`KVConnector.start_load_kv`.
-    """
-
-    def __init__(self) -> None:
-        self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
-        self.reqs_to_save: dict[ReqId, ReqMeta] = {}
-        self.reqs_to_send: dict[ReqId, float] = {}
-        self.reqs_in_batch: set[ReqId] = set()
-        self.reqs_not_processed: set[ReqId] = set()
-        self.request_id_to_transfer_id: dict[ReqId, int] = {}
-
-    @staticmethod
-    def _build_req_meta(
-        req_id: ReqId,
-        local_block_ids: list[int],
-        kv_transfer_params: dict[str, Any],
-    ) -> ReqMeta:
-        """Construct a :class:`ReqMeta` from raw transfer parameters."""
-        return ReqMeta(
-            local_block_ids=local_block_ids,
-            remote_block_ids=kv_transfer_params["remote_block_ids"],
-            remote_engine_id=kv_transfer_params["remote_engine_id"],
-            remote_host=kv_transfer_params["remote_host"],
-            remote_port=kv_transfer_params["remote_port"],
-            remote_handshake_port=kv_transfer_params["remote_handshake_port"],
-            remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
-            remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
-            tp_size=kv_transfer_params.get("tp_size", 1),
-            transfer_id=kv_transfer_params.get("transfer_id", 0),
-        )
-
-    def add_new_req_to_save(
-        self,
-        request_id: ReqId,
-        local_block_ids: list[int],
-        kv_transfer_params: dict[str, Any],
-    ) -> None:
-        self.reqs_to_save[request_id] = self._build_req_meta(
-            request_id, local_block_ids, kv_transfer_params
-        )
-
-    def add_new_req_to_recv(
-        self,
-        request_id: ReqId,
-        local_block_ids: list[int],
-        kv_transfer_params: dict[str, Any],
-    ) -> None:
-        self.reqs_to_recv[request_id] = self._build_req_meta(
-            request_id, local_block_ids, kv_transfer_params
-        )
 
 
 # ===================================================================
@@ -684,7 +525,7 @@ class ConnectorMetadata:
 # ===================================================================
 
 
-class KVConnector:
+class KVConnector(KVConnectorBase):
     """Worker-side KV cache connector for disaggregated P/D inference.
 
     Each tensor-parallel worker instantiates one ``KVConnector``.  It is
@@ -705,7 +546,7 @@ class KVConnector:
 
         kv_transfer_config = config.kv_transfer_config
         self.local_ip = get_ip()
-        self._local_ping_port = _get_open_port()
+        self._local_ping_port = get_open_port()
 
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
@@ -1201,7 +1042,7 @@ class KVConnector:
         path = make_zmq_path("tcp", "*", base_port)
         logger.info("Handshake listener bound to %s", path)
 
-        with zmq_ctx(zmq.ROUTER, path) as sock:
+        with _zmq_ctx(zmq.ROUTER, path) as sock:
             ready_event.set()
             while True:
                 parts = sock.recv_multipart()
@@ -1251,7 +1092,7 @@ class KVConnector:
         path = make_zmq_path("tcp", host, port + port_offset)
         logger.info("Initiating handshake on %s", path)
 
-        with zmq_ctx(zmq.DEALER, path) as sock:
+        with _zmq_ctx(zmq.DEALER, path) as sock:
             sock.send(MoRIIOConstants.GET_META_MSG)
             received_frame = sock.recv_multipart()
             if len(received_frame) != 2 or received_frame[0] != b"":
@@ -1405,7 +1246,7 @@ class KVConnector:
 # ===================================================================
 
 
-class KVConnectorScheduler:
+class KVConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side KV connector that tracks transfer lifecycle.
 
     Runs in the scheduler process (not in TP workers).  Responsible for:
@@ -1422,7 +1263,7 @@ class KVConnectorScheduler:
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
-        self.handshake_port = _get_open_port()
+        self.handshake_port = get_open_port()
         self.engine_id = "None"
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.parallel_config.data_parallel_size
@@ -1528,111 +1369,14 @@ class KVConnectorScheduler:
             if transfer_id is not None:
                 self.transfer_id_to_request_id.pop(transfer_id, None)
 
-    
-def _get_open_port() -> int:
-    """Find and return an unused TCP port on the local host."""
-    for family in (socket.AF_INET, socket.AF_INET6):
-        try:
-            with socket.socket(family, socket.SOCK_STREAM) as s:
-                s.bind(("", 0))
-                return s.getsockname()[1]
-        except OSError:
-            continue
-    raise OSError("Unable to find an open port on any address family")
 
 
-def split_zmq_path(path: str) -> tuple[str, str, str]:
-    """Split a zmq path into its parts."""
-    parsed = urlparse(path)
-    if not parsed.scheme:
-        raise ValueError(f"Invalid zmq path: {path}")
 
-    scheme = parsed.scheme
-    host = parsed.hostname or ""
-    port = str(parsed.port or "")
+def _zmq_ctx(socket_type: int, addr: str):
+    """Context manager for a ZMQ socket with role-appropriate bind semantics.
 
-    if scheme == "tcp" and not all((host, port)):
-        # The host and port fields are required for tcp
-        raise ValueError(f"Invalid zmq path: {path}")
-
-    if scheme != "tcp" and port:
-        # port only makes sense with tcp
-        raise ValueError(f"Invalid zmq path: {path}")
-
-    return scheme, host, port
-
-# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783 # noqa: E501
-def make_zmq_socket(
-    ctx: zmq.asyncio.Context | zmq.Context,  # type: ignore[name-defined]
-    path: str,
-    socket_type: Any,
-    bind: bool | None = None,
-    identity: bytes | None = None,
-    linger: int | None = None,
-) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
-    """Make a ZMQ socket with the proper bind/connect semantics."""
-    import psutil
-
-    mem = psutil.virtual_memory()
-    socket = ctx.socket(socket_type)
-
-    # Calculate buffer size based on system memory
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    # For systems with substantial memory (>32GB total, >16GB available):
-    # - Set a large 0.5GB buffer to improve throughput
-    # For systems with less memory:
-    # - Use system default (-1) to avoid excessive memory consumption
-    buf_size = int(0.5 * 1024**3) if total_mem > 32 and available_mem > 16 else -1
-
-    if bind is None:
-        bind = socket_type not in (zmq.PUSH, zmq.SUB, zmq.XSUB)
-
-    if socket_type in (zmq.PULL, zmq.DEALER, zmq.ROUTER):
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type in (zmq.PUSH, zmq.DEALER, zmq.ROUTER):
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    if identity is not None:
-        socket.setsockopt(zmq.IDENTITY, identity)
-
-    if linger is not None:
-        socket.setsockopt(zmq.LINGER, linger)
-
-    if socket_type == zmq.XPUB:
-        socket.setsockopt(zmq.XPUB_VERBOSE, True)
-
-    # Determine if the path is a TCP socket with an IPv6 address.
-    # Enable IPv6 on the zmq socket if so.
-    scheme, host, _ = split_zmq_path(path)
-    if scheme == "tcp" and is_valid_ipv6_address(host):
-        socket.setsockopt(zmq.IPV6, 1)
-
-    if bind:
-        socket.bind(path)
-    else:
-        socket.connect(path)
-
-    return socket
-
-
-@contextlib.contextmanager
-def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
-    """Context manager for a ZMQ socket"""
-
-    if socket_type not in (zmq.ROUTER, zmq.REQ, zmq.DEALER):
-        raise ValueError(f"Unexpected socket type: {socket_type}")
-
-    ctx: zmq.Context | None = None
-    try:
-        ctx = zmq.Context()  # type: ignore[attr-defined]
-        yield make_zmq_socket(
-            ctx=ctx, path=addr, socket_type=socket_type, bind=socket_type == zmq.ROUTER
-        )
-    finally:
-        if ctx is not None:
-            ctx.destroy(linger=0)
-            
+    ROUTER sockets bind; DEALER/REQ sockets connect.
+    """
+    return zmq_socket_ctx(
+        addr, socket_type, bind=(socket_type == zmq.ROUTER)
+    )
