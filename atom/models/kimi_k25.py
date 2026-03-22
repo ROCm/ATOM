@@ -262,6 +262,12 @@ if is_vllm():
         dummy_inputs=KimiK25DummyInputsBuilder,
     )
     class KimiK25ForConditionalGeneration_(vLLMKimiK25):
+        packed_modules_mapping: dict[str, tuple[str, int]] = {
+            "q_a_proj": ("fused_qkv_a_proj", 0),
+            "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
+            "gate_proj": ("gate_up_proj", 0),
+            "up_proj": ("gate_up_proj", 1),
+        }
         hf_to_atom_mapper = WeightsMapper(
             orig_to_new_prefix={
                 "model.visual.": "visual.",
@@ -269,13 +275,11 @@ if is_vllm():
                 "model.language_model.": "language_model.model.",
             }
         )
+
         def __init__(self, atom_config: Config, prefix: str = "model"):
             # protocols have not __init__ method, so we need to use nn.Module.__init__
             nn.Module.__init__(self)
             config: KimiK25Config = atom_config.hf_config
-            print(f"config = {config}, type(config) = {type(config)}", flush=True)
-            print(f"config.vision_config = {config.vision_config}", flush=True)
-            print(f"config.text_config = {config.text_config}", flush=True)
 
             vllm_config = atom_config.plugin_config.vllm_config
             quant_config = vllm_config.quant_config

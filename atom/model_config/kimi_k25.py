@@ -94,7 +94,6 @@ class KimiK25Config(PretrainedConfig):
         elif isinstance(vision_config, dict):
             vision_config = KimiK25VisionConfig(**vision_config)
         self.vision_config: KimiK25VisionConfig = vision_config
-        print(f"vision_config = {vision_config}, type(vision_config) = {type(vision_config)}", flush=True)
 
         # Text config
         if text_config is None:
