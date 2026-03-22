@@ -38,6 +38,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
+    "KimiK25ForConditionalGeneration": "atom.models.kimi_k25:KimiK25ForConditionalGeneration_",
 }
 
 
@@ -84,8 +85,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.ignore_unexpected_prefixes: list[str] = []
         self.ignore_unexpected_suffixes: list[str] = []
 
+        print(f"vllm_config = {vllm_config}", flush=True)
         self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
-
+        print(f"self.atom_config = {self.atom_config}", flush=True)
         _prepare_env(atom_config=self.atom_config)
 
         model_arch = vllm_config.model_config.architectures[0]

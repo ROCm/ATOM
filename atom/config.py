@@ -594,7 +594,7 @@ _CONFIG_REGISTRY: dict[str, str] = {
 
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
-    "kimi_k25": "text_config",
+    # "kimi_k25": "text_config",
 }
 
 
