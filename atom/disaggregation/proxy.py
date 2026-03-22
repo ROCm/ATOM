@@ -325,6 +325,12 @@ async def handle_request():
             ]
             req_data["kv_transfer_params"]["transfer_id"] = prefill_kv["transfer_id"]
 
+            # Use the actual dp_rank from the prefill response (authoritative),
+            # falling back to the proxy's round-robin selection.
+            actual_dp_rank = prefill_kv.get("dp_rank", selected_prefill_dp_rank)
+            if actual_dp_rank is not None:
+                selected_prefill_dp_rank = actual_dp_rank
+
         req_data["kv_transfer_params"]["remote_dp_size"] = prefill_ep["dp_size"]
         req_data["kv_transfer_params"]["remote_tp_size"] = prefill_ep["tp_size"]
 

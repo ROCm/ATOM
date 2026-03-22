@@ -1545,7 +1545,8 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
 
-        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
+        graph_bs = context.graph_bs
+        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1] or graph_bs > self.graph_bs[-1]:
             # prefill[bs=1 tok=115 ctx=115]
             label = f"prefill[bs={bs}"
             if batch is not None:
@@ -1573,7 +1574,6 @@ class ModelRunner:
                     label += f" spec={batch.num_spec_step}"
             label += "]"
             with record_function(label):
-                graph_bs = context.graph_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
                 graph_key = (graph_bs, max_q_len)
                 self.graphs[graph_key].replay()

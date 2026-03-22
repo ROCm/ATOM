@@ -129,6 +129,7 @@ class ReqMeta:
     remote_engine_id: str
     tp_size: int
     remote_dp_size: int
+    remote_dp_rank: int = 0
     # Producer and consumer may assign different seq_ids to the same
     # logical request.  ``transfer_id`` keeps them correlated so the
     # producer can free its blocks after the consumer acknowledges receipt.
@@ -652,6 +653,7 @@ class ConnectorMetadata:
             remote_port=kv_transfer_params["remote_port"],
             remote_handshake_port=kv_transfer_params["remote_handshake_port"],
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
+            remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
             tp_size=kv_transfer_params.get("tp_size", 1),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
         )
@@ -889,10 +891,11 @@ class KVConnector:
     def _issue_read_for_req(self, req_id: str, meta: ReqMeta) -> None:
         """Issue RDMA reads for a single request."""
         logger.debug(
-            "Issuing RDMA read for req %s from engine %s (tp_rank=%d)",
+            "Issuing RDMA read for req %s from engine %s (tp_rank=%d, remote_dp_rank=%d)",
             req_id,
             meta.remote_engine_id,
             self.tp_rank,
+            meta.remote_dp_rank,
         )
         self._read_blocks(
             request_id=req_id,
@@ -901,6 +904,7 @@ class KVConnector:
             remote_block_ids=meta.remote_block_ids,
             remote_host=meta.remote_host,
             remote_handshake_port=meta.remote_handshake_port,
+            remote_dp_rank=meta.remote_dp_rank,
         )
         
     def merge_contiguous_blocks(
@@ -1061,6 +1065,7 @@ class KVConnector:
         request_id: str,
         remote_host: str,
         remote_handshake_port: int,
+        remote_dp_rank: int = 0,
     ) -> None:
         """Issue RDMA reads for all layers of a single request.
 
@@ -1072,15 +1077,16 @@ class KVConnector:
         remote_block_ids = convert_virtual_to_physical_pages(remote_block_ids)
 
         logger.debug(
-            "Reading %d blocks for req %s from %s (tp_rank=%d)",
+            "Reading %d blocks for req %s from %s (tp_rank=%d, remote_dp_rank=%d)",
             len(local_block_ids),
             request_id,
             dst_engine_id,
             self.tp_rank,
+            remote_dp_rank,
         )
 
-        dp0_id = self._engine_name_with_dp(dst_engine_id, 0)
-        sessions, remote_meta = self._get_or_build_sessions(dp0_id)
+        dp_engine_id = self._engine_name_with_dp(dst_engine_id, remote_dp_rank)
+        sessions, remote_meta = self._get_or_build_sessions(dp_engine_id)
 
         # Compute offsets once (identical across layers for uniform caches)
         first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
@@ -1088,9 +1094,13 @@ class KVConnector:
             first_layer, local_block_ids, remote_block_ids, remote_meta
         )
 
+        # Notify port = base handshake port + offset(remote_dp_rank, local_tp_rank)
+        notify_port = remote_handshake_port + get_port_offset(
+            remote_dp_rank, self.tp_rank
+        )
+
         layer_names = list(self.layer_name_to_local_kv_cache_metadata.keys())
         for layer_idx, layer_name in enumerate(layer_names):
-            # TODO: use multi-session batch-read once MoRIIO supports it
             transfer_status = self.moriio_wrapper.read_remote_data(
                 offsets[2], offsets[0], offsets[1], sessions[layer_idx]
             )
@@ -1098,14 +1108,16 @@ class KVConnector:
                 self._recving_transfers[request_id].append(transfer_status)
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
-                    str(remote_handshake_port + self.tp_rank),
+                    str(notify_port),
                 )
 
         logger.debug(
-            "RDMA read issued for req %s (%d layers) from %s",
+            "RDMA read issued for req %s (%d layers) from %s (dp_rank=%d, notify_port=%d)",
             request_id,
             len(layer_names),
             dst_engine_id,
+            remote_dp_rank,
+            notify_port,
         )
 
     def _service_discovery_ping(self, zmq_context: zmq.Context) -> None:
@@ -1414,6 +1426,7 @@ class KVConnectorScheduler:
         self.engine_id = "None"
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.parallel_config.data_parallel_size
+        self.dp_rank = config.parallel_config.data_parallel_rank
         self.host_ip = get_ip()
 
         # Pending receive requests: req_id -> (Sequence, block_table)
@@ -1505,6 +1518,7 @@ class KVConnectorScheduler:
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
             "tp_size": self.tp_size,
+            "dp_rank": self.dp_rank,
             "transfer_id": seq.id,
         }
 

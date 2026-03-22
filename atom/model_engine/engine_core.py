@@ -409,7 +409,19 @@ class DPEngineCoreProc(EngineCore):
             else:
                 executed = self._process_engine_step()
                 if not executed:
-                    self._execute_dummy_batch()
+                    if global_has_prefill:
+                        # get_next_batch_info predicted prefill but schedule()
+                        # skipped it (e.g. WAITING_FOR_REMOTE_KVS).  Other DP
+                        # ranks already committed to dummy_prefill, so we must
+                        # match to keep the all-reduce in sync.
+                        logger.info(
+                            f"{self.label}: Predicted prefill was not scheduled, "
+                            f"falling back to dummy prefill ({global_max_tokens} "
+                            f"tokens) to stay in sync with other DP ranks"
+                        )
+                        self._execute_dummy_prefill(global_max_tokens)
+                    else:
+                        self._execute_dummy_batch()
 
             self.engines_running = global_has_unfinished
 
