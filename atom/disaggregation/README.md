@@ -47,7 +47,9 @@ across the tensor-parallel group.
 
 ## How to Run
 
-### 1. Start the Proxy
+### TP-only Mode (Tensor Parallelism)
+
+#### 1. Start the Proxy
 
 ```bash
 python -m atom.disaggregation.proxy
@@ -55,7 +57,7 @@ python -m atom.disaggregation.proxy
 python -m atom.disaggregation.proxy --port 10001
 ```
 
-### 2. Start the Prefill Node
+#### 2. Start the Prefill Node
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -66,7 +68,7 @@ python -m atom.entrypoints.openai_server \
   --kv-transfer-config '{"kv_role":"kv_producer","proxy_ip":"<PROXY_IP>","proxy_ping_port":36367,"http_prt":8000}'
 ```
 
-### 3. Start the Decode Node
+#### 3. Start the Decode Node
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -77,7 +79,74 @@ python -m atom.entrypoints.openai_server \
   --kv-transfer-config '{"kv_role":"kv_consumer","proxy_ip":"<PROXY_IP>","proxy_ping_port":36367,"http_prt":8000}'
 ```
 
-### 4. Send Requests (to the Proxy)
+#### 4. Send Requests (to the Proxy)
+
+```bash
+curl -s http://<PROXY_IP>:10001/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"1 2 3 4 5","max_tokens":10,"temperature":0}'
+```
+
+### DP + TP Mode (Data Parallelism + Tensor Parallelism)
+
+When running MoE models (e.g. DeepSeek-V3/R1), you can enable data parallelism
+with expert parallelism for higher throughput. Each DP rank runs a full TP
+group, and MoE all-to-all is handled by MORI.
+
+Key differences from TP-only mode:
+
+- Add `--enable-dp-attention --enable-expert-parallel` to both prefill and
+  decode nodes.
+- Set `MORI_SHMEM_MODE=ISOLATION` to separate MoRI (MoE all-to-all) and
+  MORI-IO (KV transfer) symmetric heap memory pools — without this, the two
+  subsystems compete for the same memory and cause OOM during warmup.
+- The prefill node reports its `dp_rank` back to the proxy so the decode node
+  knows which DP rank's KV cache to read.
+- Each decode DP rank binds MORI-IO sessions to **all** prefill DP ranks
+  (not just its own), because any prefill DP rank may have processed the
+  request.
+
+#### 1. Start the Proxy
+
+Same as TP-only:
+
+```bash
+python -m atom.disaggregation.proxy --port 10001
+```
+
+#### 2. Start the Prefill Node
+
+```bash
+export MORI_SHMEM_MODE=ISOLATION
+
+python -m atom.entrypoints.openai_server \
+  --kv_cache_dtype fp8 \
+  --model /path/to/model \
+  --block-size 16 \
+  -tp 8 \
+  --enable-dp-attention \
+  --enable-expert-parallel \
+  --kv-transfer-config '{"kv_role":"kv_producer","proxy_ip":"<PROXY_IP>","proxy_ping_port":36367,"http_prt":8000}'
+```
+
+#### 3. Start the Decode Node
+
+```bash
+export MORI_SHMEM_MODE=ISOLATION
+
+python -m atom.entrypoints.openai_server \
+  --kv_cache_dtype fp8 \
+  --model /path/to/model \
+  --block-size 16 \
+  -tp 8 \
+  --enable-dp-attention \
+  --enable-expert-parallel \
+  --kv-transfer-config '{"kv_role":"kv_consumer","proxy_ip":"<PROXY_IP>","proxy_ping_port":36367,"http_prt":8000}'
+```
+
+#### 4. Send Requests
+
+Same as TP-only — requests go through the proxy:
 
 ```bash
 curl -s http://<PROXY_IP>:10001/v1/completions \
