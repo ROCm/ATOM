@@ -210,7 +210,8 @@ class InputOutputProcessor:
             sampling_params,
             stop_token_sequences,
             stream_callback=stream_callback,
-            id=None,
+            num_draft_tokens=self.num_speculative_tokens,
+            mamba_enabled=self.mamba_enabled,
             kv_transfer_params=kv_transfer_params,
         )
         seq.arrive_time = time.time()
