@@ -21,7 +21,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from atom.mesh.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+from atom.mesh.disaggregation.types import ConnectorMetadata
 
 
 class KVConnectorBase(ABC):

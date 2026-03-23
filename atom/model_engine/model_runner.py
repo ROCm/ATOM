@@ -11,7 +11,6 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.profiler as torch_profiler
 import tqdm
 from aiter import destroy_dist_env, dtypes, init_dist_env

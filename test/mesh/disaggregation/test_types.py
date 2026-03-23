@@ -7,7 +7,6 @@ import pytest
 
 from atom.mesh.disaggregation.types import (
     ConnectorMetadata,
-    KVConnectorOutput,
     RemoteAllocInfo,
     RemoteMeta,
     ReqMeta,

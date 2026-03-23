@@ -38,8 +38,6 @@ from typing import Any, Optional
 import msgpack
 import msgspec
 import numpy as np
-import torch
-import torch.distributed as dist
 import zmq
 
 from atom.config import Config
@@ -47,9 +45,7 @@ from atom.mesh.disaggregation.base import KVConnectorBase, KVConnectorSchedulerB
 from atom.mesh.disaggregation.types import (
     ConnectorMetadata,
     EngineId,
-    KVConnectorOutput,
     RemoteAllocInfo,
-    RemoteMeta,
     ReqId,
     ReqMeta,
     TransferId,
@@ -78,8 +74,6 @@ try:
         IOEngine,
         IOEngineConfig,
         MemoryDesc,
-        PollCqMode,
-        RdmaBackendConfig,
     )
 
     _MORIIO_AVAILABLE = True

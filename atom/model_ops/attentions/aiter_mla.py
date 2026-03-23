@@ -371,9 +371,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.prepare_block_tables(batch)
 
 
-        num_blocks_per_seq_bk = [
-            (ctx + self.block_size - 1) // self.block_size for ctx in batch.context_lens
-        ]
         num_blocks_per_seq = []
         for i, (ctx, is_first) in enumerate(zip(batch.context_lens, batch.is_first_decode_without_local_prefill)):
             if is_first:

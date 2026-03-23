@@ -31,7 +31,6 @@ from atom.mesh.disaggregation.kv_transfer_engine import (
     _RoleManager,
     set_role,
 )
-from atom.mesh.disaggregation.types import ConnectorMetadata
 from atom.model_engine.sequence import Sequence
 from atom.utils import get_open_port, make_zmq_path
 
