@@ -1,192 +1,294 @@
 name: ATOM vLLM OOT Full Validation
 
 on:
+  schedule:
+    # Nightly at 02:00 Beijing time (18:00 UTC on the previous day)
+    - cron: '0 18 * * *'
   workflow_dispatch:
+    # Manual runs use GitHub Actions' built-in branch dropdown as the ATOM
+    # branch selector, so users do not need to type branch names.
     inputs:
-      vllm_commit:
-        description: "vLLM commit to validate"
-        # NOTE: For full validation, set this commit explicitly when your PR
-        # adapts ATOM to a newer vLLM version; using an old default commit can
-        # hide real compatibility issues.
+      run_qwen3_moe_tp8:
+        description: "Qwen3-235B-A22B-Instruct-2507-FP8 TP8"
         required: false
-        type: string
-        default: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
-      vllm_version:
-        description: "vLLM version label in image tag"
+        type: boolean
+        default: true
+      run_qwen3_next_80b_tp2:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP2"
         required: false
-        type: string
-        default: "0.17"
-      base_image:
-        description: "ATOM base image for rebuild"
+        type: boolean
+        default: true
+      run_qwen35_397b_tp8:
+        description: "Qwen3.5-397B-A17B-FP8 TP8"
         required: false
-        type: string
-        default: "rocm/atom-dev:latest"
+        type: boolean
+        default: true
+      run_kimi_k2_tp8:
+        description: "Kimi-K2-Thinking-MXFP4 TP8"
+        required: false
+        type: boolean
+        default: true
+      run_dsr1_fp4_tp8:
+        description: "DeepSeek-R1-0528-MXFP4 TP8"
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  BASE_IMAGE: ${{ inputs.base_image || 'rocm/atom-dev:latest' }}
-  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  NIGHTLY_OOT_IMAGE_TAG: rocm/atom-dev:vllm-latest
   VALIDATION_IMAGE_REPO: rocm/atom-dev
+  MANUAL_BASE_IMAGE: rocm/pytorch:latest
+  GPU_ARCH: "gfx942;gfx950"
+  AITER_REPO: "https://github.com/ROCm/aiter.git"
+  AITER_COMMIT: "HEAD"
+  RCCL_REPO: "https://github.com/ROCm/rccl.git"
+  RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
+  VLLM_COMMIT: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
 
 jobs:
-  build-oot-image:
-    name: Build OOT validation image
+  prepare-oot-image:
+    name: Prepare OOT validation image
     runs-on: build-only-atom
     outputs:
       oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
+      cleanup_temp_image: ${{ steps.meta.outputs.cleanup_temp_image }}
+      model_matrix: ${{ steps.meta.outputs.model_matrix }}
     steps:
-      - name: Checkout ATOM repo
-        uses: actions/checkout@v4
+      - name: Checkout selected ATOM branch
+        uses: actions/checkout@v6
 
       - name: Docker Login
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != 'main' }}
         run: |
-          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
-      - name: Generate OOT base Dockerfile
-        run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.BASE_IMAGE }}
-          RUN pip install -U lm-eval[api]
-          RUN pip show lm-eval || true
-          RUN pip install hf_transfer
-          RUN pip show hf_transfer || true
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
-          RUN pip uninstall -y amd-aiter
-          RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip show pybind11
-          RUN rm -rf /app/aiter-test
-          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
-              cd /app/aiter-test && \\
-              git checkout HEAD && \\
-              git submodule sync && git submodule update --init --recursive && \\
-              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
-          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
-          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
-          RUN pip uninstall -y atom
-          RUN rm -rf /app/ATOM
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
-              cd /app/ATOM && \\
-              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
-              pip install -e .
-          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          EOF
-
-      - name: Build OOT base image
-        run: |
-          docker build --pull --network=host \
-            --no-cache \
-            -t atom_oot_base:ci \
-            -f Dockerfile.mod .
-
-      - name: Build OOT vLLM image from current commit
+      - name: Resolve image source and model matrix
         id: meta
+        env:
+          RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
+          RUN_QWEN3_NEXT_80B_TP2: ${{ inputs.run_qwen3_next_80b_tp2 }}
+          RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
+          RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
+          RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
         run: |
-          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-vllm-validation-${GITHUB_COMMIT_SHA}-${{ github.run_id }}"
-          # OOT_BASE_IMAGE is built in the previous step and only exists locally on this runner.
-          docker build --network=host \
-            --no-cache \
+          set -euo pipefail
+
+          # Keep this Python model list as the single source of truth for OOT
+          # full-validation coverage and manual checkbox filtering.
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          models = [
+              {
+                  "toggle_env": "RUN_QWEN3_MOE_TP8",
+                  "model_name": "Qwen3-235B-A22B-Instruct-2507-FP8 TP8",
+                  "model_path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+                  "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel",
+                  "accuracy_test_threshold": 0.87,
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "linux-atom-mi350-8",
+              },
+              {
+                  "toggle_env": "RUN_QWEN3_NEXT_80B_TP2",
+                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
+                  "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+                  "extra_args": "--kv-cache-dtype fp8 --tensor-parallel-size 2",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "runner": "linux-atom-mi350-8",
+              },
+              {
+                  "toggle_env": "RUN_QWEN35_397B_TP8",
+                  "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
+                  "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+                  "extra_args": "--kv-cache-dtype fp8 --tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "runner": "linux-atom-mi350-8",
+              },
+              {
+                  "toggle_env": "RUN_KIMI_K2_TP8",
+                  "model_name": "Kimi-K2-Thinking-MXFP4 TP8",
+                  "model_path": "amd/Kimi-K2-Thinking-MXFP4",
+                  "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.90,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi350-8",
+              },
+              {
+                  "toggle_env": "RUN_DSR1_FP4_TP8",
+                  "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
+                  "model_path": "amd/DeepSeek-R1-0528-MXFP4",
+                  "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi350-8",
+              },
+          ]
+
+          selected = []
+          for model in models:
+              enabled = event != "workflow_dispatch" or os.environ.get(model["toggle_env"], "").lower() == "true"
+              if enabled:
+                  selected.append({k: v for k, v in model.items() if k != "toggle_env"})
+
+          if event == "workflow_dispatch" and not selected:
+              print("No models selected for manual run.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"model_matrix={json.dumps({'include': selected})}")
+          PY
+
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF_NAME}" = "main" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "Manual run on main reuses published OOT image: ${NIGHTLY_OOT_IMAGE_TAG}"
+            else
+              echo "Scheduled run uses published OOT image: ${NIGHTLY_OOT_IMAGE_TAG}"
+            fi
+            echo "oot_image_tag=${NIGHTLY_OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
+            echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          MANUAL_BASE_IMAGE_TAG="atom_oot_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          BUILD_CONTEXT="$(mktemp -d)"
+          trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
+
+          git archive --format=tar HEAD | tar -xf - -C "${BUILD_CONTEXT}"
+
+          BUILD_CONTEXT="${BUILD_CONTEXT}" python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          build_context = Path(os.environ["BUILD_CONTEXT"])
+          dockerfile_path = build_context / "docker" / "Dockerfile"
+          manual_dockerfile_path = build_context / "docker" / "Dockerfile.manual"
+
+          text = dockerfile_path.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r"# ATOM:.*?ARG CACHEBUST=.*?RUN pip show atom \|\| true\n",
+              re.S,
+          )
+          replacement = "\n".join([
+              "# ATOM: install the selected branch from the workflow checkout archive",
+              "# CACHEBUST invalidates only this layer so parallel stages stay cached",
+              "ARG CACHEBUST=1",
+              "RUN rm -rf /app/ATOM",
+              "COPY . /app/ATOM",
+              "RUN cd /app/ATOM && pip install -e .",
+              "RUN pip show atom || true",
+              "",
+          ])
+
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit("Unable to rewrite the ATOM install block in docker/Dockerfile")
+
+          manual_dockerfile_path.write_text(text, encoding="utf-8")
+          PY
+
+          echo "Building manual OOT image from branch ${GITHUB_REF_NAME}"
+
+          DOCKER_BUILDKIT=1 docker build --pull --network=host \
+            -t "${MANUAL_BASE_IMAGE_TAG}" \
+            --target atom_image \
+            --build-arg BASE_IMAGE="${MANUAL_BASE_IMAGE}" \
+            --build-arg GPU_ARCH="${GPU_ARCH}" \
+            --build-arg AITER_REPO="${AITER_REPO}" \
+            --build-arg AITER_COMMIT="${AITER_COMMIT}" \
+            --build-arg RCCL_REPO="${RCCL_REPO}" \
+            --build-arg RCCL_BRANCH="${RCCL_BRANCH}" \
+            --build-arg CACHEBUST="$(date +%s)" \
+            -f "${BUILD_CONTEXT}/docker/Dockerfile.manual" \
+            "${BUILD_CONTEXT}"
+
+          DOCKER_BUILDKIT=1 docker build --network=host \
             -t "${OOT_IMAGE_TAG}" \
             --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            --build-arg OOT_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
-            --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || 'b31e9326a7d9394aab8c767f8ebe225c65594b60' }}" \
+            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
+            -f "${BUILD_CONTEXT}/docker/Dockerfile.manual" \
+            "${BUILD_CONTEXT}"
+
+          docker push "${OOT_IMAGE_TAG}"
 
           echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
+          echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Push OOT validation image
+      - name: Clean up builder images
+        if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker push "${{ steps.meta.outputs.oot_image_tag }}"
+          docker rmi "${{ steps.meta.outputs.oot_image_tag }}" || true
+          docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
 
   plugin-ut:
     name: Plugin UT (OOT image)
-    needs: [build-oot-image]
+    needs: [prepare-oot-image]
     runs-on: linux-atom-mi355-1
     timeout-minutes: 60
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Docker Login
         run: |
-          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
-      - name: Pull built OOT image
+      - name: Pull OOT image
         run: |
-          docker pull "${{ needs.build-oot-image.outputs.oot_image_tag }}"
+          docker pull "${{ needs.prepare-oot-image.outputs.oot_image_tag }}"
 
       - name: Run all plugin unit tests
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
-            "${{ needs.build-oot-image.outputs.oot_image_tag }}" \
+            "${{ needs.prepare-oot-image.outputs.oot_image_tag }}" \
             bash -lc "pytest -q tests/plugin -o cache_dir=/tmp/.pytest_cache"
+
+      - name: Clean up pulled image
+        if: always()
+        run: |
+          docker rmi "${{ needs.prepare-oot-image.outputs.oot_image_tag }}" || true
 
   oot-model-accuracy:
     name: OOT Model Accuracy (${{ matrix.model_name }})
-    needs: [build-oot-image, plugin-ut]
+    needs: [prepare-oot-image, plugin-ut]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Keep this matrix as the single source of truth for OOT full
-          # validation coverage. The test script consumes the current matrix
-          # entry via OOT_MODEL_* env vars to avoid drift.
-          - model_name: "Qwen3 MoE"
-            model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
-            accuracy_test_threshold: 0.87
-            env_vars: ""
-            runner: atom-mi355-8gpu.predownload
-          - model_name: "DeepSeek-R1 FP8"
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
-            accuracy_test_threshold: 0.94
-            env_vars: ""
-            runner: atom-mi355-8gpu.predownload
-          - model_name: "DeepSeek-R1 MXFP4"
-            model_path: "amd/DeepSeek-R1-0528-MXFP4"
-            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
-            accuracy_test_threshold: 0.93
-            env_vars: ""
-            runner: atom-mi355-8gpu.predownload
-          - model_name: "GPT-OSS"
-            model_path: "openai/gpt-oss-120b"
-            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --gpu-memory-utilization 0.3"
-            accuracy_test_threshold: 0.38
-            env_vars: |
-              ATOM_GPT_OSS_MODEL=1
-            runner: linux-atom-mi355-1
-          - model_name: "Kimi-K2"
-            model_path: "amd/Kimi-K2-Thinking-MXFP4"
-            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
-            accuracy_test_threshold: 0.90
-            env_vars: ""
-            runner: atom-mi355-8gpu.predownload
+      matrix: ${{ fromJSON(needs.prepare-oot-image.outputs.model_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     env:
       CONTAINER_NAME: atom_vllm_oot_validation_${{ strategy.job-index }}
-      OOT_IMAGE_TAG: ${{ needs.build-oot-image.outputs.oot_image_tag }}
+      OOT_IMAGE_TAG: ${{ needs.prepare-oot-image.outputs.oot_image_tag }}
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Docker Login
         run: |
-          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Set HF_TOKEN
-        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
-      - name: Pull built OOT image
+      - name: Pull OOT image
         run: |
           docker pull "${OOT_IMAGE_TAG}"
 
@@ -300,6 +402,7 @@ jobs:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
+          OOT_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
@@ -307,6 +410,7 @@ jobs:
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
@@ -367,3 +471,4 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
+          docker rmi "${OOT_IMAGE_TAG}" || true
