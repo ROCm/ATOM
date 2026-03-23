@@ -22,6 +22,7 @@ from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
+from atom.utils.forward_context import get_forward_context
 
 
 import logging
@@ -159,13 +160,9 @@ class MLAAttentionImplPluginModeMethods:
         return k
 
     def _v_up_proj(self, x, out):
-        # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         out = out.view(-1, self.num_heads, self.v_head_dim)
-        # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
-        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
-        # Convert from (B, N, L) to (N, B, L)
-        if envs.ATOM_USE_TRITON_MXFP4_BMM:
+        if self.is_aiter_triton_fp4_bmm_enabled:
             out = batched_gemm_a16wfp4(
                 x,
                 self.W_V,
@@ -175,10 +172,9 @@ class MLAAttentionImplPluginModeMethods:
                 prequant=True,
                 y_scale=None,
             )
-            # x = x.transpose(0, 1).flatten(1, 2)
             x = out.view(-1, self.num_heads * self.v_head_dim)
         else:
-            x = _aiter_triton_fp8_bmm(
+            _aiter_triton_fp8_bmm(
                 x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
             )
 
@@ -545,6 +541,49 @@ class MLAAttentionImplPluginModeMethods:
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
             output.copy_(output_prefill)
 
+    def _get_decode_output_buffer(self, B, dtype, device):
+        """Return a pre-allocated decode output buffer, growing if needed."""
+        buf = getattr(self, "_decode_o_buf", None)
+        if buf is None or buf.shape[0] < B or buf.dtype != dtype or buf.device != device:
+            self._decode_o_buf = torch.empty(
+                max(B, getattr(self, "_decode_o_buf_cap", 0)),
+                self.padded_num_heads,
+                self.kv_lora_rank,
+                dtype=dtype,
+                device=device,
+            )
+            self._decode_o_buf_cap = self._decode_o_buf.shape[0]
+        return self._decode_o_buf[:B]
+
+    def _get_decode_q_buffer(self, B, device):
+        """Return a pre-allocated decode_q buffer for decode-only path."""
+        q_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        q_dtype = dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
+        buf = getattr(self, "_decode_q_buf", None)
+        if buf is None or buf.shape[0] < B or buf.device != device:
+            self._decode_q_buf = torch.empty(
+                max(B, getattr(self, "_decode_q_buf_cap", 0)),
+                self.num_heads,
+                q_dim,
+                dtype=q_dtype,
+                device=device,
+            )
+            self._decode_q_buf_cap = self._decode_q_buf.shape[0]
+        return self._decode_q_buf[:B]
+
+    def _get_decode_q_concat_buffer(self, shape, device, dtype):
+        """Return a pre-allocated buffer for Q nope+pe concat in mixed path."""
+        buf = getattr(self, "_decode_q_concat_buf", None)
+        if (
+            buf is None
+            or buf.shape[0] < shape[0]
+            or buf.shape != shape
+            or buf.device != device
+            or buf.dtype != dtype
+        ):
+            self._decode_q_concat_buf = torch.empty(shape, device=device, dtype=dtype)
+        return self._decode_q_concat_buf[: shape[0]]
+
     def _forward_decode_plugin_mode(
         self,
         q,
@@ -552,69 +591,47 @@ class MLAAttentionImplPluginModeMethods:
         attn_metadata,
         layer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        assert kv_c_and_k_pe_cache.numel() > 0
-        assert attn_metadata.plugin_metadata.decode is not None
-        assert attn_metadata.plugin_metadata.decode.max_qo_len is not None
-
-        # if type(q) is tuple:
-        #     q = torch.cat(q, dim=-1)
-
-        assert isinstance(q, torch.Tensor)
-        if self.head_repeat_factor > 1:
-            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+        decode_meta = attn_metadata.plugin_metadata.decode
         B = q.shape[0]
-        o = torch.empty(
-            B,
-            self.padded_num_heads,
-            self.kv_lora_rank,
-            dtype=attn_metadata.plugin_metadata.decode.attn_out_dtype,
-            device=q.device,
-        )
-
+        o = self._get_decode_output_buffer(B, decode_meta.attn_out_dtype, q.device)
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
-        use_persistent_mode = not (
-            self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
-        )
-        if not use_persistent_mode:
-            # DP : disable persistent mode to avoid overflow
-            work_meta_data = None
-            work_indptr = None
-            work_info_set = None
-            reduce_indptr = None
-            reduce_final_map = None
-            reduce_partial_map = None
+
+        if self._use_persistent_decode:
+            mla_decode_fwd(
+                q,
+                kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                o,
+                decode_meta.qo_indptr,
+                decode_meta.paged_kv_indptr,
+                decode_meta.paged_kv_indices,
+                decode_meta.paged_kv_last_page_len,
+                decode_meta.max_qo_len,
+                sm_scale=self.scale,
+                work_meta_data=attn_metadata.work_meta_data,
+                work_indptr=attn_metadata.work_indptr,
+                work_info_set=attn_metadata.work_info_set,
+                reduce_indptr=attn_metadata.reduce_indptr,
+                reduce_final_map=attn_metadata.reduce_final_map,
+                reduce_partial_map=attn_metadata.reduce_partial_map,
+                q_scale=layer._q_scale,
+                kv_scale=layer._k_scale,
+            )
         else:
-            work_meta_data = attn_metadata.work_meta_data
-            work_indptr = attn_metadata.work_indptr
-            work_info_set = attn_metadata.work_info_set
-            reduce_indptr = attn_metadata.reduce_indptr
-            reduce_final_map = attn_metadata.reduce_final_map
-            reduce_partial_map = attn_metadata.reduce_partial_map
+            from vllm._aiter_ops import rocm_aiter_ops
 
-        paged_kv_indptr = attn_metadata.plugin_metadata.decode.paged_kv_indptr
-        paged_kv_indices = attn_metadata.plugin_metadata.decode.paged_kv_indices
-
-        mla_decode_fwd(
-            q,
-            kv_buffer.view(-1, 1, 1, q.shape[-1]),
-            o,
-            attn_metadata.plugin_metadata.decode.qo_indptr,
-            paged_kv_indptr,
-            paged_kv_indices,
-            attn_metadata.plugin_metadata.decode.paged_kv_last_page_len,
-            attn_metadata.plugin_metadata.decode.max_qo_len,
-            sm_scale=self.scale,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            q_scale=layer._q_scale,
-            kv_scale=layer._k_scale,
-        )
-        if self.head_repeat_factor > 1:
-            o = o[:, :: self.head_repeat_factor, :]
+            rocm_aiter_ops.mla_decode_fwd(
+                q,
+                kv_buffer,
+                o,
+                self.scale,
+                decode_meta.qo_indptr,
+                decode_meta.max_qo_len,
+                decode_meta.paged_kv_indptr,
+                decode_meta.paged_kv_indices,
+                decode_meta.paged_kv_last_page_len,
+                q_scale=layer._q_scale,
+                kv_scale=layer._k_scale,
+            )
         return o, None
 
     def forward_impl_plugin_mode(
@@ -628,10 +645,19 @@ class MLAAttentionImplPluginModeMethods:
         output=None,
     ):
         assert output is not None, "Output tensor must be provided."
-        from vllm.distributed.parallel_state import get_dcp_group
-        from vllm import _custom_ops as ops
-        from vllm.platforms import current_platform
-        from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+        if not hasattr(self, "_cached_ops"):
+            from vllm.distributed.parallel_state import get_dcp_group
+            from vllm import _custom_ops as ops
+            from vllm.platforms import current_platform
+            from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+            self._cached_ops = ops
+            self._cached_current_platform = current_platform
+            self._cached_get_dcp_group = get_dcp_group
+            self._cached_cp_lse_ag_out_rs = cp_lse_ag_out_rs
+        ops = self._cached_ops
+        current_platform = self._cached_current_platform
+        get_dcp_group = self._cached_get_dcp_group
+        cp_lse_ag_out_rs = self._cached_cp_lse_ag_out_rs
 
         # create the output here, it use query shape
         if attn_metadata is None:
@@ -655,6 +681,10 @@ class MLAAttentionImplPluginModeMethods:
 
         if self.dcp_world_size == -1:
             self.dcp_world_size = get_dcp_group().world_size
+            self._use_persistent_decode = (
+                self.use_persistent_mla_decode_metadata
+                and not (self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8")
+            )
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
@@ -671,10 +701,14 @@ class MLAAttentionImplPluginModeMethods:
         has_prefill = attn_metadata.plugin_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.plugin_metadata.num_decode_tokens
 
-        atom_config = get_current_atom_config()
-        positions = atom_config.compilation_config.static_forward_context["positions"][
-            :num_actual_toks
-        ]
+        forward_context = get_forward_context().context
+        if forward_context is not None and forward_context.positions is not None:
+            positions = forward_context.positions[:num_actual_toks]
+        else:
+            atom_config = get_current_atom_config()
+            positions = atom_config.compilation_config.static_forward_context[
+                "positions"
+            ][:num_actual_toks]
         k_pe = k_pe.unsqueeze(1)
         output_padded = output
         output = output[:num_actual_toks, ...]
@@ -688,14 +722,11 @@ class MLAAttentionImplPluginModeMethods:
         prefill_k_c_normed = k_c_normed[num_decode_tokens:]
 
         decode_only = has_decode and not has_prefill
-        assert (
-            self.rotary_emb is not None
-        ), "Rotary embedding is required for MLAAttentionImplPluginModeMethods"
 
         if not decode_only:
-            # write the latent and rope to kv cache
-            # make sure ops has concat_and_cache_mla_rope_fused
-            if kv_cache.numel() > 0 and hasattr(ops, "concat_and_cache_mla_rope_fused"):
+            if not hasattr(self, "_has_fused_rope_cache"):
+                self._has_fused_rope_cache = hasattr(ops, "concat_and_cache_mla_rope_fused")
+            if kv_cache.numel() > 0 and self._has_fused_rope_cache:
                 ops.concat_and_cache_mla_rope_fused(
                     positions,
                     q[..., self.qk_nope_head_dim :],
@@ -772,18 +803,8 @@ class MLAAttentionImplPluginModeMethods:
                 )
 
             if decode_only:
-                decode_q = torch.empty(
-                    (
-                        decode_ql_nope.shape[0],
-                        self.num_heads,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=(
-                        dtypes.fp8
-                        if self.kv_cache_dtype.startswith("fp8")
-                        else self.dtype
-                    ),
-                    device=decode_ql_nope.device,
+                decode_q = self._get_decode_q_buffer(
+                    decode_ql_nope.shape[0], decode_ql_nope.device
                 )
                 aiter.fused_qk_rope_concat_and_cache_mla(
                     decode_ql_nope,
@@ -819,11 +840,8 @@ class MLAAttentionImplPluginModeMethods:
                             ql_nope_shape[1],
                             ql_nope_shape[2] + q_pe_shape[2],
                         )
-                        # Using empty and copy since torch.cat introduces significant overhead.
-                        decode_q0 = torch.empty(
-                            decode_q_shape,
-                            device=decode_ql_nope.device,
-                            dtype=decode_ql_nope.dtype,
+                        decode_q0 = self._get_decode_q_concat_buffer(
+                            decode_q_shape, decode_ql_nope.device, decode_ql_nope.dtype
                         )
                         decode_q0[..., : ql_nope_shape[2]].copy_(decode_ql_nope)
                         decode_q0[..., ql_nope_shape[2] :].copy_(decode_q_pe)
@@ -896,6 +914,10 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
             envs.ATOM_USE_TRITON_MXFP4_BMM
             and self.kv_b_proj.weight.dtype == torch.bfloat16
         )
+        self.use_persistent_mla_decode_metadata = (
+            envs.ATOM_USE_PERSISTENT_MLA_DECODE_METADATA
+        )
+        self._use_persistent_decode = False
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
         self._pad_v = True
         self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
@@ -946,6 +968,9 @@ def MLAAttentionImplDecoratorForPluginMode(cls):
         "_context_parallel_compute_prefill_context_plugin_mode",
         "_compute_prefill_context_plugin_mode",
         "_forward_prefill_plugin_mode",
+        "_get_decode_output_buffer",
+        "_get_decode_q_buffer",
+        "_get_decode_q_concat_buffer",
         "_forward_decode_plugin_mode",
         "forward_impl_plugin_mode",
         "do_kv_cache_update",

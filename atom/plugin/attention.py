@@ -9,6 +9,7 @@ from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
 from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer, envs
+from atom.utils.block_convert import kv_indices_generate_triton
 from atom.config import get_current_atom_config
 
 from atom.utils.forward_context import Context, AttentionMetaData
@@ -704,17 +705,9 @@ class vllmMLAAttentionMetadataBuilderMethods:
             "Its methods are meant to be added to other classes via decorators."
         )
 
-    # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
         self, bs: int, cu_seqlens_q: torch.Tensor, max_q_len: int = 1
     ):
-        split_params = {
-            "kv_granularity": max(self.block_size, 16),
-            "max_seqlen_qo": max_q_len,
-            "uni_seqlen_qo": max_q_len,
-            "fast_mode": 1,
-            "max_split_per_batch": 16,
-        }
         var = self.mla_persistent_metadata
         work_meta_data = var["work_meta_data"]
         work_info_set = var["work_info_set"]
@@ -722,12 +715,20 @@ class vllmMLAAttentionMetadataBuilderMethods:
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
+
+        split_params = {
+            "kv_granularity": max(self.block_size, 16),
+            "max_seqlen_qo": max_q_len,
+            "uni_seqlen_qo": max_q_len,
+            "fast_mode": 1,
+            "max_split_per_batch": 16,
+        }
         get_mla_metadata_v1(
             cu_seqlens_q,
-            self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
+            self.paged_kv_indptr[: bs + 1],
             self.paged_kv_last_page_len[:bs],
             self.padded_num_attention_heads,
-            1,  # nhead_kv,
+            1,
             True,
             work_meta_data,
             work_info_set,
@@ -738,6 +739,7 @@ class vllmMLAAttentionMetadataBuilderMethods:
             page_size=self.block_size,
             **split_params,
         )
+
         return {
             "work_meta_data": work_meta_data,
             "work_info_set": work_info_set,
@@ -757,53 +759,59 @@ class vllmMLAAttentionMetadataBuilderMethods:
         num_decode_tokens: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ):
-        # kernel block size is always 1, although the kv block size is not 1.
         device = self.device
         num_reqs = seq_lens_device.size(0)
 
-        mask = torch.arange(
-            block_table_tensor.size(1),
-            dtype=block_table_tensor.dtype,
-            device=device,
-        ).unsqueeze(0) < seq_lens_device.unsqueeze(1)
-        paged_kv_indices = block_table_tensor[mask]
-
-        # kernel block size is always 1, so each page has exactly 1 token.
-        # last_page_len is always 1 - just slice the pre-initialized buffer.
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
-        paged_kv_indptr = torch.cat(
-            [
-                torch.zeros(1, dtype=seq_lens_device.dtype, device=device),
-                seq_lens_device.cumsum(dim=0, dtype=torch.int32),
-            ]
+        # paged_kv_indptr[0] is already 0 from initialization; cumsum writes [1:].
+        torch.cumsum(
+            seq_lens_device,
+            dim=0,
+            dtype=torch.int32,
+            out=self.paged_kv_indptr[1 : 1 + num_reqs],
         )
-        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        max_qo_len = qo_len.max().item()
-
-        num_actual_pages = paged_kv_indices.size(0)
-
-        self.paged_kv_indices[:num_actual_pages].copy_(
-            paged_kv_indices, non_blocking=True
-        )
-        self.paged_kv_indices[num_actual_pages:].fill_(-1)
-        paged_kv_indices = self.paged_kv_indices[:num_actual_pages]
-
-        self.paged_kv_indptr[: 1 + num_reqs].copy_(paged_kv_indptr, non_blocking=True)
-        self.paged_kv_indptr[1 + num_reqs :].fill_(paged_kv_indptr[-1])
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-        # paged_kv_last_page_len already uses the pre-initialized buffer slice
-        # (set above), so no copy needed - buffer is always 1s.
+        max_qo_len = (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item() \
+            if query_start_loc_cpu.numel() > 1 else 1
 
-        self.qo_indptr[: 1 + num_reqs].copy_(query_start_loc_device, non_blocking=True)
-        self.qo_indptr[1 + num_reqs :] = query_start_loc_device[-1]
+        kv_indices_generate_triton(
+            block_table_tensor,
+            self.paged_kv_indices,
+            paged_kv_indptr,
+            1,
+            max_seq_len,
+        )
+        paged_kv_indices = self.paged_kv_indices
+
+        # For pure decode, query_start_loc is [0,1,2,...,N]; skip the DtoD copy
+        # and populate qo_indptr using an in-place arange when possible.
+        if num_decode_tokens == num_reqs:
+            if not getattr(self, "_qo_indptr_arange_ready", False) or \
+               getattr(self, "_qo_indptr_arange_n", 0) != num_reqs:
+                torch.arange(
+                    0, num_reqs + 1, dtype=torch.int32, device=device,
+                    out=self.qo_indptr[: num_reqs + 1],
+                )
+                if num_reqs + 1 < self.qo_indptr.shape[0]:
+                    self.qo_indptr[num_reqs + 1 :] = num_reqs
+                self._qo_indptr_arange_ready = True
+                self._qo_indptr_arange_n = num_reqs
+        else:
+            self._qo_indptr_arange_ready = False
+            self.qo_indptr[: 1 + num_reqs].copy_(
+                query_start_loc_device, non_blocking=True
+            )
+            if 1 + num_reqs < self.qo_indptr.shape[0]:
+                self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
-            num_reqs, query_start_loc_device, 1
-        )
-        self.mla_persistent_metadata.update(ctx_mla_ps)
+        if self.use_persistent_mla_decode_metadata:
+            ctx_mla_ps = self._set_mla_persistent_worker_buffers(
+                num_reqs, qo_indptr, 1
+            )
+            self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(
             block_table=block_table_tensor,
@@ -1147,6 +1155,9 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             // get_tp_group().world_size
         )
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        self.use_persistent_mla_decode_metadata = (
+            envs.ATOM_USE_PERSISTENT_MLA_DECODE_METADATA
+        )
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
 
@@ -1170,45 +1181,59 @@ def create_mla_attn_metadata_builder_init_method(base_class):
 
         self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
 
-        (
-            (work_meta_data_size, work_meta_data_type),
-            (work_indptr_size, work_indptr_type),
-            (work_info_set_size, work_info_set_type),
-            (reduce_indptr_size, reduce_indptr_type),
-            (reduce_final_map_size, reduce_final_map_type),
-            (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            max_num_reqs,
-            1,
-            self.padded_num_attention_heads,
-            torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
-            is_sparse=False,  # TODO: support sparse
-            fast_mode=True,
-        )
+        if self.use_persistent_mla_decode_metadata:
+            (
+                (work_meta_data_size, work_meta_data_type),
+                (work_indptr_size, work_indptr_type),
+                (work_info_set_size, work_info_set_type),
+                (reduce_indptr_size, reduce_indptr_type),
+                (reduce_final_map_size, reduce_final_map_type),
+                (reduce_partial_map_size, reduce_partial_map_type),
+            ) = get_mla_metadata_info_v1(
+                max_num_reqs,
+                1,
+                self.padded_num_attention_heads,
+                torch.bfloat16,
+                dtypes.d_dtypes[config.cache_config.cache_dtype],
+                is_sparse=False,  # TODO: support sparse
+                fast_mode=True,
+            )
 
-        self.mla_persistent_metadata = {
-            "work_meta_data": torch.empty(
-                work_meta_data_size, dtype=work_meta_data_type, device=self.device
-            ),
-            "work_indptr": torch.empty(
-                work_indptr_size, dtype=work_indptr_type, device=self.device
-            ),
-            "work_info_set": torch.empty(
-                work_info_set_size, dtype=work_info_set_type, device=self.device
-            ),
-            "reduce_indptr": torch.empty(
-                reduce_indptr_size, dtype=reduce_indptr_type, device=self.device
-            ),
-            "reduce_final_map": torch.empty(
-                reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
-            ),
-            "reduce_partial_map": torch.empty(
-                reduce_partial_map_size,
-                dtype=reduce_partial_map_type,
-                device=self.device,
-            ),
-        }
+            self.mla_persistent_metadata = {
+                "work_meta_data": torch.empty(
+                    work_meta_data_size, dtype=work_meta_data_type, device=self.device
+                ),
+                "work_indptr": torch.empty(
+                    work_indptr_size, dtype=work_indptr_type, device=self.device
+                ),
+                "work_info_set": torch.empty(
+                    work_info_set_size, dtype=work_info_set_type, device=self.device
+                ),
+                "reduce_indptr": torch.empty(
+                    reduce_indptr_size, dtype=reduce_indptr_type, device=self.device
+                ),
+                "reduce_final_map": torch.empty(
+                    reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
+                ),
+                "reduce_partial_map": torch.empty(
+                    reduce_partial_map_size,
+                    dtype=reduce_partial_map_type,
+                    device=self.device,
+                ),
+            }
+        else:
+            logger.info(
+                "Disable persistent MLA decode metadata in plugin mode; "
+                "falling back to lightweight decode scheduling buffers."
+            )
+            self.mla_persistent_metadata = {
+                "work_meta_data": None,
+                "work_indptr": None,
+                "work_info_set": None,
+                "reduce_indptr": None,
+                "reduce_final_map": None,
+                "reduce_partial_map": None,
+            }
 
     return init_method_under_plugin_mode
 
