@@ -5,7 +5,6 @@ from functools import lru_cache
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from atom.utils.custom_register import direct_register_custom_op
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
@@ -121,13 +120,19 @@ def rocm_aiter_topk_softmax_impl(
     token_expert_indicies = torch.empty(
         gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
     )
-    if fused_shared_experts_scoring_func == None:
+    if fused_shared_experts_scoring_func is None:
         fused_shared_experts_scoring_func = ""
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
     topk_softmax(
-        topk_weights, topk_ids, token_expert_indicies, gating_output, renormalize, fused_shared_experts_for_kernel, fused_shared_experts_scoring_func
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output,
+        renormalize,
+        fused_shared_experts_for_kernel,
+        fused_shared_experts_scoring_func,
     )
     if is_rocm_aiter_fusion_shared_expert_enabled() and num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
