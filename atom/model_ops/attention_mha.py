@@ -15,9 +15,14 @@ from torch import nn
 
 from .attention_mla import MLAModules
 
+import logging
+
 from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
 from atom.utils.decorators import mark_trace
+from atom.model_ops.base_attention import cp_mha_gather_cache
+
+logger = logging.getLogger("atom")
 
 
 @PagedAttentionImplDecoratorForPluginMode
@@ -130,6 +135,14 @@ class PagedAttentionImpl(nn.Module):
             and self.q_norm is not None
             and self.k_norm is not None
         ):
+            # fused_qk_norm_rope_cache_quant_shuffle expects V cache layout
+            # [num_blocks, num_kv_heads, block_size//x, head_size, x], not [n, nh, hd, bs]
+            x = 16 // k_cache.element_size()
+            if k_cache.dim() == 5 and v_cache.dim() == 4:
+                n, nh, hd, bs = v_cache.shape
+                v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+            else:
+                v_cache_shuffle = v_cache
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
                 num_heads_q=self.num_heads,
@@ -143,7 +156,7 @@ class PagedAttentionImpl(nn.Module):
                 is_neox_style=self.rotary_emb.is_neox_style,
                 pos_ids=position,
                 k_cache=k_cache,
-                v_cache=v_cache,
+                v_cache=v_cache_shuffle,
                 slot_mapping=attn_metadata.slot_mapping,
                 kv_cache_dtype=(
                     "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
@@ -216,7 +229,96 @@ class PagedAttentionImpl(nn.Module):
                     asm_layout=asm_layout,
                 )
 
+        # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
+        if attn_metadata.has_cached:
+            q, k, v, k_cache, v_cache, k_scale, v_scale = (
+                self._gather_prefix_and_concat_kv(
+                    q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
+                )
+            )
+
         return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    def _gather_prefix_and_concat_kv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        attn_metadata,
+    ):
+        """
+        When prefix cache hits, gather full KV (cached + new) from paged cache in
+        one pass. New tokens are already written by fused_qk_rope_reshape_and_cache.
+        Same flow as gather_kv_b_proj: write new first, then read cached+new together.
+        """
+        cu_seqlens_k = attn_metadata.cu_seqlens_k
+        total_tokens = attn_metadata.total_kv
+        bs = attn_metadata.context_lens.shape[0]
+        token_to_batch = torch.repeat_interleave(
+            torch.arange(
+                bs, dtype=torch.int32, device=attn_metadata.context_lens.device
+            ),
+            attn_metadata.context_lens.long(),
+        )
+
+        num_kv_heads = k.shape[1]
+        head_dim = k.shape[2]
+
+        k_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
+        )
+        v_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
+        )
+
+        # Convert cache for cp_mha_gather_cache
+        # fused_qk_norm_rope_cache_quant_shuffle: K [n, nh, hd//x, bs, x], V [n, nh, bs//x, hd, x] (SHUFFLE)
+        # fused_qk_rope_reshape_and_cache: K [n, nh, hd//x, bs, x], V [n, nh, hd, bs] -> NHD
+        if k_cache.dim() == 5:
+            x = 16 // k_cache.element_size()
+            n, nh, _, block_size, _ = k_cache.shape
+            if v_cache.dim() == 4:
+                # fused_qk_norm_rope_cache_quant_shuffle: V data in [n, nh, bs//x, hd, x] layout
+                use_shuffle = True
+                k_cache_gather = k_cache
+                v_cache_gather = v_cache.view(n, nh, block_size // x, head_dim, x)
+            else:
+                # fused_qk_rope_reshape_and_cache: V [n, nh, hd, bs] -> NHD
+                use_shuffle = False
+                k_cache_gather = (
+                    k_cache.permute(0, 3, 1, 2, 4)
+                    .contiguous()
+                    .view(n, block_size, nh, head_dim)
+                )
+                v_cache_gather = v_cache.permute(0, 3, 1, 2).contiguous()
+        else:
+            use_shuffle = False
+            k_cache_gather = k_cache
+            v_cache_gather = v_cache
+            block_size = k_cache.shape[1]
+
+        block_tables = attn_metadata.block_tables
+        cp_mha_gather_cache(
+            key_cache=k_cache_gather,
+            value_cache=v_cache_gather,
+            key=k_full,
+            value=v_full,
+            block_tables=block_tables,
+            k_scales=k_scale,
+            v_scales=v_scale,
+            cu_seqlens_kv=cu_seqlens_k,
+            token_to_batch=token_to_batch,
+            seq_starts=attn_metadata.seq_starts,
+            dequant=self.kv_cache_dtype.startswith("fp8"),
+            kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
+            total_tokens=total_tokens,
+        )
+
+        return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
 
     @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(

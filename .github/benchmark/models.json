@@ -48,5 +48,15 @@
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
     "env_vars": ""
+  },
+  {
+    "display": "Kimi-K2.5-MXFP4",
+    "path": "amd/Kimi-K2.5-MXFP4",
+    "prefix": "kimi-k25-mxfp4",
+    "args": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1"
   }
 ]

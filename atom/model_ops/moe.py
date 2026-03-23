@@ -2224,10 +2224,10 @@ class FusedMoE(torch.nn.Module):
             if load_shard_size != shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
-        if expert_data.dtype != dtypes.fp4x2:
-            expert_data.copy_(loaded_weight)
-        else:
+        if expert_data.dtype == dtypes.fp4x2:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+        else:
+            expert_data.copy_(loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int

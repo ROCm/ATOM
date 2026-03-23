@@ -174,6 +174,8 @@ launch_one_model() {
   export VLLM_RPC_TIMEOUT=1800000
   export VLLM_CACHE_ROOT=/tmp/.cache/vllm
   export TORCHINDUCTOR_CACHE_DIR=/tmp/.cache/inductor
+  # FIXME here disable the dual stream in OOT CI for avoid the hang issue
+  export ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0
   rm -rf /tmp/.cache
 
   rm -f "${VLLM_PID_FILE}" || true

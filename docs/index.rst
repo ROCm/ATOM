@@ -29,6 +29,12 @@ ATOM Documentation
 
 .. toctree::
    :maxdepth: 2
+   :caption: Framework Integrations
+
+   vllm_plugin_backend_guide
+
+.. toctree::
+   :maxdepth: 2
    :caption: API Reference
 
    api/serving

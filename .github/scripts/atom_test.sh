@@ -93,7 +93,7 @@ if [ "$TYPE" == "accuracy" ]; then
   mkdir -p accuracy_test_results
   RESULT_FILENAME=accuracy_test_results/$(date +%Y%m%d%H%M%S).json
   lm_eval --model local-completions \
-          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
+          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False,trust_remote_code=True \
           --tasks gsm8k \
           --num_fewshot 3 \
           --output_path "${RESULT_FILENAME}"
@@ -162,7 +162,7 @@ if [ "$TYPE" == "benchmark" ]; then
     --max-concurrency=$CONC \
     --num-prompts=${NUM_PROMPTS_OVERRIDE:-$(( $CONC * 10 ))} \
     --trust-remote-code \
-    --num-warmups=1 \
+    --num-warmups=$(( $CONC * 2 )) \
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
     --result-dir=. --result-filename=${RESULT_FILENAME}.json \

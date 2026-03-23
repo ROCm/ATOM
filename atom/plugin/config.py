@@ -9,7 +9,6 @@ import logging
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
-_KNOWN_ISSUE_MAX_NUM_BATCHED_TOKENS_THRESHOLD = 18 * 1024
 
 
 @dataclass
@@ -22,6 +21,7 @@ class PluginConfig:
     is_sglang: bool = False
 
     # vllm specific
+    vllm_config: Any = None
     vllm_scheduler_config: Any = None
     vllm_cache_config: Any = None
     vllm_quant_config: Any = None
@@ -69,6 +69,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         is_vllm=True,
         is_sglang=False,
         # vllm specific
+        vllm_config=config,
         vllm_scheduler_config=vllm_scheduler_config,
         vllm_cache_config=vllm_cache_config,
         vllm_quant_config=vllm_quant_config,
@@ -81,15 +82,6 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         max_model_len = vllm_scheduler_config.max_model_len
 
     max_num_batched_tokens = vllm_scheduler_config.max_num_batched_tokens
-    # FIXME: known issue for illegal mem access in fused_moe kernel
-    if max_num_batched_tokens >= _KNOWN_ISSUE_MAX_NUM_BATCHED_TOKENS_THRESHOLD:
-        logger.warning(
-            "For plugin mode, when setting max_num_batched_tokens >= "
-            + f"{_KNOWN_ISSUE_MAX_NUM_BATCHED_TOKENS_THRESHOLD}, there is a known issue "
-            + "for illegal mem access in asm fused_moe kernel, if you met the issue, "
-            + "please set max_num_batched_tokens smaller or choose the ck fused_moe "
-            + "kernel instead of asm ones"
-        )
 
     return Config(
         model=vllm_model_config.model,

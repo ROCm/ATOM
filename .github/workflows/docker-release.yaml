@@ -5,6 +5,14 @@ on:
     - cron: '0 14 * * *'  # Every day at 22:00 Beijing Time (UTC+8)
   workflow_dispatch:
     inputs:
+      base_image:
+        description: "Base Docker image for ATOM build"
+        type: choice
+        default: "rocm/pytorch:latest"
+        options:
+          - rocm/pytorch:latest
+          - rocm/pytorch-nightly:latest
+          - rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.10.0
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
@@ -36,7 +44,7 @@ on:
         type: boolean
         default: false
       build_oot_image:
-        description: "Build OOT vLLM image"
+        description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT)"
         type: boolean
         default: false
       oot_base_image:
@@ -57,7 +65,7 @@ jobs:
       fail-fast: false
       matrix:
         base_image:
-          - "rocm/pytorch:latest"
+          - ${{ inputs.base_image || 'rocm/pytorch:latest' }}
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
@@ -93,7 +101,7 @@ jobs:
       - name: Build Docker image
         timeout-minutes: 180
         run: |
-          docker build --pull --network=host -t atom_release:ci \
+          DOCKER_BUILDKIT=1 docker build --pull --network=host -t atom_release:ci \
           --target atom_image \
           --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
@@ -103,6 +111,7 @@ jobs:
           --build-arg AITER_COMMIT="${{ inputs.aiter_commit || env.AITER_COMMIT }}" \
           --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
           --build-arg RCCL_BRANCH="${{ inputs.rccl_branch || env.RCCL_BRANCH }}" \
+          --build-arg CACHEBUST=$(date +%s) \
           -f docker/Dockerfile .
           docker inspect atom_release:ci
 
@@ -133,7 +142,8 @@ jobs:
             atom_release:ci
               
           docker exec atom_release_ci bash -c \
-            "python3 -m atom.examples.simple_inference \
+            "rm -f ~/.cache/huggingface/token ~/.cache/huggingface/stored_tokens 2>/dev/null; \
+             python3 -m atom.examples.simple_inference \
                --model meta-llama/Meta-Llama-3-8B-Instruct \
                --temperature 0 | grep -E '^Prompt: |^Completion:'" > atom_release_output.txt
           
@@ -165,7 +175,7 @@ jobs:
           docker push rocm/atom-dev:${TAG}
 
       - name: Build OOT Docker image
-        if: ${{ success() && inputs.build_oot_image == true }}
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true) }}
         timeout-minutes: 180
         run: |
           if [ -n "${{ inputs.oot_base_image }}" ]; then
@@ -186,7 +196,7 @@ jobs:
           docker inspect atom_oot_release:ci
 
       - name: Push OOT Docker image
-        if: ${{ success() && inputs.build_oot_image == true }}
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true) }}
         run: |
           VLLM_VER="${{ inputs.vllm_version || env.VLLM_VERSION }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"

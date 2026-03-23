@@ -26,6 +26,10 @@ on:
         description: "Benchmark gpt-oss-120b"
         type: boolean
         default: true
+      kimi-k25-mxfp4:
+        description: "Benchmark Kimi-K2.5-MXFP4"
+        type: boolean
+        default: true
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
@@ -53,39 +57,31 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
-    env:
-      # Nightly params aligned with InferenceX dsr1-fp8 config: 1k1k, 1k8k, 8k1k with multiple concurrency levels
-      NIGHTLY_PARAM_LISTS: "1024,1024,1,0.8;1024,1024,2,0.8;1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,1024,256,0.8;1024,8192,1,0.8;1024,8192,2,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;8192,1024,1,0.8;8192,1024,2,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8"
     steps:
+      - uses: actions/checkout@v6
+
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            PARAM_LISTS="${{ env.NIGHTLY_PARAM_LISTS }}"
-            echo "Using nightly param lists (1k1k, 1k8k, 8k1k with multiple concurrency)"
-            echo "PARAM_LISTS: ${PARAM_LISTS}"
+            echo "Using nightly param lists from .github/benchmark/nightly_params.json"
+            # Expand grouped format (isl/osl + concurrency array) into flat matrix
+            MATRIX_JSON=$(jq -c '[.[] | . as $group | .concurrency[] | {input_length: $group.isl, output_length: $group.osl, concurrency: ., random_range_ratio: $group.random_range_ratio}]' .github/benchmark/nightly_params.json)
           else
             PARAM_LISTS="${{ inputs.param_lists || '1024,1024,128,0.8' }}"
             echo "Using param_lists: ${PARAM_LISTS}"
+            IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
+            MATRIX_JSON="["
+            SEP=""
+            for SET in "${SETS[@]}"; do
+              IFS=',' read -ra PARAMS <<< "$SET"
+              MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${PARAMS[0]},\"output_length\":${PARAMS[1]},\"concurrency\":${PARAMS[2]},\"random_range_ratio\":${PARAMS[3]}}"
+              SEP=","
+            done
+            MATRIX_JSON="${MATRIX_JSON}]"
           fi
-          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
-          MATRIX_JSON="["
-          SEP=""
-          for SET in "${SETS[@]}"; do
-            IFS=',' read -ra PARAMS <<< "$SET"
-            INPUT_LEN="${PARAMS[0]}"
-            OUTPUT_LEN="${PARAMS[1]}"
-            CONCURRENCY="${PARAMS[2]}"
-            RANDOM_RANGE_RATIO="${PARAMS[3]}"
-            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
-            SEP=","
-          done
-          MATRIX_JSON="${MATRIX_JSON}]"
+          echo "Matrix JSON: ${MATRIX_JSON}"
           echo "matrix_json=${MATRIX_JSON}" >> $GITHUB_OUTPUT
-      
-      - name: Print matrix JSON
-        run: |
-          echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
   load-models:
     name: Load model configs
@@ -107,8 +103,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
         model: ${{ fromJson(needs.load-models.outputs.models_json) }}
+        config: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
         exclude:
           # Skip low-concurrency MTP runs to limit CI time
           - model: { suffix: "-mtp3" }
@@ -134,15 +130,13 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "enabled=true" >> $GITHUB_OUTPUT
           else
-            # Map model prefix to workflow input
-            # Note: inputs are boolean; "|| 'true'" would swallow explicit false
-            case "${{ matrix.model.prefix }}" in
-              deepseek-r1-0528) echo "enabled=${{ inputs.deepseek-r1-0528 }}" >> $GITHUB_OUTPUT ;;
-              deepseek-r1-0528-mxfp4) echo "enabled=${{ inputs.deepseek-r1-0528-mxfp4 }}" >> $GITHUB_OUTPUT ;;
-              glm-5-fp8) echo "enabled=${{ inputs.glm-5-fp8 }}" >> $GITHUB_OUTPUT ;;
-              gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> $GITHUB_OUTPUT ;;
-              *) echo "enabled=true" >> $GITHUB_OUTPUT ;;
-            esac
+            # Look up workflow input by model prefix; default to true for unknown models
+            ENABLED=$(echo '${{ toJson(inputs) }}' | python3 -c "
+          import json, sys
+          inputs = json.load(sys.stdin)
+          print(str(inputs.get('${{ matrix.model.prefix }}', True)).lower())
+          ")
+            echo "enabled=${ENABLED}" >> $GITHUB_OUTPUT
           fi
 
       - name: Kill all Docker containers
@@ -270,14 +264,16 @@ jobs:
       - name: Download baseline from previous nightly run
         id: baseline
         run: |
+          # Use the most recent completed nightly run (regardless of success/failure)
+          # because even failed runs have valid per-model benchmark artifacts.
+          # Only requiring --status=success misses baselines when any single job fails.
           PREV_RUN_ID=$(gh run list \
             --workflow="ATOM Benchmark" \
             --branch=main \
             --event=schedule \
-            --status=success \
-            --limit=1 \
-            --json databaseId \
-            --jq '.[0].databaseId // empty')
+            --limit=5 \
+            --json databaseId,status \
+            --jq '[.[] | select(.status == "completed")][0].databaseId // empty')
 
           if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
             echo "Downloading baseline from run #$PREV_RUN_ID"
@@ -287,7 +283,7 @@ jobs:
             echo "Downloaded $BASELINE_COUNT baseline files"
             echo "baseline_dir=/tmp/baseline" >> $GITHUB_OUTPUT
           else
-            echo "No previous successful nightly run found"
+            echo "No previous completed nightly run found"
             echo "baseline_dir=" >> $GITHUB_OUTPUT
           fi
         env:
@@ -403,12 +399,60 @@ jobs:
           git push origin gh-pages
           git checkout "$CURRENT_SHA"
 
-  # ---------- Regression re-run (GPU, only on regression) ----------
-  regression-rerun:
+  # ---------- Generate regression matrix (lightweight, ubuntu) ----------
+  generate-regression-matrix:
     if: always() && needs.summarize-benchmark-result.outputs.has_regression == 'true'
-    name: Re-run regressed configs with profiler
+    name: Generate regression rerun matrix
     needs: [summarize-benchmark-result]
-    runs-on: atom-mi355-8gpu.predownload
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_json: ${{ steps.gen.outputs.matrix_json }}
+      has_matrix: ${{ steps.gen.outputs.has_matrix }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: regression-report
+
+      - name: Generate matrix from regression report
+        id: gen
+        run: |
+          python3 .github/scripts/regression_rerun.py \
+            regression_report.json \
+            .github/benchmark/models.json \
+            --output-matrix /tmp/matrix.json
+
+          if [ -s /tmp/matrix.json ] && [ "$(cat /tmp/matrix.json)" != "[]" ]; then
+            echo "matrix_json=$(cat /tmp/matrix.json)" >> $GITHUB_OUTPUT
+            echo "has_matrix=true" >> $GITHUB_OUTPUT
+            echo "=== Matrix cells ==="
+            python3 -c "
+          import json
+          cells = json.load(open('/tmp/matrix.json'))
+          for c in cells:
+              configs = json.loads(c['configs'])
+              print(f\"  {c['prefix']}: {len(configs)} config(s) on {c['runner']}\")
+          "
+          else
+            echo "matrix_json=[]" >> $GITHUB_OUTPUT
+            echo "has_matrix=false" >> $GITHUB_OUTPUT
+            echo "No regression configs generated"
+          fi
+
+  # ---------- Regression re-run (GPU, matrix by model) ----------
+  regression-rerun:
+    if: >-
+      always()
+      && needs.generate-regression-matrix.outputs.has_matrix == 'true'
+    name: Rerun ${{ matrix.cell.prefix }}
+    needs: [generate-regression-matrix]
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJson(needs.generate-regression-matrix.outputs.matrix_json) }}
+    runs-on: ${{ matrix.cell.runner }}
+    timeout-minutes: 60
     steps:
       - name: Kill all Docker containers
         run: |
@@ -422,156 +466,154 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
-      - name: Download regression report
-        uses: actions/download-artifact@v8
-        with:
-          name: regression-report
-
       - name: Docker Login
         run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Start CI container
         run: |
-          if [ -f "/etc/podinfo/gha-render-devices" ]; then
-            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-          else
-            DEVICE_FLAG="--device /dev/dri"
-          fi
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
           MODEL_MOUNT=""
-          if [ -d "/models" ]; then
-            MODEL_MOUNT="-v /models:/models"
+          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+
+          # Build env var flags from model config
+          ENV_FLAGS=""
+          if [ -n "${{ matrix.cell.env_vars }}" ]; then
+            for ev in ${{ matrix.cell.env_vars }}; do
+              ENV_FLAGS="$ENV_FLAGS -e $ev"
+            done
           fi
+
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
-            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-            $MODEL_MOUNT \
-            -w /workspace \
-            --ipc=host --group-add video \
-            --shm-size=16G --privileged \
-            --cap-add=SYS_PTRACE \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
+            -w /workspace --ipc=host --group-add video \
+            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --security-opt seccomp=unconfined \
-            --ulimit memlock=-1 --ulimit stack=67108864 \
+            --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
             -e ATOM_DISABLE_MMAP=true \
+            $ENV_FLAGS \
             --name atom-regression \
-            rocm/atom-dev:latest
+            ${{ inputs.image || 'rocm/atom-dev:latest' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Prepare regression configs
-        id: prepare
+      - name: Download model
         run: |
-          python3 .github/scripts/regression_rerun.py \
-            regression_report.json \
-            .github/benchmark/models.json \
-            -o /tmp/regression_configs.txt
-
-          if [ -s /tmp/regression_configs.txt ]; then
-            echo "has_configs=true" >> $GITHUB_OUTPUT
-            echo "=== Configs to profile ==="
-            cat -n /tmp/regression_configs.txt
-          else
-            echo "has_configs=false" >> $GITHUB_OUTPUT
-            echo "No regression configs generated"
+          if [ -d "/models" ]; then
+            echo "=== Downloading ${{ matrix.cell.model_path }} ==="
+            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
+              "hf download ${{ matrix.cell.model_path }} --local-dir /models/${{ matrix.cell.model_path }}" \
+              || echo "::warning::Failed to download ${{ matrix.cell.model_path }}, will use HF online"
           fi
 
-      - name: Download models
-        if: steps.prepare.outputs.has_configs == 'true'
+      - name: Launch server
         run: |
-          cut -d'|' -f1 /tmp/regression_configs.txt | sort -u | while read MODEL_PATH; do
-            echo "=== Downloading $MODEL_PATH ==="
-            if [ -d "/models" ]; then
-              docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-regression bash -lc \
-                "hf download $MODEL_PATH --local-dir /models/$MODEL_PATH" \
-                || echo "::warning::Failed to download $MODEL_PATH, will use HF online"
-            fi
-          done
+          if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
+          else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
 
-      - name: Run configs with profiler
-        if: steps.prepare.outputs.has_configs == 'true'
-        timeout-minutes: 60
+          docker exec atom-regression bash -lc "set -euo pipefail
+            ${{ matrix.cell.env_vars }} \
+            ENABLE_TORCH_PROFILER=1 \
+            .github/scripts/atom_test.sh launch $MODEL_DIR ${{ matrix.cell.server_args }}"
+
+      - name: Run regression configs with profiler
         run: |
           set -uo pipefail  # no -e: allow per-config failure without aborting loop
 
-          # Track current server to avoid unnecessary restarts
-          CURRENT_SERVER=""
+          if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
+          else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
+
           FAIL_COUNT=0
           TOTAL_COUNT=0
 
-          while IFS='|' read -r MODEL_PATH SERVER_ARGS BENCH_ARGS ISL OSL CONC ENV_VARS PREFIX; do
+          # Parse configs JSON into pipe-delimited lines for shell loop
+          echo '${{ matrix.cell.configs }}' | python3 -c "
+          import json, sys
+          for c in json.load(sys.stdin):
+              print('{isl}|{osl}|{conc}|{bench_args}|{prefix}'.format(**c))
+          " > /tmp/regression_configs.txt
+
+          while IFS='|' read -r ISL OSL CONC BENCH_ARGS PREFIX; do
             TOTAL_COUNT=$((TOTAL_COUNT + 1))
-            if [ -d "/models" ]; then MODEL_DIR="/models/$MODEL_PATH"; else MODEL_DIR="$MODEL_PATH"; fi
-            SERVER_KEY="$MODEL_PATH|$SERVER_ARGS|$ENV_VARS"
-            TRACE_SUBDIR="${PREFIX}${ISL}-${OSL}-${CONC}"
+            TRACE_SUBDIR="${PREFIX}-${ISL}-${OSL}-${CONC}"
 
-            # Launch server if model/args/env changed
-            if [ "$SERVER_KEY" != "$CURRENT_SERVER" ]; then
-              if [ -n "$CURRENT_SERVER" ]; then
-                docker exec atom-regression bash -lc \
-                  "TORCH_PROFILER_DIR=/app/trace .github/scripts/atom_test.sh stop"
-              fi
-              echo "=== Launching: $MODEL_DIR $SERVER_ARGS ==="
-              if ! docker exec atom-regression bash -lc "set -euo pipefail
-                $ENV_VARS \
-                ENABLE_TORCH_PROFILER=1 \
-                .github/scripts/atom_test.sh launch $MODEL_DIR $SERVER_ARGS"; then
-                echo "::error::Server launch failed for $MODEL_PATH, skipping remaining configs for this model"
-                CURRENT_SERVER=""
-                FAIL_COUNT=$((FAIL_COUNT + 1))
-                continue
-              fi
-              CURRENT_SERVER="$SERVER_KEY"
-            fi
+            docker exec atom-regression bash -lc "mkdir -p /app/trace/$TRACE_SUBDIR"
 
-            # Per-config trace directory to avoid overwrites
-            docker exec atom-regression bash -lc "
-              mkdir -p /app/trace/$TRACE_SUBDIR"
+            # Record profiler stop count before benchmark (to detect new completions)
+            STOP_COUNT_BEFORE=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null || echo 0)
 
-            # Run benchmark with profiler
             echo "=== Profiling: $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC ==="
             if ! docker exec atom-regression bash -lc "
-              $ENV_VARS \
+              ${{ matrix.cell.env_vars }} \
               ENABLE_TORCH_PROFILER=1 \
               ISL=$ISL OSL=$OSL CONC=$CONC \
               RANDOM_RANGE_RATIO=0.8 \
               NUM_PROMPTS_OVERRIDE=$((CONC*2)) \
               RESULT_FILENAME=regression-${PREFIX}-${ISL}-${OSL}-${CONC} \
               BENCH_EXTRA_ARGS='$BENCH_ARGS' \
-              SERVER_ARGS='$SERVER_ARGS' \
+              SERVER_ARGS='${{ matrix.cell.server_args }}' \
               .github/scripts/atom_test.sh benchmark $MODEL_DIR"; then
               echo "::warning::Benchmark failed for $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC"
               FAIL_COUNT=$((FAIL_COUNT + 1))
               continue
             fi
 
-            # Move trace files into per-config subdir (before next config overwrites)
+            # Wait for engine core to finish exporting profiler trace (blocks inference)
+            # See .claude/plan/profiler-async-refactor.md for long-term fix
+            for i in $(seq 1 300); do
+              STOP_COUNT=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null || echo 0)
+              [ "$STOP_COUNT" -gt "$STOP_COUNT_BEFORE" ] && echo "Profiler trace export done after ${i}s" && break
+              [ "$i" -eq 1 ] && echo "Waiting for profiler trace export..."
+              [ "$i" -eq 300 ] && echo "WARNING: Profiler did not finish after 300s, proceeding anyway"
+              sleep 1
+            done
+
+            # Move trace files into per-config subdir
             docker exec atom-regression bash -lc "
               for d in /app/trace/rank_*; do
                 [ -d \"\$d\" ] && mv \"\$d\" /app/trace/$TRACE_SUBDIR/ 2>/dev/null || true
               done"
-
           done < /tmp/regression_configs.txt
 
-          # Stop last server (includes trace wait + GPU memory release)
-          if [ -n "$CURRENT_SERVER" ]; then
-            docker exec atom-regression bash -lc \
-              "TORCH_PROFILER_DIR=/app/trace .github/scripts/atom_test.sh stop"
+          echo "=== Regression re-run complete: $((TOTAL_COUNT - FAIL_COUNT))/$TOTAL_COUNT succeeded ==="
+          if [ "$FAIL_COUNT" -gt 0 ]; then
+            echo "::warning::$FAIL_COUNT/$TOTAL_COUNT configs failed"
           fi
 
-          echo "=== Regression re-run complete: $((TOTAL_COUNT - FAIL_COUNT))/$TOTAL_COUNT succeeded ==="
-          [ "$FAIL_COUNT" -gt 0 ] && echo "::warning::$FAIL_COUNT/$TOTAL_COUNT configs failed"
+      - name: Stop server
+        if: always()
+        run: |
+          docker exec atom-regression bash -lc \
+            "TORCH_PROFILER_DIR=/app/trace .github/scripts/atom_test.sh stop" || true
 
-      - name: Copy and upload profiler traces
+      - name: Copy profiler traces from container
+        id: copy-traces
         if: always()
         run: |
           docker cp atom-regression:/app/trace ./regression-traces 2>/dev/null || echo "No traces found"
-          ls -lhR ./regression-traces/ 2>/dev/null || true
+          TRACE_COUNT=$(find ./regression-traces -type f \( -name "*.json.gz" -o -name "*.pt.trace.*" \) 2>/dev/null | wc -l | tr -d ' ')
+          echo "trace_count=$TRACE_COUNT" >> $GITHUB_OUTPUT
+          if [ "$TRACE_COUNT" -gt 0 ]; then
+            echo "Found $TRACE_COUNT trace files"
+            ls -lhR ./regression-traces/
+          else
+            echo "::warning::No trace files found in container — profiler may not have produced output"
+          fi
 
       - name: Upload regression traces
+        if: always() && fromJSON(steps.copy-traces.outputs.trace_count) > 0
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-traces-${{ github.run_id }}-${{ matrix.cell.prefix }}
+          path: regression-traces/
+
+      - name: Upload regression results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: regression-traces-${{ github.run_id }}
-          path: regression-traces/
+          name: regression-results-${{ github.run_id }}-${{ matrix.cell.prefix }}
+          path: regression-*.json
+          if-no-files-found: ignore
 
       - name: Clean Up
         if: always()
@@ -579,30 +621,54 @@ jobs:
           docker stop atom-regression || true
           docker rm atom-regression || true
 
+  # ---------- Collect regression traces from all matrix cells ----------
+  collect-regression-traces:
+    if: always() && needs.regression-rerun.result != 'skipped'
+    name: Collect regression traces
+    needs: [regression-rerun]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all regression trace artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: regression-traces-${{ github.run_id }}-*
+          merge-multiple: true
+          path: regression-traces/
+        continue-on-error: true
+
+      - name: Upload combined regression traces
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-traces-${{ github.run_id }}
+          path: regression-traces/
+          if-no-files-found: ignore
+
   # ---------- Profiler analysis (lightweight, runs on regression OR manual profiler) ----------
   profiler-analysis:
     if: >-
       always()
-      && (needs.regression-rerun.result != 'cancelled'
-          && needs.regression-rerun.result != 'skipped'
+      && (needs.collect-regression-traces.result != 'cancelled'
+          && needs.collect-regression-traces.result != 'skipped'
           || inputs.enable_profiler == true)
     name: Profiler trace analysis
-    needs: [benchmark, summarize-benchmark-result, regression-rerun]
+    needs: [benchmark, summarize-benchmark-result, generate-regression-matrix, regression-rerun, collect-regression-traces]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
       - name: Download regression traces
-        if: needs.regression-rerun.result == 'success'
+        if: needs.collect-regression-traces.result == 'success'
         uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
           name: regression-traces-${{ github.run_id }}
           path: profiler-traces/
 
       - name: Download benchmark profiler traces
-        if: needs.regression-rerun.result != 'success'
+        if: needs.collect-regression-traces.result != 'success'
         uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
           pattern: profiler-traces-*
           merge-multiple: true
