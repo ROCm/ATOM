@@ -35,10 +35,10 @@ from atom.mesh.disaggregation.types import ConnectorMetadata
 from atom.model_engine.sequence import Sequence
 from atom.utils import get_open_port, make_zmq_path
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_config(*, kv_role="kv_consumer", tp_size=1, dp_size=1, dp_rank=0):
     cfg = MagicMock()
@@ -73,6 +73,7 @@ _KV_PARAMS = {
 # MoRIIOConstants
 # ---------------------------------------------------------------------------
 
+
 class TestMoRIIOConstants:
     def test_get_meta_msg_is_bytes(self):
         assert isinstance(MoRIIOConstants.GET_META_MSG, bytes)
@@ -88,6 +89,7 @@ class TestMoRIIOConstants:
 # ---------------------------------------------------------------------------
 # MoRIIOWrapper — unit tests (no RDMA, just internal state + ZMQ)
 # ---------------------------------------------------------------------------
+
 
 class TestMoRIIOWrapper:
     def test_init_defaults(self):
@@ -165,6 +167,7 @@ class TestMoRIIOWrapper:
 # ZMQ handshake roundtrip — tests the handshake_listener <-> client protocol
 # ---------------------------------------------------------------------------
 
+
 class TestZMQHandshake:
     def test_handshake_returns_metadata(self):
         """Simulate the GET_META_MSG handshake and verify metadata exchange."""
@@ -226,7 +229,10 @@ class TestZMQHandshake:
             assert frame2[0] == b""
             received_layer_meta = msgpack.loads(frame2[1])
             expected_keys = {"layer0", "layer1"}
-            actual_keys = {k if isinstance(k, str) else k.decode() for k in received_layer_meta.keys()}
+            actual_keys = {
+                k if isinstance(k, str) else k.decode()
+                for k in received_layer_meta.keys()
+            }
             assert actual_keys == expected_keys
         finally:
             sock.close(linger=0)
@@ -311,19 +317,36 @@ class TestZMQHandshake:
 # KVConnectorScheduler — full lifecycle integration
 # ---------------------------------------------------------------------------
 
+
 class TestSchedulerLifecycle:
     """End-to-end scheduler-side connector flow: arrive → alloc → meta → finish."""
 
     @pytest.fixture()
     def sched(self):
-        with patch("atom.mesh.disaggregation.kv_transfer_engine.get_open_port", return_value=9999), \
-             patch("atom.mesh.disaggregation.kv_transfer_engine.get_ip", return_value="127.0.0.1"):
+        with (
+            patch(
+                "atom.mesh.disaggregation.kv_transfer_engine.get_open_port",
+                return_value=9999,
+            ),
+            patch(
+                "atom.mesh.disaggregation.kv_transfer_engine.get_ip",
+                return_value="127.0.0.1",
+            ),
+        ):
             return KVConnectorScheduler(_make_config(kv_role="kv_consumer"))
 
     @pytest.fixture()
     def producer(self):
-        with patch("atom.mesh.disaggregation.kv_transfer_engine.get_open_port", return_value=8888), \
-             patch("atom.mesh.disaggregation.kv_transfer_engine.get_ip", return_value="127.0.0.1"):
+        with (
+            patch(
+                "atom.mesh.disaggregation.kv_transfer_engine.get_open_port",
+                return_value=8888,
+            ),
+            patch(
+                "atom.mesh.disaggregation.kv_transfer_engine.get_ip",
+                return_value="127.0.0.1",
+            ),
+        ):
             return KVConnectorScheduler(_make_config(kv_role="kv_producer"))
 
     def test_consumer_full_flow(self, sched):

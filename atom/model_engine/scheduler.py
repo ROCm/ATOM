@@ -181,8 +181,12 @@ class ScheduledBatch:
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
         ]
-        self.temperatures = np.asarray([seq.temperature for seq in seqs.values()], dtype=np.float32)
-        self.context_lens = np.asarray([seq.num_tokens for seq in seqs.values()], dtype=np.int32)
+        self.temperatures = np.asarray(
+            [seq.temperature for seq in seqs.values()], dtype=np.float32
+        )
+        self.context_lens = np.asarray(
+            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
+        )
 
         # Build the flat scheduled-token array
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
@@ -340,7 +344,9 @@ class Scheduler:
             # KV Transfer: skip request if still waiting for remote KVs
             waiting_remote_to_waiting_ready = False
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                waiting_remote_to_waiting_ready = self._update_waiting_for_remote_kv(seq)
+                waiting_remote_to_waiting_ready = self._update_waiting_for_remote_kv(
+                    seq
+                )
                 if waiting_remote_to_waiting_ready:
                     seq.status = SequenceStatus.WAITING
                 else:
@@ -611,7 +617,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
-    
+
     def _update_waiting_for_remote_kv(self, seq: Sequence) -> bool:
         """Check whether a remote KV transfer for *seq* has completed.
 
@@ -638,20 +644,20 @@ class Scheduler:
             return
 
         for req_id in kv_connector_output.finished_recving or ():
-            assert not self.kv_connector.is_producer, (
-                "Only consumer should update recving KV status"
-            )
+            assert (
+                not self.kv_connector.is_producer
+            ), "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():
-            assert self.kv_connector.is_producer, (
-                "Only producer should free blocks after sending KV"
-            )
+            assert (
+                self.kv_connector.is_producer
+            ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.deferred_free_blocks, (
-                f"req_id={req_id} not found in deferred_free_blocks"
-            )
+            assert (
+                req_id in self.deferred_free_blocks
+            ), f"req_id={req_id} not found in deferred_free_blocks"
             self.block_manager.deallocate(self.deferred_free_blocks.pop(req_id))
 
     def get_request_counts(self) -> tuple[int, int]:

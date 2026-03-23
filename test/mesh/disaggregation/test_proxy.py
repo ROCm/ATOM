@@ -14,10 +14,10 @@ from atom.mesh.disaggregation.proxy import (
     example_round_robin_dp_loader,
 )
 
-
 # ---------------------------------------------------------------------------
 # _extract_ip_port
 # ---------------------------------------------------------------------------
+
 
 class TestExtractIpPort:
     def test_valid_url(self):
@@ -47,6 +47,7 @@ class TestExtractIpPort:
 # example_round_robin_dp_loader
 # ---------------------------------------------------------------------------
 
+
 class TestRoundRobin:
     def test_even_distribution(self):
         results = [example_round_robin_dp_loader(i, dp_size=3) for i in range(6)]
@@ -62,6 +63,7 @@ class TestRoundRobin:
 # ---------------------------------------------------------------------------
 # _append_whole_dict_unique
 # ---------------------------------------------------------------------------
+
 
 class TestAppendWholeDictUnique:
     @pytest.fixture(autouse=True)
@@ -90,19 +92,13 @@ class TestAppendWholeDictUnique:
 
     def test_different_dicts_both_appended(self):
         target = []
-        _append_whole_dict_unique(
-            target, {"host": "10.0.0.1", "transfer_mode": "read"}
-        )
-        _append_whole_dict_unique(
-            target, {"host": "10.0.0.2", "transfer_mode": "read"}
-        )
+        _append_whole_dict_unique(target, {"host": "10.0.0.1", "transfer_mode": "read"})
+        _append_whole_dict_unique(target, {"host": "10.0.0.2", "transfer_mode": "read"})
         assert len(target) == 2
 
     def test_transfer_mode_mismatch_raises(self):
         target = []
-        _append_whole_dict_unique(
-            target, {"host": "10.0.0.1", "transfer_mode": "read"}
-        )
+        _append_whole_dict_unique(target, {"host": "10.0.0.1", "transfer_mode": "read"})
         with pytest.raises(ValueError, match="mismatched"):
             _append_whole_dict_unique(
                 target, {"host": "10.0.0.2", "transfer_mode": "write"}
@@ -110,7 +106,5 @@ class TestAppendWholeDictUnique:
 
     def test_sets_global_transfer_type(self):
         target = []
-        _append_whole_dict_unique(
-            target, {"host": "10.0.0.1", "transfer_mode": "read"}
-        )
+        _append_whole_dict_unique(target, {"host": "10.0.0.1", "transfer_mode": "read"})
         assert proxy_mod.TRANSFER_TYPE == "read"

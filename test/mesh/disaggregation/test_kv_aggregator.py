@@ -70,57 +70,69 @@ class TestAggregateMultiRound:
         agg = KVOutputAggregator(world_size=3)
 
         # Round 1: 2 of 3 workers done
-        result = agg.aggregate([
-            KVConnectorOutput(finished_sending={"r1"}),
-            KVConnectorOutput(finished_sending={"r1"}),
-            KVConnectorOutput(),
-        ])
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(finished_sending={"r1"}),
+                KVConnectorOutput(finished_sending={"r1"}),
+                KVConnectorOutput(),
+            ]
+        )
         assert result.finished_sending == set()
         assert agg.pending_count == (1, 0)
 
         # Round 2: last worker reports
-        result = agg.aggregate([
-            KVConnectorOutput(),
-            KVConnectorOutput(),
-            KVConnectorOutput(finished_sending={"r1"}),
-        ])
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(),
+                KVConnectorOutput(),
+                KVConnectorOutput(finished_sending={"r1"}),
+            ]
+        )
         assert result.finished_sending == {"r1"}
         assert agg.pending_count == (0, 0)
 
     def test_interleaved_send_recv(self):
         agg = KVOutputAggregator(world_size=2)
-        result = agg.aggregate([
-            KVConnectorOutput(finished_sending={"s1"}, finished_recving={"r1"}),
-            KVConnectorOutput(finished_sending={"s1"}, finished_recving={"r1"}),
-        ])
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(finished_sending={"s1"}, finished_recving={"r1"}),
+                KVConnectorOutput(finished_sending={"s1"}, finished_recving={"r1"}),
+            ]
+        )
         assert result.finished_sending == {"s1"}
         assert result.finished_recving == {"r1"}
 
     def test_multiple_requests_mixed_progress(self):
         agg = KVOutputAggregator(world_size=2)
 
-        result = agg.aggregate([
-            KVConnectorOutput(finished_sending={"a", "b"}),
-            KVConnectorOutput(finished_sending={"a"}),
-        ])
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(finished_sending={"a", "b"}),
+                KVConnectorOutput(finished_sending={"a"}),
+            ]
+        )
         assert result.finished_sending == {"a"}
         assert "b" not in result.finished_sending
 
-        result = agg.aggregate([
-            KVConnectorOutput(),
-            KVConnectorOutput(finished_sending={"b"}),
-        ])
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(),
+                KVConnectorOutput(finished_sending={"b"}),
+            ]
+        )
         assert result.finished_sending == {"b"}
 
 
 class TestReset:
     def test_reset_clears_pending(self):
         agg = KVOutputAggregator(world_size=3)
-        agg.aggregate([
-            KVConnectorOutput(finished_sending={"r1"}),
-            KVConnectorOutput(),
-            KVConnectorOutput(),
-        ])
+        agg.aggregate(
+            [
+                KVConnectorOutput(finished_sending={"r1"}),
+                KVConnectorOutput(),
+                KVConnectorOutput(),
+            ]
+        )
         assert agg.pending_count == (1, 0)
         agg.reset()
         assert agg.pending_count == (0, 0)

@@ -13,10 +13,10 @@ from atom.mesh.disaggregation.types import (
     ReqMeta,
 )
 
-
 # ---------------------------------------------------------------------------
 # ReqMeta
 # ---------------------------------------------------------------------------
+
 
 class TestReqMeta:
     def test_fields(self):
@@ -40,6 +40,7 @@ class TestReqMeta:
 # RemoteAllocInfo
 # ---------------------------------------------------------------------------
 
+
 class TestRemoteAllocInfo:
     def test_defaults(self):
         info = RemoteAllocInfo()
@@ -52,6 +53,7 @@ class TestRemoteAllocInfo:
 # ---------------------------------------------------------------------------
 # RemoteMeta
 # ---------------------------------------------------------------------------
+
 
 class TestRemoteMeta:
     def test_all_fields(self):

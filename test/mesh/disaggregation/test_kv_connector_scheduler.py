@@ -20,13 +20,18 @@ from atom.mesh.disaggregation.kv_transfer_engine import (
 from atom.mesh.disaggregation.types import ConnectorMetadata
 from atom.model_engine.sequence import Sequence
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _make_config(*, kv_role: str = "kv_consumer", tp_size: int = 1,
-                 dp_size: int = 1, dp_rank: int = 0) -> MagicMock:
+
+def _make_config(
+    *,
+    kv_role: str = "kv_consumer",
+    tp_size: int = 1,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+) -> MagicMock:
     """Return a minimal Config-like object for KVConnectorScheduler."""
     cfg = MagicMock()
     cfg.kv_transfer_config = {"kv_role": kv_role}
@@ -36,9 +41,12 @@ def _make_config(*, kv_role: str = "kv_consumer", tp_size: int = 1,
     return cfg
 
 
-def _make_seq(*, token_ids: list[int] | None = None,
-              kv_transfer_params: dict | None = None,
-              block_table: list[int] | None = None) -> Sequence:
+def _make_seq(
+    *,
+    token_ids: list[int] | None = None,
+    kv_transfer_params: dict | None = None,
+    block_table: list[int] | None = None,
+) -> Sequence:
     """Create a lightweight Sequence for testing."""
     if token_ids is None:
         token_ids = list(range(10))
@@ -50,21 +58,38 @@ def _make_seq(*, token_ids: list[int] | None = None,
 
 @pytest.fixture()
 def consumer_sched() -> KVConnectorScheduler:
-    with patch("atom.mesh.disaggregation.kv_transfer_engine.get_open_port", return_value=9999), \
-         patch("atom.mesh.disaggregation.kv_transfer_engine.get_ip", return_value="127.0.0.1"):
+    with (
+        patch(
+            "atom.mesh.disaggregation.kv_transfer_engine.get_open_port",
+            return_value=9999,
+        ),
+        patch(
+            "atom.mesh.disaggregation.kv_transfer_engine.get_ip",
+            return_value="127.0.0.1",
+        ),
+    ):
         return KVConnectorScheduler(_make_config(kv_role="kv_consumer"))
 
 
 @pytest.fixture()
 def producer_sched() -> KVConnectorScheduler:
-    with patch("atom.mesh.disaggregation.kv_transfer_engine.get_open_port", return_value=8888), \
-         patch("atom.mesh.disaggregation.kv_transfer_engine.get_ip", return_value="127.0.0.1"):
+    with (
+        patch(
+            "atom.mesh.disaggregation.kv_transfer_engine.get_open_port",
+            return_value=8888,
+        ),
+        patch(
+            "atom.mesh.disaggregation.kv_transfer_engine.get_ip",
+            return_value="127.0.0.1",
+        ),
+    ):
         return KVConnectorScheduler(_make_config(kv_role="kv_producer"))
 
 
 # ---------------------------------------------------------------------------
 # Tests: get_num_new_matched_tokens
 # ---------------------------------------------------------------------------
+
 
 class TestGetNumNewMatchedTokens:
     def test_remote_prefill_returns_token_count(self, consumer_sched):
@@ -103,6 +128,7 @@ class TestGetNumNewMatchedTokens:
 # Tests: update_state_after_alloc
 # ---------------------------------------------------------------------------
 
+
 class TestUpdateStateAfterAlloc:
     def test_consumer_records_transfer_id(self, consumer_sched):
         seq = _make_seq(
@@ -133,6 +159,7 @@ class TestUpdateStateAfterAlloc:
 # Tests: build_connector_meta
 # ---------------------------------------------------------------------------
 
+
 class TestBuildConnectorMeta:
     def test_empty_queue(self, consumer_sched):
         meta = consumer_sched.build_connector_meta()
@@ -160,6 +187,7 @@ class TestBuildConnectorMeta:
 # ---------------------------------------------------------------------------
 # Tests: request_finished
 # ---------------------------------------------------------------------------
+
 
 class TestRequestFinished:
     def test_producer_populates_output(self, producer_sched):
@@ -199,13 +227,16 @@ class TestRequestFinished:
 # Tests: convert_virtual_to_physical_pages
 # ---------------------------------------------------------------------------
 
+
 class TestConvertVirtualToPhysicalPages:
     def test_default_16_to_1(self):
         result = convert_virtual_to_physical_pages([0, 1])
         assert result == list(range(32))
 
     def test_same_block_size(self):
-        result = convert_virtual_to_physical_pages([3], virtual_block_size=1, physical_block_size=1)
+        result = convert_virtual_to_physical_pages(
+            [3], virtual_block_size=1, physical_block_size=1
+        )
         assert result == [3]
 
     def test_custom_ratio(self):
@@ -222,6 +253,7 @@ class TestConvertVirtualToPhysicalPages:
 # Tests: get_port_offset
 # ---------------------------------------------------------------------------
 
+
 class TestGetPortOffset:
     def test_formula(self):
         assert get_port_offset(dp_rank=0, tp_rank=0) == 0
@@ -232,6 +264,7 @@ class TestGetPortOffset:
 # ---------------------------------------------------------------------------
 # Tests: Role / set_role / get_role
 # ---------------------------------------------------------------------------
+
 
 class TestRoleManager:
     def test_initial_role(self):
