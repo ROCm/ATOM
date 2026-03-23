@@ -288,7 +288,9 @@ class MoRIIOWrapper:
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
         consumer_engine_metadata = EngineDesc.unpack(remote_packed_engine_metadata)
         self.moriio_engine.register_remote_engine(consumer_engine_metadata)
-        logger.info("Registered remote engine with key: %s", consumer_engine_metadata.key)
+        logger.info(
+            "Registered remote engine with key: %s", consumer_engine_metadata.key
+        )
         return consumer_engine_metadata.key
 
     def register_local_tensor(self, tensor):
@@ -297,9 +299,9 @@ class MoRIIOWrapper:
             self.local_memory_metadata = self.moriio_engine.register_torch_tensor(
                 tensor
             )
-            assert self.local_memory_metadata is not None, (
-                "register_torch_tensor returned None"
-            )
+            assert (
+                self.local_memory_metadata is not None
+            ), "register_torch_tensor returned None"
             local_memory_metadata_packed = self.local_memory_metadata.pack()
         except Exception as e:
             raise ValueError(f"Failed to register local memory: {e}") from e
@@ -314,7 +316,7 @@ class MoRIIOWrapper:
         tmp = self.moriio_engine.create_session(
             local_memory_metadata, remote_memory_metadata
         )
-        
+
         return tmp
 
     def read_remote_data(
@@ -433,13 +435,15 @@ class MoRIIOWrapper:
 
     def _handle_block_alloc_message(self, data: dict) -> None:
         """Process a remote block allocation notification (producer side)."""
-        assert get_role() == Role.PRODUCER, "Only producer should receive block alloc messages"
+        assert (
+            get_role() == Role.PRODUCER
+        ), "Only producer should receive block alloc messages"
         req_id = data["req_id"]
         block_notify_list = data.get("block_notify_list", [])
         decode_dp_rank = data.get("decode_rank", 0)
-        assert len(block_notify_list) > 0, (
-            "block_notify_list cannot be empty in remote allocate message"
-        )
+        assert (
+            len(block_notify_list) > 0
+        ), "block_notify_list cannot be empty in remote allocate message"
 
         with self.lock:
             self.done_remote_allocate_req_dict[req_id] = RemoteAllocInfo(
@@ -505,7 +509,9 @@ class MoRIIOWrapper:
 
     def shutdown(self) -> None:
         """Close all cached ZMQ sockets and release resources."""
-        logger.debug("Shutting down MoRIIOWrapper, closing %d sockets", len(self._sockets))
+        logger.debug(
+            "Shutting down MoRIIOWrapper, closing %d sockets", len(self._sockets)
+        )
         for path, sock in self._sockets.items():
             try:
                 sock.close(linger=0)
@@ -553,15 +559,15 @@ class KVConnector(KVConnectorBase):
 
         # Compute unique side-channel port for this (dp, tp) rank
         handshake_port = MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
-        self.side_channel_port = (
-            handshake_port + get_port_offset(self.dp_rank, self.tp_rank)
+        self.side_channel_port = handshake_port + get_port_offset(
+            self.dp_rank, self.tp_rank
         )
         self.engine_id = f"{self.local_ip}:{handshake_port}"
 
         # Remote metadata caches
-        self.layer_name_to_remote_kv_cache_metadata: dict[
-            str, dict[str, list[Any]]
-        ] = {}
+        self.layer_name_to_remote_kv_cache_metadata: dict[str, dict[str, list[Any]]] = (
+            {}
+        )
         self.remote_moriio_metadata: dict[EngineId, MoRIIOAgentMetadata] = {}
         self.kv_caches_base_addr: dict[EngineId, list[int]] = {}
 
@@ -616,7 +622,6 @@ class KVConnector(KVConnectorBase):
                 name="kv-connector-ping",
             )
             self._ping_thread.start()
-
 
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Register all KV cache tensors for RDMA and start the handshake listener.
@@ -741,7 +746,7 @@ class KVConnector(KVConnectorBase):
             remote_handshake_port=meta.remote_handshake_port,
             remote_dp_rank=meta.remote_dp_rank,
         )
-        
+
     def merge_contiguous_blocks(
         self,
         offsets_local: list[int],
@@ -876,15 +881,11 @@ class KVConnector(KVConnectorBase):
         if remote_engine_id not in self._built_sessions:
             sessions = []
             for ln, local_meta in self.layer_name_to_local_kv_cache_metadata.items():
-                local_md = self.moriio_wrapper.get_unpack_memory_metadata(
-                    local_meta[0]
-                )
+                local_md = self.moriio_wrapper.get_unpack_memory_metadata(local_meta[0])
                 remote_md = self.moriio_wrapper.get_unpack_memory_metadata(
                     self.layer_name_to_remote_kv_cache_metadata[remote_engine_id][ln][0]
                 )
-                sessions.append(
-                    self.moriio_wrapper.build_session(local_md, remote_md)
-                )
+                sessions.append(self.moriio_wrapper.build_session(local_md, remote_md))
             self._built_sessions[remote_engine_id] = sessions
 
         return (
@@ -981,14 +982,18 @@ class KVConnector(KVConnectorBase):
                     sock.send(msgpack.dumps(registration_data))
                     logger.debug(
                         "Ping #%d sent to %s (role=%s)",
-                        msg_index, proxy_path, role_code,
+                        msg_index,
+                        proxy_path,
+                        role_code,
                     )
                     retry_count = 0
 
                 except ConnectionRefusedError:
                     logger.info(
                         "Proxy connection refused: %s:%s -> %s",
-                        self.local_ip, self._local_ping_port, proxy_path,
+                        self.local_ip,
+                        self._local_ping_port,
+                        proxy_path,
                     )
                     retry_count += 1
 
@@ -1029,9 +1034,7 @@ class KVConnector(KVConnectorBase):
         """
         encoder = msgspec.msgpack.Encoder()
         encoded_data = encoder.encode(metadata)
-        logger.info(
-            "Handshake listener ready (%d bytes metadata)", len(encoded_data)
-        )
+        logger.info("Handshake listener ready (%d bytes metadata)", len(encoded_data))
 
         path = make_zmq_path("tcp", "*", base_port)
         logger.info("Handshake listener bound to %s", path)
@@ -1062,7 +1065,7 @@ class KVConnector(KVConnectorBase):
                 else:
                     logger.error("Unexpected handshake message type: %s", msg)
                     raise ValueError(f"Unexpected handshake message: {msg!r}")
-                    
+
     def _execute_handshake(
         self,
         host: str,
@@ -1157,7 +1160,8 @@ class KVConnector(KVConnectorBase):
         """
         logger.info(
             "Initiating background handshake for req %s -> %s",
-            req_id, remote_engine_id,
+            req_id,
+            remote_engine_id,
         )
 
         host = meta.remote_host
@@ -1199,7 +1203,7 @@ class KVConnector(KVConnectorBase):
 
         all_done_future = self._handshake_executor.submit(_wait_all)
         all_done_future.add_done_callback(_on_all_done)
-    
+
     def _pop_done_transfers(self) -> set[str]:
         done_req_ids: set[str] = set()
         with self.moriio_wrapper.lock:
@@ -1220,7 +1224,7 @@ class KVConnector(KVConnectorBase):
                 del self._recving_transfers_callback_addr[req_id]
 
             return done_req_ids
-    
+
     def get_finished(self) -> tuple[set[int], set[str]]:
         """Return the sets of finished sending and receiving request IDs.
 
@@ -1327,14 +1331,15 @@ class KVConnectorScheduler(KVConnectorSchedulerBase):
 
         # Decode side: queue for remote KV loading
         if params.get("do_remote_prefill"):
-            assert not self.is_producer, (
-                "Only the decode (consumer) side handles do_remote_prefill"
-            )
+            assert (
+                not self.is_producer
+            ), "Only the decode (consumer) side handles do_remote_prefill"
             self._reqs_need_recv[seq.id] = (seq, seq.block_table)
             params["do_remote_prefill"] = False
             logger.debug(
                 "Queued req %s for remote KV loading (%d blocks)",
-                seq.id, len(seq.block_table),
+                seq.id,
+                len(seq.block_table),
             )
 
     def request_finished(self, seq: Sequence) -> None:
@@ -1364,13 +1369,9 @@ class KVConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id.pop(transfer_id, None)
 
 
-
-
 def _zmq_ctx(socket_type: int, addr: str):
     """Context manager for a ZMQ socket with role-appropriate bind semantics.
 
     ROUTER sockets bind; DEALER/REQ sockets connect.
     """
-    return zmq_socket_ctx(
-        addr, socket_type, bind=(socket_type == zmq.ROUTER)
-    )
+    return zmq_socket_ctx(addr, socket_type, bind=(socket_type == zmq.ROUTER))

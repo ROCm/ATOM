@@ -413,13 +413,17 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
         if _global_kvconnector is None:
             from atom.mesh.disaggregation import KVConnectorFactory
 
-            _global_kvconnector = KVConnectorFactory.create_connector(config, role="worker")
+            _global_kvconnector = KVConnectorFactory.create_connector(
+                config, role="worker"
+            )
             _logger.debug("Initialized global KVConnector at tp_rank %d", tp_rank)
 
     elif role == "scheduler":
         from atom.mesh.disaggregation import KVConnectorFactory
 
-        _global_kvconnector_scheduler = KVConnectorFactory.create_connector(config, role="scheduler")
+        _global_kvconnector_scheduler = KVConnectorFactory.create_connector(
+            config, role="scheduler"
+        )
         _logger.debug("Initialized global KVConnectorScheduler")
         return _global_kvconnector_scheduler
 

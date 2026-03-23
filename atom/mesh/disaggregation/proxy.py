@@ -185,9 +185,7 @@ async def send_request_to_prefill(
         ) as response:
             if response.status == 200:
                 return await response.json()
-            raise RuntimeError(
-                f"Prefill request failed with status {response.status}"
-            )
+            raise RuntimeError(f"Prefill request failed with status {response.status}")
 
 
 async def start_decode_request(
@@ -258,10 +256,12 @@ async def handle_request():
         request_id = str(uuid.uuid4())
 
         if not prefill_instances or not decode_instances:
-            return await make_response((
-                "Service Unavailable: no prefill or decode instances registered.",
-                503,
-            ))
+            return await make_response(
+                (
+                    "Service Unavailable: no prefill or decode instances registered.",
+                    503,
+                )
+            )
 
         # Round-robin instance selection
         pid = request_nums % len(prefill_instances)
@@ -372,7 +372,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Atom P/D Disaggregation Proxy")
-    parser.add_argument("--port", type=int, default=10001, help="HTTP port (default: 10001)")
+    parser.add_argument(
+        "--port", type=int, default=10001, help="HTTP port (default: 10001)"
+    )
     args = parser.parse_args()
 
     main(port=args.port)

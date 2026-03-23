@@ -120,7 +120,9 @@ class EngineCore:
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         if self.kv_transfer_enabled:
-            self.kv_aggregator = KVOutputAggregator(world_size=config.tensor_parallel_size)
+            self.kv_aggregator = KVOutputAggregator(
+                world_size=config.tensor_parallel_size
+            )
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
@@ -187,7 +189,10 @@ class EngineCore:
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
-        if self.kv_transfer_enabled and scheduled_batch.connector_meta_output is not None:
+        if (
+            self.kv_transfer_enabled
+            and scheduled_batch.connector_meta_output is not None
+        ):
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
             )
@@ -201,7 +206,9 @@ class EngineCore:
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         if self.kv_transfer_enabled:
-            kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+            kvoutput = self.runner_mgr.call_func_with_aggregation(
+                "async_proc_aggregation"
+            )
             self.scheduler._update_from_kv_xfer_finished(kvoutput)
 
         if not has_seqs:

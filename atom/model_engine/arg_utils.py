@@ -48,7 +48,6 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     mark_trace: bool = False
 
-
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         """Add engine arguments to an argument parser."""
@@ -166,14 +165,14 @@ class EngineArgs:
             default=0.9,
             help="GPU memory utilization (0.0 to 1.0)",
         )
-        
-        parser.add_argument(  
-            "--kv-transfer-config",  
-            type=str,  
-            default="{}",  
-            help="KV transfer config as JSON string.",  
-        )  
-        
+
+        parser.add_argument(
+            "--kv-transfer-config",
+            type=str,
+            default="{}",
+            help="KV transfer config as JSON string.",
+        )
+
         parser.add_argument(
             "--scheduler-delay-factor",
             type=float,

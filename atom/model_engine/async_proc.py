@@ -171,7 +171,10 @@ class AsyncIOProc:
                     continue
                 out = func(*args)
                 if out is not None:
-                    if self.io_addrs[1] is not None and func_name not in self._KV_FUNC_NAMES:
+                    if (
+                        self.io_addrs[1] is not None
+                        and func_name not in self._KV_FUNC_NAMES
+                    ):
                         self.io_queues[1].put_nowait(out)
                     if self.kv_queue is not None and func_name in self._KV_FUNC_NAMES:
                         self.kv_queue.put_nowait(out)
@@ -357,9 +360,7 @@ class AsyncIOProcManager:
                 raise ret
             return ret
 
-    def call_func_with_aggregation(
-        self, func_name: str, *args, timeout: float = 10.0
-    ):
+    def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
         """RPC call with KV output aggregation across all workers.
 
         Broadcasts the function call to all workers, collects their
@@ -373,13 +374,9 @@ class AsyncIOProcManager:
             Aggregated :class:`KVConnectorOutput`, or ``None`` on timeout.
         """
         if self.kv_output_aggregator is None:
-            self.kv_output_aggregator = KVOutputAggregator(
-                world_size=self.proc_num
-            )
+            self.kv_output_aggregator = KVOutputAggregator(world_size=self.proc_num)
 
-        logger.debug(
-            f"{self.label}: call_func_with_aggregation {func_name} {args}"
-        )
+        logger.debug(f"{self.label}: call_func_with_aggregation {func_name} {args}")
         msg = (func_name, *args)
         self.rpc_broadcast_mq.enqueue(msg)
 
@@ -398,9 +395,7 @@ class AsyncIOProcManager:
         if not worker_outputs:
             return None
 
-        kv_output = self.kv_output_aggregator.aggregate(
-            worker_outputs=worker_outputs
-        )
+        kv_output = self.kv_output_aggregator.aggregate(worker_outputs=worker_outputs)
         logger.debug(f"Aggregated KV output: {kv_output}")
         return kv_output
 

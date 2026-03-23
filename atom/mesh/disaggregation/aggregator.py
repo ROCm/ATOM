@@ -55,9 +55,7 @@ class KVOutputAggregator:
     def world_size(self) -> int:
         return self._world_size
 
-    def aggregate(
-        self, worker_outputs: list[KVConnectorOutput]
-    ) -> KVConnectorOutput:
+    def aggregate(self, worker_outputs: list[KVConnectorOutput]) -> KVConnectorOutput:
         """Aggregate per-worker outputs and return globally completed request IDs.
 
         Args:
@@ -97,12 +95,8 @@ class KVOutputAggregator:
                     if rid in self._remaining_recving:
                         self._remaining_recving[rid] -= 1
 
-        done_sending = {
-            rid for rid, cnt in self._remaining_sending.items() if cnt <= 0
-        }
-        done_recving = {
-            rid for rid, cnt in self._remaining_recving.items() if cnt <= 0
-        }
+        done_sending = {rid for rid, cnt in self._remaining_sending.items() if cnt <= 0}
+        done_recving = {rid for rid, cnt in self._remaining_recving.items() if cnt <= 0}
 
         for rid in done_sending:
             del self._remaining_sending[rid]

@@ -882,7 +882,6 @@ class Config:
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
 
-
         if self.speculative_config is not None:
             if self.speculative_config.num_speculative_tokens > 4:
                 raise ValueError(

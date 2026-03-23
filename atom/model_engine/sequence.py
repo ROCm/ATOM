@@ -79,11 +79,10 @@ class Sequence:
         self.first_token_time = 0.0
         self.leave_time = 0.0
         self.leave_reason = ""
-        
+
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
-
 
         # accepted tokens for spec decode
         self.num_bonus_tokens = 0

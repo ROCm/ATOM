@@ -464,7 +464,6 @@ async def generate_async(
         else 0.0
     )
 
-
     logger.debug("Request %s completed, finish_reason=%s", seq.id, finish_reason)
     response = {
         "text": text,
@@ -854,9 +853,7 @@ async def completions(request: CompletionRequest):
         if "kv_transfer_output_meta_info" in final_output:
             response_data = response_data.model_copy(
                 update={
-                    "kv_transfer_params": final_output[
-                        "kv_transfer_output_meta_info"
-                    ]
+                    "kv_transfer_params": final_output["kv_transfer_output_meta_info"]
                 }
             )
 

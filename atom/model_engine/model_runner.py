@@ -63,6 +63,7 @@ support_model_arch_dict = {
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
 }
 
+
 class tokenIDProcessor:
 
     def __init__(
@@ -1544,7 +1545,12 @@ class ModelRunner:
         positions = context.positions
 
         graph_bs = context.graph_bs
-        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1] or graph_bs > self.graph_bs[-1]:
+        if (
+            is_prefill
+            or self.enforce_eager
+            or bs > self.graph_bs[-1]
+            or graph_bs > self.graph_bs[-1]
+        ):
             # prefill[bs=1 tok=115 ctx=115]
             label = f"prefill[bs={bs}"
             if batch is not None:

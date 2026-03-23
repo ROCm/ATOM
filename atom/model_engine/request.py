@@ -14,4 +14,3 @@ class RequestOutput:
     finished: bool
     finish_reason: Optional[str] = None
     kv_transfer_params_output: Optional[Dict[str, Any]] = None
-
