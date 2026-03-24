@@ -273,21 +273,26 @@
 const MODEL_HUES = {
   'DeepSeek-R1-0528':      210,   // blue
   'DeepSeek-R1-0528-mtp3': 175,   // cyan/teal — distinct from base DeepSeek
+  'DeepSeek-R1-0528-MXFP4': 190,  // teal
   'GLM-5-FP8':             140,   // green
   'gpt-oss-120b':          15,    // orange
+  'Kimi-K2-Thinking-MXFP4': 320,  // magenta
   'Meta-Llama-3-8B-Instruct': 270, // purple
+  'Qwen3-235B-A22B-Instruct-2507-FP8': 50, // gold
 };
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
-function getModelHue(model) {
+function getModelHue(backend, model) {
+  const backendModelKey = backend ? `${backend}::${model}` : model;
+  if (MODEL_HUES[backendModelKey] != null) return MODEL_HUES[backendModelKey];
   if (MODEL_HUES[model] != null) return MODEL_HUES[model];
   const h = FALLBACK_HUES[fallbackHueIdx % FALLBACK_HUES.length];
-  MODEL_HUES[model] = h;
+  MODEL_HUES[backendModelKey] = h;
   fallbackHueIdx++;
   return h;
 }
-function getModelColor(model) {
-  const h = getModelHue(model);
+function getModelColor(backend, model) {
+  const h = getModelHue(backend, model);
   return {
     border: `hsl(${h}, 55%, 65%)`,
     bg:     `hsla(${h}, 55%, 65%, 0.12)`,
@@ -295,8 +300,8 @@ function getModelColor(model) {
   };
 }
 // Bar color: lower saturation, higher lightness for a soft pastel look
-function getBarColor(model, conc, concList) {
-  const h = getModelHue(model);
+function getBarColor(backend, model, conc, concList) {
+  const h = getModelHue(backend, model);
   const sorted = [...concList].sort((a, b) => a - b);
   const rank = sorted.indexOf(conc);
   const alpha = concList.length <= 1 ? 0.55 : 0.3 + (rank / (sorted.length - 1)) * 0.35;
@@ -376,10 +381,18 @@ const REGRESSION_THRESHOLD = 0.05; // 5%
 const rawData = window.BENCHMARK_DATA;
 
 function parseBenchName(name) {
-  let m = name.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
-  if (m) return { model: m[1], islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
-  m = name.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count)$/);
-  if (m) return { model: m[1], islOsl: m[2], conc: +m[3], metric: '_gpu_count', unit: '' };
+  let backend = 'ATOM';
+  let rawName = name;
+  const backendMatch = name.match(/^([^:]+)::(.+)$/);
+  if (backendMatch) {
+    backend = backendMatch[1];
+    rawName = backendMatch[2];
+  }
+  if (backend === 'OOT') backend = 'ATOM-vLLM';
+  let m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
+  if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
+  m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count)$/);
+  if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: '_gpu_count', unit: '' };
   return null;
 }
 
@@ -388,12 +401,12 @@ const allRuns = Object.values(rawData.entries).flat().sort((a, b) => b.date - a.
 
 // For each run, parse benches into structured configs
 function parseRunConfigs(run) {
-  const configs = {}; // key: "model|isl/osl|conc"
+  const configs = {}; // key: "backend|model|isl/osl|conc"
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
     if (!p || p.islOsl === '0/0') continue;
-    const key = `${p.model}|${p.islOsl}|${p.conc}`;
-    if (!configs[key]) configs[key] = { model: p.model, islOsl: p.islOsl, conc: p.conc, commit: run.commit, date: run.date, runUrl: '' };
+    const key = `${p.backend}|${p.model}|${p.islOsl}|${p.conc}`;
+    if (!configs[key]) configs[key] = { backend: p.backend, model: p.model, islOsl: p.islOsl, conc: p.conc, commit: run.commit, date: run.date, runUrl: '' };
     configs[key][p.metric] = b.value;
     if (b.extra) {
       configs[key]._extra = b.extra;
@@ -441,9 +454,11 @@ function detectRegressions() {
 const regressions = detectRegressions();
 
 // Extract unique filter values from ALL runs (not just latest) so historical models are always visible
-const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[0]))].sort();
-const allIslOsl = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))].sort();
-const allConc = [...new Set(Object.keys(historyMap).map(k => +k.split('|')[2]))].sort((a, b) => a - b);
+const allBackends = [...new Set(Object.keys(historyMap).map(k => k.split('|')[0]))].sort();
+const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))].sort();
+const allIslOsl = [...new Set(Object.keys(historyMap).map(k => k.split('|')[2]))].sort();
+const allConc = [...new Set(Object.keys(historyMap).map(k => +k.split('|')[3]))].sort((a, b) => a - b);
+const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort();
 
 /* ================================================================
    3. STATE
@@ -455,16 +470,17 @@ const PERF_METRICS = [
   { key: 'TTFT',        label: 'TTFT',              unit: 'ms',    lower: true },
 ];
 const state = {
-  filters: { models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc] },
+  filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc] },
   activeTab: 'performance',
   perfMetric: 'Total Tput',
-  trendModel: allModels[0] || '',
+  trendModelKey: allTrendModelKeys[0] || '',
   dataView: 'table',
 };
 
 function filteredConfigs() {
   const out = {};
   for (const [key, cfg] of Object.entries(latestConfigs)) {
+    if (!state.filters.backends.includes(cfg.backend)) continue;
     if (!state.filters.models.includes(cfg.model)) continue;
     if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
     if (!state.filters.conc.includes(cfg.conc)) continue;
@@ -578,6 +594,7 @@ document.getElementById('dl-btn').onclick = () => {
    6. FILTERS
    ================================================================ */
 const filterDefs = [
+  { id: 'backends', label: 'Backend', options: allBackends },
   { id: 'models', label: 'Model', options: allModels },
   { id: 'islOsl', label: 'ISL/OSL', options: allIslOsl },
   { id: 'conc', label: 'Concurrency', options: allConc.map(String) },
@@ -618,6 +635,7 @@ function renderFilters() {
   resetBtn.className = 'filter-reset';
   resetBtn.textContent = 'Reset';
   resetBtn.addEventListener('click', () => {
+    state.filters.backends = [...allBackends];
     state.filters.models = [...allModels];
     state.filters.islOsl = [...allIslOsl];
     state.filters.conc = [...allConc];
@@ -701,11 +719,13 @@ function renderKPICards() {
   }
 
   const models = new Set(entries.map(([, c]) => c.model));
+  const backends = new Set(entries.map(([, c]) => c.backend));
   const gpuCounts = [...new Set(entries.map(([, c]) => c._gpu_count).filter(Boolean))];
   const gpuLabel = gpuCounts.length === 1 ? gpuCounts[0] + '× GPU' : gpuCounts.length ? gpuCounts.join('/') + '× GPU' : '';
   const regCount = Object.keys(regressions).filter(k => {
     const c = latestConfigs[k];
-    return c && state.filters.models.includes(c.model) &&
+    return c && state.filters.backends.includes(c.backend) &&
+      state.filters.models.includes(c.model) &&
       state.filters.islOsl.includes(c.islOsl) && state.filters.conc.includes(c.conc);
   }).length;
 
@@ -725,7 +745,7 @@ function renderKPICards() {
     <div class="kpi-card">
       <div class="kpi-label">Test Matrix</div>
       <div class="kpi-value">${models.size} <span class="kpi-unit">models</span></div>
-      <div class="kpi-sub">${entries.length} configs${gpuLabel ? ' · ' + gpuLabel : ''}</div>
+      <div class="kpi-sub">${entries.length} configs · ${backends.size} modes${gpuLabel ? ' · ' + gpuLabel : ''}</div>
     </div>
     <div class="kpi-card ${regCount > 0 ? 'alert clickable' : 'ok'}" id="kpi-reg" ${regCount > 0 ? 'title="Click to view regressions"' : ''}>
       <div class="kpi-label">Regressions</div>
@@ -791,10 +811,10 @@ function renderPerformanceTab() {
   const container = document.getElementById('tab-performance');
   destroyChartsIn(container);
   const fc = filteredConfigs();
-  // Sort by model → ISL/OSL → concurrency for grouped readability
+  // Sort by backend → model → ISL/OSL → concurrency for grouped readability
   const entries = Object.entries(fc).sort((a, b) => {
     const am = a[1], bm = b[1];
-    return am.model.localeCompare(bm.model) || am.islOsl.localeCompare(bm.islOsl) || am.conc - bm.conc;
+    return am.backend.localeCompare(bm.backend) || am.model.localeCompare(bm.model) || am.islOsl.localeCompare(bm.islOsl) || am.conc - bm.conc;
   });
 
   if (entries.length === 0) {
@@ -808,11 +828,17 @@ function renderPerformanceTab() {
     `<button class="sel-btn ${m.key === state.perfMetric ? 'active' : ''}" data-metric="${m.key}">${m.label}</button>`
   ).join('');
 
-  // Group entries by model
+  // Group entries by backend + model so native/OOT stay distinct
   const byModel = {};
   for (const [key, cfg] of entries) {
-    if (!byModel[cfg.model]) byModel[cfg.model] = [];
-    byModel[cfg.model].push([key, cfg]);
+    const groupKey = `${cfg.backend}|${cfg.model}`;
+    if (!byModel[groupKey]) {
+      const group = [];
+      group._backend = cfg.backend;
+      group._model = cfg.model;
+      byModel[groupKey] = group;
+    }
+    byModel[groupKey].push([key, cfg]);
   }
 
   let html = `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:var(--gap-md)">
@@ -821,30 +847,32 @@ function renderPerformanceTab() {
   </div><div class="chart-grid">`;
 
   let chartIdx = 0;
-  for (const [model, modelEntries] of Object.entries(byModel)) {
-    const color = getModelColor(model);
+  for (const [groupKey, modelEntries] of Object.entries(byModel)) {
+    const backend = modelEntries._backend;
+    const model = modelEntries._model;
+    const color = getModelColor(backend, model);
     const concList = [...new Set(modelEntries.map(([, c]) => c.conc))];
     const sortedEntries = modelEntries.sort((a, b) => a[1].islOsl.localeCompare(b[1].islOsl) || a[1].conc - b[1].conc);
     const mLabels = sortedEntries.map(([, c]) => `${fmtIslOsl(c.islOsl)} c=${c.conc}`);
     const mValues = sortedEntries.map(([, c]) => c[pm.key] || 0);
-    const mBgColors = sortedEntries.map(([, c]) => getBarColor(model, c.conc, concList));
+    const mBgColors = sortedEntries.map(([, c]) => getBarColor(backend, model, c.conc, concList));
     const mBdColors = sortedEntries.map(([k]) => regressions[k] ? 'rgba(240,85,69,0.8)' : color.border);
     const mBdWidths = sortedEntries.map(([k]) => regressions[k] ? 2.5 : 1.5);
     const avgVal = mValues.length ? mValues.reduce((a, b) => a + b, 0) / mValues.length : null;
 
     html += `<div class="chart-card${Object.keys(byModel).length <= 2 ? ' hero' : ''}">
-      <h3 style="color:${color.text}">${model}</h3>
+      <h3 style="color:${color.text}">${backend} · ${model}</h3>
       <div class="chart-wrap"><canvas id="perf-bar-${chartIdx}"></canvas></div>
     </div>`;
     // Store data for chart creation after innerHTML
-    byModel[model]._chartData = { id: `perf-bar-${chartIdx}`, labels: mLabels, values: mValues, bgColors: mBgColors, bdColors: mBdColors, bdWidths: mBdWidths, avgVal, sortedEntries };
+    byModel[groupKey]._chartData = { id: `perf-bar-${chartIdx}`, labels: mLabels, values: mValues, bgColors: mBgColors, bdColors: mBdColors, bdWidths: mBdWidths, avgVal, sortedEntries };
     chartIdx++;
   }
   html += '</div>';
 
   // --- Table ---
   html += `<div class="table-watermark"><table class="perf-table"><thead><tr>
-    <th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th>
+    <th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th>
     <th class="num">Total Tput (tok/s)</th><th class="num">Output Tput (tok/s)</th>
     <th class="num">Interac.</th>
     <th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th>
@@ -868,8 +896,9 @@ function renderPerformanceTab() {
     const tpotRatio = cfg.TPOT != null ? (cfg.TPOT - tpotMin) / (tpotMax - tpotMin || 1) : 0;
     const ttftRatio = cfg.TTFT != null ? (cfg.TTFT - ttftMin) / (ttftMax - ttftMin || 1) : 0;
 
-    const modelTextColor = getModelColor(cfg.model).text;
+    const modelTextColor = getModelColor(cfg.backend, cfg.model).text;
     html += `<tr class="${reg ? 'regression' : ''}" data-key="${key}">
+      <td>${cfg.backend}</td>
       <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${cfg.model}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
@@ -879,12 +908,12 @@ function renderPerformanceTab() {
       <td class="num">${cfg.TPOT != null && cfg.TPOT > 0 ? fmtNum(1000 / cfg.TPOT, 1) : '—'}</td>
       <td class="num" style="background:${heatBg(tpotRatio)}">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
       <td class="num" style="background:${heatBg(ttftRatio)}">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
-      <td class="num">${trendHTML(cfg.throughput, prev ? prev.throughput : null, false)} <button class="trend-jump" data-model="${cfg.model}" title="View trends">trend →</button></td>
+      <td class="num">${trendHTML(cfg.throughput, prev ? prev.throughput : null, false)} <button class="trend-jump" data-trend-key="${cfg.backend}|${cfg.model}" title="View trends">trend →</button></td>
       <td><a href="${cfg.commit.url || '#'}" target="_blank">${commitId}</a></td>
       <td>${cfg.runUrl ? '<a href="' + cfg.runUrl + '" target="_blank">view</a>' : '—'}</td>
     </tr>`;
     // Detail row
-    html += `<tr class="detail-row" data-detail="${key}"><td colspan="12">${buildDetailHTML(key, cfg)}</td></tr>`;
+    html += `<tr class="detail-row" data-detail="${key}"><td colspan="13">${buildDetailHTML(key, cfg)}</td></tr>`;
   }
   html += '</tbody></table></div>';
 
@@ -949,7 +978,7 @@ function _bindPerfTableEvents(container, byModel) {
   container.querySelectorAll('.trend-jump').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      switchToTrends(btn.dataset.model);
+      switchToTrends(btn.dataset.trendKey);
     });
   });
   container.querySelectorAll('.sel-btn[data-metric]').forEach(btn => {
@@ -960,8 +989,8 @@ function _bindPerfTableEvents(container, byModel) {
   });
 }
 
-function switchToTrends(model) {
-  state.trendModel = model;
+function switchToTrends(trendModelKey) {
+  state.trendModelKey = trendModelKey;
   state.activeTab = 'trends';
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'trends'));
   document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-trends'));
@@ -1005,11 +1034,11 @@ function renderTradeoffTab() {
   const entries = Object.entries(fc);
   if (entries.length === 0) { container.innerHTML = '<div class="chart-empty">No data matches the current filters.</div>'; return; }
 
-  // Group by model+ISL/OSL for scatter series
+  // Group by backend+model+ISL/OSL for scatter series
   const seriesMap = {};
   for (const [key, cfg] of entries) {
-    const sKey = `${cfg.model} ${cfg.islOsl}`;
-    if (!seriesMap[sKey]) seriesMap[sKey] = { model: cfg.model, points: [], concLabels: [], configKeys: [] };
+    const sKey = `${cfg.backend} · ${cfg.model} ${cfg.islOsl}`;
+    if (!seriesMap[sKey]) seriesMap[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, points: [], concLabels: [], configKeys: [] };
     const tpot = cfg.TPOT;
     const totalTput = cfg['Total Tput'];
     const gpuCount = cfg._gpu_count || 8;
@@ -1055,9 +1084,9 @@ function renderTradeoffTab() {
     for (const [sKey, s] of Object.entries(seriesMap)) {
       if (!famModels.includes(s.model) || s.points.length === 0) continue;
       const indices = s.points.map((_, i) => i).sort((a, b) => s.points[a].x - s.points[b].x);
-      const color = getModelColor(s.model);
+      const color = getModelColor(s.backend, s.model);
       heroDS.push({
-        label: modelVariant(s.model) + ' ' + fmtIslOsl(sKey.split(' ').slice(1).join(' ')), data: indices.map(i => s.points[i]),
+        label: `${s.backend} · ${modelVariant(s.model)} ${fmtIslOsl(s.islOsl)}`, data: indices.map(i => s.points[i]),
         borderColor: color.border, backgroundColor: color.bg,
         borderWidth: 2, pointRadius: 5, pointHoverRadius: 7, showLine: true, fill: false,
         _concLabels: indices.map(i => s.concLabels[i]), _configKeys: indices.map(i => s.configKeys[i])
@@ -1127,8 +1156,8 @@ function renderTradeoffTab() {
 function buildSimpleScatter(canvasId, configs, xMetric, yMetric, xLabel, yLabel) {
   const seriesMap = {};
   for (const [key, cfg] of Object.entries(configs)) {
-    const sKey = `${cfg.model} ${cfg.islOsl}`;
-    if (!seriesMap[sKey]) seriesMap[sKey] = { model: cfg.model, points: [], concLabels: [], configKeys: [] };
+    const sKey = `${cfg.backend} · ${cfg.model} ${cfg.islOsl}`;
+    if (!seriesMap[sKey]) seriesMap[sKey] = { backend: cfg.backend, model: cfg.model, points: [], concLabels: [], configKeys: [] };
     if (cfg[xMetric] != null && cfg[yMetric] != null) {
       seriesMap[sKey].points.push({ x: cfg[xMetric], y: cfg[yMetric] });
       seriesMap[sKey].concLabels.push(cfg.conc);
@@ -1140,7 +1169,7 @@ function buildSimpleScatter(canvasId, configs, xMetric, yMetric, xLabel, yLabel)
     if (!s.points.length) continue;
     // Sort by x so lines don't zigzag
     const indices = s.points.map((_, i) => i).sort((a, b) => s.points[a].x - s.points[b].x);
-    const color = getModelColor(s.model);
+    const color = getModelColor(s.backend, s.model);
     datasets.push({ label: sKey, data: indices.map(i => s.points[i]), borderColor: color.border, backgroundColor: color.bg, borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, showLine: true, fill: false, _concLabels: indices.map(i => s.concLabels[i]), _configKeys: indices.map(i => s.configKeys[i]) });
   }
   if (!datasets.length) return;
@@ -1179,8 +1208,8 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
   if (!famModels) famModels = [familyName];
   const byKey = {}; // key: "model|islOsl"
   for (const [key, cfg] of Object.entries(configs)) {
-    const sKey = `${cfg.model}|${cfg.islOsl}`;
-    if (!byKey[sKey]) byKey[sKey] = { model: cfg.model, islOsl: cfg.islOsl, tputPoints: [], tpotPoints: [], tputKeys: [], tpotKeys: [] };
+    const sKey = `${cfg.backend}|${cfg.model}|${cfg.islOsl}`;
+    if (!byKey[sKey]) byKey[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, tputPoints: [], tpotPoints: [], tputKeys: [], tpotKeys: [] };
     if (cfg.throughput != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg.throughput }); byKey[sKey].tputKeys.push(key); }
     if (cfg.TPOT != null) { byKey[sKey].tpotPoints.push({ x: cfg.conc, y: cfg.TPOT }); byKey[sKey].tpotKeys.push(key); }
   }
@@ -1192,8 +1221,11 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
   for (let i = 0; i < seriesKeys.length; i++) {
     const s = byKey[seriesKeys[i]];
     const dash = dashPatterns[i % dashPatterns.length];
-    const h = getModelHue(s.model);
-    const variantLabel = famModels.length > 1 ? `${modelVariant(s.model)} ${fmtIslOsl(s.islOsl)}` : fmtIslOsl(s.islOsl);
+    const h = getModelHue(s.backend, s.model);
+    const variantBits = [s.backend];
+    if (famModels.length > 1) variantBits.push(modelVariant(s.model));
+    variantBits.push(fmtIslOsl(s.islOsl));
+    const variantLabel = variantBits.join(' ');
     // Throughput: use model color
     if (s.tputPoints.length) {
       const sorted = s.tputPoints.map((_, j) => j).sort((a, b) => s.tputPoints[a].x - s.tputPoints[b].x);
@@ -1280,16 +1312,20 @@ function renderTrendsTab() {
   const container = document.getElementById('tab-trends');
   destroyChartsIn(container);
 
-  // Model selector — only shows models from global filter, matches filter-btn style
-  const models = state.filters.models.slice().sort();
-  if (!models.includes(state.trendModel)) state.trendModel = models[0] || '';
+  // Mode+model selector — keeps native and ATOM-vLLM trend lines distinct
+  const trendOptions = [...new Set(Object.values(latestConfigs)
+    .filter(cfg => state.filters.backends.includes(cfg.backend) && state.filters.models.includes(cfg.model))
+    .map(cfg => `${cfg.backend}|${cfg.model}`))]
+    .sort();
+  if (!trendOptions.includes(state.trendModelKey)) state.trendModelKey = trendOptions[0] || '';
 
   let html = '';
-  // Only show selector when there are multiple models to choose from
-  if (models.length > 1) {
+  // Only show selector when there are multiple mode/model pairs to choose from
+  if (trendOptions.length > 1) {
     html += '<div class="model-selector"><span class="sel-label">Model:</span>';
-    for (const m of models) {
-      html += `<button class="sel-btn ${m === state.trendModel ? 'active' : ''}" data-model="${m}">${m}</button>`;
+    for (const trendKey of trendOptions) {
+      const [backend, model] = trendKey.split('|');
+      html += `<button class="sel-btn ${trendKey === state.trendModelKey ? 'active' : ''}" data-trend-key="${trendKey}">${backend} · ${model}</button>`;
     }
     html += '</div>';
   }
@@ -1298,12 +1334,13 @@ function renderTrendsTab() {
 
   container.querySelectorAll('.sel-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      state.trendModel = btn.dataset.model;
+      state.trendModelKey = btn.dataset.trendKey;
       renderTrendsTab();
     });
   });
 
-  if (!state.trendModel) return;
+  if (!state.trendModelKey) return;
+  const [trendBackend, trendModel] = state.trendModelKey.split('|');
 
   // Build ordered x-axis: use date as primary key (not commit ID)
   // Each run gets a unique index; x-axis shows short date labels
@@ -1334,7 +1371,7 @@ function renderTrendsTab() {
   for (const met of metrics) {
     const card = document.createElement('div');
     card.className = 'chart-card';
-    card.innerHTML = `<h3>${state.trendModel} — ${met.title}</h3>`;
+    card.innerHTML = `<h3>${trendBackend} · ${trendModel} — ${met.title}</h3>`;
     const wrap = document.createElement('div');
     wrap.className = 'chart-wrap';
     const canvas = document.createElement('canvas');
@@ -1345,16 +1382,13 @@ function renderTrendsTab() {
     // Find all configs for this model
     const datasets = [];
     for (const [key, history] of Object.entries(historyMap)) {
-      if (!key.startsWith(state.trendModel + '|')) continue;
+      if (!key.startsWith(state.trendModelKey + '|')) continue;
       const parts = key.split('|');
       // Respect global ISL/OSL and Concurrency filters
-      if (!state.filters.islOsl.includes(parts[1])) continue;
-      if (!state.filters.conc.includes(+parts[2])) continue;
-      const seriesLabel = fmtIslOsl(parts[1]) + ' c=' + parts[2];
-      const color = getModelColor(state.trendModel);
-      // Use hue variation for different configs of same model
-      const hueShift = (parseInt(parts[2]) * 37) % 60 - 30;
-      const baseHue = parseInt(color.border.match(/\d+/)?.[0] || '200');
+      if (!state.filters.islOsl.includes(parts[2])) continue;
+      if (!state.filters.conc.includes(+parts[3])) continue;
+      const seriesLabel = fmtIslOsl(parts[2]) + ' c=' + parts[3];
+      const color = getModelColor(trendBackend, trendModel);
 
       const pointMap = {};
       for (const pt of history) {
@@ -1370,7 +1404,7 @@ function renderTrendsTab() {
         label: seriesLabel, data,
         borderColor: color.border, backgroundColor: color.bg,
         borderWidth: 2, pointRadius: 3, pointHoverRadius: 5, fill: false, spanGaps: true, tension: 0.1,
-        _configKey: key, _pointMap: pointMap, _conc: parts[2]
+        _configKey: key, _pointMap: pointMap, _conc: parts[3]
       });
     }
 
@@ -1381,7 +1415,7 @@ function renderTrendsTab() {
     });
 
     if (datasets.length === 0) {
-      card.innerHTML += '<div class="chart-empty">No historical data for this model and metric.</div>';
+      card.innerHTML += '<div class="chart-empty">No historical data for this mode/model and metric.</div>';
       continue;
     }
     if (datasets.length > 8) {
@@ -1494,15 +1528,16 @@ function renderDataTab() {
   const csvBtn = document.getElementById('copy-csv-btn');
   if (csvBtn) {
     csvBtn.addEventListener('click', () => {
-      const header = 'Date,Commit,Model,ISL/OSL,Concurrency,TP,Throughput (tok/s),TPOT (ms),TTFT (ms),Run URL';
+      const header = 'Date,Commit,Mode,Model,ISL/OSL,Concurrency,TP,Throughput (tok/s),TPOT (ms),TTFT (ms),Run URL';
       const rows = [];
       for (const run of allRuns) {
         const configs = parseRunConfigs(run);
         for (const [, cfg] of Object.entries(configs)) {
+          if (!state.filters.backends.includes(cfg.backend)) continue;
           if (!state.filters.models.includes(cfg.model)) continue;
           if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
           if (!state.filters.conc.includes(cfg.conc)) continue;
-          rows.push([fmtDate(cfg.date), cfg.commit.id?.slice(0,7), cfg.model, cfg.islOsl, cfg.conc,
+          rows.push([fmtDate(cfg.date), cfg.commit.id?.slice(0,7), cfg.backend, cfg.model, cfg.islOsl, cfg.conc,
             cfg._gpu_count ?? '', cfg.throughput ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
         }
       }
@@ -1540,7 +1575,7 @@ function renderDataTab() {
 
 function renderDataTable() {
   let html = `<div class="table-watermark"><table class="perf-table"><thead><tr>
-    <th>Date</th><th>Commit</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th>
+    <th>Date</th><th>Commit</th><th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th>
     <th class="num">Throughput (tok/s)</th><th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th><th>Run</th>
   </tr></thead><tbody>`;
 
@@ -1548,6 +1583,7 @@ function renderDataTable() {
   for (const run of allRuns) {
     const configs = parseRunConfigs(run);
     for (const [key, cfg] of Object.entries(configs)) {
+      if (!state.filters.backends.includes(cfg.backend)) continue;
       if (!state.filters.models.includes(cfg.model)) continue;
       if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
       if (!state.filters.conc.includes(cfg.conc)) continue;
@@ -1555,7 +1591,8 @@ function renderDataTable() {
       html += `<tr data-key="data-${key}-${run.date}">
         <td>${fmtDate(cfg.date)}</td>
         <td><a href="${cfg.commit.url || '#'}" target="_blank">${commitId}</a></td>
-        <td class="model-name" style="color:${getModelColor(cfg.model).text}">${cfg.model}</td>
+        <td>${cfg.backend}</td>
+        <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${cfg.model}</td>
         <td>${fmtIslOsl(cfg.islOsl)}</td>
         <td class="num">${cfg.conc}</td>
         <td class="num">${cfg._gpu_count || '—'}</td>
@@ -1564,7 +1601,7 @@ function renderDataTable() {
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
         <td>${cfg.runUrl ? '<a href="' + cfg.runUrl + '" target="_blank">view</a>' : '—'}</td>
       </tr>`;
-      html += `<tr class="detail-row" data-detail="data-${key}-${run.date}"><td colspan="10">${buildDetailHTML(key, cfg)}</td></tr>`;
+      html += `<tr class="detail-row" data-detail="data-${key}-${run.date}"><td colspan="11">${buildDetailHTML(key, cfg)}</td></tr>`;
     }
   }
   html += '</tbody></table></div>';
@@ -1577,11 +1614,13 @@ function renderTimeline() {
     const configs = parseRunConfigs(run);
     // Apply global filters to timeline entries
     const entries = Object.entries(configs).filter(([, c]) =>
+      state.filters.backends.includes(c.backend) &&
       state.filters.models.includes(c.model) &&
       state.filters.islOsl.includes(c.islOsl) &&
       state.filters.conc.includes(c.conc));
     if (entries.length === 0) continue;
     const commitId = run.commit.id.slice(0, 7);
+    const backends = [...new Set(entries.map(([, c]) => c.backend))];
     const models = [...new Set(entries.map(([, c]) => c.model))];
     const runRegCount = entries.filter(([k]) => regressions[k]).length;
     const hasReg = runRegCount > 0;
@@ -1592,6 +1631,7 @@ function renderTimeline() {
         <span class="commit-id"><a href="${run.commit.url || '#'}" target="_blank">${commitId}</a></span>
         <span class="date">${fmtDate(run.date)}</span>
         <span class="badge">${entries.length} configs</span>
+        <span class="badge">${backends.join(', ')}</span>
         <span class="badge">${models.join(', ')}</span>
         ${hasReg ? `<span class="badge warn">⚠ ${runRegCount} regressions</span>` : ''}
         ${runUrl ? `<a href="${runUrl}" target="_blank" style="font-size:12px">Open CI Run ↗</a>` : ''}
@@ -1600,12 +1640,12 @@ function renderTimeline() {
       <button class="tl-toggle">Show Details</button>
       <div class="tl-details">
         <table class="perf-table" style="margin-top:8px"><thead><tr>
-          <th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th>
+          <th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th>
           <th class="num">Throughput (tok/s)</th><th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th>
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td class="model-name" style="color:${getModelColor(cfg.model).text}">${cfg.model}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td>
+        <td>${cfg.backend}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${cfg.model}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td>
         <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
@@ -1645,6 +1685,7 @@ function buildDetailHTML(key, cfg) {
     </div>
     <div class="detail-section">
       <h4>Commit</h4>
+      <div class="detail-item"><span class="detail-key">Mode</span><span class="detail-val" style="font-family:inherit">${cfg.backend}</span></div>
       <div class="detail-item"><span class="detail-key">ID</span><span class="detail-val"><a href="${cfg.commit.url || '#'}" target="_blank">${cfg.commit.id?.slice(0, 7) || '—'}</a></span></div>
       <div class="detail-item"><span class="detail-key">Message</span><span class="detail-val" style="font-family:inherit;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(cfg.commit.message || '').replace(/"/g, '&quot;')}">${cfg.commit.message?.split('\n')[0] || '—'}</span></div>
       <div class="detail-item"><span class="detail-key">Author</span><span class="detail-val" style="font-family:inherit">${cfg.commit.author?.name || '—'}</span></div>
@@ -1674,6 +1715,7 @@ function showPopover(key, cfg) {
     <div class="pop-row"><span class="pop-key">TTFT</span><span class="pop-val">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) + ' ms' : '—'}</span></div>
     ${reg ? `<div style="margin-top:8px;color:var(--accent-red);font-size:13px">⚠ Regression: throughput ${reg.tputPct.toFixed(1)}%, TPOT ${reg.tpotPct.toFixed(1)}%</div>` : ''}
     <div class="pop-section">
+      <div class="pop-row"><span class="pop-key">Mode</span><span class="pop-val" style="font-family:inherit">${cfg.backend}</span></div>
       <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val"><a href="${cfg.commit.url || '#'}" target="_blank">${cfg.commit.id?.slice(0, 7) || '—'}</a></span></div>
       <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${cfg.commit.message?.split('\n')[0] || '—'}</span></div>
       <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${cfg.commit.author?.name || '—'}</span></div>
@@ -1714,6 +1756,7 @@ document.addEventListener('keydown', (e) => {
 let hashUpdateFromCode = false;
 function syncToHash() {
   const parts = [];
+  if (state.filters.backends.length !== allBackends.length) parts.push('backend=' + state.filters.backends.join(','));
   if (state.filters.models.length !== allModels.length) parts.push('model=' + state.filters.models.join(','));
   if (state.filters.islOsl.length !== allIslOsl.length) parts.push('isl=' + state.filters.islOsl.join(','));
   if (state.filters.conc.length !== allConc.length) parts.push('conc=' + state.filters.conc.join(','));
@@ -1728,6 +1771,7 @@ function readFromHash() {
   for (const part of hash.split('&')) {
     const [k, v] = part.split('=');
     if (!v) continue;
+    if (k === 'backend') state.filters.backends = v.split(',').filter(b => allBackends.includes(b));
     if (k === 'model') state.filters.models = v.split(',').filter(m => allModels.includes(m));
     if (k === 'isl') state.filters.islOsl = v.split(',').filter(i => allIslOsl.includes(i));
     if (k === 'conc') state.filters.conc = v.split(',').map(Number).filter(c => allConc.includes(c));

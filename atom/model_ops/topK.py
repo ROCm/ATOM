@@ -5,7 +5,6 @@ from functools import lru_cache
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from atom.utils.custom_register import direct_register_custom_op
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
@@ -110,28 +109,8 @@ def rocm_aiter_topk_softmax_impl(
             f"AITER topK meta data support {total_topk_weights.shape[0]} tokens which "
             f"is determined by max_num_batched_tokens, but got {token} tokens now."
         )
-        total_topk_weights = total_topk_weights[:token]
+        topk_weights = total_topk_weights[:token]
         total_topk_ids = total_topk_ids[:token]
-        topk_weights, shared_weights, _ = torch.split(
-            total_topk_weights,
-            [
-                topk,
-                num_fused_shared_experts,
-                total_topk_weights.shape[1] - topk - num_fused_shared_experts,
-            ],
-            dim=1,
-        )
-        if fused_shared_experts_scoring_func == "sigmoid":
-            shared_gating_output = gating_output[
-                :, num_routing_experts : num_routing_experts + num_fused_shared_experts
-            ]
-            # TODO(ganyi): maybe merge this into topk_softmax in the future
-            shared_weights.copy_(F.sigmoid(shared_gating_output))
-            gating_output = gating_output[:, :num_routing_experts]
-        elif fused_shared_experts_scoring_func is not None:
-            raise RuntimeError(
-                f"Unsupported scoring function {fused_shared_experts_scoring_func} for fused shared experts."
-            )
         topk_ids, _ = torch.split(
             total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
         )
@@ -141,8 +120,19 @@ def rocm_aiter_topk_softmax_impl(
     token_expert_indicies = torch.empty(
         gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
     )
+    if fused_shared_experts_scoring_func is None:
+        fused_shared_experts_scoring_func = ""
+        fused_shared_experts_for_kernel = 0
+    else:
+        fused_shared_experts_for_kernel = num_fused_shared_experts
     topk_softmax(
-        topk_weights, topk_ids, token_expert_indicies, gating_output, renormalize
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output,
+        renormalize,
+        fused_shared_experts_for_kernel,
+        fused_shared_experts_scoring_func,
     )
     if is_rocm_aiter_fusion_shared_expert_enabled() and num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids

@@ -170,17 +170,25 @@ if [ "$TYPE" == "benchmark" ]; then
 
   # Inject ISL/OSL into result JSON for summary table
   if [ -f "${RESULT_FILENAME}.json" ]; then
-    python3 -c "
-import json, re
-with open('${RESULT_FILENAME}.json') as f:
+    RESULT_PATH="${RESULT_FILENAME}.json" python3 - <<'PY'
+import json
+import os
+import re
+
+result_path = os.environ["RESULT_PATH"]
+with open(result_path, encoding="utf-8") as f:
     d = json.load(f)
-d['random_input_len'] = int('${ISL}')
-d['random_output_len'] = int('${OSL}')
-tp_match = re.search(r'-tp\s+(\d+)', '${SERVER_ARGS:-}')
+
+d["random_input_len"] = int(os.environ["ISL"])
+d["random_output_len"] = int(os.environ["OSL"])
+d["benchmark_backend"] = "ATOM"
+
+tp_match = re.search(r"-tp\s+(\d+)", os.environ.get("SERVER_ARGS", ""))
 if tp_match:
-    d['tensor_parallel_size'] = int(tp_match.group(1))
-with open('${RESULT_FILENAME}.json', 'w') as f:
+    d["tensor_parallel_size"] = int(tp_match.group(1))
+
+with open(result_path, "w", encoding="utf-8") as f:
     json.dump(d, f, indent=2)
-"
+PY
   fi
 fi

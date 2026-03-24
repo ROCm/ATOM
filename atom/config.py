@@ -529,6 +529,7 @@ class QuantizationConfig:
             for name_pattern, config in self.layer_quant_config.items():
                 if _matches_pattern(layer_name, name_pattern):
                     layer_quant_config = config
+                    break
 
         layer_quant_config = (
             self.global_quant_config
