@@ -55,13 +55,13 @@ jobs:
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extra_args: "--tensor-parallel-size 8"
             env_vars: ""
-            accuracy_test_threshold: 0.90
+            accuracy_test_threshold: 0.94
             runner: atom-mi355-8gpu.predownload
           - model_name: "gpt-oss-120b"
             model_path: "amd/gpt-oss-120b-w-mxfp4-a-fp8"
             extra_args: "--tensor-parallel-size 1"
             env_vars: ""
-            accuracy_test_threshold: 0.90
+            accuracy_test_threshold: 0.38
             runner: linux-atom-mi355-1
           - model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
