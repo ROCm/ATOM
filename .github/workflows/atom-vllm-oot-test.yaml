@@ -139,7 +139,7 @@ jobs:
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extra_args: "--tensor-parallel-size 1 --no-enable-chunked-prefill"
-            env_vars: ""
+            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
             accuracy_test_threshold: 0.38
             runner: linux-atom-mi355-1
           - model_name: "Kimi-K2-Thinking-MXFP4"
@@ -163,6 +163,7 @@ jobs:
 
     steps:
       - name: Clean up containers and workspace
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
