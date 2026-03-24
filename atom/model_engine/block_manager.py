@@ -127,6 +127,8 @@ class BlockManager:
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
 
+        seq.num_kv_computed = seq.num_cached_tokens
+
         # handle mamba-like model
         if seq.mamba_enabled:
             # For mamba, we need to ensure the last block is always allocated
@@ -144,6 +146,7 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
+        seq.num_kv_computed = 0
         seq.block_table.clear()
         if seq.mamba_enabled:
             for block_id in reversed(seq.mamba_block_table):

@@ -141,6 +141,7 @@ class Context:
     batch_size: int = 0
     graph_bs: int = 0
     is_draft: bool = False
+    is_partial_prefill: bool = False
 
     def __init__(
         self,
@@ -150,6 +151,7 @@ class Context:
         batch_size: int = 0,
         graph_bs: int = 0,
         is_draft: bool = False,
+        is_partial_prefill: bool = False,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -157,6 +159,7 @@ class Context:
         self.batch_size = batch_size
         self.graph_bs = graph_bs
         self.is_draft = is_draft
+        self.is_partial_prefill = is_partial_prefill
 
 
 @dataclass

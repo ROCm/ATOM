@@ -157,7 +157,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # seqs = seqs[:bs]
         for i in range(bs):
             seqlen = batch.context_lens[i]
-            cached_seqlen = batch.num_cached_tokens[i]
+            cached_seqlen = batch.num_kv_computed[i]
             if cached_seqlen > 0:
                 has_cached = True
             positions.extend(list(range(cached_seqlen, seqlen)))
@@ -169,21 +169,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not batch.block_tables:
                 continue
-            num_blocks = (
-                seqlen + self.model_runner.block_size - 1
-            ) // self.model_runner.block_size
-            num_cached_blocks = (
-                cached_seqlen + self.model_runner.block_size - 1
-            ) // self.model_runner.block_size
-            last_block_tokens = batch.last_block_num_tokens[i]
             block_table = batch.block_tables[i]
-            for blk_idx in range(num_cached_blocks, num_blocks):
-                start = block_table[blk_idx] * self.model_runner.block_size
-                if blk_idx != num_blocks - 1:
-                    end = start + self.model_runner.block_size
-                else:
-                    end = start + last_block_tokens
-                slot_mapping.extend(list(range(start, end)))
+            block_size = self.model_runner.block_size
+            for pos in range(cached_seqlen, seqlen):
+                blk_idx = pos // block_size
+                slot = block_table[blk_idx] * block_size + pos % block_size
+                slot_mapping.append(slot)
         if has_cached:
             self.prepare_block_tables(batch)
         # Validate metadata consistency
@@ -227,7 +218,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         num_cached_tokens = None
         if has_cached:
             num_cached_tokens = torch.tensor(
-                batch.num_cached_tokens[:bs], dtype=torch.int32, pin_memory=True
+                batch.num_kv_computed[:bs], dtype=torch.int32, pin_memory=True
             ).cuda(non_blocking=True)
             total_tokens = sum(batch.context_lens[:bs])
         total_kv = total_tokens if has_cached else sum_scheduled_tokens

@@ -187,7 +187,10 @@ class EngineCore:
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
-            seqs, fwd_out, stream_output_queue=self.stream_output_queue
+            seqs,
+            fwd_out,
+            stream_output_queue=self.stream_output_queue,
+            batch=scheduled_batch,
         )
 
         # Send stream outputs to main process via output_queue

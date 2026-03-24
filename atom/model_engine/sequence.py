@@ -55,6 +55,7 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        self.num_kv_computed = 0
         self.block_table = []
         self.mamba_block_table = []
         self.temperature = sampling_params.temperature

@@ -63,9 +63,12 @@ class TestSchedule:
     def test_prefill_respects_max_batched_tokens(self, seq_factory):
         sched = Scheduler(MockConfig(max_num_batched_tokens=6, num_kvcache_blocks=100))
         sched.add(seq_factory([1, 2, 3, 4]))  # 4 tokens
-        sched.add(seq_factory([5, 6, 7, 8]))  # 4 more → 8 > 6
+        sched.add(seq_factory([5, 6, 7, 8]))  # 4 tokens total, but only 2 fit in budget
         batch, _ = sched.schedule()
-        assert batch.total_seqs_num_prefill == 1
+        # Chunked prefill: seq2 gets a 2-token chunk (budget 6-4=2)
+        assert batch.total_seqs_num_prefill == 2
+        assert batch.total_tokens_num_prefill == 6
+        assert list(batch.num_scheduled_tokens) == [4, 2]
 
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
@@ -78,6 +81,7 @@ class TestSchedule:
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
         scheduler.schedule()  # prefill
+        seq.num_kv_computed = seq.num_prompt_tokens  # simulate forward pass
         seq.append_token(5)
         batch, _ = scheduler.schedule()  # decode
         assert batch.total_seqs_num_decode == 1
@@ -89,6 +93,8 @@ class TestSchedule:
         sched.add(s1)
         sched.add(s2)
         sched.schedule()  # prefill both
+        s1.num_kv_computed = s1.num_prompt_tokens  # simulate forward pass
+        s2.num_kv_computed = s2.num_prompt_tokens
         s1.append_token(9)
         s2.append_token(10)
         sched.schedule()  # one preempted
@@ -329,8 +335,10 @@ class TestGetNextBatchInfo:
         assert n == 4
 
     def test_running(self, scheduler, seq_factory):
-        scheduler.add(seq_factory([1, 2, 3, 4]))
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
         scheduler.schedule()
+        seq.num_kv_computed = seq.num_prompt_tokens  # simulate forward pass
         is_prefill, n = scheduler.get_next_batch_info()
         assert is_prefill is False
         assert n == 1

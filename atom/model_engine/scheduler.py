@@ -190,23 +190,16 @@ class ScheduledBatch:
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {},
+        num_kv_computed: list[int] = None,
+        is_partial_prefill: bool = False,
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
         # self.seqs = seqs
         self.req_ids = list(seqs.keys())
-        # self.scheduled_tokens = [
-        #     seq.token_ids[-num_tokens:]
-        #     for seq, num_tokens in zip(seqs.values(), num_scheduled_tokens)
-        # ]
-        # logger.info(f"{num_scheduled_tokens=}")
-        # logger.info(f"{self.scheduled_tokens=}")
         # num_scheduled_tokens for each sequence in the batch
         self.num_scheduled_tokens = np.asarray(num_scheduled_tokens, dtype=np.int32)
         self.temperatures = np.asarray(
             [seq.temperature for seq in seqs.values()], dtype=np.float32
-        )
-        self.context_lens = np.asarray(
-            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
         )
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
@@ -220,10 +213,30 @@ class ScheduledBatch:
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
 
-        offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
+        # num_kv_computed for chunked prefill support
+        self.num_kv_computed = num_kv_computed or [
+            seq.num_kv_computed for seq in seqs.values()
+        ]
+        self.is_partial_prefill = is_partial_prefill
+
+        # context_lens: for prefill seqs, use num_kv_computed + num_scheduled_tokens
+        # (not seq.num_tokens, which includes all prompt tokens beyond current chunk)
+        context_lens = []
+        for i, seq in enumerate(seqs.values()):
+            if seq.type == SequenceType.PREFILL:
+                context_lens.append(self.num_kv_computed[i] + num_scheduled_tokens[i])
+            else:
+                context_lens.append(seq.num_tokens)
+        self.context_lens = np.asarray(context_lens, dtype=np.int32)
+
+        # Compute token offsets: prefill uses num_kv_computed, decode uses existing formula
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
         pos = 0
-        for seq, num, offset in zip(seqs.values(), num_scheduled_tokens, offs):
+        for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
+            if seq.type == SequenceType.PREFILL:
+                offset = self.num_kv_computed[i]
+            else:
+                offset = seq.num_tokens - self.num_rejected[i] - num
             self.scheduled_tokens[pos : pos + num] = seq.token_ids[
                 offset : offset + num
             ]
@@ -254,12 +267,6 @@ class ScheduledBatch:
         self.is_dummy_run = is_dummy_run
 
         self.num_spec_step = num_spec_step
-
-        # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
-        # logger.info(f"{self.num_scheduled_tokens=}")
-        # logger.info(f"{self.context_lens=}")
-        # logger.info(f"{[len(blk)*16 for blk in self.block_tables]=}")
-        # logger.info(f"{self.block_tables=}")
 
 
 class ScheduledBatchOutput:
@@ -341,42 +348,67 @@ class Scheduler:
             # self.block_manager.reset()
             return None
 
+        # ---- Phase 1: resume partial prefills from running ----
+        for seq in self.running:
+            if seq.num_kv_computed >= seq.num_prompt_tokens:
+                continue  # already completed prefill
+            remaining = seq.num_prompt_tokens - seq.num_kv_computed
+            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+            chunk = min(remaining, budget_remaining)
+            if chunk <= 0:
+                break
+            num_batched_tokens += chunk
+            num_seqs_prefill += 1
+            seq.type = SequenceType.PREFILL
+            scheduled_seqs[seq.id] = seq
+            num_scheduled_tokens.append(chunk)
+
+        # ---- Phase 2: new requests from waiting ----
         while (
             (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
+            and num_batched_tokens < self.max_num_batched_tokens
         ):
             seq = self.waiting[0]
-            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
-            if (
-                num_batched_tokens + num_new_tokens > self.max_num_batched_tokens
-                or not self.block_manager.can_allocate(seq)
-            ):
+            if not self.block_manager.can_allocate(seq):
                 break
-            num_seqs_prefill += 1
             self.block_manager.allocate(seq)
-            # Recalculate after allocation: prefix caching may have updated
-            # seq.num_cached_tokens, reducing the actual number of new tokens.
-            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            # After allocate, num_kv_computed = num_cached_tokens (prefix cache hits)
+            num_new_tokens = seq.num_prompt_tokens - seq.num_kv_computed
             if self.cache_stats:
                 self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
-            num_batched_tokens += num_new_tokens
+            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+            chunk = min(num_new_tokens, budget_remaining)
+            assert chunk > 0, (
+                f"chunk must be positive after budget guard: {chunk=}, "
+                f"{num_new_tokens=}, {budget_remaining=}"
+            )
+            num_batched_tokens += chunk
+            num_seqs_prefill += 1
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs[seq.id] = seq
-            num_scheduled_tokens.append(num_new_tokens)
+            num_scheduled_tokens.append(chunk)
 
         num_scheduled_tokens_np = num_scheduled_tokens
         total_tokens_num_prefill = sum(num_scheduled_tokens_np)
 
         if num_seqs_prefill > 0:
+            # Determine if all prefill seqs are intermediate chunks (not final)
+            is_partial_prefill = all(
+                seq.num_kv_computed + num_scheduled_tokens[i] < seq.num_prompt_tokens
+                for i, seq in enumerate(scheduled_seqs.values())
+            )
+            num_kv_computed_list = [
+                seq.num_kv_computed for seq in scheduled_seqs.values()
+            ]
             logger.info(
-                f"Scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} token_nums: {num_scheduled_tokens}, req_ids: {tuple(scheduled_seqs.keys())}"
+                f"Scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} token_nums: {num_scheduled_tokens}, req_ids: {tuple(scheduled_seqs.keys())}, partial: {is_partial_prefill}"
             )
             self.prev_prompt = True
-            # lip: TODO for prefill/decode mixed batch
             return (
                 ScheduledBatch(
                     seqs=scheduled_seqs,
@@ -385,6 +417,8 @@ class Scheduler:
                     total_tokens_num_prefill=total_tokens_num_prefill,
                     total_seqs_num=num_seqs_prefill,
                     total_seqs_num_prefill=num_seqs_prefill,
+                    num_kv_computed=num_kv_computed_list,
+                    is_partial_prefill=is_partial_prefill,
                 ),
                 scheduled_seqs,
             )
@@ -442,13 +476,23 @@ class Scheduler:
         seqs: list[Sequence],
         fwd_output: ScheduledBatchOutput,
         stream_output_queue=None,
+        batch: ScheduledBatch = None,
     ) -> list[Sequence]:
+        # Update num_kv_computed for all scheduled prefill seqs
+        # Build set of partial prefill seq ids (still mid-prefill after this step)
+        partial_prefill_ids: set[int] = set()
+        if batch is not None:
+            for i, req_id in enumerate(batch.req_ids):
+                for seq in self.running:
+                    if seq.id == req_id and seq.type == SequenceType.PREFILL:
+                        seq.num_kv_computed += batch.num_scheduled_tokens[i]
+                        if seq.num_kv_computed < seq.num_prompt_tokens:
+                            partial_prefill_ids.add(seq.id)
+                        break
+
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
-        # logger.info(
-        #     f"Scheduler postprocess: received output for req_ids={fwd_output.req_ids}, draft_token_ids shape={fwd_output.draft_token_ids.shape}, accepted token ids: {prev_token_ids}"
-        # )
         # update token_ids with the actual sampled token ids
         finished_seqs = []
         stream_outputs = []
@@ -461,6 +505,9 @@ class Scheduler:
             # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
+                continue
+            # Partial prefill: KV written but prefill not complete — discard sampled token
+            if seq.id in partial_prefill_ids:
                 continue
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
@@ -585,6 +632,12 @@ class Scheduler:
         return self.has_unfinished_requests()
 
     def get_next_batch_info(self) -> tuple[bool, int]:
+        # Check for partial prefills in running (chunked prefill resume)
+        for seq in self.running:
+            if seq.num_kv_computed < seq.num_prompt_tokens:
+                remaining = seq.num_prompt_tokens - seq.num_kv_computed
+                chunk = min(remaining, self.max_num_batched_tokens)
+                return (True, chunk)
         if self.waiting:
             # new request is waiting, will do prefill
             seq = self.waiting[0]

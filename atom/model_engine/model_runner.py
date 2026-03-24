@@ -1447,12 +1447,14 @@ class ModelRunner:
 
         # graph_bs should be batch size (number of sequences), not token count
         graph_bs = num_input_tokens if is_prefill else bs
+        is_partial_prefill = getattr(batch, "is_partial_prefill", False)
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
             is_dummy_run=batch.is_dummy_run,
             batch_size=context_bs,
             graph_bs=graph_bs,
+            is_partial_prefill=is_partial_prefill,
         )
         actual_num_tokens = batch.total_tokens_num
 
@@ -1557,7 +1559,12 @@ class ModelRunner:
             label += "]"
             with record_function(label):
                 hidden_states = self.model(input_ids, positions)
-                logits = self.model.compute_logits(hidden_states)
+                if context.is_partial_prefill:
+                    logits = (
+                        None  # B scheme: skip compute_logits for intermediate chunks
+                    )
+                else:
+                    logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
             label = f"decode[bs={bs}"
@@ -1594,6 +1601,18 @@ class ModelRunner:
         # following for draft
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
+        # B scheme: intermediate chunks skip sampling entirely
+        if get_forward_context().context.is_partial_prefill:
+            self.forward_done_event.record()
+            return ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                draft_token_ids=None,
+                is_deferred_out=self.tokenID_processor.is_deferred_out,
+                num_rejected=np.zeros(0, dtype=np.int32),
+                num_bonus=np.zeros(0, dtype=np.int32),
+            )
+
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
