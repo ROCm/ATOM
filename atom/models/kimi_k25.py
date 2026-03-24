@@ -255,7 +255,6 @@ if is_vllm():
         def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
             return self.model.get_expert_mapping()
 
-    # if is_vllm():
     from vllm.model_executor.models.kimi_k25 import (
         KimiK25ForConditionalGeneration as vLLMKimiK25,
     )
