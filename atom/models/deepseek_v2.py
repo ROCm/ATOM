@@ -823,7 +823,6 @@ class DeepseekV2MoE(nn.Module):
             if not is_rocm_aiter_fusion_shared_expert_enabled():
                 if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0:
                     self._use_dual_stream = True
-                    self.alt_stream = DeepseekV2MoE._get_shared_stream()
                     compilation_config = get_current_atom_config().compilation_config
                     compilation_config.static_forward_context[prefix] = self
                 intermediate_size = (
