@@ -92,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - id: load
-        run: echo "models_json=$(jq -c . .github/benchmark/oot_models.json)" >> "$GITHUB_OUTPUT"
+        run: echo "models_json=$(jq -c . .github/benchmark/oot_benchmark_models.json)" >> "$GITHUB_OUTPUT"
 
   build-oot-image:
     name: Build OOT benchmark image

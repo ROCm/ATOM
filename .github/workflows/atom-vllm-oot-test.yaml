@@ -54,17 +54,26 @@ jobs:
           - model_name: "DeepSeek-R1-FP8"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extra_args: "--tensor-parallel-size 8"
+            env_vars: ""
             accuracy_test_threshold: 0.90
             runner: atom-mi355-8gpu.predownload
           - model_name: "gpt-oss-120b"
             model_path: "amd/gpt-oss-120b-w-mxfp4-a-fp8"
             extra_args: "--tensor-parallel-size 1"
+            env_vars: ""
             accuracy_test_threshold: 0.90
             runner: linux-atom-mi355-1
           - model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--tensor-parallel-size 4"
+            env_vars: ""
             accuracy_test_threshold: 0.90
+            runner: linux-atom-mi355-4
+          - model_name: "Qwen3.5-35B-A3B-FP8"
+            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
+            extra_args: "--tensor-parallel-size 2 --max-model-len 16384"
+            env_vars: "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1"
+            accuracy_test_threshold: 0.85
             runner: linux-atom-mi355-4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -248,6 +257,7 @@ jobs:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
+          OOT_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
@@ -255,6 +265,7 @@ jobs:
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "

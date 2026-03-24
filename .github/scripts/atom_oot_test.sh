@@ -170,6 +170,12 @@ launch_one_model() {
   export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
   # FIXME: here disable the dual stream in OOT CI for avoid the hang issue
   export ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0
+
+  if [[ -n "${OOT_ENV_VARS:-}" ]]; then
+    while IFS= read -r _env_line; do
+      [[ -n "${_env_line}" ]] && export "${_env_line}" && echo "Exported: ${_env_line}"
+    done <<< "$(echo -e "${OOT_ENV_VARS}")"
+  fi
   rm -rf /root/.cache
 
   rm -f "${VLLM_PID_FILE}" || true
