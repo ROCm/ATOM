@@ -15,7 +15,7 @@ set -euo pipefail
 #   accuracy - run gsm8k accuracy test and save result JSON
 #
 # MODE:
-#   ci    - DeepSeek-R1 FP8, gpt-oss-120b, Kimi-K2 TP4
+#   ci    - DeepSeek-R1 FP8, gpt-oss-120b, Kimi-K2 TP4, Qwen3.5-35B-A3B-FP8
 #   full  - all OOT-supported models
 #
 # Optional model_name can be used to run a single model in full mode.
@@ -56,7 +56,7 @@ FULL_MODE_MODELS=(
   "Qwen3 MoE|Qwen/Qwen3-235B-A22B-Instruct-2507-FP8|--tensor-parallel-size 8 --enable-expert-parallel"
   "DeepSeek-R1 FP8|deepseek-ai/DeepSeek-R1-0528|--tensor-parallel-size 8"
   "DeepSeek-R1 MXFP4|amd/DeepSeek-R1-0528-MXFP4|--tensor-parallel-size 8"
-  "GPT-OSS|amd/gpt-oss-120b-w-mxfp4-a-fp8|--tensor-parallel-size 1"
+  "GPT-OSS|openai/gpt-oss-120b|--tensor-parallel-size 1"
   "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--tensor-parallel-size 4"
 )
 
