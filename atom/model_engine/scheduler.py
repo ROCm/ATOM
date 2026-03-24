@@ -509,13 +509,12 @@ class Scheduler:
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
+                num_new_tokens = self.mtp_k + 1
 
                 # Skip block append for the first decode step after remote
                 # prefill — blocks were already allocated during prefill.
                 if not getattr(seq, "is_first_decode", False):
-                    self.block_manager.may_append(seq)
-
-                num_new_tokens = self.mtp_k + 1
+                    self.block_manager.may_append(seq, num_new_tokens)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
