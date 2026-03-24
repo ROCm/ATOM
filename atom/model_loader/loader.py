@@ -247,14 +247,6 @@ def load_model(
     weights_mapping = getattr(model, "weights_mapping", {})
     skip_weight_prefixes = getattr(model, "skip_weight_prefixes", [])
     params_dict = dict(model.named_parameters())
-    print(f"================================================", flush=True)
-    print(f"packed_modules_mapping: {packed_modules_mapping}", flush=True)
-    print(f"weights_mapping: {weights_mapping}", flush=True)
-    print(f"skip_weight_prefixes: {skip_weight_prefixes}", flush=True)
-    print(f"params_dict: {params_dict.keys()}", flush=True)
-    print(f"model.named_modules(): {model.named_modules()}", flush=True)
-    print(f"model = {model}", flush=True)
-    print(f"================================================", flush=True)
 
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
     # Original code does O(N) scan of expert_mapping (768 entries) per tensor,
