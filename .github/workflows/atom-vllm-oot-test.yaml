@@ -59,7 +59,7 @@ jobs:
             runner: atom-mi355-8gpu.predownload
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
-            extra_args: "--tensor-parallel-size 1"
+            extra_args: "--tensor-parallel-size 1 --no-enable-chunked-prefill"
             env_vars: ""
             accuracy_test_threshold: 0.38
             runner: linux-atom-mi355-1
