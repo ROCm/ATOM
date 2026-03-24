@@ -594,7 +594,7 @@ _CONFIG_REGISTRY: dict[str, str] = {
 
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
-    # "kimi_k25": "text_config",
+    "kimi_k25": "text_config",
 }
 
 
@@ -610,6 +610,9 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             return token
         return None
 
+    # vLLM oot supports text + vision for Kimi_K2.5
+    if is_vllm():
+        _MULTIMODAL_MODEL_TYPES.pop("kimi_k25")
     # For multimodal models, extract the text sub-config so the rest of ATOM
     # (which is text-only today) works transparently.
     if model_type in _MULTIMODAL_MODEL_TYPES:

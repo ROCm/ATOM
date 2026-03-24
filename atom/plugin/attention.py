@@ -1128,7 +1128,6 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         base_class.__init__(self, kv_cache_spec, layer_names, config, device)
         logger.info("init AiterAttentionMetadataBuilder for plugin mode")
         from vllm.config import VllmConfig
-        from vllm.transformers_utils.configs.kimi_k25 import KimiK25Config
 
         assert isinstance(config, VllmConfig)
 
@@ -1144,16 +1143,16 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
 
-        hf_config = config.model_config.hf_config
-        if isinstance(hf_config, KimiK25Config):
-            num_attention_heads = hf_config.text_config.num_attention_heads
-        else:
-            num_attention_heads = hf_config.num_attention_heads
-
-        self.num_attention_heads = (
-            num_attention_heads
-            // get_tp_group().world_size
+        num_attention_heads = getattr(
+            config.model_config.hf_config, "num_attention_heads", None
+        ) or getattr(
+            config.model_config.hf_config.text_config, "num_attention_heads", None
         )
+        assert (
+            num_attention_heads is not None
+        ), "num_attention_heads is not found in config"
+
+        self.num_attention_heads = num_attention_heads // get_tp_group().world_size
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs

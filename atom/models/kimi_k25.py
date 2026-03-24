@@ -22,6 +22,7 @@ from atom.models.deepseek_v2 import DeepseekV2ForCausalLM
 from atom.models.utils import IntermediateTensors
 from atom.plugin.prepare import is_vllm
 
+
 class KimiK25ForCausalLM(nn.Module):
     """Kimi-K2.5 text-only wrapper around :class:`DeepseekV2ForCausalLM`.
 
@@ -92,7 +93,6 @@ class KimiK25ForCausalLM(nn.Module):
         return self.language_model.get_expert_mapping()
 
 
-
 if is_vllm():
     from typing import Any, Iterable
 
@@ -156,8 +156,10 @@ if is_vllm():
                 )
             else:
                 self.norm = PPMissingLayer()
-            self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size
+            self.make_empty_intermediate_tensors = (
+                make_empty_intermediate_tensors_factory(
+                    ["hidden_states", "residual"], config.hidden_size
+                )
             )
 
     class KimiK25ForCausalLM_(nn.Module):
@@ -238,10 +240,14 @@ if is_vllm():
             return IntermediateTensors(
                 {
                     "hidden_states": torch.zeros(
-                        (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                        (batch_size, self.config.hidden_size),
+                        dtype=dtype,
+                        device=device,
                     ),
                     "residual": torch.zeros(
-                        (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                        (batch_size, self.config.hidden_size),
+                        dtype=dtype,
+                        device=device,
                     ),
                 }
             )
@@ -249,17 +255,24 @@ if is_vllm():
         def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
             return self.model.get_expert_mapping()
 
-# if is_vllm():
-    from vllm.model_executor.models.kimi_k25 import KimiK25ForConditionalGeneration as vLLMKimiK25
-    from vllm.model_executor.models.kimi_k25 import KimiK25ProcessingInfo, KimiK25DummyInputsBuilder, KimiK25MultiModalProcessor
-    from vllm.model_executor.models.kimi_k25_vit import MoonViT3dPretrainedModel, KimiK25MultiModalProjector
+    # if is_vllm():
+    from vllm.model_executor.models.kimi_k25 import (
+        KimiK25ForConditionalGeneration as vLLMKimiK25,
+    )
+    from vllm.model_executor.models.kimi_k25 import (
+        KimiK25ProcessingInfo,
+        KimiK25DummyInputsBuilder,
+        KimiK25MultiModalProcessor,
+    )
+    from vllm.model_executor.models.kimi_k25_vit import (
+        MoonViT3dPretrainedModel,
+        KimiK25MultiModalProjector,
+    )
     from vllm.multimodal import MULTIMODAL_REGISTRY
-    
-    from atom.models.utils import maybe_prefix
+
     from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
     from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
     from atom.model_config.kimi_k25 import KimiK25Config
-
 
     @MULTIMODAL_REGISTRY.register_processor(
         KimiK25MultiModalProcessor,
@@ -308,14 +321,22 @@ if is_vllm():
             with self._mark_tower_model(vllm_config, "vision_chunk"):
                 self.vision_tower = MoonViT3dPretrainedModel(
                     config.vision_config,
-                    quant_config=self._maybe_ignore_quant_config(quant_config, atom_quant_config.exclude_layers or [], "vision_tower"),
+                    quant_config=self._maybe_ignore_quant_config(
+                        quant_config,
+                        atom_quant_config.exclude_layers or [],
+                        "vision_tower",
+                    ),
                     prefix=maybe_prefix(prefix, "vision_tower"),
                 )
 
                 self.mm_projector = KimiK25MultiModalProjector(
                     config=config.vision_config,
                     use_data_parallel=self.use_data_parallel,
-                    quant_config=self._maybe_ignore_quant_config(quant_config, atom_quant_config.exclude_layers or [], "mm_projector"),
+                    quant_config=self._maybe_ignore_quant_config(
+                        quant_config,
+                        atom_quant_config.exclude_layers or [],
+                        "mm_projector",
+                    ),
                     prefix=maybe_prefix(prefix, "mm_projector"),
                 )
 
@@ -330,11 +351,15 @@ if is_vllm():
                 self.language_model.make_empty_intermediate_tensors
             )
 
-        def _maybe_ignore_quant_config(self, quant_config: Any, exclude_layers: list[str], layer_name: str):
+        def _maybe_ignore_quant_config(
+            self, quant_config: Any, exclude_layers: list[str], layer_name: str
+        ):
             import re
 
             for exclude_layer in exclude_layers:
-                if exclude_layer.startswith("re:") and re.search(exclude_layer[3:], layer_name):
+                if exclude_layer.startswith("re:") and re.search(
+                    exclude_layer[3:], layer_name
+                ):
                     return None
                 elif exclude_layer == layer_name:
                     return None
@@ -374,7 +399,6 @@ if is_vllm():
 
             raise ValueError(f"Unsupported modality: {modality}")
 
-            
         def load_weights(
             self,
             weights: Iterable[tuple[str, torch.Tensor]],
