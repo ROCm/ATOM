@@ -89,3 +89,50 @@ lm_eval --model local-completions \
 ## Key Environment Variables
 
 - `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: **Required** - disables ATOM attention plugin to use vLLM's implementation for full attention layers
+
+
+## Performance baseline
+
+The following script can be used to benchmark the performance:
+
+```bash
+python -m atom.benchmarks.benchmark_serving \
+    --model=Qwen/Qwen3.5-397B-A17B-FP8 --backend=vllm --base-url=http://localhost:8000 \
+    --dataset-name=random \
+    --random-input-len=${ISL} --random-output-len=${OSL} \
+    --random-range-ratio 0.8 \
+    --num-prompts=$(( $CONC * 10 )) \
+    --max-concurrency=$CONC \
+    --request-rate=inf --ignore-eos \
+    --save-result --result-dir=${result_dir} --result-filename=$RESULT_FILENAME.json \
+    --percentile-metrics="ttft,tpot,itl,e2el"
+```
+The performance number on 8 ranks is provided as a reference, with the following environment:
+- docker image: rocm/atom-dev:vllm-latest.
+- ATOM: main branch.
+
+| ISL  | OSL  | Concurrency | Num Prompts | Output Throughput (tok/s) | Total Throughput (tok/s) |
+| ---- | ---- | ----------- | ----------- | ------------------------- | ------------------------ |
+| 1024 | 1024 | 4           | 40          | 363.93                    | 699.51                   |
+| 1024 | 1024 | 8           | 80          | 707.23                    | 1407.70                  |
+| 1024 | 1024 | 16          | 160         | 1276.43                   | 2564.45                  |
+| 1024 | 1024 | 32          | 320         | 2186.24                   | 4350.59                  |
+| 1024 | 1024 | 64          | 640         | 3442.65                   | 6991.11                  |
+
+### Accuracy baseline 
+We verified the lm_eval accuracy on gsm8k dataset with command:
+```bash
+lm_eval \
+--model local-completions \
+--model_args model=Qwen/Qwen3.5-397B-A17B-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+--tasks gsm8k \
+--num_fewshot 3
+```
+
+Here is the reference value when deploying on 8 ranks:
+```bash
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.8613|±  |0.0095|
+|     |       |strict-match    |     3|exact_match|↑  |0.8491|±  |0.0099|
+```
