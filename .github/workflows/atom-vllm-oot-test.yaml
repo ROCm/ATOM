@@ -51,12 +51,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Keep CI runtime under control: enable only one OOT model for now.
-          - model_name: "Kimi-K2-Thinking-MXFP4"
-            model_path: "amd/Kimi-K2-Thinking-MXFP4"
-            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel"
+          - model_name: "DeepSeek-R1-FP8"
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
+            extra_args: "--tensor-parallel-size 8"
             accuracy_test_threshold: 0.90
             runner: atom-mi355-8gpu.predownload
+          - model_name: "gpt-oss-120b"
+            model_path: "amd/gpt-oss-120b-w-mxfp4-a-fp8"
+            extra_args: "--tensor-parallel-size 1"
+            accuracy_test_threshold: 0.90
+            runner: linux-atom-mi355-1
+          - model_name: "Kimi-K2-Thinking-MXFP4"
+            model_path: "amd/Kimi-K2-Thinking-MXFP4"
+            extra_args: "--tensor-parallel-size 4"
+            accuracy_test_threshold: 0.90
+            runner: linux-atom-mi355-4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
