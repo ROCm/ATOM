@@ -21,7 +21,7 @@
   },
   {
     "display": "DeepSeek-R1-0528 MXFP4-MTP3",
-    "path": "amd/DeepSeek-R1-0528-MoE-MXFP4-Attn-MTP-PTPC-FP8",
+    "path": "amd/DeepSeek-R1-0528-MTP-MoE-MXFP4-Attn-PTPC-FP8",
     "prefix": "deepseek-r1-0528-mxfp4",
     "args": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",
     "bench_args": "--use-chat-template",
@@ -48,5 +48,15 @@
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
     "env_vars": ""
+  },
+  {
+    "display": "Kimi-K2.5-MXFP4",
+    "path": "amd/Kimi-K2.5-MXFP4",
+    "prefix": "kimi-k25-mxfp4",
+    "args": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1"
   }
 ]

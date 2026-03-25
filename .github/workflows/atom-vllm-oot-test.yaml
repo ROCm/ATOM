@@ -74,7 +74,7 @@ jobs:
             docker kill $containers || true
           fi
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && rm -rf /workspace/*" || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v4
@@ -138,7 +138,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             "$OOT_IMAGE_TAG" \
-            bash -lc "pytest -q tests/plugin"
+            bash -lc "pytest -q tests/plugin -o cache_dir=/tmp/.pytest_cache"
 
       - name: Prepare model cache mount
         run: |

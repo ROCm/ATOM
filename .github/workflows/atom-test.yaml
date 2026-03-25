@@ -15,6 +15,12 @@ on:
     # Nightly at 00:00 Beijing time (16:00 UTC)
     - cron: '0 16 * * *'
   workflow_dispatch:
+    inputs:
+      aiter_branch:
+        description: 'ROCm/aiter branch to build inside the CI image'
+        required: false
+        default: 'main'
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,7 +29,9 @@ concurrency:
 env:
   ATOM_BASE_IMAGE: rocm/atom-dev:latest
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+  # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
+  AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
 
 jobs:
   check-signal:
@@ -35,9 +43,11 @@ jobs:
       contents: read
     steps:
       - name: Checkout ATOM repo
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: actions/checkout@v6
 
       - name: Download and check pre-checkin signal
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: bash ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -142,14 +152,14 @@ jobs:
             runner: atom-mi355-8gpu.predownload
             run_on_pr: true
           - model_name: "DeepSeek-R1-0528-FP4"
-            model_path: "amd/DeepSeek-R1-0528-MXFP4"
+            model_path: "amd/DeepSeek-R1-0528-MTP-MoE-MXFP4-Attn-PTPC-FP8"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             accuracy_test_threshold: "0.93"
             runner: atom-mi355-8gpu.predownload
             run_on_pr: true
           - model_name: "DeepSeek-R1-0528-FP4 MTP"
-            model_path: "amd/DeepSeek-R1-0528-MXFP4"
+            model_path: "amd/DeepSeek-R1-0528-MTP-MoE-MXFP4-Attn-PTPC-FP8"
             extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
             env_vars: ""
             accuracy_test_threshold: "0.93"
@@ -183,6 +193,13 @@ jobs:
             env_vars: |
               ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
             accuracy_test_threshold: "0.87"
+            runner: atom-mi355-8gpu.predownload
+            run_on_pr: false
+          - model_name: "Kimi-K2.5-MXFP4"
+            model_path: "amd/Kimi-K2.5-MXFP4"
+            extraArgs: "--kv_cache_dtype fp8 -tp 4 --trust-remote-code"
+            env_vars: "HSA_NO_SCRATCH_RECLAIM=1"
+            accuracy_test_threshold: "0.93"
             runner: atom-mi355-8gpu.predownload
             run_on_pr: false
           - model_name: "Qwen3-Next-80B-A3B-Thinking"
@@ -228,6 +245,42 @@ jobs:
       - name: Checkout ATOM repo
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         uses: actions/checkout@v6
+      
+      - name: Docker Login
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && !github.event.pull_request.head.repo.fork
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Generate Dockerfile for forked repo
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && github.event.pull_request.head.repo.fork
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+          RUN pip install -U lm-eval[api]
+          RUN pip show lm-eval || true
+          RUN pip install hf_transfer
+          RUN pip show hf_transfer || true
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y amd-aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          RUN rm -rf /app/aiter-test
+          RUN git clone --depth 1 -b ${{ env.AITER_GIT_REF }} https://github.com/ROCm/aiter.git /app/aiter-test && \\
+              cd /app/aiter-test && \\
+              git submodule sync && git submodule update --init --recursive && \\
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+          
+          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
+          RUN pip uninstall -y atom
+          RUN rm -rf /app/ATOM
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
+              cd /app/ATOM && \\
+              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
+              pip install -e .
+
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
 
       - name: Download aiter wheel
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'

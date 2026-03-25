@@ -93,7 +93,7 @@ def fused_gdn_gating(
     return g, beta_output
 
 
-class GatedDetlaNet(nn.Module):
+class GatedDeltaNet(nn.Module):
 
     def __init__(
         self,
@@ -152,6 +152,7 @@ class GatedDetlaNet(nn.Module):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        layer_name: str,
     ):
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 

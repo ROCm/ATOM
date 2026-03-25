@@ -10,6 +10,7 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from atom.plugin import is_plugin_mode
+from atom.utils import envs
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 
@@ -175,7 +176,8 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
-            logits = tensor_model_parallel_all_gather(logits, use_custom=True)
+            use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+            logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
             # all_logits = (
             #     [torch.empty_like(logits) for _ in range(self.tp_size)]
             #     if self.tp_rank == 0
