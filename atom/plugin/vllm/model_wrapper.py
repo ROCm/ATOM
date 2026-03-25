@@ -144,6 +144,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     ) -> set[str]:
         # prevent circular import
         from atom.model_loader.loader import load_model_in_plugin_mode
+
         loaded_weights_record = load_model_in_plugin_mode(
             model=self.model, config=self.atom_config, prefix="model."
         )
