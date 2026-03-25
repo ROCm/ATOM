@@ -20,11 +20,14 @@ from vllm.model_executor.models.interfaces_base import (
     VllmModelForTextGeneration,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.forward_context import (
+    get_forward_context as get_vllm_forward_context,
+    is_forward_context_available,
+)
 
 import atom  # noqa: F401
 from atom.plugin.config import generate_atom_config_for_plugin_mode
 from atom.model_loader.loader import load_model_in_plugin_mode
-from atom.utils.forward_context import get_forward_context
 
 import logging
 
@@ -118,13 +121,11 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
-        # Prefer threading the live runtime positions through the forward context
-        # so MLA decode can consume them without an extra device-to-device copy.
-        forward_context = get_forward_context().context
-        if forward_context is not None:
-            forward_context.positions = positions
+        # Thread live runtime positions through vLLM's per-forward context to
+        # avoid the extra device-to-device copy into ATOM's static buffer.
+        if is_forward_context_available():
+            get_vllm_forward_context().additional_kwargs["atom_positions"] = positions
         elif "positions" in self.atom_config.compilation_config.static_forward_context:
-            # Fallback for paths without a populated forward context.
             buf = self.atom_config.compilation_config.static_forward_context[
                 "positions"
             ]

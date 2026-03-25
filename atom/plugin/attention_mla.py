@@ -22,7 +22,6 @@ from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
-from atom.utils.forward_context import get_forward_context
 
 
 import logging
@@ -705,14 +704,19 @@ class MLAAttentionImplPluginModeMethods:
         has_prefill = attn_metadata.plugin_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.plugin_metadata.num_decode_tokens
 
-        forward_context = get_forward_context().context
-        if forward_context is not None and forward_context.positions is not None:
-            positions = forward_context.positions[:num_actual_toks]
-        else:
+        positions = None
+        if self._is_vllm_forward_context_available():
+            positions = self._get_vllm_forward_context().additional_kwargs.get(
+                "atom_positions"
+            )
+
+        if positions is None:
             atom_config = get_current_atom_config()
             positions = atom_config.compilation_config.static_forward_context[
                 "positions"
-            ][:num_actual_toks]
+            ]
+
+        positions = positions[:num_actual_toks]
         k_pe = k_pe.unsqueeze(1)
         output_padded = output
         output = output[:num_actual_toks, ...]
@@ -900,6 +904,10 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
     """Extra initialization for MLAAttentionImpl in plugin mode (vllm)."""
     if is_vllm():
         from vllm.config import get_current_vllm_config
+        from vllm.forward_context import (
+            get_forward_context as get_vllm_forward_context,
+            is_forward_context_available,
+        )
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadataBuilder,
         )
@@ -919,6 +927,8 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
             and self.kv_b_proj.weight.dtype == torch.bfloat16
         )
         self._use_persistent_decode = False
+        self._get_vllm_forward_context = get_vllm_forward_context
+        self._is_vllm_forward_context_available = is_forward_context_available
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
         self._pad_v = True
         self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
