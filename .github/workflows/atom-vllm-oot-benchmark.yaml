@@ -10,46 +10,40 @@ on:
       deepseek-r1-fp8:
         description: "Benchmark DeepSeek-R1 FP8"
         type: boolean
-        default: true
+        default: false
       deepseek-r1-mxfp4:
         description: "Benchmark DeepSeek-R1 MXFP4"
         type: boolean
-        default: true
+        default: false
       gpt-oss-120b:
         description: "Benchmark gpt-oss-120b"
         type: boolean
-        default: true
-      kimi-k2-thinking-mxfp4:
-        description: "Benchmark Kimi-K2-Thinking-MXFP4 (TP4 and TP8)"
+        default: false
+      kimi-k2-thinking-mxfp4-tp4:
+        description: "Benchmark Kimi-K2-Thinking-MXFP4 TP4"
         type: boolean
-        default: true
-      base_image:
-        description: "ATOM base image used to build the OOT benchmark image"
+        default: false
+      kimi-k2-thinking-mxfp4-tp8:
+        description: "Benchmark Kimi-K2-Thinking-MXFP4 TP8"
+        type: boolean
+        default: false
+      qwen3-5-397b-a17b-fp8:
+        description: "Benchmark Qwen3.5-397B-A17B-FP8"
+        type: boolean
+        default: false
+      oot_image:
+        description: "OOT benchmark image to pull directly"
         type: string
-        default: "rocm/atom-dev:latest"
-      vllm_commit:
-        description: "vLLM commit used by the OOT benchmark image"
-        type: string
-        default: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
-      vllm_version:
-        description: "vLLM version label used in the benchmark image tag"
-        type: string
-        default: "0.17"
+        default: "rocm/atom-dev:vllm-latest"
       param_lists:
         description: |
           "Benchmark parameter lists.
           Input as a single or multiple sets (comma-separated, semicolon between sets),
           format: input_length,output_length,concurrency,random_range_ratio.
-          Example (single set): 1024,1024,128,0.8
-          Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
+          Example (single set): 1024,1024,64,0.8
+          Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
         type: string
-        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;1024,8192,128,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8"
-
-env:
-  BASE_IMAGE: ${{ inputs.base_image || 'rocm/atom-dev:latest' }}
-  GITHUB_REPO_URL: https://github.com/ROCm/ATOM.git
-  GITHUB_COMMIT_SHA: ${{ github.sha }}
-  VALIDATION_IMAGE_REPO: rocm/atom-dev
+        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
 
 jobs:
   parse-param-lists:
@@ -62,7 +56,7 @@ jobs:
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
-          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;1024,8192,128,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8' }}"
+          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
           echo "Using param_lists: ${PARAM_LISTS}"
           printf 'param_lists=%s\n' "${PARAM_LISTS}" >> "$GITHUB_OUTPUT"
           IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
@@ -74,6 +68,13 @@ jobs:
             OUTPUT_LEN="${PARAMS[1]}"
             CONCURRENCY="${PARAMS[2]}"
             RANDOM_RANGE_RATIO="${PARAMS[3]}"
+            case "${CONCURRENCY}" in
+              4|8|16|32|64) ;;
+              *)
+                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64"
+                exit 1
+                ;;
+            esac
             MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
             SEP=","
           done
@@ -94,84 +95,13 @@ jobs:
       - id: load
         run: echo "models_json=$(jq -c . .github/benchmark/oot_benchmark_models.json)" >> "$GITHUB_OUTPUT"
 
-  build-oot-image:
-    name: Build OOT benchmark image
-    runs-on: build-only-atom
-    outputs:
-      oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
-    steps:
-      - name: Checkout ATOM repo
-        uses: actions/checkout@v6
-
-      - name: Docker Login
-        run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-
-      - name: Generate OOT base Dockerfile
-        run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.BASE_IMAGE }}
-          RUN pip install -U lm-eval[api]
-          RUN pip show lm-eval || true
-          RUN pip install hf_transfer
-          RUN pip show hf_transfer || true
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
-          RUN pip uninstall -y amd-aiter
-          RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip show pybind11
-          RUN rm -rf /app/aiter-test
-          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
-              cd /app/aiter-test && \\
-              git checkout HEAD && \\
-              git submodule sync && git submodule update --init --recursive && \\
-              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
-          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
-          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
-          RUN pip uninstall -y atom
-          RUN rm -rf /app/ATOM
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
-              cd /app/ATOM && \\
-              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
-              pip install -e .
-          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          EOF
-
-      - name: Build OOT base image
-        run: |
-          docker build --pull --network=host \
-            --no-cache \
-            -t atom_oot_base:benchmark \
-            -f Dockerfile.mod .
-
-      - name: Build OOT vLLM image from current commit
-        id: meta
-        run: |
-          SHORT_SHA="${GITHUB_COMMIT_SHA::12}"
-          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-vllm-benchmark-v${{ inputs.vllm_version || '0.17' }}-${SHORT_SHA}-${{ github.run_id }}"
-          docker build --network=host \
-            --no-cache \
-            -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:benchmark" \
-            --build-arg MAX_JOBS=64 \
-            --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || 'b31e9326a7d9394aab8c767f8ebe225c65594b60' }}" \
-            --build-arg INSTALL_LM_EVAL=1 \
-            --build-arg INSTALL_FASTSAFETENSORS=1 \
-            -f docker/Dockerfile .
-          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Push OOT benchmark image
-        run: |
-          docker push "${{ steps.meta.outputs.oot_image_tag }}"
-
   benchmark:
     name: OOT ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
-    needs: [parse-param-lists, load-models, build-oot-image]
+    needs: [parse-param-lists, load-models]
     if: >-
       always()
       && needs.parse-param-lists.result == 'success'
       && needs.load-models.result == 'success'
-      && needs.build-oot-image.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -195,7 +125,7 @@ jobs:
       CONTAINER_NAME: atom_vllm_oot_benchmark_${{ strategy.job-index }}
       CONTAINER_RESULT_DIR: /tmp/oot-benchmark-results
       CONTAINER_BENCH_SERVING_DIR: /tmp/oot-benchmark/bench_serving
-      OOT_IMAGE_TAG: ${{ needs.build-oot-image.outputs.oot_image_tag }}
+      OOT_IMAGE_TAG: ${{ inputs.oot_image || 'rocm/atom-dev:vllm-latest' }}
       BENCH_SERVING_REPO_URL: https://github.com/kimbochen/bench_serving.git
     steps:
       - name: Check if model is enabled
@@ -205,7 +135,9 @@ jobs:
             deepseek-r1-fp8) echo "enabled=${{ inputs.deepseek-r1-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp4|kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
+            kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
@@ -233,9 +165,10 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
-      - name: Pull built OOT image
+      - name: Pull OOT benchmark image
         if: steps.check.outputs.enabled == 'true'
         run: |
+          echo "Pulling OOT benchmark image: ${OOT_IMAGE_TAG}"
           docker pull "${OOT_IMAGE_TAG}"
 
       - name: Prepare model cache mount

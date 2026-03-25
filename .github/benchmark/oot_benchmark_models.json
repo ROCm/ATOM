@@ -7,7 +7,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "VLLM_ROCM_USE_AITER=1\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
     "display": "DeepSeek-R1 MXFP4",
@@ -17,7 +17,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "VLLM_ROCM_USE_AITER=1\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
     "display": "gpt-oss-120b",
@@ -27,7 +27,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "linux-atom-mi355-1",
-    "env_vars": "VLLM_ROCM_USE_AITER=1\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
   },
   {
     "display": "Kimi-K2-Thinking-MXFP4 TP4",
@@ -38,7 +38,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "VLLM_ROCM_USE_AITER=1\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
     "display": "Kimi-K2-Thinking-MXFP4 TP8",
@@ -49,6 +49,16 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "VLLM_ROCM_USE_AITER=1\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+  },
+  {
+    "display": "Qwen3.5-397B-A17B-FP8",
+    "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "path": "/models/Qwen3.5-397B-A17B-FP8",
+    "prefix": "qwen3-5-397b-a17b-fp8",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
   }
 ]
