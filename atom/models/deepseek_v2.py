@@ -729,13 +729,13 @@ def maybe_dual_stream_forward(
     """Dual-stream MoE forward: shared experts on alt stream, routed on main."""
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    # DUAL_STREAM_TOKEN_THRESHOLD = 1024
+    DUAL_STREAM_TOKEN_THRESHOLD = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
     num_tokens, hidden_dim = hidden_states.shape
     if (
         self._use_dual_stream
         and num_tokens > 0
-        # and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
-        and not get_forward_context().context.is_prefill
+        and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
+        # and not get_forward_context().context.is_prefill
     ):
         return self.dual_stream_moe_forward(hidden_states)
     else:
