@@ -160,8 +160,12 @@ class MLAAttentionImplPluginModeMethods:
         return k
 
     def _v_up_proj(self, x, out):
+        # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         out = out.view(-1, self.num_heads, self.v_head_dim)
+        # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
+        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
+        # Convert from (B, N, L) to (N, B, L)
         if self.is_aiter_triton_fp4_bmm_enabled:
             out = batched_gemm_a16wfp4(
                 x,
@@ -172,6 +176,7 @@ class MLAAttentionImplPluginModeMethods:
                 prequant=True,
                 y_scale=None,
             )
+            # x = x.transpose(0, 1).flatten(1, 2)
             x = out.view(-1, self.num_heads * self.v_head_dim)
         else:
             _aiter_triton_fp8_bmm(
@@ -682,8 +687,7 @@ class MLAAttentionImplPluginModeMethods:
         if self.dcp_world_size == -1:
             self.dcp_world_size = get_dcp_group().world_size
             self._use_persistent_decode = (
-                self.use_persistent_mla_decode_metadata
-                and not (self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8")
+                not (self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8")
             )
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
@@ -913,9 +917,6 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
         self.is_aiter_triton_fp4_bmm_enabled = (
             envs.ATOM_USE_TRITON_MXFP4_BMM
             and self.kv_b_proj.weight.dtype == torch.bfloat16
-        )
-        self.use_persistent_mla_decode_metadata = (
-            envs.ATOM_USE_PERSISTENT_MLA_DECODE_METADATA
         )
         self._use_persistent_decode = False
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
