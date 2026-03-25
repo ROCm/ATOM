@@ -90,10 +90,36 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
+      has_enabled_models: ${{ steps.load.outputs.has_enabled_models }}
     steps:
       - uses: actions/checkout@v6
       - id: load
-        run: echo "models_json=$(jq -c . .github/benchmark/oot_benchmark_models.json)" >> "$GITHUB_OUTPUT"
+        env:
+          ENABLE_DEEPSEEK_R1_FP8: ${{ inputs.deepseek-r1-fp8 }}
+          ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4 }}
+          ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b }}
+          ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
+          ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
+          ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
+        run: |
+          MODELS_JSON="$(jq -c '
+            map(select(
+              (.prefix == "deepseek-r1-fp8" and env.ENABLE_DEEPSEEK_R1_FP8 == "true")
+              or (.prefix == "deepseek-r1-mxfp4" and env.ENABLE_DEEPSEEK_R1_MXFP4 == "true")
+              or (.prefix == "gpt-oss-120b" and env.ENABLE_GPT_OSS_120B == "true")
+              or (.prefix == "kimi-k2-thinking-mxfp4-tp4" and env.ENABLE_KIMI_K2_TP4 == "true")
+              or (.prefix == "kimi-k2-thinking-mxfp4-tp8" and env.ENABLE_KIMI_K2_TP8 == "true")
+              or (.prefix == "qwen3-5-397b-a17b-fp8" and env.ENABLE_QWEN3_5_397B_A17B_FP8 == "true")
+            ))
+          ' .github/benchmark/oot_benchmark_models.json)"
+          echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
+          if [ "${MODELS_JSON}" = "[]" ]; then
+            echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
+            echo "No models selected for OOT benchmark."
+          else
+            echo "has_enabled_models=true" >> "$GITHUB_OUTPUT"
+            echo "Selected models: ${MODELS_JSON}"
+          fi
 
   benchmark:
     name: OOT ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
@@ -102,6 +128,7 @@ jobs:
       always()
       && needs.parse-param-lists.result == 'success'
       && needs.load-models.result == 'success'
+      && needs.load-models.outputs.has_enabled_models == 'true'
     strategy:
       fail-fast: false
       matrix:
