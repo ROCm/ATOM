@@ -79,7 +79,7 @@ The expected response:
     "id": "chatcmpl-941a3736cc5cce95",
     "object": "chat.completion",
     "created": 1774365813,
-    "model": "/workspace/shared/data/models/Kimi-K2.5-MXFP4",
+    "model": ""amd/Kimi-K2.5-MXFP4",
     "choices": [
         {
             "index": 0,

@@ -612,7 +612,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
 
     # vLLM oot supports text + vision for Kimi_K2.5
     if is_vllm():
-        _MULTIMODAL_MODEL_TYPES.pop("kimi_k25")
+        _MULTIMODAL_MODEL_TYPES.pop("kimi_k25", None)
     # For multimodal models, extract the text sub-config so the rest of ATOM
     # (which is text-only today) works transparently.
     if model_type in _MULTIMODAL_MODEL_TYPES:
