@@ -26,7 +26,7 @@
     "prefix": "gpt-oss-120b",
     "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
-    "runner": "linux-atom-mi355-1",
+    "runner": "atom-mi355-8gpu.predownload",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
   },
   {
@@ -37,7 +37,7 @@
     "prefix": "kimi-k2-thinking-mxfp4-tp4",
     "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
-    "runner": "linux-atom-mi355-4",
+    "runner": "atom-mi355-8gpu.predownload",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
