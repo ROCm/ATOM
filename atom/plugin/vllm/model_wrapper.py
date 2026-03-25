@@ -121,8 +121,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
-        # Thread live runtime positions through vLLM's per-forward context to
-        # avoid the extra device-to-device copy into ATOM's static buffer.
+        # pass positions from vLLM to OOT execution path via vLLM's per-forward context
         if is_forward_context_available():
             get_vllm_forward_context().additional_kwargs["atom_positions"] = positions
         elif "positions" in self.atom_config.compilation_config.static_forward_context:

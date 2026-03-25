@@ -764,7 +764,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
 
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
-        # paged_kv_indptr[0] is already 0 from initialization; cumsum writes [1:].
         torch.cumsum(
             seq_lens_device,
             dim=0,
