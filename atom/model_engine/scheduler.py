@@ -325,6 +325,9 @@ class Scheduler:
         self.cache_stats: Optional[CacheStats] = (
             CacheStats() if config.enable_prefix_caching else None
         )
+        # Track which seq IDs were partial prefill in the previous step.
+        # Their deferred output tokens are garbage and must be discarded.
+        self._prev_partial_prefill_ids: set[int] = set()
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -509,6 +512,12 @@ class Scheduler:
             # Partial prefill: KV written but prefill not complete — discard sampled token
             if seq.id in partial_prefill_ids:
                 continue
+            # Deferred output from a previous partial prefill step is garbage —
+            # discard it. Placeholders will be appended below so the next
+            # step's real first completion token can be written properly.
+            if seq.id in self._prev_partial_prefill_ids:
+                self._prev_partial_prefill_ids.discard(seq.id)
+                continue
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
             if self.spec_stats:
@@ -602,7 +611,10 @@ class Scheduler:
         if need_placeholder:
             # placeholder for the each decode step
             for seq in seqs:
-                if seq.status == SequenceStatus.RUNNING:
+                if (
+                    seq.status == SequenceStatus.RUNNING
+                    and seq.id not in partial_prefill_ids
+                ):
                     num = num_placeholder - seq.num_rejected
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
@@ -612,6 +624,8 @@ class Scheduler:
         for seq in finished_seqs:
             self.block_manager.deallocate(seq)
             self.running.remove(seq)
+        # Save partial prefill IDs for next step's deferred output filtering
+        self._prev_partial_prefill_ids = partial_prefill_ids
         return finished_seqs
 
     def get_request_counts(self) -> tuple[int, int]:
