@@ -37,7 +37,7 @@
     "prefix": "kimi-k2-thinking-mxfp4-tp4",
     "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
-    "runner": "atom-mi355-8gpu.predownload",
+    "runner": "linux-atom-mi355-4",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
