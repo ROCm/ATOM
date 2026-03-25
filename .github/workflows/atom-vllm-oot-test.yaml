@@ -141,7 +141,7 @@ jobs:
             extra_args: "--tensor-parallel-size 1"
             env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
             accuracy_test_threshold: 0.38
-            runner: linux-atom-mi355-1
+            runner: linux-atom-mi355-4
           - model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--tensor-parallel-size 4"
@@ -150,7 +150,7 @@ jobs:
             runner: linux-atom-mi355-4
           - model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B"
-            extra_args: "--tensor-parallel-size 2 --max-model-len 16384"
+            extra_args: "--tensor-parallel-size 2"
             env_vars: "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1"
             accuracy_test_threshold: 0.85
             runner: linux-atom-mi355-4
