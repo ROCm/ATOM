@@ -27,7 +27,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
   },
   {
     "display": "Kimi-K2-Thinking-MXFP4 TP4",
