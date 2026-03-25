@@ -56,14 +56,15 @@ def set_attn_cls() -> None:
 
 def init_aiter_dist(config: Config) -> None:
     """
-    Initialize aiter dist for using aiter custom collective op
+    Initialize aiter dist for using aiter custom collective op.
+
+    In vLLM plugin mode, tries to reuse vLLM's TP group and inject aiter's ca_comm
+    first (single IPC init, avoids 2x reduce slowdown). Falls back to init_dist_env
+    if reuse fails.
     """
     logger.info(
         "Initialize aiter dist for using aiter custom collective op for plugin mode"
     )
-
-    from aiter import init_dist_env
-    from aiter.dist.utils import get_distributed_init_method
 
     rank = config.plugin_config.rank
     tensor_parallel_size = config.tensor_parallel_size
@@ -71,6 +72,16 @@ def init_aiter_dist(config: Config) -> None:
     assert (
         config.plugin_config.is_plugin_mode
     ), "Make sure ATOM is running in plugin mode"
+
+    if config.plugin_config.is_vllm:
+        from atom.plugin.vllm.tp_group_reuse import init_aiter_tp_from_vllm
+
+        if init_aiter_tp_from_vllm(tensor_parallel_size):
+            return
+
+    # Fallback: create aiter's own groups (vLLM reuse failed or non-vLLM plugin)
+    from aiter import init_dist_env
+    from aiter.dist.utils import get_distributed_init_method
 
     if config.plugin_config.is_vllm:
         dp_master_ip = config.parallel_config.data_parallel_master_ip

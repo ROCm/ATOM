@@ -137,6 +137,13 @@ class EngineCore:
             self.runner_mgr.call_func("exit")
         except Exception:
             pass  # shared memory may already be freed
+        for proc in self.runner_mgr.procs:
+            try:
+                alive = proc.is_alive()
+            except ValueError:
+                continue  # process object already closed by CoreManager
+            if alive:
+                proc.join(timeout=5)
         self._send_engine_dead()
         logger.debug(f"{self.label}: model runner exit")
 

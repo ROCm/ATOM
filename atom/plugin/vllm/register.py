@@ -24,6 +24,8 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "GptOssForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV3ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
 }
 
 
@@ -112,3 +114,9 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+
+    # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
+    # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives
+    from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
+
+    apply_graph_capture_patch()

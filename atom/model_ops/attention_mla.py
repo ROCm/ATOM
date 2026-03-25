@@ -19,12 +19,14 @@ from aiter import (
 )
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
+from atom.plugin import is_plugin_mode
+from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-
 from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,
@@ -35,11 +37,6 @@ from torch import nn
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
-
-
-from atom.plugin import is_plugin_mode
-
-from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
 
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
@@ -138,10 +135,12 @@ class MLAAttention(nn.Module):
                 f"Padded head count ({self.padded_num_heads}) must be divisible "
                 f"by num_heads ({num_heads}) for head repeat"
             )
-            logger.info(
-                f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
-                f"(repeat factor {self.head_repeat_factor})"
-            )
+            if not getattr(MLAAttention, "_head_repeat_logged", False):
+                MLAAttention._head_repeat_logged = True
+                logger.info(
+                    f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
+                    f"(repeat factor {self.head_repeat_factor})"
+                )
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -479,7 +478,7 @@ class MLAAttention(nn.Module):
                 attn_metadata.token_to_seq_idxs,
                 self.topk_indices_buffer[:B],
                 attn_metadata.block_tables,
-                attn_metadata.cu_seqlens_q,
+                attn_metadata.cu_seqlens_k,
                 NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
             )
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
@@ -563,7 +562,7 @@ class MLAAttention(nn.Module):
         #     q_scale = kv_scale = self.one_scale
 
         dp_size = get_dp_group().world_size
-        use_persistent_mode = not (dp_size > 1 and self.kv_cache_dtype == "fp8")
+        use_persistent_mode = not (dp_size > 1)
 
         if not use_persistent_mode:
             # DP : disable persistent mode to avoid overflow
@@ -634,6 +633,12 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
+            use_prefix_cache = (
+                attn_metadata.has_cached
+                and not is_rocm_aiter_fp4bmm_enabled()
+                and self.qk_nope_head_dim == self.v_head_dim
+            )
+
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
@@ -650,9 +655,58 @@ class MLAAttention(nn.Module):
                     scale=self._k_scale,
                 )
 
-            output = self._forward_prefill_mha(
-                prefill_q, k_nope, k_rope, kv_cache, attn_metadata
-            )
+            if use_prefix_cache:
+                # k_full/v_full are used for attention compute; gather_kv_b_proj reads
+                # fp8 from cache and dequantizes internally, so output must be model dtype
+                k_full = torch.empty(
+                    (
+                        attn_metadata.total_kv,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    ),
+                    device=q.device,
+                    dtype=self.dtype,
+                )
+                v_full = torch.empty(
+                    (
+                        attn_metadata.total_kv,
+                        self.num_heads,
+                        self.qk_nope_head_dim,
+                    ),
+                    device=q.device,
+                    dtype=self.dtype,
+                )
+
+                gather_kv_b_proj(
+                    kv_cache,
+                    self._k_scale,
+                    attn_metadata.kv_indptr,
+                    attn_metadata.kv_indices,
+                    attn_metadata.cu_seqlens_k,
+                    self.kv_b_proj.weight,
+                    self.kv_b_proj.weight_scale,
+                    k_full,
+                    v_full,
+                    weight_preshuffle=True,
+                )
+                output = flash_attn_varlen_func(
+                    q=prefill_q,
+                    k=k_full,
+                    v=v_full,
+                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                    cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                    max_seqlen_q=attn_metadata.max_seqlen_q,
+                    max_seqlen_k=attn_metadata.max_seqlen_k,
+                    min_seqlen_q=attn_metadata.min_seqlen_q,
+                    dropout_p=attn_metadata.dropout_p,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+                output = self.o_proj(output.flatten(start_dim=-2))
+            else:
+                output = self._forward_prefill_mha(
+                    prefill_q, k_nope, k_rope, kv_cache, attn_metadata
+                )
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 

@@ -1,0 +1,54 @@
+[
+  {
+    "display": "DeepSeek-R1 FP8",
+    "source_path": "deepseek-ai/DeepSeek-R1-0528",
+    "path": "/models/DeepSeek-R1-0528",
+    "prefix": "deepseek-r1-fp8",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+  },
+  {
+    "display": "DeepSeek-R1 MXFP4",
+    "source_path": "amd/DeepSeek-R1-0528-MXFP4",
+    "path": "/models/DeepSeek-R1-0528-MXFP4",
+    "prefix": "deepseek-r1-mxfp4",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+  },
+  {
+    "display": "gpt-oss-120b",
+    "source_path": "amd/gpt-oss-120b-w-mxfp4-a-fp8",
+    "path": "/models/gpt-oss-120b",
+    "prefix": "gpt-oss-120b",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "linux-atom-mi355-1",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+  },
+  {
+    "display": "Kimi-K2-Thinking-MXFP4 TP4",
+    "dashboard_model": "Kimi-K2-Thinking-MXFP4-tp4",
+    "source_path": "amd/Kimi-K2-Thinking-MXFP4",
+    "path": "/models/Kimi-K2-Thinking-MXFP4",
+    "prefix": "kimi-k2-thinking-mxfp4-tp4",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+  },
+  {
+    "display": "Kimi-K2-Thinking-MXFP4 TP8",
+    "dashboard_model": "Kimi-K2-Thinking-MXFP4-tp8",
+    "source_path": "amd/Kimi-K2-Thinking-MXFP4",
+    "path": "/models/Kimi-K2-Thinking-MXFP4",
+    "prefix": "kimi-k2-thinking-mxfp4-tp8",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+  }
+]

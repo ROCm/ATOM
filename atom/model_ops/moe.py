@@ -688,6 +688,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
+        # Zero-fill padding region: FP4 dtype doesn't support torch.zeros,
+        # so we zero the underlying bytes to avoid garbage in padded rows.
+        w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w13_weight_scale = torch.nn.Parameter(
@@ -727,6 +730,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
+        w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
@@ -789,7 +793,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = None
             layer.w2_weight_scale = None
             return
-        elif layer.activation == ActivationType.Swiglu and layer.w13_bias is not None:
+        elif layer.activation == ActivationType.Swiglu:
             e, n, k = layer.w13_weight.shape
             layer.w13_weight.view(torch.uint8).copy_(
                 layer.w13_weight.data.view(torch.uint8)
@@ -816,12 +820,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.num_experts,
                 False,
             )
-            layer.w13_bias.data = (
-                layer.w13_bias.data.view(-1, n // 2, 2)
-                .permute(0, 2, 1)
-                .contiguous()
-                .view(-1, n)
-            )
+            if layer.w13_bias is not None:
+                layer.w13_bias.data = (
+                    layer.w13_bias.data.view(-1, n // 2, 2)
+                    .permute(0, 2, 1)
+                    .contiguous()
+                    .view(-1, n)
+                )
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
             shuffle_weights(layer.w13_weight, layer.w2_weight)
@@ -1891,7 +1896,7 @@ class FusedMoE(torch.nn.Module):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
-        has_bias: bool = True,
+        has_bias: bool = False,
         activation: ActivationType = ActivationType.Silu,
         shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
@@ -2003,10 +2008,6 @@ class FusedMoE(torch.nn.Module):
 
         self.use_chunked = get_dp_group().world_size > 1
 
-        if self.scoring_func != "softmax" and not self.use_grouped_topk:
-            raise ValueError(
-                "Only softmax scoring function is supported for " "non-grouped topk."
-            )
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,
             experts_per_token=self.top_k,
@@ -2224,10 +2225,10 @@ class FusedMoE(torch.nn.Module):
             if load_shard_size != shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
-        if expert_data.dtype != dtypes.fp4x2:
-            expert_data.copy_(loaded_weight)
-        else:
+        if expert_data.dtype == dtypes.fp4x2:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
+        else:
+            expert_data.copy_(loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -2503,14 +2504,36 @@ class FusedMoE(torch.nn.Module):
                 num_fused_shared_experts=num_fused_shared_experts,
             )
         else:
-            topk_weights, topk_ids = fused_topk(
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_fused_shared_experts=num_fused_shared_experts,
-                num_routing_experts=num_routing_experts,
-                fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
-            )
+            if scoring_func == "softmax":
+                topk_weights, topk_ids = fused_topk(
+                    gating_output=router_logits,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    num_routing_experts=num_routing_experts,
+                    fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+                )
+            elif scoring_func == "sigmoid":
+                routing_weights = torch.sigmoid(router_logits.float())
+                scores_for_choice = routing_weights
+                if e_score_correction_bias is not None:
+                    scores_for_choice = scores_for_choice + e_score_correction_bias
+
+                topk_ids = torch.topk(
+                    scores_for_choice, top_k, dim=-1, sorted=False
+                ).indices
+                topk_weights = routing_weights.gather(dim=-1, index=topk_ids)
+
+                if renormalize:
+                    topk_weights = topk_weights / topk_weights.sum(
+                        dim=-1, keepdim=True
+                    ).clamp_min(1e-20)
+
+                topk_ids = topk_ids.to(torch.int32)
+            else:
+                raise ValueError(
+                    f"Unsupported scoring function for non-grouped topk: {scoring_func}"
+                )
 
         return topk_weights, topk_ids
 
