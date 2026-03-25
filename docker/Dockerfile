@@ -48,8 +48,8 @@ RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" 
     sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt && \
     "${VENV_PYTHON}" -m pip install --no-deps xgrammar==0.1.29 compressed-tensors==0.13.0 loguru && \
     sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' requirements/rocm.txt && \
-    "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 && \
-    transformers==5.2.0 && "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
+    "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 \
+    && "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt && pip install transformers==5.2.0
 
 RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
     cd /opt/rocm/share/amd_smi && \
