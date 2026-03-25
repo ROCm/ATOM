@@ -772,8 +772,11 @@ class vllmMLAAttentionMetadataBuilderMethods:
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-        max_qo_len = (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item() \
-            if query_start_loc_cpu.numel() > 1 else 1
+        max_qo_len = (
+            (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item()
+            if query_start_loc_cpu.numel() > 1
+            else 1
+        )
 
         kv_indices_generate_triton(
             block_table_tensor,
@@ -787,10 +790,15 @@ class vllmMLAAttentionMetadataBuilderMethods:
         # For pure decode, query_start_loc is [0,1,2,...,N]; skip the DtoD copy
         # and populate qo_indptr using an in-place arange when possible.
         if num_decode_tokens == num_reqs:
-            if not getattr(self, "_qo_indptr_arange_ready", False) or \
-               getattr(self, "_qo_indptr_arange_n", 0) != num_reqs:
+            if (
+                not getattr(self, "_qo_indptr_arange_ready", False)
+                or getattr(self, "_qo_indptr_arange_n", 0) != num_reqs
+            ):
                 torch.arange(
-                    0, num_reqs + 1, dtype=torch.int32, device=device,
+                    0,
+                    num_reqs + 1,
+                    dtype=torch.int32,
+                    device=device,
                     out=self.qo_indptr[: num_reqs + 1],
                 )
                 if num_reqs + 1 < self.qo_indptr.shape[0]:
@@ -806,9 +814,7 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
-            num_reqs, qo_indptr, 1
-        )
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(

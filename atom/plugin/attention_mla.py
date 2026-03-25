@@ -548,7 +548,12 @@ class MLAAttentionImplPluginModeMethods:
     def _get_decode_output_buffer(self, B, dtype, device):
         """Return a pre-allocated decode output buffer, growing if needed."""
         buf = getattr(self, "_decode_o_buf", None)
-        if buf is None or buf.shape[0] < B or buf.dtype != dtype or buf.device != device:
+        if (
+            buf is None
+            or buf.shape[0] < B
+            or buf.dtype != dtype
+            or buf.device != device
+        ):
             self._decode_o_buf = torch.empty(
                 max(B, getattr(self, "_decode_o_buf_cap", 0)),
                 self.padded_num_heads,
@@ -654,6 +659,7 @@ class MLAAttentionImplPluginModeMethods:
             from vllm import _custom_ops as ops
             from vllm.platforms import current_platform
             from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
             self._cached_ops = ops
             self._cached_current_platform = current_platform
             self._cached_get_dcp_group = get_dcp_group
@@ -685,8 +691,8 @@ class MLAAttentionImplPluginModeMethods:
 
         if self.dcp_world_size == -1:
             self.dcp_world_size = get_dcp_group().world_size
-            self._use_persistent_decode = (
-                not (self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8")
+            self._use_persistent_decode = not (
+                self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
             )
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
@@ -733,7 +739,9 @@ class MLAAttentionImplPluginModeMethods:
 
         if not decode_only:
             if not hasattr(self, "_has_fused_rope_cache"):
-                self._has_fused_rope_cache = hasattr(ops, "concat_and_cache_mla_rope_fused")
+                self._has_fused_rope_cache = hasattr(
+                    ops, "concat_and_cache_mla_rope_fused"
+                )
             if kv_cache.numel() > 0 and self._has_fused_rope_cache:
                 ops.concat_and_cache_mla_rope_fused(
                     positions,
