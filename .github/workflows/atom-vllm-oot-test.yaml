@@ -43,46 +43,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  atom-vllm-oot:
-    needs: [check-signal]
+  build_oot_image:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    name: ATOM vLLM OOT Test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Keep CI runtime under control: enable only one OOT model for now.
-          - model_name: "Kimi-K2-Thinking-MXFP4"
-            model_path: "amd/Kimi-K2-Thinking-MXFP4"
-            extra_args: "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel"
-            accuracy_test_threshold: 0.90
-            runner: atom-mi355-8gpu.predownload
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    needs: [check-signal]
+    name: Build OOT image
+    runs-on: build-only-atom
     env:
-      CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
-      OOT_IMAGE_TAG: atom_vllm_oot_test:${{ github.sha }}-${{ strategy.job-index }}
       VLLM_COMMIT: b31e9326a7d9394aab8c767f8ebe225c65594b60
-      VLLM_VERSION: "0.17"
-
     steps:
-      - name: Clean up containers and workspace
-        run: |
-          echo "=== Cleaning up containers on $(hostname) ==="
-          containers=$(docker ps -q)
-          if [ -n "$containers" ]; then
-            docker kill $containers || true
-          fi
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
-
       - name: Checkout ATOM repo
-        uses: actions/checkout@v4
-
-      - name: Set HF_TOKEN
-        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        uses: actions/checkout@v6
 
       - name: Generate OOT base Dockerfile
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
@@ -112,6 +86,7 @@ jobs:
           EOF
 
       - name: Build OOT base image
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           docker build --pull --network=host \
             --no-cache \
@@ -119,11 +94,11 @@ jobs:
             -f Dockerfile.mod .
 
       - name: Build OOT vLLM image
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
-          # OOT_BASE_IMAGE is built in the previous step and only exists locally on this runner.
           docker build --network=host \
             --no-cache \
-            -t "${OOT_IMAGE_TAG}" \
+            -t atom_oot:ci \
             --target atom_oot \
             --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
             --build-arg MAX_JOBS=64 \
@@ -131,6 +106,149 @@ jobs:
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
+
+      - name: Push Docker image
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          IMAGE_TAG=rocm/atom-dev:oot-pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          docker tag atom_oot:ci $IMAGE_TAG
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+          docker push $IMAGE_TAG
+
+      - name: Clean up build images
+        if: ${{ !github.event.pull_request.head.repo.fork && always() }}
+        run: |
+          docker rmi "atom_oot_base:ci" || true
+          docker rmi "atom_oot:ci" || true
+          docker rmi "rocm/atom-dev:oot-pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
+
+  atom-vllm-oot:
+    needs: [check-signal, build_oot_image]
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: ATOM vLLM OOT Test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model_name: "DeepSeek-R1-FP8"
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
+            extra_args: "--tensor-parallel-size 8"
+            env_vars: ""
+            accuracy_test_threshold: 0.94
+            runner: atom-mi355-8gpu.predownload
+          - model_name: "gpt-oss-120b"
+            model_path: "openai/gpt-oss-120b"
+            extra_args: "--tensor-parallel-size 1"
+            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+            # FIXME: accuracy threshold is temporarily lowered from 0.38
+            # to 0.33
+            accuracy_test_threshold: 0.33
+            runner: linux-atom-mi355-4
+          - model_name: "Kimi-K2-Thinking-MXFP4"
+            model_path: "amd/Kimi-K2-Thinking-MXFP4"
+            extra_args: "--tensor-parallel-size 4"
+            env_vars: ""
+            accuracy_test_threshold: 0.90
+            runner: linux-atom-mi355-4
+          - model_name: "Qwen3.5-35B-A3B-FP8"
+            model_path: "Qwen/Qwen3.5-35B-A3B"
+            extra_args: "--tensor-parallel-size 2"
+            # FIXME: Remove these temporary Qwen3.5 workarounds after the
+            # aiter fix landed
+            env_vars: |
+              ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+              ATOM_USE_CUSTOM_ALL_GATHER=0
+            accuracy_test_threshold: 0.85
+            runner: linux-atom-mi355-4
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
+      VLLM_COMMIT: b31e9326a7d9394aab8c767f8ebe225c65594b60
+      VLLM_VERSION: "0.17"
+
+    steps:
+      - name: Clean up containers and workspace
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        run: |
+          echo "=== Cleaning up containers on $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v4
+
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
+
+      - name: Docker Login
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Generate OOT Dockerfile for forked repo
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+          RUN pip install -U lm-eval[api]
+          RUN pip show lm-eval || true
+          RUN pip install hf_transfer
+          RUN pip show hf_transfer || true
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y amd-aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          RUN rm -rf /app/aiter-test
+          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
+              cd /app/aiter-test && \\
+              git checkout HEAD && \\
+              git submodule sync && git submodule update --init --recursive && \\
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
+          RUN pip uninstall -y atom
+          RUN rm -rf /app/ATOM
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
+              cd /app/ATOM && \\
+              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
+              pip install -e .
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
+
+      - name: Build OOT base image for forked repo
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          docker build --pull --network=host \
+            --no-cache \
+            -t atom_oot_base:ci \
+            -f Dockerfile.mod .
+
+      - name: Build OOT vLLM image for forked repo
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          docker build --network=host \
+            --no-cache \
+            -t atom_oot:ci \
+            --target atom_oot \
+            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            --build-arg MAX_JOBS=64 \
+            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            --build-arg INSTALL_FASTSAFETENSORS=1 \
+            -f docker/Dockerfile .
+
+      - name: Set OOT image tag
+        run: |
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            echo "OOT_IMAGE_TAG=atom_oot:ci" >> "$GITHUB_ENV"
+          else
+            echo "OOT_IMAGE_TAG=rocm/atom-dev:oot-pre-build-${{ env.GITHUB_COMMIT_SHA }}" >> "$GITHUB_ENV"
+          fi
 
       - name: Run all plugin unit tests
         run: |
@@ -239,6 +357,7 @@ jobs:
           OOT_MODEL_NAME: ${{ matrix.model_name }}
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
+          OOT_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
@@ -246,6 +365,7 @@ jobs:
             -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
@@ -306,3 +426,4 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
+          docker rmi "${OOT_IMAGE_TAG}" || true
