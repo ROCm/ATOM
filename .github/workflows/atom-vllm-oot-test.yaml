@@ -143,7 +143,7 @@ jobs:
             # FIXME: accuracy threshold is temporarily lowered from 0.38
             # to 0.33
             accuracy_test_threshold: 0.33
-            runner: linux-atom-mi355-4
+            runner: linux-atom-mi355-1
           - model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--tensor-parallel-size 4"
