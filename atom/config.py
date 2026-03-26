@@ -597,6 +597,11 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "kimi_k25": "text_config",
 }
 
+# multimodal models fully supported by plugin mode
+_PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
+    "kimi_k25",
+}
+
 
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
@@ -610,9 +615,9 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             return token
         return None
 
-    # vLLM oot supports text + vision for Kimi_K2.5
     if is_vllm():
-        _MULTIMODAL_MODEL_TYPES.pop("kimi_k25", None)
+        for model_name in _PLUGIN_SUPPORTED_MULTIMODAL_MODELS:
+            _MULTIMODAL_MODEL_TYPES.pop(model_name, None)
     # For multimodal models, extract the text sub-config so the rest of ATOM
     # (which is text-only today) works transparently.
     if model_type in _MULTIMODAL_MODEL_TYPES:
