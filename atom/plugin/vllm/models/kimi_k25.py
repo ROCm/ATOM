@@ -1,10 +1,23 @@
 from typing import Any, Iterable, Optional, Union
 
 import torch
-from torch import nn
-
 from aiter.dist.parallel_state import get_pp_group
+from torch import nn
+from vllm.model_executor.models.kimi_k25 import (
+    KimiK25DummyInputsBuilder,
+    KimiK25ForConditionalGeneration as vLLMKimiK25,
+    KimiK25MultiModalProcessor,
+    KimiK25ProcessingInfo,
+)
+from vllm.model_executor.models.kimi_k25_vit import (
+    KimiK25MultiModalProjector,
+    MoonViT3dPretrainedModel,
+)
+from vllm.multimodal import MULTIMODAL_REGISTRY
+
 from atom.config import Config
+from atom.model_config.kimi_k25 import KimiK25Config
+from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV2Model
@@ -15,7 +28,9 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 from atom.utils.decorators import support_torch_compile
+
 
 @support_torch_compile
 class KimiK25Model(DeepseekV2Model):
@@ -65,14 +80,12 @@ class KimiK25Model(DeepseekV2Model):
             )
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size
-            )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
         )
 
-class KimiK25ForCausalLM(nn.Module):
 
+class KimiK25ForCausalLM(nn.Module):
     def __init__(
         self,
         atom_config: Config,
@@ -164,23 +177,6 @@ class KimiK25ForCausalLM(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
-from vllm.model_executor.models.kimi_k25 import (
-    KimiK25ForConditionalGeneration as vLLMKimiK25,
-)
-from vllm.model_executor.models.kimi_k25 import (
-    KimiK25ProcessingInfo,
-    KimiK25DummyInputsBuilder,
-    KimiK25MultiModalProcessor,
-)
-from vllm.model_executor.models.kimi_k25_vit import (
-    MoonViT3dPretrainedModel,
-    KimiK25MultiModalProjector,
-)
-from vllm.multimodal import MULTIMODAL_REGISTRY
-
-from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
-from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
-from atom.model_config.kimi_k25 import KimiK25Config
 
 @MULTIMODAL_REGISTRY.register_processor(
     KimiK25MultiModalProcessor,
@@ -289,6 +285,7 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     KimiK25MultiModalProcessor,
