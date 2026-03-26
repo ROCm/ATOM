@@ -1,6 +1,6 @@
 [
   {
-    "display": "DeepSeek-R1 FP8",
+    "display": "DeepSeek-R1 FP8 TP8",
     "source_path": "deepseek-ai/DeepSeek-R1-0528",
     "path": "/models/DeepSeek-R1-0528",
     "prefix": "deepseek-r1-fp8",
@@ -10,7 +10,7 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
-    "display": "DeepSeek-R1 MXFP4",
+    "display": "DeepSeek-R1 MXFP4 TP8",
     "source_path": "amd/DeepSeek-R1-0528-MXFP4",
     "path": "/models/DeepSeek-R1-0528-MXFP4",
     "prefix": "deepseek-r1-mxfp4",
@@ -20,7 +20,7 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
-    "display": "gpt-oss-120b",
+    "display": "gpt-oss-120b TP1",
     "source_path": "amd/gpt-oss-120b-w-mxfp4-a-fp8",
     "path": "/models/gpt-oss-120b",
     "prefix": "gpt-oss-120b",
@@ -52,7 +52,7 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
-    "display": "Qwen3.5-397B-A17B-FP8",
+    "display": "Qwen3.5-397B-A17B-FP8 TP8",
     "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
     "path": "/models/Qwen3.5-397B-A17B-FP8",
     "prefix": "qwen3-5-397b-a17b-fp8",

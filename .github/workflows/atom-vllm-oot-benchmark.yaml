@@ -8,31 +8,31 @@ on:
   workflow_dispatch:
     inputs:
       deepseek-r1-fp8:
-        description: "Benchmark DeepSeek-R1 FP8"
+        description: "DeepSeek-R1 FP8 TP8"
         type: boolean
         default: false
       deepseek-r1-mxfp4:
-        description: "Benchmark DeepSeek-R1 MXFP4"
+        description: "DeepSeek-R1 MXFP4 TP8"
         type: boolean
         default: false
       gpt-oss-120b:
-        description: "Benchmark gpt-oss-120b"
+        description: "gpt-oss-120b TP1"
         type: boolean
         default: false
       kimi-k2-thinking-mxfp4-tp4:
-        description: "Benchmark Kimi-K2-Thinking-MXFP4 TP4"
+        description: "Kimi-K2-Thinking-MXFP4 TP4"
         type: boolean
         default: false
       kimi-k2-thinking-mxfp4-tp8:
-        description: "Benchmark Kimi-K2-Thinking-MXFP4 TP8"
+        description: "Kimi-K2-Thinking-MXFP4 TP8"
         type: boolean
         default: false
       qwen3-5-397b-a17b-fp8:
-        description: "Benchmark Qwen3.5-397B-A17B-FP8"
+        description: "Qwen3.5-397B-A17B-FP8 TP8"
         type: boolean
         default: false
       oot_image:
-        description: "Prebuilt OOT benchmark image to pull when no custom rebuild is needed"
+        description: "Prebuilt OOT benchmark image used only for main-branch runs; ignored for non-main branches because a custom image is rebuilt from the selected branch"
         type: string
         default: "rocm/atom-dev:vllm-latest"
       param_lists:
@@ -132,10 +132,13 @@ jobs:
             "${OOT_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "${REBUILD_OOT_IMAGE}" == "true" ]]; then
-            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `.github/workflows/docker-release.yaml`\n' \
+            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `.github/workflows/docker-release.yaml`\n- Ignored prebuilt image input: `%s`\n' \
               "${OOT_BASE_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
-              "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
+              "${SELECTED_VLLM_COMMIT}" \
+              "${PREBUILT_OOT_IMAGE}" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '\nBecause branch `%s` is not `main`, a custom OOT docker is rebuilt from the selected branch and the prebuilt image input is ignored.\n' \
+              "${ATOM_REF}" >> "$GITHUB_STEP_SUMMARY"
           else
             printf -- '- Prebuilt image: `%s`\n- Expected vLLM version: `%s`\n- Expected vLLM commit: `%s`\n' \
               "${PREBUILT_OOT_IMAGE}" \
