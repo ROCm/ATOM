@@ -26,7 +26,7 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
-    "KimiK25ForConditionalGeneration": "atom.models.kimi_k25:KimiK25ForConditionalGeneration",
+    "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
 }
 
 

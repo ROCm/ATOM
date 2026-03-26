@@ -38,7 +38,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
-    "KimiK25ForConditionalGeneration": "atom.models.kimi_k25:KimiK25ForConditionalGeneration_",
+    "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
 }
 
 
