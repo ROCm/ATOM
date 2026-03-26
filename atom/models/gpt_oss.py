@@ -31,6 +31,7 @@ from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_wo
 
 # from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from aiter.rotary_embedding import get_rope
+from atom.plugin.prepare import is_vllm
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -63,20 +64,35 @@ def cdiv(x, y):
 class OAIAttention(nn.Module):
     def __init__(
         self,
-        config: GptOssConfig,
+        atom_config: Config,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: str = "bf16",
         prefix: str = "",
         layer_num: int = 0,
     ):
         super().__init__()
+        config = atom_config.hf_config
         self.layer_idx = layer_num
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.hidden_size = config.hidden_size
 
-        rope_params = config.rope_parameters
+        if is_vllm():
+            model_config = atom_config.plugin_config.vllm_config.model_config
+            text_hf_config = (
+                model_config.hf_text_config
+                if hasattr(model_config, "hf_text_config")
+                else model_config
+            )
+            rope_params = getattr(
+                text_hf_config,
+                "rope_parameters",
+                None,
+            )
+        else:
+            rope_params = getattr(config, "rope_parameters", None)
+
         rope_theta = rope_params["rope_theta"]
 
         if rope_params is None:
@@ -243,14 +259,13 @@ class TransformerBlock(torch.nn.Module):
     ):
         super().__init__()
 
-        config = atom_config.hf_config
         cache_config = atom_config.kv_cache_dtype
 
         self.layer_idx = layer_num
         self.hidden_size = atom_config.hf_config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.self_attn = OAIAttention(
-            config,
+            atom_config,
             prefix=f"{prefix}.self_attn",
             quant_config=quant_config,
             cache_config=cache_config,
@@ -260,7 +275,7 @@ class TransformerBlock(torch.nn.Module):
         # Fuse MoE AllReduce into input_layernorm for layers > 0.
         # Layer 0 receives already-reduced embedding output, so no fusion needed.
         self.input_layernorm = RMSNorm(
-            config.hidden_size,
+            atom_config.hf_config.hidden_size,
             eps=1e-5,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and layer_num > 0,
         )
@@ -268,7 +283,7 @@ class TransformerBlock(torch.nn.Module):
         # Padding for MXFP4 MoE GEMM alignment is now handled inside MLPBlock,
         # so this layernorm no longer needs x_pad_to_multiple.
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
+            atom_config.hf_config.hidden_size,
             eps=1e-5,
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.tp_size > 1,
             x_pad_to_multiple=0 if self.tp_size > 1 else 256,
