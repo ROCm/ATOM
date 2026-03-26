@@ -231,8 +231,11 @@ jobs:
 
   build-oot-image:
     name: Build custom OOT benchmark image
-    needs: [resolve-atom-source]
-    if: needs.resolve-atom-source.outputs.rebuild_oot_image == 'true'
+    needs: [resolve-atom-source, load-models]
+    if: >-
+      needs.resolve-atom-source.outputs.rebuild_oot_image == 'true'
+      && needs.load-models.result == 'success'
+      && needs.load-models.outputs.has_enabled_models == 'true'
     runs-on: build-only-atom
     outputs:
       oot_image_tag: ${{ steps.image-meta.outputs.oot_image_tag }}
@@ -706,7 +709,11 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          docker rmi "$OOT_IMAGE_TAG" || true
+          if [[ "${OOT_IMAGE_SOURCE}" == "rebuild" ]]; then
+            docker rmi "$OOT_IMAGE_TAG" || true
+          else
+            echo "Keeping prebuilt OOT image cached on runner: ${OOT_IMAGE_TAG}"
+          fi
 
   summarize-benchmark-result:
     if: always()
