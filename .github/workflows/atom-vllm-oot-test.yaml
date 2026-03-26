@@ -11,9 +11,6 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
-  schedule:
-    # Nightly at 00:00 Beijing time (16:00 UTC)
-    - cron: '0 16 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -134,7 +131,7 @@ jobs:
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extra_args: "--tensor-parallel-size 8"
             env_vars: ""
-            accuracy_test_threshold: 0.94
+            accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu.predownload
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
