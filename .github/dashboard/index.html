@@ -1063,7 +1063,7 @@ function renderTradeoffTab() {
     const fam = tradeoffFamilies[fi];
     const safeId = fi + '-' + fam.replace(/[^a-zA-Z0-9]/g, '');
     const famLabel = familyMap[fam].size > 1 ? fam + ' family' : fam;
-    html += `<div class="chart-card half"><h3>${famLabel} — Interactive vs Token Throughput</h3><div class="chart-wrap"><canvas id="hero-${safeId}"></canvas></div></div>`;
+    html += `<div class="chart-card half"><h3>${famLabel} — Interactive vs Total Throughput</h3><div class="chart-wrap"><canvas id="hero-${safeId}"></canvas></div></div>`;
     html += `<div class="chart-card half"><h3>${famLabel} — Concurrency Scaling</h3><div class="chart-wrap"><canvas id="scaling-${safeId}"></canvas></div></div>`;
   }
   html += '</div>';
@@ -1079,7 +1079,7 @@ function renderTradeoffTab() {
       if (famModels.includes(cfg.model)) famConfigs[key] = cfg;
     }
 
-    // Interactive vs Token Throughput scatter — all variants in one chart
+    // Interactive vs Total Throughput scatter — all variants in one chart
     const heroDS = [];
     for (const [sKey, s] of Object.entries(seriesMap)) {
       if (!famModels.includes(s.model) || s.points.length === 0) continue;
@@ -1129,14 +1129,14 @@ function renderTradeoffTab() {
               },
               label: (item) => [
                 ` Interactive:  ${fmtNum(item.parsed.x, 1)} tok/s/user`,
-                ` Token Tput:   ${fmtNum(item.parsed.y, 0)} tok/s/gpu`,
+                ` Total Tput:   ${fmtNum(item.parsed.y, 0)} tok/s/gpu`,
               ],
               afterBody: () => '\nClick for details'
             }}
           },
           scales: {
             x: { grid: chartGridOpts(), title: { display: true, text: 'Interactive (tok/s/user)', color: C_TICK }, ticks: { color: C_TICK }, grace: '5%' },
-            y: { grid: chartGridOpts(), title: { display: true, text: 'Token Tput (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '5%' }
+            y: { grid: chartGridOpts(), title: { display: true, text: 'Total Tput (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '5%' }
           },
           onClick: (_e, elems) => {
             if (!elems.length) return;
@@ -1210,7 +1210,8 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
   for (const [key, cfg] of Object.entries(configs)) {
     const sKey = `${cfg.backend}|${cfg.model}|${cfg.islOsl}`;
     if (!byKey[sKey]) byKey[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, tputPoints: [], tpotPoints: [], tputKeys: [], tpotKeys: [] };
-    if (cfg['Total Tput'] != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg['Total Tput'] }); byKey[sKey].tputKeys.push(key); }
+    const gpuCount = cfg._gpu_count || 8;
+    if (cfg['Total Tput'] != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg['Total Tput'] / gpuCount }); byKey[sKey].tputKeys.push(key); }
     if (cfg.TPOT != null) { byKey[sKey].tpotPoints.push({ x: cfg.conc, y: cfg.TPOT }); byKey[sKey].tpotKeys.push(key); }
   }
 
@@ -1271,7 +1272,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
             const isTPOT = item.dataset.yAxisID === 'y2';
             return isTPOT
               ? ` TPOT:        ${fmtNum(item.parsed.y, 2)} ms`
-              : ` Total Tput:  ${fmtNum(item.parsed.y, 1)} tok/s`;
+              : ` Total Tput:  ${fmtNum(item.parsed.y, 1)} tok/s/gpu`;
           },
           afterBody: () => '\nClick for details'
         }}
@@ -1286,7 +1287,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
         },
         y: {
           position: 'left', grid: chartGridOpts(),
-          title: { display: true, text: 'Total Throughput (tok/s)', color: C_TICK },
+          title: { display: true, text: 'Total Tput (tok/s/gpu)', color: C_TICK },
           ticks: { color: C_TICK }, grace: '5%'
         },
         y2: {
