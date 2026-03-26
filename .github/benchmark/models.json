@@ -57,6 +57,16 @@
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1"
+    "env_vars": ""
+  },
+  {
+    "display": "MiniMax-M2.5",
+    "path": "MiniMaxAI/MiniMax-M2.5",
+    "prefix": "MiniMax-M2.5",
+    "args": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
   }
 ]

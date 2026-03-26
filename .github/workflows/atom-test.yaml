@@ -382,6 +382,7 @@ jobs:
 
             echo '=== Installing ATOM ==='
             cd /workspace
+            git config --global --add safe.directory /workspace
             pip install -e .
 
             echo '=== Installed package versions ==='
