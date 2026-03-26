@@ -394,14 +394,20 @@ class Qwen3NextAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
         if is_vllm():
+            # print("hf_config: ", atom_config.plugin_config.vllm_config.model_config.hf_config, flush=True)
+            model_config = atom_config.plugin_config.vllm_config.model_config
+            text_hf_config = (
+                model_config.hf_text_config
+                if hasattr(model_config, "hf_text_config")
+                else model_config
+            )
             rope_parameters = getattr(
-                atom_config.plugin_config.vllm_config.model_config.hf_config,
+                text_hf_config,
                 "rope_parameters",
                 None,
             )
         else:
             rope_parameters = getattr(config, "rope_parameters", None)
-
         rope_parameters = rope_parameters or {}
         rope_theta = rope_parameters.get("rope_theta", 10000)
         partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
