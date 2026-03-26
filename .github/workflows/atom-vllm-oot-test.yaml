@@ -19,6 +19,7 @@ concurrency:
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  OOT_IMAGE_CACHE_KEEP: "3"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
@@ -423,3 +424,24 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
+          KEEP_COUNT="${OOT_IMAGE_CACHE_KEEP:-3}"
+          if [[ "${OOT_IMAGE_TAG}" == rocm/atom-dev:oot-pre-build-* ]]; then
+            echo "Keeping current OOT image tag and the ${KEEP_COUNT} most recent oot-pre-build tags."
+            mapfile -t OLD_OOT_TAGS < <(
+              docker image ls --filter=reference='rocm/atom-dev:oot-pre-build-*' --format '{{.Repository}}:{{.Tag}}' \
+                | while read -r tag; do
+                    [ -n "${tag}" ] || continue
+                    created_at=$(docker image inspect --format '{{.Created}}' "${tag}" 2>/dev/null || true)
+                    [ -n "${created_at}" ] && printf '%s %s\n' "${created_at}" "${tag}"
+                  done \
+                | sort -r \
+                | awk -v keep="${KEEP_COUNT}" 'NR > keep { print $2 }'
+            )
+            for tag in "${OLD_OOT_TAGS[@]}"; do
+              if [ "${tag}" = "${OOT_IMAGE_TAG}" ]; then
+                continue
+              fi
+              echo "Removing old OOT image tag: ${tag}"
+              docker rmi "${tag}" || true
+            done
+          fi
