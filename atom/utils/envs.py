@@ -47,6 +47,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1"
     )
     == "1",
+    "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: os.getenv(
+        "ATOM_ENABLE_DS_QKNORM_FUSION", "1"
+    )
+    == "1",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv(
         "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1"
     )
