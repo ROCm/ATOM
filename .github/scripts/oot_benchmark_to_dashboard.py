@@ -50,6 +50,15 @@ def append_metric(
     entries.append(entry)
 
 
+def is_dashboard_publish_allowed(payload: dict) -> bool:
+    publish_flag = payload.get("dashboard_publish_allowed")
+    if publish_flag is None:
+        return True
+    if isinstance(publish_flag, bool):
+        return publish_flag
+    return str(publish_flag).strip().lower() not in {"0", "false", "no"}
+
+
 def build_entries(result_dir: Path, run_url: str | None) -> list[dict]:
     entries: list[dict] = []
 
@@ -60,6 +69,9 @@ def build_entries(result_dir: Path, run_url: str | None) -> list[dict]:
         try:
             payload = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+        if not is_dashboard_publish_allowed(payload):
             continue
 
         if "output_throughput" not in payload:
