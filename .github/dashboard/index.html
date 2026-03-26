@@ -1210,7 +1210,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
   for (const [key, cfg] of Object.entries(configs)) {
     const sKey = `${cfg.backend}|${cfg.model}|${cfg.islOsl}`;
     if (!byKey[sKey]) byKey[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, tputPoints: [], tpotPoints: [], tputKeys: [], tpotKeys: [] };
-    if (cfg.throughput != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg.throughput }); byKey[sKey].tputKeys.push(key); }
+    if (cfg['Total Tput'] != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg['Total Tput'] }); byKey[sKey].tputKeys.push(key); }
     if (cfg.TPOT != null) { byKey[sKey].tpotPoints.push({ x: cfg.conc, y: cfg.TPOT }); byKey[sKey].tpotKeys.push(key); }
   }
 
@@ -1271,7 +1271,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
             const isTPOT = item.dataset.yAxisID === 'y2';
             return isTPOT
               ? ` TPOT:        ${fmtNum(item.parsed.y, 2)} ms`
-              : ` Throughput:  ${fmtNum(item.parsed.y, 1)} tok/s`;
+              : ` Total Tput:  ${fmtNum(item.parsed.y, 1)} tok/s`;
           },
           afterBody: () => '\nClick for details'
         }}
@@ -1286,7 +1286,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
         },
         y: {
           position: 'left', grid: chartGridOpts(),
-          title: { display: true, text: 'Throughput (tok/s)', color: C_TICK },
+          title: { display: true, text: 'Total Throughput (tok/s)', color: C_TICK },
           ticks: { color: C_TICK }, grace: '5%'
         },
         y2: {
