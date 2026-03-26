@@ -133,7 +133,7 @@ jobs:
             extra_args: "--tensor-parallel-size 8"
             env_vars: ""
             accuracy_test_threshold: 0.93
-            runner: atom-mi355-8gpu.predownload
+            runner: linux-atom-mi350-8
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extra_args: "--tensor-parallel-size 1"
@@ -141,13 +141,13 @@ jobs:
             # FIXME: accuracy threshold is temporarily lowered from 0.38
             # to 0.33
             accuracy_test_threshold: 0.33
-            runner: linux-atom-mi355-1
+            runner: linux-atom-mi350-1
           - model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--tensor-parallel-size 4"
             env_vars: ""
             accuracy_test_threshold: 0.90
-            runner: linux-atom-mi355-4
+            runner: linux-atom-mi350-4
           - model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B"
             extra_args: "--tensor-parallel-size 2"
@@ -157,7 +157,7 @@ jobs:
               ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
             accuracy_test_threshold: 0.83
-            runner: linux-atom-mi355-4
+            runner: linux-atom-mi350-4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
