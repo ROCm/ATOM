@@ -23,7 +23,6 @@ from vllm.sequence import IntermediateTensors
 
 import atom  # noqa: F401
 from atom.plugin.config import generate_atom_config_for_plugin_mode
-from atom.model_loader.loader import load_model_in_plugin_mode
 
 import logging
 
@@ -36,6 +35,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "GptOssForCausalLM": "atom.models.gpt_oss:GptOssForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
+    "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
@@ -142,6 +142,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
+        # prevent circular import
+        from atom.model_loader.loader import load_model_in_plugin_mode
+
         loaded_weights_record = load_model_in_plugin_mode(
             model=self.model, config=self.atom_config, prefix="model."
         )

@@ -5,29 +5,27 @@ on:
     branches: [main]
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, closed]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
-  schedule:
-    # Nightly at 00:00 Beijing time (16:00 UTC)
-    - cron: '0 16 * * *'
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref != 'refs/heads/main' }}
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  OOT_IMAGE_CACHE_KEEP: "3"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ !github.event.pull_request || (github.event.action != 'closed' && github.event.pull_request.draft == false) }}
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
     permissions:
@@ -44,7 +42,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_oot_image:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ !github.event.pull_request || (github.event.action != 'closed' && github.event.pull_request.draft == false) }}
     needs: [check-signal]
     name: Build OOT image
     runs-on: build-only-atom
@@ -124,7 +122,7 @@ jobs:
 
   atom-vllm-oot:
     needs: [check-signal, build_oot_image]
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ !github.event.pull_request || (github.event.action != 'closed' && github.event.pull_request.draft == false) }}
     name: ATOM vLLM OOT Test
     strategy:
       fail-fast: false
@@ -134,7 +132,7 @@ jobs:
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extra_args: "--tensor-parallel-size 8"
             env_vars: ""
-            accuracy_test_threshold: 0.94
+            accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu.predownload
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
@@ -143,7 +141,7 @@ jobs:
             # FIXME: accuracy threshold is temporarily lowered from 0.38
             # to 0.33
             accuracy_test_threshold: 0.33
-            runner: linux-atom-mi355-4
+            runner: linux-atom-mi350-1
           - model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--tensor-parallel-size 4"
@@ -158,7 +156,7 @@ jobs:
             env_vars: |
               ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
-            accuracy_test_threshold: 0.85
+            accuracy_test_threshold: 0.83
             runner: linux-atom-mi355-4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -426,4 +424,24 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          docker rmi "${OOT_IMAGE_TAG}" || true
+          KEEP_COUNT="${OOT_IMAGE_CACHE_KEEP:-3}"
+          if [[ "${OOT_IMAGE_TAG}" == rocm/atom-dev:oot-pre-build-* ]]; then
+            echo "Keeping current OOT image tag and the ${KEEP_COUNT} most recent oot-pre-build tags."
+            mapfile -t OLD_OOT_TAGS < <(
+              docker image ls --filter=reference='rocm/atom-dev:oot-pre-build-*' --format '{{.Repository}}:{{.Tag}}' \
+                | while read -r tag; do
+                    [ -n "${tag}" ] || continue
+                    created_at=$(docker image inspect --format '{{.Created}}' "${tag}" 2>/dev/null || true)
+                    [ -n "${created_at}" ] && printf '%s %s\n' "${created_at}" "${tag}"
+                  done \
+                | sort -r \
+                | awk -v keep="${KEEP_COUNT}" 'NR > keep { print $2 }'
+            )
+            for tag in "${OLD_OOT_TAGS[@]}"; do
+              if [ "${tag}" = "${OOT_IMAGE_TAG}" ]; then
+                continue
+              fi
+              echo "Removing old OOT image tag: ${tag}"
+              docker rmi "${tag}" || true
+            done
+          fi

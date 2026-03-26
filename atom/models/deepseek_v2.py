@@ -45,6 +45,7 @@ from aiter.ops.triton.fused_fp8_quant import (
     fused_reduce_rms_fp8_group_quant,
     fused_rms_fp8_group_quant,
 )
+from aiter import fused_qk_rmsnorm
 from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
     fused_rms_mxfp4_quant,
@@ -106,6 +107,7 @@ if use_triton_gemm():
         gemm_a16w8_blockscale_preshuffle = None
 
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
+ENABLE_DS_QKNORM_FUSION = envs.ATOM_ENABLE_DS_QKNORM_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
 
@@ -1442,6 +1444,8 @@ class DeepseekV2MLAAttention(nn.Module):
         self.prefix = prefix
         self.quant_dtype = None
         self.fuse_qknorm_quant = False
+        # always fuse qknorm
+        self.fuse_qknorm = ENABLE_DS_QKNORM_FUSION
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
             if layer_quant_dtype == dtypes.fp8 or (
                 layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
@@ -1513,6 +1517,16 @@ class DeepseekV2MLAAttention(nn.Module):
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
+                elif self.fuse_qknorm:
+                    hidden_states_or_q_c, kv_c_normed = fused_qk_rmsnorm(
+                        q_c,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.eps,
+                        kv_c,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.eps,
+                    )
+                    hidden_states_or_q_c_scale = None
                 else:
                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
@@ -1522,7 +1536,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 [self.kv_lora_rank, self.qk_rope_head_dim],
                 dim=-1,
             )
-        if not self.fuse_qknorm_quant:
+        if not self.fuse_qknorm_quant and not self.fuse_qknorm:
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None:
