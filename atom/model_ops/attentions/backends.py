@@ -171,10 +171,19 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 continue
             block_table = batch.block_tables[i]
             block_size = self.model_runner.block_size
-            for pos in range(cached_seqlen, seqlen):
-                blk_idx = pos // block_size
-                slot = block_table[blk_idx] * block_size + pos % block_size
-                slot_mapping.append(slot)
+            first_blk = cached_seqlen // block_size
+            last_blk = (seqlen - 1) // block_size
+            for blk_idx in range(first_blk, last_blk + 1):
+                blk_start = block_table[blk_idx] * block_size
+                # Offset within block: skip already-cached prefix in first block
+                off_start = cached_seqlen % block_size if blk_idx == first_blk else 0
+                # End within block: partial last block
+                off_end = (
+                    ((seqlen - 1) % block_size) + 1
+                    if blk_idx == last_blk
+                    else block_size
+                )
+                slot_mapping.extend(range(blk_start + off_start, blk_start + off_end))
         if has_cached:
             self.prepare_block_tables(batch)
         # Validate metadata consistency
