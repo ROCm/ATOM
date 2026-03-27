@@ -116,7 +116,7 @@ class BlockManager:
                 block_id = self._pop_free_block()
                 block = self._allocate_block(block_id)
             else:
-                seq.num_cached_tokens += self.block_size
+                seq.num_kv_computed += self.block_size
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -126,8 +126,6 @@ class BlockManager:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
-
-        seq.num_kv_computed = seq.num_cached_tokens
 
         # handle mamba-like model
         if seq.mamba_enabled:
@@ -145,7 +143,6 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
         seq.num_kv_computed = 0
         seq.block_table.clear()
         if seq.mamba_enabled:

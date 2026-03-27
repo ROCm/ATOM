@@ -254,7 +254,6 @@ class ScheduledBatch:
         self.last_block_num_tokens = [
             seq.last_block_num_tokens for seq in seqs.values()
         ]
-        self.num_cached_tokens = [seq.num_cached_tokens for seq in seqs.values()]
 
         # Total number of tokens scheduled for all requests.
         self.total_tokens_num = total_tokens_num
@@ -381,15 +380,15 @@ class Scheduler:
             if not self.block_manager.can_allocate(seq):
                 break
             self.block_manager.allocate(seq)
-            # After allocate, num_kv_computed = num_cached_tokens (prefix cache hits)
+            # After allocate, num_kv_computed reflects prefix cache hits
+            if self.cache_stats:
+                self.cache_stats.update(seq.num_kv_computed, seq.num_tokens)
             num_new_tokens = seq.num_prompt_tokens - seq.num_kv_computed
             if num_new_tokens == 0:
                 # Fully cached prompt (all blocks hit prefix cache).
                 # Still need at least 1 token for logits computation.
                 seq.num_kv_computed = seq.num_prompt_tokens - 1
                 num_new_tokens = 1
-            if self.cache_stats:
-                self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
             chunk = min(num_new_tokens, budget_remaining)
             assert chunk > 0, (
@@ -664,7 +663,7 @@ class Scheduler:
         if self.waiting:
             # new request is waiting, will do prefill
             seq = self.waiting[0]
-            num_tokens = seq.num_tokens - seq.num_cached_tokens
+            num_tokens = seq.num_tokens - seq.num_kv_computed
             return (True, num_tokens)
         elif self.running:
             # decode

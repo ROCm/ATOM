@@ -154,7 +154,7 @@ class TestPrefixCaching:
         # Without the fix: all 10 tokens would be scheduled (the bug)
         assert batch2.total_tokens_num_prefill == 2
         assert batch2.num_scheduled_tokens == [2]
-        assert seq2.num_cached_tokens == 8
+        assert seq2.num_kv_computed == 8
 
     def test_prefix_cache_scheduled_tokens_content(self, seq_factory):
         """Verify that scheduled_tokens only contains the non-cached suffix."""
@@ -217,7 +217,7 @@ class TestPrefixCaching:
 
         # No prefix caching → all 10 tokens are scheduled
         assert batch2.total_tokens_num_prefill == 10
-        assert seq2.num_cached_tokens == 0
+        assert seq2.num_kv_computed == 0
 
 
 # ── preempt ────────────────────────────────────────────────────────────────

@@ -68,7 +68,7 @@ class TestAllocateDeallocate:
         block_manager.allocate(seq)
         block_manager.deallocate(seq)
         assert seq.block_table == []
-        assert seq.num_cached_tokens == 0
+        assert seq.num_kv_computed == 0
 
     def test_deallocate_restores_capacity(self, block_manager, seq_factory):
         s1 = seq_factory([1, 2, 3, 4])
@@ -98,7 +98,7 @@ class TestPrefixCaching:
 
         s2 = seq_factory([1, 2, 3, 4, 9, 10, 11, 12])
         block_manager_prefix.allocate(s2)
-        assert s2.num_cached_tokens == 4
+        assert s2.num_kv_computed == 4
 
     def test_prefix_cache_miss_different_tokens(
         self, block_manager_prefix, seq_factory
@@ -109,7 +109,7 @@ class TestPrefixCaching:
 
         s2 = seq_factory([9, 10, 11, 12, 13, 14, 15, 16])
         block_manager_prefix.allocate(s2)
-        assert s2.num_cached_tokens == 0
+        assert s2.num_kv_computed == 0
 
     def test_shared_prefix_doesnt_double_free(self, block_manager_prefix, seq_factory):
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
@@ -298,13 +298,13 @@ class TestPrefixCachingPreemption:
         bm.allocate(s1)
         # Simulate preemption
         bm.deallocate(s1)
-        assert s1.num_cached_tokens == 0
+        assert s1.num_kv_computed == 0
         assert s1.block_table == []
 
         # Re-allocate — should get cache hits on both blocks
         s1_retry = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1_retry)
-        assert s1_retry.num_cached_tokens == 8  # both blocks cached
+        assert s1_retry.num_kv_computed == 8  # both blocks cached
 
 
 # ── Edge cases ───────────────────────────────────────────────────────────
@@ -323,7 +323,7 @@ class TestPrefixCachingEdgeCases:
         s2 = seq_factory([42])
         bm.allocate(s2)
         # Partial block → hash is -1 → no caching
-        assert s2.num_cached_tokens == 0
+        assert s2.num_kv_computed == 0
 
     def test_exact_block_size_fully_cached(self, seq_factory):
         """Sequence with exactly block_size tokens — fully cached on reuse."""
@@ -336,7 +336,7 @@ class TestPrefixCachingEdgeCases:
         bm.deallocate(s1)
         s2 = seq_factory([1, 2, 3, 4])
         bm.allocate(s2)
-        assert s2.num_cached_tokens == 4
+        assert s2.num_kv_computed == 4
 
     def test_free_block_ids_set_consistent(self, block_manager, seq_factory):
         """free_block_ids_set stays consistent through allocate/deallocate."""
