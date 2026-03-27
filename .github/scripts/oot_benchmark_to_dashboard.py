@@ -70,7 +70,17 @@ def build_entries(result_dir: Path, run_url: str | None) -> list[dict]:
         osl = int(payload.get("random_output_len", 0))
         conc = int(payload.get("max_concurrency", 0))
         label_prefix = f"{DEFAULT_BACKEND}::{model} {isl}/{osl} c={conc}"
-        extra = f"Run: {run_url}" if run_url else None
+        extra = f"Run: {run_url}" if run_url else ""
+        gpu_name = payload.get("gpu_name", "")
+        gpu_vram = payload.get("gpu_vram_gb", 0)
+        rocm_ver = payload.get("rocm_version", "")
+        if gpu_name:
+            extra += f" | GPU: {gpu_name}"
+        if gpu_vram:
+            extra += f" | VRAM: {gpu_vram}GB"
+        if rocm_ver:
+            extra += f" | ROCm: {rocm_ver}"
+        extra = extra or None
 
         append_metric(
             entries,

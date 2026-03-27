@@ -215,6 +215,18 @@ jobs:
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
 
+      - name: Collect GPU info
+        if: steps.check.outputs.enabled == 'true'
+        id: gpu-info
+        run: |
+          GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | grep "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          GPU_VRAM_GB=$(rocm-smi --showmeminfo vram 2>/dev/null | grep "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
+          ROCM_VERSION=$(cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
+          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
+          echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+
       - name: Checkout ATOM repo
         if: steps.check.outputs.enabled == 'true'
         uses: actions/checkout@v6
@@ -441,6 +453,28 @@ jobs:
           if [ "${FAIL_COUNT}" -gt 0 ]; then
             echo "::warning::${FAIL_COUNT} benchmark config(s) failed for ${MODEL_NAME}"
           fi
+
+      - name: Inject GPU metadata into benchmark results
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          shopt -s nullglob
+          for f in "${RESULT_PREFIX}"-*.json; do
+            GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            RESULT_PATH="$f" \
+            python3 -c "
+          import json, os
+          p = os.environ['RESULT_PATH']
+          with open(p) as f:
+              d = json.load(f)
+          d['gpu_name'] = os.environ.get('GPU_NAME', '')
+          d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
+          d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
+          with open(p, 'w') as f:
+              json.dump(d, f, indent=2)
+          "
+          done
 
       - name: Collect benchmark result
         if: steps.check.outputs.enabled == 'true'
