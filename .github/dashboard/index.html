@@ -1076,7 +1076,7 @@ function renderPerformanceTab() {
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
       <td class="num">${cfg._gpu_count || '—'}</td>
-      <td style="white-space:nowrap;font-size:11px">${cfg._gpu_name || '—'}</td>
+      <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${cfg._gpu_name || '—'}</td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${totalTputPct}%;background:rgba(63,185,80,0.12)"></div><span class="data-bar-text">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</span></td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${outTputPct}%;background:rgba(126,143,174,0.10)"></div><span class="data-bar-text">${fmtNum(cfg.throughput, 1)}</span></td>
       <td class="num">${cfg.TPOT != null && cfg.TPOT > 0 ? fmtNum(1000 / cfg.TPOT, 1) : '—'}</td>
@@ -1816,7 +1816,7 @@ function renderDataTable() {
         <td>${fmtIslOsl(cfg.islOsl)}</td>
         <td class="num">${cfg.conc}</td>
         <td class="num">${cfg._gpu_count || '—'}</td>
-        <td style="white-space:nowrap;font-size:11px">${cfg._gpu_name || '—'}</td>
+        <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${cfg._gpu_name || '—'}</td>
         <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
@@ -1866,7 +1866,7 @@ function renderTimeline() {
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td>${cfg.backend}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${cfg.model}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_name || '—'}</td>
+        <td>${cfg.backend}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${cfg.model}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${cfg._gpu_name || '—'}</td>
         <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
