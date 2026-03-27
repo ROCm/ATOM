@@ -20,6 +20,10 @@ from vllm.model_executor.models.interfaces_base import (
     VllmModelForTextGeneration,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.forward_context import (
+    get_forward_context as get_vllm_forward_context,
+    is_forward_context_available,
+)
 
 import atom  # noqa: F401
 from atom.plugin.config import generate_atom_config_for_plugin_mode
@@ -117,9 +121,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
-        # capture. This ensures attention_mla reads correct positions in graph mode.
-        # This is only for mla attention in plugin mode.
-        if "positions" in self.atom_config.compilation_config.static_forward_context:
+        # pass positions from vLLM to OOT execution path via vLLM's per-forward context
+        if is_forward_context_available():
+            get_vllm_forward_context().additional_kwargs["atom_positions"] = positions
+        elif "positions" in self.atom_config.compilation_config.static_forward_context:
             buf = self.atom_config.compilation_config.static_forward_context[
                 "positions"
             ]
