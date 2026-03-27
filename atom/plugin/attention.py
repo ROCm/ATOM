@@ -9,6 +9,7 @@ from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_tp_group
 from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer, envs
+from atom.utils.block_convert import kv_indices_generate_triton
 from atom.config import get_current_atom_config
 
 from atom.utils.forward_context import Context, AttentionMetaData
@@ -25,6 +26,7 @@ disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 @dataclass
 class AiterFlashAttentionPhaseMetadata:
     max_query_len: int
+    min_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
 
@@ -61,6 +63,7 @@ class AiterChunkContextMetadata:
 @dataclass
 class AiterFlashAttentionChunkPrefillMetadata:
     max_query_len: int
+    min_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
     chunk_context_metadata: AiterChunkContextMetadata
@@ -302,31 +305,17 @@ class vllmAttentionMetadataBuilderMethods:
             num_extend_tokens,
             num_prefill_tokens,
         ) = split_ret
-        prefill_only = num_decodes == 0 and num_extends == 0 and num_prefills > 0
-        decode_only = num_decodes > 0 and num_extends == 0 and num_prefills == 0
-        mixed_request = not (prefill_only or decode_only)
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        if mixed_request:
-            seq_lens = common_attn_metadata.seq_lens.cpu()
-            query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        else:
-            seq_lens = None
-            query_lens_cpu = None
+        seq_lens = common_attn_metadata.seq_lens.cpu()
+        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
         decode_metadata = None
         if num_decodes > 0:
             decode_metadata = AiterFlashAttentionDecodeMetadata(
-                max_query_len=(
-                    common_attn_metadata.max_query_len
-                    if decode_only
-                    else query_lens_cpu[:num_decodes].max().item()
-                ),
-                max_seq_len=(
-                    common_attn_metadata.max_seq_len
-                    if decode_only
-                    else seq_lens[:num_decodes].max().item()
-                ),
+                max_query_len=query_lens_cpu[:num_decodes].max().item(),
+                min_query_len=query_lens_cpu[:num_decodes].min().item(),
+                max_seq_len=seq_lens[:num_decodes].max().item(),
                 query_start_loc=common_attn_metadata.query_start_loc[: num_decodes + 1],
             )
 
@@ -451,6 +440,7 @@ class vllmAttentionMetadataBuilderMethods:
             )
             extend_metadata = AiterFlashAttentionChunkPrefillMetadata(
                 max_query_len=query_lens_for_extend.max().item(),
+                min_query_len=query_lens_for_extend.min().item(),
                 max_seq_len=seq_lens[num_extends_slice].max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
                 chunk_context_metadata=chunk_context_metadata,
@@ -458,25 +448,18 @@ class vllmAttentionMetadataBuilderMethods:
 
         prefill_metadata = None
         if num_prefills > 0:
+            query_lens_for_prefill = query_lens_cpu[num_decodes + num_extends :]
             query_start_loc_device = common_attn_metadata.query_start_loc[
                 num_decodes + num_extends :
             ]
             prefill_metadata = AiterFlashAttentionPrefillMetadata(
-                max_query_len=(
-                    common_attn_metadata.max_query_len
-                    if prefill_only
-                    else query_lens_cpu[num_decodes + num_extends :].max().item()
-                ),
-                max_seq_len=(
-                    common_attn_metadata.max_seq_len
-                    if prefill_only
-                    else query_lens_cpu[num_decodes + num_extends :].max().item()
-                ),
+                max_query_len=query_lens_for_prefill.max().item(),
+                min_query_len=query_lens_for_prefill.min().item(),
+                max_seq_len=seq_lens[num_decodes + num_extends :].max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
             )
 
-        # num_actual_kv_tokens = torch.sum(seq_lens).item()
-        num_actual_kv_tokens = 0
+        num_actual_kv_tokens = torch.sum(seq_lens).item()
 
         use_cascade = False
 
@@ -779,48 +762,59 @@ class vllmMLAAttentionMetadataBuilderMethods:
         device = self.device
         num_reqs = seq_lens_device.size(0)
 
-        mask = torch.arange(
-            block_table_tensor.size(1),
-            dtype=block_table_tensor.dtype,
-            device=device,
-        ).unsqueeze(0) < seq_lens_device.unsqueeze(1)
-        paged_kv_indices = block_table_tensor[mask]
-
-        # kernel block size is always 1, so each page has exactly 1 token.
-        # last_page_len is always 1 - just slice the pre-initialized buffer.
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
-        paged_kv_indptr = torch.cat(
-            [
-                torch.zeros(1, dtype=seq_lens_device.dtype, device=device),
-                seq_lens_device.cumsum(dim=0, dtype=torch.int32),
-            ]
+        torch.cumsum(
+            seq_lens_device,
+            dim=0,
+            dtype=torch.int32,
+            out=self.paged_kv_indptr[1 : 1 + num_reqs],
         )
-        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        max_qo_len = qo_len.max().item()
-
-        num_actual_pages = paged_kv_indices.size(0)
-
-        self.paged_kv_indices[:num_actual_pages].copy_(
-            paged_kv_indices, non_blocking=True
-        )
-        self.paged_kv_indices[num_actual_pages:].fill_(-1)
-        paged_kv_indices = self.paged_kv_indices[:num_actual_pages]
-
-        self.paged_kv_indptr[: 1 + num_reqs].copy_(paged_kv_indptr, non_blocking=True)
-        self.paged_kv_indptr[1 + num_reqs :].fill_(paged_kv_indptr[-1])
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
 
-        # paged_kv_last_page_len already uses the pre-initialized buffer slice
-        # (set above), so no copy needed - buffer is always 1s.
+        max_qo_len = (
+            (query_start_loc_cpu[-1] - query_start_loc_cpu[-2]).item()
+            if query_start_loc_cpu.numel() > 1
+            else 1
+        )
 
-        self.qo_indptr[: 1 + num_reqs].copy_(query_start_loc_device, non_blocking=True)
-        self.qo_indptr[1 + num_reqs :] = query_start_loc_device[-1]
+        kv_indices_generate_triton(
+            block_table_tensor,
+            self.paged_kv_indices,
+            paged_kv_indptr,
+            1,
+            max_seq_len,
+        )
+        paged_kv_indices = self.paged_kv_indices
+
+        # For pure decode, query_start_loc is [0,1,2,...,N]; skip the DtoD copy
+        # and populate qo_indptr using an in-place arange when possible.
+        if num_decode_tokens == num_reqs:
+            if (
+                not getattr(self, "_qo_indptr_arange_ready", False)
+                or getattr(self, "_qo_indptr_arange_n", 0) != num_reqs
+            ):
+                torch.arange(
+                    0,
+                    num_reqs + 1,
+                    dtype=torch.int32,
+                    device=device,
+                    out=self.qo_indptr[: num_reqs + 1],
+                )
+                if num_reqs + 1 < self.qo_indptr.shape[0]:
+                    self.qo_indptr[num_reqs + 1 :] = num_reqs
+                self._qo_indptr_arange_ready = True
+                self._qo_indptr_arange_n = num_reqs
+        else:
+            self._qo_indptr_arange_ready = False
+            self.qo_indptr[: 1 + num_reqs].copy_(
+                query_start_loc_device, non_blocking=True
+            )
+            if 1 + num_reqs < self.qo_indptr.shape[0]:
+                self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
-            num_reqs, query_start_loc_device, 1
-        )
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(

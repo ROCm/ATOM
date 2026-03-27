@@ -558,7 +558,7 @@ class MergedColumnParallelLinear(LinearBase):
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: int | tuple[int, ...],
+        loaded_shard_id: int | tuple[int, ...] | None = None,
     ):
         # Support loading multiple consecutive shards in a single tensor.
         # This mirrors vLLM's behavior for packed modules like QKV.
@@ -587,6 +587,33 @@ class MergedColumnParallelLinear(LinearBase):
                     self, "input_scale", None
                 ):
                     shard_size //= 128
+                shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
+                self.weight_loader(param, shard, shard_id)
+                current_offset += shard_size
+            return
+
+        if loaded_shard_id is None:
+            # Loaded weight is already fused on disk
+            # Split it and load each shard individually.
+            param_data = param.data
+            # Check if this is weight or weight_scale
+            is_scale_param = param is getattr(
+                self, "weight_scale", None
+            ) or param is getattr(self, "input_scale", None)
+
+            # For fused weight, need to match param shape
+            if param_data.shape == loaded_weight.shape:
+                # Shapes match - direct copy
+                param.weight_loader_process(param_data, loaded_weight)
+                return
+
+            # Otherwise, split the fused weight and load each output shard
+            current_offset = 0
+            for shard_id, output_size in enumerate(self.output_sizes):
+                shard_size = output_size
+                if is_scale_param and self.quant_type == QuantType.per_1x128:
+                    shard_size //= 128
+
                 shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
                 self.weight_loader(param, shard, shard_id)
                 current_offset += shard_size
