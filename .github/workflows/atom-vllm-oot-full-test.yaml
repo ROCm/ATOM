@@ -8,6 +8,14 @@ on:
     # Manual runs use GitHub Actions' built-in branch dropdown as the ATOM
     # branch selector, so users do not need to type branch names.
     inputs:
+      branch_selection_notice:
+        # GitHub Actions does not support custom helper text directly on the
+        # built-in branch dropdown, so keep this informational item at the top
+        # of the manual form.
+        description: "[Info only] To test a private ATOM branch, use the branch dropdown above."
+        required: false
+        type: boolean
+        default: true
       run_qwen3_moe_tp8:
         description: "Qwen3-235B-A22B-Instruct-2507-FP8 TP8"
         required: false
