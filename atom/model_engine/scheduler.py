@@ -353,6 +353,8 @@ class Scheduler:
 
         # ---- Phase 1: resume partial prefills from running ----
         for seq in self.running:
+            if num_seqs_prefill >= self.max_num_seqs:
+                break
             if seq.num_kv_computed >= seq.num_prompt_tokens:
                 continue  # already completed prefill
             remaining = seq.num_prompt_tokens - seq.num_kv_computed
