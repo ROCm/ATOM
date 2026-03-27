@@ -16,6 +16,9 @@ docker pull rocm/atom-dev:vllm-latest
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
 ```bash
+# Disbale moe dual stream path. TODO: fix hang issue when captuing much more cuda graph. 
+export ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0
+
 vllm serve amd/Kimi-K2-Thinking-MXFP4 \
     --host localhost \
     --port 8000 \
