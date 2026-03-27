@@ -100,7 +100,6 @@ RUN pip install --upgrade pip && \
         git cython3 ibverbs-utils openmpi-bin libopenmpi-dev \
         libpci-dev cmake libdw1 locales && \
     rm -rf /var/lib/apt/lists/*
-RUN pip install --upgrade "setuptools_scm<9"
 
 # --------------------------------------------------------------------
 # Stage 1: MORI — parallel
@@ -109,7 +108,6 @@ FROM base AS build_mori
 ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
 
 RUN echo "========== [Parallel] Building MORI ==========" && \
-    rm -rf /app/mori && \
     git clone https://github.com/ROCm/mori.git /app/mori && \
     cd /app/mori && \
     git checkout $MORI_COMMIT && \
@@ -154,6 +152,7 @@ ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
 
+RUN pip install --upgrade "setuptools_scm<9"
 RUN echo "========== [Parallel] Building Aiter ==========" && \
     git clone --depth 1 $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
