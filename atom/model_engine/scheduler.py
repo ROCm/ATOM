@@ -383,6 +383,11 @@ class Scheduler:
             self.block_manager.allocate(seq)
             # After allocate, num_kv_computed = num_cached_tokens (prefix cache hits)
             num_new_tokens = seq.num_prompt_tokens - seq.num_kv_computed
+            if num_new_tokens == 0:
+                # Fully cached prompt (all blocks hit prefix cache).
+                # Still need at least 1 token for logits computation.
+                seq.num_kv_computed = seq.num_prompt_tokens - 1
+                num_new_tokens = 1
             if self.cache_stats:
                 self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -489,13 +494,13 @@ class Scheduler:
         # Build set of partial prefill seq ids (still mid-prefill after this step)
         partial_prefill_ids: set[int] = set()
         if batch is not None:
+            running_by_id = {seq.id: seq for seq in self.running}
             for i, req_id in enumerate(batch.req_ids):
-                for seq in self.running:
-                    if seq.id == req_id and seq.type == SequenceType.PREFILL:
-                        seq.num_kv_computed += batch.num_scheduled_tokens[i]
-                        if seq.num_kv_computed < seq.num_prompt_tokens:
-                            partial_prefill_ids.add(seq.id)
-                        break
+                seq = running_by_id.get(req_id)
+                if seq is not None and seq.type == SequenceType.PREFILL:
+                    seq.num_kv_computed += batch.num_scheduled_tokens[i]
+                    if seq.num_kv_computed < seq.num_prompt_tokens:
+                        partial_prefill_ids.add(seq.id)
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
