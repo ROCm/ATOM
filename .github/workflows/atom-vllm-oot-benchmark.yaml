@@ -31,6 +31,10 @@ on:
         description: "Qwen3.5-397B-A17B-FP8 TP8"
         type: boolean
         default: false
+      qwen3-next-80b-a3b-instruct-fp8:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP8"
+        type: boolean
+        default: false
       oot_image:
         description: "Prebuilt OOT benchmark image used only for main-branch runs; ignored for non-main branches because a custom image is rebuilt from the selected branch"
         type: string
@@ -209,6 +213,7 @@ jobs:
           ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
           ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
           ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
+          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8 }}
         run: |
           MODELS_JSON="$(jq -c '
             map(select(
@@ -218,6 +223,7 @@ jobs:
               or (.prefix == "kimi-k2-thinking-mxfp4-tp4" and env.ENABLE_KIMI_K2_TP4 == "true")
               or (.prefix == "kimi-k2-thinking-mxfp4-tp8" and env.ENABLE_KIMI_K2_TP8 == "true")
               or (.prefix == "qwen3-5-397b-a17b-fp8" and env.ENABLE_QWEN3_5_397B_A17B_FP8 == "true")
+              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8 == "true")
             ))
           ' .github/benchmark/oot_benchmark_models.json)"
           echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
@@ -229,13 +235,63 @@ jobs:
             echo "Selected models: ${MODELS_JSON}"
           fi
 
-  build-oot-image:
-    name: Build custom OOT benchmark image
-    needs: [resolve-atom-source, load-models]
+  build-benchmark-matrix:
+    name: Build OOT benchmark matrix
+    needs: [parse-param-lists, load-models]
     if: >-
-      needs.resolve-atom-source.outputs.rebuild_oot_image == 'true'
+      needs.parse-param-lists.result == 'success'
       && needs.load-models.result == 'success'
       && needs.load-models.outputs.has_enabled_models == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      benchmark_matrix: ${{ steps.build.outputs.benchmark_matrix }}
+      has_benchmark_cells: ${{ steps.build.outputs.has_benchmark_cells }}
+    steps:
+      - name: Combine models and params
+        id: build
+        env:
+          MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
+          PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
+        run: |
+          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          import json
+          import os
+
+          models = json.loads(os.environ["MODELS_JSON"])
+          params = json.loads(os.environ["PARAMS_JSON"])
+
+          include = []
+          for model in models:
+              supported_pairs = set(model.get("supported_input_output_pairs", []))
+              excluded_pairs = set(model.get("excluded_input_output_pairs", []))
+
+              for param in params:
+                  pair = f'{param["input_length"]}x{param["output_length"]}'
+                  if supported_pairs and pair not in supported_pairs:
+                      continue
+                  if pair in excluded_pairs:
+                      continue
+                  include.append({"model": model, "params": param})
+
+          print(json.dumps({"include": include}, separators=(",", ":")))
+          PY
+          )"
+          echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
+          if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
+            echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
+            echo "No eligible benchmark cases remain after model-specific parameter filtering."
+          else
+            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
+            echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
+          fi
+
+  build-oot-image:
+    name: Build custom OOT benchmark image
+    needs: [resolve-atom-source, build-benchmark-matrix]
+    if: >-
+      needs.resolve-atom-source.outputs.rebuild_oot_image == 'true'
+      && needs.build-benchmark-matrix.result == 'success'
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     runs-on: build-only-atom
     outputs:
       oot_image_tag: ${{ steps.image-meta.outputs.oot_image_tag }}
@@ -337,19 +393,16 @@ jobs:
 
   benchmark:
     name: OOT ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
-    needs: [resolve-atom-source, parse-param-lists, load-models, build-oot-image]
+    needs: [resolve-atom-source, build-benchmark-matrix, build-oot-image]
     if: >-
       always()
       && needs.resolve-atom-source.result == 'success'
-      && needs.parse-param-lists.result == 'success'
-      && needs.load-models.result == 'success'
+      && needs.build-benchmark-matrix.result == 'success'
       && (needs.build-oot-image.result == 'success' || needs.build-oot-image.result == 'skipped')
-      && needs.load-models.outputs.has_enabled_models == 'true'
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        model: ${{ fromJson(needs.load-models.outputs.models_json) }}
-        params: ${{ fromJson(needs.parse-param-lists.outputs.matrix_json) }}
+      matrix: ${{ fromJson(needs.build-benchmark-matrix.outputs.benchmark_matrix) }}
     runs-on: ${{ matrix.model.runner }}
     timeout-minutes: 240
     env:
@@ -387,6 +440,7 @@ jobs:
             kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-next-80b-a3b-instruct-fp8) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
 

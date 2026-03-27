@@ -53,12 +53,25 @@
   },
   {
     "display": "Qwen3.5-397B-A17B-FP8 TP8",
+    "dashboard_model": "Qwen3.5-397B-A17B-FP8",
     "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
     "path": "/models/Qwen3.5-397B-A17B-FP8",
     "prefix": "qwen3-5-397b-a17b-fp8",
     "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+    "excluded_input_output_pairs": ["1024x8192"]
+  },
+  {
+    "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP8",
+    "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8",
+    "source_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+    "path": "/models/Qwen3-Next-80B-A3B-Instruct-FP8",
+    "prefix": "qwen3-next-80b-a3b-instruct-fp8",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1"
   }
 ]
