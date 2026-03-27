@@ -165,7 +165,7 @@ class MLAAttentionImplPluginModeMethods:
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
         # Convert from (B, N, L) to (N, B, L)
-        if envs.ATOM_USE_TRITON_MXFP4_BMM:
+        if self.is_aiter_triton_fp4_bmm_enabled:
             out = batched_gemm_a16wfp4(
                 x,
                 self.W_V,
@@ -178,7 +178,7 @@ class MLAAttentionImplPluginModeMethods:
             # x = x.transpose(0, 1).flatten(1, 2)
             x = out.view(-1, self.num_heads * self.v_head_dim)
         else:
-            x = _aiter_triton_fp8_bmm(
+            _aiter_triton_fp8_bmm(
                 x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
             )
 
@@ -552,13 +552,6 @@ class MLAAttentionImplPluginModeMethods:
         attn_metadata,
         layer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        assert kv_c_and_k_pe_cache.numel() > 0
-        assert attn_metadata.plugin_metadata.decode is not None
-        assert attn_metadata.plugin_metadata.decode.max_qo_len is not None
-
-        # if type(q) is tuple:
-        #     q = torch.cat(q, dim=-1)
-
         assert isinstance(q, torch.Tensor)
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
@@ -572,11 +565,11 @@ class MLAAttentionImplPluginModeMethods:
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
+
         use_persistent_mode = not (
             self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8"
         )
         if not use_persistent_mode:
-            # DP : disable persistent mode to avoid overflow
             work_meta_data = None
             work_indptr = None
             work_info_set = None
@@ -628,10 +621,20 @@ class MLAAttentionImplPluginModeMethods:
         output=None,
     ):
         assert output is not None, "Output tensor must be provided."
-        from vllm.distributed.parallel_state import get_dcp_group
-        from vllm import _custom_ops as ops
-        from vllm.platforms import current_platform
-        from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+        if not hasattr(self, "_cached_ops"):
+            from vllm.distributed.parallel_state import get_dcp_group
+            from vllm import _custom_ops as ops
+            from vllm.platforms import current_platform
+            from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
+            self._cached_ops = ops
+            self._cached_current_platform = current_platform
+            self._cached_get_dcp_group = get_dcp_group
+            self._cached_cp_lse_ag_out_rs = cp_lse_ag_out_rs
+        ops = self._cached_ops
+        current_platform = self._cached_current_platform
+        get_dcp_group = self._cached_get_dcp_group
+        cp_lse_ag_out_rs = self._cached_cp_lse_ag_out_rs
 
         # create the output here, it use query shape
         if attn_metadata is None:
@@ -671,10 +674,19 @@ class MLAAttentionImplPluginModeMethods:
         has_prefill = attn_metadata.plugin_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.plugin_metadata.num_decode_tokens
 
-        atom_config = get_current_atom_config()
-        positions = atom_config.compilation_config.static_forward_context["positions"][
-            :num_actual_toks
-        ]
+        positions = None
+        if self._is_vllm_forward_context_available():
+            positions = self._get_vllm_forward_context().additional_kwargs.get(
+                "atom_positions"
+            )
+
+        if positions is None:
+            atom_config = get_current_atom_config()
+            positions = atom_config.compilation_config.static_forward_context[
+                "positions"
+            ]
+
+        positions = positions[:num_actual_toks]
         k_pe = k_pe.unsqueeze(1)
         output_padded = output
         output = output[:num_actual_toks, ...]
@@ -688,14 +700,13 @@ class MLAAttentionImplPluginModeMethods:
         prefill_k_c_normed = k_c_normed[num_decode_tokens:]
 
         decode_only = has_decode and not has_prefill
-        assert (
-            self.rotary_emb is not None
-        ), "Rotary embedding is required for MLAAttentionImplPluginModeMethods"
 
         if not decode_only:
-            # write the latent and rope to kv cache
-            # make sure ops has concat_and_cache_mla_rope_fused
-            if kv_cache.numel() > 0 and hasattr(ops, "concat_and_cache_mla_rope_fused"):
+            if not hasattr(self, "_has_fused_rope_cache"):
+                self._has_fused_rope_cache = hasattr(
+                    ops, "concat_and_cache_mla_rope_fused"
+                )
+            if kv_cache.numel() > 0 and self._has_fused_rope_cache:
                 ops.concat_and_cache_mla_rope_fused(
                     positions,
                     q[..., self.qk_nope_head_dim :],
@@ -819,7 +830,6 @@ class MLAAttentionImplPluginModeMethods:
                             ql_nope_shape[1],
                             ql_nope_shape[2] + q_pe_shape[2],
                         )
-                        # Using empty and copy since torch.cat introduces significant overhead.
                         decode_q0 = torch.empty(
                             decode_q_shape,
                             device=decode_ql_nope.device,
@@ -878,6 +888,10 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
     """Extra initialization for MLAAttentionImpl in plugin mode (vllm)."""
     if is_vllm():
         from vllm.config import get_current_vllm_config
+        from vllm.forward_context import (
+            get_forward_context as get_vllm_forward_context,
+            is_forward_context_available,
+        )
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadataBuilder,
         )
@@ -896,6 +910,9 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
             envs.ATOM_USE_TRITON_MXFP4_BMM
             and self.kv_b_proj.weight.dtype == torch.bfloat16
         )
+        self._use_persistent_decode = False
+        self._get_vllm_forward_context = get_vllm_forward_context
+        self._is_vllm_forward_context_available = is_forward_context_available
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
         self._pad_v = True
         self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
