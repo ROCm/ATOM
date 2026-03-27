@@ -1,7 +1,6 @@
 from collections.abc import Iterable
 
 import torch
-from einops import rearrange
 from torch import nn
 
 
@@ -178,14 +177,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        z_shape_og = z.shape
-        # Reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens] = self.out_proj(core_attn_out)
+        core_attn_out, maybe_scale = self.norm(core_attn_out, z)
+        output[:num_tokens] = self.out_proj(core_attn_out, x_scale=maybe_scale)
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
