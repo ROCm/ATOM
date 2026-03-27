@@ -189,8 +189,8 @@ class ScheduledBatch:
         total_seqs_num_decode: int = 0,
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
-        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {},
-        num_kv_computed: list[int] = None,
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] | None = None,
+        num_kv_computed: list[int] | None = None,
         is_partial_prefill: bool = False,
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
@@ -214,9 +214,11 @@ class ScheduledBatch:
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
 
         # num_kv_computed for chunked prefill support
-        self.num_kv_computed = num_kv_computed or [
-            seq.num_kv_computed for seq in seqs.values()
-        ]
+        self.num_kv_computed = (
+            num_kv_computed
+            if num_kv_computed is not None
+            else [seq.num_kv_computed for seq in seqs.values()]
+        )
         self.is_partial_prefill = is_partial_prefill
 
         # context_lens: for prefill seqs, use num_kv_computed + num_scheduled_tokens
@@ -242,7 +244,7 @@ class ScheduledBatch:
             ]
             pos += num
 
-        if num_spec_step > 0:
+        if num_spec_step > 0 and scheduled_spec_decode_tokens is not None:
             self.scheduled_spec_decode_tokens = np.asarray(
                 list(scheduled_spec_decode_tokens.values()), dtype=np.int32
             )
