@@ -760,13 +760,22 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
-        if not hasattr(self.hf_config, "rope_parameters"):
-            # Compatible with both transformers < 5
-            rope_params = getattr(self.hf_config, "rope_scaling", {})
-            if rope_params is None:
-                rope_params = {}
+        # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
+        # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
+        if getattr(self.hf_config, "rope_parameters", None) is None:
+            # Compatible with transformers < 5
+            rope_params = getattr(self.hf_config, "rope_scaling", None) or {}
+            rope_params = dict(rope_params)
+            # rope_theta: GPT-OSS / LLaMA-style configs keep it on the root in <5
             rope_params["rope_theta"] = getattr(self.hf_config, "rope_theta", None)
-            rope_params["rope_type"] = getattr(self.hf_config, "rope_type", "default")
+            # rope_type: must NOT overwrite rope_scaling["rope_type"] (e.g. GPT-OSS YaRN).
+            # transformers 4.x has no top-level rope_type; getattr(..., "default") was wrong.
+            if "rope_type" not in rope_params and "type" in rope_params:
+                rope_params["rope_type"] = rope_params["type"]
+            if "rope_type" not in rope_params:
+                rope_params["rope_type"] = getattr(
+                    self.hf_config, "rope_type", "default"
+                )
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
