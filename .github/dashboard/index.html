@@ -64,7 +64,7 @@
     /* ============================================================
        KPI CARDS (Level 1 — Overview)
        ============================================================ */
-    .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--gap-md); margin-bottom: var(--gap-lg); }
+    .kpi-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: var(--gap-md); margin-bottom: var(--gap-lg); }
     .kpi-card { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--gap-md); }
     .kpi-card .kpi-label { font-size: 11px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
     .kpi-card .kpi-value { font-size: 28px; font-weight: 700; color: var(--text-primary); font-family: "SF Mono", "Fira Code", monospace; }
@@ -259,7 +259,7 @@
     <img class="header-logo" src="atom_logo.png" alt="ATOM" onerror="this.style.display='none'">
     <div>
       <h1>Benchmark Dashboard</h1>
-      <div class="meta"><span id="last-update"></span> · <a id="repo-link" target="_blank"></a></div>
+      <div class="meta"><span id="last-update"></span> · <a id="repo-link" target="_blank" rel="noopener noreferrer"></a></div>
     </div>
   </div>
   <div class="filter-bar" id="filter-bar"></div>
@@ -276,18 +276,20 @@
     <div class="tab" data-tab="tradeoff">Throughput vs Latency</div>
     <div class="tab" data-tab="trends">Trends</div>
     <div class="tab" data-tab="data">Data &amp; Trace</div>
+    <div class="tab" data-tab="accuracy">Accuracy</div>
   </div>
 
   <div class="tab-content active" id="tab-performance"></div>
   <div class="tab-content" id="tab-tradeoff"></div>
   <div class="tab-content" id="tab-trends"></div>
   <div class="tab-content" id="tab-data"></div>
+  <div class="tab-content" id="tab-accuracy"></div>
 
   <footer>
     <div>
       <button id="dl-btn">Download JSON</button>
     </div>
-    <span>Powered by <a href="https://github.com/benchmark-action/github-action-benchmark" target="_blank">github-action-benchmark</a> · ATOM Inference Engine</span>
+    <span>Powered by <a href="https://github.com/benchmark-action/github-action-benchmark" target="_blank" rel="noopener noreferrer">github-action-benchmark</a> · ATOM Inference Engine</span>
   </footer>
 </div>
 
@@ -424,7 +426,10 @@ function parseBenchName(name) {
     rawName = backendMatch[2];
   }
   if (backend === 'OOT') backend = 'ATOM-vLLM';
-  let m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
+  // Accuracy entries: "ModelName accuracy (GSM8K)" — (.+?) for multi-word model names
+  let m = rawName.match(/^(.+?)\s+accuracy\s+\((\w+)\)$/);
+  if (m) return { backend, model: m[1], metric: 'accuracy', unit: m[2], isAccuracy: true };
+  m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
   if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
   m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count)$/);
   if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: '_gpu_count', unit: '' };
@@ -495,6 +500,67 @@ function detectRegressions() {
   return regressions;
 }
 const regressions = detectRegressions();
+
+/* ---- Accuracy data ---- */
+const accuracyMap = {}; // "backend|model" -> [{date, commit, score, runUrl, threshold}, ...]
+for (const run of allRuns) {
+  for (const b of run.benches) {
+    const p = parseBenchName(b.name);
+    if (!p || !p.isAccuracy) continue;
+    const key = `${p.backend}|${p.model}`;
+    if (!accuracyMap[key]) accuracyMap[key] = [];
+    const entry = { date: run.date, commit: run.commit, score: b.value, runUrl: '' };
+    if (b.extra) {
+      const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/);
+      if (rm) entry.runUrl = rm[1];
+      const tm = b.extra.match(/Threshold:\s*([\d.]+)/);
+      if (tm) entry.threshold = +tm[1];
+      const sm = b.extra.match(/strict-match:\s*([\d.]+)/);
+      if (sm) entry.strictMatch = +sm[1];
+      const fm = b.extra.match(/fewshot:\s*(\d+)/);
+      if (fm) entry.fewshot = +fm[1];
+      const bl = b.extra.match(/Baseline:\s*([\d.]+)/);
+      if (bl) entry.baseline = +bl[1];
+      const bm = b.extra.match(/BaselineModel:\s*(\S+)/);
+      if (bm) entry.baselineModel = bm[1];
+      const bn = b.extra.match(/BaselineNote:\s*([^|]+)/);
+      if (bn) entry.baselineNote = bn[1].trim();
+    }
+    accuracyMap[key].push(entry);
+  }
+}
+// Sort each history descending by date (do not rely on allRuns iteration order)
+for (const history of Object.values(accuracyMap)) {
+  history.sort((a, b) => b.date - a.date);
+}
+const latestAccuracy = {};
+for (const [key, history] of Object.entries(accuracyMap)) {
+  if (!history.length) continue;
+  latestAccuracy[key] = history[0];
+}
+// Accuracy regression: thresholds are absolute score differences (not percentages)
+const ACC_REG_WARNING = 0.02;  // score drop >=0.02 (e.g. 0.94→0.92) = warning
+const ACC_REG_CRITICAL = 0.05; // score drop >=0.05 (e.g. 0.94→0.89) = critical
+function detectAccuracyRegressions() {
+  const regs = {};
+  for (const [key, latest] of Object.entries(latestAccuracy)) {
+    const history = accuracyMap[key];
+    if (!history || history.length < 2) continue;
+    const prev = history[1];
+    const drop = prev.score - latest.score;
+    if (drop >= ACC_REG_WARNING) {
+      const severity = drop >= ACC_REG_CRITICAL ? 'critical' : 'warning';
+      regs[key] = { dropAbs: drop, dropPct: prev.score > 0 ? (drop / prev.score) * 100 : 0, prev, severity };
+    }
+  }
+  return regs;
+}
+const accuracyRegressions = detectAccuracyRegressions();
+const hasAccuracyData = Object.keys(accuracyMap).length > 0;
+
+// HTML escape & safe URL helpers
+function escHTML(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function safeHref(url) { return typeof url === 'string' && url.startsWith('https://') ? url : null; }
 
 // Extract unique filter values from ALL runs (not just latest) so historical models are always visible
 const allBackends = [...new Set(Object.keys(historyMap).map(k => k.split('|')[0]))].sort();
@@ -897,6 +963,20 @@ function renderKPICards() {
     regSub = `${warningCount} warning`;
   }
 
+  // Accuracy KPI
+  const accEntries = Object.entries(latestAccuracy).filter(([key]) => {
+    const [bk, mdl] = key.split('|');
+    return state.filters.backends.includes(bk) && state.filters.models.includes(mdl);
+  });
+  const passCount = accEntries.filter(([, a]) => a.threshold && a.score >= a.threshold).length;
+  const failCount = accEntries.filter(([, a]) => a.threshold && a.score < a.threshold).length;
+  const accRegCount = Object.keys(accuracyRegressions).length;
+  const accCardClass = failCount > 0 ? 'alert clickable' : accRegCount > 0 ? 'alert-warning clickable' : (accEntries.length > 0 ? 'ok clickable' : 'clickable');
+  const accSub = accEntries.length === 0 ? 'No accuracy data'
+    : failCount > 0 ? `${failCount} failed` + (accRegCount > 0 ? ` · ${accRegCount} regression` : '')
+    : accRegCount > 0 ? `All passing · ${accRegCount} regression`
+    : 'All passing · stable';
+
   row.innerHTML = `
     <div class="kpi-card">
       <div class="kpi-label">Peak Total Throughput</div>
@@ -919,14 +999,17 @@ function renderKPICards() {
       <div class="kpi-label">Regressions</div>
       <div class="kpi-value">${regCount > 0 ? regCount : '0'} <span class="kpi-unit">${regCount > 0 ? '⚠' : '✓'}</span></div>
       <div class="kpi-sub">${regSub}</div>
+    </div>
+    <div class="kpi-card ${accCardClass}" id="kpi-acc" title="Click to view accuracy">
+      <div class="kpi-label">Accuracy</div>
+      <div class="kpi-value">${accEntries.length > 0 ? passCount + '/' + accEntries.length : '—'} <span class="kpi-unit">${failCount > 0 ? '⚠' : accEntries.length > 0 ? '✓' : ''}</span></div>
+      <div class="kpi-sub">${accSub}</div>
     </div>`;
-
 
   // Regression card click → switch to Performance tab, scroll to first regression, flash highlight
   const regCard = document.getElementById('kpi-reg');
   if (regCard && regCount > 0) {
     regCard.addEventListener('click', () => {
-      // Switch to Performance tab if not already
       if (state.activeTab !== 'performance') {
         document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'performance'));
         document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-performance'));
@@ -934,7 +1017,6 @@ function renderKPICards() {
         renderActiveTab();
         syncToHash();
       }
-      // Wait for render, then scroll and flash
       requestAnimationFrame(() => {
         const rows = document.querySelectorAll('#tab-performance tr.regression');
         if (rows.length) {
@@ -942,6 +1024,20 @@ function renderKPICards() {
           rows.forEach(r => { r.classList.add('flash'); setTimeout(() => r.classList.remove('flash'), 1500); });
         }
       });
+    });
+  }
+
+  // Accuracy card click → switch to Accuracy tab
+  const accCard = document.getElementById('kpi-acc');
+  if (accCard) {
+    accCard.addEventListener('click', () => {
+      if (state.activeTab !== 'accuracy') {
+        document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'accuracy'));
+        document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-accuracy'));
+        state.activeTab = 'accuracy';
+        renderActiveTab();
+        syncToHash();
+      }
     });
   }
 }
@@ -968,6 +1064,7 @@ function renderActiveTab() {
     case 'tradeoff': renderTradeoffTab(); break;
     case 'trends': renderTrendsTab(); break;
     case 'data': renderDataTab(); break;
+    case 'accuracy': renderAccuracyTab(); break;
   }
   syncHeaderH();
 }
@@ -1071,20 +1168,20 @@ function renderPerformanceTab() {
     const dataAge = Date.now() - cfg.date;
     const staleClass = dataAge > 3 * 86400000 ? ' stale-data' : '';
     html += `<tr class="${regClass}${staleClass}" data-key="${key}">
-      <td>${cfg.backend}</td>
-      <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${cfg.model}</td>
+      <td>${escHTML(cfg.backend)}</td>
+      <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
       <td class="num">${cfg._gpu_count || '—'}</td>
-      <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${cfg._gpu_name || '—'}</td>
+      <td style="white-space:nowrap;font-size:11px">${cfg._gpu_name ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_name : '—'}</td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${totalTputPct}%;background:rgba(63,185,80,0.12)"></div><span class="data-bar-text">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</span></td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${outTputPct}%;background:rgba(126,143,174,0.10)"></div><span class="data-bar-text">${fmtNum(cfg.throughput, 1)}</span></td>
       <td class="num">${cfg.TPOT != null && cfg.TPOT > 0 ? fmtNum(1000 / cfg.TPOT, 1) : '—'}</td>
       <td class="num" style="background:${heatBg(tpotRatio)}">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
       <td class="num" style="background:${heatBg(ttftRatio)}">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
       <td class="num">${trendHTML(cfg.throughput, prev ? prev.throughput : null, false)} <button class="trend-jump" data-trend-key="${cfg.backend}|${cfg.model}" title="View trends">trend →</button></td>
-      <td><a href="${cfg.commit.url || '#'}" target="_blank">${commitId}</a></td>
-      <td>${cfg.runUrl ? '<a href="' + cfg.runUrl + '" target="_blank">view</a>' : '—'}</td>
+      <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
+      <td>${safeHref(cfg.runUrl) ? `<a href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">view</a>` : '—'}</td>
     </tr>`;
     // Detail row
     html += `<tr class="detail-row" data-detail="${key}"><td colspan="14">${buildDetailHTML(key, cfg)}</td></tr>`;
@@ -1810,17 +1907,17 @@ function renderDataTable() {
       const commitId = cfg.commit.id ? cfg.commit.id.slice(0, 7) : '';
       html += `<tr data-key="data-${key}-${run.date}">
         <td>${fmtDate(cfg.date)}</td>
-        <td><a href="${cfg.commit.url || '#'}" target="_blank">${commitId}</a></td>
-        <td>${cfg.backend}</td>
-        <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${cfg.model}</td>
+        <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
+        <td>${escHTML(cfg.backend)}</td>
+        <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td>
         <td>${fmtIslOsl(cfg.islOsl)}</td>
         <td class="num">${cfg.conc}</td>
         <td class="num">${cfg._gpu_count || '—'}</td>
-        <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${cfg._gpu_name || '—'}</td>
+        <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
         <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
-        <td>${cfg.runUrl ? '<a href="' + cfg.runUrl + '" target="_blank">view</a>' : '—'}</td>
+        <td>${safeHref(cfg.runUrl) ? `<a href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">view</a>` : '—'}</td>
       </tr>`;
       html += `<tr class="detail-row" data-detail="data-${key}-${run.date}"><td colspan="12">${buildDetailHTML(key, cfg)}</td></tr>`;
     }
@@ -1849,15 +1946,15 @@ function renderTimeline() {
 
     html += `<div class="tl-node ${hasReg ? 'has-regression' : ''}">
       <div class="tl-header">
-        <span class="commit-id"><a href="${run.commit.url || '#'}" target="_blank">${commitId}</a></span>
+        <span class="commit-id">${safeHref(run.commit.url) ? `<a href="${escHTML(safeHref(run.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</span>
         <span class="date">${fmtDate(run.date)}</span>
         <span class="badge">${entries.length} configs</span>
-        <span class="badge">${backends.join(', ')}</span>
-        <span class="badge">${models.join(', ')}</span>
+        <span class="badge">${escHTML(backends.join(', '))}</span>
+        <span class="badge">${escHTML(models.join(', '))}</span>
         ${hasReg ? `<span class="badge warn">⚠ ${runRegCount} regressions</span>` : ''}
-        ${runUrl ? `<a href="${runUrl}" target="_blank" style="font-size:12px">Open CI Run ↗</a>` : ''}
+        ${safeHref(runUrl) ? `<a href="${escHTML(safeHref(runUrl))}" target="_blank" rel="noopener noreferrer" style="font-size:12px">Open CI Run ↗</a>` : ''}
       </div>
-      <div class="tl-msg" title="${(run.commit.message || '').replace(/"/g, '&quot;')}">${run.commit.message.split('\n')[0]}</div>
+      <div class="tl-msg" title="${escHTML(run.commit.message || '')}">${escHTML((run.commit.message || '').split('\n')[0])}</div>
       <button class="tl-toggle">Show Details</button>
       <div class="tl-details">
         <table class="perf-table" style="margin-top:8px"><thead><tr>
@@ -1866,7 +1963,7 @@ function renderTimeline() {
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td>${cfg.backend}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${cfg.model}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${cfg._gpu_name || '—'}</td>
+        <td>${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
         <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
@@ -1906,17 +2003,17 @@ function buildDetailHTML(key, cfg) {
     </div>
     <div class="detail-section">
       <h4>Environment</h4>
-      <div class="detail-item"><span class="detail-key">Mode</span><span class="detail-val" style="font-family:inherit">${cfg.backend}</span></div>
-      <div class="detail-item"><span class="detail-key">GPU</span><span class="detail-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${cfg._gpu_name || '—'}</span></div>
+      <div class="detail-item"><span class="detail-key">Mode</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.backend)}</span></div>
+      <div class="detail-item"><span class="detail-key">GPU</span><span class="detail-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">VRAM</span><span class="detail-val">${cfg._gpu_vram_gb ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_vram_gb + ' GB' : '—'}</span></div>
-      <div class="detail-item"><span class="detail-key">ROCm</span><span class="detail-val">${cfg._rocm_version || '—'}</span></div>
-      <div class="detail-item"><span class="detail-key">Commit</span><span class="detail-val"><a href="${cfg.commit.url || '#'}" target="_blank">${cfg.commit.id?.slice(0, 7) || '—'}</a></span></div>
-      <div class="detail-item"><span class="detail-key">Message</span><span class="detail-val" style="font-family:inherit;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(cfg.commit.message || '').replace(/"/g, '&quot;')}">${cfg.commit.message?.split('\n')[0] || '—'}</span></div>
-      <div class="detail-item"><span class="detail-key">Author</span><span class="detail-val" style="font-family:inherit">${cfg.commit.author?.name || '—'}</span></div>
+      <div class="detail-item"><span class="detail-key">ROCm</span><span class="detail-val">${escHTML(cfg._rocm_version || '—')}</span></div>
+      <div class="detail-item"><span class="detail-key">Commit</span><span class="detail-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
+      <div class="detail-item"><span class="detail-key">Message</span><span class="detail-val" style="font-family:inherit;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHTML(cfg.commit.message || '')}">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
+      <div class="detail-item"><span class="detail-key">Author</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Date</span><span class="detail-val">${cfg.commit.timestamp ? fmtDate(new Date(cfg.commit.timestamp).getTime()) : '—'}</span></div>
       <div class="action-row">
-        ${cfg.runUrl ? `<a class="action-btn" href="${cfg.runUrl}" target="_blank">Open CI Run ↗</a>` : ''}
-        <a class="action-btn" href="${cfg.commit.url || '#'}" target="_blank">View Commit ↗</a>
+        ${safeHref(cfg.runUrl) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">Open CI Run ↗</a>` : ''}
+        ${safeHref(cfg.commit.url) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
       </div>
     </div>
   </div>`;
@@ -1932,25 +2029,25 @@ function showPopover(key, cfg) {
 
   const pop = document.getElementById('popover');
   pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
-    <h3>${cfg.model} ${fmtIslOsl(cfg.islOsl)} c=${cfg.conc}</h3>
+    <h3>${escHTML(cfg.model)} ${fmtIslOsl(cfg.islOsl)} c=${cfg.conc}</h3>
     <div class="pop-row"><span class="pop-key">Total Throughput</span><span class="pop-val">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) + ' tok/s ' + trendHTML(cfg['Total Tput'], prev?.['Total Tput'], false) : '—'}</span></div>
     <div class="pop-row"><span class="pop-key">Output Throughput</span><span class="pop-val">${fmtNum(cfg.throughput, 1)} tok/s ${trendHTML(cfg.throughput, prev?.throughput, false)}</span></div>
     <div class="pop-row"><span class="pop-key">TPOT</span><span class="pop-val">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) + ' ms ' + trendHTML(cfg.TPOT, prev?.TPOT, true) : '—'}</span></div>
     <div class="pop-row"><span class="pop-key">TTFT</span><span class="pop-val">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) + ' ms' : '—'}</span></div>
     ${reg ? `<div style="margin-top:8px;color:${reg.severity === 'critical' ? 'var(--accent-red)' : 'var(--accent-orange)'};font-size:13px">⚠ ${reg.severity.toUpperCase()}: throughput ${reg.tputPct.toFixed(1)}%, TPOT ${reg.tpotPct.toFixed(1)}%</div>` : ''}
     <div class="pop-section">
-      <div class="pop-row"><span class="pop-key">Mode</span><span class="pop-val" style="font-family:inherit">${cfg.backend}</span></div>
-      <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${cfg._gpu_name || '—'}${cfg._gpu_vram_gb ? ' · ' + cfg._gpu_vram_gb + 'GB' : ''}</span></div>
-      <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${cfg._rocm_version || '—'}</span></div>
-      <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val"><a href="${cfg.commit.url || '#'}" target="_blank">${cfg.commit.id?.slice(0, 7) || '—'}</a></span></div>
-      <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${cfg.commit.message?.split('\n')[0] || '—'}</span></div>
-      <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${cfg.commit.author?.name || '—'}</span></div>
+      <div class="pop-row"><span class="pop-key">Mode</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.backend)}</span></div>
+      <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}${cfg._gpu_vram_gb ? ' · ' + cfg._gpu_vram_gb + 'GB' : ''}</span></div>
+      <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(cfg._rocm_version || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${fmtDate(cfg.date)}</span></div>
     </div>
     <div class="action-row">
       <button class="action-btn" id="pop-trace-btn">Trace →</button>
-      ${cfg.runUrl ? `<a class="action-btn" href="${cfg.runUrl}" target="_blank">Open CI Run ↗</a>` : ''}
-      <a class="action-btn" href="${cfg.commit.url || '#'}" target="_blank">View Commit ↗</a>
+      ${safeHref(cfg.runUrl) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">Open CI Run ↗</a>` : ''}
+      ${safeHref(cfg.commit.url) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
     </div>`;
   document.getElementById('popover-overlay').classList.add('open');
   document.getElementById('pop-close-btn').addEventListener('click', (e) => {
@@ -2010,7 +2107,216 @@ function readFromHash() {
 }
 
 /* ================================================================
-   16. INIT
+   16. ACCURACY TAB
+   ================================================================ */
+function renderAccuracyTab() {
+  const container = document.getElementById('tab-accuracy');
+  if (!hasAccuracyData) {
+    container.innerHTML = '<p style="color:var(--text-tertiary);padding:var(--gap-lg)">No accuracy data available yet. Accuracy data will appear after CI accuracy tests run on the main branch.</p>';
+    return;
+  }
+  const models = Object.entries(latestAccuracy)
+    .filter(([key]) => {
+      const [bk, mdl] = key.split('|');
+      return state.filters.backends.includes(bk) && state.filters.models.includes(mdl);
+    })
+    .sort((a, b) => b[1].score - a[1].score);
+
+  let html = `
+    <h3 style="color:var(--text-primary);margin-bottom:var(--gap-md)">Model Accuracy (GSM8K)</h3>
+    <div class="table-watermark">
+      <table class="perf-table">
+        <thead><tr>
+          <th>Mode</th><th>Model</th>
+          <th class="num">flexible-extract</th><th class="num">strict-match</th>
+          <th class="num">Baseline</th><th class="num">Recovery</th>
+          <th class="num">Threshold</th><th class="num">Margin</th><th>Status</th>
+          <th>Trend</th><th>Fewshot</th><th>Last Tested</th><th>Run</th>
+        </tr></thead>
+        <tbody>`;
+
+  for (const [key, acc] of models) {
+    const [backend, model] = key.split('|');
+    const history = accuracyMap[key];
+    const prev = history.length > 1 ? history[1] : null;
+    const threshold = acc.threshold || 0;
+    const hasThreshold = !!acc.threshold;
+    const margin = acc.score - threshold;
+    const marginClass = !hasThreshold ? 'trend-neutral' : margin >= 0.05 ? 'trend-up' : margin >= 0 ? 'trend-neutral' : 'trend-down';
+    const status = hasThreshold ? (margin >= 0 ? '✓ Pass' : '✗ Fail') : '—';
+    const statusClass = !hasThreshold ? 'trend-neutral' : margin >= 0 ? 'trend-up' : 'trend-down';
+    const reg = accuracyRegressions[key];
+    const regClass = reg ? (reg.severity === 'critical' ? 'regression' : 'regression-warning') : '';
+    const dateStr = new Date(acc.date * 1000).toLocaleDateString();
+    const href = safeHref(acc.runUrl);
+
+    html += `
+      <tr class="${regClass}" data-acc-key="${escHTML(key)}">
+        <td>${escHTML(backend)}</td>
+        <td style="font-weight:600;color:var(--text-primary)">${escHTML(model)}</td>
+        <td class="num" style="font-weight:700;color:var(--text-primary)">${fmtNum(acc.score, 4)}</td>
+        <td class="num">${acc.strictMatch != null ? fmtNum(acc.strictMatch, 4) : '—'}</td>
+        <td class="num">${acc.baseline > 0 ? fmtNum(acc.baseline, 4) : '—'}</td>
+        <td class="num">${acc.baseline > 0 ? '<span class="' + (acc.score / acc.baseline >= 0.98 ? 'trend-up' : acc.score / acc.baseline >= 0.95 ? 'trend-neutral' : 'trend-down') + '">' + (acc.score / acc.baseline * 100).toFixed(1) + '%</span>' : '—'}</td>
+        <td class="num">${hasThreshold ? fmtNum(threshold, 4) : '—'}</td>
+        <td class="num"><span class="${marginClass}">${hasThreshold ? (margin >= 0 ? '+' : '') + fmtNum(margin, 4) : '—'}</span></td>
+        <td><span class="${statusClass}">${status}</span></td>
+        <td>${trendHTML(acc.score, prev?.score, false)}</td>
+        <td class="num">${acc.fewshot != null ? acc.fewshot : '—'}</td>
+        <td>${dateStr}</td>
+        <td>${href ? `<a href="${escHTML(href)}" target="_blank" rel="noopener noreferrer">→</a>` : '—'}</td>
+      </tr>`;
+
+    // Detail row with inline trend chart
+    const canvasId = 'acc-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+    html += `<tr class="detail-row" data-detail-acc="${escHTML(key)}"><td colspan="13"><div class="detail-inner" style="display:flex;gap:var(--gap-lg);flex-wrap:wrap;align-items:flex-start">`;
+    // Left: trend chart
+    html += `<div style="flex:1;min-width:280px"><canvas id="${canvasId}" style="height:180px"></canvas></div>`;
+    // Right: info
+    html += `<div style="flex:0 0 auto;min-width:200px">`;
+    if (acc.baselineModel || acc.baselineNote) {
+      html += `<div class="detail-section"><h4>Baseline</h4>`;
+      if (acc.baselineModel) html += `<p style="color:var(--text-secondary)">${escHTML(acc.baselineModel)}<br>score: ${acc.baseline > 0 ? fmtNum(acc.baseline, 4) : '—'}</p>`;
+      if (acc.baselineNote) html += `<p style="color:var(--text-tertiary);font-size:11px;margin-top:4px;font-style:italic">${escHTML(acc.baselineNote)}</p>`;
+      html += `</div>`;
+    }
+    if (reg) {
+      html += `<div class="detail-section"><h4>Regression</h4><p>flexible-extract dropped by ${fmtNum(reg.dropAbs, 4)} (${fmtNum(reg.dropPct, 1)}%) from ${fmtNum(reg.prev.score, 4)}</p></div>`;
+    }
+    html += `</div></div></td></tr>`;
+  }
+
+  html += '</tbody></table></div>';
+
+  container.innerHTML = html;
+
+  // Track per-row chart instances to avoid duplicates
+  const accCharts = {};
+
+  // Row expand/collapse — render chart on first expand
+  container.querySelectorAll('tr[data-acc-key]').forEach(row => {
+    row.style.cursor = 'pointer';
+    row.addEventListener('click', () => {
+      const key = row.dataset.accKey;
+      const detail = container.querySelector(`tr[data-detail-acc="${key}"]`);
+      if (!detail) return;
+      const expanding = !detail.classList.contains('expanded');
+      detail.classList.toggle('expanded');
+      row.classList.toggle('row-open');
+      if (expanding && !accCharts[key]) {
+        requestAnimationFrame(() => renderAccuracyMiniChart(key, accCharts));
+      }
+    });
+  });
+}
+
+function renderAccuracyMiniChart(key, chartCache) {
+  const canvasId = 'acc-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+
+  const history = accuracyMap[key];
+  if (!history || !history.length) return;
+  const [backend, model] = key.split('|');
+  const color = getModelColor(backend, model);
+
+  // Build data sorted ascending by date
+  const sorted = [...history].sort((a, b) => a.date - b.date);
+  const labels = sorted.map(h => {
+    const dt = new Date(h.date * 1000);
+    return `${dt.getMonth()+1}/${dt.getDate()}`;
+  });
+  const scores = sorted.map(h => h.score);
+  const strictScores = sorted.map(h => h.strictMatch ?? null);
+  const hasStrict = strictScores.some(v => v != null);
+
+  // Baseline reference line
+  const baseline = sorted[0].baseline ?? (Object.entries(latestAccuracy).find(([k]) => k === key)?.[1]?.baseline);
+
+  const datasets = [
+    {
+      label: 'flexible-extract',
+      data: scores,
+      borderColor: color.border,
+      backgroundColor: color.bg,
+      borderWidth: 2,
+      pointRadius: 4,
+      pointHoverRadius: 6,
+      tension: 0.3,
+      spanGaps: true,
+      fill: false,
+    },
+  ];
+  if (hasStrict) {
+    datasets.push({
+      label: 'strict-match',
+      data: strictScores,
+      borderColor: color.border,
+      backgroundColor: color.bg,
+      borderWidth: 1.5,
+      borderDash: [4, 3],
+      pointRadius: 3,
+      pointHoverRadius: 5,
+      tension: 0.3,
+      spanGaps: true,
+      fill: false,
+    });
+  }
+
+  const allVals = scores.concat(strictScores.filter(v => v != null));
+  const yMin = Math.max(0, Math.floor((Math.min(...allVals) - 0.03) * 20) / 20);
+
+  // Baseline reference line plugin
+  const baselinePlugin = baseline ? {
+    id: 'baselineLine_' + canvasId,
+    afterDraw(chart) {
+      const yScale = chart.scales.y;
+      const yPx = yScale.getPixelForValue(baseline);
+      if (yPx < yScale.top || yPx > yScale.bottom) return;
+      const ctx = chart.ctx;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(136,153,184,0.5)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(chart.chartArea.left, yPx);
+      ctx.lineTo(chart.chartArea.right, yPx);
+      ctx.stroke();
+      ctx.fillStyle = C_TICK;
+      ctx.font = '10px sans-serif';
+      ctx.fillText('baseline ' + fmtNum(baseline, 4), chart.chartArea.right - 80, yPx - 4);
+      ctx.restore();
+    }
+  } : null;
+
+  chartCache[key] = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets },
+    plugins: baselinePlugin ? [baselinePlugin] : [],
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
+        tooltip: { ...chartTooltipOpts(), callbacks: {
+          title: (items) => model + ' · ' + labels[items[0].dataIndex],
+          label: (item) => ` ${item.dataset.label}: ${fmtNum(item.raw, 4)}  (${(item.raw * 100).toFixed(1)}%)`,
+        }},
+        datalabels: { display: false },
+      },
+      scales: {
+        x: { grid: chartGridOpts(), ticks: { color: C_TICK, font: { size: 10 } } },
+        y: {
+          min: yMin, suggestedMax: 1,
+          grid: chartGridOpts(),
+          ticks: { color: C_TICK, callback: v => (v * 100).toFixed(0) + '%' },
+        },
+      },
+    },
+  });
+}
+
+/* ================================================================
+   17. INIT
    ================================================================ */
 readFromHash();
 renderFilters();

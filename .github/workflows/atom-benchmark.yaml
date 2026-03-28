@@ -149,18 +149,9 @@ jobs:
           fi
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
-      - name: Show ROCm status and collect GPU info
+      - name: Show ROCm status (host)
         if: steps.check.outputs.enabled == 'true'
-        id: gpu-info
-        run: |
-          docker ps -a && rocm-smi --showmemuse && rocm-smi --showpidgpus
-          GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | grep "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
-          GPU_VRAM_GB=$(rocm-smi --showmeminfo vram 2>/dev/null | grep "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
-          ROCM_VERSION=$(cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
-          echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
-          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
-          echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
-          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+        run: docker ps -a && rocm-smi --showmemuse 2>/dev/null || true
 
       - name: Checkout ATOM repo
         if: steps.check.outputs.enabled == 'true'
@@ -198,6 +189,19 @@ jobs:
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Collect GPU info (inside container)
+        if: steps.check.outputs.enabled == 'true'
+        id: gpu-info
+        run: |
+          # Run rocm-smi inside the container for consistent output across runners
+          GPU_NAME=$(docker exec atom-benchmark rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          GPU_VRAM_GB=$(docker exec atom-benchmark rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
+          ROCM_VERSION=$(docker exec atom-benchmark cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
+          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
+          echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
 
       - name: Download models
         if: steps.check.outputs.enabled == 'true'

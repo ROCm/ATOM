@@ -90,6 +90,9 @@ if [ "$TYPE" == "accuracy" ]; then
 
   echo ""
   echo "========== Running accuracy test =========="
+  # Set umask so files created by lm_eval are world-readable (container runs as root,
+  # host runner user needs to read results via the shared volume mount)
+  umask 0022
   mkdir -p accuracy_test_results
   RESULT_FILENAME=accuracy_test_results/$(date +%Y%m%d%H%M%S).json
   lm_eval --model local-completions \
@@ -98,7 +101,6 @@ if [ "$TYPE" == "accuracy" ]; then
           --num_fewshot 3 \
           --output_path "${RESULT_FILENAME}"
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
-  chmod -R 777 accuracy_test_results
 fi
 
 if [ "$TYPE" == "stop" ]; then
