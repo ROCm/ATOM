@@ -10,26 +10,12 @@ on:
     - cron: '0 17 * * *'
   workflow_dispatch:
     inputs:
-      deepseek-r1-0528:
-        description: "Benchmark DeepSeek-R1-0528"
-        type: boolean
-        default: true
-      glm-5-fp8:
-        description: "Benchmark GLM-5-FP8"
-        type: boolean
-        default: true
-      deepseek-r1-0528-mxfp4:
-        description: "Benchmark DeepSeek-R1-0528 MXFP4-MTP3"
-        type: boolean
-        default: true
-      gpt-oss-120b:
-        description: "Benchmark gpt-oss-120b"
-        type: boolean
-        default: true
-      kimi-k25-mxfp4:
-        description: "Benchmark Kimi-K2.5-MXFP4"
-        type: boolean
-        default: true
+      models:
+        description: >
+          Model prefixes to benchmark (comma-separated). Leave empty or "all" to run all models
+          from .github/benchmark/models.json. Example: "deepseek-r1-0528,glm-5-fp8"
+        type: string
+        default: "all"
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
@@ -126,17 +112,22 @@ jobs:
     steps:
       - name: Check if model is enabled
         id: check
+        env:
+          MODEL_PREFIX: ${{ matrix.model.prefix }}
+          MODELS_INPUT: ${{ inputs.models || 'all' }}
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "enabled=true" >> $GITHUB_OUTPUT
+          elif [ "$MODELS_INPUT" = "all" ] || [ -z "$MODELS_INPUT" ]; then
+            echo "enabled=true" >> $GITHUB_OUTPUT
           else
-            # Look up workflow input by model prefix; default to true for unknown models
-            ENABLED=$(echo '${{ toJson(inputs) }}' | python3 -c "
-          import json, sys
-          inputs = json.load(sys.stdin)
-          print(str(inputs.get('${{ matrix.model.prefix }}', True)).lower())
-          ")
-            echo "enabled=${ENABLED}" >> $GITHUB_OUTPUT
+            # Check if model prefix is in the comma-separated list
+            if echo ",$MODELS_INPUT," | grep -q ",$MODEL_PREFIX,"; then
+              echo "enabled=true" >> $GITHUB_OUTPUT
+            else
+              echo "enabled=false" >> $GITHUB_OUTPUT
+              echo "Skipping $MODEL_PREFIX (not in: $MODELS_INPUT)"
+            fi
           fi
 
       - name: Kill all Docker containers
