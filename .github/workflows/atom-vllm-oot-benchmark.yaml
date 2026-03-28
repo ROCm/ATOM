@@ -770,13 +770,14 @@ jobs:
           fi
 
   summarize-benchmark-result:
-    if: always()
+    if: >-
+      always()
+      && needs.resolve-atom-source.result == 'success'
+      && needs.build-benchmark-matrix.result == 'success'
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     name: Summarize OOT benchmark result
-    needs: [resolve-atom-source, benchmark]
+    needs: [resolve-atom-source, build-benchmark-matrix, benchmark]
     runs-on: ubuntu-latest
-    outputs:
-      has_regression: ${{ steps.check-regression.outputs.has_regression }}
-      has_results: ${{ steps.check-results.outputs.has_results }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -789,31 +790,73 @@ jobs:
           path: .
         continue-on-error: true
 
-      - name: Check downloaded results
-        id: check-results
+      - name: Count downloaded benchmark results
+        id: downloaded
         run: |
           shopt -s nullglob
           json_files=(*.json)
-          if [ "${#json_files[@]}" -gt 0 ]; then
-            echo "has_results=true" >> "$GITHUB_OUTPUT"
-            printf 'Downloaded %s benchmark result files\n' "${#json_files[@]}"
+          echo "downloaded_count=${#json_files[@]}" >> "$GITHUB_OUTPUT"
+          printf 'Downloaded %s benchmark result files\n' "${#json_files[@]}"
+
+      - name: Note summary behavior
+        run: |
+          if [[ "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" == "true" ]]; then
+            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table. Because this run is dashboard-eligible, successful cases will also be used for regression comparison and dashboard upload.\n' \
+              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
+              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
+              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "has_results=false" >> "$GITHUB_OUTPUT"
-            echo "No benchmark result JSON files were downloaded."
+            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table only. Dashboard upload is skipped.\n' \
+              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
+              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
+              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Download baseline from previous successful manual run
-        if: steps.check-results.outputs.has_results == 'true'
-        id: baseline
+      - name: Generate OOT benchmark summary table
+        env:
+          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          mapfile -t CANDIDATE_RUN_IDS < <(gh run list \
-            --workflow="ATOM vLLM OOT Benchmark" \
-            --branch=main \
-            --event=workflow_dispatch \
-            --status=success \
-            --limit=10 \
-            --json databaseId \
-            --jq '.[].databaseId // empty')
+          python3 .github/scripts/oot_benchmark_summary.py \
+            --result-dir . \
+            --matrix-json "${BENCHMARK_MATRIX}" \
+            --run-url "${RUN_URL}" \
+            --output-json oot_benchmark_summary.json \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Read summary stats
+        id: summary-stats
+        run: |
+          PASSED_CASES=$(python3 -c "import json; print(json.load(open('oot_benchmark_summary.json', encoding='utf-8'))['passed_cases'])")
+          FAILED_CASES=$(python3 -c "import json; print(json.load(open('oot_benchmark_summary.json', encoding='utf-8'))['failed_cases'])")
+          echo "passed_cases=${PASSED_CASES}" >> "$GITHUB_OUTPUT"
+          echo "failed_cases=${FAILED_CASES}" >> "$GITHUB_OUTPUT"
+          echo "Summary stats: passed=${PASSED_CASES}, failed=${FAILED_CASES}"
+
+      - name: Upload OOT benchmark summary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-benchmark-summary
+          path: oot_benchmark_summary.json
+
+      - name: Download baseline from previous successful main run
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -t CANDIDATE_RUN_IDS < <(
+            {
+              gh run list \
+                --workflow="ATOM vLLM OOT Benchmark" \
+                --branch=main \
+                --event=workflow_dispatch \
+                --status=success \
+                --limit=10 \
+                --json databaseId \
+                --jq '.[].databaseId // empty' || true
+            }
+          )
 
           BASELINE_DIR=""
           for PREV_RUN_ID in "${CANDIDATE_RUN_IDS[@]}"; do
@@ -830,59 +873,44 @@ jobs:
               continue
             fi
 
-            if python3 - <<'PY'
-            import json
-            from pathlib import Path
-
-            valid_payload_found = False
-            for path in Path("/tmp/baseline_candidate").rglob("*.json"):
-                if path.name == "regression_report.json":
-                    continue
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if "output_throughput" not in payload:
-                    continue
-                valid_payload_found = True
-                if payload.get("dashboard_publish_allowed", True) is False:
-                    raise SystemExit(1)
-
-            raise SystemExit(0 if valid_payload_found else 1)
-            PY
-            then
+            if python3 .github/scripts/oot_benchmark_validate_baseline.py /tmp/baseline_candidate; then
               mv /tmp/baseline_candidate /tmp/baseline
               BASELINE_DIR="/tmp/baseline"
               echo "Using baseline from run #$PREV_RUN_ID"
               break
             fi
 
-            echo "Skipping run #$PREV_RUN_ID because it contains custom/non-dashboard benchmark results."
+            echo "Skipping run #$PREV_RUN_ID because it is not a dashboard-eligible baseline."
           done
 
-          if [ -n "$BASELINE_DIR" ]; then
-            echo "baseline_dir=${BASELINE_DIR}" >> "$GITHUB_OUTPUT"
-          else
-            echo "No previous successful dashboard-eligible manual run found"
-            echo "baseline_dir=" >> "$GITHUB_OUTPUT"
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
+          echo "baseline_dir=${BASELINE_DIR}" >> "$GITHUB_OUTPUT"
 
-      - name: Summarize benchmark result
-        if: steps.check-results.outputs.has_results == 'true'
+      - name: Note skipped dashboard processing
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases == '0'
+        run: |
+          printf '\nNo successful benchmark result JSONs were produced, so regression comparison and dashboard upload were skipped.\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize regression against baseline
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         id: check-regression
         run: |
           BASELINE_ARG=""
           if [ -n "${{ steps.baseline.outputs.baseline_dir }}" ]; then
             BASELINE_ARG="--baseline-dir ${{ steps.baseline.outputs.baseline_dir }}"
+          else
+            printf '\nNo eligible baseline run was found. Showing current successful results without regression deltas.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
-          .github/scripts/summarize.py . $BASELINE_ARG \
+
+          python3 .github/scripts/oot_benchmark_regression.py \
+            --result-dir . \
+            $BASELINE_ARG \
             --output-json regression_report.json \
             >> "$GITHUB_STEP_SUMMARY" || true
 
           if [ -f regression_report.json ]; then
-            REG_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json'))['regression_count'])")
+            REG_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json', encoding='utf-8'))['regression_count'])")
             if [ "$REG_COUNT" -gt 0 ]; then
               echo "has_regression=true" >> "$GITHUB_OUTPUT"
             else
@@ -893,22 +921,14 @@ jobs:
           fi
 
       - name: Upload regression report
-        if: steps.check-results.outputs.has_results == 'true' && steps.check-regression.outputs.has_regression == 'true'
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.check-regression.outputs.has_regression == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: oot-benchmark-regression-report
           path: regression_report.json
 
-      - name: Note dashboard upload skipped
-        if: steps.check-results.outputs.has_results == 'true' && needs.resolve-atom-source.outputs.publish_to_dashboard != 'true'
-        run: |
-          printf '### Dashboard upload skipped\nResults from `%s@%s` using `%s` OOT image mode are intentionally kept out of the benchmark dashboard.\n' \
-            "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
-            "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-            "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Transform results for benchmark dashboard
-        if: steps.check-results.outputs.has_results == 'true' && needs.resolve-atom-source.outputs.publish_to_dashboard == 'true'
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
           python3 .github/scripts/oot_benchmark_to_dashboard.py \
             . \
@@ -916,7 +936,7 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Store benchmark result to dashboard
-        if: steps.check-results.outputs.has_results == 'true' && needs.resolve-atom-source.outputs.publish_to_dashboard == 'true'
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           tool: customBiggerIsBetter
@@ -931,7 +951,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy custom dashboard to gh-pages
-        if: steps.check-results.outputs.has_results == 'true' && needs.resolve-atom-source.outputs.publish_to_dashboard == 'true'
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
