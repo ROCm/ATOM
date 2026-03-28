@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       deepseek-r1-0528:
-        description: "Benchmark DeepSeek-R1-0528"
+        description: "Benchmark DeepSeek-R1-0528 (+ MTP3)"
         type: boolean
         default: true
       glm-5-fp8:
@@ -19,7 +19,7 @@ on:
         type: boolean
         default: true
       deepseek-r1-0528-mxfp4:
-        description: "Benchmark DeepSeek-R1-0528 MXFP4-MTP3"
+        description: "Benchmark DeepSeek-R1-0528 MXFP4 (+ MXFP4-MTP3)"
         type: boolean
         default: true
       gpt-oss-120b:
@@ -28,6 +28,10 @@ on:
         default: true
       kimi-k25-mxfp4:
         description: "Benchmark Kimi-K2.5-MXFP4"
+        type: boolean
+        default: true
+      MiniMax-M2.5:
+        description: "Benchmark MiniMax-M2.5"
         type: boolean
         default: true
       extra_args:

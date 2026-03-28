@@ -138,6 +138,11 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
+          print(f"{'Model':<45} {'Level':<10} {'Runner'}")
+          print("-" * 80)
+          for m in models:
+              enabled = "✓" if m in filtered else "·"
+              print(f"  {enabled} {m['model_name']:<43} {m.get('test_level','?'):<10} {m['runner']}")
           PY
 
   atom-test:

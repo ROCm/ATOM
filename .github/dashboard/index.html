@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ATOM Benchmark Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='4' fill='%23f5f0eb'/><rect x='0' y='0' width='8' height='8' fill='%23f2cfee'/><rect x='8' y='8' width='8' height='8' fill='%23f2cfee'/><rect x='0' y='16' width='8' height='8' fill='%23f2cfee'/><rect x='16' y='16' width='8' height='8' fill='%23f2cfee'/><rect x='0' y='24' width='8' height='8' fill='%23f2cfee'/><rect x='8' y='24' width='8' height='8' fill='%23f2cfee'/><rect x='24' y='24' width='8' height='8' fill='%23f2cfee'/></svg>" />
   <style>
     /* ============================================================
        CSS VARIABLES & RESET
@@ -444,7 +445,7 @@ function parseRunConfigs(run) {
   const configs = {}; // key: "backend|model|isl/osl|conc"
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
-    if (!p || p.islOsl === '0/0') continue;
+    if (!p || p.isAccuracy || p.islOsl === '0/0') continue;
     const key = `${p.backend}|${p.model}|${p.islOsl}|${p.conc}`;
     if (!configs[key]) configs[key] = { backend: p.backend, model: p.model, islOsl: p.islOsl, conc: p.conc, commit: run.commit, date: run.date, runUrl: '' };
     configs[key][p.metric] = b.value;
@@ -563,11 +564,12 @@ function escHTML(s) { const d = document.createElement('div'); d.textContent = s
 function safeHref(url) { return typeof url === 'string' && url.startsWith('https://') ? url : null; }
 
 // Extract unique filter values from ALL runs (not just latest) so historical models are always visible
-const allBackends = [...new Set(Object.keys(historyMap).map(k => k.split('|')[0]))].sort();
-const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))].sort();
+const _lc = (a, b) => { const la = a.toLowerCase(), lb = b.toLowerCase(); return la < lb ? -1 : la > lb ? 1 : 0; };
+const allBackends = [...new Set(Object.keys(historyMap).map(k => k.split('|')[0]))].sort(_lc);
+const allModels = [...new Set(Object.keys(historyMap).map(k => k.split('|')[1]))].sort(_lc);
 const allIslOsl = [...new Set(Object.keys(historyMap).map(k => k.split('|')[2]))].sort();
 const allConc = [...new Set(Object.keys(historyMap).map(k => +k.split('|')[3]))].sort((a, b) => a - b);
-const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort();
+const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort(_lc);
 
 /* ================================================================
    3. STATE
@@ -963,11 +965,8 @@ function renderKPICards() {
     regSub = `${warningCount} warning`;
   }
 
-  // Accuracy KPI
-  const accEntries = Object.entries(latestAccuracy).filter(([key]) => {
-    const [bk, mdl] = key.split('|');
-    return state.filters.backends.includes(bk) && state.filters.models.includes(mdl);
-  });
+  // Accuracy KPI (not filtered by model/backend — accuracy models may differ from perf models)
+  const accEntries = Object.entries(latestAccuracy);
   const passCount = accEntries.filter(([, a]) => a.threshold && a.score >= a.threshold).length;
   const failCount = accEntries.filter(([, a]) => a.threshold && a.score < a.threshold).length;
   const accRegCount = Object.keys(accuracyRegressions).length;
@@ -1384,7 +1383,7 @@ function renderTradeoffTab() {
   for (let fi = 0; fi < tradeoffFamilies.length; fi++) {
     const fam = tradeoffFamilies[fi];
     const safeId = fi + '-' + fam.replace(/[^a-zA-Z0-9]/g, '');
-    const famModels = [...familyMap[fam]].sort();
+    const famModels = [...familyMap[fam]].sort(_lc);
     const famConfigs = {};
     for (const [key, cfg] of entries) {
       if (famModels.includes(cfg.model)) famConfigs[key] = cfg;
@@ -1628,7 +1627,7 @@ function renderTrendsTab() {
   const trendOptions = [...new Set(Object.values(latestConfigs)
     .filter(cfg => state.filters.backends.includes(cfg.backend) && state.filters.models.includes(cfg.model))
     .map(cfg => `${cfg.backend}|${cfg.model}`))]
-    .sort();
+    .sort((a, b) => _lc(a.split('|')[1], b.split('|')[1]));
   if (!trendOptions.includes(state.trendModelKey)) state.trendModelKey = trendOptions[0] || '';
 
   let html = '';
@@ -2115,12 +2114,9 @@ function renderAccuracyTab() {
     container.innerHTML = '<p style="color:var(--text-tertiary);padding:var(--gap-lg)">No accuracy data available yet. Accuracy data will appear after CI accuracy tests run on the main branch.</p>';
     return;
   }
+  // Not filtered by model/backend — accuracy tab always shows all models
   const models = Object.entries(latestAccuracy)
-    .filter(([key]) => {
-      const [bk, mdl] = key.split('|');
-      return state.filters.backends.includes(bk) && state.filters.models.includes(mdl);
-    })
-    .sort((a, b) => b[1].score - a[1].score);
+    .sort((a, b) => _lc(a[0].split('|')[1], b[0].split('|')[1]));
 
   let html = `
     <h3 style="color:var(--text-primary);margin-bottom:var(--gap-md)">Model Accuracy (GSM8K)</h3>
