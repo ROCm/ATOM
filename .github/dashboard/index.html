@@ -2143,7 +2143,7 @@ function renderAccuracyTab() {
     const statusClass = !hasThreshold ? 'trend-neutral' : margin >= 0 ? 'trend-up' : 'trend-down';
     const reg = accuracyRegressions[key];
     const regClass = reg ? (reg.severity === 'critical' ? 'regression' : 'regression-warning') : '';
-    const dateStr = new Date(acc.date * 1000).toLocaleDateString();
+    const dateStr = fmtDate(acc.date);
     const href = safeHref(acc.runUrl);
 
     html += `
@@ -2219,7 +2219,7 @@ function renderAccuracyMiniChart(key, chartCache) {
   // Build data sorted ascending by date
   const sorted = [...history].sort((a, b) => a.date - b.date);
   const labels = sorted.map(h => {
-    const dt = new Date(h.date * 1000);
+    const dt = new Date(h.date);
     return `${dt.getMonth()+1}/${dt.getDate()}`;
   });
   const scores = sorted.map(h => h.score);

@@ -1142,7 +1142,7 @@ class Indexer(nn.Module):
         self.weights_proj = ReplicatedLinear(
             hidden_size,
             self.n_head,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5

@@ -1937,11 +1937,12 @@ class FusedMoE(torch.nn.Module):
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
+        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
         self.num_fused_shared_experts = (
             config.n_shared_experts
             if config is not None
             and hasattr(config, "n_shared_experts")
-            and is_rocm_aiter_fusion_shared_expert_enabled()
+            and fuse_shared_experts
             else 0
         )
         self.routed_scaling_factor = (
@@ -1971,10 +1972,7 @@ class FusedMoE(torch.nn.Module):
                 ),
                 dim=0,
             )
-        if (
-            is_rocm_aiter_fusion_shared_expert_enabled()
-            and self.num_fused_shared_experts > 0
-        ):
+        if fuse_shared_experts and self.num_fused_shared_experts > 0:
             init_aiter_topK_meta_data(
                 n_routed_experts=self.global_num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
@@ -1989,7 +1987,7 @@ class FusedMoE(torch.nn.Module):
                 max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
-        if is_rocm_aiter_fusion_shared_expert_enabled():
+        if fuse_shared_experts:
             self.local_num_experts += self.num_fused_shared_experts
         assert intermediate_size % self.tp_size == 0
         self.hidden_size = hidden_size
