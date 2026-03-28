@@ -21,8 +21,8 @@
   },
   {
     "display": "gpt-oss-120b TP1",
-    "source_path": "amd/gpt-oss-120b-w-mxfp4-a-fp8",
-    "path": "/models/gpt-oss-120b",
+    "source_path": "openai/gpt-oss-120b",
+    "path": "/models/openai-gpt-oss-120b",
     "prefix": "gpt-oss-120b",
     "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
