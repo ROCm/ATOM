@@ -80,18 +80,23 @@ def build_entries(
         except (TypeError, ValueError):
             pass
 
-        # Include num_fewshot from lm_eval config
+        # Include num_fewshot: check configs.gsm8k first, then top-level config
         lm_config = data.get("config", {})
-        num_fewshot = lm_config.get("num_fewshot")
+        task_configs = data.get("configs", {})
+        num_fewshot = task_configs.get("gsm8k", {}).get("num_fewshot") or lm_config.get(
+            "num_fewshot"
+        )
         if num_fewshot is not None:
             extra_parts.append(f"fewshot: {num_fewshot}")
 
         model_args = lm_config.get("model_args", "")
-        if model_args:
+        if isinstance(model_args, str) and model_args:
             for arg in model_args.split(","):
                 if arg.startswith("model="):
                     extra_parts.append(f"Model: {arg[6:]}")
                     break
+        elif isinstance(model_args, dict) and "model" in model_args:
+            extra_parts.append(f"Model: {model_args['model']}")
 
         extra = " | ".join(extra_parts) if extra_parts else None
 

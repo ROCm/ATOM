@@ -443,8 +443,20 @@ jobs:
 
       - name: Collect Test Summary
         if: success()
+        env:
+          MODEL_NAME: ${{ matrix.model_name }}
         run: |
-          echo "Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          # Read threshold and score for summary
+          threshold=$(python3 -c "
+          import json, os
+          models = json.load(open('.github/benchmark/models_accuracy.json', encoding='utf-8'))
+          name = os.environ['MODEL_NAME']
+          print(next((m.get('accuracy_threshold', 0) for m in models if m['model_name'] == name), 0))
+          ")
+          result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
+          score=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file" 2>/dev/null || echo "N/A")
+
+          echo "Accuracy Test Summary for ${{ matrix.model_name }} (threshold: ${threshold}, score: ${score}):" >> $GITHUB_STEP_SUMMARY
           awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
