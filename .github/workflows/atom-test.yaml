@@ -243,7 +243,7 @@ jobs:
             MODEL_MOUNT=""
           fi
 
-          # Write env_vars via env block (avoids ${{ }} shell injection)
+          # Write env_vars via env block (avoids expression injection)
           printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
 
           IMAGE_TAG=${{ env.ATOM_BASE_IMAGE }}
