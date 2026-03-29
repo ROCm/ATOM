@@ -9,13 +9,8 @@ on:
     # from") as the ATOM branch selector, so users do not need to type branch
     # names.
     inputs:
-      private_branch_notice:
-        description: "Info only. No need to edit this field."
-        required: false
-        type: string
-        default: "To test a private ATOM branch, use the branch dropdown above. When a private branch is selected, the accuracy-test Docker image is built from that selected branch."
       run_qwen3_moe_tp8:
-        description: "Qwen3-235B-A22B-Instruct-2507-FP8 TP8"
+        description: "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8"
         required: false
         type: boolean
         default: false
@@ -34,8 +29,18 @@ on:
         required: false
         type: boolean
         default: false
+      run_dsr1_fp8_tp8:
+        description: "DeepSeek-R1-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
       run_dsr1_fp4_tp8:
         description: "DeepSeek-R1-0528-MXFP4 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_gpt_oss_120b_tp1:
+        description: "gpt-oss-120b TP1"
         required: false
         type: boolean
         default: false
@@ -79,7 +84,9 @@ jobs:
           RUN_QWEN3_NEXT_80B_TP2: ${{ inputs.run_qwen3_next_80b_tp2 }}
           RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
           RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
+          RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
+          RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
         run: |
           set -euo pipefail
 
@@ -94,9 +101,9 @@ jobs:
           models = [
               {
                   "toggle_env": "RUN_QWEN3_MOE_TP8",
-                  "model_name": "Qwen3-235B-A22B-Instruct-2507-FP8 TP8",
+                  "model_name": "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8",
                   "model_path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
-                  "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel",
+                  "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel",
                   "accuracy_test_threshold": 0.87,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi350-8",
@@ -105,16 +112,16 @@ jobs:
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP2",
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-                  "extra_args": "--kv-cache-dtype fp8 --tensor-parallel-size 2",
+                  "extra_args": "--tensor-parallel-size 2",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
-                  "runner": "linux-atom-mi350-8",
+                  "runner": "linux-atom-mi350-4",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_TP8",
                   "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
-                  "extra_args": "--kv-cache-dtype fp8 --tensor-parallel-size 8",
+                  "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
                   "runner": "linux-atom-mi350-8",
@@ -123,8 +130,17 @@ jobs:
                   "toggle_env": "RUN_KIMI_K2_TP8",
                   "model_name": "Kimi-K2-Thinking-MXFP4 TP8",
                   "model_path": "amd/Kimi-K2-Thinking-MXFP4",
-                  "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8",
+                  "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.90,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi350-8",
+              },
+              {
+                  "toggle_env": "RUN_DSR1_FP8_TP8",
+                  "model_name": "DeepSeek-R1-FP8 TP8",
+                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "extra_args": "--tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.93,
                   "env_vars": "",
                   "runner": "linux-atom-mi350-8",
               },
@@ -132,10 +148,19 @@ jobs:
                   "toggle_env": "RUN_DSR1_FP4_TP8",
                   "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
                   "model_path": "amd/DeepSeek-R1-0528-MXFP4",
-                  "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8",
+                  "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
                   "runner": "linux-atom-mi350-8",
+              },
+              {
+                  "toggle_env": "RUN_GPT_OSS_120B_TP1",
+                  "model_name": "gpt-oss-120b TP1",
+                  "model_path": "openai/gpt-oss-120b",
+                  "extra_args": "--tensor-parallel-size 1",
+                  "accuracy_test_threshold": 0.33,
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "linux-atom-mi350-1",
               },
           ]
 
