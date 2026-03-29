@@ -95,7 +95,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - id: load
-        run: echo "models_json=$(jq -c . .github/benchmark/models.json)" >> $GITHUB_OUTPUT
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUTS_JSON: ${{ toJson(inputs) }}
+        run: |
+          python3 << 'PY'
+          import json, os
+          event = os.environ["EVENT_NAME"]
+          inputs = json.loads(os.environ.get("INPUTS_JSON", "{}"))
+          models = json.load(open(".github/benchmark/models.json", encoding="utf-8"))
+          if event == "schedule":
+              filtered = models
+          else:
+              filtered = [m for m in models if inputs.get(m["prefix"], True)]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"models_json={json.dumps(filtered)}\n")
+          print(f"Event={event}: {len(filtered)}/{len(models)} models enabled")
+          PY
 
   benchmark:
     name: ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
@@ -128,23 +144,7 @@ jobs:
       RESULT_FILENAME: ${{ matrix.model.prefix }}${{ matrix.model.suffix }}-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
 
     steps:
-      - name: Check if model is enabled
-        id: check
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "enabled=true" >> $GITHUB_OUTPUT
-          else
-            # Look up workflow input by model prefix; default to true for unknown models
-            ENABLED=$(echo '${{ toJson(inputs) }}' | python3 -c "
-          import json, sys
-          inputs = json.load(sys.stdin)
-          print(str(inputs.get('${{ matrix.model.prefix }}', True)).lower())
-          ")
-            echo "enabled=${ENABLED}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Kill all Docker containers
-        if: steps.check.outputs.enabled == 'true'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -154,15 +154,12 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Show ROCm status (host)
-        if: steps.check.outputs.enabled == 'true'
         run: docker ps -a && rocm-smi --showmemuse 2>/dev/null || true
 
       - name: Checkout ATOM repo
-        if: steps.check.outputs.enabled == 'true'
         uses: actions/checkout@v6
 
       - name: Start CI container
-        if: steps.check.outputs.enabled == 'true'
         run: |
           docker ps -aq -f name=atom-benchmark | xargs -r docker stop | xargs -r docker rm
           DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
@@ -195,7 +192,6 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Collect GPU info (inside container)
-        if: steps.check.outputs.enabled == 'true'
         id: gpu-info
         run: |
           # Run rocm-smi inside the container for consistent output across runners
@@ -208,7 +204,6 @@ jobs:
           echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
 
       - name: Download models
-        if: steps.check.outputs.enabled == 'true'
         run: |
           if [ -d "/models" ]; then
             docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-benchmark bash -lc \
@@ -216,7 +211,6 @@ jobs:
           fi
 
       - name: Run benchmark
-        if: steps.check.outputs.enabled == 'true'
         timeout-minutes: 60
         run: |
           set -euo pipefail
@@ -235,7 +229,6 @@ jobs:
           "
 
       - name: Inject GPU metadata into benchmark result
-        if: steps.check.outputs.enabled == 'true'
         run: |
           docker exec \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
@@ -260,25 +253,24 @@ jobs:
           "
 
       - name: Copy profiler traces
-        if: steps.check.outputs.enabled == 'true' && inputs.enable_profiler
+        if: inputs.enable_profiler
         run: docker cp atom-benchmark:/app/trace ./profiler-traces 2>/dev/null || true
 
       - name: Upload profiler traces
-        if: steps.check.outputs.enabled == 'true' && inputs.enable_profiler
+        if: inputs.enable_profiler
         uses: actions/upload-artifact@v7
         with:
           name: profiler-traces-${{ env.RESULT_FILENAME }}
           path: profiler-traces/
 
       - name: Upload benchmark result
-        if: steps.check.outputs.enabled == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
       - name: Clean Up
-        if: always() && steps.check.outputs.enabled == 'true'
+        if: always()
         run: |
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
             ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
