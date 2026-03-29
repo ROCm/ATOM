@@ -62,7 +62,9 @@ def main() -> int:
     if not current_results:
         print("> No successful benchmark results found for regression comparison.\n")
         report = build_report([], 0, [])
-        Path(args.output_json).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        Path(args.output_json).write_text(
+            json.dumps(report, indent=2), encoding="utf-8"
+        )
         return 0
 
     regression_count = 0
