@@ -92,7 +92,7 @@ jobs:
 
           # Keep this Python model list as the single source of truth for OOT
           # full-validation coverage and manual checkbox filtering.
-          python - <<'PY' >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
           import sys
@@ -197,7 +197,7 @@ jobs:
 
           git archive --format=tar HEAD | tar -xf - -C "${BUILD_CONTEXT}"
 
-          BUILD_CONTEXT="${BUILD_CONTEXT}" python - <<'PY'
+          BUILD_CONTEXT="${BUILD_CONTEXT}" python3 - <<'PY'
           import os
           import re
           from pathlib import Path
