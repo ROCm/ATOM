@@ -409,7 +409,7 @@ jobs:
       MODEL_NAME: ${{ matrix.model.display }}
       DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
-      MODEL_PATH: ${{ matrix.model.path }}
+      MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
       OOT_EXTRA_ARGS: ${{ matrix.model.extra_args }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
@@ -488,8 +488,12 @@ jobs:
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
         run: |
-          model_path="${MODEL_PATH}"
-          model_cache_rel="${model_path#/models/}"
+          model_cache_rel="${MODEL_PATH}"
+          if [[ "${model_cache_rel}" = /models/* ]]; then
+            model_cache_rel="${model_cache_rel#/models/}"
+          elif [[ "${model_cache_rel}" = /data/models/* ]]; then
+            model_cache_rel="${model_cache_rel#/data/models/}"
+          fi
           MODEL_CACHE_HOST_ROOT=""
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
@@ -571,6 +575,9 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: |
           model_dir="${MODEL_PATH}"
+          if [[ "${model_dir}" != /* ]]; then
+            model_dir="/models/${model_dir}"
+          fi
           if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"$model_dir\" ] && [ -f \"$model_dir/config.json\" ]"; then
             echo "Model already exists under ${model_dir}; skip download"
           else
@@ -584,9 +591,13 @@ jobs:
       - name: Resolve OOT model path
         if: steps.check.outputs.enabled == 'true'
         run: |
-          if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"${MODEL_PATH}\" ] && [ -f \"${MODEL_PATH}/config.json\" ]"; then
-            echo "OOT_RESOLVED_MODEL_PATH=${MODEL_PATH}" >> "$GITHUB_ENV"
-            echo "Using pre-downloaded model path: ${MODEL_PATH}"
+          model_dir="${MODEL_PATH}"
+          if [[ "${model_dir}" != /* ]]; then
+            model_dir="/models/${model_dir}"
+          fi
+          if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"${model_dir}\" ] && [ -f \"${model_dir}/config.json\" ]"; then
+            echo "OOT_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+            echo "Using pre-downloaded model path: ${model_dir}"
           else
             echo "OOT_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
             echo "Using model id: ${MODEL_SOURCE_PATH}"
