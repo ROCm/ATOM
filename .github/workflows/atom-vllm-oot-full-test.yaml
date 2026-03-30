@@ -14,8 +14,8 @@ on:
         required: false
         type: boolean
         default: false
-      run_qwen3_next_80b_tp2:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP2"
+      run_qwen3_next_80b_tp4:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
         required: false
         type: boolean
         default: false
@@ -89,7 +89,7 @@ jobs:
         id: meta
         env:
           RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
-          RUN_QWEN3_NEXT_80B_TP2: ${{ inputs.run_qwen3_next_80b_tp2 }}
+          RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
           RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
           RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
           RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
@@ -119,10 +119,10 @@ jobs:
                   "runner": "linux-atom-mi35x-8",
               },
               {
-                  "toggle_env": "RUN_QWEN3_NEXT_80B_TP2",
-                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
+                  "toggle_env": "RUN_QWEN3_NEXT_80B_TP4",
+                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-                  "extra_args": "--tensor-parallel-size 2",
+                  "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-4",
@@ -517,6 +517,14 @@ jobs:
             oot_accuracy_output.txt
             oot_accuracy_results
 
+      - name: Upload accuracy results for dashboard
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: accuracy-${{ matrix.model_name }}
+          path: oot_accuracy_results/*.json
+          if-no-files-found: ignore
+
       - name: Cleanup
         if: always()
         run: |
@@ -524,3 +532,62 @@ jobs:
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           docker rmi "${OOT_IMAGE_TAG}" || true
+
+  accuracy-dashboard:
+    name: Update OOT accuracy dashboard
+    needs: [oot-model-accuracy]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Prepare accuracy artifact directory
+        run: mkdir -p /tmp/accuracy-results
+
+      - name: Download accuracy artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/accuracy-results
+          pattern: accuracy-*
+        continue-on-error: true
+
+      - name: Count downloaded accuracy artifacts
+        id: downloaded
+        run: |
+          json_count=$(find /tmp/accuracy-results -type f -name '*.json' | wc -l | tr -d ' ')
+          echo "json_count=${json_count}" >> "$GITHUB_OUTPUT"
+          echo "Downloaded ${json_count} OOT accuracy JSON files"
+
+      - name: List downloaded accuracy artifacts
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          echo "=== Downloaded OOT accuracy artifacts ==="
+          find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
+
+      - name: Transform OOT accuracy results for dashboard
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          python3 .github/scripts/accuracy_to_dashboard.py \
+            /tmp/accuracy-results \
+            --output accuracy-benchmark-input.json \
+            --models .github/benchmark/oot_models_accuracy.json \
+            --backend "ATOM-vLLM" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "=== Generated entries ==="
+          cat accuracy-benchmark-input.json
+
+      - name: Store OOT accuracy result to dashboard
+        if: steps.downloaded.outputs.json_count != '0'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: accuracy-benchmark-input.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-dashboard
+          auto-push: true
+          max-items-in-chart: 90
+          github-token: ${{ secrets.GITHUB_TOKEN }}
