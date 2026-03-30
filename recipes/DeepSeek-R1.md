@@ -1,6 +1,6 @@
 # DeepSeek-R1 Usage Guide
 
-[DeepSeek-R1-0528](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) is a reasoning-focused Mixture-of-Experts (MoE) large language model developed by DeepSeek. It features Multi-head Latent Attention (MLA) with LoRA-compressed QKV projections and Multi-Token Prediction (MTP) for speculative decoding. ATOM provides built-in support for both BF16 and MXFP4 quantized variants.
+[DeepSeek-R1-0528](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) is a reasoning-focused Mixture-of-Experts (MoE) large language model developed by DeepSeek. It features Multi-head Latent Attention (MLA) with LoRA-compressed QKV projections and Multi-Token Prediction (MTP) for speculative decoding. The model weights are natively stored in FP8. ATOM provides built-in support for both the FP8 original and MXFP4 quantized variants.
 
 ## Preparing environment
 
@@ -12,7 +12,7 @@ All the operations below will be executed inside the container.
 
 ## Launching server
 
-### BF16 on 8xMI300X/MI355X GPUs (TP8 + FP8 KV Cache)
+### FP8 on 8xMI300X/MI355X GPUs (TP8 + FP8 KV Cache)
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -20,7 +20,7 @@ python -m atom.entrypoints.openai_server \
   --kv_cache_dtype fp8 -tp 8
 ```
 
-### BF16 with MTP Speculative Decoding (Recommended)
+### FP8 with MTP Speculative Decoding (Recommended)
 
 MTP provides ~60% throughput improvement with 3 speculative tokens:
 
@@ -75,14 +75,14 @@ Performance on 8xMI300X GPUs with the following environment:
 - Docker image: rocm/atom:latest.
 - ATOM: main branch.
 
-### BF16 (TP8, FP8 KV Cache)
+### FP8 (TP8, FP8 KV Cache)
 
 | ISL  | OSL  | Concurrency | Output Throughput (tok/s) | Total Throughput (tok/s) | Mean TPOT (ms) |
 | ---- | ---- | ----------- | ------------------------- | ------------------------ | -------------- |
 | 1024 | 1024 | 128         | 4,274                     | 8,558                    | 28.8           |
 | 1024 | 1024 | 256         | 6,039                     | 12,071                   | 40.8           |
 
-### BF16 + MTP3 (TP8, FP8 KV Cache, 3 speculative tokens)
+### FP8 + MTP3 (TP8, FP8 KV Cache, 3 speculative tokens)
 
 | ISL  | OSL  | Concurrency | Output Throughput (tok/s) | Total Throughput (tok/s) | Mean TPOT (ms) |
 | ---- | ---- | ----------- | ------------------------- | ------------------------ | -------------- |
@@ -102,7 +102,7 @@ lm_eval \
   --num_fewshot 5
 ```
 
-Reference accuracy on 8 GPUs (BF16, FP8 KV Cache):
+Reference accuracy on 8 GPUs (FP8, FP8 KV Cache):
 ```
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
@@ -110,4 +110,4 @@ Reference accuracy on 8 GPUs (BF16, FP8 KV Cache):
 |     |       |strict-match    |     5|exact_match|↑  |0.9538|±  |0.0058|
 ```
 
-CI accuracy threshold: `flexible-extract ≥ 0.94` (BF16), `≥ 0.93` (MXFP4).
+CI accuracy threshold: `flexible-extract ≥ 0.94` (FP8), `≥ 0.93` (MXFP4).

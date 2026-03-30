@@ -341,7 +341,10 @@ def load_model(
                         for shard_idx, target_name in enumerate(packed_value):
                             param_name = name.replace(k, target_name)
                             if "output_scale" not in param_name:
-                                param = model.get_parameter(param_name)
+                                try:
+                                    param = model.get_parameter(param_name)
+                                except AttributeError:
+                                    continue
                                 weight_loader = getattr(param, "weight_loader")
                                 futures.append(
                                     executor.submit(
@@ -355,7 +358,10 @@ def load_model(
                         param_name = name.replace(k, v)
                         # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
                         if "output_scale" not in param_name:
-                            param = model.get_parameter(param_name)
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                break
                             weight_loader = getattr(param, "weight_loader")
                             # weight_loader(param, weight_tensor, shard_id)
                             futures.append(
@@ -424,7 +430,13 @@ def load_model(
                         if "mtp" in name and not spec_decode:
                             matched = True
                             break
-                        param = model.get_parameter(name)
+                        try:
+                            param = model.get_parameter(name)
+                        except AttributeError:
+                            # Parameter absent from model (e.g. weight scales for
+                            # an unquantized drafter MTP block); skip silently.
+                            matched = True
+                            break
                         weight_loader = getattr(param, "weight_loader")
                         futures.append(
                             executor.submit(
@@ -442,7 +454,10 @@ def load_model(
                     if not matched:
                         if "mtp" in name and not spec_decode:
                             continue
-                        param = model.get_parameter(name)
+                        try:
+                            param = model.get_parameter(name)
+                        except AttributeError:
+                            continue
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -452,7 +467,10 @@ def load_model(
                         loaded_weights_record.add(prefix + name)
                 else:
                     # Model doesn't have expert mapping, use generic loading
-                    param = model.get_parameter(name)
+                    try:
+                        param = model.get_parameter(name)
+                    except AttributeError:
+                        continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

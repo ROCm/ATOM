@@ -135,7 +135,7 @@ The dashboard tracks nightly performance across models and configurations:
 - **Regression detection** — Automatic alerts when throughput drops >5% or latency increases >10%
 - **Profiler trace collection** — On regression, automatically re-runs with PyTorch profiler and uploads traces
 
-Models tracked: DeepSeek-R1-0528 (BF16 & MTP3), GLM-5-FP8, gpt-oss-120b
+Models tracked: DeepSeek-R1-0528 (FP8 & MTP3), GLM-5-FP8, gpt-oss-120b
 
 ### Online Serving Throughput
 
@@ -233,7 +233,7 @@ lm_eval --model local-completions \
 
 **Deployment Recipes:**
 
-- [DeepSeek-R1](recipes/DeepSeek-R1.md) — BF16/MXFP4 with MTP speculative decoding on 8 GPUs
+- [DeepSeek-R1](recipes/DeepSeek-R1.md) — FP8/MXFP4 with MTP speculative decoding on 8 GPUs
 - [Qwen3-235B-A22B](recipes/Qwen3-235b.md) — TP8 + EP with FP8 KV cache
 - [Qwen3-Next](recipes/Qwen3-Next.md) — Hybrid GDN + MoE architecture
 - [Kimi-K2-Thinking](recipes/Kimi-K2-Thinking.md) — MXFP4 MoE on 4 GPUs

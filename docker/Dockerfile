@@ -12,6 +12,9 @@ ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
 ARG VLLM_COMMIT="b31e9326a7d9394aab8c767f8ebe225c65594b60"
 ARG INSTALL_LM_EVAL=1
 ARG INSTALL_FASTSAFETENSORS=1
+ARG ROCM_WHEEL_INDEX="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/"
+ARG ROCM_TORCHVISION_VERSION="0.24.0+rocm7.2.1.gitb919bd0c"
+ARG ROCM_TORCHAUDIO_VERSION="2.9.0+rocm7.2.1.gite3c6ee2b"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV MAX_JOBS=${MAX_JOBS}
@@ -71,6 +74,13 @@ RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && 
     if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi && \
     "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \
     "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom mori || true
+
+RUN echo "FIXME: rocm/pytorch:latest currently resolves incompatible torchvision/torchaudio wheels; pin ROCm wheels here until the base image is fixed upstream." && \
+    "${VENV_PYTHON}" -m pip uninstall -y torchvision torchaudio || true && \
+    "${VENV_PYTHON}" -m pip install --no-index --find-links "${ROCM_WHEEL_INDEX}" \
+      "torchvision==${ROCM_TORCHVISION_VERSION}" \
+      "torchaudio==${ROCM_TORCHAUDIO_VERSION}" && \
+    "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
 
 CMD ["/bin/bash"]
 

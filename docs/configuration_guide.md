@@ -16,7 +16,7 @@ controls ATOM's runtime behaviour.
 | `CompilationLevel` | Integer constants for the four compilation levels |
 | `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (none / piecewise / full / hybrid) |
 | `QuantizationConfig` | Layer-wise quantization orchestrator: global config, per-layer overrides, exclude lists, layer name remapping |
-| `LayerQuantConfig` | Per-layer quantization parameters: quant type, dtype, dynamic flag, method |
+| `LayerQuantConfig` | Per-layer quantization spec (frozen dataclass): quant type, dtype, dynamic flag, method |
 | `ParallelConfig` | Data-parallel size, rank, master IP/port |
 | `SpeculativeConfig` | Speculative decoding method, draft model, number of speculative tokens |
 | `KVCacheConfig` / `KVCacheTensor` | Per-layer KV cache tensor descriptors (k/v caches and scales) |
@@ -122,16 +122,16 @@ Helper methods on `CUDAGraphMode`:
 
 ## 3. Quantization Configuration (`QuantizationConfig` & `LayerQuantConfig`)
 
-Defined in `atom/config.py`. The quantization system uses two classes:
+Defined in `atom/config.py` and `atom/quant_spec.py`. The quantization system uses two classes:
 
-- **`QuantizationConfig`** -- the top-level orchestrator that holds a global config, per-layer overrides, and exclusion lists. It is **not** a `dict` subclass.
-- **`LayerQuantConfig(dict)`** -- a `dict` subclass that stores the concrete quantization parameters for a single layer (or as the global default).
+- **`QuantizationConfig`** -- the top-level orchestrator that holds a global config, per-layer overrides, and exclusion lists.
+- **`LayerQuantConfig`** -- a frozen dataclass (defined in `atom/quant_spec.py`) that stores the concrete quantization parameters for a single layer or as the global default. Typed, immutable, with attribute access (e.g., `spec.quant_type`).
 
 ### 3.1 `LayerQuantConfig` Fields
 
-`LayerQuantConfig` extends `dict`. Fields are stored and accessed as dictionary keys (e.g., `cfg["quant_type"]`).
+`LayerQuantConfig` is a frozen dataclass. Fields are accessed as typed attributes (e.g., `spec.quant_type`).
 
-| Key | Type | Default | Description |
+| Field | Type | Default | Description |
 |---|---|---|---|
 | `quant_type` | `QuantType` | `QuantType.No` | Quantization granularity (see below) |
 | `quant_dtype` | `torch.dtype` | `torch.bfloat16` | Data type for quantized weights |
@@ -144,8 +144,8 @@ Defined in `atom/config.py`. The quantization system uses two classes:
 |---|---|---|
 | `torch_dtype` | `torch.dtype` | The model's default dtype (from `hf_config.torch_dtype`) |
 | `hf_quant_config` | `dict \| None` | Raw `quantization_config` dict from HuggingFace config |
-| `global_quant_config` | `LayerQuantConfig` | Default quantization config applied to all layers |
-| `layer_quant_config` | `dict[str, LayerQuantConfig]` | Per-layer overrides keyed by layer name pattern (supports fnmatch globs like `"*.mlp.*"`) |
+| `global_quant_config` | `LayerQuantConfig` | Default quantization spec applied to all layers |
+| `_parsed.layer_pattern_specs` | `list[tuple[str, LayerQuantConfig]]` | Per-layer overrides keyed by layer name pattern (supports fnmatch globs like `"*.mlp.*"`) |
 | `exclude_layers` | `list[str]` | Layer names excluded from quantization (supports exact match and `"re:"` regex prefix) |
 | `quant_method` | `str` | Top-level quantization method name (e.g., `"quark"`, `"compressed-tensors"`) |
 
@@ -154,11 +154,10 @@ Key methods:
 | Method | Description |
 |---|---|
 | `get_name()` | Returns the quantization method name |
-| `get_layer_quant_config(layer_name)` | Returns the `LayerQuantConfig` for a layer: checks exclusions first, then per-layer overrides, then falls back to global config |
-| `should_ignore_layer_quant(layer_name)` | Returns `True` if the layer is in the exclusion list |
+| `get_layer_quant_config(layer_name)` | Returns the `LayerQuantConfig` for a layer: checks exclusions first, then per-layer overrides, then falls back to global spec |
 | `remap_layer_name(hf_config, packed_modules_mapping)` | Remaps layer names for packed/fused modules (e.g., `q_a_proj` → `fused_qkv_a_proj` for DeepSeek) |
 | `compute_hash()` | Returns a SHA-256 hash of the quantization config for cache invalidation |
-| `parse_quark_config_dict(config)` | Parses a quark-format config dict into a `LayerQuantConfig` |
+
 
 ### 3.3 `QuantType` Values (from AITER)
 
@@ -188,7 +187,7 @@ parameters:
 
 **For quark models** (`quant_method == "quark"`):
 
-1. Parses `global_quant_config` dict via `parse_quark_config_dict()` to produce the global `LayerQuantConfig`.
+1. Parses `global_quant_config` dict via `QuarkParser` to produce the global `LayerQuantConfig`.
 2. Parses each entry in `layer_quant_config` dict to produce per-layer overrides.
 3. Reads the `"exclude"` list for excluded layers.
 4. Within each config dict, `weight.qscheme` determines `quant_type` (`"per_channel"` → `per_Token`, `"per_tensor"` → `per_Tensor`, `"per_group"` → `per_1x32`), and `weight.dtype` determines `quant_dtype`.
@@ -388,7 +387,7 @@ Need maximum decode throughput?
 
 | File | Description |
 |---|---|
-| `atom/config.py` | `Config`, `CompilationConfig`, `CompilationLevel`, `CUDAGraphMode`, `LayerQuantConfig`, `QuantizationConfig`, `ParallelConfig`, `SpeculativeConfig`, `KVCacheTensor`, `KVCacheConfig`, `get_hf_config` |
+| `atom/config.py` | `Config`, `CompilationConfig`, `CompilationLevel`, `CUDAGraphMode`, `QuantizationConfig`, `ParallelConfig`, `SpeculativeConfig`, `KVCacheTensor`, `KVCacheConfig`, `get_hf_config` |
 | `atom/utils/envs.py` | All `ATOM_*` environment variable definitions with lazy evaluation |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` dataclass and CLI argument parser |
 | `atom/sampling_params.py` | `SamplingParams` dataclass |

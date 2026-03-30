@@ -111,7 +111,7 @@ class OAIAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.num_attention_heads,
             total_num_kv_heads=self.num_key_value_heads,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
             bias=True,
         )
@@ -119,7 +119,7 @@ class OAIAttention(nn.Module):
         self.o_proj = RowParallelLinear(
             input_size=self.num_attention_heads * self.head_dim,
             output_size=self.hidden_size,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             bias=True,
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
@@ -212,10 +212,10 @@ class MLPBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
 
-        g = self.router(x)
+        g = self.router(x[..., : self.hidden_size])
 
         # Pad input for MXFP4 MoE GEMM alignment if needed
-        if self.moe_hidden_pad > 0:
+        if self.moe_hidden_pad > 0 and self.tp_size > 1:
             x = F.pad(x, (0, self.moe_hidden_pad))
 
         x = self.experts(hidden_states=x, router_logits=g)
@@ -248,6 +248,7 @@ class TransformerBlock(torch.nn.Module):
 
         self.layer_idx = layer_num
         self.hidden_size = atom_config.hf_config.hidden_size
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.self_attn = OAIAttention(
             config,
             prefix=f"{prefix}.self_attn",
@@ -269,7 +270,8 @@ class TransformerBlock(torch.nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=1e-5,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.tp_size > 1,
+            x_pad_to_multiple=0 if self.tp_size > 1 else 256,
         )
 
     def forward(
@@ -377,7 +379,9 @@ class GptOssForCausalLM(nn.Module):
         "gate_up_proj_blocks": "w13_weight",
         "down_proj_blocks": "w2_weight",
         "gate_up_proj_scales": "w13_weight_scale",
+        "gate_up_proj_input_scale": "w13_input_scale",
         "down_proj_scales": "w2_weight_scale",
+        "down_proj_input_scale": "w2_input_scale",
         # MoE other weights
         "gate_up_proj": "w13_weight",
         "down_proj": "w2_weight",

@@ -552,6 +552,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             input_size=self.conv_kernel_size,
             output_size=self.conv_dim,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -627,7 +628,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def create_qkvzba_proj(self, quant_config, prefix):
         # This projection fusion should only opened when model type is bfloat16
-        if self.quant_config.global_quant_config["quant_dtype"] == torch.bfloat16:
+        if self.quant_config.global_quant_config.quant_dtype == torch.bfloat16:
             self.in_proj_qkvzba = QKVZBAParallelLinear(
                 input_size=self.hidden_size,
                 head_k_dim=self.head_k_dim,
@@ -1168,7 +1169,7 @@ class Qwen3NextForCausalLM(nn.Module):
         quant_config = atom_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        if self.quant_config.global_quant_config["quant_dtype"] == torch.bfloat16:
+        if self.quant_config.global_quant_config.quant_dtype == torch.bfloat16:
             self.packed_modules_mapping["in_proj_qkvz"] = ("in_proj_qkvzba", "qkvz")
             self.packed_modules_mapping["in_proj_ba"] = ("in_proj_qkvzba", "ba")
         # Only perform the following mapping when Qwen3NextMLP exists
