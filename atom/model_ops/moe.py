@@ -640,6 +640,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
+        self.static_input_scales = not quant_config.get("is_dynamic", True)
         gfx = get_gfx()
         self.use_triton = gfx.startswith("gfx94") or (
             gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
@@ -677,6 +678,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_pad = (
             self.intermediate_size - layer.intermediate_size_per_partition
         )
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -758,6 +760,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_bias, extra_weight_attrs)
         else:
             layer.register_parameter("w2_bias", None)
+
+        if self.static_input_scales:
+            w13_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+            w2_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer):
         if layer.w13_bias is not None:
@@ -987,6 +1007,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+
+        a1_scale = getattr(layer, "w13_input_scale", None)
+        a2_scale = getattr(layer, "w2_input_scale", None)
+
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -999,6 +1023,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 quant_type=self.quant_type,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
@@ -1019,8 +1045,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             expert_map=expert_map,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            a1_scale=None,
-            a2_scale=None,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
             bias1=layer.w13_bias,
             bias2=layer.w2_bias,
             hidden_pad=self.hidden_pad,
@@ -2332,6 +2358,20 @@ class FusedMoE(torch.nn.Module):
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
             param[:, :dim1, :dim2].copy_(narrow_weight)
+        elif param is getattr(self, "w13_input_scale", None):
+            # Layer-level per-expert activation scales (HF: gate_up_proj_input_scale);
+            # generic load calls weight_loader(..., weight_name="") so we must handle here.
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end]
+            else:
+                narrow_weight = loaded_weight
+            param.data.copy_(narrow_weight.to(param.data.dtype).view_as(param.data))
+        elif param is getattr(self, "w2_input_scale", None):
+            if self.use_ep:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end]
+            else:
+                narrow_weight = loaded_weight
+            param.data.copy_(narrow_weight.to(param.data.dtype).view_as(param.data))
 
     def weight_loader(
         self,
