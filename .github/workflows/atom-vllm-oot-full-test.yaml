@@ -124,7 +124,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 2",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -133,7 +133,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
@@ -142,7 +142,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
