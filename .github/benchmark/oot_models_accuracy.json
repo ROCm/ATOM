@@ -83,8 +83,8 @@
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
     "runner": "linux-atom-mi35x-1",
     "test_level": "nightly",
-    "accuracy_threshold": 0.33,
-    "accuracy_baseline": 0.33,
+    "accuracy_threshold": 0.38,
+    "accuracy_baseline": 0.38,
     "accuracy_baseline_model": "openai/gpt-oss-120b"
   },
   {
@@ -94,8 +94,8 @@
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
     "runner": "linux-atom-mi35x-4",
     "test_level": "nightly",
-    "accuracy_threshold": 0.33,
-    "accuracy_baseline": 0.33,
+    "accuracy_threshold": 0.38,
+    "accuracy_baseline": 0.38,
     "accuracy_baseline_model": "openai/gpt-oss-120b"
   }
 ]
