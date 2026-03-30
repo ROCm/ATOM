@@ -1,4 +1,4 @@
-name: ATOM OOT vLLM Test
+name: ATOM vLLM OOT Test
 
 on:
   pull_request:
