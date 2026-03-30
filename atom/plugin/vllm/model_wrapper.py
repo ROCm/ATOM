@@ -90,6 +90,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.ignore_unexpected_suffixes: list[str] = []
 
         self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+
         _prepare_env(atom_config=self.atom_config)
 
         model_arch = vllm_config.model_config.architectures[0]
