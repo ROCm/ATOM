@@ -485,13 +485,18 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             return token
         return None
 
+    multimodal_model_types = _MULTIMODAL_MODEL_TYPES
     if is_vllm():
-        for model_name in _PLUGIN_SUPPORTED_MULTIMODAL_MODELS:
-            _MULTIMODAL_MODEL_TYPES.pop(model_name, None)
+        # Avoid mutating module-level state
+        multimodal_model_types = {
+            name: text_key
+            for name, text_key in _MULTIMODAL_MODEL_TYPES.items()
+            if name not in _PLUGIN_SUPPORTED_MULTIMODAL_MODELS
+        }
     # For multimodal models, extract the text sub-config so the rest of ATOM
     # (which is text-only today) works transparently.
-    if model_type in _MULTIMODAL_MODEL_TYPES:
-        text_config_key = _MULTIMODAL_MODEL_TYPES[model_type]
+    if model_type in multimodal_model_types:
+        text_config_key = multimodal_model_types[model_type]
         text_config_dict = config_dict.get(text_config_key, {}).copy()
         # Remove auto_map to avoid trust_remote_code issues
         text_config_dict.pop("auto_map", None)

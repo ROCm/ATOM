@@ -1155,11 +1155,11 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
 
+        hf_config = config.model_config.hf_config
+        text_config = getattr(hf_config, "text_config", None)
         num_attention_heads = getattr(
-            config.model_config.hf_config, "num_attention_heads", None
-        ) or getattr(
-            config.model_config.hf_config.text_config, "num_attention_heads", None
-        )
+            hf_config, "num_attention_heads", None
+        ) or getattr(text_config, "num_attention_heads", None)
         assert (
             num_attention_heads is not None
         ), "num_attention_heads is not found in config"

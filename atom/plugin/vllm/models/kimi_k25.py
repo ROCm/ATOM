@@ -15,7 +15,7 @@ from vllm.model_executor.models.kimi_k25_vit import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from atom.config import Config
+from atom.config import Config, QuantizationConfig
 from atom.model_config.kimi_k25 import KimiK25Config
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -98,19 +98,6 @@ class KimiK25ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        if hasattr(config, "q_lora_rank") and config.q_lora_rank is not None:
-            self.packed_modules_mapping = {
-                "q_a_proj": ("fused_qkv_a_proj", 0),
-                "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
-                "gate_proj": ("gate_up_proj", 0),
-                "up_proj": ("gate_up_proj", 1),
-            }
-        else:
-            self.packed_modules_mapping = {
-                "gate_proj": ("gate_up_proj", 0),
-                "up_proj": ("gate_up_proj", 1),
-            }
-
         self.model = KimiK25Model(
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -125,10 +112,6 @@ class KimiK25ForCausalLM(nn.Module):
             )
         else:
             self.lm_head = PPMissingLayer()
-
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -258,14 +241,8 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
     def _maybe_ignore_quant_config(
         self, quant_config: Any, exclude_layers: list[str], layer_name: str
     ):
-        import re
-
         for exclude_layer in exclude_layers:
-            if exclude_layer.startswith("re:") and re.search(
-                exclude_layer[3:], layer_name
-            ):
-                return None
-            elif exclude_layer == layer_name:
+            if QuantizationConfig._matches_exclude(layer_name, exclude_layer):
                 return None
         return quant_config
 
