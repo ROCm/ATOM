@@ -6,12 +6,6 @@
     "random_range_ratio": 0.8
   },
   {
-    "isl": 1024,
-    "osl": 8192,
-    "concurrency": [1, 2, 4, 8, 16, 32, 64, 128],
-    "random_range_ratio": 0.8
-  },
-  {
     "isl": 8192,
     "osl": 1024,
     "concurrency": [1, 2, 4, 8, 16, 32, 64, 128, 256],

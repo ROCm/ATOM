@@ -1,57 +1,163 @@
 name: ATOM vLLM OOT Benchmark
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
   workflow_dispatch:
     inputs:
       deepseek-r1-fp8:
-        description: "Benchmark DeepSeek-R1 FP8"
+        description: "DeepSeek-R1 FP8 TP8"
         type: boolean
-        default: true
+        default: false
       deepseek-r1-mxfp4:
-        description: "Benchmark DeepSeek-R1 MXFP4"
+        description: "DeepSeek-R1 MXFP4 TP8"
         type: boolean
-        default: true
+        default: false
       gpt-oss-120b:
-        description: "Benchmark gpt-oss-120b"
+        description: "gpt-oss-120b TP1"
         type: boolean
-        default: true
-      kimi-k2-thinking-mxfp4:
-        description: "Benchmark Kimi-K2-Thinking-MXFP4 (TP4 and TP8)"
+        default: false
+      kimi-k2-thinking-mxfp4-tp4:
+        description: "Kimi-K2-Thinking-MXFP4 TP4"
         type: boolean
-        default: true
-      base_image:
-        description: "ATOM base image used to build the OOT benchmark image"
+        default: false
+      kimi-k2-thinking-mxfp4-tp8:
+        description: "Kimi-K2-Thinking-MXFP4 TP8"
+        type: boolean
+        default: false
+      qwen3-5-397b-a17b-fp8:
+        description: "Qwen3.5-397B-A17B-FP8 TP8"
+        type: boolean
+        default: false
+      qwen3-next-80b-a3b-instruct-fp8:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP8"
+        type: boolean
+        default: false
+      oot_image:
+        description: "Prebuilt OOT benchmark image used only for main-branch runs; ignored for non-main branches because a custom image is rebuilt from the selected branch"
         type: string
-        default: "rocm/atom-dev:latest"
-      vllm_commit:
-        description: "vLLM commit used by the OOT benchmark image"
-        type: string
-        default: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
-      vllm_version:
-        description: "vLLM version label used in the benchmark image tag"
-        type: string
-        default: "0.17"
+        default: "rocm/atom-dev:vllm-latest"
       param_lists:
         description: |
           "Benchmark parameter lists.
           Input as a single or multiple sets (comma-separated, semicolon between sets),
           format: input_length,output_length,concurrency,random_range_ratio.
-          Example (single set): 1024,1024,128,0.8
-          Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
+          Example (single set): 1024,1024,64,0.8
+          Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
         type: string
-        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8"
-
-env:
-  BASE_IMAGE: ${{ inputs.base_image || 'rocm/atom-dev:latest' }}
-  GITHUB_REPO_URL: https://github.com/ROCm/ATOM.git
-  GITHUB_COMMIT_SHA: ${{ github.sha }}
-  VALIDATION_IMAGE_REPO: rocm/atom-dev
+        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
 
 jobs:
+  resolve-atom-source:
+    name: Resolve ATOM benchmark source
+    runs-on: ubuntu-latest
+    outputs:
+      atom_repository: ${{ steps.resolve.outputs.atom_repository }}
+      atom_ref: ${{ steps.resolve.outputs.atom_ref }}
+      normalized_ref: ${{ steps.resolve.outputs.normalized_ref }}
+      rebuild_oot_image: ${{ steps.resolve.outputs.rebuild_oot_image }}
+      prebuilt_oot_image: ${{ steps.resolve.outputs.prebuilt_oot_image }}
+      selected_vllm_commit: ${{ steps.resolve.outputs.selected_vllm_commit }}
+      selected_vllm_version: ${{ steps.resolve.outputs.selected_vllm_version }}
+      oot_base_image: ${{ steps.resolve.outputs.oot_base_image }}
+      oot_image_source: ${{ steps.resolve.outputs.oot_image_source }}
+      publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v6
+
+      - name: Resolve benchmark source
+        id: resolve
+        env:
+          INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
+        run: |
+          set -euo pipefail
+
+          ATOM_REPOSITORY="${GITHUB_REPOSITORY}"
+          ATOM_REF="${GITHUB_REF_NAME}"
+          PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE:-rocm/atom-dev:vllm-latest}"
+          OOT_BASE_IMAGE="rocm/atom-dev:latest"
+
+          NORMALIZED_REF="${ATOM_REF#refs/heads/}"
+          NORMALIZED_REF="${NORMALIZED_REF#refs/tags/}"
+
+          REBUILD_OOT_IMAGE=false
+          if [[ "${NORMALIZED_REF}" != "main" ]]; then
+            REBUILD_OOT_IMAGE=true
+          fi
+
+          OOT_IMAGE_SOURCE="prebuilt"
+          if [[ "${REBUILD_OOT_IMAGE}" == "true" ]]; then
+            OOT_IMAGE_SOURCE="rebuild"
+          fi
+
+          PUBLISH_TO_DASHBOARD=false
+          if [[ "${REBUILD_OOT_IMAGE}" != "true" && "${NORMALIZED_REF}" == "main" ]]; then
+            PUBLISH_TO_DASHBOARD=true
+          fi
+
+          mapfile -t VLLM_META < <(python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path(".github/workflows/docker-release.yaml").read_text(encoding="utf-8")
+          commit_match = re.search(r'^\s*VLLM_COMMIT:\s*"([^"]+)"', text, re.MULTILINE)
+          version_match = re.search(r'^\s*VLLM_VERSION:\s*"([^"]+)"', text, re.MULTILINE)
+
+          if not commit_match or not version_match:
+              raise SystemExit("Failed to read VLLM_COMMIT/VLLM_VERSION from .github/workflows/docker-release.yaml")
+
+          print(commit_match.group(1))
+          print(version_match.group(1))
+          PY
+          )
+
+          SELECTED_VLLM_COMMIT="${VLLM_META[0]}"
+          SELECTED_VLLM_VERSION="${VLLM_META[1]}"
+
+          {
+            echo "atom_repository=${ATOM_REPOSITORY}"
+            echo "atom_ref=${ATOM_REF}"
+            echo "normalized_ref=${NORMALIZED_REF}"
+            echo "rebuild_oot_image=${REBUILD_OOT_IMAGE}"
+            echo "prebuilt_oot_image=${PREBUILT_OOT_IMAGE}"
+            echo "selected_vllm_commit=${SELECTED_VLLM_COMMIT}"
+            echo "selected_vllm_version=${SELECTED_VLLM_VERSION}"
+            echo "oot_base_image=${OOT_BASE_IMAGE}"
+            echo "oot_image_source=${OOT_IMAGE_SOURCE}"
+            echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '### OOT benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
+            "${ATOM_REPOSITORY}" \
+            "${ATOM_REF}" \
+            "${OOT_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${REBUILD_OOT_IMAGE}" == "true" ]]; then
+            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `.github/workflows/docker-release.yaml`\n- Ignored prebuilt image input: `%s`\n' \
+              "${OOT_BASE_IMAGE}" \
+              "${SELECTED_VLLM_VERSION}" \
+              "${SELECTED_VLLM_COMMIT}" \
+              "${PREBUILT_OOT_IMAGE}" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '\nBecause branch `%s` is not `main`, a custom OOT docker is rebuilt from the selected branch and the prebuilt image input is ignored.\n' \
+              "${ATOM_REF}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf -- '- Prebuilt image: `%s`\n- Expected vLLM version: `%s`\n- Expected vLLM commit: `%s`\n' \
+              "${PREBUILT_OOT_IMAGE}" \
+              "${SELECTED_VLLM_VERSION}" \
+              "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          printf -- '- Upload to dashboard: `%s`\n' \
+            "${PUBLISH_TO_DASHBOARD}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${PUBLISH_TO_DASHBOARD}" != "true" ]]; then
+            printf '\nNon-main or overridden ATOM sources keep benchmark results in artifacts and run summaries only.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   parse-param-lists:
     name: Parse parameter lists
     runs-on: ubuntu-latest
@@ -62,7 +168,7 @@ jobs:
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
-          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8' }}"
+          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
           echo "Using param_lists: ${PARAM_LISTS}"
           printf 'param_lists=%s\n' "${PARAM_LISTS}" >> "$GITHUB_OUTPUT"
           IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
@@ -74,6 +180,13 @@ jobs:
             OUTPUT_LEN="${PARAMS[1]}"
             CONCURRENCY="${PARAMS[2]}"
             RANDOM_RANGE_RATIO="${PARAMS[3]}"
+            case "${CONCURRENCY}" in
+              4|8|16|32|64) ;;
+              *)
+                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64"
+                exit 1
+                ;;
+            esac
             MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
             SEP=","
           done
@@ -89,28 +202,136 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
+      has_enabled_models: ${{ steps.load.outputs.has_enabled_models }}
     steps:
       - uses: actions/checkout@v6
       - id: load
-        run: echo "models_json=$(jq -c . .github/benchmark/oot_benchmark_models.json)" >> "$GITHUB_OUTPUT"
+        env:
+          ENABLE_DEEPSEEK_R1_FP8: ${{ inputs.deepseek-r1-fp8 }}
+          ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4 }}
+          ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b }}
+          ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
+          ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
+          ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
+          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8 }}
+        run: |
+          MODELS_JSON="$(jq -c '
+            map(select(
+              (.prefix == "deepseek-r1-fp8" and env.ENABLE_DEEPSEEK_R1_FP8 == "true")
+              or (.prefix == "deepseek-r1-mxfp4" and env.ENABLE_DEEPSEEK_R1_MXFP4 == "true")
+              or (.prefix == "gpt-oss-120b" and env.ENABLE_GPT_OSS_120B == "true")
+              or (.prefix == "kimi-k2-thinking-mxfp4-tp4" and env.ENABLE_KIMI_K2_TP4 == "true")
+              or (.prefix == "kimi-k2-thinking-mxfp4-tp8" and env.ENABLE_KIMI_K2_TP8 == "true")
+              or (.prefix == "qwen3-5-397b-a17b-fp8" and env.ENABLE_QWEN3_5_397B_A17B_FP8 == "true")
+              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8 == "true")
+            ))
+          ' .github/benchmark/oot_benchmark_models.json)"
+          echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
+          if [ "${MODELS_JSON}" = "[]" ]; then
+            echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
+            echo "No models selected for OOT benchmark."
+          else
+            echo "has_enabled_models=true" >> "$GITHUB_OUTPUT"
+            echo "Selected models: ${MODELS_JSON}"
+          fi
+
+  build-benchmark-matrix:
+    name: Build OOT benchmark matrix
+    needs: [parse-param-lists, load-models]
+    if: >-
+      needs.parse-param-lists.result == 'success'
+      && needs.load-models.result == 'success'
+      && needs.load-models.outputs.has_enabled_models == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      benchmark_matrix: ${{ steps.build.outputs.benchmark_matrix }}
+      has_benchmark_cells: ${{ steps.build.outputs.has_benchmark_cells }}
+    steps:
+      - name: Combine models and params
+        id: build
+        env:
+          MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
+          PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
+        run: |
+          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          import json
+          import os
+
+          models = json.loads(os.environ["MODELS_JSON"])
+          params = json.loads(os.environ["PARAMS_JSON"])
+
+          include = []
+          for model in models:
+              supported_pairs = set(model.get("supported_input_output_pairs", []))
+              excluded_pairs = set(model.get("excluded_input_output_pairs", []))
+
+              for param in params:
+                  pair = f'{param["input_length"]}x{param["output_length"]}'
+                  if supported_pairs and pair not in supported_pairs:
+                      continue
+                  if pair in excluded_pairs:
+                      continue
+                  include.append({"model": model, "params": param})
+
+          print(json.dumps({"include": include}, separators=(",", ":")))
+          PY
+          )"
+          echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
+          if [ "${BENCHMARK_MATRIX}" = '{"include":[]}' ]; then
+            echo "has_benchmark_cells=false" >> "$GITHUB_OUTPUT"
+            echo "No eligible benchmark cases remain after model-specific parameter filtering."
+          else
+            echo "has_benchmark_cells=true" >> "$GITHUB_OUTPUT"
+            echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
+          fi
 
   build-oot-image:
-    name: Build OOT benchmark image
+    name: Build custom OOT benchmark image
+    needs: [resolve-atom-source, build-benchmark-matrix]
+    if: >-
+      needs.resolve-atom-source.outputs.rebuild_oot_image == 'true'
+      && needs.build-benchmark-matrix.result == 'success'
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     runs-on: build-only-atom
     outputs:
-      oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
+      oot_image_tag: ${{ steps.image-meta.outputs.oot_image_tag }}
+      atom_source_sha: ${{ steps.source-meta.outputs.atom_source_sha }}
+    env:
+      ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+      ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+      OOT_BASE_IMAGE: ${{ needs.resolve-atom-source.outputs.oot_base_image }}
+      VLLM_COMMIT: ${{ needs.resolve-atom-source.outputs.selected_vllm_commit }}
+      VLLM_VERSION: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
+      OOT_IMAGE_REPO: rocm/atom-dev
     steps:
-      - name: Checkout ATOM repo
+      - name: Checkout benchmark ATOM source
         uses: actions/checkout@v6
+        with:
+          repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
+          ref: ${{ env.ATOM_SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Record source metadata
+        id: source-meta
+        run: |
+          ATOM_SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "atom_source_sha=${ATOM_SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+          printf '### Building custom OOT image\n- Repository: `%s`\n- Ref: `%s`\n- Commit: `%s`\n- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n' \
+            "${ATOM_SOURCE_REPOSITORY}" \
+            "${ATOM_SOURCE_REF}" \
+            "${ATOM_SOURCE_SHA}" \
+            "${OOT_BASE_IMAGE}" \
+            "${VLLM_VERSION}" \
+            "${VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Docker Login
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
-      - name: Generate OOT base Dockerfile
+      - name: Generate custom OOT base Dockerfile
         run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.BASE_IMAGE }}
+          cat > Dockerfile.oot-base <<EOF
+          FROM ${OOT_BASE_IMAGE}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -127,71 +348,87 @@ jobs:
               MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
-          RUN pip uninstall -y atom
+          RUN pip uninstall -y atom || true
           RUN rm -rf /app/ATOM
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
-              cd /app/ATOM && \\
-              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
-              pip install -e .
+          COPY . /app/ATOM
+          RUN cd /app/ATOM && pip install -e .
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
-      - name: Build OOT base image
+      - name: Build custom OOT base image
         run: |
           docker build --pull --network=host \
             --no-cache \
-            -t atom_oot_base:benchmark \
-            -f Dockerfile.mod .
+            -t atom_oot_base:ci \
+            -f Dockerfile.oot-base .
 
-      - name: Build OOT vLLM image from current commit
-        id: meta
+      - name: Build custom OOT vLLM image
+        id: image-meta
         run: |
-          SHORT_SHA="${GITHUB_COMMIT_SHA::12}"
-          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-vllm-benchmark-v${{ inputs.vllm_version || '0.17' }}-${SHORT_SHA}-${{ github.run_id }}"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          SHORT_VLLM="$(printf '%s' "${VLLM_COMMIT}" | cut -c1-12)"
+          SAFE_VLLM_VERSION="$(printf '%s' "${VLLM_VERSION}" | tr '/:' '--')"
+          OOT_IMAGE_TAG="${OOT_IMAGE_REPO}:oot-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_VLLM_VERSION}-${SHORT_VLLM}"
           docker build --network=host \
             --no-cache \
             -t "${OOT_IMAGE_TAG}" \
             --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:benchmark" \
+            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
             --build-arg MAX_JOBS=64 \
-            --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || 'b31e9326a7d9394aab8c767f8ebe225c65594b60' }}" \
+            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
           echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Push OOT benchmark image
+      - name: Push custom OOT image
         run: |
-          docker push "${{ steps.meta.outputs.oot_image_tag }}"
+          docker push "${{ steps.image-meta.outputs.oot_image_tag }}"
+
+      - name: Clean up build images
+        if: always()
+        run: |
+          docker rmi "${{ steps.image-meta.outputs.oot_image_tag }}" || true
+          docker rmi atom_oot_base:ci || true
 
   benchmark:
-    name: OOT ${{ matrix.model.display }}
-    needs: [parse-param-lists, load-models, build-oot-image]
+    name: OOT ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
+    needs: [resolve-atom-source, build-benchmark-matrix, build-oot-image]
     if: >-
       always()
-      && needs.parse-param-lists.result == 'success'
-      && needs.load-models.result == 'success'
-      && needs.build-oot-image.result == 'success'
+      && needs.resolve-atom-source.result == 'success'
+      && needs.build-benchmark-matrix.result == 'success'
+      && (needs.build-oot-image.result == 'success' || needs.build-oot-image.result == 'skipped')
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        model: ${{ fromJson(needs.load-models.outputs.models_json) }}
+      matrix: ${{ fromJson(needs.build-benchmark-matrix.outputs.benchmark_matrix) }}
     runs-on: ${{ matrix.model.runner }}
     timeout-minutes: 240
     env:
-      PARAM_LISTS: ${{ needs.parse-param-lists.outputs.param_lists }}
       MODEL_NAME: ${{ matrix.model.display }}
       DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
-      MODEL_PATH: ${{ matrix.model.path }}
+      MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
       OOT_EXTRA_ARGS: ${{ matrix.model.extra_args }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
+      ISL: ${{ matrix.params.input_length }}
+      OSL: ${{ matrix.params.output_length }}
+      CONC: ${{ matrix.params.concurrency }}
+      RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
+      RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
       CONTAINER_NAME: atom_vllm_oot_benchmark_${{ strategy.job-index }}
       CONTAINER_RESULT_DIR: /tmp/oot-benchmark-results
       CONTAINER_BENCH_SERVING_DIR: /tmp/oot-benchmark/bench_serving
-      OOT_IMAGE_TAG: ${{ needs.build-oot-image.outputs.oot_image_tag }}
+      OOT_IMAGE_TAG: ${{ needs.build-oot-image.outputs.oot_image_tag || needs.resolve-atom-source.outputs.prebuilt_oot_image }}
+      OOT_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.oot_image_source }}
       BENCH_SERVING_REPO_URL: https://github.com/kimbochen/bench_serving.git
+      ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+      ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+      VLLM_COMMIT_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_commit }}
+      VLLM_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
+      PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
     steps:
       - name: Check if model is enabled
         id: check
@@ -200,7 +437,10 @@ jobs:
             deepseek-r1-fp8) echo "enabled=${{ inputs.deepseek-r1-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp4|kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
+            kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-next-80b-a3b-instruct-fp8) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
@@ -215,9 +455,20 @@ jobs:
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
 
-      - name: Checkout ATOM repo
+      - name: Checkout benchmark ATOM source
         if: steps.check.outputs.enabled == 'true'
         uses: actions/checkout@v6
+        with:
+          repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
+          ref: ${{ needs.build-oot-image.outputs.atom_source_sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Record benchmark source revision
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
+          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${OOT_IMAGE_SOURCE} image ${OOT_IMAGE_TAG}"
 
       - name: Docker Login
         if: steps.check.outputs.enabled == 'true'
@@ -228,16 +479,21 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
-      - name: Pull built OOT image
+      - name: Pull OOT benchmark image
         if: steps.check.outputs.enabled == 'true'
         run: |
+          echo "Pulling OOT benchmark image: ${OOT_IMAGE_TAG}"
           docker pull "${OOT_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
         run: |
-          model_path="${MODEL_PATH}"
-          model_cache_rel="${model_path#/models/}"
+          model_cache_rel="${MODEL_PATH}"
+          if [[ "${model_cache_rel}" = /models/* ]]; then
+            model_cache_rel="${model_cache_rel#/models/}"
+          elif [[ "${model_cache_rel}" = /data/models/* ]]; then
+            model_cache_rel="${model_cache_rel#/data/models/}"
+          fi
           MODEL_CACHE_HOST_ROOT=""
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
@@ -248,26 +504,21 @@ jobs:
           elif [ -d "/data/models/${model_cache_rel}" ] && [ -f "/data/models/${model_cache_rel}/config.json" ]; then
             MODEL_CACHE_HOST_ROOT="/data/models"
             MODEL_CACHE_DESC="/data/models (pre-provisioned host path)"
-          elif [ -d "/models" ] && [ -w "/models" ]; then
+          elif [ -d "/models" ]; then
             MODEL_CACHE_HOST_ROOT="/models"
-            MODEL_CACHE_DESC="/models (writable host path)"
-          elif [ -d "/data/models" ] && [ -w "/data/models" ]; then
+            MODEL_CACHE_DESC="/models (shared host path)"
+          elif [ -d "/data/models" ]; then
             MODEL_CACHE_HOST_ROOT="/data/models"
-            MODEL_CACHE_DESC="/data/models (writable host path)"
+            MODEL_CACHE_DESC="/data/models (shared host path)"
           fi
 
           if [ -n "${MODEL_CACHE_HOST_ROOT}" ]; then
-            if mkdir -p "${MODEL_CACHE_HOST_ROOT}/${model_cache_rel}"; then
-              MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_HOST_ROOT}:/models"
-              echo "Model cache host root: ${MODEL_CACHE_HOST_ROOT}"
-            else
-              MODEL_CACHE_HOST_ROOT=""
-              MODEL_CACHE_DESC="container-local /models (no writable host cache mount)"
-            fi
+            MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_HOST_ROOT}:/models"
+            echo "Model cache host root: ${MODEL_CACHE_HOST_ROOT}"
           fi
 
           if [ -z "${MODEL_CACHE_MOUNT}" ]; then
-            echo "No writable host model cache found; using container-local /models."
+            echo "No shared host model cache found; using container-local /models."
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -308,10 +559,25 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Collect GPU info (inside container)
+        if: steps.check.outputs.enabled == 'true'
+        id: gpu-info
+        run: |
+          GPU_NAME=$(docker exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          GPU_VRAM_GB=$(docker exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
+          ROCM_VERSION=$(docker exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
+          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
+          echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+
       - name: Download model if needed
         if: steps.check.outputs.enabled == 'true'
         run: |
           model_dir="${MODEL_PATH}"
+          if [[ "${model_dir}" != /* ]]; then
+            model_dir="/models/${model_dir}"
+          fi
           if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"$model_dir\" ] && [ -f \"$model_dir/config.json\" ]"; then
             echo "Model already exists under ${model_dir}; skip download"
           else
@@ -325,9 +591,13 @@ jobs:
       - name: Resolve OOT model path
         if: steps.check.outputs.enabled == 'true'
         run: |
-          if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"${MODEL_PATH}\" ] && [ -f \"${MODEL_PATH}/config.json\" ]"; then
-            echo "OOT_RESOLVED_MODEL_PATH=${MODEL_PATH}" >> "$GITHUB_ENV"
-            echo "Using pre-downloaded model path: ${MODEL_PATH}"
+          model_dir="${MODEL_PATH}"
+          if [[ "${model_dir}" != /* ]]; then
+            model_dir="/models/${model_dir}"
+          fi
+          if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"${model_dir}\" ] && [ -f \"${model_dir}/config.json\" ]"; then
+            echo "OOT_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+            echo "Using pre-downloaded model path: ${model_dir}"
           else
             echo "OOT_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
             echo "Using model id: ${MODEL_SOURCE_PATH}"
@@ -369,86 +639,120 @@ jobs:
             TRUST_REMOTE_CODE_ARG="--trust-remote-code"
           fi
 
-          FAIL_COUNT=0
+          echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+
+          docker exec \
+            -e ISL="${ISL}" \
+            -e OSL="${OSL}" \
+            -e CONC="${CONC}" \
+            -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+            -e RESULT_FILENAME="${RESULT_FILENAME}" \
+            -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              rm -rf \"${CONTAINER_RESULT_DIR}\"
+              mkdir -p \"${CONTAINER_RESULT_DIR}\"
+              PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
+                --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                --backend=vllm \
+                --base-url=http://127.0.0.1:8000 \
+                --dataset-name=random \
+                --random-input-len=\"${ISL}\" \
+                --random-output-len=\"${OSL}\" \
+                --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                --num-prompts=\"$(( CONC * 10 ))\" \
+                --max-concurrency=\"${CONC}\" \
+                ${TRUST_REMOTE_CODE_ARG} \
+                --num-warmups=\"$(( 2 * CONC ))\" \
+                --request-rate=inf \
+                --ignore-eos \
+                --save-result \
+                --percentile-metrics=\"ttft,tpot,itl,e2el\" \
+                --result-dir=\"${CONTAINER_RESULT_DIR}\" \
+                --result-filename=\"${RESULT_FILENAME}.json\" \
+                ${BENCH_EXTRA_ARGS:-}
+            "
+
+          docker exec -i \
+            -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
+            -e ISL="${ISL}" \
+            -e OSL="${OSL}" \
+            -e EXTRA_ARGS_TEXT="${OOT_EXTRA_ARGS}" \
+            -e DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
+            -e ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
+            -e ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
+            -e ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
+            -e VLLM_COMMIT_USED="${VLLM_COMMIT_USED}" \
+            -e VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
+            -e OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
+            -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
+            "$CONTAINER_NAME" python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          result_path = os.environ["RESULT_PATH"]
+          with open(result_path, encoding="utf-8") as f:
+              data = json.load(f)
+
+          data["random_input_len"] = int(os.environ["ISL"])
+          data["random_output_len"] = int(os.environ["OSL"])
+          data["benchmark_backend"] = "ATOM-vLLM"
+
+          display_name = os.environ.get("DASHBOARD_MODEL_NAME", "")
+          if display_name:
+              data["benchmark_model_name"] = display_name
+
+          tp_match = re.search(
+              r"--tensor-parallel-size\s+(\d+)",
+              os.environ.get("EXTRA_ARGS_TEXT", ""),
+          )
+          if tp_match:
+              data["tensor_parallel_size"] = int(tp_match.group(1))
+
+          data["atom_source_repository"] = os.environ.get("ATOM_SOURCE_REPOSITORY", "")
+          data["atom_source_ref"] = os.environ.get("ATOM_SOURCE_REF", "")
+          data["atom_source_sha"] = os.environ.get("ATOM_SOURCE_SHA", "")
+          data["vllm_commit"] = os.environ.get("VLLM_COMMIT_USED", "")
+          data["vllm_version"] = os.environ.get("VLLM_VERSION_USED", "")
+          data["oot_image_source"] = os.environ.get("OOT_IMAGE_SOURCE", "")
+          data["dashboard_publish_allowed"] = (
+              os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
+          )
+
+          with open(result_path, "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+          PY
+
+          docker cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"
+
+      - name: Inject GPU metadata into benchmark results
+        if: steps.check.outputs.enabled == 'true'
+        run: |
           shopt -s nullglob
-          rm -f "${RESULT_PREFIX}"-*.json
-          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
-          for SET in "${SETS[@]}"; do
-            IFS=',' read -ra PARAMS <<< "$SET"
-            ISL="${PARAMS[0]}"
-            OSL="${PARAMS[1]}"
-            CONC="${PARAMS[2]}"
-            RANDOM_RANGE_RATIO="${PARAMS[3]}"
-            RESULT_FILENAME="${RESULT_PREFIX}-${ISL}-${OSL}-${CONC}-${RANDOM_RANGE_RATIO}"
-
-            echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
-
-            if ! docker exec \
-              -e ISL="${ISL}" \
-              -e OSL="${OSL}" \
-              -e CONC="${CONC}" \
-              -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-              -e RESULT_FILENAME="${RESULT_FILENAME}" \
-              -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-              "$CONTAINER_NAME" bash -lc "
-                set -euo pipefail
-                rm -rf \"${CONTAINER_RESULT_DIR}\"
-                mkdir -p \"${CONTAINER_RESULT_DIR}\"
-                PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
-                  --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                  --backend=vllm \
-                  --base-url=http://127.0.0.1:8000 \
-                  --dataset-name=random \
-                  --random-input-len=\"${ISL}\" \
-                  --random-output-len=\"${OSL}\" \
-                  --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                  --num-prompts=\"$(( CONC * 10 ))\" \
-                  --max-concurrency=\"${CONC}\" \
-                  ${TRUST_REMOTE_CODE_ARG} \
-                  --num-warmups=\"$(( 2 * CONC ))\" \
-                  --request-rate=inf \
-                  --ignore-eos \
-                  --save-result \
-                  --percentile-metrics=\"ttft,tpot,itl,e2el\" \
-                  --result-dir=\"${CONTAINER_RESULT_DIR}\" \
-                  --result-filename=\"${RESULT_FILENAME}.json\" \
-                  ${BENCH_EXTRA_ARGS:-}
-              "; then
-              echo "::warning::Benchmark failed for ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC}"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              continue
-            fi
-
-            if ! docker exec \
-              -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
-              -e ISL="${ISL}" \
-              -e OSL="${OSL}" \
-              -e EXTRA_ARGS_TEXT="${OOT_EXTRA_ARGS}" \
-              -e DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
-              "$CONTAINER_NAME" python3 -c "import json, os, re; result_path = os.environ['RESULT_PATH']; data = json.load(open(result_path, encoding='utf-8')); data['random_input_len'] = int(os.environ['ISL']); data['random_output_len'] = int(os.environ['OSL']); data['benchmark_backend'] = 'ATOM-vLLM'; display_name = os.environ.get('DASHBOARD_MODEL_NAME', ''); display_name and data.__setitem__('benchmark_model_name', display_name); tp_match = re.search(r'--tensor-parallel-size\\s+(\\d+)', os.environ.get('EXTRA_ARGS_TEXT', '')); tp_match and data.__setitem__('tensor_parallel_size', int(tp_match.group(1))); json.dump(data, open(result_path, 'w', encoding='utf-8'), indent=2)"; then
-              echo "::warning::Failed to post-process ${RESULT_FILENAME}.json"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              continue
-            fi
-
-            if ! docker cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"; then
-              echo "::warning::Failed to copy ${RESULT_FILENAME}.json from container"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              continue
-            fi
+          for f in "${RESULT_PREFIX}"-*.json; do
+            GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            RESULT_PATH="$f" \
+            python3 -c "
+          import json, os
+          p = os.environ['RESULT_PATH']
+          with open(p) as f:
+              d = json.load(f)
+          d['gpu_name'] = os.environ.get('GPU_NAME', '')
+          d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
+          d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
+          with open(p, 'w') as f:
+              json.dump(d, f, indent=2)
+          "
           done
-
-          if [ "${FAIL_COUNT}" -gt 0 ]; then
-            echo "::warning::${FAIL_COUNT} benchmark config(s) failed for ${MODEL_NAME}"
-          fi
 
       - name: Collect benchmark result
         if: steps.check.outputs.enabled == 'true'
         run: |
-          shopt -s nullglob
-          results=( "${RESULT_PREFIX}"-*.json )
-          if [ "${#results[@]}" -eq 0 ]; then
-            echo "ERROR: No benchmark result files were generated for ${MODEL_NAME}."
+          if [ ! -f "${RESULT_FILENAME}.json" ]; then
+            echo "ERROR: Benchmark result file ${RESULT_FILENAME}.json was not generated for ${MODEL_NAME}."
             exit 1
           fi
 
@@ -456,8 +760,8 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: oot-benchmark-${{ env.RESULT_PREFIX }}
-          path: ${{ env.RESULT_PREFIX }}-*.json
+          name: oot-benchmark-${{ env.RESULT_FILENAME }}
+          path: ${{ env.RESULT_FILENAME }}.json
 
       - name: Clean up OOT benchmark container
         if: always() && steps.check.outputs.enabled == 'true'
@@ -465,15 +769,21 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
+          if [[ "${OOT_IMAGE_SOURCE}" == "rebuild" ]]; then
+            docker rmi "$OOT_IMAGE_TAG" || true
+          else
+            echo "Keeping prebuilt OOT image cached on runner: ${OOT_IMAGE_TAG}"
+          fi
 
   summarize-benchmark-result:
-    if: always()
+    if: >-
+      always()
+      && needs.resolve-atom-source.result == 'success'
+      && needs.build-benchmark-matrix.result == 'success'
+      && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     name: Summarize OOT benchmark result
-    needs: [benchmark]
+    needs: [resolve-atom-source, build-benchmark-matrix, benchmark]
     runs-on: ubuntu-latest
-    outputs:
-      has_regression: ${{ steps.check-regression.outputs.has_regression }}
-      has_results: ${{ steps.check-results.outputs.has_results }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -486,58 +796,127 @@ jobs:
           path: .
         continue-on-error: true
 
-      - name: Check downloaded results
-        id: check-results
+      - name: Count downloaded benchmark results
+        id: downloaded
         run: |
           shopt -s nullglob
           json_files=(*.json)
-          if [ "${#json_files[@]}" -gt 0 ]; then
-            echo "has_results=true" >> "$GITHUB_OUTPUT"
-            printf 'Downloaded %s benchmark result files\n' "${#json_files[@]}"
-          else
-            echo "has_results=false" >> "$GITHUB_OUTPUT"
-            echo "No benchmark result JSON files were downloaded."
-          fi
+          echo "downloaded_count=${#json_files[@]}" >> "$GITHUB_OUTPUT"
+          printf 'Downloaded %s benchmark result files\n' "${#json_files[@]}"
 
-      - name: Download baseline from previous successful manual run
-        if: steps.check-results.outputs.has_results == 'true'
-        id: baseline
+      - name: Note summary behavior
         run: |
-          PREV_RUN_ID=$(gh run list \
-            --workflow="ATOM vLLM OOT Benchmark" \
-            --branch=main \
-            --event=workflow_dispatch \
-            --status=success \
-            --limit=1 \
-            --json databaseId \
-            --jq '.[0].databaseId // empty')
-
-          if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
-            echo "Downloading baseline from run #$PREV_RUN_ID"
-            mkdir -p /tmp/baseline
-            gh run download "$PREV_RUN_ID" --dir /tmp/baseline || echo "::warning::Failed to download baseline artifacts"
-            echo "baseline_dir=/tmp/baseline" >> "$GITHUB_OUTPUT"
+          if [[ "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" == "true" ]]; then
+            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table. Because this run is dashboard-eligible, successful cases will also be used for regression comparison and dashboard upload.\n' \
+              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
+              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
+              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No previous successful manual run found"
-            echo "baseline_dir=" >> "$GITHUB_OUTPUT"
+            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table only. Dashboard upload is skipped.\n' \
+              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
+              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
+              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Generate OOT benchmark summary table
+        env:
+          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/oot_benchmark_summary.py \
+            --result-dir . \
+            --matrix-json "${BENCHMARK_MATRIX}" \
+            --run-url "${RUN_URL}" \
+            --output-json oot_benchmark_summary.json \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Read summary stats
+        id: summary-stats
+        run: |
+          PASSED_CASES=$(python3 -c "import json; print(json.load(open('oot_benchmark_summary.json', encoding='utf-8'))['passed_cases'])")
+          FAILED_CASES=$(python3 -c "import json; print(json.load(open('oot_benchmark_summary.json', encoding='utf-8'))['failed_cases'])")
+          echo "passed_cases=${PASSED_CASES}" >> "$GITHUB_OUTPUT"
+          echo "failed_cases=${FAILED_CASES}" >> "$GITHUB_OUTPUT"
+          echo "Summary stats: passed=${PASSED_CASES}, failed=${FAILED_CASES}"
+
+      - name: Upload OOT benchmark summary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-benchmark-summary
+          path: oot_benchmark_summary.json
+
+      - name: Download baseline from previous successful main run
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        id: baseline
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -t CANDIDATE_RUN_IDS < <(
+            {
+              gh run list \
+                --workflow="ATOM vLLM OOT Benchmark" \
+                --branch=main \
+                --event=workflow_dispatch \
+                --status=success \
+                --limit=10 \
+                --json databaseId \
+                --jq '.[].databaseId // empty' || true
+            }
+          )
 
-      - name: Summarize benchmark result
-        if: steps.check-results.outputs.has_results == 'true'
+          BASELINE_DIR=""
+          for PREV_RUN_ID in "${CANDIDATE_RUN_IDS[@]}"; do
+            if [ -z "$PREV_RUN_ID" ] || [ "$PREV_RUN_ID" = "${{ github.run_id }}" ]; then
+              continue
+            fi
+
+            echo "Checking baseline candidate run #$PREV_RUN_ID"
+            rm -rf /tmp/baseline_candidate /tmp/baseline
+            mkdir -p /tmp/baseline_candidate
+
+            if ! gh run download "$PREV_RUN_ID" --dir /tmp/baseline_candidate; then
+              echo "::warning::Failed to download baseline artifacts from run #$PREV_RUN_ID"
+              continue
+            fi
+
+            if python3 .github/scripts/oot_benchmark_validate_baseline.py /tmp/baseline_candidate; then
+              mv /tmp/baseline_candidate /tmp/baseline
+              BASELINE_DIR="/tmp/baseline"
+              echo "Using baseline from run #$PREV_RUN_ID"
+              break
+            fi
+
+            echo "Skipping run #$PREV_RUN_ID because it is not a dashboard-eligible baseline."
+          done
+
+          echo "baseline_dir=${BASELINE_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Note skipped dashboard processing
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases == '0'
+        run: |
+          printf '\nNo successful benchmark result JSONs were produced, so regression comparison and dashboard upload were skipped.\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize regression against baseline
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         id: check-regression
         run: |
           BASELINE_ARG=""
           if [ -n "${{ steps.baseline.outputs.baseline_dir }}" ]; then
             BASELINE_ARG="--baseline-dir ${{ steps.baseline.outputs.baseline_dir }}"
+          else
+            printf '\nNo eligible baseline run was found. Showing current successful results without regression deltas.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
-          .github/scripts/summarize.py . $BASELINE_ARG \
+
+          python3 .github/scripts/oot_benchmark_regression.py \
+            --result-dir . \
+            $BASELINE_ARG \
             --output-json regression_report.json \
             >> "$GITHUB_STEP_SUMMARY" || true
 
           if [ -f regression_report.json ]; then
-            REG_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json'))['regression_count'])")
+            REG_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json', encoding='utf-8'))['regression_count'])")
             if [ "$REG_COUNT" -gt 0 ]; then
               echo "has_regression=true" >> "$GITHUB_OUTPUT"
             else
@@ -548,14 +927,14 @@ jobs:
           fi
 
       - name: Upload regression report
-        if: steps.check-results.outputs.has_results == 'true' && steps.check-regression.outputs.has_regression == 'true'
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.check-regression.outputs.has_regression == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: oot-benchmark-regression-report
           path: regression_report.json
 
       - name: Transform results for benchmark dashboard
-        if: steps.check-results.outputs.has_results == 'true'
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
           python3 .github/scripts/oot_benchmark_to_dashboard.py \
             . \
@@ -563,7 +942,7 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Store benchmark result to dashboard
-        if: steps.check-results.outputs.has_results == 'true'
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           tool: customBiggerIsBetter
@@ -578,7 +957,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy custom dashboard to gh-pages
-        if: steps.check-results.outputs.has_results == 'true'
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

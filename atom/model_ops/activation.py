@@ -6,7 +6,8 @@ from typing import Optional
 from torch import nn
 import torch.nn.functional as F
 from aiter import silu_and_mul
-from atom.config import QuantizationConfig, LayerQuantConfig
+from atom.config import QuantizationConfig
+from atom.quant_spec import LayerQuantConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from aiter import (
@@ -59,17 +60,18 @@ class SiluAndMul(nn.Module):
         self,
         fused_quant: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.fused_quant = fused_quant
         layer_quant_config = (
             LayerQuantConfig()
             if quant_config is None
-            else quant_config.global_quant_config
+            else quant_config.get_layer_quant_config(prefix)
         )
 
-        quant_type = layer_quant_config["quant_type"]
-        params_dtype = layer_quant_config["quant_dtype"]
+        quant_type = layer_quant_config.quant_type
+        params_dtype = layer_quant_config.quant_dtype
         self.quant_type = quant_type
         self.params_dtype = params_dtype
 

@@ -115,100 +115,43 @@ jobs:
           path: aiter-whl/amd_aiter*.whl
           retention-days: 1
 
-  atom:
-    needs: [download_aiter_wheel]
+  load-test-models:
+    name: Load test model configs
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.load.outputs.models_json }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: load
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 << 'PY'
+          import json, os
+          event = os.environ["EVENT_NAME"]
+          # pr → pr models only; push to main → pr+main; schedule/dispatch → all
+          level_map = {"schedule": "nightly", "workflow_dispatch": "nightly", "push": "main"}
+          current = level_map.get(event, "pr")
+          allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
+          models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
+          filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"models_json={json.dumps(filtered)}\n")
+          print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
+          print(f"{'Model':<45} {'Level':<10} {'Runner'}")
+          print("-" * 80)
+          for m in models:
+              enabled = "✓" if m in filtered else "·"
+              print(f"  {enabled} {m['model_name']:<43} {m.get('test_level','?'):<10} {m['runner']}")
+          PY
+
+  atom-test:
+    needs: [download_aiter_wheel, load-test-models]
     name: ATOM Test
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # run_on_pr: true = run on all events; false = skip on PR (still runs on push/schedule/workflow_dispatch)
-          - model_name: "Meta-Llama-3-8B-Instruct"
-            model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: ""
-            accuracy_test_threshold: "0.73"
-            runner: linux-atom-mi355-1
-            run_on_pr: true
-          - model_name: "Llama-3.3-70B-Instruct-MXFP4-Preview"
-            model_path: "amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: ""
-            accuracy_test_threshold: "0.88"
-            runner: linux-atom-mi355-1
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528"
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8"
-            env_vars: ""
-            accuracy_test_threshold: "0.94"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528 MTP"
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
-            env_vars: ""
-            accuracy_test_threshold: "0.94"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528-FP4"
-            model_path: "amd/DeepSeek-R1-0528-MTP-MoE-MXFP4-Attn-PTPC-FP8"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8"
-            env_vars: ""
-            accuracy_test_threshold: "0.93"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528-FP4 MTP"
-            model_path: "amd/DeepSeek-R1-0528-MTP-MoE-MXFP4-Attn-PTPC-FP8"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
-            env_vars: ""
-            accuracy_test_threshold: "0.93"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "gpt-oss-120b"
-            model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: ""
-            accuracy_test_threshold: "0.38"
-            runner: linux-atom-mi355-1
-            run_on_pr: true
-          - model_name: "gpt-oss-120b (2 GPUs)"
-            model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
-            env_vars: ""
-            accuracy_test_threshold: "0.38"
-            runner: linux-atom-mi355-4
-            run_on_pr: false
-          - model_name: "Qwen3-235B-A22B-Instruct-2507-FP8"
-            model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
-            env_vars: |
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
-            accuracy_test_threshold: "0.87"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "Qwen3-235B-A22B-Instruct-2507-MXFP4"
-            model_path: "amd/Qwen3-235B-A22B-Instruct-2507-MXFP4"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
-            env_vars: |
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
-            accuracy_test_threshold: "0.87"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: false
-          - model_name: "Kimi-K2.5-MXFP4"
-            model_path: "amd/Kimi-K2.5-MXFP4"
-            extraArgs: "--kv_cache_dtype fp8 -tp 4 --trust-remote-code"
-            env_vars: "HSA_NO_SCRATCH_RECLAIM=1"
-            accuracy_test_threshold: "0.93"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: false
-          - model_name: "Qwen3-Next-80B-A3B-Thinking"
-            model_path: "Qwen/Qwen3-Next-80B-A3B-Thinking"
-            extraArgs: "-tp 8"
-            env_vars: ""
-            accuracy_test_threshold: "0.65"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
+        include: ${{ fromJson(needs.load-test-models.outputs.models_json) }}
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ${{ matrix.runner }}
 
@@ -217,11 +160,10 @@ jobs:
 
     steps:
       - name: Set HF_TOKEN
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
 
       - name: Kill all Docker containers and clean up workspace
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -231,28 +173,27 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true 
 
       - name: Show Docker containers
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: docker ps -a
 
       - name: Show ROCm memory usage
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: rocm-smi --showmemuse
 
       - name: Show ROCm GPU processes
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         uses: actions/checkout@v6
       
       - name: Docker Login
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && !github.event.pull_request.head.repo.fork
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Generate Dockerfile for forked repo
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && github.event.pull_request.head.repo.fork
+        if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
@@ -283,14 +224,12 @@ jobs:
           EOF
 
       - name: Download aiter wheel
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         uses: actions/download-artifact@v4
         with:
           name: aiter-whl
           path: /tmp/aiter-whl
 
       - name: Start CI container
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           echo "Clean up containers..."
           (docker ps -aq -f name="^${CONTAINER_NAME}$" | xargs -r docker stop) || true
@@ -309,13 +248,12 @@ jobs:
             MODEL_MOUNT=""
           fi
 
-          cat > /tmp/env_file.txt << 'EOF'
-          ${{ matrix.env_vars }}
-          EOF
+          # Write env_vars via env block (avoids expression injection)
+          printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
 
           IMAGE_TAG=${{ env.ATOM_BASE_IMAGE }}
           echo "Starting container with image: $IMAGE_TAG"
-          echo "Model-specific environment variables for ${{ matrix.model_name }}:"
+          echo "Model-specific environment variables:"
           cat /tmp/env_file.txt
 
           docker run -dt --pull always --device=/dev/kfd $DEVICE_FLAG \
@@ -339,14 +277,13 @@ jobs:
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          MODEL_ENV_VARS: ${{ matrix.env_vars }}
 
       - name: Check shm size
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
       - name: Install aiter from wheel
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           AITER_WHL=$(ls -t /tmp/aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
           if [ -z "$AITER_WHL" ]; then
@@ -372,7 +309,6 @@ jobs:
           "
 
       - name: Install ATOM and dependencies
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           docker exec "$CONTAINER_NAME" bash -lc "
             set -euo pipefail
@@ -393,7 +329,6 @@ jobs:
           "
 
       - name: Download models
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
@@ -407,7 +342,7 @@ jobs:
 
       - name: Run ATOM simple inference
         # Skip simple inference; accuracy test already validates correctness
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && false
+        if: false
         timeout-minutes: 30
         run: |
           # Run the inference and capture output
@@ -444,7 +379,7 @@ jobs:
           cat atom_test_output.txt
 
       - name: Compare output with golden outputs
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && false
+        if: false
         timeout-minutes: 30
         # TODO: skip for all test until it's fixed
         run: |
@@ -459,7 +394,6 @@ jobs:
           fi
       
       - name: Run ATOM accuracy test
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         timeout-minutes: 30
         run: |
           set -euo pipefail
@@ -480,7 +414,9 @@ jobs:
           " 2>&1 | tee atom_accuracy_output.txt
       
       - name: Check accuracy test results
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
+        if: success()
+        env:
+          MODEL_NAME: ${{ matrix.model_name }}
         run: |
           result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
@@ -491,33 +427,60 @@ jobs:
           fi
           flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
           echo "Flexible extract value: $flexible_extract_value"
-          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
 
-          # Compare as float: use awk for decimal value comparison
-          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          # Read threshold from models_accuracy.json (via env var to avoid shell injection)
+          threshold=$(python3 -c "
+          import json, os
+          models = json.load(open('.github/benchmark/models_accuracy.json', encoding='utf-8'))
+          name = os.environ['MODEL_NAME']
+          t = next((m.get('accuracy_threshold', 0) for m in models if m['model_name'] == name), 0)
+          print(t)
+          ")
+          echo "Accuracy test threshold: $threshold"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="$threshold" 'BEGIN {print (val < threshold) ? 1 : 0}')
           if [ "$result" -eq 1 ]; then
-            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than the threshold ${{ matrix.accuracy_test_threshold }}."
+            echo "Accuracy test failed: $flexible_extract_value < $threshold"
             exit 1
           else
-            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to the threshold ${{ matrix.accuracy_test_threshold }}."
-            exit 0
+            echo "Accuracy test passed: $flexible_extract_value >= $threshold"
           fi
 
       - name: Collect Test Summary
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
+        if: success()
+        env:
+          MODEL_NAME: ${{ matrix.model_name }}
         run: |
-          echo "Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          # Read threshold and score for summary
+          threshold=$(python3 -c "
+          import json, os
+          models = json.load(open('.github/benchmark/models_accuracy.json', encoding='utf-8'))
+          name = os.environ['MODEL_NAME']
+          print(next((m.get('accuracy_threshold', 0) for m in models if m['model_name'] == name), 0))
+          ")
+          result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
+          score=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file" 2>/dev/null || echo "N/A")
+
+          echo "Accuracy Test Summary for ${{ matrix.model_name }} (threshold: ${threshold}, score: ${score}):" >> $GITHUB_STEP_SUMMARY
           awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.model_name }}_atom_test_output.txt
           path: atom_test_output.txt
 
+      - name: Upload accuracy results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: accuracy-${{ matrix.model_name }}
+          path: accuracy_test_results/*.json
+          if-no-files-found: ignore
+
       - name: Clean Up
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        if: always()
         run: |
           # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
           # We should use non-root user to run the test to avoid this issue.
@@ -530,4 +493,50 @@ jobs:
           docker rm "$CONTAINER_NAME" || true
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
+
+  # ---------- Push accuracy data to benchmark dashboard ----------
+  accuracy-dashboard:
+    name: Update accuracy dashboard
+    needs: [atom-test]
+    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Download accuracy artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/accuracy-results
+          pattern: accuracy-*
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== Downloaded accuracy artifacts ==="
+          find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
+
+      - name: Transform accuracy results for dashboard
+        run: |
+          python3 .github/scripts/accuracy_to_dashboard.py \
+            /tmp/accuracy-results \
+            --output accuracy-benchmark-input.json \
+            --models .github/benchmark/models_accuracy.json \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "=== Generated entries ==="
+          cat accuracy-benchmark-input.json
+
+      - name: Store accuracy result to dashboard
+        if: hashFiles('accuracy-benchmark-input.json') != ''
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: accuracy-benchmark-input.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-dashboard
+          auto-push: true
+          max-items-in-chart: 90
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 

@@ -18,8 +18,8 @@ from atom.config import (
     Config,
     QuantizationConfig,
     get_current_atom_config,
-    LayerQuantConfig,
 )
+from atom.quant_spec import LayerQuantConfig
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.fused_moe.config import (
@@ -633,9 +633,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
-        self.quant_type = self.quant_config["quant_type"]
-        self.quant_dtype = self.quant_config["quant_dtype"]
-        self.quant_method = self.quant_config["quant_method"]
+        self.quant_type = quant_config.quant_type
+        self.quant_dtype = quant_config.quant_dtype
+        self.quant_method = quant_config.quant_method or ""
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -1034,8 +1034,8 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
-        self.quant_type = quant_config["quant_type"]
-        self.quant_dtype = quant_config["quant_dtype"]
+        self.quant_type = quant_config.quant_type
+        self.quant_dtype = quant_config.quant_dtype
 
         # Check if we need to normalize e4m3fn to e4m3fnuz (AMD GPUs)
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
@@ -1052,7 +1052,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         self.per_channel = self.quant_type == QuantType.per_Token
 
         # Check if static input scales (activation quantization)
-        self.static_input_scales = not quant_config.get("is_dynamic", True)
+        self.static_input_scales = not quant_config.is_dynamic
 
         # Block sizes for block quantization
         if self.block_quant:
@@ -1436,14 +1436,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     the model weights are loaded.
 
     Args:
-        quant_config: The quantization config.
+        quant_config: The quantization config (LayerQuantConfig).
     """
 
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
-        self.quant_type = self.quant_config["quant_type"]
-        self.quant_dtype = self.quant_config["quant_dtype"]
+        self.quant_type = quant_config.quant_type
+        self.quant_dtype = quant_config.quant_dtype
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -1556,7 +1556,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-            assert self.quant_config["is_dynamic"]
+            assert self.quant_config.is_dynamic
         else:
             # Per-tensor
             w13_weight_scale = torch.nn.Parameter(
@@ -1573,7 +1573,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # INPUT_SCALES
         # Per-channel uses dynamic per-token activation, no static input scales.
-        if self.channel_quant or self.quant_config["is_dynamic"]:
+        if self.channel_quant or self.quant_config.is_dynamic:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
         else:
@@ -1615,7 +1615,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._process_tensor_quant(layer)
 
     def _process_block_quant(self, layer: nn.Module) -> None:
-        assert self.quant_config["is_dynamic"]
+        assert self.quant_config.is_dynamic
         self._normalize_weights_and_scales(layer)
 
         if not self.need_normalize_e4m3fn_to_e4m3fnuz:
@@ -1652,7 +1652,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_tensor_quant(self, layer: nn.Module) -> None:
-        if not self.quant_config["is_dynamic"]:
+        if not self.quant_config.is_dynamic:
             if layer.w13_input_scale is None or layer.w2_input_scale is None:
                 raise ValueError(
                     "QuantConfig has static quantization, but found "
@@ -1907,7 +1907,7 @@ class FusedMoE(torch.nn.Module):
             quant_config.get_layer_quant_config(prefix) if quant_config else None
         )
         self.params_dtype = (
-            layer_quant_config["quant_dtype"]
+            layer_quant_config.quant_dtype
             if layer_quant_config
             else torch.get_default_dtype()
         )
@@ -1937,11 +1937,12 @@ class FusedMoE(torch.nn.Module):
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
+        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
         self.num_fused_shared_experts = (
             config.n_shared_experts
             if config is not None
             and hasattr(config, "n_shared_experts")
-            and is_rocm_aiter_fusion_shared_expert_enabled()
+            and fuse_shared_experts
             else 0
         )
         self.routed_scaling_factor = (
@@ -1971,10 +1972,7 @@ class FusedMoE(torch.nn.Module):
                 ),
                 dim=0,
             )
-        if (
-            is_rocm_aiter_fusion_shared_expert_enabled()
-            and self.num_fused_shared_experts > 0
-        ):
+        if fuse_shared_experts and self.num_fused_shared_experts > 0:
             init_aiter_topK_meta_data(
                 n_routed_experts=self.global_num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
@@ -1989,7 +1987,7 @@ class FusedMoE(torch.nn.Module):
                 max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
-        if is_rocm_aiter_fusion_shared_expert_enabled():
+        if fuse_shared_experts:
             self.local_num_experts += self.num_fused_shared_experts
         assert intermediate_size % self.tp_size == 0
         self.hidden_size = hidden_size
@@ -2025,24 +2023,26 @@ class FusedMoE(torch.nn.Module):
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
 
-        quant_method_str = layer_quant_config.get("quant_method", None)
-        if layer_quant_config["quant_type"] == QuantType.No:
+        quant_method_str = (
+            layer_quant_config.quant_method if layer_quant_config else None
+        )
+        if layer_quant_config is None or layer_quant_config.quant_type == QuantType.No:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
                 moe
             )
         elif (
             quant_method_str == "compressed-tensors"
-            and layer_quant_config["quant_dtype"] == dtypes.fp8
+            and layer_quant_config.quant_dtype == dtypes.fp8
         ):
             # Use CompressedTensorsFp8MoEMethod for compressed-tensors format
             self.quant_method = CompressedTensorsFp8MoEMethod(layer_quant_config, moe)
-        elif layer_quant_config["quant_dtype"] == dtypes.fp8:
+        elif layer_quant_config.quant_dtype == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(layer_quant_config, moe)
-        elif layer_quant_config["quant_dtype"] == dtypes.fp4x2:
+        elif layer_quant_config.quant_dtype == dtypes.fp4x2:
             self.quant_method = Mxfp4MoEMethod(layer_quant_config, moe)
         else:
             raise ValueError(
-                f"Unsupported quant dtype: {layer_quant_config['quant_dtype']}"
+                f"Unsupported quant dtype: {layer_quant_config.quant_dtype}"
             )
 
         assert self.quant_method is not None
@@ -2341,7 +2341,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str = "",
         expert_id: int = 0,
     ) -> None:
-        if self.layer_quant_config["quant_dtype"] == dtypes.fp4x2 and weight_name == "":
+        if self.layer_quant_config.quant_dtype == dtypes.fp4x2 and weight_name == "":
             self.mxf4_merged_weight_loader(param, loaded_weight)
             return
 
@@ -2419,7 +2419,7 @@ class FusedMoE(torch.nn.Module):
             # FusedMoeWeightScaleSupported
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
-            quant_method = self.layer_quant_config["quant_type"]
+            quant_method = self.layer_quant_config.quant_type
             if quant_method == QuantType.per_Token:
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,

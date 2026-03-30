@@ -29,7 +29,7 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
     --no-enable-prefix-caching
 ```
 
-### Qwen3.5-397B-A5B (TP=8)
+### Qwen3.5-397B-A17B (TP=8)
 
 ```bash
 export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
