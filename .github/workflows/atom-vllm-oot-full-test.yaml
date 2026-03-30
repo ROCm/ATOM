@@ -19,8 +19,13 @@ on:
         required: false
         type: boolean
         default: false
-      run_qwen35_397b_tp8:
+      run_qwen35_397b_fp8_tp8:
         description: "Qwen3.5-397B-A17B-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_qwen35_397b_tp8:
+        description: "Qwen3.5-397B-A17B TP8"
         required: false
         type: boolean
         default: false
@@ -41,6 +46,11 @@ on:
         default: false
       run_gpt_oss_120b_tp1:
         description: "gpt-oss-120b TP1"
+        required: false
+        type: boolean
+        default: false
+      run_gpt_oss_120b_tp2:
+        description: "gpt-oss-120b TP2"
         required: false
         type: boolean
         default: false
@@ -80,11 +90,13 @@ jobs:
         env:
           RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
           RUN_QWEN3_NEXT_80B_TP2: ${{ inputs.run_qwen3_next_80b_tp2 }}
+          RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
           RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
           RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
           RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
+          RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
         run: |
           set -euo pipefail
 
@@ -116,9 +128,18 @@ jobs:
                   "runner": "linux-atom-mi35x-4",
               },
               {
-                  "toggle_env": "RUN_QWEN35_397B_TP8",
+                  "toggle_env": "RUN_QWEN35_397B_FP8_TP8",
                   "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+                  "extra_args": "--tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "runner": "linux-atom-mi35x-8",
+              },
+              {
+                  "toggle_env": "RUN_QWEN35_397B_TP8",
+                  "model_name": "Qwen3.5-397B-A17B TP8",
+                  "model_path": "Qwen/Qwen3.5-397B-A17B",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
@@ -159,6 +180,15 @@ jobs:
                   "accuracy_test_threshold": 0.33,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-1",
+              },
+              {
+                  "toggle_env": "RUN_GPT_OSS_120B_TP2",
+                  "model_name": "gpt-oss-120b TP2",
+                  "model_path": "openai/gpt-oss-120b",
+                  "extra_args": "--tensor-parallel-size 2",
+                  "accuracy_test_threshold": 0.33,
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "runner": "linux-atom-mi35x-4",
               },
           ]
 
