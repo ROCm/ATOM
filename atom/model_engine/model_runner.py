@@ -280,7 +280,6 @@ class tokenIDProcessor:
         total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
-        total_reqs_prefill = batch.total_seqs_num_prefill
         """for prefill: all input ids are new"""
         self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
             :total_tokens_prefill
@@ -289,8 +288,8 @@ class tokenIDProcessor:
 
         self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
-        # TODO: remove this when we support mixed prefill and decode in one batch
-        if total_reqs_prefill > 0:
+        # Pure prefill or no decode tokens: return prefill-only input_ids
+        if total_tokens_decode == 0:
             return self.input_ids.gpu[:total_tokens_prefill]
 
         if not self.is_deferred_out:
@@ -300,10 +299,16 @@ class tokenIDProcessor:
             if self.use_spec:
                 token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
 
-            self.input_ids.np[:total_tokens_decode] = token_ids
-            return self.input_ids.copy_to_gpu(total_tokens_decode)
+            # In mixed batch, decode tokens are placed after prefill tokens
+            offset = total_tokens_prefill
+            self.input_ids.np[offset : offset + total_tokens_decode] = token_ids
+            self.input_ids.copy_to_gpu(offset + total_tokens_decode)
+            return self.input_ids.gpu[: offset + total_tokens_decode]
 
         """for decode: input ids are from prev_sampled_token_ids"""
+        # In mixed batch, decode tokens start after prefill tokens
+        decode_offset = total_tokens_prefill
+
         deferred_curr_indices, deferred_prev_indices, new_curr_indices, is_all_same = (
             self.get_token_locations(batch)
         )
@@ -351,10 +356,14 @@ class tokenIDProcessor:
                     )  # (num_deferred_tokens,)
                 else:
                     combined = self.prev_token_ids
-                self.input_ids.gpu[:num_deferred_tokens] = combined
+                self.input_ids.gpu[
+                    decode_offset : decode_offset + num_deferred_tokens
+                ] = combined
             else:
                 # Non-MTP mode: only prev_token_ids
-                self.input_ids.gpu[:num_deferred_tokens] = self.prev_token_ids
+                self.input_ids.gpu[
+                    decode_offset : decode_offset + num_deferred_tokens
+                ] = self.prev_token_ids
         else:
             """
             (1) prev_batch=[301], cur_batch=[0..255, 301] → Layout: [301 prefill | new | deferred]
@@ -405,10 +414,13 @@ class tokenIDProcessor:
                     gathered_tokens = gathered_prev
 
             if new_decode_front:
-                # Layout: [new | deferred]
+                # Layout: [prefill | new | deferred]
                 if gathered_tokens is not None:
                     self.input_ids.gpu[
-                        num_new_tokens : num_new_tokens + num_deferred_tokens
+                        decode_offset
+                        + num_new_tokens : decode_offset
+                        + num_new_tokens
+                        + num_deferred_tokens
                     ] = gathered_tokens
                 if num_new_tokens > 0:
                     token_ids = scheduled_tokens[
@@ -418,10 +430,12 @@ class tokenIDProcessor:
                         token_ids[:, 1:] = batch.scheduled_spec_decode_tokens[
                             :num_new_seqs
                         ]
-                    self.input_ids.np[:num_new_tokens] = token_ids.flatten()
-                    self.input_ids.copy_to_gpu(num_new_tokens)
+                    self.input_ids.np[
+                        decode_offset : decode_offset + num_new_tokens
+                    ] = token_ids.flatten()
+                    self.input_ids.copy_to_gpu(decode_offset + num_new_tokens)
             else:
-                # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
+                # Layout: [prefill | deferred | new]
                 if num_new_tokens > 0:
                     new_token_ids = scheduled_tokens[new_curr_indices].reshape(
                         num_new_seqs, tokens_per_seq
@@ -433,12 +447,24 @@ class tokenIDProcessor:
                             new_curr_indices
                         ]
                         new_token_ids[:, 1:] = draft_tokens
-                    self.input_ids.np[:num_new_tokens] = new_token_ids.flatten()
+                    self.input_ids.np[
+                        decode_offset : decode_offset + num_new_tokens
+                    ] = new_token_ids.flatten()
                     self.input_ids.gpu[
-                        num_deferred_tokens : num_deferred_tokens + num_new_tokens
-                    ].copy_(self.input_ids.cpu[:num_new_tokens], non_blocking=True)
+                        decode_offset
+                        + num_deferred_tokens : decode_offset
+                        + num_deferred_tokens
+                        + num_new_tokens
+                    ].copy_(
+                        self.input_ids.cpu[
+                            decode_offset : decode_offset + num_new_tokens
+                        ],
+                        non_blocking=True,
+                    )
                 if gathered_tokens is not None:
-                    self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
+                    self.input_ids.gpu[
+                        decode_offset : decode_offset + num_deferred_tokens
+                    ] = gathered_tokens
         input_ids = self.input_ids.gpu[:total_tokens]
         return input_ids
 
@@ -1413,6 +1439,7 @@ class ModelRunner:
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
+        is_mixed = getattr(batch, "is_mixed", False)
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
@@ -1443,18 +1470,27 @@ class ModelRunner:
                 self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
             )
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
-        context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        if is_mixed:
+            context_bs = batch.total_seqs_num
+        elif is_prefill:
+            context_bs = batch.total_seqs_num_prefill
+        else:
+            context_bs = scheduled_bs
 
         # graph_bs should be batch size (number of sequences), not token count
-        graph_bs = num_input_tokens if is_prefill else bs
+        # Mixed and prefill both go eager path
+        graph_bs = num_input_tokens if (is_prefill or is_mixed) else bs
         is_partial_prefill = getattr(batch, "is_partial_prefill", False)
+        # In mixed batch, is_partial_prefill is always False (set by scheduler)
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
+            is_mixed=is_mixed,
             is_dummy_run=batch.is_dummy_run,
             batch_size=context_bs,
             graph_bs=graph_bs,
             is_partial_prefill=is_partial_prefill,
+            num_prefill_tokens=batch.total_tokens_num_prefill,
         )
         actual_num_tokens = batch.total_tokens_num
 
@@ -1534,6 +1570,32 @@ class ModelRunner:
             all_greedy,
         )
 
+    def _get_logits_indices(self, batch: ScheduledBatch) -> Optional[torch.Tensor]:
+        """Return indices into hidden_states that need compute_logits in mixed batch.
+
+        For prefill seqs, only the last token of the FINAL chunk needs logits.
+        For decode seqs, the last token always needs logits.
+        Returns None if no seqs need logits (all intermediate prefill chunks).
+        """
+        indices = []
+        token_offset = 0
+        n_prefill = batch.total_seqs_num_prefill
+        for i, num_tokens in enumerate(batch.num_scheduled_tokens):
+            num_tokens = int(num_tokens)
+            if i < n_prefill:
+                # Prefill seq: logits only if this is the final chunk
+                kv_computed = batch.num_kv_computed[i]
+                is_final = (kv_computed + num_tokens) >= batch.num_prompt_tokens[i]
+                if is_final:
+                    indices.append(token_offset + num_tokens - 1)
+            else:
+                # Decode seq: always need logits (last token)
+                indices.append(token_offset + num_tokens - 1)
+            token_offset += num_tokens
+        if not indices:
+            return None
+        return torch.tensor(indices, dtype=torch.long, device=self.device)
+
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -1543,10 +1605,11 @@ class ModelRunner:
         context = forward_context.context
         bs = context.batch_size
         is_prefill = context.is_prefill
+        is_mixed = context.is_mixed
         positions = context.positions
-        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
+        if is_prefill or is_mixed or self.enforce_eager or bs > self.graph_bs[-1]:
             # prefill[bs=1 tok=115 ctx=115]
-            label = f"prefill[bs={bs}"
+            label = f"{'mixed' if is_mixed else 'prefill'}[bs={bs}"
             if batch is not None:
                 ctx = batch.context_lens
                 if len(ctx) == 1:
@@ -1563,6 +1626,15 @@ class ModelRunner:
                     logits = (
                         None  # B scheme: skip compute_logits for intermediate chunks
                     )
+                elif is_mixed:
+                    # Mixed batch: compute logits only for seqs that need them
+                    logits_indices = self._get_logits_indices(batch)
+                    if logits_indices is not None:
+                        logits = self.model.compute_logits(
+                            hidden_states[logits_indices]
+                        )
+                    else:
+                        logits = None
                 else:
                     logits = self.model.compute_logits(hidden_states)
         else:
@@ -1602,7 +1674,10 @@ class ModelRunner:
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
         # B scheme: intermediate chunks skip sampling entirely
-        if get_forward_context().context.is_partial_prefill:
+        # Also handles mixed batch with all-intermediate prefill (logits=None)
+        if get_forward_context().context.is_partial_prefill or (
+            get_forward_context().context.is_mixed and logits is None
+        ):
             self.forward_done_event.record()
             return ScheduledBatchOutput(
                 req_ids=[],
@@ -1614,7 +1689,44 @@ class ModelRunner:
             )
 
         spec_decode_metadata = get_forward_context().spec_decode_metadata
+        context = get_forward_context().context
         bs = batch.total_seqs_num
+
+        # In mixed batch, logits may be sparse — filter sampling params to match
+        if context.is_mixed and logits is not None:
+            logits_indices = self._get_logits_indices(batch)
+            if logits_indices is not None:
+                # Build mask of which seqs have logits
+                logits_seq_indices = []
+                n_prefill = batch.total_seqs_num_prefill
+                for i, num_tokens in enumerate(batch.num_scheduled_tokens):
+                    num_tokens = int(num_tokens)
+                    if i < n_prefill:
+                        kv_computed = batch.num_kv_computed[i]
+                        is_final = (
+                            kv_computed + num_tokens
+                        ) >= batch.num_prompt_tokens[i]
+                        if is_final:
+                            logits_seq_indices.append(i)
+                    else:
+                        logits_seq_indices.append(i)
+                logits_seq_indices = torch.tensor(
+                    logits_seq_indices, dtype=torch.long, device=self.device
+                )
+                # Filter sampling params
+                temperatures = temperatures[logits_seq_indices]
+                if top_ks is not None and top_ks.shape[0] > 1:
+                    top_ks = top_ks[logits_seq_indices]
+                if top_ps is not None and top_ps.shape[0] > 1:
+                    top_ps = top_ps[logits_seq_indices]
+                # Filter req_ids for output mapping
+                mixed_req_ids = [batch.req_ids[i] for i in logits_seq_indices.tolist()]
+                bs = len(mixed_req_ids)
+            else:
+                mixed_req_ids = None
+        else:
+            mixed_req_ids = None
+
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(
                 logits, temperatures, top_ks, top_ps, all_greedy
@@ -1658,9 +1770,21 @@ class ModelRunner:
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
-        req_ids_out, token_ids_out = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event
-        )
+        if mixed_req_ids is not None:
+            # Mixed batch: sampled_tokens corresponds to mixed_req_ids (subset of batch.req_ids)
+            token_ids = sampled_tokens.tolist()
+            if token_ids and isinstance(token_ids[0], list):
+                processed = self.tokenID_processor._batch_process_token_ids(token_ids)
+            else:
+                processed = [(tid,) for tid in token_ids]
+            req_ids_out = mixed_req_ids
+            token_ids_out = processed
+            # Still update prev_batch for deferred output tracking
+            self.tokenID_processor.prev_batch = batch
+        else:
+            req_ids_out, token_ids_out = self.tokenID_processor.prepare_sampled_ids(
+                batch, sampled_tokens, self.forward_done_event
+            )
 
         draft_token_ids: Optional[np.ndarray] = None
         if self.tokenID_processor.is_deferred_out:

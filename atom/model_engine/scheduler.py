@@ -266,6 +266,8 @@ class ScheduledBatch:
         self.total_seqs_num_decode = total_seqs_num_decode
 
         self.is_dummy_run = is_dummy_run
+        self.is_mixed = total_seqs_num_prefill > 0 and total_seqs_num_decode > 0
+        self.num_prompt_tokens = [seq.num_prompt_tokens for seq in seqs.values()]
 
         self.num_spec_step = num_spec_step
 
@@ -404,11 +406,13 @@ class Scheduler:
             scheduled_seqs[seq.id] = seq
             num_scheduled_tokens.append(chunk)
 
-        num_scheduled_tokens_np = num_scheduled_tokens
-        total_tokens_num_prefill = sum(num_scheduled_tokens_np)
+        # Compute prefill totals
+        total_tokens_num_prefill = sum(num_scheduled_tokens)
 
+        # Compute is_partial_prefill (only if all prefill seqs are intermediate chunks)
+        is_partial_prefill = False
+        num_kv_computed_list = None
         if num_seqs_prefill > 0:
-            # Determine if all prefill seqs are intermediate chunks (not final)
             is_partial_prefill = all(
                 seq.num_kv_computed + num_scheduled_tokens[i] < seq.num_prompt_tokens
                 for i, seq in enumerate(scheduled_seqs.values())
@@ -416,28 +420,21 @@ class Scheduler:
             num_kv_computed_list = [
                 seq.num_kv_computed for seq in scheduled_seqs.values()
             ]
-            logger.info(
-                f"Scheduled prefill batch: {num_seqs_prefill} reqs, {total_tokens_num_prefill} token_nums: {num_scheduled_tokens}, req_ids: {tuple(scheduled_seqs.keys())}, partial: {is_partial_prefill}"
-            )
-            self.prev_prompt = True
-            return (
-                ScheduledBatch(
-                    seqs=scheduled_seqs,
-                    num_scheduled_tokens=num_scheduled_tokens_np,
-                    total_tokens_num=total_tokens_num_prefill,
-                    total_tokens_num_prefill=total_tokens_num_prefill,
-                    total_seqs_num=num_seqs_prefill,
-                    total_seqs_num_prefill=num_seqs_prefill,
-                    num_kv_computed=num_kv_computed_list,
-                    is_partial_prefill=is_partial_prefill,
-                ),
-                scheduled_seqs,
-            )
 
-        # decode
+        # ---- Phase 3: decode — runs alongside prefill (mixed batch) ----
         num_seqs_decode = 0
-        while self.running and num_seqs_decode < self.max_num_seqs:
+        scheduled_decode_seqs = []
+        decode_candidates = deque()
+        while self.running and (num_seqs_prefill + num_seqs_decode) < self.max_num_seqs:
             seq = self.running.popleft()
+            if seq.id in scheduled_seqs:
+                # Already scheduled as prefill — keep in running
+                decode_candidates.append(seq)
+                continue
+            if seq.num_kv_computed < seq.num_prompt_tokens:
+                # Partial prefill but budget exhausted — keep in running
+                decode_candidates.append(seq)
+                continue
             while not self.block_manager.can_append(seq, self.mtp_k + 1):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -445,34 +442,80 @@ class Scheduler:
                     self.preempt(seq)
                     break
             else:
+                num_new_tokens = self.mtp_k + 1
+                if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
+                    decode_candidates.append(seq)
+                    break  # budget exhausted
+                num_batched_tokens += num_new_tokens
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
-                num_new_tokens = self.mtp_k + 1
                 self.block_manager.may_append(seq, num_new_tokens)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
+                scheduled_decode_seqs.append(seq)
 
-        num_scheduled_tokens_np = num_scheduled_tokens
-        total_tokens_num_decode = sum(num_scheduled_tokens_np)
+        # Restore unscheduled seqs to running
+        self.running.extendleft(reversed(decode_candidates))
+        # Put scheduled decode seqs at the front of running (preserving FCFS order)
+        self.running.extendleft(reversed(scheduled_decode_seqs))
 
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs.values()))
-        # logger.info(
-        #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, req_ids: {tuple(scheduled_seqs.keys())}"
-        # )
+        if not scheduled_seqs:
+            return None
+
+        total_tokens_num_decode = sum(
+            int(num_scheduled_tokens[i])
+            for i, seq in enumerate(scheduled_seqs.values())
+            if seq.type == SequenceType.DECODE
+        )
+        # Recompute prefill total (may differ from total_tokens_num_prefill if decode added)
+        total_tokens_num_prefill = sum(
+            int(num_scheduled_tokens[i])
+            for i, seq in enumerate(scheduled_seqs.values())
+            if seq.type == SequenceType.PREFILL
+        )
+
+        # Mixed batch: if has both prefill AND decode, is_partial_prefill must be False
+        if num_seqs_prefill > 0 and num_seqs_decode > 0:
+            is_partial_prefill = False
+
+        # Build num_kv_computed_list for ALL seqs (prefill + decode)
+        if num_kv_computed_list is None:
+            num_kv_computed_list = [
+                seq.num_kv_computed for seq in scheduled_seqs.values()
+            ]
+        else:
+            # Extend with decode seqs' num_kv_computed
+            for seq in scheduled_seqs.values():
+                if seq.type == SequenceType.DECODE:
+                    num_kv_computed_list.append(seq.num_kv_computed)
+
+        self.prev_prompt = num_seqs_prefill > 0
+
+        if num_seqs_prefill > 0:
+            logger.info(
+                f"Scheduled {'mixed' if num_seqs_decode > 0 else 'prefill'} batch: "
+                f"{num_seqs_prefill} prefill + {num_seqs_decode} decode, "
+                f"{total_tokens_num_prefill}+{total_tokens_num_decode} tokens, "
+                f"req_ids: {tuple(scheduled_seqs.keys())}, "
+                f"partial: {is_partial_prefill}"
+            )
+
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
-                num_scheduled_tokens=num_scheduled_tokens_np,
-                total_tokens_num=total_tokens_num_decode,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=total_tokens_num_prefill + total_tokens_num_decode,
+                total_tokens_num_prefill=total_tokens_num_prefill,
                 total_tokens_num_decode=total_tokens_num_decode,
                 total_seqs_num=num_seqs_prefill + num_seqs_decode,
                 total_seqs_num_prefill=num_seqs_prefill,
                 total_seqs_num_decode=num_seqs_decode,
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+                num_kv_computed=num_kv_computed_list,
+                is_partial_prefill=is_partial_prefill,
             ),
             scheduled_seqs,
         )
@@ -655,18 +698,29 @@ class Scheduler:
 
     def get_next_batch_info(self) -> tuple[bool, int]:
         # Check for partial prefills in running (chunked prefill resume)
+        has_partial_prefill = False
+        prefill_tokens = 0
+        num_decode_seqs = 0
         for seq in self.running:
             if seq.num_kv_computed < seq.num_prompt_tokens:
                 remaining = seq.num_prompt_tokens - seq.num_kv_computed
-                chunk = min(remaining, self.max_num_batched_tokens)
-                return (True, chunk)
+                prefill_tokens += min(remaining, self.max_num_batched_tokens)
+                has_partial_prefill = True
+                break  # currently resume one partial at a time
+            else:
+                num_decode_seqs += 1
+        if has_partial_prefill:
+            # Mixed batch: prefill tokens + decode seq count
+            total = prefill_tokens + num_decode_seqs
+            return (True, total)
         if self.waiting:
-            # new request is waiting, will do prefill
+            # new request is waiting, will do prefill (possibly mixed with decode)
             seq = self.waiting[0]
             num_tokens = seq.num_tokens - seq.num_kv_computed
-            return (True, num_tokens)
+            total = num_tokens + len(self.running)
+            return (True, total)
         elif self.running:
-            # decode
+            # pure decode
             num_tokens = len(self.running)
             return (False, num_tokens)
         else:

@@ -137,29 +137,35 @@ class Context:
     # This context is used to store the basic context of the forward.
     positions: torch.Tensor
     is_prefill: bool = False
+    is_mixed: bool = False
     is_dummy_run: bool = False
     batch_size: int = 0
     graph_bs: int = 0
     is_draft: bool = False
     is_partial_prefill: bool = False
+    num_prefill_tokens: int = 0
 
     def __init__(
         self,
         positions: torch.Tensor,
         is_prefill: bool = False,
+        is_mixed: bool = False,
         is_dummy_run: bool = False,
         batch_size: int = 0,
         graph_bs: int = 0,
         is_draft: bool = False,
         is_partial_prefill: bool = False,
+        num_prefill_tokens: int = 0,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
+        self.is_mixed = is_mixed
         self.is_dummy_run = is_dummy_run
         self.batch_size = batch_size
         self.graph_bs = graph_bs
         self.is_draft = is_draft
         self.is_partial_prefill = is_partial_prefill
+        self.num_prefill_tokens = num_prefill_tokens
 
 
 @dataclass
@@ -201,6 +207,10 @@ class AttentionMetaData:
     # only used for plugin mode to store the metadata for attn
     plugin_metadata: Optional["MetadataForPluginMode"] = None
 
+    # Mixed batch sub-metadata for Split Dispatch
+    prefill_attn_metadata: Optional["AttentionMetaData"] = None
+    decode_attn_metadata: Optional["AttentionMetaData"] = None
+
     def __init__(
         self,
         cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -232,7 +242,11 @@ class AttentionMetaData:
         total_kv: Optional[int] = None,
         num_cached_tokens: Optional[torch.Tensor] = None,
         seq_starts: Optional[torch.Tensor] = None,
+        prefill_attn_metadata: Optional["AttentionMetaData"] = None,
+        decode_attn_metadata: Optional["AttentionMetaData"] = None,
     ):
+        self.prefill_attn_metadata = prefill_attn_metadata
+        self.decode_attn_metadata = decode_attn_metadata
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens

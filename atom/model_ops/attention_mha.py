@@ -104,18 +104,53 @@ class PagedAttentionImpl(nn.Module):
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        # rope cache
+        # rope cache — writes to KV cache via merged slot_mapping for all tokens
         q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(
             q, k, v, qkv, position, fwd_ctx
         )
 
-        attn_impl = self.dispatch_backend(fwd_ctx)
+        if fwd_ctx.context.is_mixed:
+            # Split Dispatch: prefill tokens → flash_attn, decode tokens → paged_attn
+            n_prefill = fwd_ctx.context.num_prefill_tokens
+            q_p, q_d = q[:n_prefill], q[n_prefill:]
+            k_p, k_d = k[:n_prefill], k[n_prefill:]
+            v_p, v_d = v[:n_prefill], v[n_prefill:]
 
-        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+            # Prefill: flash_attn_varlen using prefill sub-metadata
+            saved_attn_metadata = fwd_ctx.attn_metadata
+            fwd_ctx.attn_metadata = saved_attn_metadata.prefill_attn_metadata
+            o_p = self.prefill_attention(
+                q_p, k_p, v_p, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+            )
+
+            # Decode: paged_attention using decode sub-metadata
+            fwd_ctx.attn_metadata = saved_attn_metadata.decode_attn_metadata
+            decode_impl = self._get_decode_backend()
+            o_d = decode_impl(
+                q_d, k_d, v_d, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+            )
+
+            # Restore original metadata
+            fwd_ctx.attn_metadata = saved_attn_metadata
+
+            o = torch.cat([o_p, o_d], dim=0)
+        else:
+            attn_impl = self.dispatch_backend(fwd_ctx)
+            o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
         return o
+
+    def _get_decode_backend(self):
+        """Return the decode attention implementation (no prefill check)."""
+        if self.use_triton_attn:
+            return self.paged_attention_triton
+        else:
+            atom_config = get_current_atom_config()
+            if atom_config.kv_cache_block_size == 1024:
+                return self.paged_attention_persistent_asm
+            return self.paged_attention_asm
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):

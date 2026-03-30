@@ -181,6 +181,220 @@ class AiterAttentionMetadataBuilder:
             "reduce_partial_map": reduce_partial_map,
         }
 
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        """Build mixed prefill+decode metadata with AITER persistent buffers for decode."""
+        var = self.model_runner.forward_vars
+
+        n_prefill_seqs = batch.total_seqs_num_prefill
+        n_prefill_tokens = batch.total_tokens_num_prefill
+        n_decode_seqs = batch.total_seqs_num_decode
+        n_decode_tokens = batch.total_tokens_num_decode
+        total_tokens = n_prefill_tokens + n_decode_tokens
+
+        # ---- Prefill sub-metadata (reuse CommonAttentionBuilder logic) ----
+        positions_prefill = []
+        cu_seqlens_q_p = [0]
+        cu_seqlens_k_p = [0]
+        max_seqlen_q_p = 0
+        max_seqlen_k_p = 0
+        slot_mapping_prefill = []
+        has_cached = False
+
+        for i in range(n_prefill_seqs):
+            seqlen = batch.context_lens[i]
+            cached_seqlen = batch.num_kv_computed[i]
+            if cached_seqlen > 0:
+                has_cached = True
+            positions_prefill.extend(list(range(cached_seqlen, seqlen)))
+            seqlen_q = seqlen - cached_seqlen
+            seqlen_k = seqlen
+            cu_seqlens_q_p.append(cu_seqlens_q_p[-1] + seqlen_q)
+            cu_seqlens_k_p.append(cu_seqlens_k_p[-1] + seqlen_k)
+            max_seqlen_q_p = max(seqlen_q, max_seqlen_q_p)
+            max_seqlen_k_p = max(seqlen_k, max_seqlen_k_p)
+            if not batch.block_tables:
+                continue
+            block_table = batch.block_tables[i]
+            block_size = self.model_runner.block_size
+            first_blk = cached_seqlen // block_size
+            last_blk = (seqlen - 1) // block_size
+            for blk_idx in range(first_blk, last_blk + 1):
+                blk_start = block_table[blk_idx] * block_size
+                off_start = cached_seqlen % block_size if blk_idx == first_blk else 0
+                off_end = (
+                    ((seqlen - 1) % block_size) + 1
+                    if blk_idx == last_blk
+                    else block_size
+                )
+                slot_mapping_prefill.extend(
+                    range(blk_start + off_start, blk_start + off_end)
+                )
+
+        if has_cached:
+            self.prepare_block_tables(batch)
+
+        cu_seqlens_k_p_tensor = torch.tensor(
+            cu_seqlens_k_p, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        cu_seqlens_q_p_tensor = torch.tensor(
+            cu_seqlens_q_p, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        slot_mapping_p_tensor = torch.tensor(
+            slot_mapping_prefill if slot_mapping_prefill else [-1] * n_prefill_tokens,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        num_cached_tokens = None
+        total_kv = n_prefill_tokens
+        if has_cached:
+            num_cached_tokens = torch.tensor(
+                batch.num_kv_computed[:n_prefill_seqs],
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            total_kv = sum(batch.context_lens[:n_prefill_seqs])
+
+        prefill_attn_metadata = AttentionMetaData(
+            cu_seqlens_q=cu_seqlens_q_p_tensor,
+            cu_seqlens_k=cu_seqlens_k_p_tensor,
+            max_seqlen_q=max_seqlen_q_p,
+            max_seqlen_k=max_seqlen_k_p,
+            slot_mapping=slot_mapping_p_tensor,
+            context_lens=torch.tensor(
+                batch.context_lens[:n_prefill_seqs].tolist(),
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True),
+            block_tables=(
+                var["block_tables"].gpu[:n_prefill_seqs] if has_cached else None
+            ),
+            seq_starts=(var["seq_starts"].gpu[:n_prefill_seqs] if has_cached else None),
+            has_cached=has_cached,
+            total_kv=total_kv,
+            num_cached_tokens=num_cached_tokens,
+        )
+
+        # ---- Decode sub-metadata with AITER persistent buffers ----
+        decode_context_lens = np.asarray(
+            batch.context_lens[n_prefill_seqs:], dtype=np.int32
+        )
+        decode_block_tables = batch.block_tables[n_prefill_seqs:]
+
+        max_seqlen_q_d = batch.num_spec_step + 1
+        slot_mapping_decode = [
+            bt[-1] * self.model_runner.block_size + lbt - 1
+            for bt, lbt in zip(
+                decode_block_tables, batch.last_block_num_tokens[n_prefill_seqs:]
+            )
+        ]
+        positions_decode = np.asarray(decode_context_lens - 1, dtype=np.int32)
+        max_seqlen_k_d = int(decode_context_lens.max()) if n_decode_seqs > 0 else 0
+
+        # Write decode block tables into var buffer (after prefill seqs)
+        block_tables_np = var["block_tables"].np
+        for i, bt in enumerate(decode_block_tables):
+            row = n_prefill_seqs + i
+            block_tables_np[row] = 0
+            block_tables_np[row, : len(bt)] = bt
+
+        # Write decode context_lens and cu_seqlens_q into var buffers
+        var["context_lens"].np[:n_decode_seqs] = decode_context_lens
+        var["context_lens"].np[n_decode_seqs:bs] = 0
+        # cu_seqlens_q for decode: 1 token per seq
+        # (already initialized as 0,1,2,...,max_bs in __init__)
+
+        # Prepare kv_indptr and kv_indices for persistent attention
+        num_blocks_per_seq = cdiv(decode_context_lens, self.block_size)
+        kv_indptr = np.cumsum(num_blocks_per_seq)
+        sum_blocks = kv_indptr[-1] if len(kv_indptr) > 0 else 0
+
+        var["kv_indptr"].np[0] = 0
+        var["kv_indptr"].np[1 : n_decode_seqs + 1] = kv_indptr
+        var["kv_indptr"].np[n_decode_seqs + 1 : bs + 1] = sum_blocks
+
+        # Copy decode-specific buffers to GPU
+        # Block tables: copy full range then slice for decode
+        var["block_tables"].copy_to_gpu(n_prefill_seqs + n_decode_seqs)
+        decode_block_tables_gpu = var["block_tables"].gpu[
+            n_prefill_seqs : n_prefill_seqs + n_decode_seqs
+        ]
+
+        vars_used = [
+            ("context_lens", bs),
+            ("cu_seqlens_q", bs + 1),
+            ("kv_indptr", bs + 1),
+        ]
+        ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+
+        if self.block_size == 1024:
+            ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
+            ctx.update(ctx_pa_ps)
+
+        ctx["kv_indices"] = var["kv_indices"].gpu
+        kv_indices_generate_triton(
+            decode_block_tables_gpu,
+            ctx["kv_indices"],
+            ctx["kv_indptr"],
+            self.block_ratio,
+            max_seqlen_k_d,
+        )
+
+        if self.block_ratio > 1:
+            block_table_convert_triton(
+                decode_block_tables_gpu,
+                var["block_tables_converted"].gpu[
+                    n_prefill_seqs : n_prefill_seqs + n_decode_seqs
+                ],
+                ctx["context_lens"][:n_decode_seqs],
+                self.block_ratio,
+            )
+            ctx["block_tables_converted"] = var["block_tables_converted"].gpu[
+                n_prefill_seqs : n_prefill_seqs + n_decode_seqs
+            ]
+
+        decode_slot_mapping_tensor = torch.tensor(
+            slot_mapping_decode, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        decode_attn_metadata = AttentionMetaData(
+            cu_seqlens_q=ctx["cu_seqlens_q"],
+            max_seqlen_q=max_seqlen_q_d,
+            max_seqlen_k=max_seqlen_k_d,
+            slot_mapping=decode_slot_mapping_tensor,
+            context_lens=ctx["context_lens"],
+            block_tables=decode_block_tables_gpu,
+            kv_indptr=ctx["kv_indptr"],
+            kv_indices=ctx["kv_indices"],
+            **{
+                k: v
+                for k, v in ctx.items()
+                if k not in ("context_lens", "cu_seqlens_q", "kv_indptr", "kv_indices")
+            },
+        )
+
+        # ---- Merge positions and slot_mapping ----
+        var["positions"].np[:n_prefill_tokens] = positions_prefill
+        var["positions"].np[n_prefill_tokens:total_tokens] = positions_decode
+        positions = var["positions"].copy_to_gpu(total_tokens)
+
+        merged_slot_np = np.empty(total_tokens, dtype=np.int64)
+        merged_slot_np[:n_prefill_tokens] = (
+            slot_mapping_prefill if slot_mapping_prefill else [-1] * n_prefill_tokens
+        )
+        merged_slot_np[n_prefill_tokens:total_tokens] = slot_mapping_decode
+        merged_slot_mapping = torch.tensor(
+            merged_slot_np, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        attn_metadata = AttentionMetaData(
+            slot_mapping=merged_slot_mapping,
+            prefill_attn_metadata=prefill_attn_metadata,
+            decode_attn_metadata=decode_attn_metadata,
+        )
+
+        return attn_metadata, positions
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0

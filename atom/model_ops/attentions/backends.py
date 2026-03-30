@@ -247,9 +247,188 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         return attn_metadata, positions
         # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        """Build metadata for mixed prefill+decode batch (Split Dispatch).
+
+        Builds separate prefill and decode AttentionMetaData, then returns
+        a combined AttentionMetaData with sub-metadata fields, plus merged
+        positions tensor (prefill tokens first, decode tokens after).
+        """
+        import numpy as np
+
+        var = self.model_runner.forward_vars
+
+        # ---- Prefill sub-metadata ----
+        n_prefill_seqs = batch.total_seqs_num_prefill
+        n_prefill_tokens = batch.total_tokens_num_prefill
+
+        positions_prefill = []
+        cu_seqlens_q_p = [0]
+        cu_seqlens_k_p = [0]
+        max_seqlen_q_p = 0
+        max_seqlen_k_p = 0
+        slot_mapping_prefill = []
+        has_cached = False
+
+        for i in range(n_prefill_seqs):
+            seqlen = batch.context_lens[i]
+            cached_seqlen = batch.num_kv_computed[i]
+            if cached_seqlen > 0:
+                has_cached = True
+            positions_prefill.extend(list(range(cached_seqlen, seqlen)))
+            seqlen_q = seqlen - cached_seqlen
+            seqlen_k = seqlen
+            cu_seqlens_q_p.append(cu_seqlens_q_p[-1] + seqlen_q)
+            cu_seqlens_k_p.append(cu_seqlens_k_p[-1] + seqlen_k)
+            max_seqlen_q_p = max(seqlen_q, max_seqlen_q_p)
+            max_seqlen_k_p = max(seqlen_k, max_seqlen_k_p)
+            if not batch.block_tables:
+                continue
+            block_table = batch.block_tables[i]
+            block_size = self.model_runner.block_size
+            first_blk = cached_seqlen // block_size
+            last_blk = (seqlen - 1) // block_size
+            for blk_idx in range(first_blk, last_blk + 1):
+                blk_start = block_table[blk_idx] * block_size
+                off_start = cached_seqlen % block_size if blk_idx == first_blk else 0
+                off_end = (
+                    ((seqlen - 1) % block_size) + 1
+                    if blk_idx == last_blk
+                    else block_size
+                )
+                slot_mapping_prefill.extend(
+                    range(blk_start + off_start, blk_start + off_end)
+                )
+
+        assert len(positions_prefill) == n_prefill_tokens
+        if batch.block_tables:
+            assert len(slot_mapping_prefill) == n_prefill_tokens
+
+        # Block tables needed for prefill if prefix caching
+        if has_cached:
+            self.prepare_block_tables(batch)
+
+        cu_seqlens_k_p_tensor = torch.tensor(
+            cu_seqlens_k_p, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        cu_seqlens_q_p_tensor = torch.tensor(
+            cu_seqlens_q_p, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        slot_mapping_p_tensor = torch.tensor(
+            slot_mapping_prefill if slot_mapping_prefill else [-1] * n_prefill_tokens,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        num_cached_tokens = None
+        total_kv = n_prefill_tokens
+        if has_cached:
+            num_cached_tokens = torch.tensor(
+                batch.num_kv_computed[:n_prefill_seqs],
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            total_kv = sum(batch.context_lens[:n_prefill_seqs])
+
+        prefill_attn_metadata = AttentionMetaData(
+            cu_seqlens_q=cu_seqlens_q_p_tensor,
+            cu_seqlens_k=cu_seqlens_k_p_tensor,
+            max_seqlen_q=max_seqlen_q_p,
+            max_seqlen_k=max_seqlen_k_p,
+            slot_mapping=slot_mapping_p_tensor,
+            context_lens=torch.tensor(
+                batch.context_lens[:n_prefill_seqs].tolist(),
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True),
+            block_tables=(
+                var["block_tables"].gpu[:n_prefill_seqs] if has_cached else None
+            ),
+            seq_starts=(var["seq_starts"].gpu[:n_prefill_seqs] if has_cached else None),
+            has_cached=has_cached,
+            total_kv=total_kv,
+            num_cached_tokens=num_cached_tokens,
+        )
+
+        # ---- Decode sub-metadata ----
+        n_decode_seqs = batch.total_seqs_num_decode
+        n_decode_tokens = batch.total_tokens_num_decode
+
+        decode_context_lens = np.asarray(
+            batch.context_lens[n_prefill_seqs:], dtype=np.int32
+        )
+        decode_block_tables = batch.block_tables[n_prefill_seqs:]
+
+        max_seqlen_q_d = batch.num_spec_step + 1
+        slot_mapping_decode = [
+            bt[-1] * self.model_runner.block_size + lbt - 1
+            for bt, lbt in zip(
+                decode_block_tables, batch.last_block_num_tokens[n_prefill_seqs:]
+            )
+        ]
+        positions_decode = np.asarray(decode_context_lens - 1, dtype=np.int32)
+        max_seqlen_k_d = int(decode_context_lens.max()) if n_decode_seqs > 0 else 0
+
+        # Write decode block tables
+        block_tables_np = var["block_tables"].np
+        for i, bt in enumerate(decode_block_tables):
+            block_tables_np[n_prefill_seqs + i] = 0
+            block_tables_np[n_prefill_seqs + i, : len(bt)] = bt
+
+        # Decode cu_seqlens_q (1 token per seq)
+        decode_cu_q = torch.arange(
+            0, n_decode_seqs + 1, dtype=torch.int32, device=self.device
+        )
+
+        decode_context_lens_tensor = torch.tensor(
+            decode_context_lens.tolist(), dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        decode_slot_mapping_tensor = torch.tensor(
+            slot_mapping_decode, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        decode_block_tables_tensor = var["block_tables"].copy_to_gpu(
+            n_prefill_seqs + n_decode_seqs
+        )[n_prefill_seqs:]
+
+        decode_attn_metadata = AttentionMetaData(
+            cu_seqlens_q=decode_cu_q,
+            max_seqlen_q=max_seqlen_q_d,
+            max_seqlen_k=max_seqlen_k_d,
+            slot_mapping=decode_slot_mapping_tensor,
+            context_lens=decode_context_lens_tensor,
+            block_tables=decode_block_tables_tensor,
+        )
+
+        # ---- Merge positions and slot_mapping ----
+        total_tokens = n_prefill_tokens + n_decode_tokens
+        var["positions"].np[:n_prefill_tokens] = positions_prefill
+        var["positions"].np[n_prefill_tokens:total_tokens] = positions_decode
+        positions = var["positions"].copy_to_gpu(total_tokens)
+
+        merged_slot_np = np.empty(total_tokens, dtype=np.int64)
+        merged_slot_np[:n_prefill_tokens] = (
+            slot_mapping_prefill if slot_mapping_prefill else [-1] * n_prefill_tokens
+        )
+        merged_slot_np[n_prefill_tokens:total_tokens] = slot_mapping_decode
+        merged_slot_mapping = torch.tensor(
+            merged_slot_np, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        # Combined metadata with sub-metadata for Split Dispatch
+        attn_metadata = AttentionMetaData(
+            slot_mapping=merged_slot_mapping,
+            prefill_attn_metadata=prefill_attn_metadata,
+            decode_attn_metadata=decode_attn_metadata,
+        )
+
+        return attn_metadata, positions
+
     def build(self, batch: ScheduledBatch, bs: int):
         is_prefill = batch.total_tokens_num_prefill > 0
-        if is_prefill:
+        is_mixed = getattr(batch, "is_mixed", False)
+        if is_mixed:
+            return self.prepare_mixed(batch, bs)
+        elif is_prefill:
             return self.prepare_prefill(batch)
         else:
             return self.prepare_decode(batch, bs)

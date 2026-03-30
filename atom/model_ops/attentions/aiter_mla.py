@@ -349,6 +349,237 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dtype_q = self.dtype_q
         return attn_metadata, positions
 
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        """Build mixed prefill+decode metadata with MLA persistent buffers for decode."""
+        var = self.model_runner.forward_vars
+
+        n_prefill_seqs = batch.total_seqs_num_prefill
+        n_prefill_tokens = batch.total_tokens_num_prefill
+        n_decode_seqs = batch.total_seqs_num_decode
+        n_decode_tokens = batch.total_tokens_num_decode
+        total_tokens = n_prefill_tokens + n_decode_tokens
+
+        # ---- Prefill sub-metadata (via CommonAttentionBuilder) ----
+        # Temporarily build prefill metadata by calling parent prepare_prefill
+        # which only iterates the first n_prefill_seqs
+        prefill_attn_metadata, prefill_positions = (
+            CommonAttentionBuilder.prepare_prefill(self, batch)
+        )
+
+        # Add sparse attention metadata for prefill if needed
+        if self.is_sparse and prefill_attn_metadata.max_seqlen_k > self.index_topk:
+            sum_scheduled_tokens = n_prefill_tokens
+            if prefill_attn_metadata.block_tables is None:
+                self.prepare_block_tables(batch)
+                prefill_attn_metadata.block_tables = var["block_tables"].copy_to_gpu(
+                    n_prefill_seqs
+                )
+                if self.block_ratio > 1:
+                    block_table_convert_triton(
+                        var["block_tables"].gpu[:n_prefill_seqs],
+                        var["block_tables_converted"].gpu[:n_prefill_seqs],
+                        var["context_lens"].gpu[:n_prefill_seqs],
+                        self.block_ratio,
+                    )
+                    prefill_attn_metadata.block_tables = var[
+                        "block_tables_converted"
+                    ].gpu[:n_prefill_seqs]
+            counts = (
+                var["cu_seqlens_q"].np[1 : n_prefill_seqs + 1]
+                - var["cu_seqlens_q"].np[:n_prefill_seqs]
+            )
+            if prefill_attn_metadata.has_cached:
+                var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
+                    var["cu_seqlens_k"].np[:-1], counts
+                )
+                var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = np.repeat(
+                    var["cu_seqlens_k"].np[1:], counts
+                )
+            else:
+                var["cu_seqlen_ke"].np[:sum_scheduled_tokens] = (
+                    np.arange(sum_scheduled_tokens, dtype=np.int32) + 1
+                )
+                var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
+                    var["cu_seqlens_q"].np[:n_prefill_seqs], counts
+                )
+            prefill_attn_metadata.cu_seqlen_ks = var["cu_seqlen_ks"].copy_to_gpu(
+                sum_scheduled_tokens
+            )
+            prefill_attn_metadata.cu_seqlen_ke = var["cu_seqlen_ke"].copy_to_gpu(
+                sum_scheduled_tokens
+            )
+            prefill_attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
+                : sum_scheduled_tokens + 1
+            ]
+            prefill_attn_metadata.kv_last_page_lens = var[
+                "sparse_kv_last_page_lens"
+            ].gpu[:sum_scheduled_tokens]
+            prefill_attn_metadata.token_to_seq_idxs = torch.repeat_interleave(
+                torch.arange(n_prefill_seqs, dtype=torch.int32, device=self.device),
+                torch.tensor(counts, dtype=torch.int64, device=self.device),
+            )
+            var["sparse_kv_indptr"].np[0] = 0
+            var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
+                np.minimum(
+                    np.concatenate([np.arange(1, s + 1) for s in counts]),
+                    self.index_topk,
+                ),
+                dtype=np.int32,
+            )
+            prefill_attn_metadata.sparse_kv_indptr = var[
+                "sparse_kv_indptr"
+            ].copy_to_gpu(sum_scheduled_tokens + 1)
+
+        if hasattr(self.model_runner, "drafter") or prefill_attn_metadata.has_cached:
+            if self.model_runner.block_size != 1:
+                var["kv_last_page_lens"].np[:n_prefill_seqs] = np.asarray(
+                    batch.last_block_num_tokens[:n_prefill_seqs], dtype=np.int32
+                )
+            else:
+                var["kv_last_page_lens"].np[:n_prefill_seqs] = 1
+            var["kv_last_page_lens"].copy_to_gpu()
+
+            prefill_attn_metadata.kv_indices = var["kv_indices"].gpu
+            prefill_attn_metadata.kv_indptr = var["kv_indptr"].gpu[: n_prefill_seqs + 1]
+            prefill_attn_metadata.kv_indptr[0] = 0
+            prefill_attn_metadata.kv_indptr[1 : n_prefill_seqs + 1] = torch.cumsum(
+                prefill_attn_metadata.context_lens, 0
+            )
+            prefill_attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[
+                :n_prefill_seqs
+            ]
+
+            self.prepare_block_tables(batch)
+            block_tables_for_kv = var["block_tables"].copy_to_gpu(n_prefill_seqs)
+            kv_indices_generate_triton(
+                block_tables_for_kv,
+                prefill_attn_metadata.kv_indices,
+                prefill_attn_metadata.kv_indptr,
+                self.block_ratio,
+                prefill_attn_metadata.max_seqlen_k,
+            )
+
+        prefill_attn_metadata.dtype_q = self.dtype_q
+
+        # ---- Decode sub-metadata with MLA persistent buffers ----
+        decode_context_lens = np.asarray(
+            batch.context_lens[n_prefill_seqs:], dtype=np.int32
+        )
+        decode_block_tables = batch.block_tables[n_prefill_seqs:]
+        max_seqlen_q_d = 1
+        max_seqlen_k_d = int(decode_context_lens.max()) if n_decode_seqs > 0 else 0
+
+        slot_mapping_decode = [
+            bt[-1] * self.model_runner.block_size + lbt - 1
+            for bt, lbt in zip(
+                decode_block_tables, batch.last_block_num_tokens[n_prefill_seqs:]
+            )
+        ]
+        positions_decode = np.asarray(decode_context_lens - 1, dtype=np.int32)
+
+        # Write decode data into var buffers
+        block_tables_np = var["block_tables"].np
+        for i, bt in enumerate(decode_block_tables):
+            row = n_prefill_seqs + i
+            block_tables_np[row] = 0
+            block_tables_np[row, : len(bt)] = bt
+
+        var["context_lens"].np[:n_decode_seqs] = decode_context_lens
+        var["context_lens"].np[n_decode_seqs:bs] = 0
+
+        num_blocks_per_seq = cdiv(decode_context_lens, self.block_size)
+        kv_indptr = np.cumsum(num_blocks_per_seq)
+        sum_blocks = kv_indptr[-1] if len(kv_indptr) > 0 else 0
+
+        var["kv_indptr"].np[0] = 0
+        var["kv_indptr"].np[1 : n_decode_seqs + 1] = kv_indptr
+        var["kv_indptr"].np[n_decode_seqs + 1 : bs + 1] = sum_blocks
+
+        var["kv_last_page_lens"].np[:n_decode_seqs] = (
+            batch.last_block_num_tokens[n_prefill_seqs:] if self.block_size != 1 else 1
+        )
+        var["kv_last_page_lens"].np[n_decode_seqs:bs] = 0
+
+        # Copy to GPU and build decode block tables
+        var["block_tables"].copy_to_gpu(n_prefill_seqs + n_decode_seqs)
+        decode_block_tables_gpu = var["block_tables"].gpu[
+            n_prefill_seqs : n_prefill_seqs + n_decode_seqs
+        ]
+
+        vars_used = [
+            ("slot_mapping", bs),
+            ("context_lens", bs),
+            ("cu_seqlens_q", bs + 1),
+            ("kv_indptr", bs + 1),
+            ("kv_last_page_lens", bs),
+        ]
+        if self.is_sparse:
+            index_topk = self.index_topk
+            sparse_context_lens = np.clip(var["context_lens"].np[:bs], None, index_topk)
+            var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
+                sparse_context_lens, dtype=np.int32
+            )
+            var["sparse_kv_indptr"].np[n_decode_seqs : bs + 1] = var[
+                "sparse_kv_indptr"
+            ].np[n_decode_seqs]
+            vars_used.append(("sparse_kv_indptr", bs + 1))
+
+        ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+
+        # Write decode slot_mapping
+        var["slot_mapping"].np[:n_decode_seqs] = slot_mapping_decode
+        ctx["slot_mapping"] = var["slot_mapping"].copy_to_gpu(n_decode_seqs)
+
+        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q_d)
+        ctx.update(ctx_mla_ps)
+
+        ctx["kv_indices"] = var["kv_indices"].gpu
+        kv_indices_generate_triton(
+            decode_block_tables_gpu,
+            ctx["kv_indices"],
+            ctx["kv_indptr"],
+            self.block_ratio,
+            max_seqlen_k_d,
+        )
+
+        decode_attn_metadata = AttentionMetaData(
+            max_seqlen_q=max_seqlen_q_d,
+            max_seqlen_k=max_seqlen_k_d,
+            block_tables=decode_block_tables_gpu,
+            **ctx,
+        )
+        decode_attn_metadata.dtype_q = self.dtype_q
+
+        # ---- Merge positions ----
+        var["positions"].np[:n_prefill_tokens] = (
+            prefill_positions.cpu().numpy()
+            if isinstance(prefill_positions, torch.Tensor)
+            else prefill_positions
+        )
+        var["positions"].np[n_prefill_tokens:total_tokens] = positions_decode
+        positions = var["positions"].copy_to_gpu(total_tokens)
+
+        # Merged slot_mapping
+        merged_slot_np = np.empty(total_tokens, dtype=np.int64)
+        prefill_slot = prefill_attn_metadata.slot_mapping
+        if isinstance(prefill_slot, torch.Tensor):
+            merged_slot_np[:n_prefill_tokens] = prefill_slot.cpu().numpy()
+        else:
+            merged_slot_np[:n_prefill_tokens] = prefill_slot
+        merged_slot_np[n_prefill_tokens:total_tokens] = slot_mapping_decode
+        merged_slot_mapping = torch.tensor(
+            merged_slot_np, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        attn_metadata = AttentionMetaData(
+            slot_mapping=merged_slot_mapping,
+            prefill_attn_metadata=prefill_attn_metadata,
+            decode_attn_metadata=decode_attn_metadata,
+        )
+        attn_metadata.dtype_q = self.dtype_q
+
+        return attn_metadata, positions
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0

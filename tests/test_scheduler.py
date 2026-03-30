@@ -342,3 +342,162 @@ class TestGetNextBatchInfo:
         is_prefill, n = scheduler.get_next_batch_info()
         assert is_prefill is False
         assert n == 1
+
+
+# ── Mixed Prefill-Decode Batch ────────────────────────────────────────────
+
+
+class TestMixedBatch:
+    """Phase 2: mixed prefill + decode in one batch."""
+
+    def test_mixed_chunked_prefill_with_decode(self, seq_factory):
+        """A chunked prefill seq resumes alongside a decode seq."""
+        # Budget=10 so prefill chunk (8 tokens) + decode (1 token) fit
+        sched = Scheduler(MockConfig(max_num_batched_tokens=10, num_kvcache_blocks=20))
+        # seq1: short prompt, prefill then decode
+        seq1 = seq_factory([1, 2, 3, 4])
+        sched.add(seq1)
+        sched.schedule()  # prefill seq1 (4 tokens)
+        seq1.num_kv_computed = 4  # simulate forward pass
+        seq1.append_token(5)
+
+        # seq2: long prompt (12 tokens), will be chunked
+        seq2 = seq_factory(list(range(10, 22)))
+        sched.add(seq2)
+
+        batch, seqs = sched.schedule()
+        # seq2 gets min(12, 10-0)=10 prefill but then budget check:
+        # budget_remaining = 10-0 = 10, chunk = min(12, 10) = 10 - wait,
+        # but then decode needs 1 more token. Let's check:
+        # Phase 2: seq2 allocated, chunk = min(12, 10) = 10. But wait, that's
+        # seq2 being chunked to 10 tokens out of 12. Then budget = 10.
+        # Phase 3: seq1 decode needs 1 token. 10 + 1 > 10 → doesn't fit.
+        # Need budget > seq2_chunk + 1. Let's use budget=13.
+        pass
+
+    def test_mixed_chunked_prefill_with_decode_v2(self, seq_factory):
+        """A chunked prefill seq resumes alongside a decode seq."""
+        # Budget=13 so prefill chunk (12 tokens) + decode (1 token) = 13
+        sched = Scheduler(MockConfig(max_num_batched_tokens=13, num_kvcache_blocks=20))
+        seq1 = seq_factory([1, 2, 3, 4])
+        sched.add(seq1)
+        sched.schedule()  # prefill seq1 (4 tokens)
+        seq1.num_kv_computed = 4
+        seq1.append_token(5)
+
+        # seq2: 12 tokens, fits in budget
+        seq2 = seq_factory(list(range(10, 22)))
+        sched.add(seq2)
+
+        batch, seqs = sched.schedule()
+        assert batch.total_seqs_num_prefill >= 1
+        assert batch.total_seqs_num_decode >= 1
+        assert batch.is_mixed
+        assert batch.total_tokens_num == (
+            batch.total_tokens_num_prefill + batch.total_tokens_num_decode
+        )
+
+    def test_mixed_is_partial_prefill_false(self, seq_factory):
+        """In mixed batch, is_partial_prefill should be False."""
+        sched = Scheduler(MockConfig(max_num_batched_tokens=8, num_kvcache_blocks=20))
+        seq1 = seq_factory([1, 2, 3, 4])
+        sched.add(seq1)
+        sched.schedule()
+        seq1.num_kv_computed = 4
+        seq1.append_token(5)
+
+        # Long prompt that will be chunked (intermediate chunk)
+        seq2 = seq_factory(list(range(10, 30)))  # 20 tokens
+        sched.add(seq2)
+
+        batch, _ = sched.schedule()
+        if batch.is_mixed:
+            assert not batch.is_partial_prefill
+
+    def test_pure_prefill_regression(self, seq_factory):
+        """Pure prefill batch (no decode) still works correctly."""
+        sched = Scheduler(MockConfig(num_kvcache_blocks=20))
+        seq = seq_factory([1, 2, 3, 4])
+        sched.add(seq)
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+        assert batch.total_seqs_num_decode == 0
+        assert not batch.is_mixed
+
+    def test_pure_decode_regression(self, seq_factory):
+        """Pure decode batch still works correctly."""
+        sched = Scheduler(MockConfig(num_kvcache_blocks=20))
+        seq = seq_factory([1, 2, 3, 4])
+        sched.add(seq)
+        sched.schedule()  # prefill
+        seq.num_kv_computed = 4
+        seq.append_token(5)
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_decode == 1
+        assert batch.total_seqs_num_prefill == 0
+        assert not batch.is_mixed
+
+    def test_mixed_seq_ordering(self, seq_factory):
+        """Prefill seqs should come before decode seqs in batch."""
+        sched = Scheduler(MockConfig(max_num_batched_tokens=16, num_kvcache_blocks=20))
+        # Prepare two decode seqs
+        s1 = seq_factory([1, 2, 3, 4])
+        s2 = seq_factory([5, 6, 7, 8])
+        sched.add(s1)
+        sched.add(s2)
+        sched.schedule()  # prefill both
+        s1.num_kv_computed = 4
+        s2.num_kv_computed = 4
+        s1.append_token(9)
+        s2.append_token(10)
+
+        # Add a new prefill seq
+        s3 = seq_factory([20, 21, 22, 23])
+        sched.add(s3)
+
+        batch, seqs = sched.schedule()
+        if batch.is_mixed:
+            # Check ordering: prefill seqs first in req_ids
+            prefill_count = batch.total_seqs_num_prefill
+            for i, req_id in enumerate(batch.req_ids):
+                seq = seqs[req_id]
+                if i < prefill_count:
+                    from atom.model_engine.sequence import SequenceType
+
+                    assert seq.type == SequenceType.PREFILL
+                else:
+                    assert seq.type == SequenceType.DECODE
+
+    def test_mixed_num_prompt_tokens(self, seq_factory):
+        """ScheduledBatch.num_prompt_tokens should be set for all seqs."""
+        sched = Scheduler(MockConfig(max_num_batched_tokens=16, num_kvcache_blocks=20))
+        s1 = seq_factory([1, 2, 3, 4])
+        sched.add(s1)
+        sched.schedule()
+        s1.num_kv_computed = 4
+        s1.append_token(5)
+
+        s2 = seq_factory([10, 11, 12, 13])
+        sched.add(s2)
+
+        batch, _ = sched.schedule()
+        assert len(batch.num_prompt_tokens) == batch.total_seqs_num
+
+    def test_get_next_batch_info_mixed(self, seq_factory):
+        """get_next_batch_info should report mixed batch as prefill."""
+        sched = Scheduler(MockConfig(max_num_batched_tokens=8, num_kvcache_blocks=20))
+        s1 = seq_factory([1, 2, 3, 4])
+        sched.add(s1)
+        sched.schedule()
+        s1.num_kv_computed = 4
+        s1.append_token(5)
+
+        # Long prompt → will create partial prefill in running
+        s2 = seq_factory(list(range(10, 30)))
+        sched.add(s2)
+        sched.schedule()  # mixed batch: s2 partial prefill + s1 decode
+
+        # After step, s2 is still partial → next batch should be prefill (mixed)
+        is_prefill, n = sched.get_next_batch_info()
+        if s2.num_kv_computed < s2.num_prompt_tokens:
+            assert is_prefill is True

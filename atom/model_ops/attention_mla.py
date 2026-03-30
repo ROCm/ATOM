@@ -614,7 +614,6 @@ class MLAAttention(nn.Module):
         positions: torch.Tensor = None,
         q_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         context = forward_context.context
@@ -632,7 +631,134 @@ class MLAAttention(nn.Module):
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
-        if context.is_prefill and not use_prefill_mla:
+        if context.is_mixed:
+            # Split Dispatch: prefill → MHA path, decode → MLA path
+            n_prefill = context.num_prefill_tokens
+            saved_attn_metadata = attn_metadata
+            prefill_meta = saved_attn_metadata.prefill_attn_metadata
+            decode_meta = saved_attn_metadata.decode_attn_metadata
+
+            # ---- Prefill path (MHA): q_proj → rotary → cache_write → flash_attn → o_proj ----
+            q_p = q[:n_prefill]
+            k_nope_p = k_nope[:n_prefill]
+            k_rope_p = k_rope[:n_prefill]
+            positions_p = positions[:n_prefill]
+
+            use_prefix_cache = (
+                prefill_meta.has_cached
+                and not is_rocm_aiter_fp4bmm_enabled()
+                and self.qk_nope_head_dim == self.v_head_dim
+            )
+
+            prefill_q = self.q_proj(q_p, x_scale=q_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
+            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+            self.rotary_emb(positions_p, prefill_q_pe, k_rope_p)
+
+            if kv_cache.numel() > 0:
+                concat_and_cache_mla(
+                    k_nope_p,
+                    k_rope_p.squeeze(1),
+                    kv_cache,
+                    prefill_meta.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
+
+            if use_prefix_cache:
+                k_full = torch.empty(
+                    (
+                        prefill_meta.total_kv,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    ),
+                    device=q.device,
+                    dtype=self.dtype,
+                )
+                v_full = torch.empty(
+                    (
+                        prefill_meta.total_kv,
+                        self.num_heads,
+                        self.qk_nope_head_dim,
+                    ),
+                    device=q.device,
+                    dtype=self.dtype,
+                )
+                gather_kv_b_proj(
+                    kv_cache,
+                    self._k_scale,
+                    prefill_meta.kv_indptr,
+                    prefill_meta.kv_indices,
+                    prefill_meta.cu_seqlens_k,
+                    self.kv_b_proj.weight,
+                    self.kv_b_proj.weight_scale,
+                    k_full,
+                    v_full,
+                    weight_preshuffle=True,
+                )
+                output_p = flash_attn_varlen_func(
+                    q=prefill_q,
+                    k=k_full,
+                    v=v_full,
+                    cu_seqlens_q=prefill_meta.cu_seqlens_q,
+                    cu_seqlens_k=prefill_meta.cu_seqlens_k,
+                    max_seqlen_q=prefill_meta.max_seqlen_q,
+                    max_seqlen_k=prefill_meta.max_seqlen_k,
+                    min_seqlen_q=prefill_meta.min_seqlen_q,
+                    dropout_p=prefill_meta.dropout_p,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+                output_p = self.o_proj(output_p.flatten(start_dim=-2))
+            else:
+                output_p = self._forward_prefill_mha(
+                    prefill_q, k_nope_p, k_rope_p, kv_cache, prefill_meta
+                )
+
+            # ---- Decode path (MLA): q_proj_and_k_up → fused_qk_rope_cache → decode ----
+            q_d = q[n_prefill:]
+            k_nope_d = k_nope[n_prefill:]
+            k_rope_d = k_rope[n_prefill:]
+            positions_d = positions[n_prefill:]
+
+            q_nope_d, q_rope_d = self._q_proj_and_k_up_proj(q_d, x_scale=q_scale)
+            q_out_d = torch.empty(
+                (
+                    q_nope_d.shape[0],
+                    self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=decode_meta.dtype_q,
+                device=q_nope_d.device,
+            )
+            if kv_cache.numel() > 0:
+                fused_qk_rope_concat_and_cache_mla(
+                    q_nope_d,
+                    q_rope_d,
+                    k_nope_d,
+                    k_rope_d,
+                    kv_cache.view(
+                        kv_cache.shape[0],
+                        -1,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    q_out_d,
+                    decode_meta.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
+                    positions_d,
+                    self.rotary_emb.cos_cache,
+                    self.rotary_emb.sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    is_nope_first=True,
+                )
+
+            output_d = self._forward_decode(q_out_d, kv_cache, decode_meta)
+
+            output = torch.cat([output_p, output_d], dim=0)
+
+        elif context.is_prefill and not use_prefill_mla:
             use_prefix_cache = (
                 attn_metadata.has_cached
                 and not is_rocm_aiter_fp4bmm_enabled()
@@ -656,8 +782,6 @@ class MLAAttention(nn.Module):
                 )
 
             if use_prefix_cache:
-                # k_full/v_full are used for attention compute; gather_kv_b_proj reads
-                # fp8 from cache and dequantizes internally, so output must be model dtype
                 k_full = torch.empty(
                     (
                         attn_metadata.total_kv,
@@ -738,7 +862,6 @@ class MLAAttention(nn.Module):
                     is_neox=self.rotary_emb.is_neox_style,
                     is_nope_first=True,
                 )
-                # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:
                 output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
