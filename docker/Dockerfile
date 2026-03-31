@@ -34,7 +34,12 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
 RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========" && \
     "${VENV_PYTHON}" -m pip show atom || true && \
     "${VENV_PYTHON}" -m pip show amd-aiter || true && \
-    "${VENV_PYTHON}" -m pip show mori || true
+    "${VENV_PYTHON}" -m pip show mori || true && \
+    echo "========== [OOT 2/7] Back up base image triton ==========" && \
+    mkdir -p /tmp/triton-base-backup && \
+    cp -a /opt/venv/lib/python3.12/site-packages/triton /tmp/triton-base-backup/ && \
+    cp -a /opt/venv/lib/python3.12/site-packages/triton-*.dist-info /tmp/triton-base-backup/ && \
+    "${VENV_PYTHON}" -c "import triton; print(f'Base image triton backed up: {triton.__version__}')"
 
 RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
     rm -rf /app/vllm && \
@@ -81,6 +86,17 @@ RUN echo "FIXME: rocm/pytorch:latest currently resolves incompatible torchvision
       "torchvision==${ROCM_TORCHVISION_VERSION}" \
       "torchaudio==${ROCM_TORCHAUDIO_VERSION}" && \
     "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
+
+RUN echo "========== [OOT] Restore base image triton ==========" && \
+    "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
+    rm -rf /opt/venv/lib/python3.12/site-packages/triton \
+           /opt/venv/lib/python3.12/site-packages/triton-*.dist-info && \
+    cp -a /tmp/triton-base-backup/triton /opt/venv/lib/python3.12/site-packages/ && \
+    for f in /tmp/triton-base-backup/triton-*.dist-info; do \
+      cp -a "$f" /opt/venv/lib/python3.12/site-packages/; \
+    done && \
+    rm -rf /tmp/triton-base-backup && \
+    "${VENV_PYTHON}" -c "import triton; print(f'Restored base image triton: {triton.__version__}')"
 
 CMD ["/bin/bash"]
 
