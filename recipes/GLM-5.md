@@ -3,9 +3,9 @@
 [GLM-5](https://huggingface.co/zai-org/GLM-5-FP8) is an advanced Mixture-of-Experts (MoE) large language model developed by Zhipu AI (THUDM). Its architecture is structurally similar to DeepSeek v3.2, featuring Multi-head Latent Attention (MLA). This guide covers deploying the FP8 version of GLM-5 on AMD GPUs with ATOM.
 
 ## Preparing environment
-Pull the latest docker from https://hub.docker.com/r/rocm/atom/ :
+Pull the latest docker from https://hub.docker.com/r/rocm/atom-dev/ :
 ```bash
-docker pull rocm/atom:latest
+docker pull rocm/atom-dev:latest
 ```
 All the operations in the next will be executed inside the container.
 

@@ -310,7 +310,8 @@
 /* ================================================================
    1. CONSTANTS & COLOR PALETTE
    ================================================================ */
-// HSL-based palette: each model gets a distinct hue, bar alpha varies by concurrency
+// HSL-based palette: each model gets a distinct base hue; backend offsets keep
+// ATOM and ATOM-vLLM visually related but not identical.
 const MODEL_HUES = {
   'DeepSeek-R1-0528':      210,   // blue
   'DeepSeek-R1-0528-mtp3': 175,   // cyan/teal — distinct from base DeepSeek
@@ -321,16 +322,26 @@ const MODEL_HUES = {
   'Meta-Llama-3-8B-Instruct': 270, // purple
   'Qwen3-235B-A22B-Instruct-2507-FP8': 50, // gold
 };
+const BACKEND_HUE_OFFSETS = {
+  'ATOM': 0,
+  'ATOM-vLLM': 28,
+};
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
 function getModelHue(backend, model) {
-  const backendModelKey = backend ? `${backend}::${model}` : model;
+  const normalizedBackend = backend === 'OOT' ? 'ATOM-vLLM' : backend;
+  const backendModelKey = normalizedBackend ? `${normalizedBackend}::${model}` : model;
   if (MODEL_HUES[backendModelKey] != null) return MODEL_HUES[backendModelKey];
-  if (MODEL_HUES[model] != null) return MODEL_HUES[model];
-  const h = FALLBACK_HUES[fallbackHueIdx % FALLBACK_HUES.length];
-  MODEL_HUES[backendModelKey] = h;
-  fallbackHueIdx++;
-  return h;
+  let baseHue = MODEL_HUES[model];
+  if (baseHue == null) {
+    baseHue = FALLBACK_HUES[fallbackHueIdx % FALLBACK_HUES.length];
+    MODEL_HUES[model] = baseHue;
+    fallbackHueIdx++;
+  }
+  const offset = BACKEND_HUE_OFFSETS[normalizedBackend] ?? 0;
+  const derivedHue = normalizedBackend ? (baseHue + offset) % 360 : baseHue;
+  if (normalizedBackend) MODEL_HUES[backendModelKey] = derivedHue;
+  return derivedHue;
 }
 function getModelColor(backend, model) {
   const h = getModelHue(backend, model);
@@ -2168,7 +2179,7 @@ function renderAccuracyTab() {
     <div class="table-watermark">
       <table class="perf-table">
         <thead><tr>
-          <th>Mode</th><th>Model</th>
+          <th>Backend</th><th>Model</th>
           <th class="num">flexible-extract</th><th class="num">strict-match</th>
           <th class="num">Baseline</th><th class="num">Recovery</th>
           <th class="num">Threshold</th><th class="num">Margin</th><th>Status</th>

@@ -15,10 +15,11 @@ set -euo pipefail
 #   accuracy - run gsm8k accuracy test and save result JSON
 #
 # MODE:
-#   ci    - DeepSeek-R1 FP8, gpt-oss-120b, Kimi-K2 TP4, Qwen3.5-35B-A3B-FP8
-#   full  - all OOT-supported models
+#   ci    - workflow-provided OOT CI model entry
+#   full  - workflow-provided OOT full-validation model entry
 #
-# Optional model_name can be used to run a single model in full mode.
+# Optional model_name can be used to run a single model when a caller passes
+# multiple explicit entries.
 
 TYPE=${1:-launch}
 MODE=${2:-ci}
@@ -49,17 +50,6 @@ EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
 LAST_VLLM_LOG_LINE=0
 
-# Model format: MODEL_NAME|MODEL_PATH|EXTRA_ARGS
-# CI mode requires OOT_MODEL_NAME, OOT_MODEL_PATH (and optionally OOT_EXTRA_ARGS)
-# to be set via the workflow matrix. Full mode uses the built-in list below.
-FULL_MODE_MODELS=(
-  "Qwen3 MoE|Qwen/Qwen3-235B-A22B-Instruct-2507-FP8|--tensor-parallel-size 8 --enable-expert-parallel"
-  "DeepSeek-R1 FP8|deepseek-ai/DeepSeek-R1-0528|--tensor-parallel-size 8"
-  "DeepSeek-R1 MXFP4|amd/DeepSeek-R1-0528-MXFP4|--tensor-parallel-size 8"
-  "GPT-OSS|openai/gpt-oss-120b|--tensor-parallel-size 1"
-  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--tensor-parallel-size 4"
-)
-
 declare -a ACTIVE_MODELS=()
 if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
   if [[ -z "${EXPLICIT_MODEL_NAME}" || -z "${EXPLICIT_MODEL_PATH}" ]]; then
@@ -67,11 +57,9 @@ if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLIC
     exit 2
   fi
   ACTIVE_MODELS=("${EXPLICIT_MODEL_NAME}|${EXPLICIT_MODEL_PATH}|${EXPLICIT_EXTRA_ARGS}")
-elif [[ "$MODE" == "ci" ]]; then
-  echo "CI mode requires OOT_MODEL_NAME and OOT_MODEL_PATH env vars from the workflow matrix."
-  exit 2
 else
-  ACTIVE_MODELS=("${FULL_MODE_MODELS[@]}")
+  echo "${MODE} mode requires OOT_MODEL_NAME and OOT_MODEL_PATH env vars from the workflow."
+  exit 2
 fi
 
 resolve_model_path() {
@@ -174,7 +162,7 @@ launch_one_model() {
   if [[ -n "${OOT_ENV_VARS:-}" ]]; then
     while IFS= read -r _env_line; do
       [[ -n "${_env_line}" ]] && export "${_env_line}" && echo "Exported: ${_env_line}"
-    done <<< "$(echo -e "${OOT_ENV_VARS}")"
+    done <<< "$(printf '%b' "${OOT_ENV_VARS}")"
   fi
   rm -rf /root/.cache
 

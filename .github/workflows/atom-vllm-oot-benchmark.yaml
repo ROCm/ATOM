@@ -31,8 +31,12 @@ on:
         description: "Qwen3.5-397B-A17B-FP8 TP8"
         type: boolean
         default: false
-      qwen3-next-80b-a3b-instruct-fp8:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP8"
+      qwen3-next-80b-a3b-instruct-fp8-tp1:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1"
+        type: boolean
+        default: false
+      qwen3-next-80b-a3b-instruct-fp8-tp4:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
         type: boolean
         default: false
       oot_image:
@@ -213,7 +217,8 @@ jobs:
           ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
           ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
           ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8 }}
+          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}
+          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}
         run: |
           MODELS_JSON="$(jq -c '
             map(select(
@@ -223,7 +228,8 @@ jobs:
               or (.prefix == "kimi-k2-thinking-mxfp4-tp4" and env.ENABLE_KIMI_K2_TP4 == "true")
               or (.prefix == "kimi-k2-thinking-mxfp4-tp8" and env.ENABLE_KIMI_K2_TP8 == "true")
               or (.prefix == "qwen3-5-397b-a17b-fp8" and env.ENABLE_QWEN3_5_397B_A17B_FP8 == "true")
-              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8 == "true")
+              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp1" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1 == "true")
+              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp4" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4 == "true")
             ))
           ' .github/benchmark/oot_benchmark_models.json)"
           echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
@@ -440,7 +446,8 @@ jobs:
             kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-next-80b-a3b-instruct-fp8-tp1) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-next-80b-a3b-instruct-fp8-tp4) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
