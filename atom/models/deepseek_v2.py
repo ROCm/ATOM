@@ -683,6 +683,36 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
+def _fused_qk_rmsnorm_fake(
+    q_c: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_c: torch.Tensor,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q_c), torch.empty_like(kv_c)
+
+
+@torch_compile_guard(gen_fake=_fused_qk_rmsnorm_fake)
+def _fused_qk_rmsnorm(
+    q_c: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_c: torch.Tensor,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return fused_qk_rmsnorm(
+        q_c,
+        q_a_layernorm_weight,
+        q_a_layernorm_variance_epsilon,
+        kv_c,
+        kv_a_layernorm_weight,
+        kv_a_layernorm_variance_epsilon,
+    )
+
+
 class DeepseekV2MLP(nn.Module):
 
     def __init__(
@@ -1519,7 +1549,7 @@ class DeepseekV2MLAAttention(nn.Module):
                         transpose_scale=True,
                     )
                 elif self.fuse_qknorm:
-                    hidden_states_or_q_c, kv_c_normed = fused_qk_rmsnorm(
+                    hidden_states_or_q_c, kv_c_normed = _fused_qk_rmsnorm(
                         q_c,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.eps,

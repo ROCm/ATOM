@@ -1154,10 +1154,17 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         max_num_pages_per_req = self.vllm_config.model_config.max_model_len
         max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
-        self.num_attention_heads = (
-            config.model_config.hf_config.num_attention_heads
-            // get_tp_group().world_size
-        )
+
+        hf_config = config.model_config.hf_config
+        text_config = getattr(hf_config, "text_config", None)
+        num_attention_heads = getattr(
+            hf_config, "num_attention_heads", None
+        ) or getattr(text_config, "num_attention_heads", None)
+        assert (
+            num_attention_heads is not None
+        ), "num_attention_heads is not found in config"
+
+        self.num_attention_heads = num_attention_heads // get_tp_group().world_size
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
