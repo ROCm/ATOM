@@ -220,12 +220,12 @@ class MLPBlock(torch.nn.Module):
 
         x = self.experts(hidden_states=x, router_logits=g)
 
+        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+            x = tensor_model_parallel_all_reduce(x)
+
         # Remove padding from output
         if self.moe_hidden_pad > 0:
             x = x[:, : self.hidden_size]
-
-        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
-            x = tensor_model_parallel_all_reduce(x.contiguous())
 
         if self.is_sequence_parallel:
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
@@ -286,7 +286,7 @@ class TransformerBlock(torch.nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        
+
         hidden_states = self.self_attn(hidden_states, positions)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
