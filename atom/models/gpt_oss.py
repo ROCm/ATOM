@@ -222,10 +222,10 @@ class MLPBlock(torch.nn.Module):
 
         # Remove padding from output
         if self.moe_hidden_pad > 0:
-            x = x[:, : self.hidden_size].contiguous()
+            x = x[:, : self.hidden_size]
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
-            x = tensor_model_parallel_all_reduce(x)
+            x = tensor_model_parallel_all_reduce(x.contiguous())
 
         if self.is_sequence_parallel:
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
