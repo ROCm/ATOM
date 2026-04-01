@@ -279,7 +279,7 @@ def fused_split_chunk_kernel_qwen_next_qkvz_ba(
 
         core_out_base = token_id * num_v_heads * head_v_dim + v_head_id * head_v_dim
         v_dim_offset = tl.arange(0, head_v_dim)
-        val = tl.zeros([head_v_dim], dtype=tl.bfloat16)
+        val = tl.zeros([head_v_dim], dtype=core_attn_out_ptr.type.element_ty)
         tl.store(core_attn_out_ptr + core_out_base + v_dim_offset, val)
 
 
@@ -355,7 +355,7 @@ def fused_split_chunk_kernel_qwen_next_qkvzba(
             + head_id * head_v_dim
         )
         v_dim_offset = tl.arange(0, head_v_dim)
-        val = tl.zeros([head_v_dim], dtype=tl.bfloat16)
+        val = tl.zeros([head_v_dim], dtype=core_attn_out_ptr.type.element_ty)
         tl.store(core_attn_out_base_ptr + v_dim_offset, val)
         return
     num_heads_for_qkvzba: tl.constexpr = num_k_heads + 1
