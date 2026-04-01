@@ -69,7 +69,7 @@
     "source_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
     "path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
     "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp1",
-    "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu.predownload",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
@@ -80,7 +80,7 @@
     "source_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
     "path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
     "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp4",
-    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu.predownload",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"

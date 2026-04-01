@@ -397,6 +397,7 @@ if is_vllm():
             "v_proj": ("qkv_proj", "v"),
             "gate_proj": ("gate_up_proj", 0),
             "up_proj": ("gate_up_proj", 1),
+            "gate_up_proj": ["gate_proj", "up_proj"],  # BF16 models: fused → split
             "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
             "in_proj_z": ("in_proj_qkvz", 3),
             "in_proj_b": ("in_proj_ba", 0),
@@ -472,6 +473,7 @@ if is_vllm():
             "v_proj": ("qkv_proj", "v"),
             "gate_proj": ("gate_up_proj", 0),
             "up_proj": ("gate_up_proj", 1),
+            "gate_up_proj": ["gate_proj", "up_proj"],  # BF16 models: fused → split
             "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
             "in_proj_z": ("in_proj_qkvz", 3),
             "in_proj_b": ("in_proj_ba", 0),
@@ -676,7 +678,6 @@ if is_vllm():
 
         hf_to_atom_mapper = WeightsMapper(
             orig_to_new_prefix={
-                # "model.visual.": "visual.",
                 "lm_head.": "language_model.lm_head.",
                 "model.language_model.": "language_model.model.",
             }

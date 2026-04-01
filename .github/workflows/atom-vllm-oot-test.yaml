@@ -204,14 +204,14 @@ jobs:
             accuracy_test_threshold: 0.90
             runner: linux-atom-mi35x-4
           - model_name: "Qwen3.5-35B-A3B-FP8"
-            model_path: "Qwen/Qwen3.5-35B-A3B"
+            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
             extra_args: "--tensor-parallel-size 2"
             # FIXME: Remove these temporary Qwen3.5 workarounds after the
             # aiter fix landed
             env_vars: |
               ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
-            accuracy_test_threshold: 0.83
+            accuracy_test_threshold: 0.76
             runner: linux-atom-mi35x-4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
