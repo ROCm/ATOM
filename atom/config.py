@@ -402,7 +402,10 @@ class QuantizationConfig:
         return False
 
     def remap_layer_name(
-        self, hf_config: PretrainedConfig, packed_modules_mapping: dict | None = None
+        self,
+        hf_config: PretrainedConfig,
+        packed_modules_mapping: dict | None = None,
+        quant_exclude_name_mapping: dict[str, str] | None = None,
     ):
         model_type = hf_config.model_type
         self.packed_modules_mapping = (
@@ -453,6 +456,17 @@ class QuantizationConfig:
         for name in self.exclude_layers:
             new_exclude.extend(_remap_layer_name(name))
         self.exclude_layers = list(dict.fromkeys(new_exclude))
+
+        # Apply model-declared HF-name to ATOM-path translations for exclude entries.
+        # Models that have a mismatch between their HF quant config names and ATOM
+        # module paths declare `quant_exclude_name_mapping` as a class attribute.
+        if quant_exclude_name_mapping:
+            new_excludes = []
+            for name in self.exclude_layers:
+                for old, new in quant_exclude_name_mapping.items():
+                    name = name.replace(old, new)
+                new_excludes.append(name)
+            self.exclude_layers = list(dict.fromkeys(new_excludes))
 
 
 _CONFIG_REGISTRY: dict[str, str] = {

@@ -142,6 +142,7 @@ class EagleProposer:
                 if i < self.mtp_k - 1:
                     do_attn_metadata_update = not context.is_prefill
                     if i == 0:
+                        i0_max_seqlen_q = attn_metadata.max_seqlen_q
                         attn_metadata.max_seqlen_q = 1
                         kv_indptr = var["kv_indptr"].gpu[: bs + 1]
                         kv_indices = var["kv_indices"].gpu
@@ -164,7 +165,11 @@ class EagleProposer:
                     attn_metadata.max_seqlen_k += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
-                        attn_metadata.max_seqlen_q,
+                        (
+                            attn_metadata.max_seqlen_q
+                            if not do_attn_metadata_update
+                            else i0_max_seqlen_q
+                        ),
                         attn_metadata.max_seqlen_k,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,

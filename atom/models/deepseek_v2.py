@@ -1172,7 +1172,7 @@ class Indexer(nn.Module):
         self.weights_proj = ReplicatedLinear(
             hidden_size,
             self.n_head,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
@@ -1991,4 +1991,11 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     """GLM 5.0 MoE (structurally similar to DeepSeek v3.2). Reuses DeepseekV2 implementation."""
 
-    pass
+    # GLM-5's HF quant config uses `indexers_proj` in modules_to_not_convert, but
+    # the ATOM module path is `indexer.weights_proj`.  Declaring the mapping here
+    # keeps the translation co-located with the model and out of config.py.
+    quant_exclude_name_mapping: dict[str, str] = {
+        # HF quant config uses "indexers_proj" but the ATOM module path is
+        # "indexer.weights_proj".  str.replace translates each exclude entry.
+        "indexers_proj": "indexer.weights_proj",
+    }
