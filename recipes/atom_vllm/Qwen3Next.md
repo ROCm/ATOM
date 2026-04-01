@@ -12,11 +12,11 @@ docker pull rocm/atom-dev:vllm-latest
 
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
-### Qwen3-Next-80B-A3B-Instruct-FP8 (TP=2)
+### Qwen3-Next-80B-A3B-Instruct-FP8 (TP=1, MI355X)
 
 ```bash
 export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
-export export ATOM_USE_CUSTOM_ALL_GATHER=0
+export ATOM_USE_CUSTOM_ALL_GATHER=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
