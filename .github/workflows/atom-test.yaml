@@ -159,9 +159,6 @@ jobs:
       CONTAINER_NAME: atom_test_${{ strategy.job-index }}
 
     steps:
-      - name: Set HF_TOKEN
-        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
-
       - name: Kill all Docker containers and clean up workspace
         if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
@@ -332,7 +329,7 @@ jobs:
         run: |
           if [ -d "/models" ]; then
             echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
+            if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi

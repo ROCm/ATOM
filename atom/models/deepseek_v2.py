@@ -683,6 +683,36 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
+def _fused_qk_rmsnorm_fake(
+    q_c: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_c: torch.Tensor,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q_c), torch.empty_like(kv_c)
+
+
+@torch_compile_guard(gen_fake=_fused_qk_rmsnorm_fake)
+def _fused_qk_rmsnorm(
+    q_c: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_c: torch.Tensor,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return fused_qk_rmsnorm(
+        q_c,
+        q_a_layernorm_weight,
+        q_a_layernorm_variance_epsilon,
+        kv_c,
+        kv_a_layernorm_weight,
+        kv_a_layernorm_variance_epsilon,
+    )
+
+
 class DeepseekV2MLP(nn.Module):
 
     def __init__(
@@ -1142,7 +1172,7 @@ class Indexer(nn.Module):
         self.weights_proj = ReplicatedLinear(
             hidden_size,
             self.n_head,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
@@ -1519,7 +1549,7 @@ class DeepseekV2MLAAttention(nn.Module):
                         transpose_scale=True,
                     )
                 elif self.fuse_qknorm:
-                    hidden_states_or_q_c, kv_c_normed = fused_qk_rmsnorm(
+                    hidden_states_or_q_c, kv_c_normed = _fused_qk_rmsnorm(
                         q_c,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.eps,
@@ -1961,4 +1991,11 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     """GLM 5.0 MoE (structurally similar to DeepSeek v3.2). Reuses DeepseekV2 implementation."""
 
-    pass
+    # GLM-5's HF quant config uses `indexers_proj` in modules_to_not_convert, but
+    # the ATOM module path is `indexer.weights_proj`.  Declaring the mapping here
+    # keeps the translation co-located with the model and out of config.py.
+    quant_exclude_name_mapping: dict[str, str] = {
+        # HF quant config uses "indexers_proj" but the ATOM module path is
+        # "indexer.weights_proj".  str.replace translates each exclude entry.
+        "indexers_proj": "indexer.weights_proj",
+    }

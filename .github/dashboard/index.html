@@ -41,7 +41,7 @@
     .header-spacer { margin-bottom: var(--gap-lg); }
     .fixed-thead { position: fixed; z-index: 40; background: var(--bg-secondary); display: none; overflow: hidden; }
     .header-left { display: flex; align-items: center; gap: 12px; }
-    .header-logo { height: 28px; opacity: 0.9; }
+    .header-logo { height: 36px; opacity: 0.9; display: block; }
     h1 { font-size: 20px; color: var(--text-primary); font-weight: 600; }
     h1 .h1-sep { color: var(--text-tertiary); font-weight: 300; margin: 0 2px; }
     h1 .h1-sub { color: var(--text-secondary); font-weight: 400; }
@@ -134,6 +134,10 @@
     .perf-table td { padding: 7px 10px; border-bottom: 1px solid var(--border-light); }
     .perf-table td.num { text-align: right; font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; }
     .perf-table td.model-name { font-weight: 500; white-space: nowrap; }
+    .perf-table th.sortable { cursor: pointer; user-select: none; }
+    .perf-table th.sortable:hover { color: var(--text-secondary); }
+    .perf-table th.sortable .sort-icon { font-size: 9px; opacity: 0.3; margin-left: 2px; }
+    .perf-table th.sortable.sort-asc .sort-icon, .perf-table th.sortable.sort-desc .sort-icon { opacity: 1; color: var(--ui-bright); }
     .perf-table tbody tr[data-key] { cursor: pointer; transition: background 0.1s; }
     #tab-performance .perf-table tbody tr[data-key] td:first-child::before,
     #tab-data .perf-table tbody tr[data-key] td:first-child::before { content: '▸ '; color: var(--text-tertiary); font-size: 10px; }
@@ -257,7 +261,7 @@
 <body>
 <header>
   <div class="header-left">
-    <img class="header-logo" src="atom_logo.png" alt="ATOM" onerror="this.style.display='none'">
+    <a href="https://github.com/rocm/atom" target="_blank" rel="noopener noreferrer"><img class="header-logo" src="atom_logo.png" alt="ATOM" onerror="this.style.display='none'"></a>
     <div>
       <h1>Benchmark Dashboard</h1>
       <div class="meta"><span id="last-update"></span> · <a id="repo-link" target="_blank" rel="noopener noreferrer"></a></div>
@@ -306,7 +310,8 @@
 /* ================================================================
    1. CONSTANTS & COLOR PALETTE
    ================================================================ */
-// HSL-based palette: each model gets a distinct hue, bar alpha varies by concurrency
+// HSL-based palette: each model gets a distinct base hue; backend offsets keep
+// ATOM and ATOM-vLLM visually related but not identical.
 const MODEL_HUES = {
   'DeepSeek-R1-0528':      210,   // blue
   'DeepSeek-R1-0528-mtp3': 175,   // cyan/teal — distinct from base DeepSeek
@@ -317,16 +322,26 @@ const MODEL_HUES = {
   'Meta-Llama-3-8B-Instruct': 270, // purple
   'Qwen3-235B-A22B-Instruct-2507-FP8': 50, // gold
 };
+const BACKEND_HUE_OFFSETS = {
+  'ATOM': 0,
+  'ATOM-vLLM': 28,
+};
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
 function getModelHue(backend, model) {
-  const backendModelKey = backend ? `${backend}::${model}` : model;
+  const normalizedBackend = backend === 'OOT' ? 'ATOM-vLLM' : backend;
+  const backendModelKey = normalizedBackend ? `${normalizedBackend}::${model}` : model;
   if (MODEL_HUES[backendModelKey] != null) return MODEL_HUES[backendModelKey];
-  if (MODEL_HUES[model] != null) return MODEL_HUES[model];
-  const h = FALLBACK_HUES[fallbackHueIdx % FALLBACK_HUES.length];
-  MODEL_HUES[backendModelKey] = h;
-  fallbackHueIdx++;
-  return h;
+  let baseHue = MODEL_HUES[model];
+  if (baseHue == null) {
+    baseHue = FALLBACK_HUES[fallbackHueIdx % FALLBACK_HUES.length];
+    MODEL_HUES[model] = baseHue;
+    fallbackHueIdx++;
+  }
+  const offset = BACKEND_HUE_OFFSETS[normalizedBackend] ?? 0;
+  const derivedHue = normalizedBackend ? (baseHue + offset) % 360 : baseHue;
+  if (normalizedBackend) MODEL_HUES[backendModelKey] = derivedHue;
+  return derivedHue;
 }
 function getModelColor(backend, model) {
   const h = getModelHue(backend, model);
@@ -454,7 +469,7 @@ function parseRunConfigs(run) {
       const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/);
       if (rm) configs[key].runUrl = rm[1];
       const gm = b.extra.match(/GPU:\s*([^|]+)/);
-      if (gm) configs[key]._gpu_name = gm[1].trim();
+      if (gm) configs[key]._gpu_name = gm[1].trim().replace(/\bAMD\b/gi, '').replace(/\bInstinct\b/gi, '').replace(/\s+/g, ' ').trim();
       const vm = b.extra.match(/VRAM:\s*(\d+)GB/);
       if (vm) configs[key]._gpu_vram_gb = +vm[1];
       const rcm = b.extra.match(/ROCm:\s*([\d.]+)/);
@@ -586,6 +601,7 @@ const state = {
   perfMetric: 'Total Tput',
   trendModelKey: allTrendModelKeys[0] || '',
   dataView: 'table',
+  dataSort: { column: 'date', direction: 'desc' },
 };
 
 function filteredConfigs() {
@@ -1139,7 +1155,7 @@ function renderPerformanceTab() {
   // --- Table ---
   html += `<div class="table-watermark"><table class="perf-table"><thead><tr>
     <th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th><th>GPU</th>
-    <th class="num">Total Tput (tok/s)</th><th class="num">Output Tput (tok/s)</th>
+    <th class="num">Total tok/s</th><th class="num">Output tok/s</th>
     <th class="num">Interac.</th>
     <th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th>
     <th class="num">Trend</th><th>Commit</th><th>Run</th>
@@ -1167,7 +1183,7 @@ function renderPerformanceTab() {
     const dataAge = Date.now() - cfg.date;
     const staleClass = dataAge > 3 * 86400000 ? ' stale-data' : '';
     html += `<tr class="${regClass}${staleClass}" data-key="${key}">
-      <td>${escHTML(cfg.backend)}</td>
+      <td style="white-space:nowrap">${escHTML(cfg.backend)}</td>
       <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
@@ -1178,7 +1194,7 @@ function renderPerformanceTab() {
       <td class="num">${cfg.TPOT != null && cfg.TPOT > 0 ? fmtNum(1000 / cfg.TPOT, 1) : '—'}</td>
       <td class="num" style="background:${heatBg(tpotRatio)}">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
       <td class="num" style="background:${heatBg(ttftRatio)}">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
-      <td class="num">${trendHTML(cfg.throughput, prev ? prev.throughput : null, false)} <button class="trend-jump" data-trend-key="${cfg.backend}|${cfg.model}" title="View trends">trend →</button></td>
+      <td class="num" style="white-space:nowrap">${trendHTML(cfg.throughput, prev ? prev.throughput : null, false)} <button class="trend-jump" data-trend-key="${cfg.backend}|${cfg.model}" title="View trends">trend →</button></td>
       <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
       <td>${safeHref(cfg.runUrl) ? `<a href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">view</a>` : '—'}</td>
     </tr>`;
@@ -1841,7 +1857,7 @@ function renderDataTab() {
   const csvBtn = document.getElementById('copy-csv-btn');
   if (csvBtn) {
     csvBtn.addEventListener('click', () => {
-      const header = 'Date,Commit,Mode,Model,ISL/OSL,Concurrency,TP,Throughput (tok/s),TPOT (ms),TTFT (ms),Run URL';
+      const header = 'Date,Commit,Mode,Model,ISL/OSL,Concurrency,TP,Total Throughput (tok/s),TPOT (ms),TTFT (ms),Run URL';
       const rows = [];
       for (const run of allRuns) {
         const configs = parseRunConfigs(run);
@@ -1851,7 +1867,7 @@ function renderDataTab() {
           if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
           if (!state.filters.conc.includes(cfg.conc)) continue;
           rows.push([fmtDate(cfg.date), cfg.commit.id?.slice(0,7), cfg.backend, cfg.model, cfg.islOsl, cfg.conc,
-            cfg._gpu_count ?? '', cfg.throughput ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
+            cfg._gpu_count ?? '', cfg['Total Tput'] ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
         }
       }
       navigator.clipboard.writeText(header + '\n' + rows.join('\n'));
@@ -1860,8 +1876,16 @@ function renderDataTab() {
     });
   }
 
-  // Row expansion for table — detail rows stop propagation
+  // Column sorting for table headers
   if (state.dataView === 'table') {
+    container.querySelectorAll('th.sortable').forEach(th => {
+      th.addEventListener('click', () => {
+        const col = th.dataset.sort;
+        if (state.dataSort.column === col) { state.dataSort.direction = state.dataSort.direction === 'asc' ? 'desc' : 'asc'; }
+        else { state.dataSort.column = col; state.dataSort.direction = col === 'date' ? 'desc' : 'asc'; }
+        renderDataTab();
+      });
+    });
     container.querySelectorAll('tr.detail-row').forEach(dr => {
       dr.addEventListener('click', (e) => e.stopPropagation());
     });
@@ -1890,12 +1914,7 @@ function renderDataTab() {
 }
 
 function renderDataTable() {
-  let html = `<div class="table-watermark"><table class="perf-table"><thead><tr>
-    <th>Date</th><th>Commit</th><th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th><th>GPU</th>
-    <th class="num">Throughput (tok/s)</th><th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th><th>Run</th>
-  </tr></thead><tbody>`;
-
-  // All runs, all configs, filtered
+  const rows = [];
   for (const run of allRuns) {
     const configs = parseRunConfigs(run);
     for (const [key, cfg] of Object.entries(configs)) {
@@ -1903,23 +1922,60 @@ function renderDataTable() {
       if (!state.filters.models.includes(cfg.model)) continue;
       if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
       if (!state.filters.conc.includes(cfg.conc)) continue;
-      const commitId = cfg.commit.id ? cfg.commit.id.slice(0, 7) : '';
-      html += `<tr data-key="data-${key}-${run.date}">
-        <td>${fmtDate(cfg.date)}</td>
-        <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
-        <td>${escHTML(cfg.backend)}</td>
-        <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td>
-        <td>${fmtIslOsl(cfg.islOsl)}</td>
-        <td class="num">${cfg.conc}</td>
-        <td class="num">${cfg._gpu_count || '—'}</td>
-        <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
-        <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
-        <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
-        <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
-        <td>${safeHref(cfg.runUrl) ? `<a href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">view</a>` : '—'}</td>
-      </tr>`;
-      html += `<tr class="detail-row" data-detail="data-${key}-${run.date}"><td colspan="12">${buildDetailHTML(key, cfg)}</td></tr>`;
+      rows.push({ key, cfg, runDate: run.date });
     }
+  }
+  const { column, direction } = state.dataSort;
+  const dir = direction === 'asc' ? 1 : -1;
+  rows.sort((a, b) => {
+    switch (column) {
+      case 'date': return dir * (a.cfg.date - b.cfg.date);
+      case 'commit': return dir * (a.cfg.commit.id || '').localeCompare(b.cfg.commit.id || '');
+      case 'mode': return dir * (a.cfg.backend || '').localeCompare(b.cfg.backend || '');
+      case 'model': return dir * a.cfg.model.localeCompare(b.cfg.model);
+      case 'islOsl': return dir * a.cfg.islOsl.localeCompare(b.cfg.islOsl);
+      case 'conc': return dir * (a.cfg.conc - b.cfg.conc);
+      case 'tp': return dir * ((a.cfg._gpu_count || 0) - (b.cfg._gpu_count || 0));
+      case 'gpu': return dir * (a.cfg._gpu_name || '').localeCompare(b.cfg._gpu_name || '');
+      case 'totalTput': return dir * ((a.cfg['Total Tput'] || 0) - (b.cfg['Total Tput'] || 0));
+      case 'tpot': return dir * ((a.cfg.TPOT || 0) - (b.cfg.TPOT || 0));
+      case 'ttft': return dir * ((a.cfg.TTFT || 0) - (b.cfg.TTFT || 0));
+      default: return dir * (a.cfg.date - b.cfg.date);
+    }
+  });
+  const sCls = (col) => 'sortable' + (state.dataSort.column === col ? ' sort-' + state.dataSort.direction : '');
+  const sIco = (col) => '<span class="sort-icon">' + (state.dataSort.column === col ? (state.dataSort.direction === 'asc' ? '▲' : '▼') : '⇕') + '</span>';
+  let html = `<div class="table-watermark"><table class="perf-table"><thead><tr>
+    <th class="${sCls('date')}" data-sort="date">Date ${sIco('date')}</th>
+    <th class="${sCls('commit')}" data-sort="commit">Commit ${sIco('commit')}</th>
+    <th class="${sCls('mode')}" data-sort="mode">Mode ${sIco('mode')}</th>
+    <th class="${sCls('model')}" data-sort="model">Model ${sIco('model')}</th>
+    <th class="${sCls('islOsl')}" data-sort="islOsl">ISL/OSL ${sIco('islOsl')}</th>
+    <th class="num ${sCls('conc')}" data-sort="conc">Conc ${sIco('conc')}</th>
+    <th class="num ${sCls('tp')}" data-sort="tp">TP ${sIco('tp')}</th>
+    <th class="${sCls('gpu')}" data-sort="gpu">GPU ${sIco('gpu')}</th>
+    <th class="num ${sCls('totalTput')}" data-sort="totalTput">Total Throughput (tok/s) ${sIco('totalTput')}</th>
+    <th class="num ${sCls('tpot')}" data-sort="tpot">TPOT (ms) ${sIco('tpot')}</th>
+    <th class="num ${sCls('ttft')}" data-sort="ttft">TTFT (ms) ${sIco('ttft')}</th>
+    <th>Run</th>
+  </tr></thead><tbody>`;
+  for (const { key, cfg, runDate } of rows) {
+    const commitId = cfg.commit.id ? cfg.commit.id.slice(0, 7) : '';
+    html += `<tr data-key="data-${key}-${runDate}">
+      <td>${fmtDate(cfg.date)}</td>
+      <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
+      <td style="white-space:nowrap">${escHTML(cfg.backend)}</td>
+      <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td>
+      <td>${fmtIslOsl(cfg.islOsl)}</td>
+      <td class="num">${cfg.conc}</td>
+      <td class="num">${cfg._gpu_count || '—'}</td>
+      <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
+      <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
+      <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
+      <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
+      <td>${safeHref(cfg.runUrl) ? `<a href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">view</a>` : '—'}</td>
+    </tr>`;
+    html += `<tr class="detail-row" data-detail="data-${key}-${runDate}"><td colspan="12">${buildDetailHTML(key, cfg)}</td></tr>`;
   }
   html += '</tbody></table></div>';
   return html;
@@ -1958,12 +2014,12 @@ function renderTimeline() {
       <div class="tl-details">
         <table class="perf-table" style="margin-top:8px"><thead><tr>
           <th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th><th>GPU</th>
-          <th class="num">Throughput (tok/s)</th><th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th>
+          <th class="num">Total Throughput (tok/s)</th><th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th>
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td>${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
-        <td class="num">${cfg.throughput != null ? fmtNum(cfg.throughput, 1) : '—'}</td>
+        <td style="white-space:nowrap">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
+        <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
       </tr>`;
@@ -2123,7 +2179,7 @@ function renderAccuracyTab() {
     <div class="table-watermark">
       <table class="perf-table">
         <thead><tr>
-          <th>Mode</th><th>Model</th>
+          <th>Backend</th><th>Model</th>
           <th class="num">flexible-extract</th><th class="num">strict-match</th>
           <th class="num">Baseline</th><th class="num">Recovery</th>
           <th class="num">Threshold</th><th class="num">Margin</th><th>Status</th>
@@ -2148,7 +2204,7 @@ function renderAccuracyTab() {
 
     html += `
       <tr class="${regClass}" data-acc-key="${escHTML(key)}">
-        <td>${escHTML(backend)}</td>
+        <td style="white-space:nowrap">${escHTML(backend)}</td>
         <td style="font-weight:600;color:var(--text-primary)">${escHTML(model)}</td>
         <td class="num" style="font-weight:700;color:var(--text-primary)">${fmtNum(acc.score, 4)}</td>
         <td class="num">${acc.strictMatch != null ? fmtNum(acc.strictMatch, 4) : '—'}</td>

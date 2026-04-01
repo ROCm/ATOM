@@ -79,12 +79,6 @@ class OAIAttention(nn.Module):
         rope_params = config.rope_parameters
         rope_theta = rope_params["rope_theta"]
 
-        if rope_params is None:
-            raise ValueError(
-                "GPT-OSS config is missing RoPE scaling parameters. Expected either "
-                "`rope_scaling` (transformers < 5) or `rope_parameters` (transformers 5+)."
-            )
-
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
