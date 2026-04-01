@@ -16,16 +16,18 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 
 ```bash
 export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export export ATOM_USE_CUSTOM_ALL_GATHER=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
     --port 8000 \
-    --tensor-parallel-size 2 \
+    --tensor-parallel-size 1 \
     --kv-cache-dtype fp8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --max-model-len 16384 \
+    --max-num-batched-tokens 32768 \
     --no-enable-prefix-caching
 ```
 
