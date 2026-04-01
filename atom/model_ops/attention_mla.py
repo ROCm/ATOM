@@ -640,6 +640,7 @@ class MLAAttention(nn.Module):
             use_prefix_cache = (
                 attn_metadata.has_cached
                 and not is_rocm_aiter_fp4bmm_enabled()
+                and self.kv_b_proj.weight.dtype != dtypes.fp4x2
                 and self.qk_nope_head_dim == self.v_head_dim
             )
 

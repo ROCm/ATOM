@@ -169,6 +169,7 @@ class PagedAttentionImpl(nn.Module):
             q, k, v = qkv.split(
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
+            self._cache_format = "SHUFFLE"
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
@@ -193,6 +194,7 @@ class PagedAttentionImpl(nn.Module):
                 k_out=k,
                 output_zeros=False,
             )
+            self._cache_format = "NHD"
         else:
             # for asm paged attention
             asm_layout = True
@@ -228,6 +230,7 @@ class PagedAttentionImpl(nn.Module):
                     v_scale=None,
                     asm_layout=asm_layout,
                 )
+            self._cache_format = "SHUFFLE" if asm_layout else "NHD"
 
         # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
         if attn_metadata.has_cached:
@@ -276,19 +279,20 @@ class PagedAttentionImpl(nn.Module):
         )
 
         # Convert cache for cp_mha_gather_cache
-        # fused_qk_norm_rope_cache_quant_shuffle: K [n, nh, hd//x, bs, x], V [n, nh, bs//x, hd, x] (SHUFFLE)
-        # fused_qk_rope_reshape_and_cache: K [n, nh, hd//x, bs, x], V [n, nh, hd, bs] -> NHD
+        # The cache format depends on which rope_cache branch wrote the data:
+        # - SHUFFLE: fused_qk_norm_rope_cache_quant_shuffle or reshape_and_cache(asm_layout=True)
+        #   K [n, nh, hd//x, bs, x], V viewed as [n, nh, bs//x, hd, x]
+        # - NHD: fused_qk_rope_reshape_and_cache or reshape_and_cache(asm_layout=False)
+        #   K [n, nh, hd//x, bs, x] -> permute to [n, bs, nh, hd], V [n, nh, hd, bs] -> [n, bs, nh, hd]
+        use_shuffle = getattr(self, "_cache_format", "SHUFFLE") == "SHUFFLE"
         if k_cache.dim() == 5:
             x = 16 // k_cache.element_size()
             n, nh, _, block_size, _ = k_cache.shape
-            if v_cache.dim() == 4:
-                # fused_qk_norm_rope_cache_quant_shuffle: V data in [n, nh, bs//x, hd, x] layout
-                use_shuffle = True
+            if use_shuffle:
                 k_cache_gather = k_cache
                 v_cache_gather = v_cache.view(n, nh, block_size // x, head_dim, x)
             else:
-                # fused_qk_rope_reshape_and_cache: V [n, nh, hd, bs] -> NHD
-                use_shuffle = False
+                # V is in ASM/NHD format [n, nh, hd, bs], convert to [n, bs, nh, hd]
                 k_cache_gather = (
                     k_cache.permute(0, 3, 1, 2, 4)
                     .contiguous()
@@ -301,7 +305,14 @@ class PagedAttentionImpl(nn.Module):
             v_cache_gather = v_cache
             block_size = k_cache.shape[1]
 
-        block_tables = attn_metadata.block_tables
+        # Use original (unconverted) block_tables for gather: the kernel indexes
+        # at model_runner block_size (PAGE_SIZE from k_cache shape), not the
+        # attention backend's sub-block size.
+        block_tables = (
+            attn_metadata.orig_block_tables
+            if attn_metadata.orig_block_tables is not None
+            else attn_metadata.block_tables
+        )
         cp_mha_gather_cache(
             key_cache=k_cache_gather,
             value_cache=v_cache_gather,
@@ -316,6 +327,7 @@ class PagedAttentionImpl(nn.Module):
             dequant=self.kv_cache_dtype.startswith("fp8"),
             kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
             total_tokens=total_tokens,
+            per_token_quant=self.per_token_quant,
         )
 
         return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale

@@ -142,6 +142,7 @@ class Context:
     batch_size: int = 0
     graph_bs: int = 0
     is_draft: bool = False
+    is_partial_prefill: bool = False
 
     def __init__(
         self,
@@ -151,6 +152,7 @@ class Context:
         batch_size: int = 0,
         graph_bs: int = 0,
         is_draft: bool = False,
+        is_partial_prefill: bool = False,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -158,6 +160,7 @@ class Context:
         self.batch_size = batch_size
         self.graph_bs = graph_bs
         self.is_draft = is_draft
+        self.is_partial_prefill = is_partial_prefill
 
 
 @dataclass
@@ -195,6 +198,9 @@ class AttentionMetaData:
     total_kv: Optional[int] = None
     num_cached_tokens: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
+    # original block_tables before sub-block conversion (for gather kernels
+    # that index at model_runner block_size, not attention backend block_size)
+    orig_block_tables: Optional[torch.Tensor] = None
 
     # only used for plugin mode to store the metadata for attn
     plugin_metadata: Optional["MetadataForPluginMode"] = None
@@ -257,6 +263,7 @@ class AttentionMetaData:
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
         if block_tables_converted is not None:
+            self.orig_block_tables = block_tables
             self.block_tables = block_tables_converted
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs

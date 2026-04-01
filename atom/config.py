@@ -765,6 +765,7 @@ class Config:
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     enable_prefix_caching: bool = False
+    enable_chunked_prefill: bool = True
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
