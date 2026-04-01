@@ -165,7 +165,7 @@ class BlockManager:
             block_id = self._pop_free_block()
             self._allocate_block(block_id)
             seq.block_table.append(block_id)
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        seq.num_kv_computed = num_cached_blocks * self.block_size
 
         # Per-request cache: claim one slot index from the pre-allocated
         # state tensor (e.g. GDN mamba_k_cache, V4 compressor state + SWA
@@ -183,16 +183,16 @@ class BlockManager:
         Called from scheduler.postprocess() after the forward completes, so a
         block's hash is only published once its KV is actually computed. The
         `[start, end)` range covers blocks fully filled by this step:
-          start = first block whose first token was at num_cached_tokens
+          start = first block whose first token was at num_kv_computed
           end   = first block not yet fully filled (excludes the partial one)
         Caller passes `num_new_tokens` = tokens forwarded in this step. For
-        single-shot prefill that's `seq.num_tokens - seq.num_cached_tokens`;
+        single-shot prefill that's `seq.num_tokens - seq.num_kv_computed`;
         chunked prefill will pass the per-chunk count.
         """
         if not self.enable_prefix_caching:
             return
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + num_new_tokens) // self.block_size
+        start = seq.num_kv_computed // self.block_size
+        end = (seq.num_kv_computed + num_new_tokens) // self.block_size
         if start >= end:
             return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
@@ -209,7 +209,7 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
+        seq.num_kv_computed = 0
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             self.free_per_req_cache_groups.append(seq.per_req_cache_group)

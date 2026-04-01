@@ -461,12 +461,16 @@ class tokenIDProcessor:
             else:
                 # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
                 if num_new_tokens > 0:
-                    new_token_ids = scheduled_tokens[new_curr_indices].reshape(
+                    # Convert seq-level indices to token-level indices
+                    new_token_indices = (
+                        new_curr_indices[:, None] * tokens_per_seq
+                        + np.arange(tokens_per_seq)
+                    ).flatten()
+                    new_token_ids = scheduled_tokens[new_token_indices].reshape(
                         num_new_seqs, tokens_per_seq
                     )
                     if self.use_spec:
                         # MTP mode: combine scheduled_tokens and draft_tokens
-                        # For new_decode_front=False, use new_curr_indices to get the right sequences
                         draft_tokens = batch.scheduled_spec_decode_tokens[
                             new_curr_indices
                         ]
@@ -1682,6 +1686,7 @@ class ModelRunner:
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
         graph_bs = num_input_tokens if is_prefill else bs
+        is_partial_prefill = getattr(batch, "is_partial_prefill", False)
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -1689,6 +1694,7 @@ class ModelRunner:
             batch_size=context_bs,
             graph_bs=graph_bs,
             dp_uniform_decode=dp_uniform_decode,
+            is_partial_prefill=is_partial_prefill,
         )
 
         actual_num_tokens = batch.total_tokens_num
@@ -1859,7 +1865,11 @@ class ModelRunner:
                 else:
                     hidden_states = model_output
                     self._aux_hidden_states = None
-                logits = self.model.compute_logits(hidden_states)
+                if context.is_partial_prefill:
+                    # B scheme: skip compute_logits for intermediate chunks
+                    logits = None
+                else:
+                    logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
             label = f"decode[bs={bs}"
@@ -1903,6 +1913,18 @@ class ModelRunner:
         hidden_states: torch.Tensor,
         needs_independent_noise: bool = False,
     ) -> ScheduledBatchOutput:
+        # B scheme: intermediate chunks skip sampling entirely
+        if get_forward_context().context.is_partial_prefill:
+            self.forward_done_event.record()
+            return ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                draft_token_ids=None,
+                is_deferred_out=self.tokenID_processor.is_deferred_out,
+                num_rejected=np.zeros(0, dtype=np.int32),
+                num_bonus=np.zeros(0, dtype=np.int32),
+            )
+
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:

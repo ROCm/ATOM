@@ -70,7 +70,7 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
-        self.num_cached_tokens = 0
+        self.num_kv_computed = 0
         self.block_table = []
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
@@ -157,10 +157,6 @@ class Sequence:
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens : self.num_tokens]
-
-    @property
-    def num_cached_blocks(self):
-        return self.num_cached_tokens // self.block_size
 
     # @property
     # def num_blocks(self):

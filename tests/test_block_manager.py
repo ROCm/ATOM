@@ -68,7 +68,7 @@ class TestAllocateDeallocate:
         block_manager.allocate(seq)
         block_manager.deallocate(seq)
         assert seq.block_table == []
-        assert seq.num_cached_tokens == 0
+        assert seq.num_kv_computed == 0
 
     def test_deallocate_restores_capacity(self, block_manager, seq_factory):
         s1 = seq_factory([1, 2, 3, 4])
@@ -94,13 +94,13 @@ class TestPrefixCaching:
     def test_prefix_cache_hit(self, block_manager_prefix, seq_factory):
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         block_manager_prefix.allocate(s1)
-        block_manager_prefix.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        block_manager_prefix.hash_blocks(s1, s1.num_tokens - s1.num_kv_computed)
         block_manager_prefix.deallocate(s1)
 
         s2 = seq_factory([1, 2, 3, 4, 9, 10, 11, 12])
         n = block_manager_prefix.can_allocate(s2)
         block_manager_prefix.allocate(s2, n)
-        assert s2.num_cached_tokens == 4
+        assert s2.num_kv_computed == 4
 
     def test_prefix_cache_miss_different_tokens(
         self, block_manager_prefix, seq_factory
@@ -111,7 +111,7 @@ class TestPrefixCaching:
 
         s2 = seq_factory([9, 10, 11, 12, 13, 14, 15, 16])
         block_manager_prefix.allocate(s2)
-        assert s2.num_cached_tokens == 0
+        assert s2.num_kv_computed == 0
 
     def test_shared_prefix_doesnt_double_free(self, block_manager_prefix, seq_factory):
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
@@ -191,7 +191,7 @@ class TestCanAllocateWithPrefixCaching:
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
-        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_kv_computed)
         bm.deallocate(s1)  # blocks freed, hashes retained
 
         # Use up 2 of the 4 free blocks with non-overlapping tokens
@@ -202,7 +202,7 @@ class TestCanAllocateWithPrefixCaching:
         n = bm.can_allocate(s2)
         assert n == 1
         bm.allocate(s2, n)
-        assert s2.num_cached_tokens == 4
+        assert s2.num_kv_computed == 4
 
     def test_can_allocate_no_false_positive(self, seq_factory):
         """can_allocate should return False when even with cache hits
@@ -231,14 +231,14 @@ class TestHashTableCleanup:
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
-        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_kv_computed)
         h1 = bm.blocks[s1.block_table[0]].hash
         bm.deallocate(s1)
 
         # Allocate with completely different tokens — should overwrite blocks
         s2 = seq_factory([90, 91, 92, 93, 94, 95, 96, 97])
         bm.allocate(s2)
-        bm.hash_blocks(s2, s2.num_tokens - s2.num_cached_tokens)
+        bm.hash_blocks(s2, s2.num_tokens - s2.num_kv_computed)
         # Old hash should no longer point to a valid block
         assert bm.hash_to_block_id.get(h1) != s2.block_table[0]
 
@@ -306,10 +306,10 @@ class TestPrefixCachingPreemption:
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
-        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_kv_computed)
         # Simulate preemption
         bm.deallocate(s1)
-        assert s1.num_cached_tokens == 0
+        assert s1.num_kv_computed == 0
         assert s1.block_table == []
 
         # Re-allocate — first block is a cache hit; the last full block is
@@ -317,7 +317,7 @@ class TestPrefixCachingPreemption:
         s1_retry = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         n = bm.can_allocate(s1_retry)
         bm.allocate(s1_retry, n)
-        assert s1_retry.num_cached_tokens == 4
+        assert s1_retry.num_kv_computed == 4
 
 
 # ── Edge cases ───────────────────────────────────────────────────────────
@@ -336,7 +336,7 @@ class TestPrefixCachingEdgeCases:
         s2 = seq_factory([42])
         bm.allocate(s2)
         # Partial block → hash is -1 → no caching
-        assert s2.num_cached_tokens == 0
+        assert s2.num_kv_computed == 0
 
     def test_exact_block_size_last_block_recomputed(self, seq_factory):
         """Single-block prompt: last full block is force-recomputed on reuse so
@@ -350,7 +350,7 @@ class TestPrefixCachingEdgeCases:
         bm.deallocate(s1)
         s2 = seq_factory([1, 2, 3, 4])
         bm.allocate(s2)
-        assert s2.num_cached_tokens == 0
+        assert s2.num_kv_computed == 0
 
     def test_free_block_ids_set_consistent(self, block_manager, seq_factory):
         """free_block_ids_set stays consistent through allocate/deallocate."""

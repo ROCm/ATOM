@@ -83,11 +83,20 @@ class TestSchedule:
         assert batch.total_seqs_num_prefill == 2
 
     def test_prefill_respects_max_batched_tokens(self, seq_factory):
-        sched = Scheduler(MockConfig(max_num_batched_tokens=6, num_kvcache_blocks=100))
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                enable_chunked_prefill=True,
+            )
+        )
         sched.add(seq_factory([1, 2, 3, 4]))  # 4 tokens
-        sched.add(seq_factory([5, 6, 7, 8]))  # 4 more → 8 > 6
+        sched.add(seq_factory([5, 6, 7, 8]))  # 4 tokens total, but only 2 fit in budget
         batch, _ = sched.schedule()
-        assert batch.total_seqs_num_prefill == 1
+        # Chunked prefill: seq2 gets a 2-token chunk (budget 6-4=2)
+        assert batch.total_seqs_num_prefill == 2
+        assert batch.total_tokens_num_prefill == 6
+        assert list(batch.num_scheduled_tokens) == [4, 2]
 
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
@@ -100,6 +109,7 @@ class TestSchedule:
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
         scheduler.schedule()  # prefill
+        seq.num_kv_computed = seq.num_prompt_tokens  # simulate forward pass
         seq.append_token(5)
         batch, _ = scheduler.schedule()  # decode
         assert batch.total_seqs_num_decode == 1
@@ -111,6 +121,8 @@ class TestSchedule:
         sched.add(s1)
         sched.add(s2)
         sched.schedule()  # prefill both
+        s1.num_kv_computed = s1.num_prompt_tokens  # simulate forward pass
+        s2.num_kv_computed = s2.num_prompt_tokens
         s1.append_token(9)
         s2.append_token(10)
         sched.schedule()  # one preempted
@@ -170,7 +182,7 @@ class TestPrefixCaching:
         # Without the fix: all 10 tokens would be scheduled (the bug)
         assert batch2.total_tokens_num_prefill == 2
         assert batch2.num_scheduled_tokens == [2]
-        assert seq2.num_cached_tokens == 8
+        assert seq2.num_kv_computed == 8
 
     def test_prefix_cache_scheduled_tokens_content(self, seq_factory):
         """Verify that scheduled_tokens only contains the non-cached suffix."""
@@ -233,7 +245,7 @@ class TestPrefixCaching:
 
         # No prefix caching → all 10 tokens are scheduled
         assert batch2.total_tokens_num_prefill == 10
-        assert seq2.num_cached_tokens == 0
+        assert seq2.num_kv_computed == 0
 
 
 # ── preempt ────────────────────────────────────────────────────────────────
@@ -352,8 +364,10 @@ class TestGetNextBatchInfo:
         assert num_reqs == 1
 
     def test_running(self, scheduler, seq_factory):
-        scheduler.add(seq_factory([1, 2, 3, 4]))
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
         scheduler.schedule()
+        seq.num_kv_computed = seq.num_prompt_tokens  # simulate forward pass
         is_prefill, n, num_reqs = scheduler.get_next_batch_info()
         assert is_prefill is False
         assert n == 1
