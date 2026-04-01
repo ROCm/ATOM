@@ -41,7 +41,7 @@
     .header-spacer { margin-bottom: var(--gap-lg); }
     .fixed-thead { position: fixed; z-index: 40; background: var(--bg-secondary); display: none; overflow: hidden; }
     .header-left { display: flex; align-items: center; gap: 12px; }
-    .header-logo { height: 28px; opacity: 0.9; }
+    .header-logo { height: 36px; opacity: 0.9; display: block; }
     h1 { font-size: 20px; color: var(--text-primary); font-weight: 600; }
     h1 .h1-sep { color: var(--text-tertiary); font-weight: 300; margin: 0 2px; }
     h1 .h1-sub { color: var(--text-secondary); font-weight: 400; }
@@ -261,7 +261,7 @@
 <body>
 <header>
   <div class="header-left">
-    <img class="header-logo" src="atom_logo.png" alt="ATOM" onerror="this.style.display='none'">
+    <a href="https://github.com/rocm/atom" target="_blank" rel="noopener noreferrer"><img class="header-logo" src="atom_logo.png" alt="ATOM" onerror="this.style.display='none'"></a>
     <div>
       <h1>Benchmark Dashboard</h1>
       <div class="meta"><span id="last-update"></span> · <a id="repo-link" target="_blank" rel="noopener noreferrer"></a></div>
@@ -469,7 +469,7 @@ function parseRunConfigs(run) {
       const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/);
       if (rm) configs[key].runUrl = rm[1];
       const gm = b.extra.match(/GPU:\s*([^|]+)/);
-      if (gm) configs[key]._gpu_name = gm[1].trim();
+      if (gm) configs[key]._gpu_name = gm[1].trim().replace(/\bAMD\b/gi, '').replace(/\bInstinct\b/gi, '').replace(/\s+/g, ' ').trim();
       const vm = b.extra.match(/VRAM:\s*(\d+)GB/);
       if (vm) configs[key]._gpu_vram_gb = +vm[1];
       const rcm = b.extra.match(/ROCm:\s*([\d.]+)/);
@@ -1155,7 +1155,7 @@ function renderPerformanceTab() {
   // --- Table ---
   html += `<div class="table-watermark"><table class="perf-table"><thead><tr>
     <th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th><th>GPU</th>
-    <th class="num">Total Tput (tok/s)</th><th class="num">Output Tput (tok/s)</th>
+    <th class="num">Total tok/s</th><th class="num">Output tok/s</th>
     <th class="num">Interac.</th>
     <th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th>
     <th class="num">Trend</th><th>Commit</th><th>Run</th>
@@ -1183,7 +1183,7 @@ function renderPerformanceTab() {
     const dataAge = Date.now() - cfg.date;
     const staleClass = dataAge > 3 * 86400000 ? ' stale-data' : '';
     html += `<tr class="${regClass}${staleClass}" data-key="${key}">
-      <td>${escHTML(cfg.backend)}</td>
+      <td style="white-space:nowrap">${escHTML(cfg.backend)}</td>
       <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
@@ -1194,7 +1194,7 @@ function renderPerformanceTab() {
       <td class="num">${cfg.TPOT != null && cfg.TPOT > 0 ? fmtNum(1000 / cfg.TPOT, 1) : '—'}</td>
       <td class="num" style="background:${heatBg(tpotRatio)}">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
       <td class="num" style="background:${heatBg(ttftRatio)}">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
-      <td class="num">${trendHTML(cfg.throughput, prev ? prev.throughput : null, false)} <button class="trend-jump" data-trend-key="${cfg.backend}|${cfg.model}" title="View trends">trend →</button></td>
+      <td class="num" style="white-space:nowrap">${trendHTML(cfg.throughput, prev ? prev.throughput : null, false)} <button class="trend-jump" data-trend-key="${cfg.backend}|${cfg.model}" title="View trends">trend →</button></td>
       <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
       <td>${safeHref(cfg.runUrl) ? `<a href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">view</a>` : '—'}</td>
     </tr>`;
@@ -1964,7 +1964,7 @@ function renderDataTable() {
     html += `<tr data-key="data-${key}-${runDate}">
       <td>${fmtDate(cfg.date)}</td>
       <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
-      <td>${escHTML(cfg.backend)}</td>
+      <td style="white-space:nowrap">${escHTML(cfg.backend)}</td>
       <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
@@ -2018,7 +2018,7 @@ function renderTimeline() {
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td>${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
+        <td style="white-space:nowrap">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
         <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
@@ -2204,7 +2204,7 @@ function renderAccuracyTab() {
 
     html += `
       <tr class="${regClass}" data-acc-key="${escHTML(key)}">
-        <td>${escHTML(backend)}</td>
+        <td style="white-space:nowrap">${escHTML(backend)}</td>
         <td style="font-weight:600;color:var(--text-primary)">${escHTML(model)}</td>
         <td class="num" style="font-weight:700;color:var(--text-primary)">${fmtNum(acc.score, 4)}</td>
         <td class="num">${acc.strictMatch != null ? fmtNum(acc.strictMatch, 4) : '—'}</td>
