@@ -72,6 +72,7 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
     seed: Optional[int] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
     def get_messages(self) -> List[ChatMessage]:
         """Get messages from either 'messages' or 'prompt' field."""
@@ -129,6 +130,7 @@ class CompletionResponse(BaseModel):
 engine = None
 tokenizer: Optional[AutoTokenizer] = None
 model_name: str = ""
+default_chat_template_kwargs: Dict[str, Any] = {}
 _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
@@ -666,10 +668,16 @@ async def chat_completions(request: ChatCompletionRequest):
     try:
         # Get messages and format prompt
         messages = request.get_messages()
+
+        merged_kwargs = dict(default_chat_template_kwargs)
+        if request.chat_template_kwargs:
+            merged_kwargs.update(request.chat_template_kwargs)
+        merged_kwargs["tokenize"] = False
+        merged_kwargs["add_generation_prompt"] = True
+
         prompt = tokenizer.apply_chat_template(
             [{"role": msg.role, "content": msg.content} for msg in messages],
-            tokenize=False,
-            add_generation_prompt=True,
+            **merged_kwargs,
         )
 
         # Create sampling parameters
@@ -902,7 +910,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine, tokenizer, model_name
+    global engine, tokenizer, model_name, default_chat_template_kwargs
 
     parser = argparse.ArgumentParser(description="Atom OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -913,7 +921,21 @@ def main():
         default=DEFAULT_PORT,
         help="Server port (note: --port is used for internal engine communication)",
     )
+    parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=str,
+        default=None,
+        help=(
+            "Default kwargs for chat template rendering (JSON string). "
+            "Merged with per-request chat_template_kwargs (request wins). "
+            "Example: '{\"enable_thinking\": false}'"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.default_chat_template_kwargs:
+        default_chat_template_kwargs = json.loads(args.default_chat_template_kwargs)
+        logger.info(f"Default chat template kwargs: {default_chat_template_kwargs}")
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
