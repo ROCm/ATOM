@@ -336,12 +336,33 @@ jobs:
           if [ -d "/models" ]; then
             model_dir="/models/${{ matrix.model_path }}"
             completion_flag="$model_dir/.download-complete"
-            lock_file="$model_dir/.download.lock"
+            lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
+            lock_file="/models/.download-lock-${lock_suffix}"
+            runner_name="${{ matrix.runner }}"
+            use_model_lock="true"
 
-            mkdir -p "$model_dir"
+            if [ "$runner_name" = "atom-mi355-8gpu.predownload" ]; then
+              use_model_lock="false"
+            fi
 
-            if [ -f "$completion_flag" ]; then
+            download_model() {
+              if docker exec "$CONTAINER_NAME" bash -lc "[ -f \"$model_dir/config.json\" ]"; then
+                echo "Model directory exists without a completion marker under ${model_dir}; validating download"
+              else
+                echo "Model not found under ${model_dir}; downloading model"
+              fi
+
+              if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "set -euo pipefail; rm -f \"$completion_flag\"; hf download ${{ matrix.model_path }} --local-dir \"$model_dir\"; touch \"$completion_flag\""; then
+                echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+                exit 1
+              fi
+            }
+
+            if docker exec "$CONTAINER_NAME" bash -lc "[ -f \"$completion_flag\" ]"; then
               echo "Model already exists under ${model_dir}; skip download"
+            elif [ "$use_model_lock" != "true" ]; then
+              echo "Baremetal runner ${runner_name} detected; skipping shared model download lock"
+              download_model
             else
               exec 9>"$lock_file"
               echo "Waiting for model download lock: $lock_file"
@@ -350,21 +371,10 @@ jobs:
                 exit 1
               fi
 
-              if [ -f "$completion_flag" ]; then
+              if docker exec "$CONTAINER_NAME" bash -lc "[ -f \"$completion_flag\" ]"; then
                 echo "Model became available under ${model_dir} while waiting for the lock; skip download"
               else
-                if [ -f "$model_dir/config.json" ]; then
-                  echo "Model directory exists without a completion marker under ${model_dir}; validating download"
-                else
-                  echo "Model not found under ${model_dir}; downloading model"
-                fi
-
-                rm -f "$completion_flag"
-                if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "set -euo pipefail; hf download ${{ matrix.model_path }} --local-dir \"$model_dir\""; then
-                  echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
-                  exit 1
-                fi
-                touch "$completion_flag"
+                download_model
               fi
             fi
           else
