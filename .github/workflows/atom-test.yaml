@@ -253,7 +253,12 @@ jobs:
           echo "Model-specific environment variables:"
           cat /tmp/env_file.txt
 
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          PULL_FLAG=""
+          if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            PULL_FLAG="--pull always"
+          fi
+
+          docker run -dt $PULL_FLAG --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           $MODEL_MOUNT \
           -w /workspace \
