@@ -78,6 +78,8 @@ class PagedAttentionImpl(nn.Module):
         self.q_norm = q_norm
         self.k_norm = k_norm
 
+        self._decode_workspace: dict[tuple, dict[str, torch.Tensor]] = {}
+
         # for plugin mode(vllm), the query quant is disabled for now
         if is_vllm():
             self.supports_quant_query_input = False
@@ -320,6 +322,35 @@ class PagedAttentionImpl(nn.Module):
 
         return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
 
+    def _get_decode_workspace(
+        self,
+        q: torch.Tensor,
+        intermediate_shape: tuple,
+        head_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (o, exp_sums, max_logits, temporary_output), reusing cached buffers
+        when the shape matches a previous decode call on this layer."""
+        cache_key = (intermediate_shape, head_size, q.dtype)
+        ws = self._decode_workspace.get(cache_key)
+        if ws is not None:
+            return ws["o"], ws["exp_sums"], ws["max_logits"], ws["tmp_out"]
+
+        o = torch.empty_like(q)
+        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+        max_logits = torch.empty(
+            intermediate_shape, dtype=torch.float32, device=q.device
+        )
+        temporary_output = torch.empty(
+            *intermediate_shape, head_size, dtype=q.dtype, device=q.device
+        )
+        self._decode_workspace[cache_key] = {
+            "o": o,
+            "exp_sums": exp_sums,
+            "max_logits": max_logits,
+            "tmp_out": temporary_output,
+        }
+        return o, exp_sums, max_logits, temporary_output
+
     @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -327,11 +358,9 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        o = torch.empty_like(q)
         num_seqs = attn_metadata.context_lens.shape[0]
         _, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        # assume all query have same length
         query_group_size = attn_metadata.max_seqlen_q * (
             num_q_heads_total // num_kv_heads
         )
@@ -344,23 +373,28 @@ class PagedAttentionImpl(nn.Module):
             max_context_partition_num = 1
             context_partition_size = 128
 
-        # Output buffers (same as Triton)
         intermediate_shape = (
             num_seqs,
             num_kv_heads,
             max_context_partition_num,
             query_group_size,
         )
-        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-        max_logits = torch.empty(
-            intermediate_shape, dtype=torch.float32, device=q.device
-        )
-        temporary_output = torch.empty(
-            *intermediate_shape,
-            head_size,
-            dtype=q.dtype,
-            device=q.device,
-        )
+
+        if not fwd_ctx.context.is_prefill:
+            o, exp_sums, max_logits, temporary_output = self._get_decode_workspace(
+                q, intermediate_shape, head_size
+            )
+        else:
+            o = torch.empty_like(q)
+            exp_sums = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            max_logits = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            temporary_output = torch.empty(
+                *intermediate_shape, head_size, dtype=q.dtype, device=q.device
+            )
 
         if k_scale is not None and k_scale.numel() > 1:
             k_scale = k_scale.unsqueeze(-1)

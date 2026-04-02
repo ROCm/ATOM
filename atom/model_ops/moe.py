@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -54,6 +55,8 @@ from atom.utils.decorators import mark_trace
 from torch import nn
 from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
+
+logger = logging.getLogger("atom")
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -177,6 +180,25 @@ def naive_multicast(
     return buffer
 
 
+_ep_comm_buffer_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _get_or_alloc_buffer(
+    key: tuple, shape: tuple, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Return a cached zero-filled buffer or allocate a new one."""
+    from atom.utils import envs
+
+    if envs.ATOM_EP_PREALLOCATE_COMM_BUFFERS and key in _ep_comm_buffer_cache:
+        buf = _ep_comm_buffer_cache[key]
+        if buf.shape == shape and buf.dtype == dtype:
+            return buf
+    buf = torch.zeros(shape, dtype=dtype, device=device)
+    if envs.ATOM_EP_PREALLOCATE_COMM_BUFFERS:
+        _ep_comm_buffer_cache[key] = buf
+    return buf
+
+
 def all_gather_with_padding(x: torch.Tensor):
     max_batch_size = get_forward_context().context.graph_bs
     dim = 0
@@ -184,12 +206,15 @@ def all_gather_with_padding(x: torch.Tensor):
     padded_x = x
     if original_batch_size < max_batch_size:
         padding_size = max_batch_size - original_batch_size
-
         padding_shape = list(x.shape)
         padding_shape[dim] = padding_size
 
-        padding = torch.empty(padding_shape, dtype=x.dtype, device=x.device)
-        padding.zero_()
+        padding = _get_or_alloc_buffer(
+            ("ag_pad", x.shape[1], x.dtype),
+            tuple(padding_shape),
+            x.dtype,
+            x.device,
+        )
         padded_x = torch.cat([x, padding], dim=dim)
 
     gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=dim)
@@ -202,7 +227,6 @@ def reduce_scatter_with_unpadding(
     dim = 0
     dp_group = get_dp_group()
 
-    # scattered_output = dp_group.reduce_scatter(x, dim=dim)
     scattered_output = dp_group.reduce_scatter_tensor(x)
 
     if scattered_output.shape[dim] > original_batch_size:
@@ -286,8 +310,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
 
-            # Check if quant_dtype is an FP8 type
             from aiter import QuantType
+            from atom.utils import envs
 
             fp8_dtypes = (
                 torch.float8_e4m3fn,
@@ -296,9 +320,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 torch.float8_e5m2fnuz,
             )
             is_fp8 = quant_config.quant_dtype in fp8_dtypes
-            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
-            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
-            use_fp8_dispatch = is_fp8
+            ep_fp8_dispatch_enabled = envs.ATOM_EP_FP8_DISPATCH
+
+            use_fp8_dispatch = is_fp8 and ep_fp8_dispatch_enabled
             quant_type = None
             if use_fp8_dispatch:
                 if quant_config.is_block_quantized:
@@ -306,27 +330,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 elif quant_config.is_per_act_token:
                     quant_type = QuantType.per_Token
 
-            # For FP8: use FP8 dtype for communication
-            # For FP4/no quant: use bfloat16
-            # mori_dtype = (
-            #     quant_config.quant_dtype
-            #     if is_fp8 and quant_type is not None
-            #     else torch.bfloat16
-            # )
-            # mori_dtype = torch.bfloat16
+            mori_dtype = (
+                quant_config.quant_dtype
+                if use_fp8_dispatch and quant_type is not None
+                else moe.in_dtype
+            )
 
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
                 num_ep_ranks=all2all_manager.world_size,
-                # quant_dtype=mori_dtype,
-                # We now use bfloat16 for mori
-                # TODO: To support quant
-                quant_dtype=moe.in_dtype,
+                quant_dtype=mori_dtype,
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
                 max_num_tokens_per_dp_rank=16384,
-                # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
@@ -334,9 +351,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             )
             handle = all2all_manager.get_handle(all_to_all_args)
 
-            # We not use quant for mori now
-            use_fp8_dispatch = False
-            quant_type = None
+            if use_fp8_dispatch:
+                logger.info(
+                    "EP FP8 dispatch enabled: comm dtype=%s, quant_type=%s "
+                    "(halving all2all volume)",
+                    mori_dtype,
+                    quant_type,
+                )
 
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,

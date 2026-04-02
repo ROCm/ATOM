@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 from typing import Any
 
 import torch
@@ -8,8 +9,11 @@ import torch
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.utils.forward_context import get_forward_context
+from atom.utils import envs
 from aiter import dtypes
 from aiter import QuantType
+
+logger = logging.getLogger("atom")
 
 # Lazy import mori
 try:
@@ -47,6 +51,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.use_fp8_dispatch = use_fp8_dispatch
         self.quant_type = quant_type
         self.quant_dtype = quant_dtype
+
+        self._decode_block_num = envs.ATOM_MORI_DECODE_BLOCK_NUM
+        self._decode_warp_per_block = envs.ATOM_MORI_DECODE_WARP_PER_BLOCK
+        self._prefill_block_num = envs.ATOM_MORI_PREFILL_BLOCK_NUM
+        self._prefill_warp_per_block = envs.ATOM_MORI_PREFILL_WARP_PER_BLOCK
+        logger.info(
+            "MORI launch config: prefill(block=%d, warp=%d) "
+            "decode(block=%d, warp=%d)",
+            self._prefill_block_num,
+            self._prefill_warp_per_block,
+            self._decode_block_num,
+            self._decode_warp_per_block,
+        )
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -99,11 +116,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
         context = get_forward_context().context
         if context.is_prefill:
-            block_num = 128
-            warp_per_block = 16
+            block_num = self._prefill_block_num
+            warp_per_block = self._prefill_warp_per_block
         else:
-            block_num = 64
-            warp_per_block = 4
+            block_num = self._decode_block_num
+            warp_per_block = self._decode_warp_per_block
 
         (
             dispatch_a1,
@@ -138,11 +155,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> None:
         context = get_forward_context().context
         if context.is_prefill:
-            block_num = 128
-            warp_per_block = 16
+            block_num = self._prefill_block_num
+            warp_per_block = self._prefill_warp_per_block
         else:
-            block_num = 64
-            warp_per_block = 4
+            block_num = self._decode_block_num
+            warp_per_block = self._decode_warp_per_block
 
         num_token = output.shape[0]
         result = self.mori_op.combine(

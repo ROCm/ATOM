@@ -88,6 +88,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # --- Expert Parallelism ---
+    # Enable FP8 quantization before MORI EP dispatch to halve all2all volume.
+    "ATOM_EP_FP8_DISPATCH": lambda: os.getenv("ATOM_EP_FP8_DISPATCH", "0") == "1",
+    # MORI decode kernel launch tuning (MI355-optimized defaults).
+    "ATOM_MORI_DECODE_BLOCK_NUM": lambda: int(
+        os.getenv("ATOM_MORI_DECODE_BLOCK_NUM", "64")
+    ),
+    "ATOM_MORI_DECODE_WARP_PER_BLOCK": lambda: int(
+        os.getenv("ATOM_MORI_DECODE_WARP_PER_BLOCK", "4")
+    ),
+    "ATOM_MORI_PREFILL_BLOCK_NUM": lambda: int(
+        os.getenv("ATOM_MORI_PREFILL_BLOCK_NUM", "128")
+    ),
+    "ATOM_MORI_PREFILL_WARP_PER_BLOCK": lambda: int(
+        os.getenv("ATOM_MORI_PREFILL_WARP_PER_BLOCK", "16")
+    ),
+    # Pre-allocate EP communication buffers for decode to avoid per-step allocations.
+    "ATOM_EP_PREALLOCATE_COMM_BUFFERS": lambda: os.getenv(
+        "ATOM_EP_PREALLOCATE_COMM_BUFFERS", "1"
+    )
+    == "1",
 }
 
 

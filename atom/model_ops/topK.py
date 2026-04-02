@@ -10,6 +10,38 @@ from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
 from atom.utils.custom_register import direct_register_custom_op
 
+# Buffer pool for TopK outputs: keyed by (token, topk) to avoid per-step
+# GPU allocations during decode.  Each entry holds (ids, weights, indicies).
+_topk_buffer_pool: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_pooled_topk_buffers(
+    token: int, topk: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    key = (token, topk)
+    cached = _topk_buffer_pool.get(key)
+    if cached is not None:
+        return cached
+    ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+    weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+    indicies = torch.empty(token, topk, dtype=torch.int32, device=device)
+    _topk_buffer_pool[key] = (ids, weights, indicies)
+    return ids, weights, indicies
+
+
+# Separate pool for token_expert_indicies (scratch only, never returned to caller).
+_indicies_pool: dict[tuple, torch.Tensor] = {}
+
+
+def _get_pooled_indicies(token: int, topk: int, device: torch.device) -> torch.Tensor:
+    key = (token, topk)
+    cached = _indicies_pool.get(key)
+    if cached is not None:
+        return cached
+    indicies = torch.empty(token, topk, dtype=torch.int32, device=device)
+    _indicies_pool[key] = indicies
+    return indicies
+
 
 @torch_compile_guard()
 def is_rocm_aiter_fusion_shared_expert_enabled() -> bool:
@@ -96,9 +128,11 @@ def rocm_aiter_topk_softmax_impl(
     fused_shared_experts_scoring_func: Optional[str] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter import topk_softmax
+    from atom.utils import envs
 
     token = gating_output.shape[0]
     device = gating_output.device
+    pool = envs.ATOM_EP_PREALLOCATE_COMM_BUFFERS
     fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
     if fuse_shared_experts and num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
@@ -115,12 +149,24 @@ def rocm_aiter_topk_softmax_impl(
         topk_ids, _ = torch.split(
             total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
         )
+        token_expert_indicies = (
+            _get_pooled_indicies(token, topk, device)
+            if pool
+            else torch.empty(token, topk, dtype=torch.int32, device=device)
+        )
     else:
-        topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
-        topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    token_expert_indicies = torch.empty(
-        gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
-    )
+        if pool:
+            topk_ids, topk_weights, token_expert_indicies = _get_pooled_topk_buffers(
+                token, topk, device
+            )
+        else:
+            topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+            topk_weights = torch.empty(
+                (token, topk), dtype=torch.float32, device=device
+            )
+            token_expert_indicies = torch.empty(
+                token, topk, dtype=torch.int32, device=device
+            )
     if fused_shared_experts_scoring_func is None:
         fused_shared_experts_scoring_func = ""
         fused_shared_experts_for_kernel = 0
