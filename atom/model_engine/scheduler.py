@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import time
 from collections import deque
 from typing import Optional
@@ -255,6 +256,8 @@ class ScheduledBatch:
 
         self.num_spec_step = num_spec_step
 
+        # Profiler annotation string (set by Scheduler when profiling is active)
+        self.profile_annotation: str | None = None
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
         # logger.info(f"{self.context_lens=}")
@@ -318,6 +321,8 @@ class Scheduler:
         self.cache_stats: Optional[CacheStats] = (
             CacheStats() if config.enable_prefix_caching else None
         )
+        self.profile_active = False
+
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -566,6 +571,101 @@ class Scheduler:
             self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
+
+    def build_profile_annotation(
+        self,
+        scheduled_batch: ScheduledBatch,
+        seqs: dict[int, Sequence],
+    ):
+        """Return a context manager that annotates the profiler trace with
+        iteration details and roofline-analysis aggregates.
+
+        The annotation encodes aggregate statistics needed for roofline
+        analysis of paged attention **without** per-request details:
+
+        For context (prefill) requests (prefix ``c_``):
+            R_C           — number of context requests
+            sum N_Q       — total query tokens          (sq)
+            sum N_KV      — total KV tokens             (sk)
+            sum N_Q^2     — sum of sq^2 per request     (sqsq)
+            sum N_Q*N_KV  — sum of sq*sk per request    (sqsk)
+
+        For generation (decode) requests (prefix ``g_``):
+            R_G           — number of generation requests
+            sum N_Q       — total query tokens          (sq)
+            sum N_KV      — total KV tokens             (sk)
+            sum N_Q^2     — sum of sq^2 per request     (sqsq)
+            sum N_Q*N_KV  — sum of sq*sk per request    (sqsk)
+
+        bs = total scheduled tokens across both phases.
+        """
+        if not self.profile_active or not os.environ.get("ATOM_ENABLE_ROOFLINE_ANNOTATION", "0") == "1":
+            return
+
+        # Context (prefill) phase aggregates
+        p_nq = 0     # sum N_Q
+        p_nkv = 0    # sum N_KV
+        p_sqsq = 0   # sum N_Q^2
+        p_sqsk = 0   # sum N_Q*N_KV
+
+        # Generation (decode) phase aggregates
+        g_nq = 0
+        g_nkv = 0
+        g_sqsq = 0
+        g_sqsk = 0
+
+        num_ctx_requests = 0
+        num_gen_requests = 0
+        bs = 0
+
+        for seq, num_tokens in zip(seqs.values(), scheduled_batch.num_scheduled_tokens):
+            if seq.type == SequenceType.DECODE:
+                nq = 1
+                nkv = seq.num_tokens  # full sequence length
+                num_gen_requests += 1
+                g_nq += nq
+                g_nkv += nkv
+                g_sqsq += nq * nq
+                g_sqsk += nq * nkv
+            else:
+                # PREFILL: num_tokens scheduled is the query length,
+                # KV length = cached + new tokens
+                nq = num_tokens
+                nkv = seq.num_cached_tokens + num_tokens
+                num_ctx_requests += 1
+                p_nq += nq
+                p_nkv += nkv
+                p_sqsq += nq * nq
+                p_sqsk += nq * nkv
+            bs += nq
+
+        scheduled_batch.profile_annotation = "".join(
+            [
+                "execute_",
+                str(bs),
+                "_context_",
+                str(num_ctx_requests),
+                "(sq",
+                str(p_nq),
+                "sk",
+                str(p_nkv),
+                "sqsq",
+                str(p_sqsq),
+                "sqsk",
+                str(p_sqsk),
+                ")_generation_",
+                str(num_gen_requests),
+                "(sq",
+                str(g_nq),
+                "sk",
+                str(g_nkv),
+                "sqsq",
+                str(g_sqsq),
+                "sqsk",
+                str(g_sqsk),
+                ")",
+            ]
+        )
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
