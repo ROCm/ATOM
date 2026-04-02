@@ -636,6 +636,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_type = quant_config.quant_type
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
+        self.static_input_scales = not quant_config.is_dynamic
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -758,6 +759,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_bias, extra_weight_attrs)
         else:
             layer.register_parameter("w2_bias", None)
+
+        if self.static_input_scales:
+            w13_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+            w2_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer):
         if layer.w13_bias is not None:
@@ -987,6 +1006,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        a1_scale = getattr(layer, "w13_input_scale", None)
+        a2_scale = getattr(layer, "w2_input_scale", None)
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -999,6 +1020,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 quant_type=self.quant_type,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
@@ -1019,8 +1042,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             expert_map=expert_map,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            a1_scale=None,
-            a2_scale=None,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
             bias1=layer.w13_bias,
             bias2=layer.w2_bias,
             hidden_pad=self.hidden_pad,
@@ -2267,7 +2290,20 @@ class FusedMoE(torch.nn.Module):
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
+        expert_id: Optional[int] = None,
     ):
+        target_param = param
+        # single_expert means gate_up_proj.shape=[2880*2, 1440] from quark
+        maybe_single_expert_input = loaded_weight.dim() == param.dim() - 1
+        if expert_id is not None and maybe_single_expert_input:
+            local_expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+            if local_expert_id == -1:
+                return
+            # Support loading a split/single expert tensor while reusing the
+            # original merged loading logic.
+            if loaded_weight.dim() == param.dim() - 1:
+                loaded_weight = loaded_weight.unsqueeze(0)
+                target_param = param[local_expert_id : local_expert_id + 1]
         # (FIXME) for gpt-oss all experts are combined
         mxfp4_block = 32
         ep_rank_start = self.ep_rank * self.local_num_experts
@@ -2276,62 +2312,91 @@ class FusedMoE(torch.nn.Module):
         tp_rank_end = tp_rank_start + self.intermediate_size_per_partition
         if param is getattr(self, "w13_bias", None):
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
             dim1 = narrow_weight.shape[1]
-            param[:, :dim1].copy_(narrow_weight)
+            target_param[:, :dim1].copy_(narrow_weight)
         elif param is getattr(self, "w2_bias", None):
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight
                 if self.tp_rank != 0:
                     narrow_weight.zero_()
             dim1 = narrow_weight.shape[1]
-            param[:, :dim1].copy_(narrow_weight)
+            target_param[:, :dim1].copy_(narrow_weight)
         elif param is getattr(self, "w13_weight", None):
             loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[
                     :, 2 * tp_rank_start : 2 * tp_rank_end, ...
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
-            param.view(torch.uint8)[:, :dim1, :dim2].copy_(
+            target_param.view(torch.uint8)[:, :dim1, :dim2].copy_(
                 narrow_weight.view(torch.uint8)
             )
         elif param is getattr(self, "w2_weight", None):
             loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[
                     ..., tp_rank_start // 2 : tp_rank_end // 2
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
-            param.view(torch.uint8)[:, :dim1, :dim2].copy_(
+            target_param.view(torch.uint8)[:, :dim1, :dim2].copy_(
                 narrow_weight.view(torch.uint8)
             )
         elif param is getattr(self, "w13_weight_scale", None):
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[
                     :, 2 * tp_rank_start : 2 * tp_rank_end, ...
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
-            param[:, :dim1, :dim2].copy_(narrow_weight)
+            target_param[:, :dim1, :dim2].copy_(narrow_weight)
         elif param is getattr(self, "w2_weight_scale", None):
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[
                     ..., tp_rank_start // mxfp4_block : tp_rank_end // mxfp4_block
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
-            param[:, :dim1, :dim2].copy_(narrow_weight)
+            target_param[:, :dim1, :dim2].copy_(narrow_weight)
+        elif param is getattr(self, "w13_input_scale", None) or param is getattr(
+            self, "w2_input_scale", None
+        ):
+            # input_scale is scalar per expert.
+            if loaded_weight.dim() == 0:
+                loaded_weight = loaded_weight.unsqueeze(0)
+            if self.use_ep and loaded_weight.shape[0] != target_param.shape[0]:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight
+            target_param[: narrow_weight.shape[0]].copy_(narrow_weight)
 
     def weight_loader(
         self,
@@ -2342,7 +2407,7 @@ class FusedMoE(torch.nn.Module):
         expert_id: int = 0,
     ) -> None:
         if self.layer_quant_config.quant_dtype == dtypes.fp4x2 and weight_name == "":
-            self.mxf4_merged_weight_loader(param, loaded_weight)
+            self.mxf4_merged_weight_loader(param, loaded_weight, expert_id)
             return
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)

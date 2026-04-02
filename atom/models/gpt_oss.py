@@ -377,12 +377,17 @@ class GptOssForCausalLM(nn.Module):
         "gate_up_proj_input_scale": "w13_input_scale",
         "down_proj_scales": "w2_weight_scale",
         "down_proj_input_scale": "w2_input_scale",
-        # MoE other weights
-        "gate_up_proj": "w13_weight",
-        "down_proj": "w2_weight",
-        # MoE Bias
         "gate_up_proj_bias": "w13_bias",
         "down_proj_bias": "w2_bias",
+        # Quark weights
+        ".gate_up_proj.weight": ".w13_weight",
+        ".gate_up_proj.weight_scale": ".w13_weight_scale",
+        ".gate_up_proj.input_scale": ".w13_input_scale",
+        ".gate_up_proj.bias": ".w13_bias",
+        ".down_proj.weight": ".w2_weight",
+        ".down_proj.weight_scale": ".w2_weight_scale",
+        ".down_proj.input_scale": ".w2_input_scale",
+        ".down_proj.bias": ".w2_bias",
     }
 
     def __init__(

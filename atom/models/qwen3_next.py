@@ -4,8 +4,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
-import triton
-import triton.language as tl
 
 from aiter.dist.parallel_state import get_tensor_model_parallel_rank
 from transformers.activations import ACT2FN
@@ -13,6 +11,10 @@ from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.split_chunk import (
+    fused_split_chunk_qwen_next_qkvz_ba,
+    fused_split_chunk_qwen_next_qkvzba,
+)
 
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
@@ -57,79 +59,6 @@ ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
-
-
-@triton.jit
-def shard_qkvzba_kernel(
-    qkvzba_ptr,  # [num_tokens,  (2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim + 2 * num_v_heads)]
-    qkv_ptr,  # [num_tokens, (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim)]
-    z_ptr,  # [num_tokens, num_v_heads * head_v_dim]
-    b_ptr,  # [num_tokens, num_v_heads]
-    a_ptr,  # [num_tokens, num_v_heads]
-    num_k_heads: tl.constexpr,
-    num_v_heads: tl.constexpr,
-    head_k_dim: tl.constexpr,
-    head_v_dim: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-    QKVZ_TOTAL_SIZE = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
-    QKVZ_DIM_SIZE = 2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads
-    BA_TOTAL_SIZE = 2 * num_v_heads
-    KV_HEAD_RATIO: tl.constexpr = num_v_heads // num_k_heads
-    ROW_SIZE = QKVZ_TOTAL_SIZE + BA_TOTAL_SIZE
-    if head_id == num_k_heads:  # ba
-        load_ptr = qkvzba_ptr + token_id * ROW_SIZE + QKVZ_TOTAL_SIZE
-        b_offset = (
-            tl.arange(0, num_v_heads) // KV_HEAD_RATIO * KV_HEAD_RATIO * 2
-            + tl.arange(0, num_v_heads) % KV_HEAD_RATIO
-        )
-        a_offset = b_offset + KV_HEAD_RATIO
-        b_val = tl.load(load_ptr + b_offset)
-        a_val = tl.load(load_ptr + a_offset)
-        store_offset = tl.arange(0, num_v_heads)
-        tl.store(b_ptr + token_id * num_v_heads + store_offset, b_val)
-        tl.store(a_ptr + token_id * num_v_heads + store_offset, a_val)
-    else:
-        base_ptr = qkvzba_ptr + token_id * ROW_SIZE + head_id * QKVZ_DIM_SIZE
-        qkv_base_ptr = qkv_ptr + token_id * (
-            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
-        )
-        k_dim_offset = tl.arange(0, head_k_dim)
-        v_dim_offset = tl.arange(0, head_v_dim)
-        q_val = tl.load(base_ptr + k_dim_offset)
-        q_store_ptr = qkv_base_ptr + head_id * head_k_dim
-        tl.store(q_store_ptr + k_dim_offset, q_val)
-
-        k_val = tl.load(base_ptr + head_k_dim + k_dim_offset)
-        k_store_ptr = qkv_base_ptr + num_k_heads * head_k_dim + head_id * head_k_dim
-        tl.store(k_store_ptr + k_dim_offset, k_val)
-
-        for sub_head in tl.static_range(0, KV_HEAD_RATIO):
-            v_val = tl.load(
-                base_ptr + 2 * head_k_dim + sub_head * head_v_dim + v_dim_offset
-            )
-            v_store_ptr = (
-                qkv_base_ptr
-                + 2 * num_k_heads * head_k_dim
-                + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
-            )
-            tl.store(v_store_ptr + v_dim_offset, v_val)
-
-        for sub_head in tl.static_range(0, KV_HEAD_RATIO):
-            z_val = tl.load(
-                base_ptr
-                + 2 * head_k_dim
-                + KV_HEAD_RATIO * head_v_dim
-                + sub_head * head_v_dim
-                + v_dim_offset
-            )
-            z_store_ptr = (
-                z_ptr
-                + token_id * num_v_heads * head_v_dim
-                + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
-            )
-            tl.store(z_store_ptr + v_dim_offset, z_val)
 
 
 def mamba_v2_sharded_weight_loader(
@@ -756,42 +685,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
-    def shard_qkvzba(
-        self,
-        qkvzba: torch.Tensor,
-        num_k_heads: int,
-        num_v_heads: int,
-        head_k_dim: int,
-        head_v_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
-        mixed_qkv = torch.empty(
-            [
-                num_tokens,
-                2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
-            ],
-            dtype=dtype,
-            device=device,
-        )
-        z = torch.empty(
-            [num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device
-        )
-        b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-        a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-        grid = (num_tokens, num_k_heads + 1)
-        shard_qkvzba_kernel[grid](
-            qkvzba,
-            mixed_qkv,
-            z,
-            b,
-            a,
-            num_k_heads,
-            num_v_heads,
-            head_k_dim,
-            head_v_dim,
-        )
-        return mixed_qkv, z, b, a
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -812,8 +705,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
             k_heads_after_tp = self.num_k_heads // self.tp_size
             v_heads_after_tp = self.num_v_heads // self.tp_size
-
-            mixed_qkv, z, b, a = self.shard_qkvzba(
+            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_qwen_next_qkvzba(
                 projected_states_qkvzba,
                 k_heads_after_tp,
                 v_heads_after_tp,
@@ -823,24 +715,23 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         else:
             projected_states_qkvz = self.in_proj_qkvz(hidden_states)
             projected_states_ba = self.in_proj_ba(hidden_states)
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states_qkvz, projected_states_ba
+            # Use Triton kernel to process qkvz and ba
+            num_k_heads_tp = self.num_k_heads // self.tp_size
+            num_v_heads_tp = self.num_v_heads // self.tp_size
+            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_qwen_next_qkvz_ba(
+                projected_states_qkvz,
+                projected_states_ba,
+                num_k_heads_tp,
+                num_v_heads_tp,
+                self.head_k_dim,
+                self.head_v_dim,
             )
-            query, key, value = map(
-                lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-            )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
 
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
 
