@@ -573,8 +573,10 @@ class ModelRunner:
         # so we must complete the remapping for layers before constructing the model.
         config.quant_config.remap_layer_name(
             config.hf_config,
-            getattr(model_class, "packed_modules_mapping", {}),
-            getattr(model_class, "quant_exclude_name_mapping", {}),
+            packed_modules_mapping=getattr(model_class, "packed_modules_mapping", {}),
+            quant_exclude_name_mapping=getattr(
+                model_class, "quant_exclude_name_mapping", {}
+            ),
         )
         self.model = model_class(config)
         torch.set_default_device(None)
