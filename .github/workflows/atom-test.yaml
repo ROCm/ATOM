@@ -328,10 +328,15 @@ jobs:
       - name: Download models
         run: |
           if [ -d "/models" ]; then
-            echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
-            if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
-              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
-              exit 1
+            model_dir="/models/${{ matrix.model_path }}"
+            if docker exec "$CONTAINER_NAME" bash -lc "[ -d \"$model_dir\" ] && [ -f \"$model_dir/config.json\" ]"; then
+              echo "Model already exists under ${model_dir}; skip download"
+            else
+              echo "Model not found under ${model_dir}; downloading model"
+              if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir \"$model_dir\""; then
+                echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+                exit 1
+              fi
             fi
           else
             echo "/models directory not found, skipping model download"
