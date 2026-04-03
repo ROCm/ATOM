@@ -163,12 +163,8 @@ class MemoryManagerMixin:
             return
         saved_blocks = self._kv_cache_num_blocks
         self._kv_cache_num_blocks = None
-        # Ensure CUDA allocator has released cached blocks before checking
-        # available memory — otherwise stale cached blocks inflate 'used'.
         torch.cuda.empty_cache()
-        # Cap at currently available blocks to prevent over-allocation after
-        # sleep/wake cycles where the GPU memory layout may have changed
-        # (e.g. allocator fragmentation, different weight tensor addresses).
+        torch.cuda.reset_peak_memory_stats()
         available_blocks = self.get_num_blocks()
         num_blocks = min(saved_blocks, available_blocks)
         if num_blocks < saved_blocks:

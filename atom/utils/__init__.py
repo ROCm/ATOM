@@ -48,7 +48,7 @@ def set_device_control_env_var(config: "Config", local_dp_rank: int):
     for engine subprocess.
     """
     world_size = config.tensor_parallel_size
-    evar = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
+    evar = "ATOM_DP_DEVICE_MAP"
 
     value = get_device_indices(evar, local_dp_rank, world_size)
     print(f"Setting DP rank {local_dp_rank} to {value}")

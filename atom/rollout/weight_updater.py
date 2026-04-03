@@ -308,7 +308,7 @@ class WeightUpdaterMixin:
         """
         Update model weights from named tensors.
 
-        Called by RLHF frameworks (e.g., verl) after each training step to
+        Called by RLHF frameworks after each training step to
         synchronize weights from training engine to inference engine.
 
         Supports both direct parameter names and HuggingFace-style names that
