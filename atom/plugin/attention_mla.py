@@ -29,6 +29,25 @@ import logging
 logger = logging.getLogger("atom")
 
 
+import pdb
+import sys
+from typing import Any
+
+
+class ForkedPdb(pdb.Pdb):
+    """
+    PDB Subclass for debugging multi-processed code
+    Suggested in: https://stackoverflow.com/questions/4716533/how-to-attach-debugger-to-a-python-subproccess
+    """
+
+    def interaction(self, *args: Any, **kwargs: Any) -> None:
+        _stdin = sys.stdin
+        try:
+            sys.stdin = open("/dev/stdin")
+            pdb.Pdb.interaction(self, *args, **kwargs)
+        finally:
+            sys.stdin = _stdin
+
 if use_triton_gemm():
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
@@ -620,6 +639,13 @@ class MLAAttentionImplPluginModeMethods:
         attn_metadata=None,
         output=None,
     ):
+        # ForkedPdb().set_trace()
+        print(f"q.shape: {q.shape} \n", flush=True)
+        print(f"k_c_normed.shape: {k_c_normed.shape} \n", flush=True)
+        print(f"k_pe.shape: {k_pe.shape} \n", flush=True)
+        print(f"kv_cache.shape: {kv_cache.shape} \n", flush=True)
+        print(f"================================================", flush=True)
+
         assert output is not None, "Output tensor must be provided."
         if not hasattr(self, "_cached_ops"):
             from vllm.distributed.parallel_state import get_dcp_group
@@ -896,15 +922,19 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
             MLACommonMetadataBuilder,
         )
 
+        vllm_config = get_current_vllm_config()
         self.supports_quant_query_input = False
-        self.dcp_world_size: int = -1
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.can_return_lse_for_decode = True
+
+        self.need_to_return_lse_for_decode = self.dcp_world_size > 1 and self.can_return_lse_for_decode
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
                 get_current_vllm_config()
             )
         )
         self.cp_kv_cache_interleave_size: int = (
-            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
         self.is_aiter_triton_fp4_bmm_enabled = (
             envs.ATOM_USE_TRITON_MXFP4_BMM

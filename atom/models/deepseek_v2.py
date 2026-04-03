@@ -1578,6 +1578,11 @@ class DeepseekV2MLAAttention(nn.Module):
                 positions,
                 self.indexer_rope_emb,
             )
+        print(f"hidden_states_or_q_c.shape: {hidden_states_or_q_c.shape} \n", flush=True)
+        print(f"kv_c_normed.shape: {kv_c_normed.shape} \n", flush=True)
+        print(f"k_pe.shape: {k_pe.shape} \n", flush=True)
+        print(f"positions.shape: {positions.shape} \n", flush=True)
+        print(f"================================================", flush=True)
 
         return self.mla_attn(
             hidden_states_or_q_c,

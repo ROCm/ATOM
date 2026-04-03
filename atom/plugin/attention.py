@@ -1189,6 +1189,8 @@ def create_mla_attn_metadata_builder_init_method(base_class):
 
         self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
 
+        cache_dtype = "bf16" if config.cache_config.cache_dtype == "auto" else config.cache_config.cache_dtype
+
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -1201,7 +1203,7 @@ def create_mla_attn_metadata_builder_init_method(base_class):
             1,
             self.padded_num_attention_heads,
             torch.bfloat16,
-            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            dtypes.d_dtypes[cache_dtype],
             is_sparse=False,  # TODO: support sparse
             fast_mode=True,
         )
@@ -1405,6 +1407,8 @@ def unified_attention_with_output_base_for_plugin_mode(
         kv_c_normed = k
         k_pe = v
         self = atom_config.compilation_config.static_forward_context[layer_name]
+        print(f"======= layer_name: {layer_name} \n", flush=True)
+        print(f"======= self: {self} \n", flush=True)
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
