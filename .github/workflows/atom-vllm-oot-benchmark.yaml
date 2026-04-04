@@ -853,52 +853,6 @@ jobs:
           name: oot-benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
-      - name: Prepare per-case benchmark dashboard payload
-        id: per_case_dashboard
-        if: steps.check.outputs.enabled == 'true' && env.PUBLISH_TO_DASHBOARD == 'true'
-        run: |
-          rm -rf benchmark-dashboard-input
-          mkdir -p benchmark-dashboard-input
-          cp "${RESULT_FILENAME}.json" benchmark-dashboard-input/
-
-          python3 .github/scripts/oot_benchmark_to_dashboard.py \
-            benchmark-dashboard-input \
-            --output benchmark-action-input.json \
-            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          ENTRY_COUNT=$(python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          payload_path = Path("benchmark-action-input.json")
-          if not payload_path.exists():
-              print(0)
-          else:
-              data = json.loads(payload_path.read_text(encoding="utf-8"))
-              print(len(data))
-          PY
-          )
-          echo "entry_count=${ENTRY_COUNT}" >> "$GITHUB_OUTPUT"
-
-          echo "=== Generated per-case benchmark dashboard entries ==="
-          cat benchmark-action-input.json
-
-      - name: Publish per-case benchmark result to dashboard
-        if: steps.check.outputs.enabled == 'true' && env.PUBLISH_TO_DASHBOARD == 'true' && steps.per_case_dashboard.outputs.entry_count != '0'
-        continue-on-error: true
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          tool: customBiggerIsBetter
-          output-file-path: benchmark-action-input.json
-          gh-pages-branch: gh-pages
-          benchmark-data-dir-path: benchmark-dashboard
-          auto-push: true
-          alert-threshold: "80%"
-          comment-on-alert: false
-          fail-on-alert: false
-          max-items-in-chart: 90
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Clean up OOT benchmark container
         if: always() && steps.check.outputs.enabled == 'true'
         run: |
@@ -943,7 +897,7 @@ jobs:
       - name: Note summary behavior
         run: |
           if [[ "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" == "true" ]]; then
-            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, each successful benchmark case is published to the dashboard as soon as it finishes, and the final summary job also reconciles the completed run for regression comparison.\n' \
+            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
               "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
               "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
               "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"

@@ -1214,39 +1214,6 @@ jobs:
           docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
           docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
 
-      # Publish each finished model case immediately so successful nightly/full
-      # results become visible on the dashboard even if other matrix cases are
-      # still queued or later fail.
-      - name: Prepare per-case accuracy dashboard payload
-        if: always() && hashFiles('oot_accuracy_results/*.json') != ''
-        run: |
-          rm -rf accuracy-dashboard-input
-          mkdir -p "accuracy-dashboard-input/accuracy-${{ matrix.model_name }}"
-          cp oot_accuracy_results/*.json "accuracy-dashboard-input/accuracy-${{ matrix.model_name }}/"
-
-          python3 .github/scripts/accuracy_to_dashboard.py \
-            accuracy-dashboard-input \
-            --output accuracy-benchmark-input.json \
-            --models .github/benchmark/oot_models_accuracy.json \
-            --backend "ATOM-vLLM" \
-            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          echo "=== Generated per-case dashboard entries ==="
-          cat accuracy-benchmark-input.json
-
-      - name: Publish per-case accuracy result to dashboard
-        if: always() && hashFiles('accuracy-benchmark-input.json') != ''
-        continue-on-error: true
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          tool: customBiggerIsBetter
-          output-file-path: accuracy-benchmark-input.json
-          gh-pages-branch: gh-pages
-          benchmark-data-dir-path: benchmark-dashboard
-          auto-push: true
-          max-items-in-chart: 90
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Upload model artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -1273,9 +1240,9 @@ jobs:
           docker rm "$CONTAINER_NAME" || true
           docker rmi "${OOT_IMAGE_TAG}" || true
 
-  # Rebuild the dashboard payload from all uploaded accuracy artifacts after
-  # the full matrix completes. This final pass converges the dashboard state
-  # and backfills any successful cases that did not publish earlier.
+  # Build the dashboard payload from all uploaded accuracy artifacts after the
+  # full matrix completes. This keeps dashboard writes off the GPU runners and
+  # ensures each nightly/manual run publishes at most once.
   accuracy-dashboard:
     name: Update OOT accuracy dashboard
     needs: [oot-model-accuracy]
