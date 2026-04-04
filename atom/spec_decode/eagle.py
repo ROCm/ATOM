@@ -140,7 +140,11 @@ class EagleProposer:
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
-                    do_attn_metadata_update = not context.is_prefill
+                    do_attn_metadata_update = (
+                        not context.is_prefill
+                        and self.runner.attn_metadata_builder.num_attention_heads
+                        == 16  # TODO: FIX this
+                    )
                     if i == 0:
                         i0_max_seqlen_q = attn_metadata.max_seqlen_q
                         attn_metadata.max_seqlen_q = 1
