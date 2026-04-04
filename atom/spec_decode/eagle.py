@@ -142,8 +142,8 @@ class EagleProposer:
                 if i < self.mtp_k - 1:
                     do_attn_metadata_update = (
                         not context.is_prefill
-                        and self.runner.attn_metadata_builder.num_attention_heads
-                        == 16  # TODO: FIX this
+                        # TODO: FIX this condition after we support3 attention head numbers=32
+                        and self.runner.attn_metadata_builder.num_attention_heads != 32
                     )
                     if i == 0:
                         i0_max_seqlen_q = attn_metadata.max_seqlen_q
