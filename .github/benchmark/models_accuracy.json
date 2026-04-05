@@ -62,7 +62,7 @@
   {
     "model_name": "DeepSeek-R1-0528-FP4",
     "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "main",
@@ -74,7 +74,7 @@
   {
     "model_name": "DeepSeek-R1-0528-FP4 MTP",
     "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --method mtp",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --method mtp",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
