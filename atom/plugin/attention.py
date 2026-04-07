@@ -210,6 +210,7 @@ def create_attn_metadata_builder_init_method(base_class):
         self.block_size = kv_cache_spec.block_size
 
         self.aot_sliding_window: Optional[tuple[int, int]] = None
+        self.swa_head_dim: int = self.head_dim
         self.total_tokens: int = 0
 
         self.scheduler_config = config.scheduler_config
@@ -224,8 +225,10 @@ def create_attn_metadata_builder_init_method(base_class):
                 sliding_window_sizes.add(None)
             elif isinstance(sliding_window, tuple):
                 sliding_window_sizes.add(sliding_window)
+                self.swa_head_dim = layer.impl.head_dim
             else:
                 sliding_window_sizes.add((sliding_window - 1, 0))
+                self.swa_head_dim = layer.impl.head_dim
 
         while len(sliding_window_sizes) > 0:
             sliding_window_config = sliding_window_sizes.pop()
@@ -409,7 +412,7 @@ class vllmAttentionMetadataBuilderMethods:
                 )
                 fetched_shape = cu_seq_lens[-1].item()
                 swa_workspace = torch.empty(
-                    (2, fetched_shape, self.num_heads_kv, self.head_dim),
+                    (2, fetched_shape, self.num_heads_kv, self.swa_head_dim),
                     dtype=self.vllm_config.model_config.dtype,
                     device=self.device,
                 )

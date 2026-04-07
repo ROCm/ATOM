@@ -28,6 +28,63 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+_CK_MAX_HEAD_DIM = 256
+
+
+def _flash_attn_varlen_with_fallback(
+    q, k, v,
+    cu_seqlens_q, cu_seqlens_k,
+    max_seqlen_q, max_seqlen_k,
+    min_seqlen_q,
+    softmax_scale, causal,
+    head_dim,
+    sink_ptr=None,
+    alibi_slopes=None,
+):
+    if head_dim <= _CK_MAX_HEAD_DIM:
+        return aiter.flash_attn_varlen_func(
+            q=q, k=k, v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=0.0,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            sink_ptr=sink_ptr,
+            alibi_slopes=alibi_slopes,
+            return_lse=True,
+        )
+    import torch.nn.functional as F
+    total_q = q.shape[0]
+    num_heads_q = q.shape[1]
+    num_seqs = cu_seqlens_q.shape[0] - 1
+    out = torch.empty_like(q)
+    lse = torch.empty(num_heads_q, total_q, dtype=torch.float32, device=q.device)
+    for i in range(num_seqs):
+        sq_s, sq_e = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
+        sk_s, sk_e = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
+        qi = q[sq_s:sq_e].transpose(0, 1).unsqueeze(0)
+        ki = k[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
+        vi = v[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
+        num_q_heads = qi.shape[1]
+        num_kv_heads = ki.shape[1]
+        if num_q_heads != num_kv_heads:
+            rep = num_q_heads // num_kv_heads
+            ki = ki.repeat_interleave(rep, dim=1)
+            vi = vi.repeat_interleave(rep, dim=1)
+        oi = F.scaled_dot_product_attention(
+            qi, ki, vi, scale=softmax_scale, is_causal=causal,
+        )
+        out[sq_s:sq_e] = oi.squeeze(0).transpose(0, 1)
+        scores = torch.matmul(qi * softmax_scale, ki.transpose(-1, -2))
+        if causal and (sq_e - sq_s) == (sk_e - sk_s):
+            mask = torch.triu(
+                torch.full_like(scores, float("-inf")), diagonal=1)
+            scores = scores + mask
+        lse[:, sq_s:sq_e] = torch.logsumexp(scores, dim=-1).squeeze(0)
+    return out, lse
 _QWEN_GLUON_PA_DECODE_BS = 64
 
 
@@ -464,21 +521,20 @@ class PagedAttentionImplPluginModeMethods:
                 v_scale,
             )
             return
-        out, lse = aiter.flash_attn_varlen_func(
+        out, lse = _flash_attn_varlen_with_fallback(
             q=query,
             k=key,
             v=value,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_q,  # need to confirm
+            max_seqlen_k=max_seqlen_q,
             min_seqlen_q=min_seqlen_q,
-            dropout_p=0.0,
             softmax_scale=self.scale,
             causal=True,
+            head_dim=self.head_dim,
             sink_ptr=self.sinks,
             alibi_slopes=self.alibi_slopes,
-            return_lse=True,
         )
         assert attn_metadata.plugin_metadata.extend_metadata is not None
         chunk_context_metadata = (
@@ -512,7 +568,7 @@ class PagedAttentionImplPluginModeMethods:
                 per_token_quant=self.per_token_quant,
             )
 
-            suf_out, suf_lse = aiter.flash_attn_varlen_func(
+            suf_out, suf_lse = _flash_attn_varlen_with_fallback(
                 q=query,
                 k=key_fetched,
                 v=value_fetched,
@@ -521,13 +577,11 @@ class PagedAttentionImplPluginModeMethods:
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlens[chunk_idx],
                 min_seqlen_q=min_seqlen_q,
-                dropout_p=0.0,
                 softmax_scale=self.scale,
                 causal=False,
-                window_size=(-1, -1, 0),
+                head_dim=self.head_dim,
                 sink_ptr=self.sinks,
                 alibi_slopes=self.alibi_slopes,
-                return_lse=True,
             )
 
             if chunked_output is None:
