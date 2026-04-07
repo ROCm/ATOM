@@ -904,9 +904,11 @@ class DeepseekV2MoE(nn.Module):
         alt_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(alt_stream):
-            final_hidden_states = self.routed_expert_forward(hidden_states)
+            # final_hidden_states = self.routed_expert_forward(hidden_states)
+            shared_output = self.shared_experts(hidden_states)
 
-        shared_output = self.shared_experts(hidden_states)
+        final_hidden_states = self.routed_expert_forward(hidden_states)
+        # shared_output = self.shared_experts(hidden_states)
 
         current_stream.wait_stream(alt_stream)
 
@@ -1820,6 +1822,7 @@ class DeepseekV2Model(nn.Module):
         self.alt_stream: Optional[torch.cuda.Stream] = None
         if getattr(config, "n_shared_experts", None) is not None:
             self.alt_stream = torch.cuda.Stream()
+            self._warmup_dual_stream(self.alt_stream)
 
         _alt_stream = self.alt_stream
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -1849,6 +1852,18 @@ class DeepseekV2Model(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+
+    @staticmethod
+    def _warmup_dual_stream(alt_stream: torch.cuda.Stream):
+        """two-stream warmup to activate ROCm multi-stream dispatch"""
+        cur = torch.cuda.current_stream()
+        t = torch.empty(1, device="cuda")
+        alt_stream.wait_stream(cur)
+        with torch.cuda.stream(alt_stream):
+            t.add_(0)
+        t.add_(0)
+        cur.wait_stream(alt_stream)
+        torch.cuda.synchronize()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
