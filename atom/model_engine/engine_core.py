@@ -354,16 +354,23 @@ class DPEngineCoreProc(EngineCore):
         while True:
             shutdown = shutdown or self.pull_and_process_input_queue()
 
-            local_is_prefill, local_num_tokens = self.scheduler.get_next_batch_info()
+            local_is_prefill, local_num_tokens, local_num_reqs = (
+                self.scheduler.get_next_batch_info()
+            )
             local_unfinished = not self.scheduler.is_finished()
 
             (
                 global_has_prefill,
                 global_max_tokens,
+                global_max_reqs,
                 global_has_unfinished,
                 global_shutdown,
             ) = self._sync_dp_state(
-                local_is_prefill, local_num_tokens, local_unfinished, shutdown
+                local_is_prefill,
+                local_num_tokens,
+                local_num_reqs,
+                local_unfinished,
+                shutdown,
             )
 
             if global_shutdown and not global_has_unfinished:
@@ -379,11 +386,14 @@ class DPEngineCoreProc(EngineCore):
             if global_has_prefill and not local_is_prefill:
                 # We must do dummy prefill to sync here
                 # Since we want to split mori output in moe, we need to make dp all run prefill or all run decode
+                dummy_reqs = min(
+                    global_max_reqs, 2
+                )  # dummy reqs at 2: just enough for TBO agreement, avoid wasting compute.
                 logger.info(
-                    f"{self.label}: Running dummy prefill ({global_max_tokens} tokens) "
+                    f"{self.label}: Running dummy prefill ({global_max_tokens} tokens, {dummy_reqs} reqs) "
                     f"to sync with other DP ranks doing prefill"
                 )
-                self._execute_dummy_prefill(global_max_tokens)
+                self._execute_dummy_prefill(global_max_tokens, dummy_reqs)
             else:
                 executed = self._process_engine_step()
                 if not executed:
@@ -391,8 +401,10 @@ class DPEngineCoreProc(EngineCore):
 
             self.engines_running = global_has_unfinished
 
-    def _execute_dummy_batch(self):
-        return self.runner_mgr.call_func("dummy_execution", wait_out=True)
+    def _execute_dummy_prefill(self, num_tokens: int, num_reqs: int = 1):
+        return self.runner_mgr.call_func(
+            "dummy_prefill_execution", num_tokens, num_reqs, wait_out=True
+        )
 
     def _execute_dummy_prefill(self, num_tokens: int):
         """Execute dummy prefill batch to sync with other DP ranks doing prefill."""
@@ -404,18 +416,26 @@ class DPEngineCoreProc(EngineCore):
         self,
         local_is_prefill: bool,
         local_num_tokens: int,
+        local_num_reqs: int,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-    ) -> tuple[bool, int, bool, bool]:
+    ) -> tuple[bool, int, int, bool, bool]:
         if self._shutting_down:
-            return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
+            return (
+                local_is_prefill,
+                local_num_tokens,
+                local_num_reqs,
+                local_has_unfinished,
+                True,
+            )
 
         try:
-            # Pack all state: [is_prefill, num_tokens, has_unfinished, shutdown]
+            # Pack all state: [is_prefill, num_tokens, num_reqs, has_unfinished, shutdown]
             state_tensor = torch.tensor(
                 [
                     1 if local_is_prefill else 0,
                     local_num_tokens,
+                    local_num_reqs,
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
                 ],
@@ -427,11 +447,13 @@ class DPEngineCoreProc(EngineCore):
             )
             global_has_prefill = state_tensor[0].item() == 1
             global_max_tokens = state_tensor[1].item()
-            global_has_unfinished = state_tensor[2].item() == 1
-            global_shutdown = state_tensor[3].item() == 1
+            global_max_reqs = state_tensor[2].item()
+            global_has_unfinished = state_tensor[3].item() == 1
+            global_shutdown = state_tensor[4].item() == 1
             return (
                 global_has_prefill,
                 global_max_tokens,
+                global_max_reqs,
                 global_has_unfinished,
                 global_shutdown,
             )
@@ -439,7 +461,13 @@ class DPEngineCoreProc(EngineCore):
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             # If sync fails, assume shutdown to prevent hang
             self._shutting_down = True
-            return (local_is_prefill, local_num_tokens, local_has_unfinished, True)
+            return (
+                local_is_prefill,
+                local_num_tokens,
+                local_num_reqs,
+                local_has_unfinished,
+                True,
+            )
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:

@@ -333,18 +333,57 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
             )
+            from atom.utils.dbo.ubatching import tbo_enabled
+            from atom.config import get_current_atom_config
+
             handle = all2all_manager.get_handle(all_to_all_args)
+            is_async = tbo_enabled()
+            atom_config = get_current_atom_config()
+            low_latency = getattr(atom_config, "enable_low_latency", False)
 
             # We not use quant for mori now
             use_fp8_dispatch = False
             quant_type = None
 
+            common_args = dict(
+                rank=all2all_manager.rank,
+                world_size=all2all_manager.world_size,
+                hidden_dim=moe.hidden_dim,
+                scale_dim=scale_dim,
+                max_num_inp_token_per_rank=16384,
+                num_local_experts=moe.num_experts // all2all_manager.world_size,
+                num_experts_per_token=moe.experts_per_token,
+                gpu_per_node=moe.moe_parallel_config.local_ep_size,
+                data_type_itemsize=moe.in_dtype.itemsize,
+                max_token_type_size=moe.in_dtype.itemsize,
+            )
+
+            tbo_mori_ops = None
+            sync_handle = handle  # IntraNode handle for prefill (sync path)
+            if is_async:
+                from atom.model_ops.fused_moe.mori_prepare_finalize import (
+                    init_mori_op,
+                    _NUM_TBO_UBATCHES,
+                )
+
+                tbo_mori_ops = [
+                    init_mori_op(
+                        **common_args,
+                        low_latency=low_latency,
+                        instance_id=i,
+                    )
+                    for i in range(_NUM_TBO_UBATCHES)
+                ]
+
             prepare_finalize = MoriPrepareAndFinalize(
-                handle,
+                sync_handle,
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
                 quant_type=quant_type,
+                is_async=is_async,
+                tbo_mori_ops=tbo_mori_ops,
+                low_latency=low_latency,
             )
 
         return prepare_finalize

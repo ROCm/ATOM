@@ -781,6 +781,9 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
 
+    enable_tbo: bool = False
+    enable_low_latency: bool = False
+
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
 

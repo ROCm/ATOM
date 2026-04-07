@@ -46,6 +46,8 @@ class EngineArgs:
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
+    enable_tbo: bool = False
+    enable_low_latency: bool = False
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     mark_trace: bool = False
@@ -135,6 +137,17 @@ class EngineArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enable DP attention.",
+        )
+        parser.add_argument(
+            "--enable-tbo",
+            action="store_true",
+            help="Enable TBO (Two-Batch Overlap) for comm/compute overlap.",
+        )
+        parser.add_argument(
+            "--low-latency",
+            dest="enable_low_latency",
+            action="store_true",
+            help="Use AsyncLL MORI kernel for low-latency overlap (requires --enable-tbo).",
         )
         parser.add_argument(
             "--method",
