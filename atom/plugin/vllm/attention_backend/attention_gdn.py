@@ -217,17 +217,6 @@ class GatedDeltaNet(nn.Module):
         )  # noqa: E501
         compilation_config = forward_context.no_compile_layers
         self_kv_cache = compilation_config[layer_name].kv_cache
-        virtual_engine = getattr(forward_context, "virtual_engine", None)
-        # vLLM <= 0.17 exposed per-virtual-engine KV caches via
-        # forward_context.virtual_engine. vLLM 0.19 no longer sets that field
-        # for this path and the layer cache is already the active cache tuple.
-        if (
-            virtual_engine is not None
-            and isinstance(self_kv_cache, (list, tuple))
-            and self_kv_cache
-            and isinstance(self_kv_cache[0], (list, tuple))
-        ):
-            self_kv_cache = self_kv_cache[virtual_engine]
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
