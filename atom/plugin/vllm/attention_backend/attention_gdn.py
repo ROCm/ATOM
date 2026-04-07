@@ -12,12 +12,14 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
 )
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
+from vllm import envs as vllm_envs
 from vllm.forward_context import get_forward_context
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
+    fused_recurrent_gated_delta_rule_packed_decode,
 )
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
@@ -162,6 +164,9 @@ class GatedDeltaNet(nn.Module):
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+        self.enable_packed_recurrent_decode = (
+            vllm_envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+        )
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -181,6 +186,53 @@ class GatedDeltaNet(nn.Module):
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
+
+    def _forward_core_decode_non_spec(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        query_non_spec, key_non_spec, value_non_spec = causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            conv_weights,
+            self.num_k_heads * self.head_k_dim // self.tp_size,
+            self.num_v_heads * self.head_v_dim // self.tp_size,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+            validate_data=False,
+        )
+        mixed_qkv_non_spec = torch.cat(
+            (query_non_spec, key_non_spec, value_non_spec), dim=-1
+        ).contiguous()
+        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=mixed_qkv_non_spec,
+            a=a,
+            b=b,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            scale=self.head_k_dim**-0.5,
+            initial_state=ssm_state,
+            out=out_buf,
+            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+            use_qk_l2norm_in_kernel=True,
+        )
+        return core_attn_out
 
     def forward(
         self,
@@ -230,6 +282,23 @@ class GatedDeltaNet(nn.Module):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+
+        if (
+            self.enable_packed_recurrent_decode
+            and attn_metadata.spec_sequence_masks is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes > 0
+        ):
+            return self._forward_core_decode_non_spec(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                conv_weights=conv_weights,
+            )
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
