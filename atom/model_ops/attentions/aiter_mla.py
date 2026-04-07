@@ -429,7 +429,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             vars_used.append(("sparse_kv_indptr", bs + 1))
 
         prep_stream = self.prep_stream
-        metadata_deps = {"cu_seqlens_q", "kv_indptr", "kv_last_page_lens", "sparse_kv_indptr"}
+        metadata_deps = {
+            "cu_seqlens_q",
+            "kv_indptr",
+            "kv_last_page_lens",
+            "sparse_kv_indptr",
+        }
         vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
         vars_remaining = [(el, num) for el, num in vars_used if el not in metadata_deps]
         max_seqlen_k = context_lens.max()
