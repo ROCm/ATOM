@@ -4,27 +4,27 @@ Authors:  Zejun Chen, Hattie Wu, Lingpeng Jin, Carlus Huang, Chuan Li, Peng Sun,
 
 ## 1. Introduction
 
-LLM inference faces a persistent dilemma: balancing hardware-specific optimization and framework compatibility. To unlock the full performance potential of AMD Instinct GPUs, in-depth hardware-aware kernel engineering is a must; yet production-grade LLM serving is overwhelmingly built on [vLLM](https://github.com/vllm-project/vllm) — the de facto industry standard—thanks to its robust scheduling mechanisms, sophisticated memory management, and universal API compatibility.
+LLM inference faces a persistent dilemma: balancing hardware-specific optimization and framework compatibility. To unlock the full performance potential of AMD Instinct™ GPUs, in-depth hardware-aware kernel engineering is a must; yet production-grade LLM serving is overwhelmingly built on [vLLM](https://github.com/vllm-project/vllm) — the de facto industry standard—thanks to its robust scheduling mechanisms, sophisticated memory management, and universal API compatibility.
 
 
-ATOM, a high-performance inference engine purpose-built for AMD Instinct GPUs, resolves this conflict with its dual-mode architecture. It can run as a standalone inference server or integrate seamlessly into vLLM as a plugin backend, delivering AMD-native model and kernel optimizations without any modifications to vLLM’s core codebase.
+[ATOM](https://github.com/ROCm/ATOM), a high-performance inference engine purpose-built for AMD Instinct GPUs, resolves this conflict with its dual-mode architecture. It can run as a standalone inference server or integrate seamlessly into vLLM as a plugin backend, delivering the AMD native model and kernel optimizations without any modifications to vLLM’s core codebase.
 
-Not a fork, nor a replacement for vLLM, the ATOM vLLM plugin acts as a collaborative bridge connecting AMD’s hardware innovation to the open-source vLLM ecosystem, rooted in the spirit of co-evolution rather than competition. As the universal standard for LLM serving, vLLM forms the backbone of inference infrastructure for startups and hyperscalers alike, who rely on its mature APIs, continuous batching capabilities, and full suite of operational tools. Switching serving frameworks entails steep learning curves, migration risks, and heavy operational overhead—users should never have to choose between a trusted production framework and full hardware performance.
+Not a fork, nor a replacement for vLLM, the ATOM vLLM plugin acts as a collaborative bridge connecting the AMD hardware innovation to the open-source vLLM ecosystem, rooted in the spirit of co-evolution rather than competition. As the universal standard for LLM serving, vLLM forms the backbone of inference infrastructure for startups and hyperscalers alike, who rely on its mature APIs, continuous batching capabilities, and full suite of operational tools. Switching serving frameworks entails steep learning curves, migration risks, and heavy operational overhead—users should never have to choose between a trusted production framework and full hardware performance.
 
 Integrating ATOM as a vLLM plugin creates a win-win for all stakeholders, with five core advantages:
 
 
 - **Zero learning curve:** Full compatibility with existing vLLM commands, APIs, and end-to-end workflows. ATOM runs transparently in the background, requiring no new tools or complex configurations—only delivering enhanced kernel performance while preserving a consistent user experience.
 
-- **Instant access to AMD innovation:** Leverage cutting-edge AMD hardware features (e.g., FP4 on MI355X, rack-scale inference on MI400) and top-tier kernel optimizations (e.g., AITER fused attention, custom AllReduce) out of the box, without waiting for upstream integration into the main vLLM codebase. This drastically shortens the time-to-value for new AMD GPU chips.
+- **Instant access to AMD innovation:** Leverage cutting-edge AMD hardware features (e.g., FP4 on the MI355X GPU, rack-scale inference on the MI400 GPU) and top-tier kernel optimizations (e.g., AITER fused attention, custom AllReduce) out of the box, without waiting for upstream integration into the main vLLM codebase. This drastically shortens the time-to-value for the new AMD GPUs.
 
-- **Agile innovation sandbox:** A fast validation layer for new technical ideas, hardware enablement, and kernel library testing (e.g., AITER). The plugin aligns flexibly with AMD’s product roadmap—including new GPU releases, FP8/FP4 precision support, and next-gen attention mechanisms—unconstrained by vLLM’s upstream release cycles. 
+- **Agile innovation sandbox:** A fast validation layer for new technical ideas, hardware enablement, and kernel library testing (e.g., AITER). The plugin aligns flexibly with the AMD product roadmap, including new GPU releases, FP8/FP4 precision support, and next-gen attention mechanisms—unconstrained by vLLM’s upstream release cycles. 
 
 - **vLLM as production-grade foundation for ROCm:** As the community-standard serving framework, vLLM provides the enterprise-grade stability, broad model coverage, and production-critical features needed to deploy ROCm-based infrastructure at scale.
 
-- **Mature optimizations upstreamed for all:** ATOM serves as a temporary proving ground for new optimizations; once stabilized, kernels, optimization strategies, and new features are upstreamed to vLLM’s native ROCm backend, benefiting the entire ROCm user community and strengthening the open-source LLM ecosystem.
+- **Mature optimizations upstreamed for all:** ATOM serves as a temporary proving ground for new optimizations; once stabilized, kernels, optimization strategies, and new features are upstreamed to vLLM’s native ROCm backend, benefiting the entire ROCm software user community and strengthening the open-source LLM ecosystem.
 
-This plugin enables a closed, iterative innovation cycle: **new hardware/ideas/libraries** → **rapid validation via ATOM** → **upstream integration into vLLM core when mature** → **universal access for all ROCm users**. This approach accelerates the delivery of AMD’s hardware advantages to end users through ATOM, while long-term technical improvements flow back to the broader open-source community via vLLM. The remainder of this post dives into the design, architecture, and technical implementation of the ATOM vLLM plugin system.
+This plugin enables a closed, iterative innovation cycle: **new hardware/ideas/libraries** → **rapid validation via ATOM** → **upstream integration into vLLM core when mature** → **universal access for all ROCm software users**. This approach accelerates the delivery of the AMD hardware advantages to end users through ATOM, while long-term technical improvements flow back to the broader open-source community via vLLM. The remainder of this post dives into the design, architecture, and technical implementation of the ATOM vLLM plugin system.
 
 
 ## 2. Architecture Overview
@@ -149,7 +149,7 @@ In practice, the dashboard is an essential tool for release validation: after ev
 
 The ATOM vLLM plugin proves that hardware-specific optimization and framework compatibility are not mutually exclusive. By leveraging vLLM’s out-of-the-box plugin mechanism, ATOM delivers AMD-native kernel optimizations—including fused attention, quantized GEMM, and optimized MoE routing—while preserving the full feature set of vLLM that production LLM deployments rely on.
 
-Beyond immediate performance gains, the plugin’s architecture serves as a critical proving ground for AMD’s hardware and software innovations: optimizations validated in ATOM’s plugin mode are gradually upstreamed to vLLM’s native ROCm backend, benefiting the entire ROCm and open-source LLM community. For end users, this means immediate access to the latest AMD hardware capabilities without waiting for slow upstream integration cycles—creating a virtuous cycle of co-evolution between AMD’s hardware innovation and the vLLM serving ecosystem.
+Beyond immediate performance gains, the plugin’s architecture serves as a critical proving ground for AMD’s hardware and software innovations: optimizations validated in ATOM’s plugin mode are gradually upstreamed to vLLM’s native ROCm backend, benefiting the entire ROCm and open-source LLM community. For end users, this means immediate access to the latest AMD hardware capabilities without waiting for slow upstream integration cycles—creating a virtuous cycle of co-evolution between the AMD hardware innovation and the vLLM serving ecosystem.
 
 ## References
 
