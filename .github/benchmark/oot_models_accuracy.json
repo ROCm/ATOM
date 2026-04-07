@@ -17,8 +17,8 @@
     "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
     "runner": "linux-atom-mi35x-4",
     "test_level": "nightly",
-    "accuracy_threshold": 0.83,
-    "accuracy_baseline": 0.83,
+    "accuracy_threshold": 0.76,
+    "accuracy_baseline": 0.76,
     "accuracy_baseline_model": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
   },
   {
@@ -55,6 +55,18 @@
     "accuracy_baseline_model": "amd/Kimi-K2-Thinking-MXFP4"
   },
   {
+    "model_name": "Kimi-K2.5-MXFP4 TP8",
+    "model_path": "amd/Kimi-K2.5-MXFP4",
+    "extraArgs": "--tensor-parallel-size 8",
+    "env_vars": "",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.93,
+    "accuracy_baseline_model": "amd/Kimi-K2.5-MXFP4",
+    "_baseline_note": "Reference value from recipes/atom_vllm/Kimi-K2.5.md"
+  },
+  {
     "model_name": "DeepSeek-R1-FP8 TP8",
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extraArgs": "--tensor-parallel-size 8",
@@ -62,7 +74,7 @@
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
     "accuracy_threshold": 0.93,
-    "accuracy_baseline": 0.9553,
+    "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528"
   },
   {

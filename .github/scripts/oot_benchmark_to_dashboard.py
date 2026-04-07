@@ -86,12 +86,15 @@ def build_entries(result_dir: Path, run_url: str | None) -> list[dict]:
         gpu_name = payload.get("gpu_name", "")
         gpu_vram = payload.get("gpu_vram_gb", 0)
         rocm_ver = payload.get("rocm_version", "")
+        oot_image_tag = payload.get("oot_image_tag", "")
         if gpu_name:
             extra += f" | GPU: {gpu_name}"
         if gpu_vram:
             extra += f" | VRAM: {gpu_vram}GB"
         if rocm_ver:
             extra += f" | ROCm: {rocm_ver}"
+        if oot_image_tag:
+            extra += f" | Docker: {oot_image_tag}"
         extra = extra or None
 
         append_metric(

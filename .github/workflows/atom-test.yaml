@@ -253,7 +253,12 @@ jobs:
           echo "Model-specific environment variables:"
           cat /tmp/env_file.txt
 
-          docker run -dt --pull always --device=/dev/kfd $DEVICE_FLAG \
+          PULL_FLAG=""
+          if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            PULL_FLAG="--pull always"
+          fi
+
+          docker run -dt $PULL_FLAG --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           $MODEL_MOUNT \
           -w /workspace \
@@ -328,6 +333,7 @@ jobs:
       - name: Download models
         timeout-minutes: 150
         run: |
+          set -euo pipefail
           if [ -d "/models" ]; then
             model_dir="/models/${{ matrix.model_path }}"
             echo "/models directory found, checking cache and lock-protected download for ${model_dir}"

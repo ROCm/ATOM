@@ -15,6 +15,8 @@ ARG INSTALL_FASTSAFETENSORS=1
 ARG ROCM_WHEEL_INDEX="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/"
 ARG ROCM_TORCHVISION_VERSION="0.24.0+rocm7.2.1.gitb919bd0c"
 ARG ROCM_TORCHAUDIO_VERSION="2.9.0+rocm7.2.1.gite3c6ee2b"
+# Let PR OOT CI verify whether a pulled prebuilt image still matches this vLLM commit
+LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV MAX_JOBS=${MAX_JOBS}
@@ -31,15 +33,35 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     /usr/local/bin/ninja --version && \
     rm -rf /var/lib/apt/lists/*
 
+# Keep OOT aligned with the Triton that the ATOM base image actually imports.
+# vLLM/OOT installs can perturb Triton metadata, and some base images may carry
+# extra triton-*.dist-info residues. We therefore treat `import triton` in the
+# base image as the source of truth and back up only the matching dist-info
 RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========" && \
     "${VENV_PYTHON}" -m pip show atom || true && \
     "${VENV_PYTHON}" -m pip show amd-aiter || true && \
     "${VENV_PYTHON}" -m pip show mori || true && \
     echo "========== [OOT 2/7] Back up base image triton ==========" && \
+    BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
     mkdir -p /tmp/triton-base-backup && \
     cp -a /opt/venv/lib/python3.12/site-packages/triton /tmp/triton-base-backup/ && \
-    cp -a /opt/venv/lib/python3.12/site-packages/triton-*.dist-info /tmp/triton-base-backup/ && \
-    "${VENV_PYTHON}" -c "import triton; print(f'Base image triton backed up: {triton.__version__}')"
+    MATCHED_DIST_INFO="" && \
+    MATCH_COUNT=0 && \
+    for f in /opt/venv/lib/python3.12/site-packages/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
+      DIST_VERSION="$(awk -F': ' '$1 == "Version" { print $2; exit }' "$f/METADATA")"; \
+      if [ "${DIST_VERSION}" = "${BASE_TRITON_VERSION}" ]; then \
+        cp -a "$f" /tmp/triton-base-backup/; \
+        MATCHED_DIST_INFO="$(basename "$f")"; \
+        MATCH_COUNT=$((MATCH_COUNT + 1)); \
+      fi; \
+    done && \
+    if [ "${MATCH_COUNT}" -ne 1 ]; then \
+      echo "ERROR: Expected exactly one triton dist-info matching imported version ${BASE_TRITON_VERSION}, found ${MATCH_COUNT}." && \
+      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true && \
+      exit 1; \
+    fi && \
+    echo "Base image triton backed up: version=${BASE_TRITON_VERSION}, dist-info=${MATCHED_DIST_INFO}"
 
 RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
     rm -rf /app/vllm && \
@@ -87,16 +109,41 @@ RUN echo "FIXME: rocm/pytorch:latest currently resolves incompatible torchvision
       "torchaudio==${ROCM_TORCHAUDIO_VERSION}" && \
     "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
 
+# Restore that exact base-image Triton after all OOT installs finish. The goal
+# is not to choose a new Triton version, but to preserve ATOM base-image runtime
+# behavior and fail fast if `pip show triton` would disagree with `import triton`.
 RUN echo "========== [OOT] Restore base image triton ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
     rm -rf /opt/venv/lib/python3.12/site-packages/triton \
            /opt/venv/lib/python3.12/site-packages/triton-*.dist-info && \
     cp -a /tmp/triton-base-backup/triton /opt/venv/lib/python3.12/site-packages/ && \
+    RESTORED_DIST_INFO="" && \
+    RESTORED_COUNT=0 && \
     for f in /tmp/triton-base-backup/triton-*.dist-info; do \
+      [ -d "$f" ] || continue; \
       cp -a "$f" /opt/venv/lib/python3.12/site-packages/; \
+      RESTORED_DIST_INFO="$(basename "$f")"; \
+      RESTORED_COUNT=$((RESTORED_COUNT + 1)); \
     done && \
     rm -rf /tmp/triton-base-backup && \
-    "${VENV_PYTHON}" -c "import triton; print(f'Restored base image triton: {triton.__version__}')"
+    if [ "${RESTORED_COUNT}" -ne 1 ]; then \
+      echo "ERROR: Expected exactly one restored triton dist-info, found ${RESTORED_COUNT}." && \
+      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true && \
+      exit 1; \
+    fi && \
+    "${VENV_PYTHON}" -m pip show triton > /tmp/triton_pip_show.txt && \
+    PIP_TRITON_VERSION="$(awk -F': ' '/^Version: / { print $2; exit }' /tmp/triton_pip_show.txt)" && \
+    IMPORT_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
+    if [ -z "${PIP_TRITON_VERSION}" ] || [ "${PIP_TRITON_VERSION}" != "${IMPORT_TRITON_VERSION}" ]; then \
+      echo "ERROR: pip show triton reports '${PIP_TRITON_VERSION}', but import triton reports '${IMPORT_TRITON_VERSION}'." && \
+      cat /tmp/triton_pip_show.txt || true && \
+      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true && \
+      exit 1; \
+    fi && \
+    echo "Restored base image triton: version=${IMPORT_TRITON_VERSION}, dist-info=${RESTORED_DIST_INFO}" && \
+    cat /tmp/triton_pip_show.txt && \
+    rm -f /tmp/triton_pip_show.txt && \
+    "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')"
 
 CMD ["/bin/bash"]
 

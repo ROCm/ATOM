@@ -16,7 +16,7 @@ from atom.utils.block_convert import (
 import atom.model_ops as ops
 from atom.model_ops.paged_attention import PagedAttention
 from atom.model_ops.attention_mha import PagedAttentionImpl
-from atom.model_ops.radix_attention import RadixAttention
+from atom.plugin.sglang.attention_backend.radix_attention import RadixAttention
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder

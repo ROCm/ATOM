@@ -44,18 +44,13 @@ on:
         type: boolean
         default: false
       build_oot_image:
-        description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT)"
+        description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
+        type: boolean
+        default: true
+      only_release_oot:
+        description: "Only release the OOT vLLM image: skip native image test/push and always build/push OOT"
         type: boolean
         default: false
-      oot_base_image:
-        description: "Base ATOM image for OOT vLLM (empty means the atom_release:ci image built in this job)"
-        default: ""
-      vllm_commit:
-        description: "vLLM commit for OOT image"
-        default: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
-      vllm_version:
-        description: "vLLM version label for OOT image tags"
-        default: "0.17.0"
 
 jobs:
   docker-release:
@@ -116,7 +111,7 @@ jobs:
           docker inspect atom_release:ci
 
       - name: Test Docker image
-        if: ${{ inputs.skip_tests != true }}
+        if: ${{ inputs.skip_tests != true && inputs.only_release_oot != true }}
         timeout-minutes: 60
         run: |
           echo "Clean up containers..."
@@ -165,7 +160,7 @@ jobs:
           fi
 
       - name: Push Docker image
-        if: ${{ success() }}
+        if: ${{ success() && inputs.only_release_oot != true }}
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
           TAG=nightly_$(date +%Y%m%d%H%M)
@@ -175,30 +170,25 @@ jobs:
           docker push rocm/atom-dev:${TAG}
 
       - name: Build OOT Docker image
-        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true) }}
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
         timeout-minutes: 180
         run: |
-          if [ -n "${{ inputs.oot_base_image }}" ]; then
-            OOT_BASE_IMAGE="${{ inputs.oot_base_image }}"
-            docker pull "${OOT_BASE_IMAGE}"
-          else
-            OOT_BASE_IMAGE="atom_release:ci"
-          fi
+          OOT_BASE_IMAGE="atom_release:ci"
           echo "Using OOT base image: ${OOT_BASE_IMAGE}"
           docker build --network=host -t atom_oot_release:ci \
             --target atom_oot \
             --build-arg OOT_BASE_IMAGE="${OOT_BASE_IMAGE}" \
             --build-arg MAX_JOBS=64 \
-            --build-arg VLLM_COMMIT="${{ inputs.vllm_commit || env.VLLM_COMMIT }}" \
+            --build-arg VLLM_COMMIT="${{ env.VLLM_COMMIT }}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
           docker inspect atom_oot_release:ci
 
       - name: Push OOT Docker image
-        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true) }}
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
         run: |
-          VLLM_VER="${{ inputs.vllm_version || env.VLLM_VERSION }}"
+          VLLM_VER="${{ env.VLLM_VERSION }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
           OOT_LATEST_TAG="vllm-latest"
           docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
