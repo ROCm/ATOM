@@ -31,8 +31,9 @@ Model onboarding progress:
 - [ ] 4) Plugin registration completed (if needed)
 - [ ] 5) Smoke test passed
 - [ ] 6) Accuracy eval completed
-- [ ] 7) `recipes/atom_vllm` recipe added/updated
-- [ ] 8) CI matrix entry added
+- [ ] 7) Accuracy result table inserted into recipe
+- [ ] 8) `recipes/atom_vllm` recipe added/updated
+- [ ] 9) CI matrix entry added
 ```
 
 ### 1) Reuse Analysis (Do This First)
@@ -100,6 +101,24 @@ lm_eval --model local-completions \
   --tasks gsm8k --num_fewshot 5
 ```
 
+### 6.5) Insert Accuracy Result Into Recipe
+
+After `lm_eval` finishes, insert the measured result into the corresponding
+`recipes/atom_vllm/<Model-Name>.md` section using this table format:
+
+```text
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.93  |±  |0.0256|
+|     |       |strict-match    |     5|exact_match|↑  |0.93  |±  |0.0256|
+```
+
+Requirements:
+
+- Use the actual `n-shot` and measured values/stderr from the run output (do not round aggressively).
+- Keep the table adjacent to the `lm_eval` command in the recipe.
+- Include the raw result JSON path for traceability.
+
 ### 7) Add `recipes/atom_vllm` Entry
 
 For every new model added to ATOM vLLM plugin support, also add or update a usage recipe under:
@@ -113,7 +132,8 @@ Minimum recipe content:
 3. `vllm serve` launch commands (include the exact model path and key args such as TP, KV dtype, async scheduling)
 4. Optional benchmark command (`vllm bench serve` or project benchmark script)
 5. Accuracy validation command (`lm_eval --model local-completions ...`)
-6. Any model-specific env vars and caveats (for example, plugin attention toggle if required)
+6. Accuracy result table using the standard `|Tasks|Version|...|` format + raw JSON path
+7. Any model-specific env vars and caveats (for example, plugin attention toggle if required)
 
 Use existing files in `recipes/atom_vllm/` (such as `DeepSeek-R1.md`, `Qwen3.5.md`, `Kimi-K2.5.md`) as style references.
 

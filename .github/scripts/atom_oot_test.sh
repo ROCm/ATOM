@@ -204,7 +204,10 @@ accuracy_one_model() {
 
   mkdir -p "${RESULT_DIR}"
   local run_tag
-  run_tag="$(date +%Y%m%d%H%M%S)_${model_name// /_}"
+  # Keep result filenames path-safe when model names contain slashes.
+  local safe_model_name="${model_name//\//_}"
+  safe_model_name="${safe_model_name// /_}"
+  run_tag="$(date +%Y%m%d%H%M%S)_${safe_model_name}"
   local output_path="${RESULT_DIR}/${run_tag}"
   flat_result_file="${RESULT_DIR}/${run_tag}.json"
 
