@@ -405,7 +405,7 @@ def analyze_concurrency(job_rows: list[dict[str, Any]], report_time: datetime):
         durations: list[float] = []
 
         for row in label_rows:
-            created = parse_time(row.get("created_at", ""))
+            parse_time(row.get("created_at", ""))
             started = parse_time(row.get("started_at", ""))
             completed = parse_time(row.get("completed_at", ""))
 
