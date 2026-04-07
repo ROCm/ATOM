@@ -40,7 +40,9 @@ class CandidateTag:
     date: str
 
 
-def http_request(url: str, *, headers: dict[str, str] | None = None) -> tuple[bytes, object]:
+def http_request(
+    url: str, *, headers: dict[str, str] | None = None
+) -> tuple[bytes, object]:
     request = Request(url, headers=headers or {})
     try:
         with urlopen(request, timeout=30) as response:
@@ -69,7 +71,9 @@ def get_registry_token(repository: str) -> str:
     payload = json.loads(body.decode("utf-8"))
     token = payload.get("token")
     if not token:
-        raise RuntimeError(f"Registry token response did not include a token for {repository}")
+        raise RuntimeError(
+            f"Registry token response did not include a token for {repository}"
+        )
     return str(token)
 
 
@@ -84,14 +88,20 @@ def registry_headers(token: str, *, accept: str | None = None) -> dict[str, str]
 
 
 def get_manifest_digest(repository: str, reference: str, token: str) -> str:
-    manifest_url = f"{REGISTRY_URL}/v2/{repository}/manifests/{quote(reference, safe='')}"
+    manifest_url = (
+        f"{REGISTRY_URL}/v2/{repository}/manifests/{quote(reference, safe='')}"
+    )
     _, headers = http_request(
         manifest_url,
         headers=registry_headers(token, accept=MANIFEST_ACCEPT),
     )
-    digest = headers.get("Docker-Content-Digest") or headers.get("docker-content-digest")
+    digest = headers.get("Docker-Content-Digest") or headers.get(
+        "docker-content-digest"
+    )
     if not digest:
-        raise RuntimeError(f"Registry did not return Docker-Content-Digest for {repository}:{reference}")
+        raise RuntimeError(
+            f"Registry did not return Docker-Content-Digest for {repository}:{reference}"
+        )
     return str(digest).strip()
 
 
@@ -119,7 +129,9 @@ def list_tags(repository: str, token: str) -> list[str]:
     return tags
 
 
-def nightly_candidates(tags: Iterable[str], preferred_version: str | None) -> list[CandidateTag]:
+def nightly_candidates(
+    tags: Iterable[str], preferred_version: str | None
+) -> list[CandidateTag]:
     candidates: list[CandidateTag] = []
     for tag in tags:
         match = NIGHTLY_RE.match(tag)
@@ -134,13 +146,17 @@ def nightly_candidates(tags: Iterable[str], preferred_version: str | None) -> li
         )
 
     def sort_key(candidate: CandidateTag) -> tuple[int, str, str]:
-        preferred = 1 if preferred_version and candidate.version == preferred_version else 0
+        preferred = (
+            1 if preferred_version and candidate.version == preferred_version else 0
+        )
         return (preferred, candidate.date, candidate.tag)
 
     return sorted(candidates, key=sort_key, reverse=True)
 
 
-def resolve_image(repository: str, reference_tag: str, preferred_version: str | None) -> dict[str, object]:
+def resolve_image(
+    repository: str, reference_tag: str, preferred_version: str | None
+) -> dict[str, object]:
     token = get_registry_token(repository)
     reference_digest = get_manifest_digest(repository, reference_tag, token)
     candidates = nightly_candidates(list_tags(repository, token), preferred_version)
@@ -182,8 +198,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Resolve a floating OOT image tag to a same-digest nightly tag when possible."
     )
-    parser.add_argument("--repository", required=True, help="Docker repository, for example rocm/atom-dev")
-    parser.add_argument("--reference-tag", required=True, help="Floating tag to resolve, for example vllm-latest")
+    parser.add_argument(
+        "--repository",
+        required=True,
+        help="Docker repository, for example rocm/atom-dev",
+    )
+    parser.add_argument(
+        "--reference-tag",
+        required=True,
+        help="Floating tag to resolve, for example vllm-latest",
+    )
     parser.add_argument(
         "--preferred-version",
         default="",
