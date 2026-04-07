@@ -1929,7 +1929,7 @@ function renderTrendsTab() {
                 ` Date:  ${fmtDate(commitDateMap[lbl])}`
               ];
             },
-            afterBody: () => '\nClick to trace'
+            afterBody: () => '\nClick for details'
           }},
           datalabels: { display: false }
         },
@@ -1940,10 +1940,13 @@ function renderTrendsTab() {
         onClick: (_e, elems) => {
           if (!elems.length) return;
           const ds = datasets[elems[0].datasetIndex];
+          const key = ds._configKey;
+          if (!key) return;
           const lbl = orderedLabels[elems[0].index];
           const cid = labelToCid[lbl];
-          const run = cid ? allRuns.find(r => r.commit.id.slice(0, 7) === cid) : null;
-          if (run && ds._configKey) switchToTrace(ds._configKey, run.date);
+          const hist = historyMap[key];
+          const histCfg = cid && hist ? hist.find(h => h.commit.id.slice(0, 7) === cid) : null;
+          showPopover(key, histCfg || latestConfigs[key]);
         }
       }
     });
