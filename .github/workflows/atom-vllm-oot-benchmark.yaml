@@ -68,7 +68,7 @@ on:
         type: boolean
         default: false
       oot_image:
-        description: "Optional OOT benchmark image override. Leave empty to use vllm-latest on main or rebuild from the selected non-main branch."
+        description: "Optional OOT benchmark image override. Leave empty to resolve main to the same-digest published nightly tag behind vllm-latest, or rebuild from the selected non-main branch."
         type: string
         default: ""
       publish_to_dashboard:
@@ -123,17 +123,10 @@ jobs:
           REBUILD_OOT_IMAGE=false
           OOT_IMAGE_SOURCE="prebuilt"
           USER_PROVIDED_OOT_IMAGE=false
-          if [[ -n "${INPUT_OOT_IMAGE}" ]]; then
-            PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE}"
-            OOT_IMAGE_SOURCE="user-provided"
-            USER_PROVIDED_OOT_IMAGE=true
-          elif [[ "${NORMALIZED_REF}" == "main" ]]; then
-            PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
-            OOT_IMAGE_SOURCE="prebuilt"
-          else
-            REBUILD_OOT_IMAGE=true
-            OOT_IMAGE_SOURCE="rebuild"
-          fi
+          RESOLVED_PREBUILT_ALIAS=""
+          RESOLVED_PREBUILT_DIGEST=""
+          PREBUILT_RESOLUTION_TYPE=""
+          RESOLVED_NIGHTLY_TAG=""
 
           PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
 
@@ -155,6 +148,47 @@ jobs:
 
           SELECTED_VLLM_COMMIT="${VLLM_META[0]}"
           SELECTED_VLLM_VERSION="${VLLM_META[1]}"
+
+          if [[ -n "${INPUT_OOT_IMAGE}" ]]; then
+            PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE}"
+            OOT_IMAGE_SOURCE="user-provided"
+            USER_PROVIDED_OOT_IMAGE=true
+          elif [[ "${NORMALIZED_REF}" == "main" ]]; then
+            if RESOLUTION_JSON="$(
+              python3 .github/scripts/resolve_oot_image.py \
+                --repository rocm/atom-dev \
+                --reference-tag vllm-latest \
+                --preferred-version "${SELECTED_VLLM_VERSION}"
+            )"; then
+              mapfile -t RESOLVED_IMAGE_META < <(
+                RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          print(resolution["reference_image"])
+          print(resolution["reference_digest"])
+          print(resolution["match_type"])
+          print(resolution.get("matched_tag", ""))
+          PY
+              )
+              PREBUILT_OOT_IMAGE="${RESOLVED_IMAGE_META[0]}"
+              RESOLVED_PREBUILT_ALIAS="${RESOLVED_IMAGE_META[1]}"
+              RESOLVED_PREBUILT_DIGEST="${RESOLVED_IMAGE_META[2]}"
+              PREBUILT_RESOLUTION_TYPE="${RESOLVED_IMAGE_META[3]}"
+              RESOLVED_NIGHTLY_TAG="${RESOLVED_IMAGE_META[4]}"
+            else
+              echo "::warning::Failed to resolve a same-digest nightly tag for rocm/atom-dev:vllm-latest; falling back to the floating tag."
+              PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
+              RESOLVED_PREBUILT_ALIAS="rocm/atom-dev:vllm-latest"
+              PREBUILT_RESOLUTION_TYPE="resolution-failed"
+            fi
+            OOT_IMAGE_SOURCE="prebuilt"
+          else
+            REBUILD_OOT_IMAGE=true
+            OOT_IMAGE_SOURCE="rebuild"
+          fi
 
           {
             echo "atom_repository=${ATOM_REPOSITORY}"
@@ -193,6 +227,28 @@ jobs:
               "${PREBUILT_OOT_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
               "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
+            if [[ -n "${RESOLVED_PREBUILT_ALIAS}" ]]; then
+              printf -- '- Floating alias: `%s`\n' \
+                "${RESOLVED_PREBUILT_ALIAS}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [[ -n "${RESOLVED_PREBUILT_DIGEST}" ]]; then
+              printf -- '- Resolved digest: `%s`\n' \
+                "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            case "${PREBUILT_RESOLUTION_TYPE}" in
+              matched-nightly-tag)
+                printf -- '- Resolution: reverse-matched same digest to nightly tag `%s`\n' \
+                  "${RESOLVED_NIGHTLY_TAG}" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              digest-pinned-latest)
+                printf -- '- Resolution: no nightly tag with the same digest was found, so this run pins `vllm-latest` to its current digest instead.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              resolution-failed)
+                printf -- '- Resolution: reverse lookup failed, so this run falls back to floating `vllm-latest`.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
+            esac
           fi
 
           printf -- '- Upload to dashboard: `%s`\n' \
@@ -579,6 +635,66 @@ jobs:
           echo "Pulling OOT benchmark image: ${OOT_IMAGE_TAG}"
           docker pull "${OOT_IMAGE_TAG}"
 
+      - name: Resolve pulled OOT image digest
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          OOT_IMAGE_DIGEST="$(
+            OOT_IMAGE_TAG="${OOT_IMAGE_TAG}" python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          image_ref = os.environ["OOT_IMAGE_TAG"]
+          repo = image_ref.split("@", 1)[0]
+          last_segment = repo.rsplit("/", 1)[-1]
+          if ":" in last_segment:
+              repo = repo.rsplit(":", 1)[0]
+
+          inspect_targets = [image_ref]
+          tag_ref = image_ref.split("@", 1)[0]
+          if tag_ref != image_ref:
+              inspect_targets.append(tag_ref)
+
+          repo_digests = []
+          for target in inspect_targets:
+              try:
+                  repo_digests_raw = subprocess.check_output(
+                      [
+                          "docker",
+                          "inspect",
+                          "--format",
+                          "{{json .RepoDigests}}",
+                          target,
+                      ],
+                      text=True,
+                  ).strip()
+              except subprocess.CalledProcessError:
+                  continue
+
+              repo_digests = json.loads(repo_digests_raw or "[]") or []
+              if repo_digests:
+                  break
+
+          digest = ""
+          for repo_digest in repo_digests:
+              if repo_digest.startswith(f"{repo}@"):
+                  digest = repo_digest.split("@", 1)[1]
+                  break
+
+          if not digest and repo_digests:
+              digest = repo_digests[0].split("@", 1)[1]
+
+          print(digest)
+          PY
+          )"
+
+          if [[ -n "${OOT_IMAGE_DIGEST}" ]]; then
+            echo "Resolved OOT image digest: ${OOT_IMAGE_DIGEST}"
+            echo "OOT_IMAGE_DIGEST=${OOT_IMAGE_DIGEST}" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Failed to determine a repo digest for ${OOT_IMAGE_TAG}"
+          fi
+
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
         run: |
@@ -774,6 +890,7 @@ jobs:
             -e VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
             -e OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
             -e OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
+            -e OOT_IMAGE_DIGEST_USED="${OOT_IMAGE_DIGEST:-}" \
             -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
             "$CONTAINER_NAME" python3 - <<'PY'
           import json
@@ -806,6 +923,7 @@ jobs:
           data["vllm_version"] = os.environ.get("VLLM_VERSION_USED", "")
           data["oot_image_source"] = os.environ.get("OOT_IMAGE_SOURCE", "")
           data["oot_image_tag"] = os.environ.get("OOT_IMAGE_TAG_USED", "")
+          data["oot_image_digest"] = os.environ.get("OOT_IMAGE_DIGEST_USED", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
           )

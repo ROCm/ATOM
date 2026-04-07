@@ -488,6 +488,8 @@ function parseRunConfigs(run) {
       if (rcm) configs[key]._rocm_version = rcm[1];
       const dm = b.extra.match(/Docker:\s*([^|]+)/);
       if (dm) configs[key]._oot_image_tag = dm[1].trim();
+      const dg = b.extra.match(/Digest:\s*([^|]+)/);
+      if (dg) configs[key]._oot_image_digest = dg[1].trim();
     }
   }
   return configs;
@@ -1308,7 +1310,7 @@ function renderPerformanceTab() {
       <td>${safeHref(cfg.runUrl) ? `<a href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">view</a>` : '—'}</td>
     </tr>`;
     // Detail row
-    html += `<tr class="detail-row" data-detail="${key}"><td colspan="14">${buildDetailHTML(key, cfg)}</td></tr>`;
+    html += `<tr class="detail-row" data-detail="${key}"><td colspan="14">${buildDetailHTML(key, cfg, { showOotDigest: true, hideOotCommitMeta: true })}</td></tr>`;
   }
   html += '</tbody></table></div></div>';
 
@@ -2162,10 +2164,19 @@ function renderTimeline() {
 /* ================================================================
    13. DETAIL HTML (shared by Performance & Data tabs)
    ================================================================ */
-function buildDetailHTML(key, cfg) {
+function buildDetailHTML(key, cfg, opts = {}) {
   const hist = historyMap[key];
   const prev = (hist && hist.length > 1) ? hist[1] : null;
   const reg = regressions[key];
+  const showOotDigest = opts.showOotDigest === true && cfg.backend === 'ATOM-vLLM' && !!cfg._oot_image_digest;
+  const hideOotCommitMeta = opts.hideOotCommitMeta === true && cfg.backend === 'ATOM-vLLM';
+  const ootDigestRow = showOotDigest
+    ? `<div class="detail-item"><span class="detail-key">Digest</span><span class="detail-val" style="max-width:250px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_digest)}</span></div>`
+    : '';
+  const commitMetaRows = hideOotCommitMeta ? '' : `
+      <div class="detail-item"><span class="detail-key">Commit</span><span class="detail-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
+      <div class="detail-item"><span class="detail-key">Message</span><span class="detail-val" style="font-family:inherit;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHTML(cfg.commit.message || '')}">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
+      <div class="detail-item"><span class="detail-key">Author</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>`;
 
   const interactive = cfg.TPOT && cfg.TPOT > 0 ? 1000 / cfg.TPOT : null;
   const prevInteractive = prev?.TPOT && prev.TPOT > 0 ? 1000 / prev.TPOT : null;
@@ -2192,13 +2203,12 @@ function buildDetailHTML(key, cfg) {
       <div class="detail-item"><span class="detail-key">VRAM</span><span class="detail-val">${cfg._gpu_vram_gb ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_vram_gb + ' GB' : '—'}</span></div>
       <div class="detail-item"><span class="detail-key">ROCm</span><span class="detail-val">${escHTML(cfg._rocm_version || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Docker</span><span class="detail-val" style="max-width:250px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_tag || '—')}</span></div>
-      <div class="detail-item"><span class="detail-key">Commit</span><span class="detail-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
-      <div class="detail-item"><span class="detail-key">Message</span><span class="detail-val" style="font-family:inherit;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHTML(cfg.commit.message || '')}">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
-      <div class="detail-item"><span class="detail-key">Author</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>
+      ${ootDigestRow}
+      ${commitMetaRows}
       <div class="detail-item"><span class="detail-key">Date</span><span class="detail-val">${cfg.commit.timestamp ? fmtDate(new Date(cfg.commit.timestamp).getTime()) : '—'}</span></div>
       <div class="action-row">
         ${safeHref(cfg.runUrl) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">Open CI Run ↗</a>` : ''}
-        ${safeHref(cfg.commit.url) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
+        ${!hideOotCommitMeta && safeHref(cfg.commit.url) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
       </div>
     </div>
   </div>`;
@@ -2211,6 +2221,12 @@ function showPopover(key, cfg) {
   const hist = historyMap[key];
   const prev = (hist && hist.length > 1) ? hist[1] : null;
   const reg = regressions[key];
+  const showOotDigest = cfg.backend === 'ATOM-vLLM' && !!cfg._oot_image_digest;
+  const hideOotCommitMeta = cfg.backend === 'ATOM-vLLM';
+  const popCommitMetaRows = hideOotCommitMeta ? '' : `
+      <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>`;
 
   const pop = document.getElementById('popover');
   pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
@@ -2225,15 +2241,14 @@ function showPopover(key, cfg) {
       <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}${cfg._gpu_vram_gb ? ' · ' + cfg._gpu_vram_gb + 'GB' : ''}</span></div>
       <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(cfg._rocm_version || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_tag || '—')}</span></div>
-      <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
-      <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
-      <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>
+      ${showOotDigest ? `<div class="pop-row"><span class="pop-key">Digest</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_digest)}</span></div>` : ''}
+      ${popCommitMetaRows}
       <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${fmtDate(cfg.date)}</span></div>
     </div>
     <div class="action-row">
       <button class="action-btn" id="pop-trace-btn">Trace →</button>
       ${safeHref(cfg.runUrl) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">Open CI Run ↗</a>` : ''}
-      ${safeHref(cfg.commit.url) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
+      ${!hideOotCommitMeta && safeHref(cfg.commit.url) ? `<a class="action-btn" href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
     </div>`;
   document.getElementById('popover-overlay').classList.add('open');
   document.getElementById('pop-close-btn').addEventListener('click', (e) => {
