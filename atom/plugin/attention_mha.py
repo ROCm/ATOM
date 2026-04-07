@@ -31,6 +31,66 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
 
 
+def _triton_flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                               max_seqlen_q, max_seqlen_k, softmax_scale,
+                               causal=True, sliding_window=(-1, -1, 0),
+                               out=None, dropout_p=0.0):
+    """Fallback for prefill when head_dim > 256 (CK limitation).
+
+    Tries aiter Triton FA2 first, falls back to PyTorch SDPA with
+    GQA head expansion.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    try:
+        from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.interface_v2 import (  # noqa: E501
+            varlen_fwd,
+        )
+        if out is None:
+            out = torch.empty_like(q)
+        wl = sliding_window[0] if isinstance(sliding_window, (tuple, list)) else sliding_window
+        wr = sliding_window[1] if isinstance(sliding_window, (tuple, list)) else 0
+        device = q.device
+        empty = torch.empty(0, device=device)
+        varlen_fwd(
+            q, k, v, out,
+            cu_seqlens_q, cu_seqlens_k,
+            None, None, empty, None,
+            max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale,
+            False, causal,
+            wl if wl > 0 else -1,
+            wr if wr > 0 else -1,
+            0.0, False,
+        )
+        return out
+    except Exception:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        num_q_heads = q.shape[1]
+        num_kv_heads = k.shape[1]
+        head_repeat = num_q_heads // num_kv_heads
+        outputs = []
+        for i in range(batch_size):
+            sq, eq = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
+            sk, ek = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
+            qi = q[sq:eq].unsqueeze(0).transpose(1, 2)
+            ki = k[sk:ek].unsqueeze(0).transpose(1, 2)
+            vi = v[sk:ek].unsqueeze(0).transpose(1, 2)
+            if head_repeat > 1:
+                ki = ki.repeat_interleave(head_repeat, dim=1)
+                vi = vi.repeat_interleave(head_repeat, dim=1)
+            oi = F.scaled_dot_product_attention(
+                qi, ki, vi, is_causal=causal, scale=softmax_scale,
+            )
+            outputs.append(oi.transpose(1, 2).squeeze(0))
+        result = torch.cat(outputs, dim=0)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+
 class PagedAttentionImplPluginModeMethods:
     """
     Container class for plugin mode methods.
@@ -629,23 +689,30 @@ class PagedAttentionImplPluginModeMethods:
                 else (-1, -1, 0)
             )
 
-            aiter.flash_attn_varlen_func(
-                q=prefill_query,
-                k=prefill_key,
-                v=prefill_value,
-                cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.plugin_metadata.prefill_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.plugin_metadata.prefill_metadata.max_seq_len,
-                min_seqlen_q=1,
-                dropout_p=attn_metadata.dropout_p,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=sliding_window,
-                alibi_slopes=None,
-                sink_ptr=self.sinks,
-                out=output_actual_tokens[num_decode_tokens + num_extend_tokens :],
-            )
+            _pf_out = output_actual_tokens[num_decode_tokens + num_extend_tokens :]
+            if self.head_dim > 256:
+                _triton_flash_attn_varlen(
+                    q=prefill_query, k=prefill_key, v=prefill_value,
+                    cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.plugin_metadata.prefill_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.plugin_metadata.prefill_metadata.max_seq_len,
+                    softmax_scale=self.scale, causal=True,
+                    sliding_window=sliding_window, out=_pf_out,
+                    dropout_p=0.0,
+                )
+            else:
+                aiter.flash_attn_varlen_func(
+                    q=prefill_query, k=prefill_key, v=prefill_value,
+                    cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.plugin_metadata.prefill_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.plugin_metadata.prefill_metadata.max_seq_len,
+                    min_seqlen_q=1, dropout_p=attn_metadata.dropout_p,
+                    softmax_scale=self.scale, causal=True,
+                    window_size=sliding_window, alibi_slopes=None,
+                    sink_ptr=self.sinks, out=_pf_out,
+                )
 
         # calculate for extends
         if num_extends > 0:

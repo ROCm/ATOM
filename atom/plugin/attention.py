@@ -1435,6 +1435,16 @@ def AiterBackendDecoratorForPluginMode(cls):
             if name.startswith("_"):
                 continue
             setattr(cls, name, getattr(methods_cls, name))
+        # Rebase onto vLLM v1 AttentionBackend so cls inherits default method
+        # stubs (get_preferred_block_size, validate_configuration, supports_*,
+        # etc.) that the vLLM v1 attention selector requires.
+        try:
+            from vllm.v1.attention.backend import (
+                AttentionBackend as _VllmAttnBackend,
+            )
+            cls.__bases__ = (_VllmAttnBackend,)
+        except ImportError:
+            pass
     return cls
 
 
