@@ -160,8 +160,9 @@ def split_attn_metadata(
         ub_slot_mapping = attn_metadata.slot_mapping[ts]
         # Pad with -1 for padded positions
         tok_count = ts.stop - ts.start
-        max_q_len = attn_metadata.max_seqlen_q
-        padded_tok_count = padded_bs * max_q_len
+        # max_q_len = attn_metadata.max_seqlen_q
+        # padded_tok_count = padded_bs * max_q_len
+        padded_tok_count = padded_bs
         if padded_tok_count > tok_count:
             pad = torch.full(
                 (padded_tok_count - tok_count,),

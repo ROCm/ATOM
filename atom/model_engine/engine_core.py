@@ -401,16 +401,14 @@ class DPEngineCoreProc(EngineCore):
 
             self.engines_running = global_has_unfinished
 
+    def _execute_dummy_batch(self):
+        return self.runner_mgr.call_func("dummy_execution", wait_out=True)
+
     def _execute_dummy_prefill(self, num_tokens: int, num_reqs: int = 1):
         return self.runner_mgr.call_func(
             "dummy_prefill_execution", num_tokens, num_reqs, wait_out=True
         )
 
-    def _execute_dummy_prefill(self, num_tokens: int):
-        """Execute dummy prefill batch to sync with other DP ranks doing prefill."""
-        return self.runner_mgr.call_func(
-            "dummy_prefill_execution", num_tokens, wait_out=True
-        )
 
     def _sync_dp_state(
         self,

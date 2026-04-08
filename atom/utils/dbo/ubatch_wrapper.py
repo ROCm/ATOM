@@ -83,14 +83,17 @@ class UBatchWrapper(nn.Module):
         forward_contexts = []
         ub_inputs = []
         for i, ub_slice in enumerate(ctx.ubatch_slices):
+            ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
             if ctx.context.is_prefill:
                 # Prefill is eager-only (no CUDAGraph), no padding needed.
-                padded_bs = ub_slice.request_slice.stop - ub_slice.request_slice.start
+                padded_bs = ub_num_reqs
             elif i < N - 1:
                 padded_bs = full_graph_bs // N
             else:
                 padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
-            ub_ctx = self._make_ubatch_context(original_ctx, ub_slice, padded_bs, i)
+            ub_ctx = self._make_ubatch_context(
+                original_ctx, ub_slice, padded_bs, i, ub_num_reqs,
+            )
             forward_contexts.append(ub_ctx)
             ub_inputs.append(
                 (
@@ -283,6 +286,7 @@ class UBatchWrapper(nn.Module):
         ub_slice: UBatchSlice,
         padded_bs: int,
         ubatch_idx: int = 0,
+        actual_num_reqs: int | None = None,
     ) -> ForwardContext:
         """Build a ForwardContext for a single micro-batch.
 
@@ -303,9 +307,10 @@ class UBatchWrapper(nn.Module):
                 padded_bs,
             )
         else:
+            attn_bs = actual_num_reqs if actual_num_reqs is not None else padded_bs
             ub_attn = self.attn_metadata_builder.build_ubatch_metadata(
                 ubatch_idx,
-                padded_bs,
+                attn_bs,
             )
 
         # Split Context
