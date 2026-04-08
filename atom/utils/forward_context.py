@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Union
@@ -338,7 +339,6 @@ _forward_context: Optional[ForwardContext] = ForwardContext()
 _forward_kv_cache_context: Optional[ForwardContext] = ForwardContext()
 
 # Thread-local storage for TBO dual-thread execution
-import threading
 
 _forward_context_local = threading.local()
 

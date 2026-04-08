@@ -18,7 +18,7 @@ from atom.utils.forward_context import (
 )
 
 from .ubatch_splitting import UBatchSlice
-from .ubatching import TBOContext, make_tbo_contexts
+from .ubatching import make_tbo_contexts
 
 logger = logging.getLogger("atom")
 

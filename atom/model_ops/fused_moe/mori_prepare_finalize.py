@@ -3,7 +3,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import torch
 
