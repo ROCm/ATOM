@@ -18,6 +18,7 @@ from aiter import (
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
 )
+from aiter.ops.flydsl import flydsl_rmsnorm
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
@@ -183,6 +184,7 @@ class RMSNorm(nn.Module):
         fused_quant: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_flydsl: bool = True,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -196,6 +198,7 @@ class RMSNorm(nn.Module):
         # (i.e. dim * dtype_size must be a multiple of 1024).
         # For bf16: dim must be a multiple of 512.
         self._fused_ar_supported = (dim * 2) % 1024 == 0
+        self.use_flydsl = use_flydsl
 
         layer_quant_config = (
             LayerQuantConfig()
@@ -226,10 +229,9 @@ class RMSNorm(nn.Module):
                     x, self.weight, self.eps, residual, self.x_pad_to_multiple
                 )
                 return x, residual
+
         if self.fused_allreduce and self.tp_size > 1:
-            assert (
-                residual is not None
-            ), "fused_allreduce_rmsnorm requires residual input!"
+            assert residual is not None, "fused_allreduce_rmsnorm requires residual input!"
             if self._fused_ar_supported:
                 x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
                     x,
@@ -239,73 +241,72 @@ class RMSNorm(nn.Module):
                 )
                 return x, residual
             else:
-                # Shape not supported by fused kernel; do allreduce separately
                 x = tensor_model_parallel_all_reduce(x)
                 x, residual = rmsnorm2d_fwd_with_add_(
                     x, self.weight, residual, self.eps, self.dim
                 )
                 return x, residual
-        else:
-            if x_scale is not None and self.use_fused_quant:
-                from aiter.ops.triton.fused_fp8_quant import (
-                    fused_rms_fp8_per_tensor_static_quant,
+
+        if x_scale is not None and self.use_fused_quant:
+            from aiter.ops.triton.fused_fp8_quant import (
+                fused_rms_fp8_per_tensor_static_quant,
+            )
+            import aiter as rocm_aiter
+
+            rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
+            if residual is None:
+                x, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
+                    x,
+                    self.weight,
+                    self.eps,
+                    x_scale,
+                    None,
+                    None,
+                    self.eps,
+                    dtype_quant=rocm_aiter_fp8_dtype,
+                    res1=None,
                 )
-                import aiter as rocm_aiter
-
-                rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
-
-                # static FP8 quantization
-                if residual is None:
-                    x, _, _, _ = fused_rms_fp8_per_tensor_static_quant(
-                        x,
-                        self.weight,
-                        self.eps,
-                        x_scale,
-                        None,
-                        None,
-                        self.eps,
-                        dtype_quant=rocm_aiter_fp8_dtype,
-                        res1=None,
-                    )
-                    return (x, x_scale)
-                else:
-                    x, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
-                        x,
-                        self.weight,
-                        self.eps,
-                        x_scale,
-                        None,
-                        None,
-                        self.eps,
-                        dtype_quant=rocm_aiter_fp8_dtype,
-                        res1=residual,
-                    )
-                    return (x, x_scale), residual
-            elif self.use_fused_quant and (
-                x_scale is None and self.quant_type.value == QuantType.per_1x32.value
-            ):
-                if residual is None:
-                    x, x_scale, _ = mxfp4_rms_quant_fuse(
-                        x, self.weight, self.eps, shuffle=True
-                    )
-                    return x, x_scale
-                else:
-                    x, x_scale, residual = mxfp4_rms_quant_fuse(
-                        x, self.weight, self.eps, shuffle=True, res1=residual
-                    )
-                    return (x, x_scale), residual
+                return (x, x_scale)
             else:
-                if residual is None:
-                    # return rmsnorm2d_fwd(x, self.weight, self.eps).view(ori_shape)
-                    x = rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
-                    return x
-                else:
-                    # return self.add_rms_forward(x, residual)
-                    x, residual = rmsnorm2d_fwd_with_add_(
-                        x, self.weight, residual, self.eps, self.dim
-                    )
-                    return x, residual
+                x, _, _, residual = fused_rms_fp8_per_tensor_static_quant(
+                    x,
+                    self.weight,
+                    self.eps,
+                    x_scale,
+                    None,
+                    None,
+                    self.eps,
+                    dtype_quant=rocm_aiter_fp8_dtype,
+                    res1=residual,
+                )
+                return (x, x_scale), residual
 
+        elif self.use_fused_quant and (
+            x_scale is None and self.quant_type.value == QuantType.per_1x32.value
+        ):
+            if residual is None:
+                x, x_scale, _ = mxfp4_rms_quant_fuse(
+                    x, self.weight, self.eps, shuffle=True
+                )
+                return x, x_scale
+            else:
+                x, x_scale, residual = mxfp4_rms_quant_fuse(
+                    x, self.weight, self.eps, shuffle=True, res1=residual
+                )
+                return (x, x_scale), residual
+
+        else:
+            if residual is None:
+                if self.use_flydsl and x.is_cuda and self.eps == 1e-5:
+                    print("Using FlyDSL)")
+                    return flydsl_rmsnorm(x, self.weight, self.eps)
+                return rmsnorm2d_fwd_(x, self.weight, self.eps, self.dim)
+            else:
+                x, residual = rmsnorm2d_fwd_with_add_(
+                    x, self.weight, residual, self.eps, self.dim
+                )
+                return x, residual
 
 class RMSNormGated(nn.Module):
     """RMS Normalization with optional gating.
