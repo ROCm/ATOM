@@ -588,6 +588,7 @@ class PagedAttentionImpl(nn.Module):
                 position=position,
                 q_scale=q_scale,
                 qkv=qkv,
+                output=output,
             )
         else:
             # only for server mode, keep the original method
