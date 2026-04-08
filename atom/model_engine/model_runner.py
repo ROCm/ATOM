@@ -58,8 +58,8 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5ForConditionalGenerationBare",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationBare",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5ForConditionalGenerationTextOnly",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
 }
@@ -580,8 +580,11 @@ class ModelRunner:
             ),
         )
         self.model = model_class(config)
+        fused_shared_expert_load_fn = None
+        if hasattr(self.model, "load_fused_expert_weights"):
+            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
-        load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        load_model(self.model, config.model, config.hf_config, config.load_dummy, load_fused_expert_weights_fn=fused_shared_expert_load_fn)
         logger.info(f"Model load done: {config.model}")
 
         if hasattr(self, "drafter"):
