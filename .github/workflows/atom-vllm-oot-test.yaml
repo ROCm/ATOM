@@ -361,30 +361,34 @@ jobs:
   atom-vllm-oot:
     needs: [check-signal, download_aiter_wheel, build_oot_image]
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
-    name: ATOM vLLM OOT Test
+    name: ATOM vLLM OOT Test (${{ matrix.display_name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - model_name: "DeepSeek-R1-FP8"
+          - display_name: "DeepSeek-R1-FP8 TP8"
+            model_name: "DeepSeek-R1-FP8"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extra_args: "--tensor-parallel-size 8"
             env_vars: ""
             accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu.predownload
-          - model_name: "gpt-oss-120b"
+          - display_name: "gpt-oss-120b TP1"
+            model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extra_args: "--tensor-parallel-size 1"
             env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
             accuracy_test_threshold: 0.38
             runner: linux-atom-mi35x-1
-          - model_name: "Kimi-K2-Thinking-MXFP4"
+          - display_name: "Kimi-K2-Thinking-MXFP4 TP4"
+            model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--tensor-parallel-size 4"
             env_vars: ""
             accuracy_test_threshold: 0.90
             runner: linux-atom-mi35x-4
-          - model_name: "Qwen3.5-35B-A3B-FP8"
+          - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
+            model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
             extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
             # FIXME: Remove these temporary Qwen3.5 workarounds after the
