@@ -63,6 +63,7 @@ support_model_arch_dict = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
+    "Gemma4ForConditionalGeneration": "atom.models.gemma4.Gemma4ForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -1023,6 +1024,34 @@ class ModelRunner:
             total += getattr(draft_hf, "num_nextn_predict_layers", 1)
         return total
 
+    def _get_per_layer_kv_dims(self):
+        """Return per-layer (num_kv_heads, head_dim) for heterogeneous models.
+
+        For models like Gemma 4 where sliding and global attention layers
+        have different num_kv_heads and head_dim, returns a list of
+        (num_kv_heads, head_dim) tuples, one per layer.
+        Returns None for homogeneous models.
+        """
+        hf_config = self.config.hf_config
+        layer_types = getattr(hf_config, "layer_types", None)
+        global_head_dim = getattr(hf_config, "global_head_dim", None)
+        num_global_kv_heads = getattr(hf_config, "num_global_key_value_heads", None)
+        if layer_types is None or global_head_dim is None or num_global_kv_heads is None:
+            return None
+        if global_head_dim == hf_config.head_dim:
+            return None
+
+        ws = self.world_size
+        swa_kv = max(hf_config.num_key_value_heads // ws, 1)
+        glo_kv = max(num_global_kv_heads // ws, 1)
+        dims = []
+        for lt in layer_types:
+            if lt == "full_attention":
+                dims.append((glo_kv, global_head_dim))
+            else:
+                dims.append((swa_kv, hf_config.head_dim))
+        return dims
+
     def _compute_block_bytes(self):
         """Compute the TRUE per-block memory cost including all tensors.
 
@@ -1080,25 +1109,28 @@ class ModelRunner:
             # It is accounted for separately via _compute_mamba_per_slot_bytes().
             # Do NOT add it to block_bytes.
         else:
-            # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
-            # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
-            # the standard path (draft layers use separate binding).
-            block_bytes = (
-                2
-                * hf_config.num_hidden_layers
-                * self.block_size
-                * num_kv_heads
-                * hf_config.head_dim
-                * kv_dtype_size
-            )
-            # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
-            block_bytes += (
-                2
-                * hf_config.num_hidden_layers
-                * num_kv_heads
-                * self.physical_block_size
-                * 4  # float32
-            )
+            per_layer_dims = self._get_per_layer_kv_dims()
+            if per_layer_dims is not None:
+                block_bytes = 0
+                for kv_h, hd in per_layer_dims:
+                    block_bytes += 2 * self.block_size * kv_h * hd * kv_dtype_size
+                    block_bytes += 2 * kv_h * self.physical_block_size * 4
+            else:
+                block_bytes = (
+                    2
+                    * hf_config.num_hidden_layers
+                    * self.block_size
+                    * num_kv_heads
+                    * hf_config.head_dim
+                    * kv_dtype_size
+                )
+                block_bytes += (
+                    2
+                    * hf_config.num_hidden_layers
+                    * num_kv_heads
+                    * self.physical_block_size
+                    * 4  # float32
+                )
         return block_bytes
 
     def _compute_mamba_per_slot_bytes(self) -> int:
@@ -1339,16 +1371,37 @@ class ModelRunner:
                 device="cuda",
             )
         else:
-            self.kv_cache = torch.zeros(
-                2,
-                hf_config.num_hidden_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
+            per_layer_dims = self._get_per_layer_kv_dims()
+            if per_layer_dims is not None:
+                self._per_layer_kv_cache = []
+                self._per_layer_kv_scale = []
+                kv_dt = dtypes.d_dtypes[config.kv_cache_dtype]
+                for kv_h, hd in per_layer_dims:
+                    kc = torch.zeros(
+                        2, self.num_physical_kvcache_blocks,
+                        self.physical_block_size, kv_h, hd,
+                        dtype=kv_dt, device="cuda",
+                    )
+                    sc = torch.zeros(
+                        2, self.num_physical_kvcache_blocks,
+                        kv_h, self.physical_block_size,
+                        dtype=dtypes.fp32, device="cuda",
+                    )
+                    self._per_layer_kv_cache.append(kc)
+                    self._per_layer_kv_scale.append(sc)
+                self.kv_cache = self._per_layer_kv_cache[0]
+            else:
+                self._per_layer_kv_cache = None
+                self.kv_cache = torch.zeros(
+                    2,
+                    hf_config.num_hidden_layers,
+                    self.num_physical_kvcache_blocks,
+                    self.physical_block_size,
+                    num_kv_heads,
+                    hf_config.head_dim,
+                    dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                    device="cuda",
+                )
 
             self.kv_scale = torch.zeros(
                 2,
@@ -1358,11 +1411,7 @@ class ModelRunner:
                 self.physical_block_size,
                 dtype=dtypes.fp32,
                 device="cuda",
-            )
-        # Build KVCacheConfig
-        # lirong TODO: This is a simple solution to build KVCacheConfig,
-        # models with only one type of attention, but not support multi-type of attention models.
-        # We need to support it by kv_cache_group in the future.
+            ) if self._per_layer_kv_cache is None else None
 
         # Prepare list of models to bind KV cache
         models_to_bind = [("target", self.model)]
@@ -1371,7 +1420,14 @@ class ModelRunner:
 
         kv_cache_tensors = []
         layer_id = 0
-        x = 16 // self.kv_cache.element_size()
+        # Gemma 4 uses heterogeneous per-layer KV cache (different head_dim per layer),
+        # so self.kv_cache may be a list instead of a single tensor.
+        _elem_size = (
+            self.kv_cache.element_size()
+            if not isinstance(self.kv_cache, list) and hasattr(self.kv_cache, "element_size")
+            else (self._per_layer_kv_cache[0].element_size() if self._per_layer_kv_cache else 2)
+        )
+        x = 16 // _elem_size
         mtp_start_layer_idx = (
             self.drafter.model.model.mtp_start_layer_idx
             if hasattr(self, "drafter")
@@ -1399,23 +1455,46 @@ class ModelRunner:
                                 )
                         else:
                             attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
+
+                        if self._per_layer_kv_cache is not None:
+                            layer_kv = self._per_layer_kv_cache[attn_idx]
+                            layer_kv_h = layer_kv.shape[3]
+                            layer_hd = layer_kv.shape[4]
+                            k_cache = layer_kv[0].view(
+                                self.num_physical_kvcache_blocks,
+                                layer_kv_h,
+                                layer_hd // x,
+                                self.physical_block_size,
+                                x,
+                            )
+                            v_cache = layer_kv[1].view(
+                                self.num_physical_kvcache_blocks,
+                                layer_kv_h,
+                                layer_hd,
+                                self.physical_block_size,
+                            )
+                            if config.kv_cache_dtype == "fp8":
+                                module.k_scale = self._per_layer_kv_scale[attn_idx][0]
+                                module.v_scale = self._per_layer_kv_scale[attn_idx][1]
+                        else:
+                            k_cache = self.kv_cache[0, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                num_kv_heads,
+                                hf_config.head_dim // x,
+                                self.physical_block_size,
+                                x,
+                            )
+                            v_cache = self.kv_cache[1, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                num_kv_heads,
+                                hf_config.head_dim,
+                                self.physical_block_size,
+                            )
+                            if config.kv_cache_dtype == "fp8":
+                                module.k_scale = self.kv_scale[0, attn_idx]
+                                module.v_scale = self.kv_scale[1, attn_idx]
+
                         module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
 
                         k_scale = module.k_scale
                         v_scale = module.v_scale

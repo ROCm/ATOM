@@ -16,7 +16,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     get_quant_parser,
 )
-from atom.utils import envs, get_open_port
+from atom.utils import envs, get_hf_text_config, get_open_port
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
@@ -492,6 +492,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
+    "gemma4": "text_config",
 }
 
 # multimodal models fully supported by plugin mode
@@ -500,6 +501,19 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "qwen3_5",
     "qwen3_5_moe",
 }
+
+
+def _resolve_atom_text_config(model_type: str):
+    """Resolve ATOM-native config class for model types not in transformers."""
+    _ATOM_TEXT_CONFIGS = {
+        "gemma4_text": "atom.model_config.gemma4.Gemma4TextConfig",
+    }
+    qualname = _ATOM_TEXT_CONFIGS.get(model_type)
+    if qualname is None:
+        return None
+    from importlib import import_module
+    mod_path, cls_name = qualname.rsplit(".", 1)
+    return getattr(import_module(mod_path), cls_name)
 
 
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
@@ -538,7 +552,12 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        config_class = AutoConfig.for_model(mapped_type)
+        try:
+            config_class = AutoConfig.for_model(mapped_type)
+        except (ValueError, KeyError):
+            config_class = _resolve_atom_text_config(text_model_type)
+            if config_class is None:
+                raise
         hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.
@@ -823,6 +842,15 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        # For multimodal models (e.g. Gemma4), resolve to the text sub-config
+        # so engine code can access num_hidden_layers, head_dim, etc. directly.
+        _original_hf_config = self.hf_config
+        self.hf_config = get_hf_text_config(self.hf_config)
+        if _original_hf_config is not self.hf_config:
+            for attr in ("architectures", "model_type"):
+                orig_val = getattr(_original_hf_config, attr, None)
+                if orig_val is not None and getattr(self.hf_config, attr, None) is None:
+                    setattr(self.hf_config, attr, orig_val)
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:

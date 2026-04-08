@@ -94,17 +94,16 @@ class PagedAttentionImpl(nn.Module):
 
         fwd_ctx: ForwardContext = get_forward_context()
 
-        # dummy run will skip attention in cuda graph capture phase
         if fwd_ctx.context.is_dummy_run:
             o = torch.empty_like(q)
             return o
 
         o: torch.Tensor
+
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        # rope cache
         q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(
             q, k, v, qkv, position, fwd_ctx
         )
@@ -450,33 +449,65 @@ class PagedAttentionImpl(nn.Module):
 
         return output
 
+    @staticmethod
+    def _sdpa_varlen_fallback(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal):
+        """SDPA fallback for head_dim > 256 where CK is unsupported."""
+        import torch.nn.functional as F
+        num_seqs = cu_seqlens_q.shape[0] - 1
+        out = torch.empty_like(q)
+        for i in range(num_seqs):
+            sq_s, sq_e = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
+            sk_s, sk_e = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
+            qi = q[sq_s:sq_e].transpose(0, 1).unsqueeze(0)
+            ki = k[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
+            vi = v[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
+            num_q_heads, num_kv_heads = qi.shape[1], ki.shape[1]
+            if num_q_heads != num_kv_heads:
+                rep = num_q_heads // num_kv_heads
+                ki = ki.repeat_interleave(rep, dim=1)
+                vi = vi.repeat_interleave(rep, dim=1)
+            oi = F.scaled_dot_product_attention(
+                qi, ki, vi, scale=softmax_scale, is_causal=causal,
+            )
+            out[sq_s:sq_e] = oi.squeeze(0).transpose(0, 1)
+        return out
+
     @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
 
-        # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
         sliding_window = (
             (self.sliding_window, 0, 0)
             if self.sliding_window is not None
             else (-1, -1, 0)
         )
-        o = aiter.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=attn_metadata.cu_seqlens_q,
-            cu_seqlens_k=attn_metadata.cu_seqlens_k,
-            max_seqlen_q=attn_metadata.max_seqlen_q,
-            max_seqlen_k=attn_metadata.max_seqlen_k,
-            min_seqlen_q=attn_metadata.min_seqlen_q,
-            dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
-            causal=True,
-            window_size=sliding_window,
-            sink_ptr=self.sinks,
-        )
+
+        if self.head_dim > 256:
+            o = self._sdpa_varlen_fallback(
+                q, k, v,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+        else:
+            o = aiter.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                min_seqlen_q=attn_metadata.min_seqlen_q,
+                dropout_p=attn_metadata.dropout_p,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=sliding_window,
+                sink_ptr=self.sinks,
+            )
 
         return o
 
