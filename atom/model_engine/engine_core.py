@@ -409,7 +409,6 @@ class DPEngineCoreProc(EngineCore):
             "dummy_prefill_execution", num_tokens, num_reqs, wait_out=True
         )
 
-
     def _sync_dp_state(
         self,
         local_is_prefill: bool,

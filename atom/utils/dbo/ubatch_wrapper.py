@@ -92,7 +92,11 @@ class UBatchWrapper(nn.Module):
             else:
                 padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
             ub_ctx = self._make_ubatch_context(
-                original_ctx, ub_slice, padded_bs, i, ub_num_reqs,
+                original_ctx,
+                ub_slice,
+                padded_bs,
+                i,
+                ub_num_reqs,
             )
             forward_contexts.append(ub_ctx)
             ub_inputs.append(

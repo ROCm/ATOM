@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from .ubatch_splitting import UBatchSlice, maybe_create_ubatch_slices, split_attn_metadata
+from .ubatch_splitting import (
+    UBatchSlice,
+    maybe_create_ubatch_slices,
+    split_attn_metadata,
+)
 from .ubatch_wrapper import UBatchWrapper
 from .ubatching import (
     TBOContext,
