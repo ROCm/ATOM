@@ -125,7 +125,9 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        from vllm.v1.attention.backend import MultipleOf  # pyright: ignore[reportMissingImports]
+        from vllm.v1.attention.backend import (
+            MultipleOf,
+        )  # pyright: ignore[reportMissingImports]
 
         return [MultipleOf(16)]
 
