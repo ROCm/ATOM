@@ -70,6 +70,7 @@ def detect_fused_expert_format(weight_name: str) -> bool:
         and weight_name.count(".experts.") == 1
     )
 
+
 def get_fused_expert_mapping() -> list[tuple[str, str, str]]:
     """Return mapping for fused expert weights (BF16 format)."""
     # (param_name, weight_name, shard_id)
@@ -77,6 +78,7 @@ def get_fused_expert_mapping() -> list[tuple[str, str, str]]:
         ("experts.w13_weight", "experts.gate_up_proj", "w1"),  # Will be chunked
         ("experts.w2_weight", "experts.down_proj", "w2"),
     ]
+
 
 def load_fused_expert_weights(
     original_name: str,
@@ -120,9 +122,7 @@ def load_fused_expert_weights(
                 if success:
                     loaded_local_expert = True
             except TypeError:
-                weight_loader(
-                    param, gate_weight[expert_id], name, "w1", expert_id
-                )
+                weight_loader(param, gate_weight[expert_id], name, "w1", expert_id)
                 loaded_local_expert = True
         # Load up part (w3)
         for expert_id in range(num_experts):
@@ -138,9 +138,7 @@ def load_fused_expert_weights(
                 if success:
                     loaded_local_expert = True
             except TypeError:
-                weight_loader(
-                    param, up_weight[expert_id], name, "w3", expert_id
-                )
+                weight_loader(param, up_weight[expert_id], name, "w3", expert_id)
                 loaded_local_expert = True
     else:
         # down_proj or other weights - no chunking
@@ -601,7 +599,9 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
         return self.language_model.compute_logits(hidden_states)
 
 
-class Qwen3_5MoeForConditionalGenerationTextOnly(Qwen3_5ForConditionalGenerationTextOnly):
+class Qwen3_5MoeForConditionalGenerationTextOnly(
+    Qwen3_5ForConditionalGenerationTextOnly
+):
     def __init__(self, atom_config: Config, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = atom_config.hf_config

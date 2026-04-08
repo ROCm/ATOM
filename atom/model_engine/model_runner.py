@@ -584,7 +584,13 @@ class ModelRunner:
         if hasattr(self.model, "load_fused_expert_weights"):
             fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
-        load_model(self.model, config.model, config.hf_config, config.load_dummy, load_fused_expert_weights_fn=fused_shared_expert_load_fn)
+        load_model(
+            self.model,
+            config.model,
+            config.hf_config,
+            config.load_dummy,
+            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
+        )
         logger.info(f"Model load done: {config.model}")
 
         if hasattr(self, "drafter"):
