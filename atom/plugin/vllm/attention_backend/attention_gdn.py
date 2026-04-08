@@ -205,7 +205,7 @@ class GatedDeltaNet(nn.Module):
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
-        query_non_spec, key_non_spec, value_non_spec = causal_conv1d_update(
+        mixed_qkv_non_spec = causal_conv1d_update(
             mixed_qkv,
             conv_state,
             conv_weights,
@@ -215,10 +215,9 @@ class GatedDeltaNet(nn.Module):
             self.activation,
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
             validate_data=False,
+            return_packed_qkv=True,
         )
-        mixed_qkv_non_spec = torch.cat(
-            (query_non_spec, key_non_spec, value_non_spec), dim=-1
-        ).contiguous()
+
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
@@ -269,6 +268,17 @@ class GatedDeltaNet(nn.Module):
         )  # noqa: E501
         compilation_config = forward_context.no_compile_layers
         self_kv_cache = compilation_config[layer_name].kv_cache
+        virtual_engine = getattr(forward_context, "virtual_engine", None)
+        # vLLM <= 0.17 exposed per-virtual-engine KV caches via
+        # forward_context.virtual_engine. vLLM 0.19 no longer sets that field
+        # for this path and the layer cache is already the active cache tuple.
+        if (
+            virtual_engine is not None
+            and isinstance(self_kv_cache, (list, tuple))
+            and self_kv_cache
+            and isinstance(self_kv_cache[0], (list, tuple))
+        ):
+            self_kv_cache = self_kv_cache[virtual_engine]
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -285,7 +295,7 @@ class GatedDeltaNet(nn.Module):
 
         if (
             self.enable_packed_recurrent_decode
-            and attn_metadata.spec_sequence_masks is None
+            and spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
         ):

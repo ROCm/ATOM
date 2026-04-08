@@ -1205,6 +1205,7 @@ def causal_conv1d_update(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
+    return_packed_qkv: bool = False,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1289,9 +1290,20 @@ def causal_conv1d_update(
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
     num_tokens = x.shape[0]
-    query = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
-    key = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
-    value = torch.empty([num_tokens, v_dim_size, 1], dtype=x.dtype, device=x.device)
+    packed_qkv = None
+    if return_packed_qkv:
+        packed_qkv = torch.empty(
+            [num_tokens, k_dim_size * 2 + v_dim_size],
+            dtype=x.dtype,
+            device=x.device,
+        )
+        query = packed_qkv[:, :k_dim_size].unsqueeze(-1)
+        key = packed_qkv[:, k_dim_size : k_dim_size * 2].unsqueeze(-1)
+        value = packed_qkv[:, k_dim_size * 2 :].unsqueeze(-1)
+    else:
+        query = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
+        key = torch.empty([num_tokens, k_dim_size, 1], dtype=x.dtype, device=x.device)
+        value = torch.empty([num_tokens, v_dim_size, 1], dtype=x.dtype, device=x.device)
 
     stride_q_seq, stride_q_dim, stride_q_token = query.stride()
     stride_k_seq, stride_k_dim, stride_k_token = key.stride()
@@ -1383,6 +1395,9 @@ def causal_conv1d_update(
     )
     if unsqueeze:
         out = out.squeeze(-1)
+    if return_packed_qkv:
+        return packed_qkv
+
     query = query.squeeze(-1)
     key = key.squeeze(-1)
     value = value.squeeze(-1)
