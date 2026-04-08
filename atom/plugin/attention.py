@@ -1447,7 +1447,10 @@ def AiterBackendDecoratorForPluginMode(cls):
             )
             cls.__bases__ = (_VllmAttnBackend,)
         except ImportError:
-            pass
+            logger.warning(
+                "vllm.v1.attention.backend not found; %s will not inherit "
+                "vLLM v1 AttentionBackend stubs — attention selector may "
+                "reject this backend.", cls.__name__)
     return cls
 
 

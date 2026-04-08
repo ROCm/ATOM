@@ -452,25 +452,9 @@ class PagedAttentionImpl(nn.Module):
     @staticmethod
     def _sdpa_varlen_fallback(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal):
         """SDPA fallback for head_dim > 256 where CK is unsupported."""
-        import torch.nn.functional as F
-        num_seqs = cu_seqlens_q.shape[0] - 1
-        out = torch.empty_like(q)
-        for i in range(num_seqs):
-            sq_s, sq_e = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
-            sk_s, sk_e = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
-            qi = q[sq_s:sq_e].transpose(0, 1).unsqueeze(0)
-            ki = k[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
-            vi = v[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
-            num_q_heads, num_kv_heads = qi.shape[1], ki.shape[1]
-            if num_q_heads != num_kv_heads:
-                rep = num_q_heads // num_kv_heads
-                ki = ki.repeat_interleave(rep, dim=1)
-                vi = vi.repeat_interleave(rep, dim=1)
-            oi = F.scaled_dot_product_attention(
-                qi, ki, vi, scale=softmax_scale, is_causal=causal,
-            )
-            out[sq_s:sq_e] = oi.squeeze(0).transpose(0, 1)
-        return out
+        from atom.plugin.attention_mha import _sdpa_varlen_attn
+        return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                 softmax_scale, causal)
 
     @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(

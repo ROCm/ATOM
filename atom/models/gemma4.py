@@ -161,7 +161,7 @@ class _Gemma4RMSNorm(nn.Module):
     """RMSNorm for Gemma 4 (standard x*weight formula, NOT the Gemma1/2 x*(1+weight) convention).
 
     Supports with_scale=False for v_norm (pure normalization, no learnable weights).
-    Uses AITER rmsnorm2d_fwd kernel when available (requires dtype fix commit 5df37c1).
+    Uses AITER rmsnorm2d_fwd kernel when available (requires aiter >= 0.1.0 with bf16 dtype support).
     """
     def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
         super().__init__()

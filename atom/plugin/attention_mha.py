@@ -31,6 +31,52 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _CK_MAX_HEAD_DIM = 256
 
 
+def _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                      softmax_scale, causal, return_lse=False, out=None):
+    """PyTorch SDPA fallback for varlen attention when CK is unsupported
+    (e.g. head_dim > 256).  Handles GQA head expansion automatically.
+
+    Returns (out, lse) when return_lse=True, else just out.
+    """
+    import torch.nn.functional as F
+
+    num_seqs = cu_seqlens_q.shape[0] - 1
+    if out is None:
+        out = torch.empty_like(q)
+    total_q = q.shape[0]
+    num_heads_q = q.shape[1]
+
+    if return_lse:
+        lse = torch.empty(num_heads_q, total_q, dtype=torch.float32,
+                          device=q.device)
+
+    for i in range(num_seqs):
+        sq_s, sq_e = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
+        sk_s, sk_e = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
+        qi = q[sq_s:sq_e].transpose(0, 1).unsqueeze(0)
+        ki = k[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
+        vi = v[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
+        num_q_heads, num_kv_heads = qi.shape[1], ki.shape[1]
+        if num_q_heads != num_kv_heads:
+            rep = num_q_heads // num_kv_heads
+            ki = ki.repeat_interleave(rep, dim=1)
+            vi = vi.repeat_interleave(rep, dim=1)
+        oi = F.scaled_dot_product_attention(
+            qi, ki, vi, scale=softmax_scale, is_causal=causal,
+        )
+        out[sq_s:sq_e] = oi.squeeze(0).transpose(0, 1)
+
+        if return_lse:
+            scores = torch.matmul(qi * softmax_scale, ki.transpose(-1, -2))
+            if causal and (sq_e - sq_s) == (sk_e - sk_s):
+                mask = torch.triu(
+                    torch.full_like(scores, float("-inf")), diagonal=1)
+                scores = scores + mask
+            lse[:, sq_s:sq_e] = torch.logsumexp(scores, dim=-1).squeeze(0)
+
+    return (out, lse) if return_lse else out
+
+
 def _flash_attn_varlen_with_fallback(
     q, k, v,
     cu_seqlens_q, cu_seqlens_k,
@@ -41,6 +87,7 @@ def _flash_attn_varlen_with_fallback(
     sink_ptr=None,
     alibi_slopes=None,
 ):
+    """CK flash attention with automatic SDPA fallback for large head_dim."""
     if head_dim <= _CK_MAX_HEAD_DIM:
         return aiter.flash_attn_varlen_func(
             q=q, k=k, v=v,
@@ -56,35 +103,10 @@ def _flash_attn_varlen_with_fallback(
             alibi_slopes=alibi_slopes,
             return_lse=True,
         )
-    import torch.nn.functional as F
-    total_q = q.shape[0]
-    num_heads_q = q.shape[1]
-    num_seqs = cu_seqlens_q.shape[0] - 1
-    out = torch.empty_like(q)
-    lse = torch.empty(num_heads_q, total_q, dtype=torch.float32, device=q.device)
-    for i in range(num_seqs):
-        sq_s, sq_e = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
-        sk_s, sk_e = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
-        qi = q[sq_s:sq_e].transpose(0, 1).unsqueeze(0)
-        ki = k[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
-        vi = v[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
-        num_q_heads = qi.shape[1]
-        num_kv_heads = ki.shape[1]
-        if num_q_heads != num_kv_heads:
-            rep = num_q_heads // num_kv_heads
-            ki = ki.repeat_interleave(rep, dim=1)
-            vi = vi.repeat_interleave(rep, dim=1)
-        oi = F.scaled_dot_product_attention(
-            qi, ki, vi, scale=softmax_scale, is_causal=causal,
-        )
-        out[sq_s:sq_e] = oi.squeeze(0).transpose(0, 1)
-        scores = torch.matmul(qi * softmax_scale, ki.transpose(-1, -2))
-        if causal and (sq_e - sq_s) == (sk_e - sk_s):
-            mask = torch.triu(
-                torch.full_like(scores, float("-inf")), diagonal=1)
-            scores = scores + mask
-        lse[:, sq_s:sq_e] = torch.logsumexp(scores, dim=-1).squeeze(0)
-    return out, lse
+    return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                             softmax_scale, causal, return_lse=True)
+
+
 _QWEN_GLUON_PA_DECODE_BS = 64
 
 
@@ -122,30 +144,11 @@ def _triton_flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
             0.0, False,
         )
         return out
-    except Exception:
-        batch_size = cu_seqlens_q.shape[0] - 1
-        num_q_heads = q.shape[1]
-        num_kv_heads = k.shape[1]
-        head_repeat = num_q_heads // num_kv_heads
-        outputs = []
-        for i in range(batch_size):
-            sq, eq = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
-            sk, ek = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
-            qi = q[sq:eq].unsqueeze(0).transpose(1, 2)
-            ki = k[sk:ek].unsqueeze(0).transpose(1, 2)
-            vi = v[sk:ek].unsqueeze(0).transpose(1, 2)
-            if head_repeat > 1:
-                ki = ki.repeat_interleave(head_repeat, dim=1)
-                vi = vi.repeat_interleave(head_repeat, dim=1)
-            oi = F.scaled_dot_product_attention(
-                qi, ki, vi, is_causal=causal, scale=softmax_scale,
-            )
-            outputs.append(oi.transpose(1, 2).squeeze(0))
-        result = torch.cat(outputs, dim=0)
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
+    except Exception as e:
+        logger.warning("Triton FA2 varlen_fwd failed (head_dim=%s), "
+                       "falling back to PyTorch SDPA: %s", q.shape[-1], e)
+        return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                 softmax_scale, causal, out=out)
 
 
 class PagedAttentionImplPluginModeMethods:
