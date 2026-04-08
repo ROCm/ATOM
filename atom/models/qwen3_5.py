@@ -34,6 +34,7 @@ from atom.models.qwen3_next import (
 
 from atom.models.utils import (
     IntermediateTensors,
+    PPMissingLayer,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -51,6 +52,11 @@ if is_vllm():
         MambaStateCopyFunc,
         MambaStateCopyFuncCalculator,
     )
+
+
+def get_qwen3_5_text_config(atom_config: Config):
+    hf_config = atom_config.hf_config
+    return hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
@@ -198,7 +204,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
     ) -> None:
         super(Qwen3NextDecoderLayer, self).__init__()
 
-        config = atom_config.hf_config.text_config
+        config = get_qwen3_5_text_config(atom_config)
         quant_config = atom_config.quant_config
         speculative_config = atom_config.speculative_config
 
@@ -225,7 +231,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
         if config.model_type == "qwen3_5_moe_text":
             self.mlp = Qwen3NextSparseMoeBlock(
-                atom_config.hf_config.text_config,
+                config,
                 atom_config.quant_config,
                 prefix=f"{prefix}.mlp",
             )
@@ -278,8 +284,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 class Qwen3_5Model(Qwen3NextModel):
     def __init__(self, *, atom_config, prefix: str = ""):
         super(Qwen3NextModel, self).__init__()
-        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = (
-            atom_config.hf_config.text_config
+        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = get_qwen3_5_text_config(
+            atom_config
         )
 
         self.config = config
@@ -312,7 +318,7 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(nn.Module):
 
     def __init__(self, atom_config: Config, prefix: str = ""):
-        config: Qwen3_5MoeTextConfig = atom_config.hf_config.text_config
+        config: Qwen3_5MoeTextConfig = get_qwen3_5_text_config(atom_config)
         self.atom_config = atom_config
 
         self.quant_config = atom_config.quant_config
@@ -367,10 +373,11 @@ class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
     def __init__(self, atom_config: Config, prefix: str = ""):
+        config: Qwen3_5MoeTextConfig = get_qwen3_5_text_config(atom_config)
+        config.n_shared_experts = 1
+        config.n_routed_experts = config.num_experts
         super().__init__(atom_config=atom_config, prefix=prefix)
-        config: Qwen3_5MoeTextConfig = atom_config.hf_config.text_config
         self.config = config
-        # set MoE hyperparameters
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -386,6 +393,78 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
                 else 0
             ),
         )
+
+
+class Qwen3_5ForConditionalGenerationBare(nn.Module):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+        "in_proj_z": ("in_proj_qkvz", 3),
+        "in_proj_b": ("in_proj_ba", 0),
+        "in_proj_a": ("in_proj_ba", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
+    }
+    weights_mapping = {
+        "model.language_model.": "language_model.model.",
+        "lm_head.": "language_model.lm_head.",
+    }
+    quant_exclude_name_mapping = {
+        "model.language_model.": "model.",
+    }
+    skip_weight_prefixes = ["model.visual."]
+
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        super().__init__()
+        self.config = atom_config.hf_config
+        self.visual = PPMissingLayer()
+        self.language_model = Qwen3_5ForCausalLM(atom_config=atom_config, prefix="")
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.model.get_input_embeddings(input_ids)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: object,
+    ):
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
+
+
+class Qwen3_5MoeForConditionalGenerationBare(Qwen3_5ForConditionalGenerationBare):
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        nn.Module.__init__(self)
+        self.config = atom_config.hf_config
+        self.visual = PPMissingLayer()
+        self.language_model = Qwen3_5MoeForCausalLM(atom_config=atom_config, prefix="")
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.language_model.get_expert_mapping()
 
 
 ########################################################
