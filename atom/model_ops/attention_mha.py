@@ -140,9 +140,9 @@ class PagedAttentionImpl(nn.Module):
             x = 16 // k_cache.element_size()
             if k_cache.dim() == 5 and v_cache.dim() == 4:
                 n, nh, hd, bs = v_cache.shape
-                v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+                v_cache = v_cache.view(n, nh, bs // x, hd, x)
             else:
-                v_cache_shuffle = v_cache
+                v_cache = v_cache
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
                 num_heads_q=self.num_heads,
@@ -156,7 +156,7 @@ class PagedAttentionImpl(nn.Module):
                 is_neox_style=self.rotary_emb.is_neox_style,
                 pos_ids=position,
                 k_cache=k_cache,
-                v_cache=v_cache_shuffle,
+                v_cache=v_cache,
                 slot_mapping=attn_metadata.slot_mapping,
                 kv_cache_dtype=(
                     "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
