@@ -904,9 +904,11 @@ class DeepseekV2MoE(nn.Module):
         alt_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(alt_stream):
-            final_hidden_states = self.routed_expert_forward(hidden_states)
+            # final_hidden_states = self.routed_expert_forward(hidden_states)
+            shared_output = self.shared_experts(hidden_states)
 
-        shared_output = self.shared_experts(hidden_states)
+        final_hidden_states = self.routed_expert_forward(hidden_states)
+        # shared_output = self.shared_experts(hidden_states)
 
         current_stream.wait_stream(alt_stream)
 
