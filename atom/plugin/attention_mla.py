@@ -875,8 +875,9 @@ class MLAAttentionImplPluginModeMethods:
             if self.dcp_world_size > 1:
                 assert not fp8_attention, "DCP not support fp8 kvcache now."
                 # decode_q do allgather in head dim.
+                print(f"before allgather decode_q.shape: {decode_q.shape} \n", flush=True)
                 decode_q = get_dcp_group().all_gather(decode_q, dim=1)
-
+                print(f"after allgather decode_q.shape: {decode_q.shape} \n", flush=True)
             # call decode attn
             attn_out, lse = self._forward_decode_plugin_mode(
                 decode_q, kv_cache, attn_metadata, layer

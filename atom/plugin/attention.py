@@ -1407,8 +1407,6 @@ def unified_attention_with_output_base_for_plugin_mode(
         kv_c_normed = k
         k_pe = v
         self = atom_config.compilation_config.static_forward_context[layer_name]
-        print(f"======= layer_name: {layer_name} \n", flush=True)
-        print(f"======= self: {self} \n", flush=True)
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
