@@ -161,6 +161,7 @@ class _Gemma4RMSNorm(nn.Module):
     """RMSNorm for Gemma 4 (standard x*weight formula, NOT the Gemma1/2 x*(1+weight) convention).
 
     Supports with_scale=False for v_norm (pure normalization, no learnable weights).
+    Uses AITER rmsnorm2d_fwd kernel when available (requires dtype fix commit 5df37c1).
     """
     def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
         super().__init__()
@@ -169,19 +170,29 @@ class _Gemma4RMSNorm(nn.Module):
         self.with_scale = with_scale
         if self.with_scale:
             self.weight = nn.Parameter(torch.ones(dim))
+        try:
+            from aiter import rmsnorm2d_fwd
+            self._aiter_rmsnorm = rmsnorm2d_fwd
+        except ImportError:
+            self._aiter_rmsnorm = None
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
-        orig_dtype = x.dtype
         if residual is not None:
             x = x + residual
             residual = x
-        x = self._norm(x.float())
-        if self.with_scale:
-            x = x * self.weight.float()
-        x = x.to(orig_dtype)
+
+        if self.with_scale and self._aiter_rmsnorm is not None:
+            x = self._aiter_rmsnorm(x, self.weight, self.eps)
+        else:
+            orig_dtype = x.dtype
+            x = self._norm(x.float())
+            if self.with_scale:
+                x = x * self.weight.float()
+            x = x.to(orig_dtype)
+
         return x if residual is None else (x, residual)
 
 class Gemma4Attention(nn.Module):
