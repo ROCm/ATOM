@@ -125,14 +125,21 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [16]
+        from vllm.v1.attention.backend import MultipleOf  # pyright: ignore[reportMissingImports]
+
+        return [MultipleOf(16)]
+
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        if block_size is None:
+            return True
+        return block_size % 16 == 0
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        # Mirror vLLM 0.19's backend contract: keep the framework default when
-        # it already satisfies the kernel requirement, otherwise fall back to
-        # the smallest supported multiple.
-        if default_block_size % 16 == 0:
+        # OOT backends do not inherit vLLM's AttentionBackend, so mirror the
+        # vLLM 0.19 default block-size selection logic locally.
+        if cls.supports_block_size(default_block_size):
             return default_block_size
         return 16
 
