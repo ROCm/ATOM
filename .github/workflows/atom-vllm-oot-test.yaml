@@ -774,7 +774,7 @@ jobs:
   # ---------- OOT full validation path (schedule / workflow_dispatch) ----------
   prepare-oot-image:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    name: Prepare OOT validation image
+    name: Prepare validation image
     runs-on: build-only-atom
     outputs:
       oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
@@ -1000,7 +1000,7 @@ jobs:
 
   oot-model-accuracy:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    name: OOT Model Accuracy (${{ matrix.model_name }})
+    name: Model Accuracy (${{ matrix.model_name }})
     needs: [prepare-oot-image]
     strategy:
       fail-fast: false
@@ -1249,7 +1249,7 @@ jobs:
   # full matrix completes. This keeps dashboard writes off the GPU runners and
   # ensures each nightly/manual run publishes at most once.
   accuracy-dashboard:
-    name: Update OOT accuracy dashboard
+    name: Update accuracy dashboard
     needs: [oot-model-accuracy]
     if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
     runs-on: ubuntu-latest
