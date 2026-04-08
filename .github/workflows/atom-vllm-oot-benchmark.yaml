@@ -635,66 +635,6 @@ jobs:
           echo "Pulling OOT benchmark image: ${OOT_IMAGE_TAG}"
           docker pull "${OOT_IMAGE_TAG}"
 
-      - name: Resolve pulled OOT image digest
-        if: steps.check.outputs.enabled == 'true'
-        run: |
-          OOT_IMAGE_DIGEST="$(
-            OOT_IMAGE_TAG="${OOT_IMAGE_TAG}" python3 - <<'PY'
-          import json
-          import os
-          import subprocess
-
-          image_ref = os.environ["OOT_IMAGE_TAG"]
-          repo = image_ref.split("@", 1)[0]
-          last_segment = repo.rsplit("/", 1)[-1]
-          if ":" in last_segment:
-              repo = repo.rsplit(":", 1)[0]
-
-          inspect_targets = [image_ref]
-          tag_ref = image_ref.split("@", 1)[0]
-          if tag_ref != image_ref:
-              inspect_targets.append(tag_ref)
-
-          repo_digests = []
-          for target in inspect_targets:
-              try:
-                  repo_digests_raw = subprocess.check_output(
-                      [
-                          "docker",
-                          "inspect",
-                          "--format",
-                          "{{json .RepoDigests}}",
-                          target,
-                      ],
-                      text=True,
-                  ).strip()
-              except subprocess.CalledProcessError:
-                  continue
-
-              repo_digests = json.loads(repo_digests_raw or "[]") or []
-              if repo_digests:
-                  break
-
-          digest = ""
-          for repo_digest in repo_digests:
-              if repo_digest.startswith(f"{repo}@"):
-                  digest = repo_digest.split("@", 1)[1]
-                  break
-
-          if not digest and repo_digests:
-              digest = repo_digests[0].split("@", 1)[1]
-
-          print(digest)
-          PY
-          )"
-
-          if [[ -n "${OOT_IMAGE_DIGEST}" ]]; then
-            echo "Resolved OOT image digest: ${OOT_IMAGE_DIGEST}"
-            echo "OOT_IMAGE_DIGEST=${OOT_IMAGE_DIGEST}" >> "$GITHUB_ENV"
-          else
-            echo "::warning::Failed to determine a repo digest for ${OOT_IMAGE_TAG}"
-          fi
-
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
         run: |
@@ -890,7 +830,6 @@ jobs:
             -e VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
             -e OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
             -e OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
-            -e OOT_IMAGE_DIGEST_USED="${OOT_IMAGE_DIGEST:-}" \
             -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
             "$CONTAINER_NAME" python3 - <<'PY'
           import json
@@ -923,7 +862,6 @@ jobs:
           data["vllm_version"] = os.environ.get("VLLM_VERSION_USED", "")
           data["oot_image_source"] = os.environ.get("OOT_IMAGE_SOURCE", "")
           data["oot_image_tag"] = os.environ.get("OOT_IMAGE_TAG_USED", "")
-          data["oot_image_digest"] = os.environ.get("OOT_IMAGE_DIGEST_USED", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
           )
