@@ -195,7 +195,10 @@ def resolve_image(
     try:
         candidates = nightly_candidates(list_tags(repository, token), preferred_version)
         for candidate in candidates:
-            if get_manifest_digest(repository, candidate.tag, token) == reference_digest:
+            if (
+                get_manifest_digest(repository, candidate.tag, token)
+                == reference_digest
+            ):
                 return build_resolution(
                     repository,
                     reference_tag,
