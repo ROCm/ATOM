@@ -85,12 +85,6 @@ class EagleProposer:
                 " from the target model."
             )
 
-        if self.config.speculative_config.method != "eagle3" and hasattr(
-            target_model, "lm_head"
-        ):
-            logger.info("Loading EAGLE LM head weights from the target model.")
-            self.model.lm_head = target_model.lm_head
-
         # If MTP shared_head.head was not in checkpoint (weight is all zeros),
         # share lm_head from the target model as fallback.
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
