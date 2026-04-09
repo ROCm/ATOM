@@ -1,4 +1,4 @@
-name: ATOM vLLM OOT Test
+name: ATOM vLLM Test
 
 on:
   pull_request:
@@ -67,6 +67,11 @@ on:
         required: false
         type: boolean
         default: false
+      upload_accuracy_to_dashboard:
+        description: "Optional: upload OOT accuracy results to dashboard after this manual run"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -82,7 +87,7 @@ env:
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  VLLM_COMMIT: "b31e9326a7d9394aab8c767f8ebe225c65594b60"
+  VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
 
 jobs:
   # ---------- OOT CI path (pull_request only) ----------
@@ -177,7 +182,7 @@ jobs:
     name: Reuse OOT CI image
     runs-on: build-only-atom
     env:
-      VLLM_COMMIT: b31e9326a7d9394aab8c767f8ebe225c65594b60
+      VLLM_COMMIT: 2a69949bdadf0e8942b7a1619b229cb475beef20
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
     steps:
       - name: Initialize OOT image tag
@@ -356,32 +361,36 @@ jobs:
   atom-vllm-oot:
     needs: [check-signal, download_aiter_wheel, build_oot_image]
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
-    name: ATOM vLLM OOT Test
+    name: ${{ matrix.display_name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - model_name: "DeepSeek-R1-FP8"
+          - display_name: "DeepSeek-R1-FP8 TP8"
+            model_name: "DeepSeek-R1-FP8"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extra_args: "--tensor-parallel-size 8"
             env_vars: ""
             accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu.predownload
-          - model_name: "gpt-oss-120b"
+          - display_name: "gpt-oss-120b TP1"
+            model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extra_args: "--tensor-parallel-size 1"
             env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
             accuracy_test_threshold: 0.38
             runner: linux-atom-mi35x-1
-          - model_name: "Kimi-K2-Thinking-MXFP4"
+          - display_name: "Kimi-K2-Thinking-MXFP4 TP4"
+            model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--tensor-parallel-size 4"
             env_vars: ""
             accuracy_test_threshold: 0.90
             runner: linux-atom-mi35x-4
-          - model_name: "Qwen3.5-35B-A3B-FP8"
+          - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
+            model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
-            extra_args: "--tensor-parallel-size 2"
+            extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
             # FIXME: Remove these temporary Qwen3.5 workarounds after the
             # aiter fix landed
             env_vars: |
@@ -393,8 +402,8 @@ jobs:
     timeout-minutes: 180
     env:
       CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
-      VLLM_COMMIT: b31e9326a7d9394aab8c767f8ebe225c65594b60
-      VLLM_VERSION: "0.17"
+      VLLM_COMMIT: 2a69949bdadf0e8942b7a1619b229cb475beef20
+      VLLM_VERSION: "0.19.0"
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
@@ -765,7 +774,7 @@ jobs:
   # ---------- OOT full validation path (schedule / workflow_dispatch) ----------
   prepare-oot-image:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    name: Prepare OOT validation image
+    name: Prepare validation image
     runs-on: build-only-atom
     outputs:
       oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
@@ -776,7 +785,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Docker Login
-        if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != 'main' }}
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
@@ -818,7 +827,7 @@ jobs:
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP4",
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-                  "extra_args": "--tensor-parallel-size 4",
+                  "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-4",
@@ -827,7 +836,7 @@ jobs:
                   "toggle_env": "RUN_QWEN35_397B_FP8_TP8",
                   "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
-                  "extra_args": "--tensor-parallel-size 8",
+                  "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
@@ -836,7 +845,7 @@ jobs:
                   "toggle_env": "RUN_QWEN35_397B_TP8",
                   "model_name": "Qwen3.5-397B-A17B TP8",
                   "model_path": "Qwen/Qwen3.5-397B-A17B",
-                  "extra_args": "--tensor-parallel-size 8",
+                  "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
@@ -910,12 +919,8 @@ jobs:
           print(f"model_matrix={json.dumps({'include': selected})}")
           PY
 
-          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF_NAME}" = "main" ]; then
-            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-              echo "Manual run on main reuses published OOT image: ${NIGHTLY_OOT_IMAGE_TAG}"
-            else
-              echo "Scheduled run uses published OOT image: ${NIGHTLY_OOT_IMAGE_TAG}"
-            fi
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            echo "Scheduled run uses published OOT image: ${NIGHTLY_OOT_IMAGE_TAG}"
             echo "oot_image_tag=${NIGHTLY_OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
@@ -959,7 +964,7 @@ jobs:
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
-          echo "Building manual OOT image from branch ${GITHUB_REF_NAME}"
+          echo "Manual run rebuilds OOT image from branch ${GITHUB_REF_NAME}"
 
           docker build --pull --network=host --no-cache \
             -t "${MANUAL_BASE_IMAGE_TAG}" \
@@ -995,7 +1000,7 @@ jobs:
 
   oot-model-accuracy:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    name: OOT Model Accuracy (${{ matrix.model_name }})
+    name: Model Accuracy (${{ matrix.model_name }})
     needs: [prepare-oot-image]
     strategy:
       fail-fast: false
@@ -1225,7 +1230,7 @@ jobs:
             oot_accuracy_results
 
       - name: Upload accuracy results for dashboard
-        if: always()
+        if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
@@ -1244,9 +1249,9 @@ jobs:
   # full matrix completes. This keeps dashboard writes off the GPU runners and
   # ensures each nightly/manual run publishes at most once.
   accuracy-dashboard:
-    name: Update OOT accuracy dashboard
+    name: Update accuracy dashboard
     needs: [oot-model-accuracy]
-    if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
     runs-on: ubuntu-latest
     permissions:
       actions: read

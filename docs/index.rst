@@ -13,6 +13,7 @@ ATOM Documentation
 
    installation
    quickstart
+   model_run_guide
 
 .. toctree::
    :maxdepth: 2
@@ -60,6 +61,10 @@ Supported GPUs
      - Architecture
      - Memory
      - Status
+   * - AMD Instinct MI355X
+     - CDNA 4 (gfx950)
+     - 288 GB HBM3e
+     - ✅ Fully Supported (primary CI target)
    * - AMD Instinct MI300X
      - CDNA 3 (gfx942)
      - 192 GB HBM3
@@ -68,10 +73,6 @@ Supported GPUs
      - CDNA 2 (gfx90a)
      - 128 GB HBM2e
      - ✅ Fully Supported
-   * - AMD Instinct MI300A
-     - CDNA 3 (gfx950)
-     - 128 GB HBM3
-     - 🧪 Experimental
 
 Quick Links
 -----------

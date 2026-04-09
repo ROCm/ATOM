@@ -498,6 +498,25 @@ class TestRemapLayerName:
 
         assert qcfg.exclude_layers.count("model.layers.0.gate_up_proj") == 1
 
+    def test_glm_moe_dsa_remaps_like_deepseek_v3(self):
+        """GLM-5 (glm_moe_dsa) uses same packed fusing as deepseek_v3."""
+        qcfg = QuantizationConfig(config=None)
+        qcfg.layer_pattern_specs = []
+        qcfg.exclude_layers = [
+            "model.layers.0.self_attn.q_a_proj",
+            "model.layers.0.self_attn.kv_a_proj_with_mqa",
+            "model.layers.0.mlp.gate_proj",
+            "model.layers.0.mlp.up_proj",
+        ]
+
+        hf = FakeHFConfig(model_type="glm_moe_dsa", q_lora_rank=2048)
+        qcfg.remap_layer_name(hf)
+
+        assert "model.layers.0.self_attn.fused_qkv_a_proj" in qcfg.exclude_layers
+        assert "model.layers.0.mlp.gate_up_proj" in qcfg.exclude_layers
+        assert "model.layers.0.self_attn.q_a_proj" not in qcfg.exclude_layers
+        assert "model.layers.0.mlp.gate_proj" not in qcfg.exclude_layers
+
 
 class TestComputeHash:
     def test_hash_is_deterministic(self):

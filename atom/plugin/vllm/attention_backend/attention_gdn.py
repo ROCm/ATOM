@@ -216,9 +216,7 @@ class GatedDeltaNet(nn.Module):
             attn_metadata.non_spec_state_indices_tensor
         )  # noqa: E501
         compilation_config = forward_context.no_compile_layers
-        self_kv_cache = compilation_config[layer_name].kv_cache[
-            forward_context.virtual_engine
-        ]
+        self_kv_cache = compilation_config[layer_name].kv_cache
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
