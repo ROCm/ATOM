@@ -59,7 +59,7 @@ The sparse MLA mechanism contains an indexer that selects the top-k tokens it de
 
 ```bash
 lm_eval --model local-completions \
-        --model_args model=zai-org/GLM-5-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+        --model_args model=zai-org/GLM-5-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3 \
         --tasks gsm8k \
         --num_fewshot 20
 ```

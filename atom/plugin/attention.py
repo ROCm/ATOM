@@ -2007,6 +2007,13 @@ class vllmAiterMLASparseBackendMethods:
     def get_supported_kernel_block_sizes():
         return [1]
 
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # ATOM's sparse MLA plugin path assumes kernel/page block size == 1
+        # throughout metadata construction and KV-cache indexing, so force that
+        # value when vLLM 0.19 negotiates the backend-specific cache block size.
+        return 1
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
