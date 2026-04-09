@@ -532,6 +532,43 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
             self.language_model.make_empty_intermediate_tensors
         )
 
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.model.get_input_embeddings(input_ids)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: object,
+    ):
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
+
+
+class Qwen3_5MoeForConditionalGenerationTextOnly(
+    Qwen3_5ForConditionalGenerationTextOnly
+):
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        nn.Module.__init__(self)
+        self.config = atom_config.hf_config
+        self.visual = PPMissingLayer()
+        self.language_model = Qwen3_5MoeForCausalLM(atom_config=atom_config, prefix="")
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
     def detect_fused_expert_format(self, weight_name: str) -> bool:
         """Detect if weight is from fused expert checkpoint (BF16 format)."""
         # Qwen3.5 BF16 has: experts.gate_up_proj, experts.down_proj
@@ -572,43 +609,6 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
             loaded_weight,
             shard_id,
             num_experts,
-        )
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.language_model.model.get_input_embeddings(input_ids)
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.language_model.embed_input_ids(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **_: object,
-    ):
-        return self.language_model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        return self.language_model.compute_logits(hidden_states)
-
-
-class Qwen3_5MoeForConditionalGenerationTextOnly(
-    Qwen3_5ForConditionalGenerationTextOnly
-):
-    def __init__(self, atom_config: Config, prefix: str = ""):
-        nn.Module.__init__(self)
-        self.config = atom_config.hf_config
-        self.visual = PPMissingLayer()
-        self.language_model = Qwen3_5MoeForCausalLM(atom_config=atom_config, prefix="")
-        self.make_empty_intermediate_tensors = (
-            self.language_model.make_empty_intermediate_tensors
         )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
