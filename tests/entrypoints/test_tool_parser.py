@@ -180,7 +180,7 @@ class TestToolCallStreamParser:
             "I'll fetch that for you.",
             "<|tool_calls_section_begin|>",
             "<|tool_call_begin|>functions.curl:0"
-            '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "POST", "body": "{\\\"key\\\": \\\"value\\\"}"}'
+            '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "POST", "body": "{\\"key\\": \\"value\\"}"}'
             "<|tool_call_end|>",
             "<|tool_calls_section_end|>",
         ]
