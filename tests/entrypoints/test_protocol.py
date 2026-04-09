@@ -63,10 +63,63 @@ class TestChatMessage:
         )
         assert msg.get_content_text() == ""
 
+    def test_none_content(self):
+        """Tool role messages may have content=None."""
+        msg = ChatMessage(role="assistant", content=None)
+        assert msg.get_content_text() == ""
+
     def test_extra_fields_allowed(self):
         """ChatMessage should accept extra fields (e.g., 'name')."""
         msg = ChatMessage(role="user", content="Hi", name="Alice")
         assert msg.role == "user"
+
+    def test_to_template_dict_basic(self):
+        msg = ChatMessage(role="user", content="Hello")
+        d = msg.to_template_dict()
+        assert d == {"role": "user", "content": "Hello"}
+
+    def test_to_template_dict_with_tool_calls(self):
+        """Assistant message with tool_calls should preserve them."""
+        msg = ChatMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "I'll run that.",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": '{"cmd": "ls"}'},
+                    }
+                ],
+            }
+        )
+        d = msg.to_template_dict()
+        assert d["role"] == "assistant"
+        assert d["content"] == "I'll run that."
+        assert len(d["tool_calls"]) == 1
+        assert d["tool_calls"][0]["function"]["name"] == "exec"
+
+    def test_to_template_dict_tool_message(self):
+        """Tool result message should preserve tool_call_id."""
+        msg = ChatMessage.model_validate(
+            {
+                "role": "tool",
+                "content": "file1.txt\nfile2.txt",
+                "tool_call_id": "call_0",
+            }
+        )
+        d = msg.to_template_dict()
+        assert d["role"] == "tool"
+        assert d["tool_call_id"] == "call_0"
+        assert "file1.txt" in d["content"]
+
+    def test_to_template_dict_with_name(self):
+        """Message with name field should preserve it."""
+        msg = ChatMessage.model_validate(
+            {"role": "user", "content": "Hi", "name": "Alice"}
+        )
+        d = msg.to_template_dict()
+        assert d["name"] == "Alice"
 
 
 # ============================================================================

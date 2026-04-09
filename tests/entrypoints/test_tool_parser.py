@@ -82,6 +82,25 @@ class TestParseToolCalls:
         assert d["type"] == "function"
         assert d["function"]["name"] == "test"
 
+    def test_curl_tool_call(self):
+        text = (
+            "I'll fetch that URL for you."
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.curl:0"
+            '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "GET", "headers": {"Authorization": "Bearer token123"}}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        content, tool_calls = parse_tool_calls(text)
+        assert content == "I'll fetch that URL for you."
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function["name"] == "curl"
+        assert tool_calls[0].type == "function"
+        args = tool_calls[0].function["arguments"]
+        assert "https://api.example.com/data" in args
+        assert '"method": "GET"' in args
+        assert '"Authorization"' in args
+
     def test_tool_call_with_complex_args(self):
         args = (
             '{"messages": [{"role": "user", "content": "hello"}], "temperature": 0.7}'
@@ -155,6 +174,31 @@ class TestToolCallStreamParser:
         results = self._run_parser(tokens)
         content = "".join(d for t, d in results if t == "content")
         assert "Let me help." in content
+
+    def test_curl_tool_call_streaming(self):
+        tokens = [
+            "I'll fetch that for you.",
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>functions.curl:0"
+            '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "POST", "body": "{\\\"key\\\": \\\"value\\\"}"}'
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        results = self._run_parser(tokens)
+        content = "".join(d for t, d in results if t == "content")
+        assert "I'll fetch that for you." in content
+
+        starts = [d for t, d in results if t == "tool_call_start"]
+        assert len(starts) == 1
+        assert starts[0]["function"]["name"] == "curl"
+
+        args = [d for t, d in results if t == "tool_call_args"]
+        assert len(args) == 1
+        assert "https://api.example.com/data" in args[0]["function"]["arguments"]
+        assert '"method": "POST"' in args[0]["function"]["arguments"]
+
+        ends = [d for t, d in results if t == "tool_call_end"]
+        assert len(ends) == 1
 
     def test_flush_with_unclosed_section(self):
         tokens = [

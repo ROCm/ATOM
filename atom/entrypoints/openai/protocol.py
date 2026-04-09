@@ -31,12 +31,14 @@ class ChatMessage(BaseModel):
     """Represents a single chat message."""
 
     role: str
-    content: Union[str, List[Dict[str, Any]]]
+    content: Union[str, List[Dict[str, Any]], None] = None
 
     model_config = ConfigDict(extra="allow")
 
     def get_content_text(self) -> str:
         """Extract text content, handling both string and multimodal content parts."""
+        if self.content is None:
+            return ""
         if isinstance(self.content, str):
             return self.content
         # OpenAI multimodal format: [{"type": "text", "text": "..."}, ...]
@@ -45,6 +47,20 @@ class ChatMessage(BaseModel):
             if isinstance(part, dict) and part.get("type") == "text":
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
+
+    def to_template_dict(self) -> Dict[str, Any]:
+        """Convert to dict for chat template, preserving tool-related fields.
+
+        Returns a dict with role, content, and any extra fields (tool_calls,
+        tool_call_id, name, reasoning_content) that the chat template needs.
+        """
+        d: Dict[str, Any] = {"role": self.role, "content": self.get_content_text()}
+        # Preserve extra fields needed by chat templates (e.g. Kimi-K2)
+        extras = self.model_extra or {}
+        for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
+            if key in extras:
+                d[key] = extras[key]
+        return d
 
 
 class ChatCompletionRequest(BaseModel):

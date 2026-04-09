@@ -307,9 +307,12 @@ async def chat_completions(request: ChatCompletionRequest):
             merged_kwargs.update(request.chat_template_kwargs)
         merged_kwargs["tokenize"] = False
         merged_kwargs["add_generation_prompt"] = True
+        # Pass tools so the chat template can inject tool declarations
+        if request.tools:
+            merged_kwargs["tools"] = request.tools
 
         prompt = tokenizer.apply_chat_template(
-            [{"role": msg.role, "content": msg.get_content_text()} for msg in messages],
+            [msg.to_template_dict() for msg in messages],
             **merged_kwargs,
         )
 
