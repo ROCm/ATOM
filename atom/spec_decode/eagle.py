@@ -94,7 +94,9 @@ class EagleProposer:
         # If MTP shared_head.head was not in checkpoint (weight is all zeros),
         # share lm_head from the target model as fallback.
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            for layer in self.model.model.layers.values():
+            layers = self.model.model.layers
+            layer_iter = layers.values() if hasattr(layers, "values") else layers
+            for layer in layer_iter:
                 if (
                     hasattr(layer, "shared_head")
                     and hasattr(layer.shared_head, "head")
