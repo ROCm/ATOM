@@ -3,7 +3,8 @@
 
 Given a floating tag like ``vllm-latest``, this script looks up its manifest
 digest and then searches the same repository for the newest
-``vllm-v*-nightly_*`` tag with that exact digest. If no nightly tag matches, it
+``vllm-v*-nightly_*`` tag with that exact digest. If no nightly tag matches, or
+if the reverse lookup cannot complete after the floating tag digest is known, it
 returns a digest-pinned ``latest`` reference instead.
 """
 
@@ -38,6 +39,37 @@ class CandidateTag:
     tag: str
     version: str
     date: str
+
+
+def build_resolution(
+    repository: str,
+    reference_tag: str,
+    reference_digest: str,
+    preferred_version: str | None,
+    *,
+    match_type: str,
+    matched_tag: str = "",
+    candidate_count: int = 0,
+    resolution_error: str = "",
+) -> dict[str, object]:
+    reference_image = f"{repository}:{reference_tag}"
+    result: dict[str, object] = {
+        "repository": repository,
+        "reference_tag": reference_tag,
+        "reference_image": reference_image,
+        "reference_digest": reference_digest,
+        "preferred_version": preferred_version or "",
+        "match_type": match_type,
+        "matched_tag": matched_tag,
+        "candidate_count": candidate_count,
+    }
+    if matched_tag:
+        result["resolved_image"] = f"{repository}:{matched_tag}"
+    else:
+        result["resolved_image"] = f"{reference_image}@{reference_digest}"
+    if resolution_error:
+        result["resolution_error"] = resolution_error
+    return result
 
 
 def http_request(
@@ -159,39 +191,39 @@ def resolve_image(
 ) -> dict[str, object]:
     token = get_registry_token(repository)
     reference_digest = get_manifest_digest(repository, reference_tag, token)
-    candidates = nightly_candidates(list_tags(repository, token), preferred_version)
+    candidates: list[CandidateTag] = []
+    try:
+        candidates = nightly_candidates(list_tags(repository, token), preferred_version)
+        for candidate in candidates:
+            if get_manifest_digest(repository, candidate.tag, token) == reference_digest:
+                return build_resolution(
+                    repository,
+                    reference_tag,
+                    reference_digest,
+                    preferred_version,
+                    match_type="matched-nightly-tag",
+                    matched_tag=candidate.tag,
+                    candidate_count=len(candidates),
+                )
+    except RuntimeError as exc:
+        return build_resolution(
+            repository,
+            reference_tag,
+            reference_digest,
+            preferred_version,
+            match_type="reverse-lookup-failed-digest-pinned-latest",
+            candidate_count=len(candidates),
+            resolution_error=str(exc),
+        )
 
-    matched_tag = None
-    for candidate in candidates:
-        if get_manifest_digest(repository, candidate.tag, token) == reference_digest:
-            matched_tag = candidate.tag
-            break
-
-    reference_image = f"{repository}:{reference_tag}"
-    if matched_tag:
-        return {
-            "repository": repository,
-            "reference_tag": reference_tag,
-            "reference_image": reference_image,
-            "reference_digest": reference_digest,
-            "preferred_version": preferred_version or "",
-            "match_type": "matched-nightly-tag",
-            "matched_tag": matched_tag,
-            "resolved_image": f"{repository}:{matched_tag}",
-            "candidate_count": len(candidates),
-        }
-
-    return {
-        "repository": repository,
-        "reference_tag": reference_tag,
-        "reference_image": reference_image,
-        "reference_digest": reference_digest,
-        "preferred_version": preferred_version or "",
-        "match_type": "digest-pinned-latest",
-        "matched_tag": "",
-        "resolved_image": f"{reference_image}@{reference_digest}",
-        "candidate_count": len(candidates),
-    }
+    return build_resolution(
+        repository,
+        reference_tag,
+        reference_digest,
+        preferred_version,
+        match_type="digest-pinned-latest",
+        candidate_count=len(candidates),
+    )
 
 
 def main() -> None:

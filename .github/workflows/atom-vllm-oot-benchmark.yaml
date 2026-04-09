@@ -179,7 +179,7 @@ jobs:
               PREBUILT_RESOLUTION_TYPE="${RESOLVED_IMAGE_META[3]}"
               RESOLVED_NIGHTLY_TAG="${RESOLVED_IMAGE_META[4]}"
             else
-              echo "::warning::Failed to resolve a same-digest nightly tag for rocm/atom-dev:vllm-latest; falling back to the floating tag."
+              echo "::warning::Failed to resolve or digest-pin rocm/atom-dev:vllm-latest; falling back to the floating tag."
               PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
               RESOLVED_PREBUILT_ALIAS="rocm/atom-dev:vllm-latest"
               PREBUILT_RESOLUTION_TYPE="resolution-failed"
@@ -244,8 +244,12 @@ jobs:
                 printf -- '- Resolution: no nightly tag with the same digest was found, so this run pins `vllm-latest` to its current digest instead.\n' \
                   >> "$GITHUB_STEP_SUMMARY"
                 ;;
+              reverse-lookup-failed-digest-pinned-latest)
+                printf -- '- Resolution: reverse lookup could not complete, so this run pins `vllm-latest` to its current digest instead of falling back to the floating tag.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
               resolution-failed)
-                printf -- '- Resolution: reverse lookup failed, so this run falls back to floating `vllm-latest`.\n' \
+                printf -- '- Resolution: digest pinning itself failed, so this run falls back to floating `vllm-latest`.\n' \
                   >> "$GITHUB_STEP_SUMMARY"
                 ;;
             esac
