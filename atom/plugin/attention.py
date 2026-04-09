@@ -111,7 +111,7 @@ class vllmAiterAttentionBackendMethods:
     # to decide the output buffer and shape, thus here use this flag to
     # let vllm don't allocate the output buffer for ATOM. ATOM will
     # handle the output buffer by itself
-    accept_output_buffer: bool = True
+    accept_output_buffer: bool = False
     supported_dtypes: list = [torch.float16, torch.bfloat16]
     forward_includes_kv_cache_update: bool = True
 

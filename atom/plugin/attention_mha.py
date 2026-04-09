@@ -626,11 +626,11 @@ class PagedAttentionImplPluginModeMethods:
         qkv: torch.Tensor = None,
         output: torch.Tensor = None,
     ):
-        if output is None:
-            num_tokens = query.shape[0]
-            output_dtype = query.dtype
-            output_shape = torch.Size((num_tokens, self.num_heads * self.head_size))
-            output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+        # create the output here, it use query shape
+        num_tokens = query.shape[0]
+        output_dtype = query.dtype
+        output_shape = torch.Size((num_tokens, self.num_heads * self.head_size))
+        output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
 
         # dummy run will skip attention in cuda graph capture phase
         if attn_metadata is None:
