@@ -34,6 +34,10 @@ on:
         description: "Benchmark MiniMax-M2.5"
         type: boolean
         default: true
+      llama-3-3-70b-instruct-mxfp4:
+        description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
+        type: boolean
+        default: true
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string

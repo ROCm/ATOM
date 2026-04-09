@@ -78,5 +78,15 @@
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
     "env_vars": ""
+  },
+  {
+    "display": "Llama-3.3-70B-Instruct-MXFP4",
+    "path": "amd/Llama-3.3-70B-Instruct-MXFP4-Preview",
+    "prefix": "llama-3-3-70b-instruct-mxfp4",
+    "args": "--kv_cache_dtype fp8 -tp 1",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
   }
 ]
