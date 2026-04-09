@@ -13,7 +13,7 @@
   {
     "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
     "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-    "extraArgs": "--tensor-parallel-size 4",
+    "extraArgs": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
     "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
     "runner": "linux-atom-mi35x-4",
     "test_level": "nightly",
@@ -24,7 +24,7 @@
   {
     "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
     "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
-    "extraArgs": "--tensor-parallel-size 8",
+    "extraArgs": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
     "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
@@ -35,7 +35,7 @@
   {
     "model_name": "Qwen3.5-397B-A17B TP8",
     "model_path": "Qwen/Qwen3.5-397B-A17B",
-    "extraArgs": "--tensor-parallel-size 8",
+    "extraArgs": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
     "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",

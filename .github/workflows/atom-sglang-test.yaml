@@ -1,4 +1,4 @@
-name: ATOM vLLM Test
+name: ATOM SGLang Accuracy Test
 
 on:
   pull_request:
@@ -17,58 +17,8 @@ on:
     # from") as the ATOM branch selector, so users do not need to type branch
     # names.
     inputs:
-      run_qwen3_moe_tp8:
-        description: "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8"
-        required: false
-        type: boolean
-        default: false
-      run_qwen3_next_80b_tp4:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_fp8_tp8:
-        description: "Qwen3.5-397B-A17B-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_qwen35_397b_tp8:
-        description: "Qwen3.5-397B-A17B TP8"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k2_tp8:
-        description: "Kimi-K2-Thinking-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_kimi_k25_tp8:
-        description: "Kimi-K2.5-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp8_tp8:
-        description: "DeepSeek-R1-FP8 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_dsr1_fp4_tp8:
-        description: "DeepSeek-R1-0528-MXFP4 TP8"
-        required: false
-        type: boolean
-        default: false
-      run_gpt_oss_120b_tp1:
-        description: "gpt-oss-120b TP1"
-        required: false
-        type: boolean
-        default: false
-      run_gpt_oss_120b_tp2:
-        description: "gpt-oss-120b TP2"
-        required: false
-        type: boolean
-        default: false
-      upload_accuracy_to_dashboard:
-        description: "Optional: upload OOT accuracy results to dashboard after this manual run"
+      run_dsr1_fp8_tp4:
+        description: "DeepSeek-R1-FP8 TP4"
         required: false
         type: boolean
         default: false
@@ -79,18 +29,18 @@ concurrency:
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
-  OOT_IMAGE_CACHE_KEEP: "3"
+  SGLANG_IMAGE_CACHE_KEEP: "3"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
-  NIGHTLY_OOT_IMAGE_TAG: rocm/atom-dev:vllm-latest
+  NIGHTLY_SGLANG_IMAGE_TAG: rocm/atom-dev:sglang-latest
   VALIDATION_IMAGE_REPO: rocm/atom-dev
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
   AITER_COMMIT: "HEAD"
-  VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
+  SGLANG_REF: "v0.5.10"
 
 jobs:
-  # ---------- OOT CI path (pull_request only) ----------
+  # ---------- SGLANG CI path (pull_request only) ----------
   check-signal:
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
     name: Check Pre Checkin Signal
@@ -176,18 +126,18 @@ jobs:
           path: aiter-whl/amd_aiter*.whl
           retention-days: 1
 
-  build_oot_image:
+  build_sglang_image:
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
     needs: [check-signal, download_aiter_wheel]
-    name: Reuse OOT CI image
+    name: Reuse SGLANG CI image
     runs-on: build-only-atom
     env:
-      VLLM_COMMIT: 2a69949bdadf0e8942b7a1619b229cb475beef20
+      SGLANG_REF: v0.5.10
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
     steps:
-      - name: Initialize OOT image tag
+      - name: Initialize SGLANG image tag
         run: |
-          echo "OOT_IMAGE_TAG=rocm/atom-dev:oot-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
+          echo "SGLANG_IMAGE_TAG=rocm/atom-dev:sglang-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
 
       - name: Checkout ATOM repo
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -198,54 +148,54 @@ jobs:
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
-      - name: Check existing prebuilt OOT image
-        id: existing_oot_image
+      - name: Check existing prebuilt SGLANG image
+        id: existing_sglang_image
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         run: |
           set -euo pipefail
           echo "image_exists=false" >> "$GITHUB_OUTPUT"
 
-          if ! docker manifest inspect "${OOT_IMAGE_TAG}" >/dev/null 2>&1; then
-            echo "No existing OOT image found for ${OOT_IMAGE_TAG}; building a new one."
+          if ! docker manifest inspect "${SGLANG_IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "No existing SGLANG image found for ${SGLANG_IMAGE_TAG}; building a new one."
             exit 0
           fi
 
-          echo "Found existing OOT image for ${OOT_IMAGE_TAG}; validating vLLM commit label."
-          if ! docker pull "${OOT_IMAGE_TAG}"; then
-            echo "Failed to pull existing image ${OOT_IMAGE_TAG}; rebuilding it."
+          echo "Found existing SGLANG image for ${SGLANG_IMAGE_TAG}; validating SGLang commit label."
+          if ! docker pull "${SGLANG_IMAGE_TAG}"; then
+            echo "Failed to pull existing image ${SGLANG_IMAGE_TAG}; rebuilding it."
             exit 0
           fi
 
-          EXISTING_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${OOT_IMAGE_TAG}" 2>/dev/null || true)"
-          EXISTING_AITER_ARTIFACT_ID="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.aiter_artifact_id" }}' "${OOT_IMAGE_TAG}" 2>/dev/null || true)"
-          if [ -n "${EXISTING_VLLM_COMMIT}" ] && [ "${EXISTING_VLLM_COMMIT}" = "${VLLM_COMMIT}" ] && [ -n "${EXISTING_AITER_ARTIFACT_ID}" ] && [ "${EXISTING_AITER_ARTIFACT_ID}" = "${AITER_ARTIFACT_ID}" ]; then
+          EXISTING_SGLANG_REF="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.sglang_ref" }}' "${SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
+          EXISTING_AITER_ARTIFACT_ID="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.aiter_artifact_id" }}' "${SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
+          if [ -n "${EXISTING_SGLANG_REF}" ] && [ "${EXISTING_SGLANG_REF}" = "${SGLANG_REF}" ] && [ -n "${EXISTING_AITER_ARTIFACT_ID}" ] && [ "${EXISTING_AITER_ARTIFACT_ID}" = "${AITER_ARTIFACT_ID}" ]; then
             echo "image_exists=true" >> "$GITHUB_OUTPUT"
-            echo "Reusing existing OOT image for ${OOT_IMAGE_TAG} (vLLM commit ${EXISTING_VLLM_COMMIT}, aiter artifact ${EXISTING_AITER_ARTIFACT_ID})."
+            echo "Reusing existing SGLANG image for ${SGLANG_IMAGE_TAG} (SGLang commit ${EXISTING_SGLANG_REF}, aiter artifact ${EXISTING_AITER_ARTIFACT_ID})."
           else
             echo "Existing image label mismatch or missing."
-            echo "Expected vLLM commit ${VLLM_COMMIT}, got ${EXISTING_VLLM_COMMIT:-<missing>}."
+            echo "Expected SGLang commit ${SGLANG_REF}, got ${EXISTING_SGLANG_REF:-<missing>}."
             echo "Expected aiter artifact ${AITER_ARTIFACT_ID}, got ${EXISTING_AITER_ARTIFACT_ID:-<missing>}."
           fi
 
       - name: Download aiter wheel
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: aiter-whl
           path: aiter-whl
 
-      - name: Generate OOT overlay Dockerfile
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' }}
+      - name: Generate SGLANG overlay Dockerfile
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' }}
         run: |
           cat <<'EOF' > Dockerfile.mod
-          ARG OOT_BASE_IMAGE
-          FROM ${OOT_BASE_IMAGE}
+          ARG SGLANG_BASE_IMAGE
+          FROM ${SGLANG_BASE_IMAGE}
           ARG GITHUB_REPO_URL
           ARG GITHUB_COMMIT_SHA
-          ARG VLLM_COMMIT
+          ARG SGLANG_REF
           ARG AITER_ARTIFACT_ID
           ARG INSTALL_LM_EVAL=1
-          LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
+          LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
           LABEL com.rocm.atom.aiter_artifact_id="${AITER_ARTIFACT_ID}"
           COPY aiter-whl/ /tmp/aiter-whl/
           RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]"; else echo "Skip lm-eval install"; fi
@@ -270,140 +220,117 @@ jobs:
               git checkout "${GITHUB_COMMIT_SHA}" && \
               pip install -e . --no-deps && \
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          RUN pip show amd-aiter atom vllm torch triton mori || true
+          RUN pip show amd-aiter atom sglang torch triton mori || true
           EOF
 
-      - name: Resolve OOT CI build mode
+      - name: Resolve SGLANG CI build mode
         id: build_mode
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' }}
         run: |
           set -euo pipefail
           echo "build_mode=full" >> "$GITHUB_OUTPUT"
 
-          if ! docker pull "${NIGHTLY_OOT_IMAGE_TAG}"; then
-            echo "Unable to pull ${NIGHTLY_OOT_IMAGE_TAG}; falling back to a full vLLM rebuild."
+          if ! docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
+            echo "Unable to pull ${NIGHTLY_SGLANG_IMAGE_TAG}; falling back to a full SGLang rebuild."
             exit 0
           fi
 
-          echo "Inspecting ${NIGHTLY_OOT_IMAGE_TAG} labels before deciding whether to reuse it."
-          docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_OOT_IMAGE_TAG}" || true
-          docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_OOT_IMAGE_TAG}" || true
-          LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_OOT_IMAGE_TAG}" 2>/dev/null || true)"
-          echo "Expected vLLM commit label: ${VLLM_COMMIT}"
-          echo "Resolved ${NIGHTLY_OOT_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
-          if [ -n "${LATEST_VLLM_COMMIT}" ] && [ "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" ]; then
+          echo "Inspecting ${NIGHTLY_SGLANG_IMAGE_TAG} labels before deciding whether to reuse it."
+          docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_SGLANG_IMAGE_TAG}" || true
+          docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_SGLANG_IMAGE_TAG}" || true
+          LATEST_SGLANG_REF="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.sglang_ref" }}' "${NIGHTLY_SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
+          echo "Expected SGLang commit label: ${SGLANG_REF}"
+          echo "Resolved ${NIGHTLY_SGLANG_IMAGE_TAG} label com.rocm.atom.sglang_ref: ${LATEST_SGLANG_REF:-<missing>}"
+          if [ -n "${LATEST_SGLANG_REF}" ] && [ "${LATEST_SGLANG_REF}" = "${SGLANG_REF}" ]; then
             echo "build_mode=fast" >> "$GITHUB_OUTPUT"
-            echo "Reusing ${NIGHTLY_OOT_IMAGE_TAG} as the OOT CI base (vLLM commit ${LATEST_VLLM_COMMIT})."
+            echo "Reusing ${NIGHTLY_SGLANG_IMAGE_TAG} as the SGLANG CI base (SGLang commit ${LATEST_SGLANG_REF})."
           else
-            echo "OOT CI latest image label mismatch or missing. Expected ${VLLM_COMMIT}, got ${LATEST_VLLM_COMMIT:-<missing>}; rebuilding vLLM."
+            echo "SGLANG CI latest image label mismatch or missing. Expected ${SGLANG_REF}, got ${LATEST_SGLANG_REF:-<missing>}; rebuilding SGLang."
           fi
 
-      - name: Build OOT overlay image from reusable latest
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode == 'fast' }}
+      - name: Build SGLANG overlay image from reusable latest
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode == 'fast' }}
         run: |
           DOCKER_BUILDKIT=1 docker build --network=host \
-            -t atom_oot:ci \
-            --build-arg OOT_BASE_IMAGE="${NIGHTLY_OOT_IMAGE_TAG}" \
+            -t atom_sglang:ci \
+            --build-arg SGLANG_BASE_IMAGE="${NIGHTLY_SGLANG_IMAGE_TAG}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
-            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
             --build-arg INSTALL_LM_EVAL=1 \
             -f Dockerfile.mod .
 
-      - name: Build OOT overlay base image
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode != 'fast' }}
+      - name: Build SGLANG overlay base image
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode != 'fast' }}
         run: |
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
-            -t atom_oot_base:ci \
-            --build-arg OOT_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            -t atom_sglang_base:ci \
+            --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
-            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
             --build-arg INSTALL_LM_EVAL=1 \
             -f Dockerfile.mod .
 
-      - name: Build OOT vLLM image
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode != 'fast' }}
+      - name: Build SGLANG SGLang image
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode != 'fast' }}
         run: |
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
-            -t atom_oot:ci \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            -t atom_sglang:ci \
+            --target atom_sglang \
+            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
             --build-arg MAX_JOBS=64 \
-            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
 
       - name: Push Docker image
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' }}
         run: |
-          docker tag atom_oot:ci "${OOT_IMAGE_TAG}"
-          docker push "${OOT_IMAGE_TAG}"
+          docker tag atom_sglang:ci "${SGLANG_IMAGE_TAG}"
+          docker push "${SGLANG_IMAGE_TAG}"
 
       - name: Skip remote build for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
-          echo "Fork PRs build the OOT image locally on each test runner."
+          echo "Fork PRs build the SGLANG image locally on each test runner."
 
       - name: Clean up build images
         if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && always() }}
         run: |
           rm -f Dockerfile.mod || true
-          docker rmi "atom_oot_base:ci" || true
-          docker rmi "atom_oot:ci" || true
-          docker rmi "${OOT_IMAGE_TAG}" || true
+          docker rmi "atom_sglang_base:ci" || true
+          docker rmi "atom_sglang:ci" || true
+          docker rmi "${SGLANG_IMAGE_TAG}" || true
 
-  atom-vllm-oot:
-    needs: [check-signal, download_aiter_wheel, build_oot_image]
+  atom-sglang-accuracy:
+    needs: [check-signal, download_aiter_wheel, build_sglang_image]
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
-    name: ${{ matrix.display_name }}
+    name: ATOM SGLang Accuracy Test
     strategy:
       fail-fast: false
       matrix:
         include:
-          - display_name: "DeepSeek-R1-FP8 TP8"
-            model_name: "DeepSeek-R1-FP8"
+          - model_name: "DeepSeek-R1-FP8 TP4"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extra_args: "--tensor-parallel-size 8"
-            env_vars: ""
-            accuracy_test_threshold: 0.93
-            runner: atom-mi355-8gpu.predownload
-          - display_name: "gpt-oss-120b TP1"
-            model_name: "gpt-oss-120b"
-            model_path: "openai/gpt-oss-120b"
-            extra_args: "--tensor-parallel-size 1"
-            env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
-            accuracy_test_threshold: 0.38
-            runner: linux-atom-mi35x-1
-          - display_name: "Kimi-K2-Thinking-MXFP4 TP4"
-            model_name: "Kimi-K2-Thinking-MXFP4"
-            model_path: "amd/Kimi-K2-Thinking-MXFP4"
             extra_args: "--tensor-parallel-size 4"
-            env_vars: ""
-            accuracy_test_threshold: 0.90
-            runner: linux-atom-mi35x-4
-          - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
-            model_name: "Qwen3.5-35B-A3B-FP8"
-            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
-            extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
-            # FIXME: Remove these temporary Qwen3.5 workarounds after the
-            # aiter fix landed
             env_vars: |
-              ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
-              ATOM_USE_CUSTOM_ALL_GATHER=0
-            accuracy_test_threshold: 0.76
+              AITER_QUICK_REDUCE_QUANTIZATION=INT4
+              SGLANG_AITER_FP8_PREFILL_ATTN=0
+              SGLANG_USE_AITER=1
+              ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+            accuracy_test_threshold: 0.92
             runner: linux-atom-mi35x-4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
-      CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
-      VLLM_COMMIT: 2a69949bdadf0e8942b7a1619b229cb475beef20
-      VLLM_VERSION: "0.19.0"
+      CONTAINER_NAME: atom_sglang_${{ strategy.job-index }}
+      SGLANG_REF: v0.5.10
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
     steps:
@@ -419,7 +346,7 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Checkout ATOM repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
@@ -436,18 +363,18 @@ jobs:
           name: aiter-whl
           path: aiter-whl
 
-      - name: Generate OOT overlay Dockerfile for forked repo
+      - name: Generate SGLANG overlay Dockerfile for forked repo
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           cat <<'EOF' > Dockerfile.mod
-          ARG OOT_BASE_IMAGE
-          FROM ${OOT_BASE_IMAGE}
+          ARG SGLANG_BASE_IMAGE
+          FROM ${SGLANG_BASE_IMAGE}
           ARG GITHUB_REPO_URL
           ARG GITHUB_COMMIT_SHA
-          ARG VLLM_COMMIT
+          ARG SGLANG_REF
           ARG AITER_ARTIFACT_ID
           ARG INSTALL_LM_EVAL=1
-          LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
+          LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
           LABEL com.rocm.atom.aiter_artifact_id="${AITER_ARTIFACT_ID}"
           COPY aiter-whl/ /tmp/aiter-whl/
           RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]"; else echo "Skip lm-eval install"; fi
@@ -472,41 +399,41 @@ jobs:
               git checkout "${GITHUB_COMMIT_SHA}" && \
               pip install -e . --no-deps && \
               echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          RUN pip show amd-aiter atom vllm torch triton mori || true
+          RUN pip show amd-aiter atom sglang torch triton mori || true
           EOF
 
-      - name: Build OOT image for forked repo
+      - name: Build SGLANG image for forked repo
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           set -euo pipefail
-          docker rmi "atom_oot_base:ci" || true
-          docker rmi "atom_oot:ci" || true
+          docker rmi "atom_sglang_base:ci" || true
+          docker rmi "atom_sglang:ci" || true
 
           BUILD_MODE="full"
-          if ! docker pull "${NIGHTLY_OOT_IMAGE_TAG}"; then
-            echo "Unable to pull ${NIGHTLY_OOT_IMAGE_TAG}; rebuilding vLLM locally."
+          if ! docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
+            echo "Unable to pull ${NIGHTLY_SGLANG_IMAGE_TAG}; rebuilding SGLang locally."
           else
-            echo "Inspecting ${NIGHTLY_OOT_IMAGE_TAG} labels before deciding whether to reuse it locally."
-            docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_OOT_IMAGE_TAG}" || true
-            docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_OOT_IMAGE_TAG}" || true
-            LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_OOT_IMAGE_TAG}" 2>/dev/null || true)"
-            echo "Expected vLLM commit label: ${VLLM_COMMIT}"
-            echo "Resolved ${NIGHTLY_OOT_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
-            if [ -n "${LATEST_VLLM_COMMIT}" ] && [ "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" ]; then
+            echo "Inspecting ${NIGHTLY_SGLANG_IMAGE_TAG} labels before deciding whether to reuse it locally."
+            docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_SGLANG_IMAGE_TAG}" || true
+            docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_SGLANG_IMAGE_TAG}" || true
+            LATEST_SGLANG_REF="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.sglang_ref" }}' "${NIGHTLY_SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
+            echo "Expected SGLang commit label: ${SGLANG_REF}"
+            echo "Resolved ${NIGHTLY_SGLANG_IMAGE_TAG} label com.rocm.atom.sglang_ref: ${LATEST_SGLANG_REF:-<missing>}"
+            if [ -n "${LATEST_SGLANG_REF}" ] && [ "${LATEST_SGLANG_REF}" = "${SGLANG_REF}" ]; then
               BUILD_MODE="fast"
-              echo "Reusing ${NIGHTLY_OOT_IMAGE_TAG} locally for fork PR OOT CI."
+              echo "Reusing ${NIGHTLY_SGLANG_IMAGE_TAG} locally for fork PR SGLANG CI."
             else
-              echo "OOT CI latest image label mismatch or missing. Expected ${VLLM_COMMIT}, got ${LATEST_VLLM_COMMIT:-<missing>}; rebuilding vLLM locally."
+              echo "SGLANG CI latest image label mismatch or missing. Expected ${SGLANG_REF}, got ${LATEST_SGLANG_REF:-<missing>}; rebuilding SGLang locally."
             fi
           fi
 
           if [ "${BUILD_MODE}" = "fast" ]; then
             DOCKER_BUILDKIT=1 docker build --network=host \
-              -t atom_oot:ci \
-              --build-arg OOT_BASE_IMAGE="${NIGHTLY_OOT_IMAGE_TAG}" \
+              -t atom_sglang:ci \
+              --build-arg SGLANG_BASE_IMAGE="${NIGHTLY_SGLANG_IMAGE_TAG}" \
               --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
               --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
-              --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+              --build-arg SGLANG_REF="${SGLANG_REF}" \
               --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
               --build-arg INSTALL_LM_EVAL=1 \
               -f Dockerfile.mod .
@@ -515,40 +442,40 @@ jobs:
 
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
-            -t atom_oot_base:ci \
-            --build-arg OOT_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            -t atom_sglang_base:ci \
+            --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
-            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
             --build-arg INSTALL_LM_EVAL=1 \
             -f Dockerfile.mod .
 
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
-            -t atom_oot:ci \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            -t atom_sglang:ci \
+            --target atom_sglang \
+            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
             --build-arg MAX_JOBS=64 \
-            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
 
-      - name: Set OOT image tag
+      - name: Set SGLANG image tag
         env:
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           if [ "${IS_FORK_PR}" = "true" ]; then
-            echo "OOT_IMAGE_TAG=atom_oot:ci" >> "$GITHUB_ENV"
+            echo "SGLANG_IMAGE_TAG=atom_sglang:ci" >> "$GITHUB_ENV"
           else
-            echo "OOT_IMAGE_TAG=rocm/atom-dev:oot-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
+            echo "SGLANG_IMAGE_TAG=rocm/atom-dev:sglang-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
           fi
 
-      - name: Pull OOT image
+      - name: Pull SGLANG image
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         run: |
-          docker pull "${OOT_IMAGE_TAG}"
+          docker pull "${SGLANG_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -566,7 +493,7 @@ jobs:
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
-      - name: Start OOT test container
+      - name: Start SGLANG test container
         run: |
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -590,7 +517,7 @@ jobs:
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
             --name "$CONTAINER_NAME" \
-            "$OOT_IMAGE_TAG"
+            "$SGLANG_IMAGE_TAG"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -659,47 +586,49 @@ jobs:
             echo "/models directory not mounted; skipping model download"
           fi
 
-      - name: Resolve OOT model path
+      - name: Resolve SGLANG model path
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
           else
-            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
-      - name: Run OOT launch and gsm8k accuracy via script (ci mode)
+      - name: Run SGLANG launch and gsm8k accuracy via script (ci mode)
         if: success()
         timeout-minutes: 120
         env:
-          OOT_MODEL_NAME: ${{ matrix.model_name }}
-          OOT_MODEL_PATH: ${{ matrix.model_path }}
-          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
-          OOT_ENV_VARS: ${{ matrix.env_vars }}
+          SGLANG_MODEL_NAME: ${{ matrix.model_name }}
+          SGLANG_MODEL_PATH: ${{ matrix.model_path }}
+          SGLANG_EXTRA_ARGS: ${{ matrix.extra_args }}
+          SGLANG_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
-          STREAM_VLLM_LOGS: "1"
+          STREAM_SGLANG_LOGS: "1"
+          LM_EVAL_TASK: "gsm8k"
         run: |
           docker exec \
-            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
-            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
-            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
+            -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
+            -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
+            -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+            -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
-            -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
+            -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
+            -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_oot_test.sh accuracy ci
+              bash .github/scripts/atom_sglang_test.sh accuracy
             "
 
-      - name: Check OOT accuracy test results
+      - name: Check SGLANG accuracy test results
         if: success()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
-          result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
-            echo "ERROR: No results JSON file found in oot_accuracy_results/"
+            echo "ERROR: No results JSON file found in atom_sglang_accuracy_results/"
             exit 2
           fi
 
@@ -717,43 +646,43 @@ jobs:
             exit 0
           fi
 
-      - name: Collect OOT accuracy summary
+      - name: Collect SGLANG accuracy summary
         if: success()
         run: |
-          echo "OOT Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          echo "SGLANG Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
-      - name: Collect OOT logs and results
+      - name: Collect SGLANG logs and results
         if: always()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
 
-      - name: Upload OOT artifacts
+      - name: Upload SGLANG artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: oot-${{ matrix.model_name }}-artifacts
+          name: sglang-${{ matrix.model_name }}-artifacts
           path: |
-            vllm_oot.log
-            oot_accuracy_output.txt
-            oot_accuracy_results
+            atom_sglang.log
+            atom_sglang_accuracy_output.txt
+            atom_sglang_accuracy_results
 
-      - name: Clean up OOT test
+      - name: Clean up SGLANG test
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           rm -f Dockerfile.mod || true
-          docker rmi "atom_oot_base:ci" || true
-          docker rmi "atom_oot:ci" || true
-          KEEP_COUNT="${OOT_IMAGE_CACHE_KEEP:-3}"
-          if [[ "${OOT_IMAGE_TAG}" == rocm/atom-dev:oot-pre-build-* ]]; then
-            echo "Keeping current OOT image tag and the ${KEEP_COUNT} most recent oot-pre-build tags."
-            mapfile -t OLD_OOT_TAGS < <(
-              docker image ls --filter=reference='rocm/atom-dev:oot-pre-build-*' --format '{{.Repository}}:{{.Tag}}' \
+          docker rmi "atom_sglang_base:ci" || true
+          docker rmi "atom_sglang:ci" || true
+          KEEP_COUNT="${SGLANG_IMAGE_CACHE_KEEP:-3}"
+          if [[ "${SGLANG_IMAGE_TAG}" == rocm/atom-dev:sglang-pre-build-* ]]; then
+            echo "Keeping current SGLANG image tag and the ${KEEP_COUNT} most recent sglang-pre-build tags."
+            mapfile -t OLD_SGLANG_TAGS < <(
+              docker image ls --filter=reference='rocm/atom-dev:sglang-pre-build-*' --format '{{.Repository}}:{{.Tag}}' \
                 | while read -r tag; do
                     [ -n "${tag}" ] || continue
                     created_at=$(docker image inspect --format '{{.Created}}' "${tag}" 2>/dev/null || true)
@@ -762,22 +691,22 @@ jobs:
                 | sort -r \
                 | awk -v keep="${KEEP_COUNT}" 'NR > keep { print $2 }'
             )
-            for tag in "${OLD_OOT_TAGS[@]}"; do
-              if [ "${tag}" = "${OOT_IMAGE_TAG}" ]; then
+            for tag in "${OLD_SGLANG_TAGS[@]}"; do
+              if [ "${tag}" = "${SGLANG_IMAGE_TAG}" ]; then
                 continue
               fi
-              echo "Removing old OOT image tag: ${tag}"
+              echo "Removing old SGLANG image tag: ${tag}"
               docker rmi "${tag}" || true
             done
           fi
 
-  # ---------- OOT full validation path (schedule / workflow_dispatch) ----------
-  prepare-oot-image:
+  # ---------- SGLANG full validation path (schedule / workflow_dispatch) ----------
+  prepare-sglang-image:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    name: Prepare validation image
+    name: Prepare SGLANG validation image
     runs-on: build-only-atom
     outputs:
-      oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
+      sglang_image_tag: ${{ steps.meta.outputs.sglang_image_tag }}
       cleanup_temp_image: ${{ steps.meta.outputs.cleanup_temp_image }}
       model_matrix: ${{ steps.meta.outputs.model_matrix }}
     steps:
@@ -785,27 +714,18 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Docker Login
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != 'main' }}
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Resolve image source and model matrix
         id: meta
         env:
-          RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
-          RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
-          RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
-          RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
-          RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
-          RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
-          RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
-          RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
-          RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
-          RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
+          RUN_DSR1_FP8_TP4: ${{ inputs.run_dsr1_fp8_tp4 }}
         run: |
           set -euo pipefail
 
-          # Keep this Python model list as the single source of truth for OOT
+          # Keep this Python model list as the single source of truth for SGLANG
           # full-validation coverage and manual checkbox filtering.
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -815,93 +735,12 @@ jobs:
           event = os.environ["GITHUB_EVENT_NAME"]
           models = [
               {
-                  "toggle_env": "RUN_QWEN3_MOE_TP8",
-                  "model_name": "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8",
-                  "model_path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
-                  "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel",
-                  "accuracy_test_threshold": 0.87,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-8",
-              },
-              {
-                  "toggle_env": "RUN_QWEN3_NEXT_80B_TP4",
-                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
-                  "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-                  "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
-                  "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-                  "runner": "linux-atom-mi35x-4",
-              },
-              {
-                  "toggle_env": "RUN_QWEN35_397B_FP8_TP8",
-                  "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
-                  "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
-                  "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
-                  "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-                  "runner": "linux-atom-mi35x-8",
-              },
-              {
-                  "toggle_env": "RUN_QWEN35_397B_TP8",
-                  "model_name": "Qwen3.5-397B-A17B TP8",
-                  "model_path": "Qwen/Qwen3.5-397B-A17B",
-                  "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
-                  "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-                  "runner": "linux-atom-mi35x-8",
-              },
-              {
-                  "toggle_env": "RUN_KIMI_K2_TP8",
-                  "model_name": "Kimi-K2-Thinking-MXFP4 TP8",
-                  "model_path": "amd/Kimi-K2-Thinking-MXFP4",
-                  "extra_args": "--tensor-parallel-size 8",
-                  "accuracy_test_threshold": 0.90,
-                  "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
-              },
-              {
-                  "toggle_env": "RUN_KIMI_K25_TP8",
-                  "model_name": "Kimi-K2.5-MXFP4 TP8",
-                  "model_path": "amd/Kimi-K2.5-MXFP4",
-                  "extra_args": "--tensor-parallel-size 8",
-                  "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
-              },
-              {
-                  "toggle_env": "RUN_DSR1_FP8_TP8",
-                  "model_name": "DeepSeek-R1-FP8 TP8",
+                  "toggle_env": "RUN_DSR1_FP8_TP4",
+                  "model_name": "DeepSeek-R1-FP8 TP4",
                   "model_path": "deepseek-ai/DeepSeek-R1-0528",
-                  "extra_args": "--tensor-parallel-size 8",
-                  "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
-              },
-              {
-                  "toggle_env": "RUN_DSR1_FP4_TP8",
-                  "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
-                  "model_path": "amd/DeepSeek-R1-0528-MXFP4",
-                  "extra_args": "--tensor-parallel-size 8",
-                  "accuracy_test_threshold": 0.93,
-                  "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
-              },
-              {
-                  "toggle_env": "RUN_GPT_OSS_120B_TP1",
-                  "model_name": "gpt-oss-120b TP1",
-                  "model_path": "openai/gpt-oss-120b",
-                  "extra_args": "--tensor-parallel-size 1",
-                  "accuracy_test_threshold": 0.38,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-1",
-              },
-              {
-                  "toggle_env": "RUN_GPT_OSS_120B_TP2",
-                  "model_name": "gpt-oss-120b TP2",
-                  "model_path": "openai/gpt-oss-120b",
-                  "extra_args": "--tensor-parallel-size 2",
-                  "accuracy_test_threshold": 0.38,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "extra_args": "--tensor-parallel-size 4",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-4",
               },
           ]
@@ -919,17 +758,21 @@ jobs:
           print(f"model_matrix={json.dumps({'include': selected})}")
           PY
 
-          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            echo "Scheduled run uses published OOT image: ${NIGHTLY_OOT_IMAGE_TAG}"
-            echo "oot_image_tag=${NIGHTLY_OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF_NAME}" = "main" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "Manual run on main reuses published SGLANG image: ${NIGHTLY_SGLANG_IMAGE_TAG}"
+            else
+              echo "Scheduled run uses published SGLANG image: ${NIGHTLY_SGLANG_IMAGE_TAG}"
+            fi
+            echo "sglang_image_tag=${NIGHTLY_SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
-          MANUAL_BASE_IMAGE_TAG="atom_oot_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
-          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          MANUAL_BASE_IMAGE_TAG="atom_sglang_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          SGLANG_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:sglang-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
@@ -964,7 +807,7 @@ jobs:
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
-          echo "Manual run rebuilds OOT image from branch ${GITHUB_REF_NAME}"
+          echo "Building manual SGLANG image from branch ${GITHUB_REF_NAME}"
 
           docker build --pull --network=host --no-cache \
             -t "${MANUAL_BASE_IMAGE_TAG}" \
@@ -976,43 +819,43 @@ jobs:
             "${BUILD_CONTEXT}"
 
           docker build --network=host --no-cache \
-            -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
+            -t "${SGLANG_IMAGE_TAG}" \
+            --target atom_sglang \
+            --build-arg SGLANG_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
-            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f "${BUILD_CONTEXT}/docker/Dockerfile" \
             "${BUILD_CONTEXT}"
 
-          docker push "${OOT_IMAGE_TAG}"
+          docker push "${SGLANG_IMAGE_TAG}"
 
-          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
           echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker rmi "${{ steps.meta.outputs.oot_image_tag }}" || true
+          docker rmi "${{ steps.meta.outputs.sglang_image_tag }}" || true
           docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
 
-  oot-model-accuracy:
+  sglang-model-accuracy:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    name: Model Accuracy (${{ matrix.model_name }})
-    needs: [prepare-oot-image]
+    name: SGLANG Model Accuracy (${{ matrix.model_name }})
+    needs: [prepare-sglang-image]
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare-oot-image.outputs.model_matrix) }}
+      matrix: ${{ fromJSON(needs.prepare-sglang-image.outputs.model_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     permissions:
       actions: read
       contents: write
     env:
-      CONTAINER_NAME: atom_vllm_oot_validation_${{ strategy.job-index }}
-      OOT_IMAGE_TAG: ${{ needs.prepare-oot-image.outputs.oot_image_tag }}
+      CONTAINER_NAME: atom_sglang_validation_${{ strategy.job-index }}
+      SGLANG_IMAGE_TAG: ${{ needs.prepare-sglang-image.outputs.sglang_image_tag }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -1024,9 +867,9 @@ jobs:
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
-      - name: Pull OOT image
+      - name: Pull SGLANG image
         run: |
-          docker pull "${OOT_IMAGE_TAG}"
+          docker pull "${SGLANG_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -1063,7 +906,7 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/oot_env_file.txt << 'EOF'
+          cat > /tmp/sglang_env_file.txt << 'EOF'
           ${{ matrix.env_vars }}
           EOF
 
@@ -1078,10 +921,10 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --env-file /tmp/oot_env_file.txt \
+            --env-file /tmp/sglang_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${OOT_IMAGE_TAG}"
+            "${SGLANG_IMAGE_TAG}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1149,46 +992,48 @@ jobs:
             echo "/models directory not mounted; skipping model download"
           fi
 
-      - name: Resolve OOT model path
+      - name: Resolve SGLANG model path
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
           else
-            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
-      - name: Run OOT launch and gsm8k accuracy via script (full mode)
+      - name: Run SGLANG launch and gsm8k accuracy via script (full mode)
         timeout-minutes: 120
         env:
-          OOT_MODEL_NAME: ${{ matrix.model_name }}
-          OOT_MODEL_PATH: ${{ matrix.model_path }}
-          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
-          OOT_ENV_VARS: ${{ matrix.env_vars }}
+          SGLANG_MODEL_NAME: ${{ matrix.model_name }}
+          SGLANG_MODEL_PATH: ${{ matrix.model_path }}
+          SGLANG_EXTRA_ARGS: ${{ matrix.extra_args }}
+          SGLANG_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
-          STREAM_VLLM_LOGS: "1"
+          STREAM_SGLANG_LOGS: "1"
+          LM_EVAL_TASK: "gsm8k"
         run: |
           docker exec \
-            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
-            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
-            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
+            -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
+            -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
+            -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+            -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
-            -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
+            -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
+            -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_oot_test.sh accuracy full
+              bash .github/scripts/atom_sglang_test.sh accuracy
             "
 
-      - name: Check OOT accuracy test results
+      - name: Check SGLANG accuracy test results
         if: success()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
-          result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
-            echo "ERROR: No results JSON file found in oot_accuracy_results/"
+            echo "ERROR: No results JSON file found in atom_sglang_accuracy_results/"
             exit 2
           fi
 
@@ -1209,103 +1054,39 @@ jobs:
       - name: Collect summary
         if: success()
         run: |
-          echo "OOT gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          echo "SGLANG gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect artifacts
         if: always()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
 
       - name: Upload model artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: oot-validation-${{ matrix.model_name }}-${{ github.run_id }}
+          name: sglang-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
-            vllm_oot.log
-            oot_accuracy_output.txt
-            oot_accuracy_results
+            atom_sglang.log
+            atom_sglang_accuracy_output.txt
+            atom_sglang_accuracy_results
 
       - name: Upload accuracy results for dashboard
-        if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
-          path: oot_accuracy_results/*.json
+          path: atom_sglang_accuracy_results/*.json
           if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          docker rmi "${OOT_IMAGE_TAG}" || true
+          docker rmi "${SGLANG_IMAGE_TAG}" || true
 
-  # Build the dashboard payload from all uploaded accuracy artifacts after the
-  # full matrix completes. This keeps dashboard writes off the GPU runners and
-  # ensures each nightly/manual run publishes at most once.
-  accuracy-dashboard:
-    name: Update accuracy dashboard
-    needs: [oot-model-accuracy]
-    if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: Prepare accuracy artifact directory
-        run: mkdir -p /tmp/accuracy-results
-
-      - name: Download accuracy artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: /tmp/accuracy-results
-          pattern: accuracy-*
-        continue-on-error: true
-
-      - name: Count downloaded accuracy artifacts
-        id: downloaded
-        run: |
-          json_count=$(find /tmp/accuracy-results -type f -name '*.json' | wc -l | tr -d ' ')
-          echo "json_count=${json_count}" >> "$GITHUB_OUTPUT"
-          echo "Downloaded ${json_count} OOT accuracy JSON files"
-
-      - name: List downloaded accuracy artifacts
-        if: steps.downloaded.outputs.json_count != '0'
-        run: |
-          echo "=== Downloaded OOT accuracy artifacts ==="
-          find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
-
-      - name: Transform OOT accuracy results for dashboard
-        if: steps.downloaded.outputs.json_count != '0'
-        run: |
-          python3 .github/scripts/accuracy_to_dashboard.py \
-            /tmp/accuracy-results \
-            --output accuracy-benchmark-input.json \
-            --models .github/benchmark/oot_models_accuracy.json \
-            --backend "ATOM-vLLM" \
-            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "=== Generated entries ==="
-          cat accuracy-benchmark-input.json
-
-      - name: Store OOT accuracy result to dashboard
-        if: steps.downloaded.outputs.json_count != '0'
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          tool: customBiggerIsBetter
-          output-file-path: accuracy-benchmark-input.json
-          gh-pages-branch: gh-pages
-          benchmark-data-dir-path: benchmark-dashboard
-          auto-push: true
-          max-items-in-chart: 90
-          github-token: ${{ secrets.GITHUB_TOKEN }}
