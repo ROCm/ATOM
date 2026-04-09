@@ -60,6 +60,39 @@ _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
 _request_start_times: Dict[str, float] = {}
+_request_logger: Optional[logging.Logger] = None
+
+
+# ============================================================================
+# Request/Response Logging
+# ============================================================================
+
+
+def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
+    """Write a JSONL entry to the request log file (if enabled)."""
+    if _request_logger is None:
+        return
+    entry = {
+        "timestamp": time.time(),
+        "request_id": request_id,
+        "type": event_type,
+        "data": data,
+    }
+    _request_logger.info(json.dumps(entry, default=str))
+
+
+async def _logged_stream(
+    gen: AsyncGenerator[str, None], request_id: str
+) -> AsyncGenerator[str, None]:
+    """Wrap a streaming generator to log each SSE chunk."""
+    async for chunk in gen:
+        if _request_logger is not None and chunk.startswith("data: "):
+            payload = chunk[6:].strip()
+            if payload != "[DONE]":
+                _log_request_event("stream_chunk", request_id, json.loads(payload))
+            else:
+                _log_request_event("stream_done", request_id, None)
+        yield chunk
 
 
 # ============================================================================
@@ -327,21 +360,24 @@ async def chat_completions(request: ChatCompletionRequest):
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
 
+        _log_request_event("request", request_id, request.model_dump())
+
         # Streaming
         if request.stream:
             seq_id, stream_queue = await setup_streaming_request(
                 prompt, sampling_params, request_id
             )
+            gen = stream_chat_response(
+                request_id,
+                model_name,
+                prompt,
+                stream_queue,
+                seq_id,
+                tokenizer,
+                cleanup_streaming_request,
+            )
             return StreamingResponse(
-                stream_chat_response(
-                    request_id,
-                    model_name,
-                    prompt,
-                    stream_queue,
-                    seq_id,
-                    tokenizer,
-                    cleanup_streaming_request,
-                ),
+                _logged_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
@@ -353,9 +389,11 @@ async def chat_completions(request: ChatCompletionRequest):
         if final_output is None:
             raise RuntimeError("No output generated")
 
-        return build_chat_response(
+        resp = build_chat_response(
             request_id, model_name, final_output["text"], final_output
         )
+        _log_request_event("response", request_id, resp.model_dump())
+        return resp
 
     except ValueError as e:
         logger.error(f"Validation error in chat_completions: {e}")
@@ -384,21 +422,24 @@ async def completions(request: CompletionRequest):
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
 
+        _log_request_event("request", request_id, request.model_dump())
+
         # Streaming
         if request.stream:
             seq_id, stream_queue = await setup_streaming_request(
                 request.prompt, sampling_params, request_id
             )
+            gen = stream_completion_response(
+                request_id,
+                model_name,
+                request.prompt,
+                stream_queue,
+                seq_id,
+                tokenizer,
+                cleanup_streaming_request,
+            )
             return StreamingResponse(
-                stream_completion_response(
-                    request_id,
-                    model_name,
-                    request.prompt,
-                    stream_queue,
-                    seq_id,
-                    tokenizer,
-                    cleanup_streaming_request,
-                ),
+                _logged_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
@@ -410,7 +451,9 @@ async def completions(request: CompletionRequest):
         if final_output is None:
             raise RuntimeError("No output generated")
 
-        return build_completion_response(request_id, model_name, final_output)
+        resp = build_completion_response(request_id, model_name, final_output)
+        _log_request_event("response", request_id, resp.model_dump())
+        return resp
 
     except ValueError as e:
         logger.error(f"Validation error in completions: {e}")
@@ -471,7 +514,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine, tokenizer, model_name, default_chat_template_kwargs
+    global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
 
     parser = argparse.ArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -492,7 +535,22 @@ def main():
             "Example: '{\"enable_thinking\": false}'"
         ),
     )
+    parser.add_argument(
+        "--request-log",
+        type=str,
+        default=None,
+        help="Path to JSONL file for logging all API requests and responses (debug)",
+    )
     args = parser.parse_args()
+
+    if args.request_log:
+        _request_logger = logging.getLogger("atom.request_log")
+        _request_logger.setLevel(logging.INFO)
+        _request_logger.propagate = False
+        fh = logging.FileHandler(args.request_log, mode="a")
+        fh.setFormatter(logging.Formatter("%(message)s"))
+        _request_logger.addHandler(fh)
+        logger.info(f"Request logging enabled: {args.request_log}")
 
     if args.default_chat_template_kwargs:
         default_chat_template_kwargs = json.loads(args.default_chat_template_kwargs)
