@@ -215,7 +215,8 @@ class PagedAttentionImplPluginModeMethods:
         self.use_triton_attn = use_triton_attn
 
         if (
-            self.rotary_emb is not None
+            qkv is not None
+            and self.rotary_emb is not None
             and self.q_norm is not None
             and self.k_norm is not None
         ):
@@ -245,7 +246,7 @@ class PagedAttentionImplPluginModeMethods:
             q, k, v = qkv.split(
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
-        elif use_triton_attn and self.rotary_emb is not None:
+        elif use_triton_attn and self.rotary_emb is not None and qkv is not None:
 
             k_scale = v_scale = self.per_tensor_scale
             self.per_token_quant = False

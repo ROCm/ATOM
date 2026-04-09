@@ -71,6 +71,7 @@ class PagedAttentionImpl(nn.Module):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.per_tensor_scale = self.kv_scale
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1

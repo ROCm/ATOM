@@ -45,6 +45,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
+    "Gemma4ForConditionalGeneration": "atom.models.gemma4:Gemma4ForCausalLM",
 }
 
 
