@@ -607,7 +607,6 @@ jobs:
           SGLANG_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
           STREAM_SGLANG_LOGS: "1"
-          SGLANG_PORT: "8013"
           LM_EVAL_TASK: "gsm8k"
         run: |
           docker exec \
@@ -617,7 +616,6 @@ jobs:
             -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
-            -e SGLANG_PORT="${SGLANG_PORT}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
@@ -1014,7 +1012,6 @@ jobs:
           SGLANG_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
           STREAM_SGLANG_LOGS: "1"
-          SGLANG_PORT: "8013"
           LM_EVAL_TASK: "gsm8k"
         run: |
           docker exec \
@@ -1024,7 +1021,6 @@ jobs:
             -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
-            -e SGLANG_PORT="${SGLANG_PORT}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail

@@ -34,7 +34,7 @@ fi
 
 MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
-SGLANG_PORT=${SGLANG_PORT:-8013}
+SGLANG_PORT=${SGLANG_PORT:-8000}
 SGLANG_HOST=${SGLANG_HOST:-localhost}
 SGLANG_PID_FILE=${SGLANG_PID_FILE:-/tmp/atom_sglang.pid}
 SGLANG_LOG_FILE=${SGLANG_LOG_FILE:-/tmp/atom_sglang.log}
@@ -184,7 +184,8 @@ launch_server() {
     --trust-remote-code \
     --kv-cache-dtype fp8_e4m3 \
     --mem-fraction-static 0.8 \
-    --cuda-graph-max-bs 16 \
+    --page-size 1 \
+    --disable-radix-cache \
     "${extra_arg_array[@]}" \
     > "${SGLANG_LOG_FILE}" 2>&1 &
 
