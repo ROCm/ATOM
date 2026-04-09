@@ -693,7 +693,7 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type == "deepseek_v3":
+        if hf_config.model_type in ("deepseek_v3", "glm_moe_dsa"):
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "qwen3_next":
             hf_config.model_type = "qwen3_next_mtp"

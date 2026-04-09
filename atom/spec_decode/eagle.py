@@ -91,6 +91,22 @@ class EagleProposer:
             logger.info("Loading EAGLE LM head weights from the target model.")
             self.model.lm_head = target_model.lm_head
 
+        # If MTP shared_head.head was not in checkpoint (weight is all zeros),
+        # share lm_head from the target model as fallback.
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            for layer in self.model.model.layers.values():
+                if (
+                    hasattr(layer, "shared_head")
+                    and hasattr(layer.shared_head, "head")
+                    and not layer.shared_head.head.weight.any()
+                ):
+                    logger.info(
+                        "MTP shared_head.head not found in checkpoint, "
+                        "sharing lm_head from the target model."
+                    )
+                    del layer.shared_head.head
+                    layer.shared_head.head = target_model.lm_head
+
     def propose(
         self,
         # [num_tokens]
