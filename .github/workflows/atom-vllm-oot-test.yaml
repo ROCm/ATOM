@@ -892,7 +892,7 @@ jobs:
                   "model_path": "openai/gpt-oss-120b",
                   "extra_args": "--tensor-parallel-size 2",
                   "accuracy_test_threshold": 0.38,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-4",
               },
           ]
