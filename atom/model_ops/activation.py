@@ -5,7 +5,6 @@ import torch
 from typing import Optional
 from torch import nn
 import torch.nn.functional as F
-from aiter import silu_and_mul
 from atom.config import QuantizationConfig
 from atom.quant_spec import LayerQuantConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -105,8 +104,5 @@ class SiluAndMul(nn.Module):
         ):
             return mxfp4_act_mul_quant_fuse(x, shuffle=True)
         else:
-            out = torch.empty(
-                [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
-            )
-            silu_and_mul(out, x)
-            return out
+            x, y = x.chunk(2, -1)
+            return F.silu(x) * y

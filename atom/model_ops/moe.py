@@ -10,6 +10,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
+from aiter.jit.core import ENABLE_CK
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
@@ -642,8 +643,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or self.quant_type == QuantType.per_1x32
         )
         gfx = get_gfx()
-        self.use_triton = gfx.startswith("gfx94") or (
-            gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
+        # Route MXFP4 MoE to Triton on gfx94/gfx12, or on gfx95 when CK is unavailable.
+        self.use_triton = gfx.startswith("gfx94") or gfx.startswith("gfx12") or (
+            gfx.startswith("gfx95") and (envs.ATOM_USE_TRITON_GEMM or not ENABLE_CK)
         )
         if self.use_triton:
             from atom.model_ops.utils import has_triton_kernels

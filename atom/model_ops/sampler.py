@@ -5,7 +5,7 @@ import warnings
 from functools import lru_cache
 
 import torch
-from aiter import mixed_sample_outer_exponential
+from aiter.ops.triton.sample import mixed_sample_outer_exponential_triton
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
@@ -99,7 +99,7 @@ class Sampler(nn.Module):
         exponential = get_per_token_exponential(vocab_size, logits.device).expand(
             num_tokens, vocab_size
         )
-        mixed_sample_outer_exponential(
+        mixed_sample_outer_exponential_triton(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
         return sampled_tokens

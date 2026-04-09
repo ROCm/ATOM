@@ -9,6 +9,7 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
+from aiter.jit.core import ENABLE_CK
 from atom.config import get_current_atom_config
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
@@ -500,6 +501,57 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
         block_tables = attn_metadata.block_tables
 
+        if block_tables is None:
+            # No paged KV cache block_table during prefill — treat each
+            # token as its own block (block_size=1) and build a fake
+            # block_table so we can go through unified_attention, which
+            # supports sinks and sliding window (context_attention_fwd
+            # does not).
+            num_seqs = attn_metadata.cu_seqlens_q.shape[0] - 1
+            seq_lens = attn_metadata.cu_seqlens_q[1:] - attn_metadata.cu_seqlens_q[:-1]
+            max_seq_len = int(attn_metadata.max_seqlen_q)
+
+            # fake block_table: [num_seqs, max_seq_len], each row is
+            # [start, start+1, ..., start+len-1, 0, 0, ...]
+            arange = torch.arange(max_seq_len, device=q.device, dtype=torch.int32)
+            starts = attn_metadata.cu_seqlens_q[:num_seqs].unsqueeze(1)
+            block_tables = starts + arange.unsqueeze(0)
+
+            # Reshape k/v as flash-layout cache with block_size=1:
+            # [total_tokens, num_kv_heads, head_dim] →
+            # [total_tokens, 1, num_kv_heads, head_dim]
+            k_cache_fake = k.unsqueeze(1)
+            v_cache_fake = v.unsqueeze(1)
+
+            o = torch.empty_like(q)
+            descale_shape = (num_seqs, k.shape[1])
+            sliding_window = (
+                (self.sliding_window - 1, 0)
+                if self.sliding_window is not None
+                else (-1, -1)
+            )
+            unified_attention(
+                q,
+                k_cache_fake,
+                v_cache_fake,
+                o,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                seqused_k=seq_lens,
+                max_seqlen_q=max_seq_len,
+                max_seqlen_k=max_seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=None,
+                window_size=sliding_window,
+                block_table=block_tables,
+                softcap=0,
+                q_descale=None,
+                k_descale=self.kv_scale.expand(descale_shape),
+                v_descale=self.kv_scale.expand(descale_shape),
+                sinks=self.sinks,
+            )
+            return o
+
         o = torch.empty_like(q)
         descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
         sliding_window = (
@@ -535,6 +587,8 @@ class PagedAttentionImpl(nn.Module):
         ctx = fwd_ctx.context
 
         if ctx.is_prefill:
+            if not ENABLE_CK and self.use_triton_attn:
+                return self.prefill_attention_triton
             return self.prefill_attention
         else:
             if self.use_triton_attn:

@@ -214,7 +214,8 @@ RUN echo "========== [Parallel] Building Triton ==========" && \
     cd /triton-test && \
     pip install -r python/requirements.txt && \
     pip install filecheck && \
-    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
+    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install . && \
+    pip install ./python/triton_kernels
 
 # --------------------------------------------------------------------
 # Stage 4: Aiter — parallel

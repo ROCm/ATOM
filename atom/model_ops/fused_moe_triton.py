@@ -30,9 +30,18 @@ logger = logging.getLogger("atom")
 
 if has_triton_kernels():
     try:
-        from triton_kernels.matmul_ogs import matmul_ogs
+        import triton_kernels.swiglu
+        from triton_kernels.matmul_ogs import (
+            FnSpecs,
+            FusedActivation,
+            PrecisionConfig,
+            matmul_ogs,
+        )
+        from triton_kernels.matmul_ogs_details.opt_flags import (
+            update_opt_flags_constraints,
+            reset_opt_flags_constraints,
+        )
         from triton_kernels.routing import routing
-        from triton_kernels.matmul_ogs import PrecisionConfig
     except (AttributeError, ImportError) as e:
         logger.error(
             "Failed to import Triton kernels. Please make sure your triton "
@@ -52,9 +61,9 @@ def _swizzle_mxfp4(quant_tensor, scale):
     scale_layout_opts: dict[str, Any] = {}
     value_layout = StridedLayout
     if get_gfx() == "gfx950":
-        from triton_kernels.tensor_details.layout import GFX950MXScaleLayout
+        from triton_kernels.tensor_details.layout import CDNA4MXScaleLayout
 
-        scale_layout = GFX950MXScaleLayout
+        scale_layout = CDNA4MXScaleLayout
     else:
         scale_layout = StridedLayout
 
@@ -227,47 +236,49 @@ def triton_kernel_fused_experts(
 
     gammas = routing_data.gate_scal if routing_data else None
 
-    # NOTE: We intentionally do NOT use the triton fused SwiGLU activation
-    # because it expects interleaved [gate0, up0, gate1, up1, ...] layout
-    # while our w13 weights produce concatenated [gate | up] output.
-    # It also uses a non-standard formula: s*sigmoid(alpha*s)*(linear+1)
-    # with alpha=1.702, which differs from the standard SiLU activation
-    # (x*sigmoid(x)*up) used by most MoE models.
-    # Instead, we compute the matmul without fused activation and apply
-    # standard silu(gate) * up manually.
-    raw_intermediate = torch.empty(
-        (batch_dim, M * topk, N),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
+    act = FusedActivation(
+        FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
+        (swiglu_alpha, swiglu_limit),
+        2,
     )
 
-    matmul_ogs(
-        hidden_states,
-        w1,
-        w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
-        precision_config=w13_precision_config,
-        gammas=gammas if apply_router_weight_on_input else None,
-        y=raw_intermediate,
+    # On CDNA4 (gfx950) with MXFP4 weights, triton_kernels auto-selects
+    # block_m=256/block_n=512 which exceeds the 160KB shared memory limit.
+    # Constrain to block_m=128/block_n=256 to stay within hardware limits.
+    needs_block_cap = (
+        get_gfx() == "gfx950"
+        and w13_precision_config is not None
+        and w13_precision_config.weight_scale is not None
     )
+    if needs_block_cap:
+        update_opt_flags_constraints({"block_m": 128, "block_n": 256})
 
-    # Standard SiLU/SwiGLU activation: silu(gate) * up
-    raw_2d = raw_intermediate.view(M * topk, N)
-    gate = raw_2d[:, :half_N]
-    up = raw_2d[:, half_N:]
-    intermediate_cache[0] = torch.nn.functional.silu(gate) * up
+    try:
+        matmul_ogs(
+            hidden_states,
+            w1,
+            w1_bias,
+            routing_data,
+            gather_indx=gather_indx,
+            precision_config=w13_precision_config,
+            gammas=gammas if apply_router_weight_on_input else None,
+            fused_activation=act,
+            y=intermediate_cache,
+        )
 
-    matmul_ogs(
-        intermediate_cache.view(M * topk, half_N),
-        w2,
-        w2_bias,
-        routing_data,
-        scatter_indx=scatter_indx,
-        precision_config=w2_precision_config,
-        gammas=None if apply_router_weight_on_input else gammas,
-        y=output_tensor,
-    )
+        matmul_ogs(
+            intermediate_cache.view(M * topk, half_N),
+            w2,
+            w2_bias,
+            routing_data,
+            scatter_indx=scatter_indx,
+            precision_config=w2_precision_config,
+            gammas=None if apply_router_weight_on_input else gammas,
+            y=output_tensor,
+        )
+    finally:
+        if needs_block_cap:
+            reset_opt_flags_constraints()
 
     output_tensor = output_tensor.view(M, K)
     return output_tensor

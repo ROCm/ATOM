@@ -165,44 +165,18 @@ def rocm_aiter_biased_grouped_topk_impl(
     num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
-    from aiter import biased_grouped_topk
+    from aiter.ops.topk import biased_grouped_topk_torch
 
-    token = gating_output.shape[0]
-    device = gating_output.device
-    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
-    if fuse_shared_experts and num_fused_shared_experts > 0:
-        assert aiter_topK_meta_data is not None, (
-            "AITER topK meta data is not initialized. "
-            "Please ensure that init_aiter_topK_meta_data is called before this function."
-        )
-        total_topk_weights, total_topk_ids = aiter_topK_meta_data
-        assert total_topk_weights.shape[0] >= token, (
-            f"AITER topK meta data support {total_topk_weights.shape[0]} tokens which "
-            f"is determined by max_num_batched_tokens, but got {token} tokens now."
-        )
-        total_topk_weights = total_topk_weights[:token]
-        total_topk_ids = total_topk_ids[:token]
-        topk_weights, _ = torch.split(
-            total_topk_weights, [topk, total_topk_weights.shape[1] - topk], dim=1
-        )
-        topk_ids, _ = torch.split(
-            total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
-        )
-    else:
-        topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
-        topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    biased_grouped_topk(
+    topk_weights, topk_ids = biased_grouped_topk_torch(
         gating_output,
         correction_bias,
-        topk_weights,
-        topk_ids,
+        topk,
+        need_renorm,
         num_expert_group,
         topk_group,
-        need_renorm,
-        routed_scaling_factor,
     )
-    if fuse_shared_experts and num_fused_shared_experts > 0:
-        return total_topk_weights, total_topk_ids
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
     return topk_weights, topk_ids
 
 
@@ -268,44 +242,18 @@ def rocm_aiter_grouped_topk_impl(
     num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
-    from aiter import grouped_topk
+    from aiter.ops.topk import grouped_topk_torch
 
-    token = gating_output.shape[0]
-    device = gating_output.device
-    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
-    if fuse_shared_experts and num_fused_shared_experts > 0:
-        assert aiter_topK_meta_data is not None, (
-            "AITER topK meta data is not initialized. "
-            "Please ensure that init_aiter_topK_meta_data is called before this function."
-        )
-        total_topk_weights, total_topk_ids = aiter_topK_meta_data
-        assert total_topk_weights.shape[0] >= token, (
-            f"AITER topK meta data support {total_topk_weights.shape[0]} tokens which "
-            f"is determined by max_num_batched_tokens, but got {token} tokens now."
-        )
-        total_topk_weights = total_topk_weights[:token]
-        total_topk_ids = total_topk_ids[:token]
-        topk_weights, _ = torch.split(
-            total_topk_weights, [topk, total_topk_weights.shape[1] - topk], dim=1
-        )
-        topk_ids, _ = torch.split(
-            total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
-        )
-    else:
-        topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
-        topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    grouped_topk(
+    topk_weights, topk_ids = grouped_topk_torch(
         gating_output,
-        topk_weights,
-        topk_ids,
+        topk,
+        need_renorm,
         num_expert_group,
         topk_group,
-        need_renorm,
         scoring_func,
-        routed_scaling_factor,
     )
-    if fuse_shared_experts and num_fused_shared_experts > 0:
-        return total_topk_weights, total_topk_ids
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
     return topk_weights, topk_ids
 
 
