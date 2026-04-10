@@ -19,7 +19,6 @@ from aiter import (
     layernorm2d_fwd_with_add,
 )
 from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
