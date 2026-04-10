@@ -4,7 +4,7 @@ ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 
-# OOT image extends an ATOM base image that already contains atom/aiter/mori.
+# vLLM-ATOM image extends an ATOM base image that already contains atom/aiter/mori.
 FROM ${OOT_BASE_IMAGE} AS atom_oot
 
 ARG MAX_JOBS
@@ -16,7 +16,7 @@ ARG INSTALL_FASTSAFETENSORS=1
 ARG ROCM_WHEEL_INDEX="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/"
 ARG ROCM_TORCHVISION_VERSION="0.24.0+rocm7.2.1.gitb919bd0c"
 ARG ROCM_TORCHAUDIO_VERSION="2.9.0+rocm7.2.1.gite3c6ee2b"
-# Let PR OOT CI verify whether a pulled prebuilt image still matches this vLLM commit
+# Let PR vLLM-ATOM CI verify whether a pulled prebuilt image still matches this vLLM commit
 LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -25,7 +25,7 @@ ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRA
 ENV VLLM_TARGET_DEVICE=rocm
 ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 
-RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
+RUN echo "========== [vLLM-ATOM 1/7] Prepare build tools ==========" && \
     apt-get update && \
     apt --fix-broken install -y && \
     apt-get install -y --no-install-recommends ca-certificates jq ninja-build vim && \
@@ -34,15 +34,15 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     /usr/local/bin/ninja --version && \
     rm -rf /var/lib/apt/lists/*
 
-# Keep OOT aligned with the Triton that the ATOM base image actually imports.
-# vLLM/OOT installs can perturb Triton metadata, and some base images may carry
+# Keep vLLM-ATOM aligned with the Triton that the ATOM base image actually imports.
+# vLLM/vLLM-ATOM installs can perturb Triton metadata, and some base images may carry
 # extra triton-*.dist-info residues. We therefore treat `import triton` in the
 # base image as the source of truth and back up only the matching dist-info
-RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========" && \
+RUN echo "========== [vLLM-ATOM 2/7] Verify base packages (atom/aiter/mori) ==========" && \
     "${VENV_PYTHON}" -m pip show atom || true && \
     "${VENV_PYTHON}" -m pip show amd-aiter || true && \
     "${VENV_PYTHON}" -m pip show mori || true && \
-    echo "========== [OOT 2/7] Back up base image triton ==========" && \
+    echo "========== [vLLM-ATOM 2/7] Back up base image triton ==========" && \
     BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
     mkdir -p /tmp/triton-base-backup && \
     cp -a /opt/venv/lib/python3.12/site-packages/triton /tmp/triton-base-backup/ && \
@@ -64,7 +64,7 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     fi && \
     echo "Base image triton backed up: version=${BASE_TRITON_VERSION}, dist-info=${MATCHED_DIST_INFO}"
 
-RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
+RUN echo "========== [vLLM-ATOM 3/7] Clone vLLM ==========" && \
     rm -rf /app/vllm && \
     git clone "${VLLM_REPO}" /app/vllm && \
     cd /app/vllm && \
@@ -73,7 +73,7 @@ RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
     echo "vLLM commit:" && \
     git rev-parse HEAD
 
-RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" && \
+RUN echo "========== [vLLM-ATOM 4/7] Install vLLM ROCm build dependencies ==========" && \
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip install --upgrade pip && \
     sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt && \
@@ -82,18 +82,18 @@ RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" 
     "${VENV_PYTHON}" -m pip install --no-deps peft tensorizer==2.10.1 runai-model-streamer[s3,gcs]==0.15.3 timm>=1.0.17 && \
     "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
 
-RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
+RUN echo "========== [vLLM-ATOM 5/7] Build and install amd-smi wheel ==========" && \
     cd /opt/rocm/share/amd_smi && \
     pip wheel . --wheel-dir=dist && \
     pip install dist/*.whl
 
-RUN echo "========== [OOT 6/7] Build vLLM wheel ==========" && \
+RUN echo "========== [vLLM-ATOM 6/7] Build vLLM wheel ==========" && \
     cd /app/vllm && \
     VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py clean --all && \
     MAX_JOBS="${MAX_JOBS}" VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py bdist_wheel --dist-dir=/tmp/vllm-wheels && \
     ls -lh /tmp/vllm-wheels
 
-RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && \
+RUN echo "========== [vLLM-ATOM 7/7] Install vLLM runtime dependencies ==========" && \
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip uninstall -y vllm || true && \
     "${VENV_PYTHON}" -m pip install /tmp/vllm-wheels/*.whl && \
@@ -110,10 +110,10 @@ RUN echo "FIXME: rocm/pytorch:latest currently resolves incompatible torchvision
       "torchaudio==${ROCM_TORCHAUDIO_VERSION}" && \
     "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
 
-# Restore that exact base-image Triton after all OOT installs finish. The goal
+# Restore that exact base-image Triton after all vLLM-ATOM installs finish. The goal
 # is not to choose a new Triton version, but to preserve ATOM base-image runtime
 # behavior and fail fast if `pip show triton` would disagree with `import triton`.
-RUN echo "========== [OOT] Restore base image triton ==========" && \
+RUN echo "========== [vLLM-ATOM] Restore base image triton ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
     rm -rf /opt/venv/lib/python3.12/site-packages/triton \
            /opt/venv/lib/python3.12/site-packages/triton-*.dist-info && \
@@ -240,7 +240,7 @@ RUN echo "========== [SGLANG 4/6] Pin ROCm vision/audio wheels ==========" && \
 # ships in the shared ATOM base image, while Triton 3.6.0 fixes that compiler
 # path for this flow. Install Triton after the torchvision/torchaudio wheel pin
 # so pip does not downgrade it back to the torch-pinned 3.5.1 dependency. Keep
-# this override local to `atom_sglang` so the OOT/atom_release flow preserves
+# this override local to `atom_sglang` so the vLLM-ATOM/atom_release flow preserves
 # its prior Triton behavior.
 RUN echo "========== [SGLANG 5/6] Install validated Triton ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y triton || true && \

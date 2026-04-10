@@ -53,7 +53,7 @@ on:
         type: boolean
         default: false
       build_oot_image:
-        description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
+        description: "Build vLLM-ATOM vLLM image for manual runs (scheduled nightly runs always build vLLM-ATOM; default enabled so manual releases also publish vLLM-ATOM)"
         type: boolean
         default: true
       build_sglang_image:
@@ -61,7 +61,7 @@ on:
         type: boolean
         default: true
       only_release_oot:
-        description: "Only release the OOT vLLM image: skip native image test/push and always build/push OOT"
+        description: "Only release the vLLM-ATOM vLLM image: skip native image test/push and always build/push vLLM-ATOM"
         type: boolean
         default: false
       only_release_sglang:
@@ -192,12 +192,12 @@ jobs:
           docker tag atom_release:ci rocm/atom-dev:${TAG}
           docker push rocm/atom-dev:${TAG}
 
-      - name: Build OOT Docker image
+      - name: Build vLLM-ATOM Docker image
         if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
         timeout-minutes: 180
         run: |
           OOT_BASE_IMAGE="atom_release:ci"
-          echo "Using OOT base image: ${OOT_BASE_IMAGE}"
+          echo "Using vLLM-ATOM base image: ${OOT_BASE_IMAGE}"
           docker build --network=host -t atom_oot_release:ci \
             --target atom_oot \
             --build-arg OOT_BASE_IMAGE="${OOT_BASE_IMAGE}" \
@@ -208,7 +208,7 @@ jobs:
             -f docker/Dockerfile .
           docker inspect atom_oot_release:ci
 
-      - name: Push OOT Docker image
+      - name: Push vLLM-ATOM Docker image
         if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
         run: |
           VLLM_VER="${{ env.VLLM_VERSION }}"

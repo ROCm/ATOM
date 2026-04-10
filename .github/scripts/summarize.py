@@ -29,7 +29,7 @@ TRACKED_METRICS = [
 
 def _backend_name(data):
     backend = str(data.get("benchmark_backend", "ATOM"))
-    return "ATOM-vLLM" if backend == "OOT" else backend
+    return "ATOM-vLLM" if backend == "vLLM-ATOM" else backend
 
 
 def load_results(result_dir, recursive=False):

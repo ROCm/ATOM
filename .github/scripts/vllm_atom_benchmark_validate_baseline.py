@@ -38,7 +38,7 @@ def validate_result_dir(result_dir: Path) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate dashboard-eligible OOT benchmark artifacts"
+        description="Validate dashboard-eligible vLLM-ATOM benchmark artifacts"
     )
     parser.add_argument("result_dir", help="Directory containing downloaded artifacts")
     args = parser.parse_args()

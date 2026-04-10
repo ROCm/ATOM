@@ -801,7 +801,7 @@ if is_vllm():
         def mamba_type(self) -> str:
             return "gdn_attention"
 
-    # If oot case, override the Qwen3NextGatedDeltaNet with the VLLM version which inherits from MambaBase to ensure it gets registered in the static_forward_context for vLLM compilation.
+    # If vLLM-ATOM case, override the Qwen3NextGatedDeltaNet with the VLLM version which inherits from MambaBase to ensure it gets registered in the static_forward_context for vLLM compilation.
     Qwen3NextGatedDeltaNet = Qwen3NextGatedDeltaNetVllm
 
 

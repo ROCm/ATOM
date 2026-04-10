@@ -1,6 +1,6 @@
 # ATOM vLLM Plugin Backend
 
-ATOM can work as the vLLM out-of-tree (OOT) plugin backend — installed as a separate Python package and plugged into vLLM through vLLM's official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.
+ATOM can work as the vLLM out-of-tree (vLLM-ATOM) plugin backend — installed as a separate Python package and plugged into vLLM through vLLM's official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.
 
 This integration follows the direction described in the [RFC to enable ATOM as a vLLM out-of-tree platform](https://github.com/ROCm/ATOM/issues/201). The high-level idea is that vLLM remains the framework-level runtime, while ATOM focuses on model-level and kernel-level optimization for AMD GPUs. In this mode, ATOM serves as the optimized execution backend and an incubation layer for new kernels, fusions, and model implementations before they are mature enough to be upstreamed.
 
@@ -168,7 +168,7 @@ The following table shows how vLLM config fields map to ATOM `Config` fields:
 
 ## 3. Attention Integration
 
-vLLM's OOT plugin interface allows an external platform to supply its own
+vLLM's vLLM-ATOM plugin interface allows an external platform to supply its own
 attention backend. ATOM hooks into this by overriding
 `ATOMPlatform.get_attn_backend_cls()` — the only contract point between vLLM and
 the plugin for attention dispatch.
@@ -199,7 +199,7 @@ Currently, the plugin backend supports the following model architectures:
 | `DeepseekV3ForCausalLM` | `atom.models.deepseek_v2.DeepseekV3ForCausalLM` | DeepSeek-R1 / DeepSeek V3 / Kimi-K2 style models |
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe.Glm4MoeForCausalLM` | GLM-4-MoE |
 
-`Kimi-K2` is also supported. Although it is usually loaded with `--trust-remote-code`, it shares the same DeepSeek-style MLA+MoE architecture path and reuses `atom.models.deepseek_v2.DeepseekV3ForCausalLM` in the ATOM vLLM OOT backend.
+`Kimi-K2` is also supported. Although it is usually loaded with `--trust-remote-code`, it shares the same DeepSeek-style MLA+MoE architecture path and reuses `atom.models.deepseek_v2.DeepseekV3ForCausalLM` in the ATOM vLLM vLLM-ATOM backend.
 
 ---
 
@@ -216,13 +216,13 @@ The recommended approach is to pull an official ATOM + vLLM Docker image from
 images ship with ROCm, PyTorch, AITER, ATOM, and a compatible vLLM build
 pre-installed — no manual dependency management is required.
 
-Pull the latest OOT image:
+Pull the latest vLLM-ATOM image:
 
 ```bash
 docker pull rocm/atom-dev:vllm-latest
 ```
 
-If you need an OOT docker image for a specific vLLM version or a specific release date, browse the available tags on [Docker Hub](https://hub.docker.com/r/rocm/atom-dev/tags) and pull the exact tag you need there. For example, to pull the OOT docker adapted to vLLM `0.17.0` on `2026-03-15`:
+If you need an vLLM-ATOM docker image for a specific vLLM version or a specific release date, browse the available tags on [Docker Hub](https://hub.docker.com/r/rocm/atom-dev/tags) and pull the exact tag you need there. For example, to pull the vLLM-ATOM docker adapted to vLLM `0.17.0` on `2026-03-15`:
 
 ```bash
 docker pull rocm/atom-dev:vllm-v0.17.0-nightly_20260315

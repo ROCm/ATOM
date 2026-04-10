@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a resilient OOT benchmark summary table.
+"""Generate a resilient vLLM-ATOM benchmark summary table.
 
 This script is intentionally tolerant of partial or total benchmark failure:
 - missing result JSON => case is marked FAIL
@@ -148,7 +148,7 @@ def _print_markdown_table(rows: list[dict], run_url: str | None) -> None:
     passed_cases = sum(1 for row in rows if row["status"] == "PASS")
     failed_cases = total_cases - passed_cases
 
-    print("## OOT Benchmark Summary\n")
+    print("## vLLM-ATOM Benchmark Summary\n")
     if run_url:
         print(f"Run: {run_url}\n")
     print(
@@ -185,11 +185,11 @@ def _print_markdown_table(rows: list[dict], run_url: str | None) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Summarize OOT benchmark results")
+    parser = argparse.ArgumentParser(description="Summarize vLLM-ATOM benchmark results")
     parser.add_argument(
         "--result-dir",
         required=True,
-        help="Directory containing downloaded OOT benchmark JSON files",
+        help="Directory containing downloaded vLLM-ATOM benchmark JSON files",
     )
     parser.add_argument(
         "--matrix-json",

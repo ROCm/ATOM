@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert OOT benchmark JSON results to github-action-benchmark input."""
+"""Convert vLLM-ATOM benchmark JSON results to github-action-benchmark input."""
 
 from __future__ import annotations
 
@@ -145,10 +145,10 @@ def build_entries(result_dir: Path, run_url: str | None) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert OOT benchmark JSON files to github-action-benchmark input"
+        description="Convert vLLM-ATOM benchmark JSON files to github-action-benchmark input"
     )
     parser.add_argument(
-        "result_dir", help="Directory containing OOT benchmark JSON files"
+        "result_dir", help="Directory containing vLLM-ATOM benchmark JSON files"
     )
     parser.add_argument("--output", required=True, help="Output JSON path")
     parser.add_argument(
@@ -163,7 +163,7 @@ def main() -> None:
 
     output_path = Path(args.output)
     output_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-    print(f"Generated {len(entries)} OOT entries at {output_path}")
+    print(f"Generated {len(entries)} vLLM-ATOM entries at {output_path}")
 
 
 if __name__ == "__main__":

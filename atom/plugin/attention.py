@@ -139,7 +139,7 @@ class vllmAiterAttentionBackendMethods:
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        # OOT backends do not inherit vLLM's AttentionBackend, so mirror the
+        # vLLM-ATOM backends do not inherit vLLM's AttentionBackend, so mirror the
         # vLLM 0.19 default block-size selection logic locally.
         if cls.supports_block_size(default_block_size):
             return default_block_size

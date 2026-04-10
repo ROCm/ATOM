@@ -118,7 +118,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from atom.config import Config, ParallelConfig, CompilationConfig
 
     # sglang's ModelRunner already parsed and stored ServerArgs globally
-    # before OOT model loading, so we can retrieve it directly.
+    # before vLLM-ATOM model loading, so we can retrieve it directly.
     try:
         server_args = get_global_server_args()
     except Exception as exc:

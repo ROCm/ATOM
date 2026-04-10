@@ -1,4 +1,4 @@
-"""Tests for the real SGLang OOT wrapper under mocked SGLang deps."""
+"""Tests for the SGLang-ATOM under mocked SGLang deps."""
 
 import importlib
 import sys

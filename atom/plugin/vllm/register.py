@@ -41,7 +41,7 @@ def register_platform() -> Optional[str]:
     if disable_vllm_plugin:
         # return None instead of error because the flag can be used to
         # run pure vllm mode without ATOM plugin
-        logger.info("Disable ATOM OOT plugin platforms")
+        logger.info("Disable ATOM vLLM-ATOM plugin platforms")
         return None
 
     _set_plugin_mode()

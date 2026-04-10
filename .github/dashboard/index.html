@@ -359,7 +359,7 @@ const BACKEND_HUE_OFFSETS = {
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
 function getModelHue(backend, model) {
-  const normalizedBackend = backend === 'OOT' ? 'ATOM-vLLM' : backend;
+  const normalizedBackend = backend === 'vLLM-ATOM' ? 'ATOM-vLLM' : backend;
   const backendModelKey = normalizedBackend ? `${normalizedBackend}::${model}` : model;
   if (MODEL_HUES[backendModelKey] != null) return MODEL_HUES[backendModelKey];
   let baseHue = MODEL_HUES[model];
@@ -499,7 +499,7 @@ function parseBenchName(name) {
     backend = backendMatch[1];
     rawName = backendMatch[2];
   }
-  if (backend === 'OOT') backend = 'ATOM-vLLM';
+  if (backend === 'vLLM-ATOM') backend = 'ATOM-vLLM';
   // Accuracy entries: "ModelName accuracy (GSM8K)" — (.+?) for multi-word model names
   let m = rawName.match(/^(.+?)\s+accuracy\s+\((\w+)\)$/);
   if (m) return { backend, model: m[1], metric: 'accuracy', unit: m[2], isAccuracy: true };
@@ -1264,7 +1264,7 @@ function renderPerformanceTab() {
     `<button class="sel-btn ${m.key === state.perfMetric ? 'active' : ''}" data-metric="${m.key}">${m.label}</button>`
   ).join('');
 
-  // Group entries by backend + model so native/OOT stay distinct
+  // Group entries by backend + model so native/vLLM-ATOM stay distinct
   const byModel = {};
   for (const [key, cfg] of entries) {
     const groupKey = `${cfg.backend}|${cfg.model}`;

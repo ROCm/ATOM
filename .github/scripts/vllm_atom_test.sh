@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Usage:
-#   .github/scripts/atom_oot_test.sh launch <mode> [model_name]
-#   .github/scripts/atom_oot_test.sh accuracy <mode> [model_name]
+#   .github/scripts/atom_vllm_atom_test.sh launch <mode> [model_name]
+#   .github/scripts/atom_vllm_atom_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
 #   OOT_MODEL_NAME
@@ -15,8 +15,8 @@ set -euo pipefail
 #   accuracy - run gsm8k accuracy test and save result JSON
 #
 # MODE:
-#   ci    - workflow-provided OOT CI model entry
-#   full  - workflow-provided OOT full-validation model entry
+#   ci    - workflow-provided vLLM-ATOM CI model entry
+#   full  - workflow-provided vLLM-ATOM full-validation model entry
 #
 # Optional model_name can be used to run a single model when a caller passes
 # multiple explicit entries.
@@ -207,7 +207,7 @@ accuracy_one_model() {
   flat_result_file="${RESULT_DIR}/${run_tag}.json"
 
   echo ""
-  echo "========== Running OOT gsm8k accuracy =========="
+  echo "========== Running vLLM-ATOM gsm8k accuracy =========="
   echo "Model name: ${model_name}"
 
   lm_eval --model local-completions \
