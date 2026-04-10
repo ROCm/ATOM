@@ -59,38 +59,47 @@ jobs:
     name: Download aiter wheel
     runs-on: ubuntu-latest
     steps:
-      - name: Prefer latest S3 aiter wheel and fallback to artifact
+      - name: Prefer latest main aiter wheel manifest and fallback to artifact
         run: |
           set -euo pipefail
-          echo "=== Trying latest aiter wheel from S3 first ==="
+          echo "=== Trying latest main aiter wheel manifest from S3 first ==="
 
-          S3_WHL_INDEX_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/amd-aiter/"
+          S3_MAIN_MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json"
           API_URL="https://api.github.com"
           AUTH_HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
           AITER_TEST_WORKFLOW_ID=179476100
 
-          download_from_s3() {
-            local index_file wheel_name wheel_url
+          download_from_s3_manifest() {
+            local manifest_file manifest_branch manifest_timestamp manifest_commit wheel_name wheel_url
 
             mkdir -p aiter-whl
             rm -f aiter-whl/amd_aiter*.whl
 
-            index_file=$(mktemp)
-            curl -fsSL "$S3_WHL_INDEX_URL" -o "$index_file" || return 1
+            manifest_file=$(mktemp)
+            trap 'rm -f "$manifest_file"' RETURN
+            curl -fsSL "$S3_MAIN_MANIFEST_URL" -o "$manifest_file" || return 1
 
-            wheel_url=$(python3 -c "import re, sys; from html import unescape; from urllib.parse import urljoin; html = open(sys.argv[1], encoding='utf-8').read(); base_url = sys.argv[2]; matches = re.findall(r'href=[\"\\']([^\"\\']*amd_aiter[^\"\\']*\\.whl)[\"\\']', html); matches = matches or re.findall(r'(amd_aiter[^<\"\\']*\\.whl)', html); print(urljoin(base_url, unescape(matches[-1])) if matches else '')" "$index_file" "$S3_WHL_INDEX_URL")
-            rm -f "$index_file"
+            manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
+            manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
+            manifest_commit=$(jq -r '.commit // empty' "$manifest_file")
+            wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
+            wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
 
-            wheel_name=$(python3 -c "import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).path.rsplit('/', 1)[-1]) if sys.argv[1] else '')" "$wheel_url")
-
-            if [ -z "$wheel_url" ] || [ -z "$wheel_name" ]; then
-              echo "No amd_aiter wheel found in S3 index"
+            if [ "$manifest_branch" != "main" ] || [ -z "$manifest_timestamp" ] || [ -z "$manifest_commit" ] || [ -z "$wheel_name" ] || [ -z "$wheel_url" ]; then
+              echo "Invalid latest main wheel manifest"
               return 1
             fi
 
-            echo "Downloading latest S3 wheel: $wheel_url"
+            echo "Selected latest main wheel manifest: $S3_MAIN_MANIFEST_URL"
+            echo "Manifest timestamp: $manifest_timestamp"
+            echo "Manifest commit: $manifest_commit"
+            echo "Manifest wheel: $wheel_name"
+            echo "Downloading manifest-selected wheel: $wheel_url"
             curl -fsSL "$wheel_url" -o "aiter-whl/$wheel_name" || return 1
-            echo "Downloaded wheel from S3: aiter-whl/$wheel_name"
+            echo "Downloaded wheel from manifest: aiter-whl/$wheel_name"
+
+            rm -f "$manifest_file"
+            trap - RETURN
           }
 
           download_from_artifact() {
@@ -128,10 +137,10 @@ jobs:
             rm -f aiter-whl.zip
           }
 
-          if download_from_s3; then
-            echo "Using wheel from S3"
+          if download_from_s3_manifest; then
+            echo "Using wheel from S3 main manifest"
           else
-            echo "S3 download failed, falling back to GitHub artifact"
+            echo "Main wheel manifest download failed, falling back to GitHub artifact"
             download_from_artifact
           fi
 
