@@ -346,7 +346,7 @@ class RMSNormGated(nn.Module):
         if quant_config is not None:
             from aiter import QuantType
 
-            quant_type = quant_config.get("quant_type", QuantType.No)
+            quant_type = quant_config.quant_type
 
             # Use fused kernel for per-block quantization (per_1x128, per_1x32)
             if quant_type in [QuantType.per_1x128, QuantType.per_1x32]:
