@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1320" height="2000" viewBox="0 0 1320 2000" role="img" aria-labelledby="title desc">
   <title id="title">vLLM execution flow with ATOM</title>
-  <desc id="desc">Animated dual-lane timeline showing how vLLM starts, discovers the ATOM out-of-tree platform, injects model wrappers, requests the attention backend, constructs the model, loads weights, compiles, and executes a model step in the OOT path.</desc>
+  <desc id="desc">Animated dual-lane timeline showing how vLLM starts, discovers the ATOM out-of-tree platform, injects model wrappers, requests the attention backend, constructs the model, loads weights, compiles, and executes a model step through the ATOM execution path.</desc>
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#07111e"/>
@@ -94,7 +94,7 @@
   <circle cx="1110" cy="1820" r="320" fill="rgba(255, 184, 112, 0.05)"/>
 
   <text x="52" y="66" class="title">vLLM execution flow with ATOM</text>
-  <text x="52" y="98" class="subtitle">OOT startup plugin coupling model construction and one serving step through the ATOM execution path</text>
+  <text x="52" y="98" class="subtitle">Plugin startup, model construction, and one serving step through the ATOM execution path</text>
 
   <rect x="52" y="118" width="548" height="1830" rx="34" fill="url(#laneLeft)" class="lane"/>
   <rect x="720" y="118" width="548" height="1830" rx="34" fill="url(#laneRight)" class="lane"/>
@@ -105,7 +105,7 @@
 
   <rect x="758" y="150" width="472" height="86" rx="22" fill="url(#headerRight)" class="laneHeader"/>
   <text x="994" y="186" text-anchor="middle" class="laneHeadText">vLLM-ATOM</text>
-  <text x="994" y="212" text-anchor="middle" class="laneHeadSub">OOT plugin and model implementation</text>
+  <text x="994" y="212" text-anchor="middle" class="laneHeadSub">plugin and model implementation</text>
 
   <line x1="660" y1="250" x2="660" y2="1850" class="spineBase"/>
   <line x1="660" y1="250" x2="660" y2="250" class="progressLine">
@@ -149,7 +149,7 @@
       <text x="26" y="30" class="chip chipBlue">vLLM</text>
       <rect x="20" y="48" width="460" height="40" class="codePanel"/>
       <text x="38" y="74" class="codeText">load_plugins_by_group("vllm.platform_plugins")</text>
-      <text x="26" y="118" class="cardTitle">Load OOT platform plugin</text>
+      <text x="26" y="118" class="cardTitle">Load Platform</text>
       <text x="26" y="142" class="cardBody">Discover installed platform entry points</text>
     </g>
     <animate attributeName="opacity" dur="24s" repeatCount="indefinite"
@@ -166,7 +166,7 @@
       <rect x="20" y="48" width="460" height="40" class="codePanel"/>
       <text x="38" y="74" class="codeText">register_platform() -&gt; ATOMPlatform</text>
       <text x="26" y="118" class="cardTitle">Register ATOMPlatform</text>
-      <text x="26" y="142" class="cardBody">Return the OOT platform class to vLLM</text>
+      <text x="26" y="142" class="cardBody">Return the platform class to vLLM</text>
     </g>
     <animate attributeName="opacity" dur="24s" repeatCount="indefinite"
       values="0;0;1;1;0" keyTimes="0;0.195;0.207;0.99;1"/>
@@ -181,7 +181,7 @@
       <text x="26" y="30" class="chip chipBlue">vLLM</text>
       <rect x="20" y="48" width="460" height="40" class="codePanel"/>
       <text x="38" y="74" class="codeText">load_general_plugins()</text>
-      <text x="26" y="118" class="cardTitle">Load OOT model plugin</text>
+      <text x="26" y="118" class="cardTitle">Load model</text>
       <text x="26" y="142" class="cardBody">Load the general plugin registration path</text>
     </g>
     <animate attributeName="opacity" dur="24s" repeatCount="indefinite"
@@ -294,7 +294,7 @@
       <rect x="20" y="48" width="460" height="40" class="codePanel"/>
       <text x="38" y="74" class="codeText">build_attention_metadata(); model.forward(); model.compute_logits()</text>
       <text x="26" y="118" class="cardTitle">Run one model step</text>
-      <text x="26" y="142" class="cardBody">Build metadata run forward and compute logits in the OOT path</text>
+      <text x="26" y="142" class="cardBody">Build metadata, run forward, and compute logits through the ATOM execution path</text>
     </g>
     <animate attributeName="opacity" dur="24s" repeatCount="indefinite"
       values="0;0;1;1;0" keyTimes="0;0.855;0.867;0.99;1"/>

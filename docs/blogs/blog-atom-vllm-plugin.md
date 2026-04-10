@@ -47,7 +47,7 @@ The ATOM vLLM plugin system is composed of four interconnected subsystems that f
 
 The following diagram illustrates the end-to-end execution flow—from `vllm serve` startup through OOT plugin discovery, model construction, and a single serving step—showing how vLLM and ATOM interact at each stage:
 
-![vLLM execution flow with ATOM OOT plugin](atom_vllm_oot_injection.svg)
+![vLLM execution flow with ATOM OOT plugin](vLLM-ATOM.svg)
 
 The execution flow is divided into four core phases: **plugin discovery** (Steps 1–5), **attention backend selection** (Steps 6–7), **model construction** (Steps 8–9), and **inference serving** (Steps 10–11). The following subsections break down the key technical implementation details for each phase.
 
