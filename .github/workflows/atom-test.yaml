@@ -226,6 +226,10 @@ jobs:
           name: aiter-whl
           path: /tmp/aiter-whl
 
+      - name: Set HF token for predownload runner
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
+
       - name: Start CI container
         run: |
           echo "Clean up containers..."
