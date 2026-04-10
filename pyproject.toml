@@ -37,3 +37,9 @@ atom = "atom.plugin.vllm.register:register_platform"
 # but the plugin mode for models can be disabled by 
 # ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
 atom_model_registry = "atom.plugin.vllm.register:register_model"
+
+[project.entry-points."vllm_omni.platform_plugins"]
+atom = "atom.plugin.vllm_omni.register:register_omni_platform"
+
+[project.entry-points."vllm_omni.general_plugins"]
+atom_model_registry = "atom.plugin.vllm_omni.register:register_omni_model"
