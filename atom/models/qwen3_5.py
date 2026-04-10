@@ -39,7 +39,10 @@ from atom.models.utils import (
     maybe_prefix,
     extract_layer_index,
 )
-from atom.model_ops.split_chunk import fused_split_chunk_zeros
+from atom.model_ops.split_chunk import (
+    fused_split_chunk_zeros,
+    fused_split_chunk_zeros_qwen3_5_qkvzba,
+)
 
 if is_vllm():
     from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -88,20 +91,36 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         )
 
     def create_qkvzba_proj(self, quant_config, prefix):
-        self.in_proj_qkvz = self.create_qkvz_proj(
-            hidden_size=self.hidden_size,
-            key_dim=self.key_dim,
-            value_dim=self.value_dim,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_qkvz",
-        )
+        if self.quant_config.global_quant_config.quant_dtype == torch.bfloat16:
+            self.in_proj_qkvzba = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.key_dim,
+                    self.key_dim,
+                    self.value_dim,
+                    self.value_dim,
+                    self.num_v_heads,
+                    self.num_v_heads,
+                ],
+                bias=False,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        else:
+            self.in_proj_qkvz = self.create_qkvz_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_qkvz",
+            )
 
-        self.in_proj_ba = self.create_ba_proj(
-            hidden_size=self.hidden_size,
-            num_v_heads=self.num_v_heads,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_ba",
-        )
+            self.in_proj_ba = self.create_ba_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_ba",
+            )
 
     def fix_query_key_value_ordering(
         self,
@@ -128,16 +147,28 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz = self.in_proj_qkvz(hidden_states)
-        ba = self.in_proj_ba(hidden_states)
+        if hasattr(self, "in_proj_qkvzba"):
+            qkvzba = self.in_proj_qkvzba(hidden_states)
+            k_heads_after_tp = self.num_k_heads // self.tp_size
+            v_heads_after_tp = self.num_v_heads // self.tp_size
+            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros_qwen3_5_qkvzba(
+                qkvzba,
+                k_heads_after_tp,
+                v_heads_after_tp,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        else:
+            mixed_qkvz = self.in_proj_qkvz(hidden_states)
+            ba = self.in_proj_ba(hidden_states)
 
-        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-        z_size = self.value_dim // self.tp_size
-        num_v_heads_tp = self.num_v_heads // self.tp_size
+            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+            z_size = self.value_dim // self.tp_size
+            num_v_heads_tp = self.num_v_heads // self.tp_size
 
-        mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros(
-            mixed_qkvz, ba, qkv_size, z_size, self.head_v_dim, num_v_heads_tp
-        )
+            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_zeros(
+                mixed_qkvz, ba, qkv_size, z_size, self.head_v_dim, num_v_heads_tp
+            )
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -423,6 +454,20 @@ if is_vllm():
             quant_config = vllm_config.quant_config
             multimodal_config = vllm_config.model_config.multimodal_config
             self.atom_config = atom_config
+            if (
+                self.atom_config.quant_config.global_quant_config.quant_dtype
+                == torch.bfloat16
+            ):
+                self.packed_modules_mapping.pop("in_proj_qkv")
+                self.packed_modules_mapping.pop("in_proj_b")
+                self.packed_modules_mapping.pop("in_proj_a")
+                self.packed_modules_mapping["in_proj_qkv"] = (
+                    "in_proj_qkvzba",
+                    (0, 1, 2),
+                )
+                self.packed_modules_mapping["in_proj_z"] = ("in_proj_qkvzba", (3))
+                self.packed_modules_mapping["in_proj_b"] = ("in_proj_qkvzba", (4))
+                self.packed_modules_mapping["in_proj_a"] = ("in_proj_qkvzba", (5))
 
             self.config = config
             self.multimodal_config = multimodal_config
@@ -502,6 +547,20 @@ if is_vllm():
             config: Qwen3_5MoeConfig = atom_config.hf_config
             quant_config = vllm_config.quant_config
             multimodal_config = vllm_config.model_config.multimodal_config
+            if (
+                self.atom_config.quant_config.global_quant_config.quant_dtype
+                == torch.bfloat16
+            ):
+                self.packed_modules_mapping.pop("in_proj_qkv")
+                self.packed_modules_mapping.pop("in_proj_b")
+                self.packed_modules_mapping.pop("in_proj_a")
+                self.packed_modules_mapping["in_proj_qkv"] = (
+                    "in_proj_qkvzba",
+                    (0, 1, 2),
+                )
+                self.packed_modules_mapping["in_proj_z"] = ("in_proj_qkvzba", (3))
+                self.packed_modules_mapping["in_proj_b"] = ("in_proj_qkvzba", (4))
+                self.packed_modules_mapping["in_proj_a"] = ("in_proj_qkvzba", (5))
 
             self.config = config
             self.multimodal_config = multimodal_config
