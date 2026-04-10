@@ -78,15 +78,16 @@ jobs:
             index_file=$(mktemp)
             curl -fsSL "$S3_WHL_INDEX_URL" -o "$index_file" || return 1
 
-            wheel_name=$(python3 -c "import re, sys; from html import unescape; html = open(sys.argv[1], encoding='utf-8').read(); matches = re.findall(r'href=[\"\\']([^\"\\']*amd_aiter[^\"\\']*\\.whl)[\"\\']', html) or re.findall(r'(amd_aiter[^<\"\\']*\\.whl)', html); wheel_names = list(dict.fromkeys(unescape(match).split('/')[-1] for match in matches)); print(wheel_names[-1] if wheel_names else '')" "$index_file")
+            wheel_url=$(python3 -c "import re, sys; from html import unescape; from urllib.parse import urljoin; html = open(sys.argv[1], encoding='utf-8').read(); base_url = sys.argv[2]; matches = re.findall(r'href=[\"\\']([^\"\\']*amd_aiter[^\"\\']*\\.whl)[\"\\']', html); matches = matches or re.findall(r'(amd_aiter[^<\"\\']*\\.whl)', html); print(urljoin(base_url, unescape(matches[-1])) if matches else '')" "$index_file" "$S3_WHL_INDEX_URL")
             rm -f "$index_file"
 
-            if [ -z "$wheel_name" ]; then
+            wheel_name=$(python3 -c "import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).path.rsplit('/', 1)[-1]) if sys.argv[1] else '')" "$wheel_url")
+
+            if [ -z "$wheel_url" ] || [ -z "$wheel_name" ]; then
               echo "No amd_aiter wheel found in S3 index"
               return 1
             fi
 
-            wheel_url="${S3_WHL_INDEX_URL}${wheel_name}"
             echo "Downloading latest S3 wheel: $wheel_url"
             curl -fsSL "$wheel_url" -o "aiter-whl/$wheel_name" || return 1
             echo "Downloaded wheel from S3: aiter-whl/$wheel_name"
