@@ -17,8 +17,22 @@ if [ "$TYPE" == "launch" ]; then
     PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"
     echo "Torch profiler enabled, trace output: /app/trace"
   fi
+
+  # RTL (rocm-trace-lite) GPU kernel tracing
+  RTL_CMD=""
+  if [ "${ENABLE_RTL_PROFILER:-0}" == "1" ]; then
+    RTL_TRACE_DIR="${ATOM_RTL_TRACE_DIR:-/app/rtl_traces}"
+    mkdir -p "$RTL_TRACE_DIR"
+    if command -v rtl &>/dev/null; then
+      RTL_CMD="rtl trace -o ${RTL_TRACE_DIR}/trace.db --"
+      echo "RTL profiler enabled, trace output: ${RTL_TRACE_DIR}"
+    else
+      echo "WARNING: RTL profiler requested but rtl command not found, skipping"
+    fi
+  fi
+
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" 2>&1 | tee "$ATOM_SERVER_LOG" &
+  $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" 2>&1 | tee "$ATOM_SERVER_LOG" &
   atom_server_pid=$!
 
   echo ""
@@ -106,6 +120,16 @@ fi
 if [ "$TYPE" == "stop" ]; then
   echo ""
   echo "========== Stopping ATOM server =========="
+
+  # Generate RTL trace summary before killing the server
+  RTL_TRACE_DIR="${ATOM_RTL_TRACE_DIR:-/app/rtl_traces}"
+  if [ -d "$RTL_TRACE_DIR" ] && ls "$RTL_TRACE_DIR"/trace*.db 1>/dev/null 2>&1; then
+    echo "Generating RTL trace summary..."
+    for db in "$RTL_TRACE_DIR"/trace*.db; do
+      rtl summary "$db" > "${db%.db}_summary.txt" 2>/dev/null || true
+    done
+    echo "RTL traces: $(ls "$RTL_TRACE_DIR"/*.db 2>/dev/null | wc -l) db files"
+  fi
 
   # Wait for trace files to finish writing (before killing the server process)
   TRACE_DIR="${TORCH_PROFILER_DIR:-/app/trace}"

@@ -156,6 +156,18 @@
     "_baseline_note": "HF: amd/GLM-5-MXFP4 card shows GLM-5 baseline=0.9545 (5-shot)"
   },
   {
+    "model_name": "GLM-5.1-FP8",
+    "model_path": "zai-org/GLM-5.1-FP8",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "pr",
+    "accuracy_threshold": 0.89,
+    "accuracy_baseline": 0.9545,
+    "accuracy_baseline_model": "zai-org/GLM-5.1",
+    "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
+  },
+  {
     "model_name": "MiniMax-M2.5",
     "model_path": "MiniMaxAI/MiniMax-M2.5",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
