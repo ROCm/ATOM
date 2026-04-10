@@ -49,6 +49,10 @@ on:
         description: "Enable torch profiler to collect trace for performance debugging"
         type: boolean
         default: false
+      enable_rtl:
+        description: "Enable RTL (rocm-trace-lite) GPU kernel tracing for prefill/decode analysis"
+        type: boolean
+        default: false
       param_lists:
         description: |
           "Benchmark parameter lists. 
@@ -189,6 +193,7 @@ jobs:
             -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} \
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+            -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
             $ENV_FLAGS \
             --name atom-benchmark \
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
@@ -223,6 +228,7 @@ jobs:
 
           docker exec atom-benchmark bash -lc "set -euo pipefail
             ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+              ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
               .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
             echo '========== Running benchmark =========='
             ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
@@ -266,6 +272,20 @@ jobs:
         with:
           name: profiler-traces-${{ env.RESULT_FILENAME }}
           path: profiler-traces/
+
+      - name: Stop server and collect RTL traces
+        if: inputs.enable_rtl
+        run: |
+          docker exec atom-benchmark bash -lc \
+            "ENABLE_RTL_PROFILER=1 .github/scripts/atom_test.sh stop" || true
+          docker cp atom-benchmark:/app/rtl_traces ./rtl-traces 2>/dev/null || true
+
+      - name: Upload RTL traces
+        if: inputs.enable_rtl
+        uses: actions/upload-artifact@v7
+        with:
+          name: rtl-traces-${{ env.RESULT_FILENAME }}
+          path: rtl-traces/
 
       - name: Upload benchmark result
         uses: actions/upload-artifact@v7

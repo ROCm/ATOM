@@ -67,6 +67,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
+    # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
+    # GPU timestamps for both prefill and decode phases.
+    "ATOM_RTL_TRACE_DIR": lambda: os.getenv("ATOM_RTL_TRACE_DIR", None),
     # --- Model Loading ---
     "ATOM_DISABLE_MMAP": lambda: os.getenv("ATOM_DISABLE_MMAP", "false").lower()
     == "true",
