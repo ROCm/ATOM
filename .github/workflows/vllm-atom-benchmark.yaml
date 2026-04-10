@@ -719,7 +719,7 @@ jobs:
             -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_vllm_atom_test.sh launch full
+              bash .github/scripts/vllm_atom_test.sh launch full
             "
 
           TRUST_REMOTE_CODE_ARG=""

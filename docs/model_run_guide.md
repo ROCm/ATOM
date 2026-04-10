@@ -31,7 +31,7 @@ docker run -it --device=/dev/kfd --device=/dev/dri \
 
 ### vLLM Plugin Backend
 
-ATOM also runs as a vLLM plugin backend. See recipes under [recpies/vllm_atom/](../recpies/vllm_atom/) for vLLM-integrated serving.
+ATOM also runs as a vLLM plugin backend. See recipes under [recipes/vllm_atom/](../recipes/vllm_atom/) for vLLM-integrated serving.
 
 ## Nightly CI Benchmark Configurations
 

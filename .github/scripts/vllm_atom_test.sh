@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Usage:
-#   .github/scripts/atom_vllm_atom_test.sh launch <mode> [model_name]
-#   .github/scripts/atom_vllm_atom_test.sh accuracy <mode> [model_name]
+#   .github/scripts/vllm_atom_test.sh launch <mode> [model_name]
+#   .github/scripts/vllm_atom_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
 #   OOT_MODEL_NAME

@@ -700,7 +700,7 @@ jobs:
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_vllm_atom_test.sh accuracy ci
+              bash .github/scripts/vllm_atom_test.sh accuracy ci
             "
 
       - name: Check vLLM-ATOM accuracy test results
@@ -1209,7 +1209,7 @@ jobs:
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_vllm_atom_test.sh accuracy full
+              bash .github/scripts/vllm_atom_test.sh accuracy full
             "
 
       - name: Check vLLM-ATOM accuracy test results
