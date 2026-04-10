@@ -31,6 +31,15 @@ on:
       rccl_branch:
         description: "RCCL branch"
         default: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
+      sglang_repo:
+        description: "SGLang repo"
+        default: "https://github.com/sgl-project/sglang.git"
+      sglang_ref:
+        description: "SGLang git ref"
+        default: "v0.5.10"
+      sglang_version:
+        description: "SGLang version used in the published tag"
+        default: "0.5.10"
       runner:
         description: "Runner label to use"
         type: choice
@@ -47,8 +56,16 @@ on:
         description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
         type: boolean
         default: true
+      build_sglang_image:
+        description: "Build SGLang+ATOM image for manual runs (scheduled nightly runs always build SGLang+ATOM; default enabled so manual releases also publish SGLang+ATOM)"
+        type: boolean
+        default: true
       only_release_oot:
         description: "Only release the OOT vLLM image: skip native image test/push and always build/push OOT"
+        type: boolean
+        default: false
+      only_release_sglang:
+        description: "Only release the SGLang+ATOM image: skip native image test/push and always build/push SGLang+ATOM"
         type: boolean
         default: false
 
@@ -72,6 +89,9 @@ jobs:
       GPU_ARCH: "gfx942;gfx950"
       VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
       VLLM_VERSION: "0.19.0"
+      SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
+      SGLANG_REF: "v0.5.10"
+      SGLANG_VERSION: "0.5.10"
 
     steps:
       - name: Set HF_TOKEN
@@ -92,6 +112,9 @@ jobs:
           echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
           echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
           echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
+          echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
+          echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
+          echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
 
       - name: Build Docker image
         timeout-minutes: 180
@@ -111,7 +134,7 @@ jobs:
           docker inspect atom_release:ci
 
       - name: Test Docker image
-        if: ${{ inputs.skip_tests != true && inputs.only_release_oot != true }}
+        if: ${{ inputs.skip_tests != true && inputs.only_release_oot != true && inputs.only_release_sglang != true }}
         timeout-minutes: 60
         run: |
           echo "Clean up containers..."
@@ -160,7 +183,7 @@ jobs:
           fi
 
       - name: Push Docker image
-        if: ${{ success() && inputs.only_release_oot != true }}
+        if: ${{ success() && inputs.only_release_oot != true && inputs.only_release_sglang != true }}
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
           TAG=nightly_$(date +%Y%m%d%H%M)
@@ -170,7 +193,7 @@ jobs:
           docker push rocm/atom-dev:${TAG}
 
       - name: Build OOT Docker image
-        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
+        if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
         timeout-minutes: 180
         run: |
           OOT_BASE_IMAGE="atom_release:ci"
@@ -186,7 +209,7 @@ jobs:
           docker inspect atom_oot_release:ci
 
       - name: Push OOT Docker image
-        if: ${{ success() && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
+        if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
         run: |
           VLLM_VER="${{ env.VLLM_VERSION }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
@@ -195,6 +218,32 @@ jobs:
           docker push rocm/atom-dev:${OOT_TAG}
           docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
           docker push rocm/atom-dev:${OOT_LATEST_TAG}
+
+      - name: Build SGLang Docker image
+        if: ${{ success() && inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true || inputs.only_release_sglang == true) }}
+        timeout-minutes: 180
+        run: |
+          SGLANG_BASE_IMAGE="atom_release:ci"
+          echo "Using SGLang+ATOM base image: ${SGLANG_BASE_IMAGE}"
+          docker build --network=host -t atom_sglang_release:ci \
+            --target atom_sglang \
+            --build-arg SGLANG_BASE_IMAGE="${SGLANG_BASE_IMAGE}" \
+            --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
+            --build-arg SGLANG_REPO="${{ inputs.sglang_repo || env.SGLANG_REPO }}" \
+            --build-arg SGLANG_REF="${{ inputs.sglang_ref || env.SGLANG_REF }}" \
+            -f docker/Dockerfile .
+          docker inspect atom_sglang_release:ci
+
+      - name: Push SGLang+ATOM Docker image
+        if: ${{ success() && inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true || inputs.only_release_sglang == true) }}
+        run: |
+          SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
+          SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
+          SGLANG_LATEST_TAG="sglang-latest"
+          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_TAG}
+          docker push rocm/atom-dev:${SGLANG_TAG}
+          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
+          docker push rocm/atom-dev:${SGLANG_LATEST_TAG}
 
       - name: Clean Up
         if: always()
@@ -205,7 +254,10 @@ jobs:
           docker rmi atom_release:ci || true
           docker rmi rocm/atom-dev:latest || true
           docker rmi atom_oot_release:ci || true
+          docker rmi atom_sglang_release:ci || true
           # Remove nightly tagged image if it exists
           docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true
           docker images "rocm/atom-dev:vllm-v*-nightly_*" -q | xargs -r docker rmi || true
+          docker images "rocm/atom-dev:sglang-v*-nightly_*" -q | xargs -r docker rmi || true
           docker rmi rocm/atom-dev:vllm-latest || true
+          docker rmi rocm/atom-dev:sglang-latest || true

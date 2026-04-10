@@ -4,7 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ATOM Benchmark Dashboard</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='4' fill='%23f5f0eb'/><rect x='0' y='0' width='8' height='8' fill='%23f2cfee'/><rect x='8' y='8' width='8' height='8' fill='%23f2cfee'/><rect x='0' y='16' width='8' height='8' fill='%23f2cfee'/><rect x='16' y='16' width='8' height='8' fill='%23f2cfee'/><rect x='0' y='24' width='8' height='8' fill='%23f2cfee'/><rect x='8' y='24' width='8' height='8' fill='%23f2cfee'/><rect x='24' y='24' width='8' height='8' fill='%23f2cfee'/></svg>" />
+  <link rel="icon" type="image/png" href="atom_logo_mini.png" />
+  <script>if(localStorage.getItem('atom-dash-theme')==='light')document.documentElement.setAttribute('data-theme','light');</script>
   <style>
     /* ============================================================
        CSS VARIABLES & RESET
@@ -25,6 +26,22 @@
       /* Spacing */
       --gap-sm: 8px; --gap-md: 16px; --gap-lg: 24px; --radius: 8px;
     }
+    [data-theme="light"] {
+      --bg-primary: #f5f6fa; --bg-secondary: #ffffff; --bg-tertiary: #ebedf3;
+      --border: #d0d3dc; --border-light: #e2e4eb;
+      --text-primary: #1a1c24; --text-secondary: #4a4d5e; --text-tertiary: #7e8094;
+      --brand: #c054b4; --brand-dim: rgba(192,84,180,0.10);
+      --ui: #5a6d8a; --ui-bright: #3d5278; --ui-dim: rgba(90,109,138,0.10);
+      --accent-green: #2e8b47; --accent-red: #d63a2f;
+      --accent-orange: #c47a30; --accent-purple: #8b5ec0; --accent-yellow: #b08a20;
+      --table-stripe: rgba(0,0,0,0.03);
+    }
+    .header-left > div { position: relative; }
+    h1 { line-height: 24px; }
+    .theme-toggle { position: absolute; right: 0; top: 5px; display: block; width: 28px; height: 14px; background: var(--border); border: none; border-radius: 7px; cursor: pointer; transition: background 0.2s; }
+    .theme-toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 10px; height: 10px; background: var(--text-primary); border-radius: 50%; transition: transform 0.2s; }
+    [data-theme="light"] .theme-toggle { background: var(--border); }
+    [data-theme="light"] .theme-toggle::after { transform: translateX(14px); }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { overflow-x: hidden; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg-primary); color: var(--text-secondary); }
@@ -36,7 +53,7 @@
     /* ============================================================
        HEADER & FILTER BAR
        ============================================================ */
-    header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: var(--gap-md); padding: var(--gap-md) var(--gap-lg); border-bottom: 2px solid var(--brand); position: fixed; top: 0; left: 0; right: 0; z-index: 50; background: var(--bg-primary); }
+    header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: var(--gap-md); padding: var(--gap-md) var(--gap-lg); border-bottom: 2px solid var(--brand); position: fixed; top: 0; left: 0; right: 0; z-index: 50; background: var(--bg-primary); max-width: 1440px; margin: 0 auto; }
     .header-spacer { margin-bottom: var(--gap-lg); }
     .fixed-thead { position: fixed; z-index: 40; background: var(--bg-secondary); display: none; overflow: hidden; }
     .header-left { display: flex; align-items: center; gap: 12px; }
@@ -93,7 +110,7 @@
        TABS (Level 2 — Diagnostic)
        ============================================================ */
     .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: var(--gap-lg); }
-    .tab { padding: 8px 16px; font-size: 13px; color: var(--text-tertiary); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; user-select: none; }
+    .tab { padding: 8px 16px; font-size: 13px; font-weight: 600; color: var(--text-tertiary); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; user-select: none; }
     .tab:hover { color: var(--text-secondary); }
     .tab.active { color: var(--text-primary); border-bottom-color: var(--ui); }
     .tab .tab-badge { display: inline-block; margin-left: 4px; vertical-align: middle; font-size: 10px; font-weight: 600; min-width: 16px; height: 16px; line-height: 16px; text-align: center; border-radius: 8px; padding: 0 4px; }
@@ -138,8 +155,8 @@
     .table-watermark { position: relative; overflow-x: scroll; }
     .table-watermark::-webkit-scrollbar { height: 8px; }
     .table-watermark::-webkit-scrollbar-track { background: var(--bg-tertiary); border-radius: 4px; }
-    .table-watermark::-webkit-scrollbar-thumb { background: var(--text-tertiary); border-radius: 4px; }
-    .table-watermark::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+    .table-watermark::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    .table-watermark::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
     .perf-table th { text-align: left; padding: 8px 10px; border-bottom: 2px solid var(--border); color: var(--text-tertiary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; background: var(--bg-secondary); }
     .perf-table th.num { text-align: right; }
     .perf-table td { padding: 7px 10px; border-bottom: 1px solid var(--border-light); }
@@ -154,7 +171,7 @@
     #tab-data .perf-table tbody tr[data-key] td:first-child::before { content: '▸ '; color: var(--text-tertiary); font-size: 10px; }
     #tab-performance .perf-table tbody tr[data-key].row-open td:first-child::before,
     #tab-data .perf-table tbody tr[data-key].row-open td:first-child::before { content: '▾ '; }
-    .perf-table tbody tr:nth-child(4n+1), .perf-table tbody tr:nth-child(4n+2) { background: rgba(22,27,34,0.5); }
+    .perf-table tbody tr:nth-child(4n+1), .perf-table tbody tr:nth-child(4n+2) { background: var(--table-stripe, rgba(22,27,34,0.5)); }
     .perf-table tbody tr:hover { background: var(--bg-tertiary); }
     .perf-table tbody tr.regression { background: rgba(242,92,78,0.06) !important; }
     .perf-table tbody tr.regression td:first-child { border-left: 3px solid var(--accent-red); }
@@ -277,6 +294,7 @@
     <div>
       <h1>Benchmark Dashboard</h1>
       <div class="meta"><span id="last-update"></span> · <a id="repo-link" target="_blank" rel="noopener noreferrer"></a></div>
+      <button class="theme-toggle" id="theme-toggle" title="Toggle light/dark mode"></button>
     </div>
   </div>
   <div class="filter-bar" id="filter-bar"></div>
@@ -357,10 +375,11 @@ function getModelHue(backend, model) {
 }
 function getModelColor(backend, model) {
   const h = getModelHue(backend, model);
+  const light = _theme === 'light';
   return {
-    border: `hsl(${h}, 55%, 65%)`,
-    bg:     `hsla(${h}, 55%, 65%, 0.12)`,
-    text:   `hsl(${h}, 35%, 75%)`,
+    border: `hsl(${h}, ${light ? '50%' : '55%'}, ${light ? '45%' : '65%'})`,
+    bg:     `hsla(${h}, ${light ? '50%' : '55%'}, ${light ? '45%' : '65%'}, ${light ? '0.08' : '0.12'})`,
+    text:   `hsl(${h}, ${light ? '40%' : '35%'}, ${light ? '40%' : '75%'})`,
   };
 }
 // Bar color: lower saturation, higher lightness for a soft pastel look
@@ -369,17 +388,44 @@ function getBarColor(backend, model, conc, concList) {
   const sorted = [...concList].sort((a, b) => a - b);
   const rank = sorted.indexOf(conc);
   const alpha = concList.length <= 1 ? 0.55 : 0.3 + (rank / (sorted.length - 1)) * 0.35;
-  return `hsla(${h}, 50%, 72%, ${alpha.toFixed(2)})`;
+  return `hsla(${h}, ${_theme === 'light' ? '45%' : '50%'}, ${_theme === 'light' ? '55%' : '72%'}, ${alpha.toFixed(2)})`;
 }
 
-// Chart color constants (match CSS --text-tertiary / --text-secondary)
-const C_TICK = '#8a8da0';    // axis ticks, labels
-const C_LEGEND = '#b0b2c4';  // legend text, datalabels
-const C_TOOLTIP_BG = '#141519';
-const C_TOOLTIP_BD = '#303140';
-const C_TOOLTIP_TITLE = '#eef0f6';
-const C_TOOLTIP_BODY = '#bfc1d0';
+// Chart color constants (match CSS variables, updated on theme toggle)
+const THEME_COLORS = {
+  dark:  { tick: '#8a8da0', legend: '#b0b2c4', tooltipBg: '#141519', tooltipBd: '#303140', tooltipTitle: '#eef0f6', tooltipBody: '#bfc1d0', grid: 'rgba(65,67,85,0.4)' },
+  light: { tick: '#5a5d70', legend: '#4a4d5e', tooltipBg: '#ffffff', tooltipBd: '#d0d3dc', tooltipTitle: '#1a1c24', tooltipBody: '#4a4d5e', grid: 'rgba(0,0,0,0.10)' }
+};
+let _theme = localStorage.getItem('atom-dash-theme') || 'dark';
+let C_TICK = THEME_COLORS[_theme].tick;
+let C_LEGEND = THEME_COLORS[_theme].legend;
+let C_TOOLTIP_BG = THEME_COLORS[_theme].tooltipBg;
+let C_TOOLTIP_BD = THEME_COLORS[_theme].tooltipBd;
+let C_TOOLTIP_TITLE = THEME_COLORS[_theme].tooltipTitle;
+let C_TOOLTIP_BODY = THEME_COLORS[_theme].tooltipBody;
+let C_GRID = THEME_COLORS[_theme].grid;
 
+// Apply saved theme on load
+if (_theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
+
+function applyTheme(theme) {
+  _theme = theme;
+  localStorage.setItem('atom-dash-theme', theme);
+  if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  else document.documentElement.removeAttribute('data-theme');
+  const tc = THEME_COLORS[theme];
+  C_TICK = tc.tick; C_LEGEND = tc.legend; C_TOOLTIP_BG = tc.tooltipBg;
+  C_TOOLTIP_BD = tc.tooltipBd; C_TOOLTIP_TITLE = tc.tooltipTitle; C_TOOLTIP_BODY = tc.tooltipBody;
+  C_GRID = tc.grid;
+  Chart.defaults.color = C_TICK;
+  // Re-render dashboard
+  if (typeof renderAll === 'function') renderAll();
+}
+document.addEventListener('click', function(e) {
+  if (e.target.id === 'theme-toggle') {
+    applyTheme(_theme === 'dark' ? 'light' : 'dark');
+  }
+});
 // Register datalabels globally but disable by default
 if (typeof ChartDataLabels !== 'undefined') Chart.register(ChartDataLabels);
 Chart.defaults.plugins.datalabels = { display: false };
@@ -799,7 +845,7 @@ window.addEventListener('resize', () => {
 }, { passive: true });
 
 function chartGridOpts() {
-  return { color: 'rgba(65,67,85,0.4)', drawBorder: false };
+  return { color: C_GRID, drawBorder: false };
 }
 
 // Reference line plugin — draws a dashed horizontal line with label
@@ -1292,7 +1338,7 @@ function renderPerformanceTab() {
     const dataAge = Date.now() - cfg.date;
     const staleClass = dataAge > 3 * 86400000 ? ' stale-data' : '';
     html += `<tr class="${regClass}${staleClass}" data-key="${key}">
-      <td style="white-space:nowrap">${escHTML(cfg.backend)}</td>
+      <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td>
       <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
@@ -2093,7 +2139,7 @@ function renderDataTable() {
     html += `<tr data-key="data-${key}-${runDate}">
       <td title="${fmtDate(cfg.date)}">${relTime(cfg.date)}</td>
       <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
-      <td style="white-space:nowrap">${escHTML(cfg.backend)}</td>
+      <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td>
       <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
@@ -2147,7 +2193,7 @@ function renderTimeline() {
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td style="white-space:nowrap">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
+        <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
         <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
@@ -2347,7 +2393,7 @@ function renderAccuracyTab() {
 
     html += `
       <tr class="${rowClass}" data-acc-key="${escHTML(key)}">
-        <td style="white-space:nowrap">${escHTML(backend)}</td>
+        <td style="white-space:nowrap;font-weight:600">${escHTML(backend)}</td>
         <td style="font-weight:600;color:var(--text-primary)">${escHTML(model)}</td>
         <td class="num" style="font-weight:700;color:var(--text-primary)">${fmtNum(acc.score, 4)}</td>
         <td class="num">${acc.strictMatch != null ? fmtNum(acc.strictMatch, 4) : '—'}</td>
@@ -2511,6 +2557,12 @@ function renderAccuracyMiniChart(key, chartCache) {
       },
     },
   });
+}
+
+// Re-render everything (used by theme toggle)
+function renderAll() {
+  renderKPICards();
+  renderActiveTab();
 }
 
 /* ================================================================
