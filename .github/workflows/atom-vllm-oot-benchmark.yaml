@@ -1106,21 +1106,26 @@ jobs:
           max-items-in-chart: 90
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Deploy custom dashboard to gh-pages
+      - name: Push dashboard data to gh-pages
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          CURRENT_SHA=$(git rev-parse HEAD)
-          cp .github/dashboard/index.html /tmp/dashboard_index.html
-          cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
-          cp docs/assets/atom_logo_mini.png /tmp/dashboard_logo_mini.png
           git fetch origin gh-pages
           git checkout gh-pages
-          cp /tmp/dashboard_index.html benchmark-dashboard/index.html
-          cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
-          cp /tmp/dashboard_logo_mini.png benchmark-dashboard/atom_logo_mini.png
-          git add benchmark-dashboard/
-          git diff --cached --quiet || git commit -m "Update OOT benchmark data and dashboard"
-          git push origin gh-pages
-          git checkout "$CURRENT_SHA"
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/oot-benchmark-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/oot-benchmark-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update OOT benchmark dashboard data"
+          git push origin HEAD:gh-pages
