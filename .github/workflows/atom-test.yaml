@@ -147,7 +147,7 @@ jobs:
 
   atom-test:
     needs: [download_aiter_wheel, load-test-models]
-    name: ATOM Test
+    name: Accuracy
     strategy:
       fail-fast: false
       matrix:
