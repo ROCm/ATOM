@@ -37,6 +37,16 @@ on:
         required: false
         type: boolean
         default: false
+      run_llama405_fp8_tp8:
+        description: "Meta-Llama-3.1-405B-Instruct-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
+      run_llama8_tp1:
+        description: "Llama-3.1-8B-Instruct TP1"
+        required: false
+        type: boolean
+        default: false
       run_kimi_k2_tp8:
         description: "Kimi-K2-Thinking-MXFP4 TP8"
         required: false
@@ -796,6 +806,8 @@ jobs:
           RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
           RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
           RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
+          RUN_LLAMA405_FP8_TP8: ${{ inputs.run_llama405_fp8_tp8 }}
+          RUN_LLAMA8_TP1: ${{ inputs.run_llama8_tp1 }}
           RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
           RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
           RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
@@ -849,6 +861,24 @@ jobs:
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
+              },
+              {
+                  "toggle_env": "RUN_LLAMA405_FP8_TP8",
+                  "model_name": "Meta-Llama-3.1-405B-Instruct-FP8/ TP8",
+                  "model_path": "Meta-Llama-3.1-405B-Instruct-FP8/",
+                  "extra_args": "--tensor-parallel-size 8 --load-format safetensors --allow-deprecated-quantization",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-8",
+              },
+              {
+                  "toggle_env": "RUN_LLAMA8_TP1",
+                  "model_name": "Llama-3.1-8B-Instruct TP1",
+                  "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+                  "extra_args": "--tensor-parallel-size 1",
+                  "accuracy_test_threshold": 0.73,
+                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "runner": "linux-atom-mi35x-1",
               },
               {
                   "toggle_env": "RUN_KIMI_K2_TP8",

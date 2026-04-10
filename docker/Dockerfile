@@ -373,6 +373,10 @@ COPY --from=build_aiter /app/aiter-test /app/aiter-test
 RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
     pip show amd-aiter
 
+# RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
+RUN pip install rocm-trace-lite && \
+    rtl --version || true
+
 # ATOM: lightweight install (no compilation needed)
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
