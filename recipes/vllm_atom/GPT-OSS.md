@@ -1,6 +1,6 @@
 # GPT-OSS with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `GPT-OSS-120B` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `GPT-OSS-120B` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_atom_guide.md).
 
 ## Step 1: Pull the vLLM-ATOM Docker
 

@@ -1,6 +1,6 @@
 # Kimi-K2-Thinking with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Kimi-K2-Thinking` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Kimi-K2-Thinking` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_atom_guide.md).
 
 This model uses remote code, so the launch command keeps `--trust-remote-code`.
 

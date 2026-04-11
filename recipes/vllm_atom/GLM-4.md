@@ -1,6 +1,6 @@
 # GLM-4-MoE with ATOM vLLM Plugin Backend
 
-This recipe shows how to run a `GLM-4-MoE` model with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run a `GLM-4-MoE` model with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_atom_guide.md).
 
 The checkpoint used here should expose the `Glm4MoeForCausalLM` architecture so it can be picked up by the ATOM vLLM-ATOM model override.
 
