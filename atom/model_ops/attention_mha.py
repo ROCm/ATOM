@@ -95,6 +95,7 @@ class PagedAttentionImpl(nn.Module):
 
         fwd_ctx: ForwardContext = get_forward_context()
 
+        # dummy run will skip attention in cuda graph capture phase
         if fwd_ctx.context.is_dummy_run:
             o = torch.empty_like(q)
             return o
@@ -105,6 +106,7 @@ class PagedAttentionImpl(nn.Module):
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
 
+        # rope cache
         q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(
             q, k, v, qkv, position, fwd_ctx
         )
@@ -462,6 +464,7 @@ class PagedAttentionImpl(nn.Module):
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
 
+        # variable length attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
         sliding_window = (
             (self.sliding_window, 0, 0)
