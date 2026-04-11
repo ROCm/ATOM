@@ -532,7 +532,7 @@ class PagedAttentionImplPluginModeMethods:
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_q,
+            max_seqlen_k=max_seqlen_q,  # need to confirm
             min_seqlen_q=min_seqlen_q,
             softmax_scale=self.scale,
             causal=True,
