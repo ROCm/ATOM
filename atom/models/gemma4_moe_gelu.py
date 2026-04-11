@@ -1,9 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
-"""Fused GELU MoE kernel for Gemma 4 26B-A4B.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-Triton kernel that fuses: expert dispatch + gate_up GEMM + GELU activation + down GEMM
-for BF16 precision. Handles non-standard intermediate dimensions (e.g., 704).
-"""
+"""Fused GELU MoE kernel for Gemma 4 26B-A4B."""
 import torch
 import triton
 import triton.language as tl
