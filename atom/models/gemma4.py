@@ -1,30 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Google LLC and the ATOM contributors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Gemma 4 model implementation for ATOM with AITER-optimized operators.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-Operator optimization levels (MI355X / gfx950):
-  - Attention decode: Gluon PA (Triton advanced, CDNA4-aware)
-  - Attention prefill: Triton flash attention
-  - GeluAndMul: AITER CUDA JIT kernel (gelu_tanh_and_mul)
-  - RMSNorm: _Gemma4RMSNorm (standard x*weight, NOT Gemma1/2 x*(1+weight))
-  - RoPE: AITER CUDA kernel per-layer-type config
-  - GEMM: CK (Composable Kernel) for FP8/MXFP4
-  - MoE: ASM + CK fused MoE (26B-A4B variant)
-  - TopK softmax: ASM
-  - Logit softcapping: fused Triton kernel (single launch)
-"""
+"""Inference-only Gemma 4 model (text-only backbone)."""
 
 from collections.abc import Iterable
 from typing import Any, Optional
