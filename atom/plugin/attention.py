@@ -125,7 +125,25 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [16]
+        from vllm.v1.attention.backend import (
+            MultipleOf,
+        )  # pyright: ignore[reportMissingImports]
+
+        return [MultipleOf(16)]
+
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        if block_size is None:
+            return True
+        return block_size % 16 == 0
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # OOT backends do not inherit vLLM's AttentionBackend, so mirror the
+        # vLLM 0.19 default block-size selection logic locally.
+        if cls.supports_block_size(default_block_size):
+            return default_block_size
+        return 16
 
     @staticmethod
     def get_kv_cache_shape(
@@ -1327,6 +1345,13 @@ class vllmAiterMLABackendMethods:
     @staticmethod
     def get_supported_kernel_block_sizes():
         return [1]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # ATOM's MLA plugin path assumes kernel/page block size == 1 throughout
+        # metadata construction and KV-cache indexing, so force that value when
+        # vLLM 0.19 negotiates the backend-specific cache block size.
+        return 1
 
     @staticmethod
     def get_kv_cache_shape(
