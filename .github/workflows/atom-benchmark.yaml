@@ -34,6 +34,10 @@ on:
         description: "Benchmark MiniMax-M2.5"
         type: boolean
         default: true
+      llama-3-3-70b-instruct-mxfp4:
+        description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
+        type: boolean
+        default: true
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
@@ -43,6 +47,10 @@ on:
         default: "rocm/atom-dev:latest"
       enable_profiler:
         description: "Enable torch profiler to collect trace for performance debugging"
+        type: boolean
+        default: false
+      enable_rtl:
+        description: "Enable RTL (rocm-trace-lite) GPU kernel tracing for prefill/decode analysis"
         type: boolean
         default: false
       param_lists:
@@ -185,6 +193,7 @@ jobs:
             -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} \
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+            -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
             $ENV_FLAGS \
             --name atom-benchmark \
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
@@ -219,6 +228,7 @@ jobs:
 
           docker exec atom-benchmark bash -lc "set -euo pipefail
             ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+              ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
               .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
             echo '========== Running benchmark =========='
             ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
@@ -262,6 +272,20 @@ jobs:
         with:
           name: profiler-traces-${{ env.RESULT_FILENAME }}
           path: profiler-traces/
+
+      - name: Stop server and collect RTL traces
+        if: inputs.enable_rtl
+        run: |
+          docker exec atom-benchmark bash -lc \
+            "ENABLE_RTL_PROFILER=1 .github/scripts/atom_test.sh stop" || true
+          docker cp atom-benchmark:/app/rtl_traces ./rtl-traces 2>/dev/null || true
+
+      - name: Upload RTL traces
+        if: inputs.enable_rtl
+        uses: actions/upload-artifact@v7
+        with:
+          name: rtl-traces-${{ env.RESULT_FILENAME }}
+          path: rtl-traces/
 
       - name: Upload benchmark result
         uses: actions/upload-artifact@v7
@@ -432,11 +456,13 @@ jobs:
           # Save dashboard assets before switching branches
           cp .github/dashboard/index.html /tmp/dashboard_index.html
           cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
+          cp docs/assets/atom_logo_mini.png /tmp/dashboard_logo_mini.png
           git fetch origin gh-pages
           git checkout gh-pages
           # Replace auto-generated index.html with custom dashboard + logo
           cp /tmp/dashboard_index.html benchmark-dashboard/index.html
           cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
+          cp /tmp/dashboard_logo_mini.png benchmark-dashboard/atom_logo_mini.png
           git add benchmark-dashboard/
           git diff --cached --quiet || git commit -m "Update benchmark data and dashboard"
           git push origin gh-pages

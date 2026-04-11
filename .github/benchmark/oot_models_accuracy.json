@@ -44,6 +44,30 @@
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B"
   },
   {
+    "model_name": "Llama-3.1-8B-Instruct TP1",
+    "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+    "extraArgs": "--tensor-parallel-size 1",
+    "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+    "runner": "linux-atom-mi35x-1",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.73,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "meta-llama/Llama-3.1-8B-Instruct",
+    "_baseline_note": "Threshold aligned with existing 8B Llama baseline used in CI (3-shot GSM8K)."
+  },
+  {
+    "model_name": "Meta-Llama-3.1-405B-Instruct-FP8/ TP8",
+    "model_path": "Meta-Llama-3.1-405B-Instruct-FP8/",
+    "extraArgs": "--tensor-parallel-size 8 --load-format safetensors --allow-deprecated-quantization",
+    "env_vars": "",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.9,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Meta-Llama-3.1-405B-Instruct-FP8/",
+    "_baseline_note": "Threshold aligned with workflow matrix target for TP8 gsm8k (3-shot)."
+  },
+  {
     "model_name": "Kimi-K2-Thinking-MXFP4 TP8",
     "model_path": "amd/Kimi-K2-Thinking-MXFP4",
     "extraArgs": "--tensor-parallel-size 8",
