@@ -11,6 +11,15 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
+      - 'scripts/**'
+      - '.github/dashboard/**'
+      - '.github/benchmark/vllm*'
+      - '.github/benchmark/oot_*'
+      - '.github/workflows/vllm-benchmark.yaml'
+      - '.github/workflows/atom-vllm-oot-benchmark.yaml'
+      - '.github/workflows/atom-benchmark.yaml'
+      - '.github/workflows/docker-release.yaml'
+      - '.github/workflows/gpu-load-test.yaml'
   schedule:
     # Nightly at 00:00 Beijing time (16:00 UTC)
     - cron: '0 16 * * *'

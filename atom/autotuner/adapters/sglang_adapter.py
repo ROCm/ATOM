@@ -1,0 +1,88 @@
+"""
+SGLang inference framework adapter.
+
+Enables the autotuner to optimize SGLang deployments on AMD GPUs.
+Uses SGLang's server and bench_serving utilities.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+from typing import Optional
+
+from atom.autotuner.adapters.base import InferenceAdapter
+from atom.autotuner.types import BenchmarkResult, GPUInfo, InferenceConfig
+
+logger = logging.getLogger(__name__)
+
+
+class SGLangAdapter(InferenceAdapter):
+    """Adapter for SGLang inference engine."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 30000):
+        self.host = host
+        self.port = port
+        self._server_proc: Optional[subprocess.Popen] = None
+
+    def deploy(self, config: InferenceConfig) -> None:
+        cmd = [
+            "python", "-m", "sglang.launch_server",
+            "--model-path", config.model,
+            "--tp", str(config.tp),
+            "--port", str(self.port),
+            "--max-total-tokens", str(config.max_seq_len * config.batch_size),
+            "--kv-cache-dtype", config.kv_cache_dtype,
+        ]
+        if config.pp > 1:
+            cmd.extend(["--dp", str(config.pp)])
+        if config.compilation_level == 0:
+            cmd.append("--disable-cuda-graph")
+
+        logger.info("Launching SGLang server: %s", " ".join(cmd))
+        self._server_proc = subprocess.Popen(
+            cmd, env=os.environ.copy(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        if not self._wait_for_server(self._server_proc, self.health_check):
+            self.teardown()
+            raise RuntimeError("SGLang server failed to start")
+
+    def benchmark(
+        self,
+        config: InferenceConfig,
+        duration_sec: int = 60,
+        concurrency: int = 32,
+        isl: int = 4000,
+        osl: int = 1000,
+    ) -> BenchmarkResult:
+        cmd = [
+            "python", "-m", "sglang.bench_serving",
+            "--backend", "sglang",
+            "--host", self.host,
+            "--port", str(self.port),
+            "--model", config.model,
+            "--num-prompts", str(concurrency * 5),
+            "--request-rate", "inf",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=duration_sec + 60,
+            )
+            return self._parse_benchmark_output(proc.stdout, config)
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.warning("SGLang benchmark failed: %s", e)
+            return BenchmarkResult(config=config)
+
+    def teardown(self) -> None:
+        self._terminate_proc(self._server_proc)
+        self._server_proc = None
+
+    def get_gpu_info(self) -> GPUInfo:
+        from atom.autotuner.utils.gpu import ROCmGPU
+        return ROCmGPU.detect()
+
+    def health_check(self) -> bool:
+        return self._http_health_check(self.host, self.port)
