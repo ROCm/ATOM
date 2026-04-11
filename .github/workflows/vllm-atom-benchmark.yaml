@@ -451,7 +451,7 @@ jobs:
           SHORT_SHA="$(git rev-parse --short HEAD)"
           SHORT_VLLM="$(printf '%s' "${VLLM_COMMIT}" | cut -c1-12)"
           SAFE_VLLM_VERSION="$(printf '%s' "${VLLM_VERSION}" | tr '/:' '--')"
-          vLLM_ATOM_IMAGE_TAG="${vLLM_ATOM_IMAGE_REPO}:vLLM-ATOM-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_VLLM_VERSION}-${SHORT_VLLM}"
+          vLLM_ATOM_IMAGE_TAG="${vLLM_ATOM_IMAGE_REPO}:vllm-atom-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_VLLM_VERSION}-${SHORT_VLLM}"
           docker build --network=host \
             --no-cache \
             -t "${vLLM_ATOM_IMAGE_TAG}" \
@@ -554,7 +554,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
-          ref: ${{ needs.build-vLLM-ATOM-image.outputs.atom_source_sha || github.sha }}
+          ref: ${{ needs.build-vllm-atom-image.outputs.atom_source_sha || github.sha }}
           fetch-depth: 1
 
       - name: Record benchmark source revision
@@ -850,7 +850,7 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: vLLM-ATOM-benchmark-${{ env.RESULT_FILENAME }}
+          name: vllm-atom-benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
       - name: Clean up vLLM-ATOM benchmark container
@@ -881,7 +881,7 @@ jobs:
       - name: Download all benchmark results
         uses: actions/download-artifact@v8
         with:
-          pattern: 'vLLM-ATOM-benchmark-*'
+          pattern: 'vllm-atom-benchmark-*'
           merge-multiple: true
           path: .
         continue-on-error: true
@@ -932,7 +932,7 @@ jobs:
       - name: Upload vLLM-ATOM benchmark summary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: vLLM-ATOM-benchmark-summary
+          name: vllm-atom-benchmark-summary
           path: vllm_atom_benchmark_summary.json
 
       - name: Download baseline from previous successful main run
@@ -944,7 +944,7 @@ jobs:
           mapfile -t CANDIDATE_RUN_IDS < <(
             {
               gh run list \
-                --workflow="ATOM vLLM vLLM-ATOM Benchmark" \
+                --workflow="vLLM-ATOM Benchmark" \
                 --branch=main \
                 --event=workflow_dispatch \
                 --status=success \
@@ -1020,7 +1020,7 @@ jobs:
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.check-regression.outputs.has_regression == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: vLLM-ATOM-benchmark-regression-report
+          name: vllm-atom-benchmark-regression-report
           path: regression_report.json
 
       - name: Transform results for benchmark dashboard

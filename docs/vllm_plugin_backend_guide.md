@@ -168,7 +168,7 @@ The following table shows how vLLM config fields map to ATOM `Config` fields:
 
 ## 3. Attention Integration
 
-vLLM's vLLM-ATOM plugin interface allows an external platform to supply its own
+vLLM's plugin interface allows an external platform to supply its own
 attention backend. ATOM hooks into this by overriding
 `ATOMPlatform.get_attn_backend_cls()` — the only contract point between vLLM and
 the plugin for attention dispatch.
@@ -199,7 +199,7 @@ Currently, the plugin backend supports the following model architectures:
 | `DeepseekV3ForCausalLM` | `atom.models.deepseek_v2.DeepseekV3ForCausalLM` | DeepSeek-R1 / DeepSeek V3 / Kimi-K2 style models |
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe.Glm4MoeForCausalLM` | GLM-4-MoE |
 
-`Kimi-K2` is also supported. Although it is usually loaded with `--trust-remote-code`, it shares the same DeepSeek-style MLA+MoE architecture path and reuses `atom.models.deepseek_v2.DeepseekV3ForCausalLM` in the ATOM vLLM vLLM-ATOM backend.
+`Kimi-K2` is also supported. Although it is usually loaded with `--trust-remote-code`, it shares the same DeepSeek-style MLA+MoE architecture path and reuses `atom.models.deepseek_v2.DeepseekV3ForCausalLM` in the vLLM-ATOM backend.
 
 ---
 

@@ -970,7 +970,7 @@ def setup_deepseek_for_sglang(model) -> None:
     """
     config = model.config
 
-    # Store atom_config (needed by load_weights in the vLLM-ATOM wrapper)
+    # Store atom_config (needed by load_weights in the SGLang-ATOM wrapper)
     if not hasattr(model, "atom_config"):
         from atom.config import get_current_atom_config
 

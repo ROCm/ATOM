@@ -51,7 +51,7 @@ def _get_atom_model_cls(model_arch: str) -> type:
     if model_arch is not None and model_arch in _ATOM_MODEL_CLASSES:
         model_ref = _ATOM_MODEL_CLASSES[model_arch]
     else:
-        raise ValueError(f"The {model_arch} is not supported by ATOM vLLM-ATOM backend")
+        raise ValueError(f"The {model_arch} is not supported by vLLM-ATOM backend")
 
     module_path, class_name = model_ref.split(":", 1)
     return getattr(importlib.import_module(module_path), class_name)
