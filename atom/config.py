@@ -503,18 +503,6 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
 }
 
 
-def _resolve_atom_text_config(model_type: str):
-    """Resolve ATOM-native config class for model types not in transformers."""
-    _ATOM_TEXT_CONFIGS = {
-        "gemma4_text": "atom.model_config.gemma4.Gemma4TextConfig",
-    }
-    qualname = _ATOM_TEXT_CONFIGS.get(model_type)
-    if qualname is None:
-        return None
-    from importlib import import_module
-    mod_path, cls_name = qualname.rsplit(".", 1)
-    return getattr(import_module(mod_path), cls_name)
-
 
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
@@ -552,12 +540,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        try:
-            config_class = AutoConfig.for_model(mapped_type)
-        except (ValueError, KeyError):
-            config_class = _resolve_atom_text_config(text_model_type)
-            if config_class is None:
-                raise
+        config_class = AutoConfig.for_model(mapped_type)
         hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.
