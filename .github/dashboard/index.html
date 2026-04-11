@@ -136,6 +136,7 @@
        ============================================================ */
     .perf-table { width: 100%; min-width: 1100px; border-collapse: collapse; font-size: 12px; }
     .table-watermark { position: relative; overflow-x: scroll; }
+    .table-watermark::after { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: url('atom_logo.png') no-repeat center/240px 60px; background-attachment: scroll; opacity: 0.04; pointer-events: none; z-index: 1; }
     .table-watermark::-webkit-scrollbar { height: 8px; }
     .table-watermark::-webkit-scrollbar-track { background: var(--bg-tertiary); border-radius: 4px; }
     .table-watermark::-webkit-scrollbar-thumb { background: var(--text-tertiary); border-radius: 4px; }
@@ -421,10 +422,6 @@ _watermarkImg.src = document.querySelector('.header-logo')?.src || 'atom_logo.pn
 Chart.register({
   id: 'watermark',
   beforeDraw(chart) {
-    // Only draw watermark on charts inside the active Performance tab
-    var perfTab = document.getElementById('tab-performance');
-    if (!perfTab || !perfTab.classList.contains('active')) return;
-    if (!perfTab.contains(chart.canvas)) return;
     if (!_watermarkImg.complete || !_watermarkImg.naturalWidth) return;
     const { ctx, chartArea: area } = chart;
     if (!area) return;
