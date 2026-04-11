@@ -147,7 +147,7 @@ jobs:
 
   atom-test:
     needs: [download_aiter_wheel, load-test-models]
-    name: ATOM Test
+    name: Accuracy
     strategy:
       fail-fast: false
       matrix:
@@ -225,6 +225,10 @@ jobs:
         with:
           name: aiter-whl
           path: /tmp/aiter-whl
+
+      - name: Set HF token for predownload runner
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
         run: |
