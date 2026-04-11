@@ -1011,7 +1011,12 @@ def sparse_attn_indexer(
     if forward_context.context.is_dummy_run:
         # dummy runner
         return weights
-    num_decode_tokens = context.batch_size if not context.is_prefill else 0
+    # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
+    num_decode_tokens = (
+        context.batch_size * attn_metadata.max_seqlen_q
+        if not context.is_prefill
+        else 0
+    )
     indexer_k_quant_and_cache(
         k,
         kv_cache,

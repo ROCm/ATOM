@@ -356,7 +356,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         kv_indptr = var["kv_indptr"].gpu[: bs + 1]
         if self.is_sparse:
-            assert False, "TODO: MTP decode is not supported for sparse attention yet"
+            # Update dense kv_indptr (needed for kv_indices generation and slot_mapping)
+            kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
+            # Recompute sparse_kv_indptr: per-seq sparse count = min(dense_kv_count, index_topk)
+            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
+            kv_counts = kv_indptr[1 : bs + 1] - kv_indptr[0]
+            sparse_counts = torch.clamp(kv_counts, max=self.index_topk)
+            sparse_kv_indptr[0] = 0
+            sparse_kv_indptr[1 : bs + 1] = torch.cumsum(sparse_counts, dim=0)
         else:
             assert self.block_size == 1
             kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
@@ -558,15 +565,42 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if self.is_sparse:
             index_topk = self.index_topk
-            sparse_context_lens = np.clip(var["context_lens"].np[:bs], None, index_topk)
-            var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
-                sparse_context_lens, dtype=np.int32
-            )
-            var["sparse_kv_indptr"].np[scheduled_bs : bs + 1] = var[
-                "sparse_kv_indptr"
-            ].np[scheduled_bs]
-            vars_used.append(("sparse_kv_indptr", bs + 1))
-            metadata_deps.add("sparse_kv_indptr")
+            if max_seqlen_q > 1:
+                # MTP verify: per-token sparse metadata
+                # Each token at offset j in seq s sees (context_lens[s] - max_seqlen_q + j + 1) KV entries
+                per_token_kv_lens = (
+                    np.repeat(context_lens[:scheduled_bs], max_seqlen_q)
+                    - max_seqlen_q
+                    + np.tile(
+                        np.arange(1, max_seqlen_q + 1, dtype=np.int32), scheduled_bs
+                    )
+                )
+                sparse_per_token_lens = np.clip(per_token_kv_lens, 0, index_topk)
+                var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
+                    sparse_per_token_lens, dtype=np.int32
+                )
+                logger.info(
+                    f"[sparse MTP prepare_decode] {scheduled_bs=} {max_seqlen_q=} "
+                    f"context_lens={context_lens[:scheduled_bs].tolist()} "
+                    f"per_token_kv_lens={per_token_kv_lens.tolist()} "
+                    f"sparse_per_token_lens={sparse_per_token_lens.tolist()} "
+                    f"sparse_kv_indptr={var['sparse_kv_indptr'].np[:sum_scheduled_tokens+1].tolist()}"
+                )
+                vars_used.append(("sparse_kv_indptr", sum_scheduled_tokens + 1))
+                vars_used.append(("sparse_cu_seqlens_q", sum_scheduled_tokens + 1))
+                metadata_deps.add("sparse_kv_indptr")
+            else:
+                sparse_context_lens = np.clip(
+                    var["context_lens"].np[:bs], None, index_topk
+                )
+                var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
+                    sparse_context_lens, dtype=np.int32
+                )
+                var["sparse_kv_indptr"].np[scheduled_bs : bs + 1] = var[
+                    "sparse_kv_indptr"
+                ].np[scheduled_bs]
+                vars_used.append(("sparse_kv_indptr", bs + 1))
+                metadata_deps.add("sparse_kv_indptr")
 
         prep_stream = self.prep_stream
         vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
@@ -612,6 +646,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
+        if self.is_sparse and max_seqlen_q > 1:
+            attn_metadata.token_to_seq_idxs = torch.repeat_interleave(
+                torch.arange(scheduled_bs, dtype=torch.int32, device=self.device),
+                max_seqlen_q,
+            )
+            attn_metadata.sparse_kv_last_page_lens = var[
+                "sparse_kv_last_page_lens"
+            ].gpu[:sum_scheduled_tokens]
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
@@ -776,9 +818,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
+        sum_tokens = bs * max_q_len
         ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
         attn_matadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
+            slot_mapping=var["slot_mapping"].gpu[:sum_tokens],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=max_q_len,
@@ -795,7 +838,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q
-        positions = var["positions"].copy_to_gpu(bs * max_q_len)
+        if self.is_sparse and max_q_len > 1:
+            attn_matadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
+                : sum_tokens + 1
+            ]
+            attn_matadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
+                : sum_tokens + 1
+            ]
+            attn_matadata.token_to_seq_idxs = torch.repeat_interleave(
+                torch.arange(bs, dtype=torch.int32, device=self.device),
+                max_q_len,
+            )
+            attn_matadata.sparse_kv_last_page_lens = var[
+                "sparse_kv_last_page_lens"
+            ].gpu[:sum_tokens]
+        positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )

@@ -1062,7 +1062,7 @@ class ModelRunner:
                 index_dim = hf_config.index_head_dim + 4
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
                 block_bytes += (
-                    hf_config.num_hidden_layers
+                    total_num_layers
                     * self.block_size
                     * aligned_index_dim
                     * dtypes.fp8.itemsize
@@ -1356,7 +1356,7 @@ class ModelRunner:
                 index_dim = hf_config.index_head_dim + 4
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
                 self.index_cache = torch.zeros(
-                    hf_config.num_hidden_layers,
+                    total_num_layers,
                     self.num_physical_kvcache_blocks,
                     self.physical_block_size,
                     aligned_index_dim,
@@ -1871,6 +1871,7 @@ class ModelRunner:
 
         temperatures, top_ks, top_ps, all_greedy = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
+        self.debug(f"{input_ids=}")
         self.prepare_inputs(batch, input_ids)
         return (
             input_ids,
@@ -1985,6 +1986,7 @@ class ModelRunner:
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
+        self.debug(f"{sampled_tokens=}")
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch

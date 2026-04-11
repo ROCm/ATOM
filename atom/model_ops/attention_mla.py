@@ -547,26 +547,59 @@ class MLAAttention(nn.Module):
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
+        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
+        max_q_len = attn_metadata.max_seqlen_q
         if self.topk_indices_buffer is not None:
-            paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = triton_convert_req_index_to_global_index(
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.kv_indptr,
-                paged_kv_indptr,
-                attn_metadata.kv_indices,
-                self.topk_indices_buffer[:B],
-                NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-            )
-
-        # q_scale = kv_scale = None
-        # if self.kv_cache_dtype.startswith("fp8"):
-        #     q = q.to(dtypes.fp8)
-        #     q_scale = kv_scale = self.one_scale
+            if attn_metadata.max_seqlen_q > 1:
+                # MTP verify: per-token mode, reuse prefill kernel
+                paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
+                paged_kv_indptr = attn_metadata.sparse_kv_indptr
+                if self.layer_num == 0 and not torch.cuda.is_current_stream_capturing():
+                    logger.info(
+                        f"[sparse MTP _forward_decode] layer=0 B={B} "
+                        f"max_seqlen_q={attn_metadata.max_seqlen_q} "
+                        f"sparse_kv_indptr={paged_kv_indptr.tolist()} "
+                        f"sparse_cu_seqlens_q={paged_cu_seqlens_q.tolist()} "
+                        f"token_to_seq_idxs={attn_metadata.token_to_seq_idxs.tolist()} "
+                        f"topk_indices[0,:5]={self.topk_indices_buffer[0,:5].tolist()} "
+                        f"topk_indices[1,:5]={self.topk_indices_buffer[1,:5].tolist() if B > 1 else 'N/A'}"
+                    )
+                # Decode topk_indices are per-request relative (0..context_len-1),
+                # not global positions like in prefill. The prefill kernel subtracts
+                # cu_seqlens_q[req_id] from each index before block_table lookup.
+                # Pass zeros so the subtraction is a no-op.
+                num_seqs = attn_metadata.cu_seqlens_q.shape[0]
+                zeros_cu_seqlens = torch.zeros(
+                    num_seqs, dtype=torch.int32, device=q.device
+                )
+                paged_kv_indices = triton_convert_req_index_to_global_index_dsa_prefill(
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    attn_metadata.token_to_seq_idxs,
+                    self.topk_indices_buffer[:B],
+                    attn_metadata.block_tables,
+                    zeros_cu_seqlens,
+                    NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                )
+                max_q_len = 1
+            else:
+                paged_kv_indptr = attn_metadata.sparse_kv_indptr
+                paged_kv_indices = triton_convert_req_index_to_global_index(
+                    attn_metadata.cu_seqlens_q,
+                    attn_metadata.kv_indptr,
+                    paged_kv_indptr,
+                    attn_metadata.kv_indices,
+                    self.topk_indices_buffer[:B],
+                    NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                )
 
         dp_size = get_dp_group().world_size
-        use_persistent_mode = not (dp_size > 1)
+        # Sparse MTP: persistent metadata was computed with per-seq layout but
+        # kernel is called with per-token layout, so disable persistent mode.
+        is_sparse_mtp = self.topk_indices_buffer is not None and attn_metadata.max_seqlen_q > 1
+        use_persistent_mode = not (dp_size > 1) and not is_sparse_mtp
 
         if not use_persistent_mode:
             # DP : disable persistent mode to avoid overflow
@@ -584,15 +617,21 @@ class MLAAttention(nn.Module):
             reduce_final_map = attn_metadata.reduce_final_map
             reduce_partial_map = attn_metadata.reduce_partial_map
 
+        paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
+        if is_sparse_mtp:
+            # Per-token mode: need B entries (one per token) instead of bs (one per seq).
+            # sparse_kv_last_page_lens is pre-filled with 1s (block_size=1).
+            paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+
         mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
-            attn_metadata.cu_seqlens_q,
+            paged_cu_seqlens_q,
             paged_kv_indptr,
             paged_kv_indices,
-            attn_metadata.kv_last_page_lens,
-            attn_metadata.max_seqlen_q,
+            paged_kv_last_page_lens,
+            max_q_len,
             num_kv_splits=16,
             sm_scale=self.scale,
             work_meta_data=work_meta_data,
@@ -878,7 +917,7 @@ def triton_convert_req_index_to_global_index(
     kv_indices_c = kv_indices.contiguous()
     token_indices_c = token_indices.contiguous()
     page_kv_indptr_c = page_kv_indptr.contiguous()
-    # TODO: not support mtp
+    # NOTE: MTP (max_seqlen_q > 1) uses triton_convert_req_index_to_global_index_dsa_prefill instead
     new_kv_indices = torch.empty_like(kv_indices)
 
     # Strides in elements
