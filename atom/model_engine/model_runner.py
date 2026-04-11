@@ -1111,11 +1111,16 @@ class ModelRunner:
         else:
             per_layer_dims = self._get_per_layer_kv_dims()
             if per_layer_dims is not None:
+                # Heterogeneous attention (e.g. Gemma 4): each layer may have
+                # different num_kv_heads / head_dim, so sum per-layer costs.
                 block_bytes = 0
                 for kv_h, hd in per_layer_dims:
                     block_bytes += 2 * self.block_size * kv_h * hd * kv_dtype_size
                     block_bytes += 2 * kv_h * self.physical_block_size * 4
             else:
+                # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
+                # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
+                # the standard path (draft layers use separate binding).
                 block_bytes = (
                     2
                     * hf_config.num_hidden_layers
@@ -1124,6 +1129,7 @@ class ModelRunner:
                     * hf_config.head_dim
                     * kv_dtype_size
                 )
+                # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
                 block_bytes += (
                     2
                     * hf_config.num_hidden_layers
@@ -1412,6 +1418,11 @@ class ModelRunner:
                 dtype=dtypes.fp32,
                 device="cuda",
             ) if self._per_layer_kv_cache is None else None
+
+        # Build KVCacheConfig
+        # TODO(lirong): This is a simple solution to build KVCacheConfig,
+        # models with only one type of attention, but not support multi-type of attention models.
+        # We need to support it by kv_cache_group in the future.
 
         # Prepare list of models to bind KV cache
         models_to_bind = [("target", self.model)]
