@@ -1,4 +1,4 @@
-name: ATOM vLLM OOT Benchmark
+name: ATOM vLLM Benchmark
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
@@ -155,7 +155,7 @@ jobs:
             USER_PROVIDED_OOT_IMAGE=true
           elif [[ "${NORMALIZED_REF}" == "main" ]]; then
             if RESOLUTION_JSON="$(
-              python3 .github/scripts/resolve_oot_image.py \
+              python3 .github/scripts/resolve_vllm_atom_image.py \
                 --repository rocm/atom-dev \
                 --reference-tag vllm-latest \
                 --preferred-version "${SELECTED_VLLM_VERSION}"
