@@ -93,6 +93,7 @@ class PagedAttentionImplPluginModeMethods:
         attn_metadata = attention_metadata
 
         use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
+        # use_triton_attn = True
         self.use_triton_attn = use_triton_attn
 
         if (
@@ -192,10 +193,20 @@ class PagedAttentionImplPluginModeMethods:
                 output_zeros=False,
             )
         else:
+            # for asm paged attention
+            asm_layout = True
+            if use_triton_attn:
+                asm_layout = False
+            if self.rotary_emb is not None:
+                assert position is not None
+                q, k = self.rotary_emb(position, q, k)
             if self.q_norm is not None:
                 q = self.q_norm(q)
             if self.k_norm is not None:
                 k = self.k_norm(k)
+            new_value_cache = new_value_cache.view(
+                num_blocks, num_kv_heads, head_size, block_size
+            )
             if self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
@@ -205,7 +216,7 @@ class PagedAttentionImplPluginModeMethods:
                     k_scale,
                     v_scale,
                     attn_metadata.slot_mapping,
-                    asm_layout=True,
+                    asm_layout=asm_layout,
                 )
             else:
                 aiter.reshape_and_cache(
@@ -627,7 +638,6 @@ class PagedAttentionImplPluginModeMethods:
         if value is not None:
             value = value[:num_actual_tokens]
         output_actual_tokens = output[:num_actual_tokens]
-
         # rope and cache flush fusion. ATOM always use shuffle layout for kv cache
         result = self.rope_cache_plugin_mode(
             q=query,

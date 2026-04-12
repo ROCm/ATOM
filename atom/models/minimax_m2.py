@@ -23,6 +23,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
+from atom.plugin.prepare import is_vllm
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import PretrainedConfig
@@ -131,6 +132,7 @@ class MiniMaxM2Attention(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         tp_size = self.tp_size
+        self.layer_num = layer_num
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -201,6 +203,7 @@ class MiniMaxM2Attention(nn.Module):
             layer_num=layer_num,
             use_mla=False,
             rotary_emb=self.rotary_emb,
+            prefix=f"{prefix}.attn",
         )
 
     @staticmethod
@@ -243,8 +246,14 @@ class MiniMaxM2Attention(nn.Module):
             k = (k * torch.rsqrt(k_var + self.rms_norm_eps) * self.k_norm.weight).to(
                 orig_dtype
             )
+            
+            # TODO: is_vllm will be removed after vllm plugin supporting q,k,v rather than qkv
+            if is_vllm():
+                qkv = torch.cat([q, k, v], dim=-1)
+            attn_output = self.attn(
+                query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
+            )
 
-        attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output
 
@@ -321,6 +330,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
         hidden_states = self.block_sparse_moe(hidden_states)
 
         return hidden_states, residual
