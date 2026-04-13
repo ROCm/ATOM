@@ -98,6 +98,13 @@ git clone https://github.com/ROCm/ATOM.git && pip install ./ATOM
 
 ### Basic Example
 
+Before running the example, please install ninja and the Hugging Face CLI, and log in to your account.
+```bash
+pip install ninja
+pip install -U "huggingface_hub"
+hf auth login
+```
+
 The default optimization level is 3 (piecewise torch.compile with CUDA graphs).
 
 ```bash

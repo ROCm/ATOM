@@ -144,6 +144,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.model_runner.forward_vars.update(mla_metadata)
 
+    @property
+    def prep_stream(self):
+        return self.model_runner.tokenID_processor.async_copy_stream
+
     def set_mla_persistent_worker_buffers(
         self,
         bs: int,
@@ -406,11 +410,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
         vars_used = [
+            ("block_tables", bs),
             ("slot_mapping", bs * max_seqlen_q),
             ("context_lens", bs),
             ("cu_seqlens_q", bs + 1),
             ("kv_indptr", bs + 1),
-            ("block_tables", bs),
             ("kv_last_page_lens", bs),
         ]
         if self.is_sparse:
@@ -424,19 +428,39 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ].np[scheduled_bs]
             vars_used.append(("sparse_kv_indptr", bs + 1))
 
-        ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+        prep_stream = self.prep_stream
+        metadata_deps = {
+            "cu_seqlens_q",
+            "kv_indptr",
+            "kv_last_page_lens",
+            "sparse_kv_indptr",
+        }
+        vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
+        vars_remaining = [(el, num) for el, num in vars_used if el not in metadata_deps]
+        max_seqlen_k = context_lens.max()
+
+        # metadata copies on main_stream
+        ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata}
+
+        # prep_stream does remaining copies + kv_indices
+        current_stream = torch.cuda.current_stream()
+        prep_stream.wait_stream(current_stream)
+        with torch.cuda.stream(prep_stream):
+            ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
+            ctx.update(ctx_rest)
+            ctx["kv_indices"] = var["kv_indices"].gpu
+            kv_indices_generate_triton(
+                ctx["block_tables"],
+                ctx["kv_indices"],
+                ctx["kv_indptr"],
+                self.block_ratio,
+                max_seqlen_k,
+            )
+
         ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
         ctx.update(ctx_mla_ps)
-
-        ctx["kv_indices"] = var["kv_indices"].gpu
-        max_seqlen_k = context_lens.max()
-        kv_indices_generate_triton(
-            ctx["block_tables"],
-            ctx["kv_indices"],
-            ctx["kv_indptr"],
-            self.block_ratio,
-            max_seqlen_k,
-        )
+        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        current_stream.wait_stream(prep_stream)
         # if self.block_ratio > 1:
         #     if "block_tables" in ctx:
         #         block_table_convert_triton(
@@ -453,8 +477,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
-        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
-
         # if self.model_runner.rank == 0:
         #     logger.info(f"context_lens: {ctx['context_lens']}")
         #     # logger.info(f"{positions=}")
