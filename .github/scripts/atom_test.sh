@@ -32,7 +32,7 @@ if [ "$TYPE" == "launch" ]; then
   fi
 
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" 2>&1 | tee "$ATOM_SERVER_LOG" &
+  $RTL_CMD PYTHONUNBUFFERED=1 python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" 2>&1 | tee "$ATOM_SERVER_LOG" &
   atom_server_pid=$!
 
   echo ""
@@ -104,6 +104,13 @@ if [ "$TYPE" == "accuracy" ]; then
 
   echo ""
   echo "========== Running accuracy test =========="
+
+  # Stream server log in background so crashes are visible in CI output
+  ATOM_SERVER_LOG="${ATOM_SERVER_LOG:-/tmp/atom_server.log}"
+  tail -f "$ATOM_SERVER_LOG" 2>/dev/null &
+  tail_pid=$!
+  trap 'kill $tail_pid 2>/dev/null || true' EXIT
+
   # Set umask so files created by lm_eval are world-readable (container runs as root,
   # host runner user needs to read results via the shared volume mount)
   umask 0022
@@ -114,6 +121,8 @@ if [ "$TYPE" == "accuracy" ]; then
           --tasks gsm8k \
           --num_fewshot 3 \
           --output_path "${RESULT_FILENAME}"
+
+  kill $tail_pid 2>/dev/null || true
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
 fi
 
@@ -175,6 +184,13 @@ fi
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
   echo "========== Running benchmark test =========="
+
+  # Stream server log in background so crashes are visible in CI output
+  ATOM_SERVER_LOG="${ATOM_SERVER_LOG:-/tmp/atom_server.log}"
+  tail -f "$ATOM_SERVER_LOG" 2>/dev/null &
+  tail_pid=$!
+  trap 'kill $tail_pid 2>/dev/null || true' EXIT
+
   RESULT_FILENAME=${RESULT_FILENAME:-benchmark_result}
   PROFILE_ARG=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
