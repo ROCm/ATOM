@@ -71,8 +71,7 @@ class AsyncLLMEngine(LLMEngine):
         """Load weights via POSIX shared memory."""
         load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
 
-    def load_weights_ipc(self, weights, bucket_size_mb: int = 2048,
-                         num_gpus: int = 1):
+    def load_weights_ipc(self, weights, bucket_size_mb: int = 2048, num_gpus: int = 1):
         """Load weights via CUDA IPC (zero-copy GPU-to-GPU).
 
         Args:
@@ -81,8 +80,7 @@ class AsyncLLMEngine(LLMEngine):
             num_gpus: Total GPUs (TP * DP). When > 1, uses per-GPU IPC
                 buffers to avoid cross-GPU hipIpcOpenMemHandle on ROCm.
         """
-        load_weights_via_ipc(self.core_mgr, weights, bucket_size_mb,
-                             num_gpus=num_gpus)
+        load_weights_via_ipc(self.core_mgr, weights, bucket_size_mb, num_gpus=num_gpus)
 
     def shutdown(self):
         """Shutdown engine and release all resources."""

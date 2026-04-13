@@ -23,8 +23,10 @@ def __getattr__(name):
     #   -> atom.rollout (this __init__) -> async_engine -> atom.model_engine.llm_engine
     if name == "AsyncLLMEngine":
         from atom.rollout.async_engine import AsyncLLMEngine
+
         return AsyncLLMEngine
     if name == "RLHFModelRunner":
         from atom.rollout.model_runner_ext import RLHFModelRunner
+
         return RLHFModelRunner
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

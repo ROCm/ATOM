@@ -83,7 +83,9 @@ class LogprobsTokenIDProcessor(tokenIDProcessor):
         token_ids = self.recv_async_output(self.token_ids_cpu).tolist()
         logprobs = self.recv_logprobs()
         self.send_to_cpu_async(
-            sampled_token_ids, self.token_ids_cpu, sync_event,
+            sampled_token_ids,
+            self.token_ids_cpu,
+            sync_event,
             gpu_logprobs=sampled_logprobs,
         )
         req_ids_out: list[int] = []
@@ -136,7 +138,9 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         if dp_isolated:
             device_indices = [int(x) for x in device_map.split(",")]
             local_device_rank = device_indices[rank]
-            dp_port = config.parallel_config.data_parallel_base_port + dp_rank_local * 100
+            dp_port = (
+                config.parallel_config.data_parallel_base_port + dp_rank_local * 100
+            )
             effective_dp_rank, effective_dp_size = 0, 1
         else:
             local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
@@ -150,7 +154,13 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
                 f"dp_isolated={dp_isolated}, dp_rank_local={dp_rank_local}, tp_rank={rank}"
             )
 
-        return local_device_rank, dp_port, effective_dp_rank, effective_dp_size, num_gpus
+        return (
+            local_device_rank,
+            dp_port,
+            effective_dp_rank,
+            effective_dp_size,
+            num_gpus,
+        )
 
     def __init__(self, rank: int, config):
         # Check if DP device-level isolation is active — if so, override
@@ -184,11 +194,14 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             import aiter
             import aiter.ops.communication as _aiter_comm
             from atom.model_engine import model_runner as _mr_mod
+
             _orig_init_dist_env = _aiter_comm.init_dist_env
             _target_local_rank = local_device_rank
 
             def _patched_init_dist_env(*args, local_rank=-1, **kwargs):
-                return _orig_init_dist_env(*args, local_rank=_target_local_rank, **kwargs)
+                return _orig_init_dist_env(
+                    *args, local_rank=_target_local_rank, **kwargs
+                )
 
             _aiter_comm.init_dist_env = _patched_init_dist_env
             aiter.init_dist_env = _patched_init_dist_env
@@ -254,8 +267,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         hidden_states: torch.Tensor,
     ) -> ScheduledBatchOutput:
         """Override to add logprobs computation."""
-        from atom.utils.forward_context import get_forward_context, reset_forward_context
-        from atom.model_engine.model_runner import Sampler
+        from atom.utils.forward_context import get_forward_context
 
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num

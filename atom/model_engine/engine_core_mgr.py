@@ -461,7 +461,9 @@ class CoreManager:
                 copy=True,  # Use copy=True since we're reusing the same buffer
             )
 
-    def broadcast_utility_command_sync(self, cmd: str, timeout: float = 300.0, **kwargs):
+    def broadcast_utility_command_sync(
+        self, cmd: str, timeout: float = 300.0, **kwargs
+    ):
         # Drain any stale responses that might be left over
         while not self.utility_response_queue.empty():
             try:

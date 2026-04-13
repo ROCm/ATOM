@@ -3,7 +3,6 @@
 
 import gc
 import logging
-import os
 import time
 import uuid
 from typing import Callable
@@ -14,7 +13,9 @@ from multiprocessing import shared_memory
 logger = logging.getLogger("atom")
 
 
-def rebuild_ipc_handle(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
+def rebuild_ipc_handle(
+    handle: tuple[Callable, tuple], device_id: int | None = None
+) -> torch.Tensor:
     """Rebuild a CUDA tensor from its IPC handle.
 
     When two processes have different CUDA_VISIBLE_DEVICES, the device_id
@@ -125,13 +126,12 @@ def load_weights_via_shm(core_mgr, weights, bucket_size_mb: int = 2048):
         shm.close()
         shm.unlink()
 
-    logger.info(
-        f"load_weights_via_shm: done – {total_params} params via SHM"
-    )
+    logger.info(f"load_weights_via_shm: done – {total_params} params via SHM")
 
 
-def load_weights_via_ipc(core_mgr, weights, bucket_size_mb: int = 2048,
-                         num_gpus: int = 1):
+def load_weights_via_ipc(
+    core_mgr, weights, bucket_size_mb: int = 2048, num_gpus: int = 1
+):
     """Load weights using CUDA IPC for zero-copy GPU-to-GPU transfer.
 
     Allocates per-GPU buffers in the caller process, copies weight tensors
@@ -213,6 +213,7 @@ def load_weights_via_ipc(core_mgr, weights, bucket_size_mb: int = 2048,
 
     try:
         import itertools
+
         all_weights = itertools.chain([(name, tensor)], weights_iter)
 
         offset = 0

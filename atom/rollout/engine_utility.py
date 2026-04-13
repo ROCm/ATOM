@@ -58,22 +58,33 @@ class EngineUtilityHandler:
                     if "weights" in tags:
                         engine._is_sleeping = True
                         logger.info(f"{self.label}: engine entered sleep mode")
-                elif cmd in ("resume_memory", "update_weights_shm", "update_weights_ipc"):
+                elif cmd in (
+                    "resume_memory",
+                    "update_weights_shm",
+                    "update_weights_ipc",
+                ):
                     tags = args.get("tags", []) if isinstance(args, dict) else []
                     if cmd == "resume_memory" and "weights" in tags:
                         engine._is_sleeping = False
                         logger.info(f"{self.label}: engine exited sleep mode")
                     elif cmd in ("update_weights_shm", "update_weights_ipc"):
-                        is_last = args.get("is_last", True) if isinstance(args, dict) else True
+                        is_last = (
+                            args.get("is_last", True)
+                            if isinstance(args, dict)
+                            else True
+                        )
                         if is_last:
                             engine._is_sleeping = False
-                            logger.info(f"{self.label}: engine exited sleep mode (weights updated)")
+                            logger.info(
+                                f"{self.label}: engine exited sleep mode (weights updated)"
+                            )
             except queue.Empty:
                 engine._has_pending_utility = False
                 break
 
     def _execute_utility_command(self, cmd: str, args: dict):
         import time as _time
+
         logger.info(f"{self.label}: executing utility command: {cmd}")
         t0 = _time.monotonic()
 
@@ -85,9 +96,7 @@ class EngineUtilityHandler:
             logger.warning(f"{self.label}: Unknown utility command: {cmd}")
 
         elapsed = _time.monotonic() - t0
-        logger.info(
-            f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s"
-        )
+        logger.info(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
 
     def _handle_update_weights(self, args: dict):
         """Handle direct weight update command."""
@@ -141,8 +150,12 @@ class EngineUtilityHandler:
         is_last = args.get("is_last", True)
         ipc_handles = args.get("ipc_handles")
         result = self.runner_mgr.call_func(
-            "update_weights_from_ipc", ipc_handle, bucket_meta, is_last,
-            ipc_handles, wait_out=True
+            "update_weights_from_ipc",
+            ipc_handle,
+            bucket_meta,
+            is_last,
+            ipc_handles,
+            wait_out=True,
         )
         logger.info(
             f"{self.label}: update_weights_ipc completed, "

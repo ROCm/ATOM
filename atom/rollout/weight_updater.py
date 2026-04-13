@@ -31,11 +31,13 @@ class WeightUpdaterMixin:
         Returns:
             Dict mapping parameter full name to (module, param_name, param) tuple
         """
-        if not hasattr(self, '_param_to_module') or self._param_to_module is None:
+        if not hasattr(self, "_param_to_module") or self._param_to_module is None:
             self._param_to_module = {}
             for module_name, module in self.model.named_modules():
                 for param_name, param in module.named_parameters(recurse=False):
-                    full_name = f"{module_name}.{param_name}" if module_name else param_name
+                    full_name = (
+                        f"{module_name}.{param_name}" if module_name else param_name
+                    )
                     self._param_to_module[full_name] = (module, param_name, param)
             logger.debug(
                 f"{self.label}: Built param_to_module mapping with "
@@ -44,15 +46,15 @@ class WeightUpdaterMixin:
         return self._param_to_module
 
     def _get_packed_modules_mapping(self) -> dict:
-        if not hasattr(self, '_cached_packed_mapping'):
+        if not hasattr(self, "_cached_packed_mapping"):
             self._cached_packed_mapping = (
-                getattr(self.model, 'packed_modules_mapping', None) or {}
+                getattr(self.model, "packed_modules_mapping", None) or {}
             )
         return self._cached_packed_mapping
 
     def _get_packed_shard_order(self) -> dict[str, list]:
         """Build {target_suffix: [shard_id_0, shard_id_1, ...]} preserving declaration order."""
-        if not hasattr(self, '_cached_packed_shard_order'):
+        if not hasattr(self, "_cached_packed_shard_order"):
             order: dict[str, list] = {}
             for _, (tgt, shard_id) in self._get_packed_modules_mapping().items():
                 order.setdefault(tgt, []).append(shard_id)
@@ -66,7 +68,10 @@ class WeightUpdaterMixin:
 
         Returns (atom_full_name, shard_id, target_suffix) or None.
         """
-        for src_suffix, (tgt_suffix, shard_id) in self._get_packed_modules_mapping().items():
+        for src_suffix, (
+            tgt_suffix,
+            shard_id,
+        ) in self._get_packed_modules_mapping().items():
             if src_suffix in name:
                 atom_name = name.replace(src_suffix, tgt_suffix)
                 if atom_name in param_to_module:
@@ -92,35 +97,37 @@ class WeightUpdaterMixin:
         """
         resolved = self._resolve_packed_name(name, param_to_module)
         if resolved is None:
-            return 'skipped'
+            return "skipped"
 
         atom_name, shard_id, tgt_suffix = resolved
         module, param_name, param = param_to_module[atom_name]
         weight_loader = getattr(module, "weight_loader", None)
         if weight_loader is None:
-            return 'skipped'
+            return "skipped"
 
         if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
-            if not hasattr(self, '_packed_weight_accum'):
+            if not hasattr(self, "_packed_weight_accum"):
                 self._packed_weight_accum = {}
 
             if atom_name not in self._packed_weight_accum:
-                self._packed_weight_accum[atom_name] = {'shards': {}}
+                self._packed_weight_accum[atom_name] = {"shards": {}}
 
-            self._packed_weight_accum[atom_name]['shards'][shard_id] = tensor.clone()
+            self._packed_weight_accum[atom_name]["shards"][shard_id] = tensor.clone()
 
             expected = self._get_packed_shard_order().get(tgt_suffix, [])
-            if set(self._packed_weight_accum[atom_name]['shards'].keys()) >= set(expected):
+            if set(self._packed_weight_accum[atom_name]["shards"].keys()) >= set(
+                expected
+            ):
                 buf = torch.nn.Parameter(
                     torch.zeros(param.shape, dtype=torch.float32, device=self.device),
                     requires_grad=False,
                 )
-                wlp = getattr(param, 'weight_loader_process', None)
+                wlp = getattr(param, "weight_loader_process", None)
                 if wlp is not None:
                     buf.weight_loader_process = wlp
 
                 for sid in expected:
-                    shard_t = self._packed_weight_accum[atom_name]['shards'][sid]
+                    shard_t = self._packed_weight_accum[atom_name]["shards"][sid]
                     shard_gpu = shard_t.to(device=self.device, dtype=torch.float32)
                     weight_loader(buf, shard_gpu, sid)
 
@@ -130,19 +137,19 @@ class WeightUpdaterMixin:
                     f"{self.label}: FP8 packed weight updated: {atom_name} "
                     f"(composed from {len(expected)} shards)"
                 )
-                return 'updated'
-            return 'accumulated'
+                return "updated"
+            return "accumulated"
 
         tensor_gpu = tensor.to(device=self.device)
         weight_loader(param, tensor_gpu, shard_id)
-        return 'updated'
+        return "updated"
 
     def _try_shard_weight(
         self,
         param: torch.nn.Parameter,
         tensor: torch.Tensor,
         tp_rank: int,
-        tp_size: int
+        tp_size: int,
     ) -> bool:
 
         param_shape = param.shape
@@ -207,7 +214,9 @@ class WeightUpdaterMixin:
             for dim in range(len(param.shape)):
                 if tensor_gpu.shape[dim] == param.shape[dim] * tp_size:
                     shard_size = param.shape[dim]
-                    tensor_gpu = tensor_gpu.narrow(dim, self.rank * shard_size, shard_size)
+                    tensor_gpu = tensor_gpu.narrow(
+                        dim, self.rank * shard_size, shard_size
+                    )
                     break
 
         if tensor_gpu.shape != param.shape:
@@ -218,6 +227,7 @@ class WeightUpdaterMixin:
             return
 
         from aiter import QuantType as _QT
+
         quant_type = getattr(module, "quant_type", None)
 
         if quant_type is not None and quant_type.value == _QT.per_1x128.value:
@@ -225,7 +235,9 @@ class WeightUpdaterMixin:
             block_k = 128
             K_blocks = (K + block_k - 1) // block_k
             if K % block_k != 0:
-                padded = torch.zeros(N, K_blocks * block_k, dtype=torch.float32, device=self.device)
+                padded = torch.zeros(
+                    N, K_blocks * block_k, dtype=torch.float32, device=self.device
+                )
                 padded[:, :K] = tensor_gpu
             else:
                 padded = tensor_gpu
@@ -236,7 +248,9 @@ class WeightUpdaterMixin:
             quantized = quantized.reshape(N, K_blocks * block_k)[:, :K].contiguous()
             param.data.copy_(quantized)
             ws = weight_scale.data
-            weight_scale.data.copy_(scale[:ws.shape[0], :ws.shape[1]].contiguous().to(ws.dtype))
+            weight_scale.data.copy_(
+                scale[: ws.shape[0], : ws.shape[1]].contiguous().to(ws.dtype)
+            )
 
         elif quant_type is not None and quant_type.value == _QT.per_Tensor.value:
             amax = tensor_gpu.abs().max()
@@ -251,7 +265,9 @@ class WeightUpdaterMixin:
             weight_scale.data.copy_(scale.to(weight_scale.dtype))
 
         else:
-            logger.warning(f"{self.label}: Unknown quant_type {quant_type} for FP8 requantize")
+            logger.warning(
+                f"{self.label}: Unknown quant_type {quant_type} for FP8 requantize"
+            )
             return
 
         self._post_process_fp8_weight(module, param)
@@ -272,8 +288,12 @@ class WeightUpdaterMixin:
         """
         weight_scale = getattr(module, "weight_scale", None)
 
-        if getattr(module, "need_normalize_e4m3fn_to_e4m3fnuz", False) and weight_scale is not None:
+        if (
+            getattr(module, "need_normalize_e4m3fn_to_e4m3fnuz", False)
+            and weight_scale is not None
+        ):
             from atom.model_ops.utils import normalize_e4m3fn_to_e4m3fnuz
+
             param.data, weight_scale.data, _ = normalize_e4m3fn_to_e4m3fnuz(
                 param.data, weight_scale.data
             )
@@ -293,6 +313,7 @@ class WeightUpdaterMixin:
         elif quant_type.value == _QT.per_Token.value:
             try:
                 from atom.model_ops import dtypes
+
                 needs_shuffle = param.dtype == dtypes.fp8
             except ImportError:
                 needs_shuffle = param.element_size() < 2
@@ -301,9 +322,7 @@ class WeightUpdaterMixin:
             shuffle_weights(param)
 
     def update_weights(
-        self,
-        named_tensors: list[tuple[str, torch.Tensor]],
-        clear_kv_cache: bool = True
+        self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
     ) -> int:
         """
         Update model weights from named tensors.
@@ -332,16 +351,14 @@ class WeightUpdaterMixin:
         for name, tensor in named_tensors:
             if name not in param_to_module:
                 result = self._apply_packed_weight(name, tensor, param_to_module)
-                if result == 'updated':
+                if result == "updated":
                     updated += 1
-                elif result == 'accumulated':
+                elif result == "accumulated":
                     pass
                 elif "weight_scale" in name or "input_scale" in name:
                     ignored_scales += 1
                 else:
-                    logger.debug(
-                        f"{self.label}: Unmatched parameter: {name}"
-                    )
+                    logger.debug(f"{self.label}: Unmatched parameter: {name}")
                     skipped += 1
                 continue
 
@@ -366,12 +383,16 @@ class WeightUpdaterMixin:
                     weight_loader(param, tensor)
                     updated += 1
                 except Exception as e:
-                    logger.warning(f"{self.label}: weight_loader failed for {name}: {e}")
+                    logger.warning(
+                        f"{self.label}: weight_loader failed for {name}: {e}"
+                    )
                     skipped += 1
             else:
                 tp_size = self.world_size
                 tp_rank = self.rank
-                if tp_size > 1 and self._try_shard_weight(param, tensor, tp_rank, tp_size):
+                if tp_size > 1 and self._try_shard_weight(
+                    param, tensor, tp_rank, tp_size
+                ):
                     updated += 1
                 else:
                     logger.warning(
@@ -383,7 +404,7 @@ class WeightUpdaterMixin:
         if clear_kv_cache:
             self.clear_kv_cache()
 
-        if hasattr(self, '_packed_weight_accum'):
+        if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
 
         logger.info(
@@ -449,16 +470,14 @@ class WeightUpdaterMixin:
 
                 if name not in param_to_module:
                     result = self._apply_packed_weight(name, tensor, param_to_module)
-                    if result == 'updated':
+                    if result == "updated":
                         updated += 1
-                    elif result == 'accumulated':
+                    elif result == "accumulated":
                         pass
                     elif "weight_scale" in name or "input_scale" in name:
                         ignored_scales += 1
                     else:
-                        logger.debug(
-                            f"{self.label}: Unmatched parameter: {name}"
-                        )
+                        logger.debug(f"{self.label}: Unmatched parameter: {name}")
                         skipped += 1
                     continue
 
@@ -503,7 +522,7 @@ class WeightUpdaterMixin:
 
             if is_last:
                 self.clear_kv_cache()
-                if hasattr(self, '_packed_weight_accum'):
+                if hasattr(self, "_packed_weight_accum"):
                     if self._packed_weight_accum:
                         logger.warning(
                             f"{self.label}: Incomplete packed weight accumulators: "
@@ -558,11 +577,14 @@ class WeightUpdaterMixin:
             Number of parameters successfully updated in this bucket.
         """
         # Cache the IPC buffer mapping: only open once per weight-update cycle.
-        if not hasattr(self, '_ipc_buffer') or self._ipc_buffer is None:
+        if not hasattr(self, "_ipc_buffer") or self._ipc_buffer is None:
             from atom.rollout.weight_sync import rebuild_ipc_handle
+
             # Global index for looking up the correct per-GPU IPC handle
             # (ATOMHttpServer keys handles by global device index: 0..num_gpus-1)
-            global_device_idx = (self.config.parallel_config.data_parallel_rank_local or 0) * self.world_size + self.rank
+            global_device_idx = (
+                self.config.parallel_config.data_parallel_rank_local or 0
+            ) * self.world_size + self.rank
             # Local index for rebuild_ipc_handle's device_id parameter
             # (DP subprocess has remapped CUDA_VISIBLE_DEVICES, so it sees cuda:0..tp-1)
             local_device_idx = self.device.index
@@ -619,16 +641,14 @@ class WeightUpdaterMixin:
 
             if name not in param_to_module:
                 result = self._apply_packed_weight(name, tensor, param_to_module)
-                if result == 'updated':
+                if result == "updated":
                     updated += 1
-                elif result == 'accumulated':
+                elif result == "accumulated":
                     pass
                 elif "weight_scale" in name or "input_scale" in name:
                     ignored_scales += 1
                 else:
-                    logger.debug(
-                        f"{self.label}: Unmatched parameter: {name}"
-                    )
+                    logger.debug(f"{self.label}: Unmatched parameter: {name}")
                     skipped += 1
                 continue
 
@@ -679,7 +699,7 @@ class WeightUpdaterMixin:
                 pass  # ipc_collect may not be available on all platforms
 
             self.clear_kv_cache()
-            if hasattr(self, '_packed_weight_accum'):
+            if hasattr(self, "_packed_weight_accum"):
                 if self._packed_weight_accum:
                     logger.warning(
                         f"{self.label}: Incomplete packed weight accumulators: "

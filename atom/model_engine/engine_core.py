@@ -59,7 +59,9 @@ class EngineCore:
         )  # Queue for streaming intermediate outputs
         # Queue for utility commands (processed in busy_loop to avoid thread contention)
         self.utility_queue = queue.Queue()
-        self._has_pending_utility = False  # Flag to avoid checking empty queue every loop
+        self._has_pending_utility = (
+            False  # Flag to avoid checking empty queue every loop
+        )
         self._is_sleeping = False  # True when weights are offloaded (sleep mode)
         self.input_address = input_address
         self.output_address = output_address
@@ -406,14 +408,16 @@ class EngineCore:
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
                 has_exit_seq = len(valid_seqs) != len(seqs)
-                
+
                 # Only send ADD message if there are valid sequences to report
                 # (Don't send empty ADD when engine is shutting down during init)
                 if valid_seqs:
-                    serialized_obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.ADD, valid_seqs)
+                    )
                     socket.send(serialized_obj)
                     logger.info(f"{self.label}: output send {len(valid_seqs)} reqs")
-                
+
                 # Send shutdown if there was an exit sequence
                 if has_exit_seq:
                     socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))

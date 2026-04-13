@@ -30,7 +30,7 @@ class MemoryManagerMixin:
     def clear_kv_cache(self) -> bool:
         kv = self.kv_cache
         if kv is None:
-            kv = getattr(self, '_kv_cache_backup', None)
+            kv = getattr(self, "_kv_cache_backup", None)
         if kv is None:
             return True
         kv.zero_()
@@ -51,7 +51,7 @@ class MemoryManagerMixin:
 
         # Clean up tokenIDProcessor deferred output state to remove
         # stale GPU tensor references (prev_token_ids, etc.)
-        if hasattr(self, 'tokenID_processor'):
+        if hasattr(self, "tokenID_processor"):
             self.tokenID_processor.clean()
 
         if "weights" in tags:
@@ -82,11 +82,11 @@ class MemoryManagerMixin:
         return True
 
     def _release_weights(self) -> None:
-        if not hasattr(self, 'model') or self.model is None:
+        if not hasattr(self, "model") or self.model is None:
             return
         # Release CUDA graphs first — they hold references to weight memory
         # and prevent freeing GPU memory.
-        if not self.enforce_eager and hasattr(self, 'graphs') and self.graphs:
+        if not self.enforce_eager and hasattr(self, "graphs") and self.graphs:
             self._graphs_backup_keys = list(self.graphs.keys())
             self.graphs.clear()
             self.graph_pool = None
@@ -105,9 +105,9 @@ class MemoryManagerMixin:
         logger.info(f"{self.label}: Weights discarded")
 
     def _resume_weights(self) -> None:
-        if not hasattr(self, 'model') or self.model is None:
+        if not hasattr(self, "model") or self.model is None:
             return
-        if getattr(self, '_weights_discarded', False):
+        if getattr(self, "_weights_discarded", False):
             # Weights were discarded — allocate empty GPU tensors with the
             # correct shape so that weight sync (SHM or IPC) can copy_ into
             # them.  This avoids the CPU→GPU round-trip entirely.
@@ -128,7 +128,7 @@ class MemoryManagerMixin:
         self._recapture_cudagraphs_if_needed()
 
     def _release_kv_cache(self) -> None:
-        if not hasattr(self, 'kv_cache') or self.kv_cache is None:
+        if not hasattr(self, "kv_cache") or self.kv_cache is None:
             return
         self._kv_cache_num_blocks = self.config.num_kvcache_blocks
 
@@ -136,7 +136,7 @@ class MemoryManagerMixin:
         # Without this, del self.kv_cache alone cannot free GPU memory.
         for model_obj in self._get_models_with_kv():
             for module in model_obj.modules():
-                for attr in ('k_cache', 'v_cache', 'kv_cache'):
+                for attr in ("k_cache", "v_cache", "kv_cache"):
                     if hasattr(module, attr):
                         setattr(module, attr, None)
 
@@ -144,8 +144,13 @@ class MemoryManagerMixin:
 
         del self.kv_cache
         self.kv_cache = None
-        for attr in ('kv_scale', 'index_cache', 'mamba_k_cache',
-                      'mamba_v_cache', '_kv_cache_backup'):
+        for attr in (
+            "kv_scale",
+            "index_cache",
+            "mamba_k_cache",
+            "mamba_v_cache",
+            "_kv_cache_backup",
+        ):
             if hasattr(self, attr) and getattr(self, attr) is not None:
                 delattr(self, attr)
         torch.cuda.empty_cache()
@@ -153,12 +158,15 @@ class MemoryManagerMixin:
 
     def _get_models_with_kv(self):
         models = [self.model]
-        if hasattr(self, 'drafter') and hasattr(self.drafter, 'model'):
+        if hasattr(self, "drafter") and hasattr(self.drafter, "model"):
             models.append(self.drafter.model)
         return models
 
     def _resume_kv_cache(self) -> None:
-        if not hasattr(self, '_kv_cache_num_blocks') or self._kv_cache_num_blocks is None:
+        if (
+            not hasattr(self, "_kv_cache_num_blocks")
+            or self._kv_cache_num_blocks is None
+        ):
             logger.warning(f"{self.label}: No KV cache num_blocks to resume from")
             return
         saved_blocks = self._kv_cache_num_blocks
@@ -173,7 +181,9 @@ class MemoryManagerMixin:
                 f"{num_blocks} due to changed GPU memory availability"
             )
         self.allocate_kv_cache(num_blocks)
-        logger.info(f"{self.label}: KV cache re-allocated and bound ({num_blocks} blocks)")
+        logger.info(
+            f"{self.label}: KV cache re-allocated and bound ({num_blocks} blocks)"
+        )
         # Recapture CUDA graphs after KV cache re-allocation (addresses changed)
         self._recapture_cudagraphs_if_needed()
 
@@ -189,12 +199,10 @@ class MemoryManagerMixin:
         """
         if self.enforce_eager:
             return
-        if not hasattr(self, '_graphs_backup_keys') or not self._graphs_backup_keys:
+        if not hasattr(self, "_graphs_backup_keys") or not self._graphs_backup_keys:
             return
         # Only recapture if both weights and KV cache are on GPU
-        has_weights_on_gpu = any(
-            p.is_cuda for p in self.model.parameters()
-        )
+        has_weights_on_gpu = any(p.is_cuda for p in self.model.parameters())
         has_kv_cache = self.kv_cache is not None
         if not has_weights_on_gpu or not has_kv_cache:
             return
@@ -212,8 +220,6 @@ class MemoryManagerMixin:
             self.enforce_eager = True
             self.graphs = {}
             self.graph_pool = None
-            if hasattr(self, '_graphs_backup_keys'):
+            if hasattr(self, "_graphs_backup_keys"):
                 del self._graphs_backup_keys
-            logger.warning(
-                f"{self.label}: Falling back to enforce_eager=True"
-            )
+            logger.warning(f"{self.label}: Falling back to enforce_eager=True")
