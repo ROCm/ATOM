@@ -978,7 +978,7 @@ jobs:
             --matrix-json "${BENCHMARK_MATRIX}" \
             --run-url "${RUN_URL}" \
             --output-json oot_benchmark_summary.json \
-            --title "OOT Benchmark Summary" \
+            --title "ATOM-vLLM Benchmark Summary" \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Read summary stats
