@@ -24,8 +24,6 @@ from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 # plugin-related utilities
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
-from atom.model_config.qwen3_5 import Qwen3_5TextConfig
-from atom.model_config.qwen3_5_moe import Qwen3_5MoeTextConfig
 from atom.utils import resolve_obj_by_qualname
 
 logger = logging.getLogger("atom")
