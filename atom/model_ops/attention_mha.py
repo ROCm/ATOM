@@ -187,7 +187,7 @@ class PagedAttentionImpl(nn.Module):
                 k_scale,
                 v_scale,
                 self.rotary_emb.is_neox_style,
-                flash_layout=False,
+                flash_layout=envs.ATOM_USE_UNIFIED_ATTN,
                 apply_scale=self.kv_cache_dtype.startswith("fp8"),
                 offs=None,
                 q_out=q,
@@ -336,36 +336,15 @@ class PagedAttentionImpl(nn.Module):
                 (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
             )
 
-            # Convert KV cache from shuffle layout to flash layout
-            if k_cache.dim() == 5:
-                nb, nkv, hdx, bs, x = k_cache.shape
-                k_flash = (
-                    k_cache.permute(0, 3, 1, 2, 4)
-                    .contiguous()
-                    .view(nb, bs, nkv, hdx * x)
-                )
-            else:
-                k_flash = k_cache
-                nkv = k_cache.shape[2]
-
-            if v_cache.dim() == 4 and v_cache.shape[-1] != self.head_dim:
-                v_flash = v_cache.permute(0, 3, 1, 2).contiguous()
-            elif v_cache.dim() == 5:
-                nb, nkv_v, hdx, bs, x = v_cache.shape
-                v_flash = (
-                    v_cache.permute(0, 3, 1, 2, 4)
-                    .contiguous()
-                    .view(nb, bs, nkv_v, hdx * x)
-                )
-            else:
-                v_flash = v_cache
-
+            # KV cache is already in flash layout (4D) when
+            # ATOM_USE_UNIFIED_ATTN is set, allocated by model_runner.
+            nkv = k_cache.shape[2]
             descale_shape = (num_seqs, nkv)
 
             unified_attention(
                 q,
-                k_flash,
-                v_flash,
+                k_cache,
+                v_cache,
                 o,
                 cu_seqlens_q=attn_metadata.cu_seqlens_q,
                 seqused_k=attn_metadata.context_lens,

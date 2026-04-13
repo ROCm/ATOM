@@ -1252,19 +1252,54 @@ class ModelRunner:
                             attn_idx = layer_id // self.full_attention_interval
                         else:
                             attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
+                        # Choose KV cache layout based on attention backend:
+                        # triton (unified_attention) needs flash layout (4D),
+                        # ASM needs shuffle layout (5D k / 4D v).
+                        # Exception: when q_norm+k_norm+rotary_emb are all present,
+                        # the fused_qk_norm_rope_cache_quant_shuffle kernel is used
+                        # which only supports shuffle layout.
+                        impl = getattr(module, "impl", None)
+                        use_triton_attn = impl is not None and (
+                            getattr(impl, "sliding_window", -1) != -1
+                            or getattr(impl, "head_dim", 128) != 128
                         )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
+                        fused_shuffle_path = impl is not None and (
+                            getattr(impl, "rotary_emb", None) is not None
+                            and getattr(impl, "q_norm", None) is not None
+                            and getattr(impl, "k_norm", None) is not None
                         )
+                        use_flash_layout = (
+                            use_triton_attn
+                            and not fused_shuffle_path
+                            and envs.ATOM_USE_UNIFIED_ATTN
+                        )
+                        if use_flash_layout:
+                            k_cache = self.kv_cache[0, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                self.physical_block_size,
+                                num_kv_heads,
+                                hf_config.head_dim,
+                            )
+                            v_cache = self.kv_cache[1, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                self.physical_block_size,
+                                num_kv_heads,
+                                hf_config.head_dim,
+                            )
+                        else:
+                            k_cache = self.kv_cache[0, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                num_kv_heads,
+                                hf_config.head_dim // x,
+                                self.physical_block_size,
+                                x,
+                            )
+                            v_cache = self.kv_cache[1, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                num_kv_heads,
+                                hf_config.head_dim,
+                                self.physical_block_size,
+                            )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":
                             module.k_scale = self.kv_scale[0, attn_idx]
