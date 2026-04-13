@@ -81,14 +81,23 @@ class _Gemma4RMSNorm(nn.Module):
             self.weight = nn.Parameter(torch.ones(dim))
         try:
             from aiter import rmsnorm2d_fwd
+            from aiter.ops.rmsnorm import rmsnorm2d_fwd_with_add
             self._aiter_rmsnorm = rmsnorm2d_fwd
+            self._aiter_rmsnorm_add = rmsnorm2d_fwd_with_add
         except ImportError:
             self._aiter_rmsnorm = None
+            self._aiter_rmsnorm_add = None
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+        if residual is not None and self.with_scale and self._aiter_rmsnorm_add is not None:
+            out = torch.empty_like(x)
+            residual_out = torch.empty_like(x)
+            self._aiter_rmsnorm_add(out, x, residual, residual_out, self.weight, self.eps)
+            return out, residual_out
+
         if residual is not None:
             x = x + residual
             residual = x
@@ -186,6 +195,7 @@ class Gemma4Attention(nn.Module):
         self.q_norm = _Gemma4RMSNorm(self.head_dim, eps=rms_norm_eps, with_scale=True)
         self.k_norm = _Gemma4RMSNorm(self.head_dim, eps=rms_norm_eps, with_scale=True)
         self.v_norm = _Gemma4RMSNorm(self.head_dim, eps=rms_norm_eps, with_scale=False)
+
         self.attn = Attention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
@@ -218,6 +228,7 @@ class Gemma4Attention(nn.Module):
             v = self.v_norm(v.reshape(-1, self.head_dim)).reshape(num_tokens, -1)
         k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(num_tokens, -1)
         o = self.attn(q, k, v, positions, **model_kwargs)
+
         output = self.o_proj(o)
         return output
 
@@ -373,14 +384,11 @@ class Gemma4DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         **model_kwargs: dict[str, Any] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # HF applies layer_scalar ONCE at the end to the full accumulated
-        # output (including residual), so we use explicit residual adds
-        # instead of the fused residual+norm pattern.
         if residual is not None:
-            hidden_states = hidden_states + residual
-
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        else:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -388,10 +396,8 @@ class Gemma4DecoderLayer(nn.Module):
             **model_kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states, residual = self.pre_feedforward_layernorm(hidden_states, residual)
 
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
