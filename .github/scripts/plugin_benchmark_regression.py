@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OOT-specific regression summary built on top of shared summarize helpers."""
+"""Regression summary built on top of shared summarize helpers."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def build_report(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Print only the OOT regression report without the full results table"
+        description="Print only the regression report without the full results table"
     )
     parser.add_argument(
         "--result-dir",

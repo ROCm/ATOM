@@ -973,11 +973,12 @@ jobs:
           BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python3 .github/scripts/oot_benchmark_summary.py \
+          python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
             --matrix-json "${BENCHMARK_MATRIX}" \
             --run-url "${RUN_URL}" \
             --output-json oot_benchmark_summary.json \
+            --title "OOT Benchmark Summary" \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Read summary stats
@@ -1029,7 +1030,7 @@ jobs:
               continue
             fi
 
-            if python3 .github/scripts/oot_benchmark_validate_baseline.py /tmp/baseline_candidate; then
+            if python3 .github/scripts/plugin_benchmark_validate_baseline.py /tmp/baseline_candidate; then
               mv /tmp/baseline_candidate /tmp/baseline
               BASELINE_DIR="/tmp/baseline"
               echo "Using baseline from run #$PREV_RUN_ID"
@@ -1059,7 +1060,7 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          python3 .github/scripts/oot_benchmark_regression.py \
+          python3 .github/scripts/plugin_benchmark_regression.py \
             --result-dir . \
             $BASELINE_ARG \
             --output-json regression_report.json \
@@ -1086,10 +1087,11 @@ jobs:
       - name: Transform results for benchmark dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
-          python3 .github/scripts/oot_benchmark_to_dashboard.py \
+          python3 .github/scripts/plugin_benchmark_to_dashboard.py \
             . \
             --output benchmark-action-input.json \
-            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --default-backend "ATOM-vLLM"
 
       - name: Store benchmark result to dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'

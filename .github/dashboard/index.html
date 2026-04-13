@@ -342,7 +342,7 @@
    1. CONSTANTS & COLOR PALETTE
    ================================================================ */
 // HSL-based palette: each model gets a distinct base hue; backend offsets keep
-// ATOM and ATOM-vLLM visually related but not identical.
+// ATOM, ATOM-vLLM, and ATOM-SGLang visually related but not identical.
 const MODEL_HUES = {
   'DeepSeek-R1-0528':      210,   // blue
   'DeepSeek-R1-0528-mtp3': 175,   // cyan/teal — distinct from base DeepSeek
@@ -356,6 +356,7 @@ const MODEL_HUES = {
 const BACKEND_HUE_OFFSETS = {
   'ATOM': 0,
   'ATOM-vLLM': 28,
+  'ATOM-SGLang': -30,
 };
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
