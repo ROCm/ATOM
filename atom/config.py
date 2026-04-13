@@ -26,6 +26,7 @@ from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.model_config.qwen3_5 import Qwen3_5TextConfig
 from atom.model_config.qwen3_5_moe import Qwen3_5MoeTextConfig
+from atom.utils import resolve_obj_by_qualname
 
 logger = logging.getLogger("atom")
 
@@ -484,8 +485,8 @@ _CONFIG_REGISTRY: dict[str, str] = {
 }
 
 _CUSTOM_TEXT_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
-    "qwen3_5_text": Qwen3_5TextConfig,
-    "qwen3_5_moe_text": Qwen3_5MoeTextConfig,
+    "qwen3_5_text": "atom.model_config.qwen3_5.Qwen3_5TextConfig",
+    "qwen3_5_moe_text": "atom.model_config.qwen3_5_moe.Qwen3_5MoeTextConfig",
 }
 
 
@@ -540,7 +541,9 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        config_class = _CUSTOM_TEXT_CONFIG_REGISTRY.get(mapped_type)
+        config_class = resolve_obj_by_qualname(
+            _CUSTOM_TEXT_CONFIG_REGISTRY.get(mapped_type)
+        )
         if config_class is None:
             config_class = AutoConfig.for_model(mapped_type)
         hf_config = config_class.from_dict(text_config_dict)
