@@ -185,7 +185,9 @@ def _print_markdown_table(rows: list[dict], run_url: str | None) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Summarize vLLM-ATOM benchmark results")
+    parser = argparse.ArgumentParser(
+        description="Summarize vLLM-ATOM benchmark results"
+    )
     parser.add_argument(
         "--result-dir",
         required=True,
