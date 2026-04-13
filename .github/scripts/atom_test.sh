@@ -32,7 +32,7 @@ if [ "$TYPE" == "launch" ]; then
   fi
 
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  env PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" 2>&1 | tee "$ATOM_SERVER_LOG" &
+  PYTHONUNBUFFERED=1 python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
 
   echo ""
