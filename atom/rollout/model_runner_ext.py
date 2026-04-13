@@ -172,9 +172,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             orig_dp_base_port = config.parallel_config.data_parallel_base_port
             config.parallel_config.data_parallel_rank = effective_dp_rank
             config.parallel_config.data_parallel_size = effective_dp_size
-            config.parallel_config.data_parallel_rank_local = (
-                0 if effective_dp_size == 1 else orig_dp_rank_local
-            )
+            config.parallel_config.data_parallel_rank_local = orig_dp_rank_local
             config.parallel_config.data_parallel_base_port = dp_port
 
             # Pre-set HIP_VISIBLE_DEVICES so aiter doesn't restrict GPU visibility
@@ -183,7 +181,39 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
                     str(i) for i in range(num_gpus)
                 )
 
+            import aiter
+            import aiter.ops.communication as _aiter_comm
+            from atom.model_engine import model_runner as _mr_mod
+            _orig_init_dist_env = _aiter_comm.init_dist_env
+            _target_local_rank = local_device_rank
+
+            def _patched_init_dist_env(*args, local_rank=-1, **kwargs):
+                return _orig_init_dist_env(*args, local_rank=_target_local_rank, **kwargs)
+
+            _aiter_comm.init_dist_env = _patched_init_dist_env
+            aiter.init_dist_env = _patched_init_dist_env
+            _mr_mod.init_dist_env = _patched_init_dist_env
+
         super().__init__(rank, config)
+
+        # Restore original init_dist_env and fix signal tensor placement.
+        if device_map is not None:
+            _aiter_comm.init_dist_env = _orig_init_dist_env
+            aiter.init_dist_env = _orig_init_dist_env
+            _mr_mod.init_dist_env = _orig_init_dist_env
+            # aiter's init_dist_env also creates a signal tensor on
+            # device=rankID (TP rank). Recreate it on self.device.
+            if config.tensor_parallel_size > 1:
+                tp_grp = get_tp_group()
+                ca_comm = tp_grp.device_communicator.ca_comm
+                signal = torch.zeros(
+                    config.tensor_parallel_size * 64,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                ca_comm.signal = signal
+                ca_comm.register_input_buffer(signal)
+                ca_comm.buffer = ca_comm._pool["input"].tensor
 
         # Restore original config values
         if device_map is not None:
