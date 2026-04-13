@@ -294,7 +294,7 @@ jobs:
   atom-vllm-oot:
     needs: [check-signal, download_aiter_wheel, build_oot_image]
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
-    name: ${{ matrix.display_name }}
+    name: Accuracy (${{ matrix.display_name }})
     strategy:
       fail-fast: false
       matrix:

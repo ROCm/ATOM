@@ -1,4 +1,4 @@
-name: ATOM SGLang Accuracy Test
+name: ATOM SGLang Test
 
 on:
   pull_request:
@@ -294,7 +294,7 @@ jobs:
   atom-sglang-accuracy:
     needs: [check-signal, download_aiter_wheel, build_sglang_image]
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
-    name: ATOM SGLang Accuracy Test
+    name: Accuracy (${{ matrix.model_name }})
     strategy:
       fail-fast: false
       matrix:
