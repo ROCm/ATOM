@@ -118,9 +118,9 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     # GPU indices assigned to this DP rank (e.g. "2,3").  When set, each DP
     # rank's ModelRunners form an independent NCCL world with TP only.
     # Frameworks may set this via their own env vars; the adapter layer is
-    # responsible for mapping to ATOM_DP_DEVICE_MAP before constructing the
+    # responsible for mapping to VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER before constructing the
     # runner.
-    DP_DEVICE_MAP_ENV = "ATOM_DP_DEVICE_MAP"
+    DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     def _init_dp_isolation(self, config, rank: int):
         """Resolve DP rank → device mapping when device-level isolation is active.

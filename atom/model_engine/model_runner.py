@@ -2275,4 +2275,3 @@ class ModelRunner:
             )
 
         return time.time() - start_time, self.graph_bs
-
