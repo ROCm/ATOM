@@ -47,8 +47,13 @@ Create (or edit) `~/.hermes/config.yaml`:
 ```yaml
 model:
   default: "<model-id-from-step-1>"
-  provider: "custom"
+  provider: "atom"
   base_url: "http://localhost:8000/v1"
+
+custom_providers:
+  - name: ATOM
+    base_url: "http://localhost:8000/v1"
+    model: "<model-id-from-step-1>"
 ```
 
 For example, if ATOM serves `Qwen/Qwen3-32B`:
@@ -56,8 +61,13 @@ For example, if ATOM serves `Qwen/Qwen3-32B`:
 ```yaml
 model:
   default: "Qwen/Qwen3-32B"
-  provider: "custom"
+  provider: "atom"
   base_url: "http://localhost:8000/v1"
+
+custom_providers:
+  - name: ATOM
+    base_url: "http://localhost:8000/v1"
+    model: "Qwen/Qwen3-32B"
 ```
 
 ## Step 4: Run Hermes
@@ -75,7 +85,7 @@ You should see the Hermes Agent TUI with your ATOM model name in the header.
 Instead of `config.yaml`, you can configure via environment variables in a `.env` file in the `hermes-agent` directory:
 
 ```bash
-HERMES_INFERENCE_PROVIDER=custom
+HERMES_INFERENCE_PROVIDER=atom
 OPENAI_BASE_URL=http://localhost:8000/v1
 OPENAI_API_KEY=dummy
 ```
