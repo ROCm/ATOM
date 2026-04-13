@@ -102,10 +102,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
         weights_mapper = getattr(model_cls, "hf_to_atom_mapper", {})
+        exclude_mapping = getattr(model_cls, "quant_exclude_name_mapping", {})
         self.atom_config.quant_config.remap_layer_name(
             self.atom_config.hf_config,
             packed_modules_mapping=module_remapping,
             weights_mapper=weights_mapper,
+            quant_exclude_name_mapping=exclude_mapping,
         )
 
         # In ATOM, quant_exclude_name_mapping is used to translate the HF module names

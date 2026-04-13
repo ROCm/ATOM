@@ -61,7 +61,9 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
+
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
+
 
 
 def divide(numerator, denominator):
@@ -151,6 +153,7 @@ def gemm_a4w4_quant(
             x_scale = x_scale.view(torch.float8_e8m0fnu)
             x = x.view(torch.float4_e2m1fn_x2)
 
+        m_padded = (m + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE * MXFP4_QUANT_BLOCK_SIZE
         if m >= MXFP4_QUANT_BLOCK_SIZE:
             x_scale = x_scale.view(torch.uint8).view(
                 x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
@@ -158,8 +161,19 @@ def gemm_a4w4_quant(
         else:
             x_scale = x_scale[:m, ...].view(torch.uint8)
 
+        if m < m_padded:
+            x_uint8 = x.view(torch.uint8)
+            x_padded = torch.zeros(m_padded, x_uint8.shape[-1], dtype=torch.uint8, device=x.device)
+            x_padded[:m] = x_uint8
+            xs_padded = torch.zeros(m_padded, x_scale.shape[-1], dtype=torch.uint8, device=x.device)
+            xs_padded[:m] = x_scale
+            x_scale = xs_padded
+            x_uint8_final = x_padded
+        else:
+            x_uint8_final = x.view(torch.uint8)
+
         y = gemm_afp4wfp4_preshuffle(
-            x.view(torch.uint8),
+            x_uint8_final,
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
             weight_scale.view(torch.uint8).view(
@@ -379,9 +393,27 @@ class LinearBase(nn.Module):
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
             ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
+                if self.quant_type == QuantType.per_1x32 and self.params_dtype in [dtypes.fp4x2, dtypes.i4x2]:
+                    _ASM_K_ALIGN = 128
+                    w_u8 = self.weight.data.view(torch.uint8)
+                    k_packed = w_u8.shape[-1]
+                    if k_packed % _ASM_K_ALIGN != 0:
+                        k_pad = (k_packed + _ASM_K_ALIGN - 1) // _ASM_K_ALIGN * _ASM_K_ALIGN
+                        w_new = torch.zeros(w_u8.shape[0], k_pad, dtype=torch.uint8, device=w_u8.device)
+                        w_new[:, :k_packed] = w_u8
+                        self.weight = nn.Parameter(w_new.view(self.weight.data.dtype), requires_grad=False)
+                        if self.weight_scale is not None:
+                            ws_u8 = self.weight_scale.data.view(torch.uint8)
+                            ws_k = ws_u8.shape[-1]
+                            ws_k_pad = k_pad // (MXFP4_QUANT_BLOCK_SIZE // 2)
+                            if ws_k < ws_k_pad:
+                                ws_new = torch.zeros(ws_u8.shape[0], ws_k_pad, dtype=torch.uint8, device=ws_u8.device)
+                                ws_new[:, :ws_k] = ws_u8
+                                self.weight_scale = nn.Parameter(ws_new.view(self.weight_scale.data.dtype), requires_grad=False)
+                        self._fp4_k_orig = k_packed
+                        self._fp4_k_padded = k_pad
+                        logger.info(f"[MXFP4] Padded weight K {k_packed} -> {k_pad} for {self.prefix}")
                 shuffle_weights(self.weight)
-                # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
-        # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32:
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
@@ -450,6 +482,31 @@ class LinearBase(nn.Module):
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
+                if hasattr(self, "_fp4_k_padded"):
+                    k_orig = self._fp4_k_orig
+                    k_pad = self._fp4_k_padded
+                    elem_size = x.element_size()
+                    fp4_elem_size = 1
+                    x_logical_k = x.shape[-1] * elem_size // fp4_elem_size
+                    x_k_target = x.shape[-1] * k_pad // k_orig
+                    if x.shape[-1] != x_k_target:
+                        if x.dtype in [dtypes.fp4x2, dtypes.i4x2, torch.uint8]:
+                            x_u8 = x.view(torch.uint8)
+                            x_new = torch.zeros(*x_u8.shape[:-1], x_k_target, dtype=torch.uint8, device=x.device)
+                            x_new[..., :x_u8.shape[-1]] = x_u8
+                            x = x_new.view(x.dtype)
+                        else:
+                            x_new = torch.zeros(*x.shape[:-1], x_k_target, dtype=x.dtype, device=x.device)
+                            x_new[..., :x.shape[-1]] = x
+                            x = x_new
+                        if x_scale is not None:
+                            xs_u8 = x_scale.view(torch.uint8)
+                            xs_k = xs_u8.shape[-1]
+                            xs_k_target = k_pad // (MXFP4_QUANT_BLOCK_SIZE // 2)
+                            if xs_k < xs_k_target:
+                                xs_new = torch.zeros(*xs_u8.shape[:-1], xs_k_target, dtype=torch.uint8, device=x_scale.device)
+                                xs_new[..., :xs_k] = xs_u8
+                                x_scale = xs_new.view(x_scale.dtype)
                 y = gemm_a4w4_quant(
                     x,
                     x_scale,
