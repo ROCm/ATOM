@@ -196,11 +196,11 @@ jobs:
         if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
         timeout-minutes: 180
         run: |
-          OOT_BASE_IMAGE="atom_release:ci"
-          echo "Using vLLM-ATOM base image: ${OOT_BASE_IMAGE}"
+          vLLM_ATOM_BASE_IMAGE="atom_release:ci"
+          echo "Using vLLM-ATOM base image: ${vLLM_ATOM_BASE_IMAGE}"
           docker build --network=host -t atom_oot_release:ci \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="${OOT_BASE_IMAGE}" \
+            --target vllm_atom \
+            --build-arg vLLM_ATOM_BASE_IMAGE="${vLLM_ATOM_BASE_IMAGE}" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${{ env.VLLM_COMMIT }}" \
             --build-arg INSTALL_LM_EVAL=1 \

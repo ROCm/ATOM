@@ -5,7 +5,7 @@ ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # vLLM-ATOM image extends an ATOM base image that already contains atom/aiter/mori.
-FROM ${vLLM_ATOM_BASE_IMAGE} AS atom_vllm_atom
+FROM ${vLLM_ATOM_BASE_IMAGE} AS vllm_atom
 
 ARG MAX_JOBS
 ARG VENV_PYTHON="/opt/venv/bin/python"
