@@ -164,9 +164,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)
-        # Expose embedding and lm_head to Wrapper.model which is used by vLLM for layer sharing.
-        self._expose_embedding_for_spec_decode()
-        self._expose_lm_head_for_spec_decode()
+        # Mirror nested attributes required by vLLM speculative decoding.
+        self._expose_spec_decode_attrs()
 
         # For sparse MLA, register the Indexer's DeepseekV32IndexerCache as
         # a virtual subclass of vLLM's AttentionLayerBase so vLLM can discover
@@ -183,35 +182,31 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.pp_group = get_pp_group()
         self.tp_group = get_tp_group()
 
-    def _expose_embedding_for_spec_decode(self) -> None:
-        """Expose embed modules on ATOM top-level model for vLLM eagle sharing.
+    def _expose_spec_decode_attrs(self) -> None:
+        """Mirror nested attrs needed by vLLM speculative decoding.
 
-        vLLM speculative decode inspects `target_model.model` and expects that
-        object to directly expose `embed_tokens` or `embedding`. ATOM's model
-        wrappers can add one more nesting level (`model.model`), so mirror the
-        attributes to keep compatibility.
+        vLLM EAGLE/MTP logic reads attributes from wrapper.model directly:
+        - embedding sharing: `embed_tokens` / `embedding`
+        - lm_head sharing: `lm_head`
+        - MTP extra sharing: `model.layers` path on draft model
+
+        ATOM models can introduce one extra nesting level (`model.model`), so
+        mirror these attrs to `self.model` when absent. Also expose `lm_head`
+        on wrapper itself for vLLM's wrapper-level lm_head checks.
         """
-        inner_model = getattr(self.model, "model", None)
-        if inner_model is None:
+        model = self.model
+        nested_model = getattr(model, "model", None)
+        if nested_model is None:
+            if hasattr(model, "lm_head") and not hasattr(self, "lm_head"):
+                self.lm_head = model.lm_head
             return
-        if not hasattr(self.model, "embed_tokens") and hasattr(
-            inner_model, "embed_tokens"
-        ):
-            self.model.embed_tokens = inner_model.embed_tokens
-        if not hasattr(self.model, "embedding") and hasattr(inner_model, "embedding"):
-            self.model.embedding = inner_model.embedding
 
-    def _expose_lm_head_for_spec_decode(self) -> None:
-        """Expose lm_head on wrapper model for vLLM draft sharing."""
-        if hasattr(self.model, "lm_head") and not hasattr(self, "lm_head"):
-            self.lm_head = self.model.lm_head
-        inner_model = getattr(self.model, "model", None)
-        if inner_model is None:
-            return
-        if not hasattr(self.model, "lm_head") and hasattr(inner_model, "lm_head"):
-            self.model.lm_head = inner_model.lm_head
-        if not hasattr(self, "lm_head") and hasattr(inner_model, "lm_head"):
-            self.lm_head = inner_model.lm_head
+        for attr in ("embed_tokens", "embedding", "lm_head", "layers"):
+            if not hasattr(model, attr) and hasattr(nested_model, attr):
+                setattr(model, attr, getattr(nested_model, attr))
+
+        if not hasattr(self, "lm_head") and hasattr(model, "lm_head"):
+            self.lm_head = model.lm_head
 
     def _register_indexer_caches_with_vllm(self):
         """Register DeepseekV32IndexerCache instances with vLLM so that:
@@ -322,8 +317,23 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # prevent circular import
         from atom.model_loader.loader import load_model_in_plugin_mode
 
+        is_mtp_draft_model = self.model_arch in {"DeepSeekMTPModel", "Qwen3NextMTPModel"}
+        draft_hf_config = None
+        if is_mtp_draft_model:
+            draft_model_config = getattr(
+                getattr(self.vllm_config, "speculative_config", None),
+                "draft_model_config",
+                None,
+            )
+            if draft_model_config is not None:
+                draft_hf_config = getattr(draft_model_config, "hf_config", draft_model_config)
+
         loaded_weights_record = load_model_in_plugin_mode(
-            model=self.model, config=self.atom_config, prefix="model."
+            model=self.model,
+            config=self.atom_config,
+            prefix="model.",
+            spec_decode=is_mtp_draft_model,
+            hf_config_override=draft_hf_config,
         )
         return loaded_weights_record
 
