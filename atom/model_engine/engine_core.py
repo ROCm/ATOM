@@ -6,6 +6,7 @@ import logging
 import pickle
 import queue
 import threading
+import time
 from contextlib import ExitStack
 from typing import List
 
@@ -308,8 +309,9 @@ class EngineCore:
     def stop_profiler(self):
         if self.profile_enbaled:
             logger.info("Profiler stopping...")
+            t0 = time.monotonic()
             self.runner_mgr.call_func("stop_profiler", wait_out=True)
-            logger.info("Profiler stopped.")
+            logger.info("Profiler stopped in %.1fs", time.monotonic() - t0)
 
     def print_mtp_statistics(self):
         if self.scheduler.spec_stats is not None:
