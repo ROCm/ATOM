@@ -190,5 +190,17 @@
     "accuracy_baseline": 0.9401,
     "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
     "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows baseline=0.9401"
+  },
+  {
+    "model_name": "MiniMax-M2.5-MXFP4",
+    "model_path": "amd/MiniMax-M2.5-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 --trust-remote-code",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.91,
+    "accuracy_baseline": 0.9401,
+    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
+    "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows MXFP4=0.9256, baseline=0.9401"
   }
 ]
