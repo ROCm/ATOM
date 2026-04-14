@@ -23,6 +23,11 @@ on:
         required: false
         default: ''
         type: string
+      signal_commit_sha:
+        description: 'Commit SHA used to look up the pre-checkin signal artifact'
+        required: false
+        default: ''
+        type: string
       aiter_branch:
         description: 'ROCm/aiter branch to build inside the CI image'
         required: false
@@ -90,7 +95,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.github_token || github.token }}
           GITHUB_REPOSITORY: ${{ inputs.checkout_repository }}
-          GITHUB_SHA: ${{ env.GITHUB_COMMIT_SHA }}
+          GITHUB_SHA: ${{ inputs.signal_commit_sha || inputs.checkout_ref }}
 
   download_aiter_wheel:
     if: ${{ !inputs.is_draft_pr && (!inputs.run_precheck || needs.check-signal.result == 'success') }}
@@ -621,6 +626,9 @@ jobs:
     needs: [atom-test]
     if: ${{ always() && inputs.publish_dashboard }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v6
         with:

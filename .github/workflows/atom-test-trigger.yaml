@@ -23,7 +23,8 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep scheduled main runs from blocking push-triggered validation.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
@@ -34,6 +35,7 @@ jobs:
       checkout_ref: ${{ github.sha }}
       source_repo_url: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.clone_url || format('https://github.com/{0}.git', github.repository) }}
       source_commit_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+      signal_commit_sha: ${{ github.sha }}
       aiter_branch: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.aiter_branch || 'main' }}
       model_scope: ${{ github.event_name == 'schedule' && 'nightly' || github.event_name == 'workflow_dispatch' && 'nightly' || github.event_name == 'push' && 'main' || 'pr' }}
       run_precheck: ${{ github.event_name != 'workflow_dispatch' }}
