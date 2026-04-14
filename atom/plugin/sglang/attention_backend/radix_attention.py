@@ -88,17 +88,20 @@ class RadixAttention(BaseAttention):
                 self.attn.k_scale = atom_parameter(
                     torch.tensor([1.0], dtype=torch.float32, device="cuda")
                 )
+            elif not self.attn.k_scale.is_cuda:
+                self.attn.k_scale = torch.nn.Parameter(
+                    self.attn.k_scale.detach().to(device="cuda"),
+                    requires_grad=False,
+                )
             if self.attn.v_scale is None:
                 self.attn.v_scale = atom_parameter(
                     torch.tensor([1.0], dtype=torch.float32, device="cuda")
                 )
-            # Some SGLang attention backends consume the host-side float scales
-            # directly. Keep them in sync with the device-side defaults so the
-            # plugin path works even when checkpoint loading never populates them.
-            if self.attn.k_scale_float is None:
-                self.attn.k_scale_float = 1.0
-            if self.attn.v_scale_float is None:
-                self.attn.v_scale_float = 1.0
+            elif not self.attn.v_scale.is_cuda:
+                self.attn.v_scale = torch.nn.Parameter(
+                    self.attn.v_scale.detach().to(device="cuda"),
+                    requires_grad=False,
+                )
         else:
             raise NotImplementedError(
                 "RadixAttention is only supported for plugin mode for sglang for now"

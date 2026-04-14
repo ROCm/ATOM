@@ -24,7 +24,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 
 logger = logging.getLogger("atom.plugin.sglang.models")
 
+_RUNTIME_SENTINEL = object()
 
+# Context for patched DeepSeek attention layers that need wrapper state without
+# changing every intermediate forward signature. ContextVar keeps nested or
+# concurrent forwards isolated and lets us reliably restore the prior value.
 _current_forward_batch: ContextVar[Optional[ForwardBatch]] = ContextVar(
     "atom_sglang_current_forward_batch", default=None
 )
@@ -215,6 +219,37 @@ def _reset_sglang_forward_context() -> None:
     reset_forward_context()
 
 
+@contextmanager
+def plugin_runtime_scope(
+    *,
+    framework: Optional[str] = None,
+    atom_config: Any = _RUNTIME_SENTINEL,
+):
+    """Temporarily bind plugin runtime globals to one wrapper instance.
+
+    ATOM core currently relies on process-global framework/config state. In
+    SGLang speculative mode both target and draft wrappers coexist, so plugin
+    entrypoints must save/restore those globals around each init/load/forward.
+    """
+
+    import atom.config as atom_config_module
+    import atom.plugin.prepare as plugin_prepare
+
+    prev_framework = plugin_prepare._CURRENT_FRAMEWORK
+    prev_atom_config = getattr(atom_config_module, "_current_atom_config", None)
+
+    if framework is not None:
+        plugin_prepare._set_framework_backbone(framework)
+    if atom_config is not _RUNTIME_SENTINEL:
+        atom_config_module._current_atom_config = atom_config
+
+    try:
+        yield
+    finally:
+        plugin_prepare._CURRENT_FRAMEWORK = prev_framework
+        atom_config_module._current_atom_config = prev_atom_config
+
+
 @dataclass(frozen=True)
 class SGLangForwardBatchMetadata:
     """Small context object for one SGLang model forward."""
@@ -327,7 +362,14 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         # Refactor so this wrapper only dispatches the attention backend
         # (register_ops_to_sglang + set_attn_cls), and let sglang handle
         # model construction directly
-        self.model = atom.prepare_model(config=config, engine="sglang")
+        with plugin_runtime_scope(framework="sglang"):
+            from atom.config import get_current_atom_config
+
+            self.model = atom.prepare_model(config=config, engine="sglang")
+            self.atom_config = getattr(self.model, "atom_config", None)
+            if self.atom_config is None:
+                self.atom_config = get_current_atom_config()
+                self.model.atom_config = self.atom_config
         if self.model is None:
             raise ValueError(
                 f"ATOM failed to create model for architecture {self.model_arch}"
@@ -348,7 +390,51 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 setup_deepseek_for_sglang,
             )
 
-            setup_deepseek_for_sglang(self.model)
+            with plugin_runtime_scope(
+                framework="sglang", atom_config=self.atom_config
+            ):
+                setup_deepseek_for_sglang(self.model)
+
+    def get_embed_and_head(self):
+        if hasattr(self.model, "get_embed_and_head"):
+            return self.model.get_embed_and_head()
+
+        embed_owner = (
+            self.model.model
+            if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens")
+            else self.model
+        )
+        return embed_owner.embed_tokens.weight, self.model.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        if hasattr(self.model, "set_embed_and_head"):
+            return self.model.set_embed_and_head(embed, head)
+
+        embed_owner = (
+            self.model.model
+            if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens")
+            else self.model
+        )
+        del embed_owner.embed_tokens.weight
+        del self.model.lm_head.weight
+        embed_owner.embed_tokens.weight = embed
+        self.model.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def set_embed(self, embed):
+        if hasattr(self.model, "set_embed"):
+            return self.model.set_embed(embed)
+
+        embed_owner = (
+            self.model.model
+            if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens")
+            else self.model
+        )
+        del embed_owner.embed_tokens.weight
+        embed_owner.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     @torch.no_grad()
     def forward(
@@ -361,75 +447,95 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **model_kwargs: Any,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        metadata = SGLangForwardBatchMetadata.build(
-            forward_batch,
-            pp_proxy_tensors=pp_proxy_tensors,
-            save_kv_cache=model_kwargs.get("save_kv_cache"),
-        )
+        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
+            metadata = SGLangForwardBatchMetadata.build(
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                save_kv_cache=model_kwargs.get("save_kv_cache"),
+            )
 
-        if _is_dummy_forward(forward_batch):
-            (
-                model_input_ids,
-                model_positions,
-                model_input_embeds,
-                model_forward_batch,
-            ) = _materialize_atom_dummy_forward(
-                input_ids,
-                positions,
-                input_embeds,
-                forward_batch,
-            )
-        else:
-            (
-                model_input_ids,
-                model_positions,
-                model_input_embeds,
-                model_forward_batch,
-            ) = (
-                input_ids,
-                positions,
-                input_embeds,
-                forward_batch,
-            )
-        model_inputs = dict(
-            input_ids=model_input_ids,
-            positions=model_positions,
-            intermediate_tensors=SGLangForwardBatchMetadata.to_intermediate_tensors(
-                pp_proxy_tensors, metadata
-            ),
-            inputs_embeds=model_input_embeds,
-        )
-        with SGLangForwardBatchMetadata.bind(metadata):
-            if self.model_arch_spec.wrapper_binds_gdn_context:
-                from atom.plugin.sglang.attention_backend.attention_gdn import (
-                    SGLangGDNForwardContext,
+            if _is_dummy_forward(forward_batch):
+                (
+                    model_input_ids,
+                    model_positions,
+                    model_input_embeds,
+                    model_forward_batch,
+                ) = _materialize_atom_dummy_forward(
+                    input_ids,
+                    positions,
+                    input_embeds,
+                    forward_batch,
+                )
+            else:
+                (
+                    model_input_ids,
+                    model_positions,
+                    model_input_embeds,
+                    model_forward_batch,
+                ) = (
+                    input_ids,
+                    positions,
+                    input_embeds,
+                    forward_batch,
                 )
 
-                with SGLangGDNForwardContext.bind(metadata):
-                    hidden_states = self.model(**model_inputs)
-            else:
-                try:
-                    _set_sglang_forward_context(
-                        self.model.atom_config, model_forward_batch, model_positions
-                    )
-                    hidden_states = self.model(**model_inputs)
-                finally:
-                    _reset_sglang_forward_context()
-
-        if self.pp_group.is_last_rank:
-            if _is_dummy_forward(forward_batch):
-                # TODO: Revisit if SGLang ever sends non-empty dummy batches.
-                # Today this path only runs when an empty IDLE batch is expanded
-                # to one ATOM dummy token, so the output boundary must trim back to
-                # the original SGLang-visible length: 0 tokens.
-                hidden_states = _trim_hidden_states_for_output(hidden_states, 0)
-            return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.model.lm_head,
-                forward_batch,
+            model_inputs = dict(
+                input_ids=model_input_ids,
+                positions=model_positions,
+                intermediate_tensors=SGLangForwardBatchMetadata.to_intermediate_tensors(
+                    pp_proxy_tensors, metadata
+                ),
+                inputs_embeds=model_input_embeds,
             )
-        return hidden_states
+            uses_context_only_forward = (
+                self.model_arch_spec.apply_deepseek_patch
+                or self.model_arch_spec.wrapper_binds_gdn_context
+            )
+            with SGLangForwardBatchMetadata.bind(metadata):
+                if self.model_arch_spec.wrapper_binds_gdn_context:
+                    from atom.plugin.sglang.attention_backend.attention_gdn import (
+                        SGLangGDNForwardContext,
+                    )
+
+                    with SGLangGDNForwardContext.bind(metadata):
+                        hidden_states = self.model(**model_inputs)
+                elif uses_context_only_forward:
+                    try:
+                        _set_sglang_forward_context(
+                            self.atom_config, model_forward_batch, model_positions
+                        )
+                        hidden_states = self.model(**model_inputs)
+                    finally:
+                        _reset_sglang_forward_context()
+                else:
+                    try:
+                        _set_sglang_forward_context(
+                            self.atom_config, model_forward_batch, model_positions
+                        )
+                        hidden_states = self.model(
+                            **model_inputs,
+                            forward_batch=model_forward_batch,
+                            get_embedding=get_embedding,
+                            pp_proxy_tensors=pp_proxy_tensors,
+                            **model_kwargs,
+                        )
+                    finally:
+                        _reset_sglang_forward_context()
+
+            if self.pp_group.is_last_rank:
+                if _is_dummy_forward(forward_batch):
+                    # TODO: Revisit if SGLang ever sends non-empty dummy batches.
+                    # Today this path only runs when an empty IDLE batch is expanded
+                    # to one ATOM dummy token, so the output boundary must trim back to
+                    # the original SGLang-visible length: 0 tokens.
+                    hidden_states = _trim_hidden_states_for_output(hidden_states, 0)
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.model.lm_head,
+                    forward_batch,
+                )
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # The passed `weights` iterable from sglang is ignored because ATOM
@@ -438,9 +544,10 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         # sglang's default weight iterator.
         from atom.model_loader.loader import load_model_in_plugin_mode
 
-        return load_model_in_plugin_mode(
-            model=self.model, config=self.model.atom_config, prefix="model."
-        )
+        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
+            return load_model_in_plugin_mode(
+                model=self.model, config=self.atom_config, prefix="model."
+            )
 
 
 EntryClass = []
