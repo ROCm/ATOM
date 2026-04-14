@@ -6,10 +6,10 @@ import logging
 from dataclasses import dataclass, fields
 from typing import List, Optional
 
-logger = logging.getLogger("atom")
-
 from atom import LLMEngine
 from atom.config import CompilationConfig, SpeculativeConfig
+
+logger = logging.getLogger("atom")
 
 
 def parse_size_list(size_str: str) -> List[int]:
