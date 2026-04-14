@@ -19,7 +19,6 @@ from aiter import (
     layernorm2d_fwd_with_add,
 )
 from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
@@ -192,10 +191,6 @@ class RMSNorm(nn.Module):
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
-        # AITER fused allreduce+rmsnorm kernel requires n_bytes % 1024 == 0
-        # (i.e. dim * dtype_size must be a multiple of 1024).
-        # For bf16: dim must be a multiple of 512.
-        self._fused_ar_supported = (dim * 2) % 1024 == 0
 
         layer_quant_config = (
             LayerQuantConfig()
@@ -230,21 +225,14 @@ class RMSNorm(nn.Module):
             assert (
                 residual is not None
             ), "fused_allreduce_rmsnorm requires residual input!"
-            if self._fused_ar_supported:
-                x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x,
-                    residual,
-                    self.weight,
-                    self.eps,
-                )
-                return x, residual
-            else:
-                # Shape not supported by fused kernel; do allreduce separately
-                x = tensor_model_parallel_all_reduce(x)
-                x, residual = rmsnorm2d_fwd_with_add_(
-                    x, self.weight, residual, self.eps, self.dim
-                )
-                return x, residual
+            # tensor_model_parallel_fused_allreduce_rmsnorm does not support non-contiguous input
+            x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
+                x.contiguous(),
+                residual,
+                self.weight,
+                self.eps,
+            )
+            return x, residual
         else:
             if x_scale is not None and self.use_fused_quant:
                 from aiter.ops.triton.fused_fp8_quant import (
