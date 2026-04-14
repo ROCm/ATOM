@@ -101,23 +101,6 @@ def register_omni_model() -> None:
         return
 
     try:
-        import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image as _qwen_t2i
-        import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit as _qwen_edit
-        import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus as _qwen_edit_plus
-        import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered as _qwen_layered
-        from atom.plugin.vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
-            ATOMQwenImageTransformer2DModel,
-        )
-        # Each pipeline has already captured QwenImageTransformer2DModel as a local binding
-        # (via vllm_omni/diffusion/models/qwen_image/__init__.py eager import). Patching the
-        # source transformer module is too late — we must patch each pipeline's local binding.
-        for _m in [_qwen_t2i, _qwen_edit, _qwen_edit_plus, _qwen_layered]:
-            _m.QwenImageTransformer2DModel = ATOMQwenImageTransformer2DModel
-        logger.info("Patched QwenImageTransformer2DModel → ATOMQwenImageTransformer2DModel in qwen_image pipelines")
-    except ImportError as e:
-        logger.warning(f"Could not patch qwen_image pipelines with ATOM transformer: {e}")
-
-    try:
         from atom.plugin.vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
             ATOMWanTransformer3DModel,
         )
