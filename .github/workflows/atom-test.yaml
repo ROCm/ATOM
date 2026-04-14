@@ -59,54 +59,99 @@ jobs:
     name: Download aiter wheel
     runs-on: ubuntu-latest
     steps:
-      - name: Find and download latest aiter wheel
+      - name: Prefer latest main aiter wheel manifest and fallback to artifact
         run: |
           set -euo pipefail
-          echo "=== Finding latest aiter-whl-main artifact from ROCm/aiter ==="
+          echo "=== Trying latest main aiter wheel manifest from S3 first ==="
 
+          S3_MAIN_MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json"
           API_URL="https://api.github.com"
           AUTH_HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
           AITER_TEST_WORKFLOW_ID=179476100
 
-          RUNS=$(curl -s -H "$AUTH_HEADER" \
-            "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
+          download_from_s3_manifest() {
+            local manifest_file manifest_branch manifest_timestamp manifest_commit wheel_name wheel_url
 
-          ARTIFACT_ID=""
-          ARTIFACT_NAME=""
-          for RUN_ID in $(echo "$RUNS" | jq -r '.workflow_runs[].id'); do
-            ARTIFACT_JSON=$(curl -s -H "$AUTH_HEADER" \
-              "$API_URL/repos/ROCm/aiter/actions/runs/$RUN_ID/artifacts" \
-              | jq '[.artifacts[] | select(.name | startswith("aiter-whl-main")) | select(.expired == false)] | first')
+            mkdir -p aiter-whl
+            rm -f aiter-whl/amd_aiter*.whl
 
-            if [ "$ARTIFACT_JSON" != "null" ] && [ -n "$ARTIFACT_JSON" ]; then
-              ARTIFACT_ID=$(echo "$ARTIFACT_JSON" | jq -r '.id')
-              ARTIFACT_NAME=$(echo "$ARTIFACT_JSON" | jq -r '.name')
-              echo "Found artifact in run $RUN_ID: $ARTIFACT_NAME (ID: $ARTIFACT_ID)"
-              break
+            manifest_file=$(mktemp)
+            trap 'rm -f "$manifest_file"' RETURN
+            curl -fsSL "$S3_MAIN_MANIFEST_URL" -o "$manifest_file" || return 1
+
+            manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
+            manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
+            manifest_commit=$(jq -r '.commit // empty' "$manifest_file")
+            wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
+            wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+
+            if [ "$manifest_branch" != "main" ] || [ -z "$manifest_timestamp" ] || [ -z "$manifest_commit" ] || [ -z "$wheel_name" ] || [ -z "$wheel_url" ]; then
+              echo "Invalid latest main wheel manifest"
+              return 1
             fi
-          done
 
-          if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
-            echo "ERROR: No aiter-whl-main artifact found in recent Aiter Test runs"
-            exit 1
+            echo "Selected latest main wheel manifest: $S3_MAIN_MANIFEST_URL"
+            echo "Manifest timestamp: $manifest_timestamp"
+            echo "Manifest commit: $manifest_commit"
+            echo "Manifest wheel: $wheel_name"
+            echo "Downloading manifest-selected wheel: $wheel_url"
+            curl -fsSL "$wheel_url" -o "aiter-whl/$wheel_name" || return 1
+            echo "Downloaded wheel from manifest: aiter-whl/$wheel_name"
+
+            rm -f "$manifest_file"
+            trap - RETURN
+          }
+
+          download_from_artifact() {
+            echo "=== Falling back to latest aiter-whl-main artifact from ROCm/aiter ==="
+
+            RUNS=$(curl -fsSL -H "$AUTH_HEADER" \
+              "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
+
+            ARTIFACT_ID=""
+            ARTIFACT_NAME=""
+            for RUN_ID in $(echo "$RUNS" | jq -r '.workflow_runs[].id'); do
+              ARTIFACT_JSON=$(curl -fsSL -H "$AUTH_HEADER" \
+                "$API_URL/repos/ROCm/aiter/actions/runs/$RUN_ID/artifacts" \
+                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-main")) | select(.expired == false)] | first')
+
+              if [ "$ARTIFACT_JSON" != "null" ] && [ -n "$ARTIFACT_JSON" ]; then
+                ARTIFACT_ID=$(echo "$ARTIFACT_JSON" | jq -r '.id')
+                ARTIFACT_NAME=$(echo "$ARTIFACT_JSON" | jq -r '.name')
+                echo "Found artifact in run $RUN_ID: $ARTIFACT_NAME (ID: $ARTIFACT_ID)"
+                break
+              fi
+            done
+
+            if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
+              echo "ERROR: No aiter-whl-main artifact found in recent Aiter Test runs"
+              return 1
+            fi
+
+            mkdir -p aiter-whl
+            rm -f aiter-whl/amd_aiter*.whl
+            curl -fsSL -H "$AUTH_HEADER" \
+              "$API_URL/repos/ROCm/aiter/actions/artifacts/$ARTIFACT_ID/zip" \
+              -o aiter-whl.zip
+            unzip -o aiter-whl.zip -d aiter-whl
+            rm -f aiter-whl.zip
+          }
+
+          if download_from_s3_manifest; then
+            echo "Using wheel from S3 main manifest"
+          else
+            echo "Main wheel manifest download failed, falling back to GitHub artifact"
+            download_from_artifact
           fi
-
-          echo "=== Downloading artifact ==="
-          mkdir -p aiter-whl
-          curl -s -L -H "$AUTH_HEADER" \
-            "$API_URL/repos/ROCm/aiter/actions/artifacts/$ARTIFACT_ID/zip" \
-            -o aiter-whl.zip
-          unzip -o aiter-whl.zip -d aiter-whl
-          rm -f aiter-whl.zip
 
           AITER_WHL=$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
           if [ -z "$AITER_WHL" ]; then
-            echo "ERROR: No amd_aiter wheel found in artifact"
-            ls -la aiter-whl/
+            echo "ERROR: No amd_aiter wheel available after S3/artifact attempts"
+            ls -la aiter-whl/ || true
             exit 1
           fi
 
-          echo "Downloaded wheel: $AITER_WHL"
+          echo "Selected wheel: $AITER_WHL"
 
       - name: Upload aiter wheel
         uses: actions/upload-artifact@v4
