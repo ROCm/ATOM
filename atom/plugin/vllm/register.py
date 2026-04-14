@@ -5,6 +5,7 @@ import torch
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
 from atom.plugin.vllm.mla_patch import patch_vllm_mla_attention
+from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
 
 logger = logging.getLogger("atom")
 
@@ -119,6 +120,7 @@ def register_model() -> None:
 
     _patch_vllm_attention_process_weights_after_loading(Attention)
     _patch_vllm_attention_process_weights_after_loading(MLAAttention)
+    apply_vllm_spec_decode_patch()
 
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives
