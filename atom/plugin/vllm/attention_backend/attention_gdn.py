@@ -22,9 +22,69 @@ from vllm.model_executor.layers.fla.ops import (
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
+
+# from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt
 from torch import nn
 
+USE_FLYDSL_GDR = True
+try:
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+except ImportError:
+    USE_FLYDSL_GDR = False
+    print(
+        "Failed to import flydsl_gdr_decode. Please make sure you have the latest version of aiter installed."
+    )
 # from aiter.dist.parallel_state import get_tp_group
+
+
+# def maybe_dump_flydsl_gdr_inputs(
+#     layer_name: str,
+#     query: torch.Tensor,
+#     key: torch.Tensor,
+#     value: torch.Tensor,
+#     a: torch.Tensor,
+#     b: torch.Tensor,
+#     dt_bias: torch.Tensor,
+#     A_log: torch.Tensor,
+#     indices: torch.Tensor,
+#     state: torch.Tensor,
+# ):
+#     import os
+#     from pathlib import Path
+
+#     dump_path_env = os.getenv("ATOM_GDN_FLYDSL_DUMP_PATH")
+#     if not dump_path_env:
+#         return
+
+#     dump_path = Path(dump_path_env)
+#     if dump_path.exists() and dump_path.is_dir():
+#         dump_path = (
+#             dump_path / f"gdn_flydsl_{os.getpid()}_{layer_name.replace('/', '_')}.pt"
+#         )
+#     elif dump_path.suffix == "":
+#         dump_path.parent.mkdir(parents=True, exist_ok=True)
+#         dump_path = (
+#             dump_path / f"gdn_flydsl_{os.getpid()}_{layer_name.replace('/', '_')}.pt"
+#         )
+#     else:
+#         dump_path.parent.mkdir(parents=True, exist_ok=True)
+
+#     torch.save(
+#         {
+#             "layer_name": layer_name,
+#             "query": query.detach().cpu(),
+#             "key": key.detach().cpu(),
+#             "value": value.detach().cpu(),
+#             "a": a.detach().cpu(),
+#             "b": b.detach().cpu(),
+#             "dt_bias": dt_bias.detach().cpu(),
+#             "A_log": A_log.detach().cpu(),
+#             "indices": indices.detach().cpu(),
+#             "state": state.detach().cpu(),
+#         },
+#         dump_path,
+#     )
+#     os.environ.pop("ATOM_GDN_FLYDSL_DUMP_PATH", None)
 
 
 class ChunkGatedDeltaRule(nn.Module):
@@ -371,24 +431,45 @@ class GatedDeltaNet(nn.Module):
                 ssm_state.dtype
             )
         elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=a,
-                    b=b,
-                    dt_bias=self.dt_bias,
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
+            if USE_FLYDSL_GDR:
+
+                core_attn_out_non_spec = query_non_spec.new_empty(*value_non_spec.shape)
+
+                flydsl_gdr_decode(
+                    query=query_non_spec.contiguous(),
+                    key=key_non_spec.contiguous(),
+                    value=value_non_spec.contiguous(),
+                    a=a.contiguous(),
+                    b=b.contiguous(),
+                    dt_bias=self.dt_bias.contiguous(),
+                    A_log=self.A_log.contiguous(),
+                    indices=non_spec_state_indices_tensor.contiguous(),
+                    state=ssm_state,
+                    out=core_attn_out_non_spec,
+                    use_qk_l2norm=True,
+                    need_shuffle_state=False,
                 )
-            )
+
+                last_recurrent_state = None
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : attn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 

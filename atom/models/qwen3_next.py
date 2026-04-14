@@ -515,11 +515,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
         self.dt_bias = nn.Parameter(
             torch.ones(self.num_v_heads // self.tp_size),
+            requires_grad=False
         )
         self.A_log = nn.Parameter(
             torch.empty(
                 (self.num_v_heads // self.tp_size),
-            )
+            ),
+            requires_grad=False,
         )
 
         self.norm = RMSNormGated(
