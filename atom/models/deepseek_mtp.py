@@ -50,6 +50,20 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
+        if hasattr(config, "index_topk"):
+            max_num_batched_tokens = getattr(
+                atom_config, "max_num_batched_tokens", atom_config.max_num_seqs
+            )
+            buffer_device = getattr(atom_config, "device", "cuda")
+            topk_indices_buffer = torch.empty(
+                max_num_batched_tokens,
+                config.index_topk,
+                dtype=torch.int32,
+                device=buffer_device,
+            )
+        else:
+            topk_indices_buffer = None
+
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
         )
@@ -63,6 +77,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
+            topk_indices_buffer=topk_indices_buffer,
         )
 
     def forward(

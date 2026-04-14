@@ -1,4 +1,5 @@
 from typing import Generic, Optional, TypeVar
+import inspect
 import logging
 
 from dataclasses import dataclass
@@ -1418,6 +1419,16 @@ class vllmAiterMLABackendMethods:
         return (1, 0, 2, 3) if include_num_layers_dimension else (0, 1, 2)
 
 
+def _copy_public_attrs_without_binding(src_cls, dst_cls):
+    """Copy public attributes without descriptor rebinding."""
+    for name in dir(src_cls):
+        if name.startswith("_"):
+            continue
+        # Avoid getattr(), which binds classmethod to src_cls.
+        raw_attr = inspect.getattr_static(src_cls, name)
+        setattr(dst_cls, name, raw_attr)
+
+
 def AiterBackendDecoratorForPluginMode(cls):
     """
     Decorator for AiterBackend to add specific methods and attributes for plugin mode
@@ -1432,10 +1443,7 @@ def AiterBackendDecoratorForPluginMode(cls):
                 methods_cls = vllmAiterMLASparseBackendMethods
             else:
                 methods_cls = vllmAiterMLABackendMethods
-        for name in dir(methods_cls):
-            if name.startswith("_"):
-                continue
-            setattr(cls, name, getattr(methods_cls, name))
+        _copy_public_attrs_without_binding(methods_cls, cls)
     return cls
 
 
@@ -2261,12 +2269,30 @@ def unified_attention_with_output_base_for_plugin_mode(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    atom_config = get_current_atom_config()
+    current_atom_config = None
+    try:
+        from vllm.forward_context import (
+            get_forward_context as get_vllm_forward_context,
+            is_forward_context_available,
+        )
+
+        if is_forward_context_available():
+            current_atom_config = get_vllm_forward_context().additional_kwargs.get(
+                "atom_config"
+            )
+    except Exception:
+        # Keep backward compatibility when vLLM forward_context is unavailable.
+        current_atom_config = None
+
+    if current_atom_config is None:
+        current_atom_config = get_current_atom_config()
+    static_forward_context = current_atom_config.compilation_config.static_forward_context
+
     if use_mla:
         # raise NotImplementedError("MLA is not supported for plugin mode for now")
         kv_c_normed = k
         k_pe = v
-        self = atom_config.compilation_config.static_forward_context[layer_name]
+        self = static_forward_context[layer_name]
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
@@ -2285,7 +2311,7 @@ def unified_attention_with_output_base_for_plugin_mode(
         )
         return self.o_proj(output)
     else:
-        self = atom_config.compilation_config.static_forward_context[layer_name]
+        self = static_forward_context[layer_name]
         # here is the standard vllm attention impl interface
         # when using fusion, we need to pass the qkv and positions through the q,k,v
         # [watch out] accept_output_buffer must be False for plugin mode
