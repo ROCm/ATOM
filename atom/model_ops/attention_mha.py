@@ -344,7 +344,7 @@ class PagedAttentionImpl(nn.Module):
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
-        
+
         if envs.ATOM_ENABLE_TRITON_UNIFIED_ATTENTION_DECODE:
             unified_attention(
                 q,
