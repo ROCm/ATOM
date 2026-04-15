@@ -242,7 +242,9 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
         self, quant_config: Any, exclude_layers: list[str], layer_name: str
     ):
         for exclude_layer in exclude_layers:
-            if QuantizationConfig._matches_exclude(layer_name, exclude_layer):
+            if QuantizationConfig._matches_exclude(
+                layer_name, exclude_layer, check_contains=True
+            ):
                 return None
         return quant_config
 

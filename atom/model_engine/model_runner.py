@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import gzip
 import logging
 import math
 import os
@@ -59,6 +58,8 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5ForConditionalGenerationTextOnly",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
 }
@@ -91,7 +92,7 @@ class tokenIDProcessor:
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
 
-        self.async_copy_stream = torch.cuda.Stream()
+        self.async_copy_stream = torch.cuda.Stream(runner.device)
         self.default_num_rejected_tokens = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
@@ -579,14 +580,24 @@ class ModelRunner:
             ),
         )
         self.model = model_class(config)
+        fused_shared_expert_load_fn = None
+        if hasattr(self.model, "load_fused_expert_weights"):
+            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
-        load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        load_model(
+            self.model,
+            config.model,
+            config.hf_config,
+            config.load_dummy,
+            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
+        )
         logger.info(f"Model load done: {config.model}")
 
         if hasattr(self, "drafter"):
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
         torch.set_default_device(self.device)
+        self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
@@ -630,7 +641,12 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
+        elif self.hf_text_config.model_type in (
+            "qwen3_next",
+            "qwen3_next_mtp",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        ):
             return True
         return False
 
@@ -717,18 +733,42 @@ class ModelRunner:
             output_prefix = os.path.join(self.profiler_dir, worker_name)
 
             def _on_trace_ready(prof):
+                import gzip as _gzip
+
                 # Use a short human-readable timestamp in file name.
                 ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
                 ms = int((time.time() % 1) * 1000)
                 output_path = f"{output_prefix}_ts_{ts}_{ms:03d}.pt.trace.json.gz"
                 tmp_json_path = output_path[:-3]
-                prof.export_chrome_trace(tmp_json_path)
-                with (
-                    open(tmp_json_path, "rb") as src,
-                    gzip.open(output_path, "wb") as dst,
-                ):
-                    dst.write(src.read())
-                os.remove(tmp_json_path)
+                try:
+                    t0 = time.monotonic()
+                    prof.export_chrome_trace(tmp_json_path)
+                    # Chunked gzip: read 64 MB at a time to avoid loading
+                    # the entire JSON (~30 GB) into memory at once.
+                    with (
+                        open(tmp_json_path, "rb") as src,
+                        _gzip.open(output_path, "wb") as dst,
+                    ):
+                        while chunk := src.read(64 * 1024 * 1024):
+                            dst.write(chunk)
+                    os.remove(tmp_json_path)
+                    sz = os.path.getsize(output_path)
+                    logger.info(
+                        "Rank %d: trace exported to %s (%.1f MB, %.1fs)",
+                        self.rank,
+                        output_path,
+                        sz / 1e6,
+                        time.monotonic() - t0,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Rank %d: failed to export trace to %s",
+                        self.rank,
+                        output_path,
+                    )
+                    for p in (tmp_json_path, output_path):
+                        if os.path.exists(p):
+                            os.remove(p)
 
             self.profiler = torch_profiler.profile(
                 activities=[
@@ -741,13 +781,31 @@ class ModelRunner:
                 on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
+            logger.info(
+                "Rank %d: profiler started (detailed=%s, dir=%s)",
+                self.rank,
+                enable_detailed_profiling,
+                self.profiler_dir,
+            )
         return True
 
     def stop_profiler(self):
-        """Stop profiling for this rank"""
-        if self.profiler is not None:
+        """Stop profiling for this rank."""
+        if self.profiler is None:
+            return True
+        t0 = time.monotonic()
+        logger.info("Rank %d: stopping profiler...", self.rank)
+        try:
             self.profiler.__exit__(None, None, None)
+        except Exception:
+            logger.exception("Rank %d: profiler stop failed", self.rank)
+        finally:
             self.profiler = None
+        logger.info(
+            "Rank %d: profiler stop completed in %.1fs",
+            self.rank,
+            time.monotonic() - t0,
+        )
         return True
 
     def debug(self, *args: Any):
@@ -1003,8 +1061,12 @@ class ModelRunner:
                 hf_config.linear_conv_kernel_dim,
                 self.num_spec_tokens,
             )
+            mamba_dtypes = self.gated_delta_net_state_dtypes()
             one_layer_byte = (
-                sum(math.prod(subtuple) for subtuple in mamba_shape) * kv_dtype_size
+                math.prod(mamba_shape[0])
+                * torch.tensor([], dtype=mamba_dtypes[0]).element_size()
+                + math.prod(mamba_shape[1])
+                * torch.tensor([], dtype=mamba_dtypes[1]).element_size()
             )
             block_bytes += self.num_gdn_attn_state * one_layer_byte
         else:
@@ -1192,16 +1254,17 @@ class ModelRunner:
                 hf_config.linear_conv_kernel_dim,
                 self.num_spec_tokens,  # self.num_spec,
             )
+            mamba_dtypes = self.gated_delta_net_state_dtypes()
             self.mamba_k_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
                 + mamba_shape[0],
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                dtype=mamba_dtypes[0],
                 device="cuda",
             )
             self.mamba_v_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
                 + mamba_shape[1],
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                dtype=mamba_dtypes[1],
                 device="cuda",
             )
         else:
@@ -1398,6 +1461,9 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
+    def gated_delta_net_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
+        return self.config.torch_dtype, self.config.torch_dtype
+
     def gated_delta_net_state_shape(
         self,
         tp_world_size: int,
@@ -1418,8 +1484,8 @@ class ModelRunner:
 
         temporal_state_shape = (
             num_v_heads // tp_world_size,
-            head_k_dim,
             head_v_dim,
+            head_k_dim,
         )
         return conv_state_shape, temporal_state_shape
 

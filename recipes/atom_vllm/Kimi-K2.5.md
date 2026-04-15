@@ -16,6 +16,9 @@ docker pull rocm/atom-dev:vllm-latest
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
 ```bash
+# use quick allreduce to reduce TTFT
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+
 vllm serve amd/Kimi-K2.5-MXFP4 \
     --host localhost \
     --port 8000 \
