@@ -1498,6 +1498,42 @@ class ModelRunner:
 
         return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
 
+    def _maybe_create_tbo_slices(
+        self,
+        batch,
+        is_prefill,
+        scheduled_bs,
+        actual_num_tokens,
+        num_scheduled_tokens,
+        reqs_across_dp,
+    ):
+        """Create TBO ubatch slices if conditions are met."""
+        if not self.config.enable_tbo:
+            return None
+        if not is_prefill and batch.is_dummy_run:
+            return None
+
+        tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        if reqs_across_dp is not None:
+            can_tbo = int(torch.min(reqs_across_dp).item()) >= 2
+        else:
+            can_tbo = tbo_num_reqs >= 2
+        if not can_tbo:
+            return None
+
+        ubatch_slices = maybe_create_ubatch_slices(
+            num_reqs=tbo_num_reqs,
+            num_tokens=actual_num_tokens,
+            is_prefill=is_prefill,
+            num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
+        )
+        if ubatch_slices is not None:
+            logger.debug(
+                f"[TBO] splitting {'prefill' if is_prefill else 'decode'} batch: "
+                f"num_reqs={tbo_num_reqs}, ubatches={len(ubatch_slices)}"
+            )
+        return ubatch_slices
+
     def _preprocess(self, batch: ScheduledBatch):
         num_input_tokens = batch.total_tokens_num
         is_prefill = batch.total_tokens_num_prefill > 0
@@ -1584,25 +1620,14 @@ class ModelRunner:
                 input_ids,
             )
 
-        ubatch_slices = None
-        if self.config.enable_tbo and (is_prefill or not batch.is_dummy_run):
-            tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
-            if reqs_across_dp is not None:
-                min_reqs = int(torch.min(reqs_across_dp).item())
-                can_tbo = min_reqs >= 2
-            else:
-                can_tbo = tbo_num_reqs >= 2
-            if can_tbo:
-                ubatch_slices = maybe_create_ubatch_slices(
-                    num_reqs=tbo_num_reqs,
-                    num_tokens=actual_num_tokens,
-                    is_prefill=is_prefill,
-                    num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
-                )
-            if ubatch_slices is not None:
-                logger.debug(
-                    f"[TBO] splitting {'prefill' if is_prefill else 'decode'} batch: num_reqs={tbo_num_reqs}, ubatches={len(ubatch_slices)}"
-                )
+        ubatch_slices = self._maybe_create_tbo_slices(
+            batch,
+            is_prefill,
+            scheduled_bs if not is_prefill else 0,
+            actual_num_tokens,
+            num_scheduled_tokens,
+            reqs_across_dp,
+        )
 
         set_forward_context(
             attn_metadata=attn_metadata,
