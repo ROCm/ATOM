@@ -2625,24 +2625,19 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             from atom.utils.dbo.ubatching import tbo_active
 
-            if tbo_active():
+            _tbo = tbo_active()
+            if _tbo:
                 from atom.utils.dbo.ubatching import (
                     tbo_switch_to_compute_sync,
                     tbo_yield_and_switch_from_compute_to_comm,
                     tbo_yield_and_switch_from_comm_to_compute,
                 )
 
-                padded_hs, original_hidden_size = pad_for_all_gather(hidden_states)
-                padded_rl, _ = pad_for_all_gather(router_logits)
                 tbo_yield_and_switch_from_compute_to_comm()
-                hidden_states = get_dp_group().all_gather(padded_hs, dim=0)
-                router_logits = get_dp_group().all_gather(padded_rl, dim=0)
+            hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
+            router_logits, _ = all_gather_with_padding(router_logits)
+            if _tbo:
                 tbo_switch_to_compute_sync()
-            else:
-                hidden_states, original_hidden_size = all_gather_with_padding(
-                    hidden_states
-                )
-                router_logits, _ = all_gather_with_padding(router_logits)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -2666,12 +2661,12 @@ class FusedMoE(torch.nn.Module):
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
         if use_dp_gather_scatter:
-            if tbo_active():
+            if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
             final_hidden_states = reduce_scatter_with_unpadding(
                 final_hidden_states, original_hidden_size
             )
-            if tbo_active():
+            if _tbo:
                 tbo_yield_and_switch_from_comm_to_compute()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
