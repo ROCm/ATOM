@@ -34,6 +34,7 @@ from atom.models.qwen3_next import (
 
 from atom.models.utils import (
     IntermediateTensors,
+    PPMissingLayer,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -51,6 +52,115 @@ if is_vllm():
         MambaStateCopyFunc,
         MambaStateCopyFuncCalculator,
     )
+
+
+def get_qwen3_5_text_config(atom_config: Config):
+    hf_config = atom_config.hf_config
+    return hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+
+
+# Qwen3.5 MoE models have some checkpoints where expert weights are fused together in BF16 format, so we need special handling to load those weights into our per-expert parameters.
+def detect_fused_expert_format(weight_name: str) -> bool:
+    """Detect if weight is from fused expert checkpoint (BF16 format)."""
+    # Qwen3.5 BF16 has: experts.gate_up_proj, experts.down_proj
+    # Qwen3.5 FP8 has: experts.0.gate_proj, experts.0.up_proj, experts.0.down_proj
+    return "experts.gate_up_proj" in weight_name or (
+        "experts.down_proj" in weight_name
+        and ".experts." in weight_name
+        and weight_name.count(".experts.") == 1
+    )
+
+
+def get_fused_expert_mapping() -> list[tuple[str, str, str]]:
+    """Return mapping for fused expert weights (BF16 format)."""
+    # (param_name, weight_name, shard_id)
+    return [
+        ("experts.w13_weight", "experts.gate_up_proj", "w1"),  # Will be chunked
+        ("experts.w2_weight", "experts.down_proj", "w2"),
+    ]
+
+
+def load_fused_expert_weights(
+    original_name: str,
+    name: str,
+    params_dict: dict,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    num_experts: int,
+) -> bool:
+    """Load fused expert weights (BF16 format) into per-expert parameters.
+
+    Args:
+        original_name: Original weight name from checkpoint (e.g., "experts.gate_up_proj")
+        name: Mapped parameter name (e.g., "experts.w13_weight")
+        params_dict: Model parameters dict
+        loaded_weight: The weight tensor to load
+        shard_id: Shard identifier ("w1", "w2", "w3")
+        num_experts: Number of experts
+
+    Returns:
+        True if weights were loaded successfully
+    """
+    param = params_dict[name]
+    weight_loader = param.weight_loader
+    loaded_local_expert = False
+
+    # Special handling for gate_up_proj: chunk into gate and up
+    if "gate_up_proj" in original_name:
+        gate_weight, up_weight = loaded_weight.chunk(2, dim=-2)
+        # Load gate part (w1)
+        for expert_id in range(num_experts):
+            try:
+                success = weight_loader(
+                    param,
+                    gate_weight[expert_id],
+                    name,
+                    "w1",
+                    expert_id,
+                    return_success=True,
+                )
+                if success:
+                    loaded_local_expert = True
+            except TypeError:
+                weight_loader(param, gate_weight[expert_id], name, "w1", expert_id)
+                loaded_local_expert = True
+        # Load up part (w3)
+        for expert_id in range(num_experts):
+            try:
+                success = weight_loader(
+                    param,
+                    up_weight[expert_id],
+                    name,
+                    "w3",
+                    expert_id,
+                    return_success=True,
+                )
+                if success:
+                    loaded_local_expert = True
+            except TypeError:
+                weight_loader(param, up_weight[expert_id], name, "w3", expert_id)
+                loaded_local_expert = True
+    else:
+        # down_proj or other weights - no chunking
+        for expert_id in range(num_experts):
+            try:
+                success = weight_loader(
+                    param,
+                    loaded_weight[expert_id],
+                    name,
+                    shard_id,
+                    expert_id,
+                    return_success=True,
+                )
+                if success:
+                    loaded_local_expert = True
+            except TypeError:
+                weight_loader(
+                    param, loaded_weight[expert_id], name, shard_id, expert_id
+                )
+                loaded_local_expert = True
+
+    return loaded_local_expert
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
@@ -198,7 +308,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
     ) -> None:
         super(Qwen3NextDecoderLayer, self).__init__()
 
-        config = atom_config.hf_config.text_config
+        config = get_qwen3_5_text_config(atom_config)
         quant_config = atom_config.quant_config
         speculative_config = atom_config.speculative_config
 
@@ -225,7 +335,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
         if config.model_type == "qwen3_5_moe_text":
             self.mlp = Qwen3NextSparseMoeBlock(
-                atom_config.hf_config.text_config,
+                config,
                 atom_config.quant_config,
                 prefix=f"{prefix}.mlp",
             )
@@ -278,8 +388,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 class Qwen3_5Model(Qwen3NextModel):
     def __init__(self, *, atom_config, prefix: str = ""):
         super(Qwen3NextModel, self).__init__()
-        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = (
-            atom_config.hf_config.text_config
+        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = get_qwen3_5_text_config(
+            atom_config
         )
 
         self.config = config
@@ -312,7 +422,7 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(nn.Module):
 
     def __init__(self, atom_config: Config, prefix: str = ""):
-        config: Qwen3_5MoeTextConfig = atom_config.hf_config.text_config
+        config: Qwen3_5MoeTextConfig = get_qwen3_5_text_config(atom_config)
         self.atom_config = atom_config
 
         self.quant_config = atom_config.quant_config
@@ -367,10 +477,11 @@ class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
     def __init__(self, atom_config: Config, prefix: str = ""):
+        config: Qwen3_5MoeTextConfig = get_qwen3_5_text_config(atom_config)
+        config.n_shared_experts = 1
+        config.n_routed_experts = config.num_experts
         super().__init__(atom_config=atom_config, prefix=prefix)
-        config: Qwen3_5MoeTextConfig = atom_config.hf_config.text_config
         self.config = config
-        # set MoE hyperparameters
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -386,6 +497,122 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
                 else 0
             ),
         )
+
+
+class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+        "in_proj_z": ("in_proj_qkvz", 3),
+        "in_proj_b": ("in_proj_ba", 0),
+        "in_proj_a": ("in_proj_ba", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
+    }
+    weights_mapping = {
+        "model.language_model.": "language_model.model.",
+        "lm_head.": "language_model.lm_head.",
+    }
+    quant_exclude_name_mapping = {
+        "model.language_model.": "model.",
+    }
+    skip_weight_prefixes = ["model.visual."]
+
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        super().__init__()
+        self.config = atom_config.hf_config
+        self.visual = PPMissingLayer()
+        self.language_model = Qwen3_5ForCausalLM(atom_config=atom_config, prefix="")
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.model.get_input_embeddings(input_ids)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: object,
+    ):
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
+
+
+class Qwen3_5MoeForConditionalGenerationTextOnly(
+    Qwen3_5ForConditionalGenerationTextOnly
+):
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        nn.Module.__init__(self)
+        self.config = atom_config.hf_config
+        self.visual = PPMissingLayer()
+        self.language_model = Qwen3_5MoeForCausalLM(atom_config=atom_config, prefix="")
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def detect_fused_expert_format(self, weight_name: str) -> bool:
+        """Detect if weight is from fused expert checkpoint (BF16 format)."""
+        # Qwen3.5 BF16 has: experts.gate_up_proj, experts.down_proj
+        # Qwen3.5 FP8 has: experts.0.gate_proj, experts.0.up_proj, experts.0.down_proj
+        return detect_fused_expert_format(weight_name)
+
+    def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
+        """Return mapping for fused expert weights (BF16 format)."""
+        # (param_name, weight_name, shard_id)
+        return get_fused_expert_mapping()
+
+    def load_fused_expert_weights(
+        self,
+        original_name: str,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
+        """Load fused expert weights (BF16 format) into per-expert parameters.
+
+        Args:
+            original_name: Original weight name from checkpoint (e.g., "experts.gate_up_proj")
+            name: Mapped parameter name (e.g., "experts.w13_weight")
+            params_dict: Model parameters dict
+            loaded_weight: The weight tensor to load
+            shard_id: Shard identifier ("w1", "w2", "w3")
+            num_experts: Number of experts
+
+        Returns:
+            True if weights were loaded successfully
+        """
+        return load_fused_expert_weights(
+            original_name,
+            name,
+            params_dict,
+            loaded_weight,
+            shard_id,
+            num_experts,
+        )
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.language_model.get_expert_mapping()
 
 
 ########################################################
@@ -591,19 +818,12 @@ if is_vllm():
             """Detect if weight is from fused expert checkpoint (BF16 format)."""
             # Qwen3.5 BF16 has: experts.gate_up_proj, experts.down_proj
             # Qwen3.5 FP8 has: experts.0.gate_proj, experts.0.up_proj, experts.0.down_proj
-            return "experts.gate_up_proj" in weight_name or (
-                "experts.down_proj" in weight_name
-                and ".experts." in weight_name
-                and weight_name.count(".experts.") == 1
-            )
+            return detect_fused_expert_format(weight_name)
 
         def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
             """Return mapping for fused expert weights (BF16 format)."""
             # (param_name, weight_name, shard_id)
-            return [
-                ("experts.w13_weight", "experts.gate_up_proj", "w1"),  # Will be chunked
-                ("experts.w2_weight", "experts.down_proj", "w2"),
-            ]
+            return get_fused_expert_mapping()
 
         def load_fused_expert_weights(
             self,
@@ -627,70 +847,14 @@ if is_vllm():
             Returns:
                 True if weights were loaded successfully
             """
-            param = params_dict[name]
-            weight_loader = param.weight_loader
-            loaded_local_expert = False
-
-            # Special handling for gate_up_proj: chunk into gate and up
-            if "gate_up_proj" in original_name:
-                gate_weight, up_weight = loaded_weight.chunk(2, dim=-2)
-                # Load gate part (w1)
-                for expert_id in range(num_experts):
-                    try:
-                        success = weight_loader(
-                            param,
-                            gate_weight[expert_id],
-                            name,
-                            "w1",
-                            expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            loaded_local_expert = True
-                    except TypeError:
-                        weight_loader(
-                            param, gate_weight[expert_id], name, "w1", expert_id
-                        )
-                        loaded_local_expert = True
-                # Load up part (w3)
-                for expert_id in range(num_experts):
-                    try:
-                        success = weight_loader(
-                            param,
-                            up_weight[expert_id],
-                            name,
-                            "w3",
-                            expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            loaded_local_expert = True
-                    except TypeError:
-                        weight_loader(
-                            param, up_weight[expert_id], name, "w3", expert_id
-                        )
-                        loaded_local_expert = True
-            else:
-                # down_proj or other weights - no chunking
-                for expert_id in range(num_experts):
-                    try:
-                        success = weight_loader(
-                            param,
-                            loaded_weight[expert_id],
-                            name,
-                            shard_id,
-                            expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            loaded_local_expert = True
-                    except TypeError:
-                        weight_loader(
-                            param, loaded_weight[expert_id], name, shard_id, expert_id
-                        )
-                        loaded_local_expert = True
-
-            return loaded_local_expert
+            return self.load_fused_expert_weights(
+                original_name,
+                name,
+                params_dict,
+                loaded_weight,
+                shard_id,
+                num_experts,
+            )
 
         def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             # load weights in plugin mode and discard passed weights generator

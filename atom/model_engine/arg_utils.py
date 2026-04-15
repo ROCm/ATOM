@@ -2,11 +2,14 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import logging
 from dataclasses import dataclass, fields
 from typing import List, Optional
 
 from atom import LLMEngine
 from atom.config import CompilationConfig, SpeculativeConfig
+
+logger = logging.getLogger("atom")
 
 
 def parse_size_list(size_str: str) -> List[int]:
@@ -218,6 +221,8 @@ class EngineArgs:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs["speculative_config"] = None
+
+        logger.info(f"Engine kwargs: {kwargs}")
 
         return kwargs
 

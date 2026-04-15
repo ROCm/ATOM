@@ -125,7 +125,7 @@ jobs:
     name: ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
     needs: [parse-param-lists, load-models]
     if: >-
-      always()
+      !cancelled()
       && needs.parse-param-lists.result == 'success'
       && needs.load-models.result == 'success'
     strategy:
@@ -512,7 +512,7 @@ jobs:
   # ---------- Regression re-run (GPU, matrix by model) ----------
   regression-rerun:
     if: >-
-      always()
+      !cancelled()
       && needs.generate-regression-matrix.outputs.has_matrix == 'true'
     name: Rerun ${{ matrix.cell.prefix }}
     needs: [generate-regression-matrix]
@@ -609,7 +609,7 @@ jobs:
             docker exec atom-regression bash -lc "mkdir -p /app/trace/$TRACE_SUBDIR"
 
             # Record profiler stop count before benchmark (to detect new completions)
-            STOP_COUNT_BEFORE=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null || echo 0)
+            STOP_COUNT_BEFORE=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null) || STOP_COUNT_BEFORE=0
 
             echo "=== Profiling: $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC ==="
             if ! docker exec atom-regression bash -lc "
@@ -630,7 +630,7 @@ jobs:
             # Wait for engine core to finish exporting profiler trace (blocks inference)
             # See .claude/plan/profiler-async-refactor.md for long-term fix
             for i in $(seq 1 300); do
-              STOP_COUNT=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null || echo 0)
+              STOP_COUNT=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null) || STOP_COUNT=0
               [ "$STOP_COUNT" -gt "$STOP_COUNT_BEFORE" ] && echo "Profiler trace export done after ${i}s" && break
               [ "$i" -eq 1 ] && echo "Waiting for profiler trace export..."
               [ "$i" -eq 300 ] && echo "WARNING: Profiler did not finish after 300s, proceeding anyway"

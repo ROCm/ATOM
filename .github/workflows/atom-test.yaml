@@ -463,6 +463,8 @@ jobs:
       
       - name: Run ATOM accuracy test
         timeout-minutes: 30
+        env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
         run: |
           set -euo pipefail
           echo ""
@@ -472,9 +474,10 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
-          docker exec "$CONTAINER_NAME" bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
-          "
+          # Pipe via stdin so container bash parses shell quoting in extraArgs
+          # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
+          echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
+            docker exec -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
           docker exec "$CONTAINER_NAME" bash -lc "
