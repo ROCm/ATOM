@@ -21,6 +21,7 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
     --host localhost \
     --port 8000 \
     --tensor-parallel-size 2 \
+    --attention-backend ROCM_AITER_FA \
     --kv-cache-dtype fp8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \
@@ -38,6 +39,7 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
     --host localhost \
     --port 8000 \
     --tensor-parallel-size 8 \
+    --attention-backend ROCM_AITER_FA \
     --kv-cache-dtype fp8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \

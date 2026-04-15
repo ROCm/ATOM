@@ -22,6 +22,7 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
     --port 8000 \
     --tensor-parallel-size 1 \
+    --attention-backend ROCM_AITER_FA \
     --kv-cache-dtype fp8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \

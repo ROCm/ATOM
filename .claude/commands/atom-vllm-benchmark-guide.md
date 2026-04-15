@@ -58,6 +58,7 @@ vllm serve <model_path> \
   --host localhost \
   --port 8000 \
   --tensor-parallel-size <tp> \
+  --attention-backend ROCM_AITER_FA \
   --trust-remote-code \
   --kv-cache-dtype fp8 \
   --gpu_memory_utilization 0.9 \
@@ -202,6 +203,7 @@ vllm serve <model_path> \
   --host localhost \
   --port 8000 \
   --tensor-parallel-size <tp> \
+  --attention-backend ROCM_AITER_FA \
   --trust-remote-code \
   --kv-cache-dtype fp8 \
   --profiler-config '<profiler_config_json>'

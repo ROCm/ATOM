@@ -20,6 +20,7 @@ export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 vllm serve openai/gpt-oss-120b \
     --host localhost \
     --port 8000 \
+    --attention-backend ROCM_AITER_FA \
     --kv-cache-dtype fp8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \
