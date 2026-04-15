@@ -125,7 +125,25 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [16]
+        from vllm.v1.attention.backend import (
+            MultipleOf,
+        )  # pyright: ignore[reportMissingImports]
+
+        return [MultipleOf(16)]
+
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        if block_size is None:
+            return True
+        return block_size % 16 == 0
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # OOT backends do not inherit vLLM's AttentionBackend, so mirror the
+        # vLLM 0.19 default block-size selection logic locally.
+        if cls.supports_block_size(default_block_size):
+            return default_block_size
+        return 16
 
     @staticmethod
     def get_kv_cache_shape(
@@ -1328,6 +1346,13 @@ class vllmAiterMLABackendMethods:
     def get_supported_kernel_block_sizes():
         return [1]
 
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # ATOM's MLA plugin path assumes kernel/page block size == 1 throughout
+        # metadata construction and KV-cache indexing, so force that value when
+        # vLLM 0.19 negotiates the backend-specific cache block size.
+        return 1
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -1377,12 +1402,824 @@ def AiterBackendDecoratorForPluginMode(cls):
         if not issubclass(cls.get_impl_cls(), MLAAttention):
             methods_cls = vllmAiterAttentionBackendMethods
         else:
-            methods_cls = vllmAiterMLABackendMethods
+            is_sparse_mla = getattr(cls, "is_sparse", lambda: False)()
+            if is_sparse_mla:
+                methods_cls = vllmAiterMLASparseBackendMethods
+            else:
+                methods_cls = vllmAiterMLABackendMethods
         for name in dir(methods_cls):
             if name.startswith("_"):
                 continue
             setattr(cls, name, getattr(methods_cls, name))
     return cls
+
+
+def AiterMLASparseAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
+    def decorator(cls):
+        is_vllm_mode = is_vllm()
+        is_sglang_mode = is_sglang()
+
+        base_class = default_base_class
+        class_dict = {}
+
+        # record original decorated cls methods
+        for key, value in cls.__dict__.items():
+            if not key.startswith("__") or key in (
+                "__annotations__",
+                "__init__",
+                "__module__",
+                "__qualname__",
+                "__doc__",
+            ):
+                class_dict[key] = value
+
+        # handle the generic base class
+        needs_generic = False
+        generic_base = None
+
+        if is_vllm_mode:
+            # get the base class and generic base class
+            base_class, generic_base, needs_generic, class_dict = (
+                setup_mla_sparse_attn_metadata_builder_base_class_and_attributes(
+                    class_dict
+                )
+            )
+
+            # replace the __init__ method in the decorated class
+            class_dict["__init__"] = (
+                create_mla_sparse_attn_metadata_builder_init_method(base_class)
+            )
+
+            # add the methods to the decorated class
+            for method_name in dir(vllmMLASparseAttentionMetadataBuilderMethods):
+                if not method_name.startswith("__"):
+                    method = getattr(
+                        vllmMLASparseAttentionMetadataBuilderMethods, method_name
+                    )
+                    if callable(method):
+                        class_dict[method_name] = method
+        elif is_sglang_mode:
+            raise NotImplementedError(
+                "Sparse MLA AttentionMetadataBuilder for sglang is not implemented yet"
+            )
+
+        # create the new class
+        new_class = type(cls.__name__, (base_class,), class_dict)
+
+        # replace the inherit base class for plugin mode, meanwhile support generic base class
+        if needs_generic and generic_base is not None:
+            new_class.__orig_bases__ = (generic_base[new_class],)
+
+        return new_class
+
+    return decorator
+
+
+def AiterMLASparseIndexerAttentionMetadataBuilderDecoratorForPluginMode(
+    default_base_class,
+):
+    def decorator(cls):
+        is_vllm_mode = is_vllm()
+        is_sglang_mode = is_sglang()
+
+        base_class = default_base_class
+        class_dict = {}
+
+        for key, value in cls.__dict__.items():
+            if not key.startswith("__") or key in (
+                "__annotations__",
+                "__init__",
+                "__module__",
+                "__qualname__",
+                "__doc__",
+            ):
+                class_dict[key] = value
+
+        needs_generic = False
+        generic_base = None
+
+        if is_vllm_mode:
+            base_class, generic_base, needs_generic, class_dict = (
+                setup_mla_sparse_attn_metadata_builder_base_class_and_attributes(
+                    class_dict
+                )
+            )
+
+            class_dict["__init__"] = (
+                create_mla_sparse_indexer_metadata_builder_init_method(base_class)
+            )
+
+            for method_name in dir(vllmMLASparseIndexerAttentionMetadataBuilderMethods):
+                if not method_name.startswith("__"):
+                    method = getattr(
+                        vllmMLASparseIndexerAttentionMetadataBuilderMethods, method_name
+                    )
+                    if callable(method):
+                        class_dict[method_name] = method
+        elif is_sglang_mode:
+            raise NotImplementedError(
+                "Sparse indexer AttentionMetadataBuilder for sglang is not implemented yet"
+            )
+
+        new_class = type(cls.__name__, (base_class,), class_dict)
+
+        if needs_generic and generic_base is not None:
+            new_class.__orig_bases__ = (generic_base[new_class],)
+
+        return new_class
+
+    return decorator
+
+
+@dataclass
+class vllmDeepseekV32IndexerPrefillChunkMetadata:
+    block_table: torch.Tensor
+    cu_seqlen_ks: torch.Tensor
+    cu_seqlen_ke: torch.Tensor
+    cu_seq_lens: torch.Tensor
+    token_to_seq: torch.Tensor
+    total_seq_lens: int
+    token_start: int
+    token_end: int
+    num_reqs: int
+
+
+@dataclass
+class vllmDeepseekV32IndexerPrefillMetadata:
+    chunks: list[vllmDeepseekV32IndexerPrefillChunkMetadata]
+
+
+@dataclass
+class vllmDeepseekV32IndexerDecodeMetadata:
+    block_table: torch.Tensor
+    seq_lens: torch.Tensor
+    decode_lens: torch.Tensor
+    requires_padding: bool
+    schedule_metadata: torch.Tensor
+    use_large_context_topk: bool
+    offsets: torch.Tensor | None  # Precomputed offsets for speculative decoding
+
+
+@dataclass
+class vllmDeepseekV32IndexerMetadata:
+    # FIXME (zyongye)
+    # hacky way to access the data now, need to be in chunked meta
+    seq_lens: torch.Tensor
+
+    num_reqs: int
+    max_query_len: int
+    max_seq_len: int
+
+    num_actual_tokens: int  # Number of tokens excluding padding.
+    query_start_loc: torch.Tensor
+    slot_mapping: torch.Tensor
+    # The dimension of the attention heads
+    head_dim: int
+
+    # New for MLA (compared to FlashAttention)
+    # For handling prefill decode split
+    num_decodes: int
+    num_decode_tokens: int
+    num_prefills: int
+    num_prefill_tokens: int
+
+    decode: vllmDeepseekV32IndexerDecodeMetadata | None = None
+    prefill: vllmDeepseekV32IndexerPrefillMetadata | None = None
+
+
+# TODO (zyongye) optimize this, this is now vibe coded
+def kv_spans_from_batches(
+    start_seq_loc: torch.Tensor, seq_len_per_batch: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Args:
+      start_seq_loc: 1D long tensor [B+1], cumulative counts of
+                     selected tokens per batch.
+            Example: [0, 2, 4, 7] ->
+                     batch sizes (selected) [2, 2, 3], N=7 tokens total.
+      seq_len_per_batch: 1D long tensor [B],
+                         full sequence length (KV length) of each batch.
+                         Example: [5, 9, 4].
+
+    Returns:
+      start_tensor: 1D long tensor [N], start offset in the
+                    concatenated KV cache for each token's batch.
+      end_location: 1D long tensor [N],
+                    **exclusive** end = start + token's local position.
+                    (So the attended KV slice is kv[start:end].)
+
+    Assumes each batch contributes its full `seq_len_per_batch[i]`
+    keys to the KV cache, andthe selected tokens within a batch
+    are the **last** `counts[i]` positions of that sequence.
+    """
+    q = start_seq_loc.to(dtype=torch.long)
+    L = seq_len_per_batch.to(dtype=torch.long)
+    assert q.dim() == 1 and L.dim() == 1
+    assert q.numel() == L.numel() + 1, "start_seq_loc must have length B+1"
+
+    # Selected tokens per batch and totals
+    counts = q[1:] - q[:-1]  # [B]
+    N = int(q[-1].item())  # total selected tokens
+    B = L.numel()
+
+    if N == 0:
+        return (
+            torch.empty(0, dtype=torch.long, device=device),
+            torch.empty(0, dtype=torch.long, device=device),
+        )
+
+    # KV start offsets per batch in the concatenated KV cache
+    kv_starts_per_batch = torch.cumsum(L, dim=0) - L  # [B]
+
+    # For each selected token, which batch does it belong to?
+    batch_id = torch.repeat_interleave(torch.arange(B), counts)  # [N]
+
+    # Map batch KV start to each token
+    start_tensor = kv_starts_per_batch[batch_id]  # [N]
+
+    # End-align local positions inside each batch:
+    # local_pos = L[b] - counts[b] + (1..counts[b])  for each batch b
+    L_expand = torch.repeat_interleave(L, counts)  # [N]
+    m_expand = torch.repeat_interleave(counts, counts)  # [N]
+    # position within the selected block: 1..counts[b]
+    pos_within = (
+        torch.arange(N, dtype=torch.long) - torch.repeat_interleave(q[:-1], counts) + 1
+    )
+
+    local_pos = L_expand - m_expand + pos_within  # [N], 1-based
+    end_location = start_tensor + local_pos  # exclusive end
+
+    return start_tensor.int().to(device), end_location.int().to(device)
+
+
+def get_max_prefill_buffer_size(max_model_len: int):
+    # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
+    # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
+    # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.
+    # The memory usage of the workspace there is 576 * 2 bytes; so we size this as
+    # (576 * 2 // 132) * 5 = 40 to maximize this workspace size while still fitting
+    # within the flashmla_sparse workspace.
+    # For DeepSeek-V3.2, the max_model_len is 163840.
+    #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+    return max_model_len * 40
+
+
+@dataclass
+class AiterMLASparseMetadataForPluginMode:
+    num_reqs: int
+    max_query_len: int
+    max_seq_len: int
+
+    seq_lens: torch.Tensor
+
+    num_actual_tokens: int  # Number of tokens excluding padding.
+    query_start_loc: torch.Tensor
+    slot_mapping: torch.Tensor
+
+    block_table: torch.Tensor
+    req_id_per_token: torch.Tensor
+
+    qo_indptr: torch.Tensor
+    paged_kv_last_page_len: torch.Tensor
+    paged_kv_indices: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    paged_kv_indptr_rest: torch.Tensor
+
+    block_size: int = 1
+    topk_tokens: int = 2048
+
+    # Flag to run ragged layout conversion only once per forward (shared across MLA layers)
+    ragged_layout_built: bool = False
+
+
+class vllmMLASparseAttentionMetadataBuilderMethods:
+    def __init__(self):
+        raise TypeError(
+            f"{self.__class__.__name__} is a utility class and should not be instantiated. "
+            "Its methods are meant to be added to other classes via decorators."
+        )
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        num_tokens = common_attn_metadata.num_actual_tokens
+        starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
+        seg_lengths = torch.diff(starts)
+        req_id_per_token = torch.repeat_interleave(
+            torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
+        )
+        # Zero-fill for cudagraphs
+        self.req_id_per_token_buffer.fill_(0)
+        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
+            req_id_per_token, non_blocking=True
+        )
+        self.paged_kv_indices.fill_(0)
+        self.paged_kv_indptr.fill_(0)
+
+        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        qo_indptr = self.qo_indptr[: num_tokens + 1]
+        paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
+        paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
+        paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
+        paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1 :]
+
+        attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            block_table=common_attn_metadata.block_table_tensor,
+            req_id_per_token=req_id_per_token,
+            block_size=self.kv_cache_spec.block_size,
+            topk_tokens=self.topk_tokens,
+            qo_indptr=qo_indptr,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indptr_rest=paged_kv_indptr_rest,
+        )
+
+        attn_metadata = AttentionMetaData(
+            max_seqlen_q=common_attn_metadata.max_query_len,
+            block_tables=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            plugin_metadata=attn_metadata_for_plugin_mode,
+        )
+        return attn_metadata
+
+
+class vllmMLASparseIndexerAttentionMetadataBuilderMethods:
+    """Mixin for DeepseekV32IndexerCache: builds vllmDeepseekV32IndexerMetadata only."""
+
+    def __init__(self):
+        raise TypeError(
+            f"{self.__class__.__name__} is a utility class and should not be instantiated. "
+            "Its methods are meant to be added to other classes via decorators."
+        )
+
+    def _build_indexer_one_prefill_chunk(
+        self, reqs_start, reqs_end, query_start_loc_cpu, seq_lens_cpu, block_table
+    ):
+        prefill_query_start_loc = (
+            query_start_loc_cpu[reqs_start : reqs_end + 1]
+            - query_start_loc_cpu[reqs_start]
+        )
+        cu_seqlen_ks, cu_seqlen_ke = kv_spans_from_batches(
+            prefill_query_start_loc, seq_lens_cpu[reqs_start:reqs_end], self.device
+        )
+        token_start = query_start_loc_cpu[reqs_start].item()
+        token_end = query_start_loc_cpu[reqs_end].item()
+        total_seq_lens = seq_lens_cpu[reqs_start:reqs_end].sum()
+        seq_idx = torch.arange(0, reqs_end - reqs_start, dtype=torch.int32)
+        token_to_seq = torch.repeat_interleave(
+            seq_idx, seq_lens_cpu[reqs_start:reqs_end]
+        ).to(self.device)
+        assert total_seq_lens <= self.max_prefill_buffer_size
+        cu_seq_lens = (
+            torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    seq_lens_cpu[reqs_start:reqs_end].cumsum(dim=0),
+                ]
+            )
+            .to(torch.int32)
+            .to(self.device)
+        )
+        return vllmDeepseekV32IndexerPrefillChunkMetadata(
+            cu_seqlen_ks=cu_seqlen_ks,
+            cu_seqlen_ke=cu_seqlen_ke,
+            cu_seq_lens=cu_seq_lens,
+            token_to_seq=token_to_seq,
+            total_seq_lens=total_seq_lens,
+            block_table=block_table[reqs_start:reqs_end],
+            token_start=token_start,
+            token_end=token_end,
+            num_reqs=reqs_end - reqs_start,
+        )
+
+    def _build_indexer(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata=None,
+        fast_build: bool = False,
+    ) -> vllmDeepseekV32IndexerMetadata:
+        from vllm.v1.attention.backends.utils import (
+            split_decodes_and_prefills,
+            split_prefill_chunks,
+        )
+        from vllm.platforms import current_platform
+        from vllm.utils.deep_gemm import (
+            get_paged_mqa_logits_metadata,
+            is_deep_gemm_supported,
+        )
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata, decode_threshold=self.reorder_batch_threshold
+            )
+        )
+
+        assert num_decodes + num_prefills == num_reqs
+        assert num_decode_tokens + num_prefill_tokens == num_tokens
+
+        prefill_metadata = None
+        if num_prefills > 0:
+            chunk_seq_ids = split_prefill_chunks(
+                common_attn_metadata.seq_lens_cpu[num_decodes:],
+                self.max_prefill_buffer_size,
+                request_offset=num_decodes,
+            )
+            chunks = [
+                self._build_indexer_one_prefill_chunk(
+                    reqs_start,
+                    reqs_end,
+                    query_start_loc_cpu,
+                    common_attn_metadata.seq_lens_cpu,
+                    common_attn_metadata.block_table_tensor,
+                )
+                for reqs_start, reqs_end in chunk_seq_ids
+            ]
+            prefill_metadata = vllmDeepseekV32IndexerPrefillMetadata(
+                chunks=chunks,
+            )
+
+        decode_metadata = None
+        if num_decodes > 0:
+            torch.diff(
+                common_attn_metadata.query_start_loc[: num_decodes + 1],
+                out=self.decode_lens_buffer[:num_decodes],
+            )
+            decode_lens = self.decode_lens_buffer[:num_decodes]
+            decode_lens_cpu = torch.diff(
+                common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+            )
+
+            seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+            block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
+
+            # Padded CUDA graph requests have block_table entries of -1.
+            # Clamp to 0 to prevent OOB access in the DeepGEMM kernel.
+            # This is safe because padded requests have seq_lens=0, so the
+            # kernel produces no meaningful output for those rows.
+            block_table.clamp_(min=0)
+
+            max_decode_len = int(decode_lens_cpu.max().item())
+            if max_decode_len > 1:
+                # Flatten multi-token decode requests into single-token
+                # batch entries, expanding seq_lens and block tables so
+                # the kernel always sees next_n=1.
+
+                # Assume 4 requests with seq_lens [10, 7, 12, 0] (the final req is
+                # padding) and decode_lens [3, 1, 4, 0] in the below example comments.
+                # The context lengths are therefore
+                # [10-3, 7-1, 12-4, 0-0] = [7, 6, 8, 0].
+
+                # 3 + 1 + 4 + 0 = 8
+                actual_expanded = int(decode_lens_cpu.sum().item())
+
+                # [7, 6, 8, 0] -> [7, 7, 7, 6, 8, 8, 8, 8]
+                expanded_base = torch.repeat_interleave(
+                    seq_lens - decode_lens, decode_lens, output_size=actual_expanded
+                )
+
+                # [0, 3, 4, 8] -> [0, 0, 0, 3, 4, 4, 4, 4]
+                expanded_starts = torch.repeat_interleave(
+                    common_attn_metadata.query_start_loc[:num_decodes],
+                    decode_lens,
+                    output_size=actual_expanded,
+                )
+
+                # [0, 1, 2, 0, 0, 1, 2, 3]
+                positions_within = (
+                    self.arange_buffer[:actual_expanded] - expanded_starts
+                )
+
+                # [8, 9, 10, 7, 9, 10, 11, 12, ...] where ... is unused buffer space
+                self.expanded_seq_lens_buffer[:actual_expanded] = (
+                    expanded_base + positions_within + 1
+                )
+                self.expanded_seq_lens_buffer[actual_expanded:] = 0
+                seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
+
+                # Give each of the flattened entries the same block table row as the
+                # original request.
+                self.expanded_block_table_buffer[:actual_expanded] = (
+                    torch.repeat_interleave(
+                        block_table, decode_lens, dim=0, output_size=actual_expanded
+                    )
+                )
+                if actual_expanded < num_decode_tokens:
+                    self.expanded_block_table_buffer[
+                        actual_expanded:num_decode_tokens, 0
+                    ] = 0
+                block_table = self.expanded_block_table_buffer[:num_decode_tokens]
+
+                # All reqs now have decode_len=1
+                self.decode_lens_buffer[:num_decode_tokens] = 1
+                decode_lens = self.decode_lens_buffer[:num_decode_tokens]
+                offsets = None
+                batch_size = num_decode_tokens
+            else:
+                next_n = 1 + self.num_speculative_tokens
+                if next_n > 1:
+                    offsets = torch.arange(
+                        next_n, device=self.device, dtype=torch.int32
+                    )
+                else:
+                    offsets = None
+                batch_size = num_decodes
+
+            # DeepGEMM is required for the paged MQA logits on CUDA devices
+            if current_platform.is_cuda() and is_deep_gemm_supported():
+                self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+                    seq_lens,
+                    self.kv_cache_spec.block_size,
+                    self.num_sms,
+                )
+
+            # Decide which top-k kernel to use based on batch size and sequence length
+            # Decision logic based on micro-benchmark results:
+            # - large_context_topk wins for batch <= 128 and seq_len > 8K
+            # - top_k_per_row_decode wins for batch > 128 or seq_len <= 8K
+            _is_large_context = common_attn_metadata.max_seq_len > 8192
+            use_large_context_topk = batch_size <= 128 and _is_large_context
+
+            decode_metadata = vllmDeepseekV32IndexerDecodeMetadata(
+                block_table=block_table,
+                seq_lens=seq_lens,
+                decode_lens=decode_lens,
+                requires_padding=False,
+                schedule_metadata=self.scheduler_metadata_buffer,
+                use_large_context_topk=use_large_context_topk,
+                offsets=offsets,
+            )
+
+        indexer_metadata = vllmDeepseekV32IndexerMetadata(
+            seq_lens=common_attn_metadata.seq_lens,
+            num_reqs=common_attn_metadata.num_reqs,
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            head_dim=128,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            prefill=prefill_metadata,
+            decode=decode_metadata,
+        )
+
+        return indexer_metadata
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        indexer_metadata = self._build_indexer(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build,
+        )
+        return AttentionMetaData(
+            max_seqlen_q=common_attn_metadata.max_query_len,
+            block_tables=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            plugin_metadata=indexer_metadata,
+        )
+
+
+class vllmAiterMLASparseBackendMethods:
+    accept_output_buffer: bool = True
+    supported_dtypes: list = [torch.float16, torch.bfloat16]
+    forward_includes_kv_cache_update: bool = True
+
+    def __init__(self):
+        raise TypeError(
+            f"{self.__class__.__name__} is a utility class and should not be instantiated. "
+            "Its methods are meant to be added to other classes via decorators."
+        )
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [1]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # ATOM's sparse MLA plugin path assumes kernel/page block size == 1
+        # throughout metadata construction and KV-cache indexing, so force that
+        # value when vLLM 0.19 negotiates the backend-specific cache block size.
+        return 1
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,  # assumed to be 1 for MLA
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        return (num_blocks, block_size, head_size)
+
+    @classmethod
+    def is_mla(cls) -> bool:
+        return True
+
+    @classmethod
+    def is_sparse(cls) -> bool:
+        return True
+
+    @staticmethod
+    def get_required_kv_cache_layout():
+        return None
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        return [576]
+
+    @classmethod
+    def full_cls_name(cls) -> tuple[str, str]:
+        return (cls.__module__, cls.__qualname__)
+
+    @classmethod
+    def supports_alibi_sqrt(cls) -> bool:
+        return False
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        # `stride_order` indicates the permutation that gets
+        # us from `get_kv_cache_shape` to the actual memory layout we want.
+        # (num_blocks, num_layers, block_size, head_size)
+        return (1, 0, 2, 3) if include_num_layers_dimension else (0, 1, 2)
+
+
+def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
+    def init_method_under_plugin_mode(
+        self,
+        kv_cache_spec=None,
+        layer_names=None,
+        config=None,
+        device=None,
+        model_runner=None,
+    ):
+        base_class.__init__(self, kv_cache_spec, layer_names, config, device)
+        logger.info("init AiterMLASparseIndexerMetadataBuilder for plugin mode")
+        from vllm.config import VllmConfig
+
+        try:
+            from vllm.utils.platform_utils import num_compute_units
+        except ImportError:
+            from vllm.utils.platform_utils import get_cu_count as num_compute_units
+        from vllm.v1.worker.cp_utils import get_total_cp_world_size
+        from vllm.utils.math_utils import cdiv
+
+        assert isinstance(config, VllmConfig)
+
+        self.vllm_config = config
+        self.model_config = config.model_config
+        self.kv_cache_spec = kv_cache_spec
+        self.device = device
+        max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+
+        self.max_prefill_buffer_size = get_max_prefill_buffer_size(
+            self.model_config.max_model_len
+        )
+        self.num_speculative_tokens = (
+            self.vllm_config.speculative_config.num_speculative_tokens
+            if self.vllm_config.speculative_config
+            else 0
+        )
+        self.reorder_batch_threshold += self.num_speculative_tokens
+
+        sm_count = num_compute_units(self.device.index)
+        self.num_sms = sm_count
+
+        self.decode_lens_buffer = torch.empty(
+            (max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        # Pre-allocated buffers for flattening (spec decode).
+        self.arange_buffer = torch.arange(
+            config.scheduler_config.max_num_seqs * (1 + self.num_speculative_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.expanded_seq_lens_buffer = torch.zeros(
+            (max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        max_num_blocks_per_req = cdiv(
+            self.vllm_config.model_config.max_model_len,
+            self.kv_cache_spec.block_size * get_total_cp_world_size(),
+        )
+        self.expanded_block_table_buffer = torch.zeros(
+            (
+                max_num_batched_tokens,
+                max_num_blocks_per_req,
+            ),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        # See: DeepGMM/csrc/apis/attention.hpp
+        self.scheduler_metadata_buffer = torch.empty(
+            (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
+        )
+
+    return init_method_under_plugin_mode
+
+
+def create_mla_sparse_attn_metadata_builder_init_method(base_class):
+
+    def init_method_under_plugin_mode(
+        self,
+        kv_cache_spec=None,
+        layer_names=None,
+        config=None,
+        device=None,
+        model_runner=None,
+    ):
+        base_class.__init__(self, kv_cache_spec, layer_names, config, device)
+        logger.info("init AiterMLASparseAttentionMetadataBuilder for plugin mode")
+        from vllm.config import VllmConfig
+        from vllm.model_executor.layers.attention.mla_attention import (
+            get_mla_dims,
+        )
+
+        assert isinstance(config, VllmConfig)
+
+        self.vllm_config = config
+        self.model_config = config.model_config
+        self.kv_cache_spec = kv_cache_spec
+        self.device = device
+        max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+
+        parallel_config = config.parallel_config
+        self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
+        self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
+        self.mla_dims = get_mla_dims(self.model_config)
+        self.topk_tokens = config.model_config.hf_config.index_topk
+        self.topk_tokens_tensor = torch.tensor(
+            [self.topk_tokens], device=device, dtype=torch.int32
+        )
+        self.max_model_len_tensor = torch.tensor(
+            [self.model_config.max_model_len], device=device, dtype=torch.int32
+        )
+        # this is ignored by `flash_mla_with_kvcache` if indices not None
+        self.dummy_block_table = torch.empty(
+            (1, 1), dtype=torch.int32, device=self.device
+        )
+
+        self.req_id_per_token_buffer = torch.empty(
+            (max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.qo_indptr = torch.arange(
+            0, max_num_batched_tokens + 1, dtype=torch.int32, device=device
+        )
+        self.paged_kv_last_page_len = torch.ones(
+            max_num_batched_tokens, dtype=torch.int32, device=device
+        )
+
+        # These two needs to be calculated in runtime,
+        # but we still needs to prepare the buffer
+        self.paged_kv_indices = torch.zeros(
+            [max_num_batched_tokens * self.topk_tokens],
+            dtype=torch.int32,
+            device=device,
+        )
+        self.paged_kv_indptr = torch.zeros(
+            [max_num_batched_tokens + 1], dtype=torch.int32, device=device
+        )
+
+    return init_method_under_plugin_mode
+
+
+def setup_mla_sparse_attn_metadata_builder_base_class_and_attributes(class_dict: dict):
+    from vllm.v1.attention.backend import (
+        AttentionCGSupport,
+        AttentionMetadataBuilder,
+    )
+
+    base_class = AttentionMetadataBuilder
+    generic_base = AttentionMetadataBuilder
+    needs_generic = True
+
+    # align with vllm ROCMAiterMLASparseMetadataBuilder
+    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # For indexer metadata, not present in vllm sparse MLA
+    class_dict["reorder_batch_threshold"] = 1
+
+    return base_class, generic_base, needs_generic, class_dict
 
 
 # here not register it as a custom op and mark split because vllm

@@ -1,0 +1,418 @@
+name: ATOM SGLang Accuracy Validation
+
+on:
+  schedule:
+    # Nightly at 02:00 Beijing time (18:00 UTC on the previous day)
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    # Manual runs use GitHub Actions' built-in branch dropdown ("Use workflow
+    # from") as the ATOM branch selector, so users do not need to type branch
+    # names.
+    inputs:
+      run_dsr1_fp8_tp4:
+        description: "DeepSeek-R1-FP8 TP4"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  NIGHTLY_SGLANG_IMAGE_TAG: rocm/atom-dev:sglang-latest
+  VALIDATION_IMAGE_REPO: rocm/atom-dev
+  GPU_ARCH: "gfx942;gfx950"
+  AITER_REPO: "https://github.com/ROCm/aiter.git"
+  AITER_COMMIT: "HEAD"
+  SGLANG_REF: "v0.5.10"
+
+jobs:
+  # ---------- SGLANG full validation path (schedule / workflow_dispatch) ----------
+  prepare-sglang-image:
+    name: Prepare SGLANG validation image
+    runs-on: build-only-atom
+    outputs:
+      sglang_image_tag: ${{ steps.meta.outputs.sglang_image_tag }}
+      cleanup_temp_image: ${{ steps.meta.outputs.cleanup_temp_image }}
+      model_matrix: ${{ steps.meta.outputs.model_matrix }}
+    steps:
+      - name: Checkout selected ATOM branch
+        uses: actions/checkout@v6
+
+      - name: Docker Login
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != 'main' }}
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Resolve image source and model matrix
+        id: meta
+        env:
+          RUN_DSR1_FP8_TP4: ${{ inputs.run_dsr1_fp8_tp4 }}
+        run: |
+          set -euo pipefail
+
+          # Keep this Python model list as the single source of truth for SGLANG
+          # full-validation coverage and manual checkbox filtering.
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          models = [
+              {
+                  "toggle_env": "RUN_DSR1_FP8_TP4",
+                  "model_name": "DeepSeek-R1-FP8 TP4",
+                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "extra_args": "--tensor-parallel-size 4",
+                  "accuracy_test_threshold": 0.92,
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
+                  "runner": "linux-atom-mi35x-4",
+              },
+          ]
+
+          selected = []
+          for model in models:
+              enabled = event != "workflow_dispatch" or os.environ.get(model["toggle_env"], "").lower() == "true"
+              if enabled:
+                  selected.append({k: v for k, v in model.items() if k != "toggle_env"})
+
+          if event == "workflow_dispatch" and not selected:
+              print("No models selected for manual run.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"model_matrix={json.dumps({'include': selected})}")
+          PY
+
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF_NAME}" = "main" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "Manual run on main reuses published SGLANG image: ${NIGHTLY_SGLANG_IMAGE_TAG}"
+            else
+              echo "Scheduled run uses published SGLANG image: ${NIGHTLY_SGLANG_IMAGE_TAG}"
+            fi
+            echo "sglang_image_tag=${NIGHTLY_SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
+            echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          MANUAL_BASE_IMAGE_TAG="atom_sglang_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          SGLANG_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:sglang-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          BUILD_CONTEXT="$(mktemp -d)"
+          trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
+
+          git archive --format=tar HEAD | tar -xf - -C "${BUILD_CONTEXT}"
+
+          cat <<'EOF' > "${BUILD_CONTEXT}/Dockerfile.mod"
+          ARG ATOM_BASE_NIGHTLY_IMAGE
+          FROM ${ATOM_BASE_NIGHTLY_IMAGE}
+          ARG GPU_ARCH
+          ARG AITER_REPO
+          ARG AITER_COMMIT
+          RUN pip install -U lm-eval[api]
+          RUN pip show lm-eval || true
+          RUN pip install hf_transfer
+          RUN pip show hf_transfer || true
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y amd-aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          RUN rm -rf /app/aiter-test
+          RUN git clone --depth 1 "${AITER_REPO}" /app/aiter-test && \
+              cd /app/aiter-test && \
+              git checkout "${AITER_COMMIT}" && \
+              git submodule sync && git submodule update --init --recursive && \
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS="${GPU_ARCH}" python3 setup.py develop
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
+          RUN pip uninstall -y atom
+          RUN rm -rf /app/ATOM
+          COPY . /app/ATOM
+          RUN cd /app/ATOM && pip install -e .
+          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          EOF
+
+          echo "Building manual SGLANG image from branch ${GITHUB_REF_NAME}"
+
+          docker build --pull --network=host --no-cache \
+            -t "${MANUAL_BASE_IMAGE_TAG}" \
+            --build-arg ATOM_BASE_NIGHTLY_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            --build-arg GPU_ARCH="${GPU_ARCH}" \
+            --build-arg AITER_REPO="${AITER_REPO}" \
+            --build-arg AITER_COMMIT="${AITER_COMMIT}" \
+            -f "${BUILD_CONTEXT}/Dockerfile.mod" \
+            "${BUILD_CONTEXT}"
+
+          docker build --network=host --no-cache \
+            -t "${SGLANG_IMAGE_TAG}" \
+            --target atom_sglang \
+            --build-arg SGLANG_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
+            --build-arg MAX_JOBS=64 \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            --build-arg INSTALL_FASTSAFETENSORS=1 \
+            -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+            "${BUILD_CONTEXT}"
+
+          docker push "${SGLANG_IMAGE_TAG}"
+
+          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
+          echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Clean up builder images
+        if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
+        run: |
+          docker rmi "${{ steps.meta.outputs.sglang_image_tag }}" || true
+          docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
+
+  sglang-model-accuracy:
+    name: SGLANG Model Accuracy (${{ matrix.model_name }})
+    needs: [prepare-sglang-image]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-sglang-image.outputs.model_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    permissions:
+      actions: read
+      contents: write
+    env:
+      CONTAINER_NAME: atom_sglang_validation_${{ strategy.job-index }}
+      SGLANG_IMAGE_TAG: ${{ needs.prepare-sglang-image.outputs.sglang_image_tag }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Docker Login
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
+
+      - name: Pull SGLANG image
+        run: |
+          docker pull "${SGLANG_IMAGE_TAG}"
+
+      - name: Prepare model cache mount
+        run: |
+          MODEL_CACHE_MOUNT=""
+          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
+
+          if [ -d "/models" ]; then
+            MODEL_CACHE_MOUNT="-v /models:/models"
+            MODEL_CACHE_DESC="/models (host mount)"
+          else
+            echo "Warning: /models directory not found on runner; using container-local /models."
+          fi
+
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
+          echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+
+      - name: Clean up old containers
+        run: |
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+      - name: Start validation container
+        run: |
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+
+          cat > /tmp/sglang_env_file.txt << 'EOF'
+          ${{ matrix.env_vars }}
+          EOF
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            $MODEL_MOUNT \
+            -w /workspace \
+            --ipc=host --group-add video \
+            --shm-size=16G \
+            --privileged \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            --env-file /tmp/sglang_env_file.txt \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --name "$CONTAINER_NAME" \
+            "${SGLANG_IMAGE_TAG}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Download model if needed
+        run: |
+          set -euo pipefail
+          model_dir="/models/${{ matrix.model_path }}"
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
+            if ! docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_PATH="${{ matrix.model_path }}" \
+              -e MODEL_DIR="$model_dir" \
+              -e RUNNER_NAME="${{ matrix.runner }}" \
+              -e LOCK_SUFFIX="$lock_suffix" \
+              "$CONTAINER_NAME" \
+              bash -lc '
+                set -euo pipefail
+                completion_flag="$MODEL_DIR/.download-complete"
+                use_model_lock="true"
+
+                if [ "$RUNNER_NAME" = "atom-mi355-8gpu.predownload" ]; then
+                  use_model_lock="false"
+                fi
+
+                download_model() {
+                  if [ -f "$MODEL_DIR/config.json" ]; then
+                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
+                  else
+                    echo "Model not found under ${MODEL_DIR}; downloading model"
+                  fi
+
+                  rm -f "$completion_flag"
+                  hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  touch "$completion_flag"
+                }
+
+                if [ -f "$completion_flag" ]; then
+                  echo "Model already exists under ${MODEL_DIR}; skip download"
+                elif [ "$use_model_lock" != "true" ]; then
+                  echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
+                  download_model
+                else
+                  lock_dir="/models/.cache/atom-download-locks"
+                  mkdir -p "$lock_dir"
+                  lock_file="$lock_dir/${LOCK_SUFFIX}.lock"
+                  exec 9>"$lock_file"
+                  echo "Waiting for model download lock: $lock_file"
+                  if ! flock -w 7200 9; then
+                    echo "Timed out waiting for model download lock: $lock_file"
+                    exit 1
+                  fi
+
+                  if [ -f "$completion_flag" ]; then
+                    echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
+                  else
+                    download_model
+                  fi
+                fi
+              '; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not mounted; skipping model download"
+          fi
+
+      - name: Resolve SGLANG model path
+        if: success()
+        run: |
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            echo "SGLANG_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: /models/${{ matrix.model_path }}"
+          else
+            echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using model id: ${{ matrix.model_path }}"
+          fi
+
+      - name: Run SGLANG launch and gsm8k accuracy via script (full mode)
+        timeout-minutes: 120
+        env:
+          SGLANG_MODEL_NAME: ${{ matrix.model_name }}
+          SGLANG_MODEL_PATH: ${{ matrix.model_path }}
+          SGLANG_EXTRA_ARGS: ${{ matrix.extra_args }}
+          SGLANG_ENV_VARS: ${{ matrix.env_vars }}
+          MAX_WAIT_RETRIES: "120"
+          STREAM_SGLANG_LOGS: "1"
+          LM_EVAL_TASK: "gsm8k"
+        run: |
+          docker exec \
+            -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
+            -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
+            -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+            -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
+            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
+            -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
+            -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              bash .github/scripts/atom_sglang_test.sh accuracy
+            "
+
+      - name: Check SGLANG accuracy test results
+        if: success()
+        run: |
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+            echo "ERROR: No results JSON file found in atom_sglang_accuracy_results/"
+            exit 2
+          fi
+
+          echo "RESULT_FILE: $result_file"
+          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
+          echo "Flexible extract value: $flexible_extract_value"
+          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          if [ "$result" -eq 1 ]; then
+            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 1
+          else
+            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 0
+          fi
+
+      - name: Collect summary
+        if: success()
+        run: |
+          echo "SGLANG gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+
+      - name: Upload model artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-validation-${{ matrix.model_name }}-${{ github.run_id }}
+          path: |
+            atom_sglang.log
+            atom_sglang_accuracy_output.txt
+            atom_sglang_accuracy_results
+
+      - name: Upload accuracy results for dashboard
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: accuracy-${{ matrix.model_name }}
+          path: atom_sglang_accuracy_results/*.json
+          if-no-files-found: ignore
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          docker stop "$CONTAINER_NAME" || true
+          docker rm "$CONTAINER_NAME" || true
+          docker rmi "${SGLANG_IMAGE_TAG}" || true

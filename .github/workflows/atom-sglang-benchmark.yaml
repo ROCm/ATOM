@@ -1,4 +1,4 @@
-name: ATOM vLLM OOT Benchmark
+name: ATOM SGLang Benchmark
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
@@ -7,68 +7,12 @@ concurrency:
 on:
   workflow_dispatch:
     inputs:
-      deepseek-r1-fp8:
+      deepseek-r1-fp8-tp8:
         description: "DeepSeek-R1 FP8 TP8"
         type: boolean
         default: false
-      deepseek-r1-mxfp4:
-        description: "DeepSeek-R1 MXFP4 TP8"
-        type: boolean
-        default: false
-      gpt-oss-120b:
-        description: "gpt-oss-120b TP1"
-        type: boolean
-        default: false
-      kimi-k2-thinking-mxfp4-tp4:
-        description: "Kimi-K2-Thinking-MXFP4 TP4"
-        type: boolean
-        default: false
-      kimi-k2-thinking-mxfp4-tp8:
-        description: "Kimi-K2-Thinking-MXFP4 TP8"
-        type: boolean
-        default: false
-      kimi-k2-5-mxfp4-tp4:
-        description: "Kimi-K2.5-MXFP4 TP4"
-        type: boolean
-        default: false
-      kimi-k2-5-mxfp4-tp8:
-        description: "Kimi-K2.5-MXFP4 TP8"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-tp2:
-        description: "Qwen3.5-397B-A17B TP2"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-tp4:
-        description: "Qwen3.5-397B-A17B TP4"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b:
-        description: "Qwen3.5-397B-A17B TP8"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-tp2:
-        description: "Qwen3.5-397B-A17B-FP8 TP2"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-tp4:
-        description: "Qwen3.5-397B-A17B-FP8 TP4"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8:
-        description: "Qwen3.5-397B-A17B-FP8 TP8"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-tp1:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1"
-        type: boolean
-        default: false
-      qwen3-next-80b-a3b-instruct-fp8-tp4:
-        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
-        type: boolean
-        default: false
-      oot_image:
-        description: "Optional OOT benchmark image override. Leave empty to use vllm-latest on main or rebuild from the selected non-main branch."
+      sglang_image:
+        description: "Optional SGLang benchmark image override. Leave empty to use sglang-latest on main or rebuild from the selected non-main branch."
         type: string
         default: ""
       publish_to_dashboard:
@@ -93,12 +37,12 @@ jobs:
       atom_repository: ${{ steps.resolve.outputs.atom_repository }}
       atom_ref: ${{ steps.resolve.outputs.atom_ref }}
       normalized_ref: ${{ steps.resolve.outputs.normalized_ref }}
-      rebuild_oot_image: ${{ steps.resolve.outputs.rebuild_oot_image }}
-      prebuilt_oot_image: ${{ steps.resolve.outputs.prebuilt_oot_image }}
-      selected_vllm_commit: ${{ steps.resolve.outputs.selected_vllm_commit }}
-      selected_vllm_version: ${{ steps.resolve.outputs.selected_vllm_version }}
-      oot_base_image: ${{ steps.resolve.outputs.oot_base_image }}
-      oot_image_source: ${{ steps.resolve.outputs.oot_image_source }}
+      rebuild_sglang_image: ${{ steps.resolve.outputs.rebuild_sglang_image }}
+      prebuilt_sglang_image: ${{ steps.resolve.outputs.prebuilt_sglang_image }}
+      selected_sglang_ref: ${{ steps.resolve.outputs.selected_sglang_ref }}
+      selected_sglang_version: ${{ steps.resolve.outputs.selected_sglang_version }}
+      sglang_base_image: ${{ steps.resolve.outputs.sglang_base_image }}
+      sglang_image_source: ${{ steps.resolve.outputs.sglang_image_source }}
       publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
     steps:
       - name: Checkout selected branch
@@ -107,32 +51,32 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
-          INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
+          INPUT_SGLANG_IMAGE: ${{ inputs.sglang_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
         run: |
           set -euo pipefail
 
           ATOM_REPOSITORY="${GITHUB_REPOSITORY}"
           ATOM_REF="${GITHUB_REF_NAME}"
-          OOT_BASE_IMAGE="rocm/atom-dev:latest"
+          SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 
           NORMALIZED_REF="${ATOM_REF#refs/heads/}"
           NORMALIZED_REF="${NORMALIZED_REF#refs/tags/}"
 
-          PREBUILT_OOT_IMAGE=""
-          REBUILD_OOT_IMAGE=false
-          OOT_IMAGE_SOURCE="prebuilt"
-          USER_PROVIDED_OOT_IMAGE=false
-          if [[ -n "${INPUT_OOT_IMAGE}" ]]; then
-            PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE}"
-            OOT_IMAGE_SOURCE="user-provided"
-            USER_PROVIDED_OOT_IMAGE=true
+          PREBUILT_SGLANG_IMAGE=""
+          REBUILD_SGLANG_IMAGE=false
+          SGLANG_IMAGE_SOURCE="prebuilt"
+          USER_PROVIDED_SGLANG_IMAGE=false
+          if [[ -n "${INPUT_SGLANG_IMAGE}" ]]; then
+            PREBUILT_SGLANG_IMAGE="${INPUT_SGLANG_IMAGE}"
+            SGLANG_IMAGE_SOURCE="user-provided"
+            USER_PROVIDED_SGLANG_IMAGE=true
           elif [[ "${NORMALIZED_REF}" == "main" ]]; then
-            PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
-            OOT_IMAGE_SOURCE="prebuilt"
+            PREBUILT_SGLANG_IMAGE="rocm/atom-dev:sglang-latest"
+            SGLANG_IMAGE_SOURCE="prebuilt"
           else
-            REBUILD_OOT_IMAGE=true
-            OOT_IMAGE_SOURCE="rebuild"
+            REBUILD_SGLANG_IMAGE=true
+            SGLANG_IMAGE_SOURCE="rebuild"
           fi
 
           PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
@@ -142,57 +86,57 @@ jobs:
           from pathlib import Path
 
           text = Path(".github/workflows/docker-release.yaml").read_text(encoding="utf-8")
-          commit_match = re.search(r'^\s*VLLM_COMMIT:\s*"([^"]+)"', text, re.MULTILINE)
-          version_match = re.search(r'^\s*VLLM_VERSION:\s*"([^"]+)"', text, re.MULTILINE)
+          commit_match = re.search(r'^\s*SGLANG_REF:\s*"([^"]+)"', text, re.MULTILINE)
+          version_match = re.search(r'^\s*SGLANG_VERSION:\s*"([^"]+)"', text, re.MULTILINE)
 
           if not commit_match or not version_match:
-              raise SystemExit("Failed to read VLLM_COMMIT/VLLM_VERSION from .github/workflows/docker-release.yaml")
+              raise SystemExit("Failed to read SGLANG_REF/SGLANG_VERSION from .github/workflows/docker-release.yaml")
 
           print(commit_match.group(1))
           print(version_match.group(1))
           PY
           )
 
-          SELECTED_VLLM_COMMIT="${VLLM_META[0]}"
-          SELECTED_VLLM_VERSION="${VLLM_META[1]}"
+          SELECTED_SGLANG_REF="${VLLM_META[0]}"
+          SELECTED_SGLANG_VERSION="${VLLM_META[1]}"
 
           {
             echo "atom_repository=${ATOM_REPOSITORY}"
             echo "atom_ref=${ATOM_REF}"
             echo "normalized_ref=${NORMALIZED_REF}"
-            echo "rebuild_oot_image=${REBUILD_OOT_IMAGE}"
-            echo "prebuilt_oot_image=${PREBUILT_OOT_IMAGE}"
-            echo "selected_vllm_commit=${SELECTED_VLLM_COMMIT}"
-            echo "selected_vllm_version=${SELECTED_VLLM_VERSION}"
-            echo "oot_base_image=${OOT_BASE_IMAGE}"
-            echo "oot_image_source=${OOT_IMAGE_SOURCE}"
+            echo "rebuild_sglang_image=${REBUILD_SGLANG_IMAGE}"
+            echo "prebuilt_sglang_image=${PREBUILT_SGLANG_IMAGE}"
+            echo "selected_sglang_ref=${SELECTED_SGLANG_REF}"
+            echo "selected_sglang_version=${SELECTED_SGLANG_VERSION}"
+            echo "sglang_base_image=${SGLANG_BASE_IMAGE}"
+            echo "sglang_image_source=${SGLANG_IMAGE_SOURCE}"
             echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
           } >> "$GITHUB_OUTPUT"
 
-          printf '### OOT benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
+          printf '### SGLang benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
             "${ATOM_REPOSITORY}" \
             "${ATOM_REF}" \
-            "${OOT_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
+            "${SGLANG_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "${USER_PROVIDED_OOT_IMAGE}" == "true" ]]; then
-            printf -- '- User-provided image: `%s`\n- Expected vLLM version: `%s`\n- Expected vLLM commit: `%s`\n' \
-              "${PREBUILT_OOT_IMAGE}" \
-              "${SELECTED_VLLM_VERSION}" \
-              "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
-            printf -- '\nBecause an explicit `oot_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
+          if [[ "${USER_PROVIDED_SGLANG_IMAGE}" == "true" ]]; then
+            printf -- '- User-provided image: `%s`\n- Expected SGLang version: `%s`\n- Expected SGLang commit: `%s`\n' \
+              "${PREBUILT_SGLANG_IMAGE}" \
+              "${SELECTED_SGLANG_VERSION}" \
+              "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '\nBecause an explicit `sglang_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
               >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "${REBUILD_OOT_IMAGE}" == "true" ]]; then
-            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `.github/workflows/docker-release.yaml`\n' \
-              "${OOT_BASE_IMAGE}" \
-              "${SELECTED_VLLM_VERSION}" \
-              "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
-            printf -- '\nBecause branch `%s` is not `main` and no `oot_image` override was provided, a custom OOT docker is rebuilt from the selected branch.\n' \
+          elif [[ "${REBUILD_SGLANG_IMAGE}" == "true" ]]; then
+            printf -- '- Base image: `%s`\n- SGLang version: `%s`\n- SGLang commit: `%s`\n- SGLang source: `.github/workflows/docker-release.yaml`\n' \
+              "${SGLANG_BASE_IMAGE}" \
+              "${SELECTED_SGLANG_VERSION}" \
+              "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '\nBecause branch `%s` is not `main` and no `sglang_image` override was provided, a custom SGLang docker is rebuilt from the selected branch.\n' \
               "${ATOM_REF}" >> "$GITHUB_STEP_SUMMARY"
           else
-            printf -- '- Prebuilt image: `%s`\n- Expected vLLM version: `%s`\n- Expected vLLM commit: `%s`\n' \
-              "${PREBUILT_OOT_IMAGE}" \
-              "${SELECTED_VLLM_VERSION}" \
-              "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
+            printf -- '- Prebuilt image: `%s`\n- Expected SGLang version: `%s`\n- Expected SGLang commit: `%s`\n' \
+              "${PREBUILT_SGLANG_IMAGE}" \
+              "${SELECTED_SGLANG_VERSION}" \
+              "${SELECTED_SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           printf -- '- Upload to dashboard: `%s`\n' \
@@ -243,7 +187,7 @@ jobs:
           echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
 
   load-models:
-    name: Load OOT model configs
+    name: Load SGLang model configs
     runs-on: ubuntu-latest
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
@@ -252,52 +196,45 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
-          ENABLE_DEEPSEEK_R1_FP8: ${{ inputs.deepseek-r1-fp8 }}
-          ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4 }}
-          ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b }}
-          ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
-          ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
-          ENABLE_KIMI_K25_TP4: ${{ inputs.kimi-k2-5-mxfp4-tp4 }}
-          ENABLE_KIMI_K25_TP8: ${{ inputs.kimi-k2-5-mxfp4-tp8 }}
-          ENABLE_QWEN3_5_397B_A17B_TP2: ${{ inputs.qwen3-5-397b-a17b-tp2 }}
-          ENABLE_QWEN3_5_397B_A17B_TP4: ${{ inputs.qwen3-5-397b-a17b-tp4 }}
-          ENABLE_QWEN3_5_397B_A17B: ${{ inputs.qwen3-5-397b-a17b }}
-          ENABLE_QWEN3_5_397B_A17B_FP8_TP2: ${{ inputs.qwen3-5-397b-a17b-fp8-tp2 }}
-          ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}
-          ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}
-          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}
+          ENABLE_DEEPSEEK_R1_FP8_TP8: ${{ inputs.deepseek-r1-fp8-tp8 }}
         run: |
-          MODELS_JSON="$(jq -c '
-            map(select(
-              (.prefix == "deepseek-r1-fp8" and env.ENABLE_DEEPSEEK_R1_FP8 == "true")
-              or (.prefix == "deepseek-r1-mxfp4" and env.ENABLE_DEEPSEEK_R1_MXFP4 == "true")
-              or (.prefix == "gpt-oss-120b" and env.ENABLE_GPT_OSS_120B == "true")
-              or (.prefix == "kimi-k2-thinking-mxfp4-tp4" and env.ENABLE_KIMI_K2_TP4 == "true")
-              or (.prefix == "kimi-k2-thinking-mxfp4-tp8" and env.ENABLE_KIMI_K2_TP8 == "true")
-              or (.prefix == "kimi-k25-mxfp4-tp4" and env.ENABLE_KIMI_K25_TP4 == "true")
-              or (.prefix == "kimi-k25-mxfp4-tp8" and env.ENABLE_KIMI_K25_TP8 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-tp2" and env.ENABLE_QWEN3_5_397B_A17B_TP2 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-tp4" and env.ENABLE_QWEN3_5_397B_A17B_TP4 == "true")
-              or (.prefix == "qwen3-5-397b-a17b" and env.ENABLE_QWEN3_5_397B_A17B == "true")
-              or (.prefix == "qwen3-5-397b-a17b-fp8-tp2" and env.ENABLE_QWEN3_5_397B_A17B_FP8_TP2 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-fp8-tp4" and env.ENABLE_QWEN3_5_397B_A17B_FP8_TP4 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-fp8" and env.ENABLE_QWEN3_5_397B_A17B_FP8 == "true")
-              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp1" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1 == "true")
-              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp4" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4 == "true")
-            ))
-          ' .github/benchmark/oot_benchmark_models.json)"
-          echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
-          if [ "${MODELS_JSON}" = "[]" ]; then
-            echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
-            echo "No models selected for OOT benchmark."
-          else
-            echo "has_enabled_models=true" >> "$GITHUB_OUTPUT"
-            echo "Selected models: ${MODELS_JSON}"
-          fi
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          models = [
+              {
+                  "toggle_env": "ENABLE_DEEPSEEK_R1_FP8_TP8",
+                  "display": "DeepSeek-R1-FP8 TP8",
+                  "source_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "path": "deepseek-ai/DeepSeek-R1-0528",
+                  "prefix": "deepseek-r1-fp8-tp8",
+                  "extra_args": "--trust-remote-code --tensor-parallel-size 8",
+                  "bench_args": "",
+                  "runner": "atom-mi355-8gpu-oot-benchmark",
+                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\\nSGLANG_AITER_FP8_PREFILL_ATTN=0\\nSGLANG_USE_AITER=1\\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1"
+              }
+          ]
+
+          selected = []
+          for model in models:
+              enabled = event != "workflow_dispatch" or os.environ.get(model["toggle_env"], "").lower() == "true"
+              if enabled:
+                  selected.append({k: v for k, v in model.items() if k != "toggle_env"})
+
+          if event == "workflow_dispatch" and not selected:
+              print("No models selected for manual run.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"models_json={json.dumps(selected)}")
+          print(f"has_enabled_models={'true' if selected else 'false'}")
+          PY
 
   build-benchmark-matrix:
-    name: Build OOT benchmark matrix
+    name: Build SGLang benchmark matrix
     needs: [parse-param-lists, load-models]
     if: >-
       needs.parse-param-lists.result == 'success'
@@ -327,14 +264,9 @@ jobs:
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
               model_params = []
               seen = set()
-              extra_concurrency = (128, 256) if str(model.get("prefix", "")).startswith("qwen3-5-") else ()
 
               for param in params:
                   variants = [param]
-                  for concurrency in extra_concurrency:
-                      variant = dict(param)
-                      variant["concurrency"] = concurrency
-                      variants.append(variant)
 
                   for variant in variants:
                       key = (
@@ -349,14 +281,15 @@ jobs:
                       model_params.append(variant)
 
               for param in model_params:
-                  pair = f'{param["input_length"]}x{param["output_length"]}'
+                  pair = f"{param['input_length']}_{param['output_length']}"
                   if supported_pairs and pair not in supported_pairs:
                       continue
-                  if pair in excluded_pairs:
+                  if excluded_pairs and pair in excluded_pairs:
                       continue
+                  
                   include.append({"model": model, "params": param})
 
-          print(json.dumps({"include": include}, separators=(",", ":")))
+          print(json.dumps({"include": include}))
           PY
           )"
           echo "benchmark_matrix=${BENCHMARK_MATRIX}" >> "$GITHUB_OUTPUT"
@@ -368,24 +301,24 @@ jobs:
             echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
           fi
 
-  build-oot-image:
-    name: Build custom OOT benchmark image
+  build-sglang-image:
+    name: Build custom SGLang benchmark image
     needs: [resolve-atom-source, build-benchmark-matrix]
     if: >-
-      needs.resolve-atom-source.outputs.rebuild_oot_image == 'true'
+      needs.resolve-atom-source.outputs.rebuild_sglang_image == 'true'
       && needs.build-benchmark-matrix.result == 'success'
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     runs-on: build-only-atom
     outputs:
-      oot_image_tag: ${{ steps.image-meta.outputs.oot_image_tag }}
+      sglang_image_tag: ${{ steps.image-meta.outputs.sglang_image_tag }}
       atom_source_sha: ${{ steps.source-meta.outputs.atom_source_sha }}
     env:
       ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
       ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
-      OOT_BASE_IMAGE: ${{ needs.resolve-atom-source.outputs.oot_base_image }}
-      VLLM_COMMIT: ${{ needs.resolve-atom-source.outputs.selected_vllm_commit }}
-      VLLM_VERSION: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
-      OOT_IMAGE_REPO: rocm/atom-dev
+      SGLANG_BASE_IMAGE: ${{ needs.resolve-atom-source.outputs.sglang_base_image }}
+      SGLANG_REF: ${{ needs.resolve-atom-source.outputs.selected_sglang_ref }}
+      SGLANG_VERSION: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
+      SGLANG_IMAGE_REPO: rocm/atom-dev
     steps:
       - name: Checkout benchmark ATOM source
         uses: actions/checkout@v6
@@ -399,22 +332,22 @@ jobs:
         run: |
           ATOM_SOURCE_SHA="$(git rev-parse HEAD)"
           echo "atom_source_sha=${ATOM_SOURCE_SHA}" >> "$GITHUB_OUTPUT"
-          printf '### Building custom OOT image\n- Repository: `%s`\n- Ref: `%s`\n- Commit: `%s`\n- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n' \
+          printf '### Building custom SGLang image\n- Repository: `%s`\n- Ref: `%s`\n- Commit: `%s`\n- Base image: `%s`\n- SGLang version: `%s`\n- SGLang commit: `%s`\n' \
             "${ATOM_SOURCE_REPOSITORY}" \
             "${ATOM_SOURCE_REF}" \
             "${ATOM_SOURCE_SHA}" \
-            "${OOT_BASE_IMAGE}" \
-            "${VLLM_VERSION}" \
-            "${VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
+            "${SGLANG_BASE_IMAGE}" \
+            "${SGLANG_VERSION}" \
+            "${SGLANG_REF}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Docker Login
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
-      - name: Generate custom OOT base Dockerfile
+      - name: Generate custom SGLang base Dockerfile
         run: |
-          cat > Dockerfile.oot-base <<EOF
-          FROM ${OOT_BASE_IMAGE}
+          cat > Dockerfile.sglang-base <<EOF
+          FROM ${SGLANG_BASE_IMAGE}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -438,50 +371,50 @@ jobs:
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
-      - name: Build custom OOT base image
+      - name: Build custom SGLang base image
         run: |
           docker build --pull --network=host \
             --no-cache \
-            -t atom_oot_base:ci \
-            -f Dockerfile.oot-base .
+            -t atom_sglang_base:ci \
+            -f Dockerfile.sglang-base .
 
-      - name: Build custom OOT vLLM image
+      - name: Build custom SGLang image
         id: image-meta
         run: |
           SHORT_SHA="$(git rev-parse --short HEAD)"
-          SHORT_VLLM="$(printf '%s' "${VLLM_COMMIT}" | cut -c1-12)"
-          SAFE_VLLM_VERSION="$(printf '%s' "${VLLM_VERSION}" | tr '/:' '--')"
-          OOT_IMAGE_TAG="${OOT_IMAGE_REPO}:oot-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_VLLM_VERSION}-${SHORT_VLLM}"
+          SHORT_SGLANG="$(printf '%s' "${SGLANG_REF}" | cut -c1-12)"
+          SAFE_SGLANG_VERSION="$(printf '%s' "${SGLANG_VERSION}" | tr '/:' '--')"
+          SGLANG_IMAGE_TAG="${SGLANG_IMAGE_REPO}:sglang-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_SGLANG_VERSION}-${SHORT_SGLANG}"
           docker build --network=host \
             --no-cache \
-            -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            -t "${SGLANG_IMAGE_TAG}" \
+            --target atom_sglang \
+            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
             --build-arg MAX_JOBS=64 \
-            --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
-          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Push custom OOT image
+      - name: Push custom SGLang image
         run: |
-          docker push "${{ steps.image-meta.outputs.oot_image_tag }}"
+          docker push "${{ steps.image-meta.outputs.sglang_image_tag }}"
 
       - name: Clean up build images
         if: always()
         run: |
-          docker rmi "${{ steps.image-meta.outputs.oot_image_tag }}" || true
-          docker rmi atom_oot_base:ci || true
+          docker rmi "${{ steps.image-meta.outputs.sglang_image_tag }}" || true
+          docker rmi atom_sglang_base:ci || true
 
   benchmark:
-    name: OOT ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
-    needs: [resolve-atom-source, build-benchmark-matrix, build-oot-image]
+    name: SGLang ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
+    needs: [resolve-atom-source, build-benchmark-matrix, build-sglang-image]
     if: >-
       always()
       && needs.resolve-atom-source.result == 'success'
       && needs.build-benchmark-matrix.result == 'success'
-      && (needs.build-oot-image.result == 'success' || needs.build-oot-image.result == 'skipped')
+      && (needs.build-sglang-image.result == 'success' || needs.build-sglang-image.result == 'skipped')
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     strategy:
       fail-fast: false
@@ -496,7 +429,7 @@ jobs:
       DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
-      OOT_EXTRA_ARGS: ${{ matrix.model.extra_args }}
+      SGLANG_EXTRA_ARGS: ${{ matrix.model.extra_args }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
       ISL: ${{ matrix.params.input_length }}
@@ -504,38 +437,24 @@ jobs:
       CONC: ${{ matrix.params.concurrency }}
       RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
       RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
-      CONTAINER_NAME: atom_vllm_oot_benchmark_${{ strategy.job-index }}
-      CONTAINER_RESULT_DIR: /tmp/oot-benchmark-results
-      CONTAINER_BENCH_SERVING_DIR: /tmp/oot-benchmark/bench_serving
-      OOT_IMAGE_TAG: ${{ needs.build-oot-image.outputs.oot_image_tag || needs.resolve-atom-source.outputs.prebuilt_oot_image }}
-      OOT_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.oot_image_source }}
+      CONTAINER_NAME: atom_sglang_benchmark_${{ strategy.job-index }}
+      CONTAINER_RESULT_DIR: /tmp/sglang-benchmark-results
+      CONTAINER_BENCH_SERVING_DIR: /tmp/sglang-benchmark/bench_serving
+      SGLANG_IMAGE_TAG: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
+      SGLANG_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.sglang_image_source }}
       BENCH_SERVING_REPO_URL: https://github.com/kimbochen/bench_serving.git
       ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
       ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
-      VLLM_COMMIT_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_commit }}
-      VLLM_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
+      SGLANG_REF_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_ref }}
+      SGLANG_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
     steps:
       - name: Check if model is enabled
         id: check
         run: |
           case "${{ matrix.model.prefix }}" in
-            deepseek-r1-fp8) echo "enabled=${{ inputs.deepseek-r1-fp8 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
-            gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k25-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k25-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-tp2) echo "enabled=${{ inputs.qwen3-5-397b-a17b-tp2 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b) echo "enabled=${{ inputs.qwen3-5-397b-a17b }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-tp2) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp2 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-tp1) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-next-80b-a3b-instruct-fp8-tp4) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp8-tp8) echo "enabled=${{ inputs.deepseek-r1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            *) echo "enabled=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
       - name: Clean up containers and workspace
@@ -554,7 +473,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
-          ref: ${{ needs.build-oot-image.outputs.atom_source_sha || github.sha }}
+          ref: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
           fetch-depth: 1
 
       - name: Record benchmark source revision
@@ -562,7 +481,7 @@ jobs:
         run: |
           SOURCE_SHA="$(git rev-parse HEAD)"
           echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
-          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${OOT_IMAGE_SOURCE} image ${OOT_IMAGE_TAG}"
+          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${SGLANG_IMAGE_SOURCE} image ${SGLANG_IMAGE_TAG}"
 
       - name: Docker Login
         if: steps.check.outputs.enabled == 'true'
@@ -573,11 +492,11 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
-      - name: Pull OOT benchmark image
+      - name: Pull SGLang benchmark image
         if: steps.check.outputs.enabled == 'true'
         run: |
-          echo "Pulling OOT benchmark image: ${OOT_IMAGE_TAG}"
-          docker pull "${OOT_IMAGE_TAG}"
+          echo "Pulling SGLang benchmark image: ${SGLANG_IMAGE_TAG}"
+          docker pull "${SGLANG_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
@@ -601,7 +520,7 @@ jobs:
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
 
-      - name: Start OOT benchmark container
+      - name: Start SGLang benchmark container
         if: steps.check.outputs.enabled == 'true'
         run: |
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
@@ -631,7 +550,7 @@ jobs:
             --env-file /tmp/oot_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${OOT_IMAGE_TAG}"
+            "${SGLANG_IMAGE_TAG}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -670,7 +589,7 @@ jobs:
             echo "/models directory not mounted; skipping model download"
           fi
 
-      - name: Resolve OOT model path
+      - name: Resolve SGLang model path
         if: steps.check.outputs.enabled == 'true'
         run: |
           model_dir="${MODEL_PATH}"
@@ -684,14 +603,14 @@ jobs:
             model_dir="/models/${model_dir}"
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
             echo "Using mounted model path: ${model_dir}"
           else
-            echo "OOT_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
+            echo "SGLANG_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
             echo "Using model id: ${MODEL_SOURCE_PATH}"
           fi
 
-      - name: Prepare OOT benchmark runner in container
+      - name: Prepare SGLang benchmark runner in container
         if: steps.check.outputs.enabled == 'true'
         run: |
           docker exec "$CONTAINER_NAME" bash -lc "
@@ -702,28 +621,28 @@ jobs:
             test -f \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\"
           "
 
-      - name: Run OOT benchmark
+      - name: Run SGLang benchmark
         if: steps.check.outputs.enabled == 'true'
         timeout-minutes: 240
         env:
           MAX_WAIT_RETRIES: "120"
-          STREAM_VLLM_LOGS: "1"
+          STREAM_SGLANG_LOGS: "1"
         run: |
           set -euo pipefail
           docker exec \
-            -e OOT_MODEL_NAME="${MODEL_NAME}" \
-            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
+            -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
+            -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
-            -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
+            -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
             -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_oot_test.sh launch full
+              bash .github/scripts/atom_sglang_test.sh launch
             "
 
           TRUST_REMOTE_CODE_ARG=""
-          if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
+          if [[ "${SGLANG_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
             TRUST_REMOTE_CODE_ARG="--trust-remote-code"
           fi
 
@@ -741,8 +660,8 @@ jobs:
               rm -rf \"${CONTAINER_RESULT_DIR}\"
               mkdir -p \"${CONTAINER_RESULT_DIR}\"
               PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
-                --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                --backend=vllm \
+                --model=\"${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                --backend=sglang \
                 --base-url=http://127.0.0.1:8000 \
                 --dataset-name=random \
                 --random-input-len=\"${ISL}\" \
@@ -765,15 +684,15 @@ jobs:
             -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
             -e ISL="${ISL}" \
             -e OSL="${OSL}" \
-            -e EXTRA_ARGS_TEXT="${OOT_EXTRA_ARGS}" \
+            -e EXTRA_ARGS_TEXT="${SGLANG_EXTRA_ARGS}" \
             -e DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
             -e ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
             -e ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
             -e ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
-            -e VLLM_COMMIT_USED="${VLLM_COMMIT_USED}" \
-            -e VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
-            -e OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
-            -e OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
+            -e SGLANG_REF_USED="${SGLANG_REF_USED}" \
+            -e SGLANG_VERSION_USED="${SGLANG_VERSION_USED}" \
+            -e SGLANG_IMAGE_SOURCE="${SGLANG_IMAGE_SOURCE}" \
+            -e SGLANG_IMAGE_TAG_USED="${SGLANG_IMAGE_TAG}" \
             -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
             "$CONTAINER_NAME" python3 - <<'PY'
           import json
@@ -786,7 +705,7 @@ jobs:
 
           data["random_input_len"] = int(os.environ["ISL"])
           data["random_output_len"] = int(os.environ["OSL"])
-          data["benchmark_backend"] = "ATOM-vLLM"
+          data["benchmark_backend"] = "ATOM-SGLang"
 
           display_name = os.environ.get("DASHBOARD_MODEL_NAME", "")
           if display_name:
@@ -802,10 +721,10 @@ jobs:
           data["atom_source_repository"] = os.environ.get("ATOM_SOURCE_REPOSITORY", "")
           data["atom_source_ref"] = os.environ.get("ATOM_SOURCE_REF", "")
           data["atom_source_sha"] = os.environ.get("ATOM_SOURCE_SHA", "")
-          data["vllm_commit"] = os.environ.get("VLLM_COMMIT_USED", "")
-          data["vllm_version"] = os.environ.get("VLLM_VERSION_USED", "")
-          data["oot_image_source"] = os.environ.get("OOT_IMAGE_SOURCE", "")
-          data["oot_image_tag"] = os.environ.get("OOT_IMAGE_TAG_USED", "")
+          data["sglang_ref"] = os.environ.get("SGLANG_REF_USED", "")
+          data["sglang_version"] = os.environ.get("SGLANG_VERSION_USED", "")
+          data["sglang_image_source"] = os.environ.get("SGLANG_IMAGE_SOURCE", "")
+          data["sglang_image_tag"] = os.environ.get("SGLANG_IMAGE_TAG_USED", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
           )
@@ -850,19 +769,19 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: oot-benchmark-${{ env.RESULT_FILENAME }}
+          name: sglang-benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
-      - name: Clean up OOT benchmark container
+      - name: Clean up SGLang benchmark container
         if: always() && steps.check.outputs.enabled == 'true'
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          if [[ "${OOT_IMAGE_SOURCE}" == "rebuild" ]]; then
-            docker rmi "$OOT_IMAGE_TAG" || true
+          if [[ "${SGLANG_IMAGE_SOURCE}" == "rebuild" ]]; then
+            docker rmi "$SGLANG_IMAGE_TAG" || true
           else
-            echo "Keeping prebuilt OOT image cached on runner: ${OOT_IMAGE_TAG}"
+            echo "Keeping prebuilt SGLang image cached on runner: ${SGLANG_IMAGE_TAG}"
           fi
 
   summarize-benchmark-result:
@@ -871,7 +790,7 @@ jobs:
       && needs.resolve-atom-source.result == 'success'
       && needs.build-benchmark-matrix.result == 'success'
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
-    name: Summarize OOT benchmark result
+    name: Summarize SGLang benchmark result
     needs: [resolve-atom-source, build-benchmark-matrix, benchmark]
     runs-on: ubuntu-latest
     steps:
@@ -881,7 +800,7 @@ jobs:
       - name: Download all benchmark results
         uses: actions/download-artifact@v8
         with:
-          pattern: 'oot-benchmark-*'
+          pattern: 'sglang-benchmark-*'
           merge-multiple: true
           path: .
         continue-on-error: true
@@ -897,43 +816,43 @@ jobs:
       - name: Note summary behavior
         run: |
           if [[ "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" == "true" ]]; then
-            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
+            printf '### Summary mode\nResults from `%s@%s` using `%s` SGLang image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
               "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
               "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+              "${{ needs.resolve-atom-source.outputs.sglang_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           else
-            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table only. Dashboard upload is disabled for this run.\n' \
+            printf '### Summary mode\nResults from `%s@%s` using `%s` SGLang image mode are shown below as a workflow summary table only. Dashboard upload is disabled for this run.\n' \
               "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
               "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+              "${{ needs.resolve-atom-source.outputs.sglang_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Generate OOT benchmark summary table
+      - name: Generate SGLang benchmark summary table
         env:
           BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python3 .github/scripts/oot_benchmark_summary.py \
+          python3 .github/scripts/sglang_benchmark_summary.py \
             --result-dir . \
             --matrix-json "${BENCHMARK_MATRIX}" \
             --run-url "${RUN_URL}" \
-            --output-json oot_benchmark_summary.json \
+            --output-json sglang_benchmark_summary.json \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Read summary stats
         id: summary-stats
         run: |
-          PASSED_CASES=$(python3 -c "import json; print(json.load(open('oot_benchmark_summary.json', encoding='utf-8'))['passed_cases'])")
-          FAILED_CASES=$(python3 -c "import json; print(json.load(open('oot_benchmark_summary.json', encoding='utf-8'))['failed_cases'])")
+          PASSED_CASES=$(python3 -c "import json; print(json.load(open('sglang_benchmark_summary.json', encoding='utf-8'))['passed_cases'])")
+          FAILED_CASES=$(python3 -c "import json; print(json.load(open('sglang_benchmark_summary.json', encoding='utf-8'))['failed_cases'])")
           echo "passed_cases=${PASSED_CASES}" >> "$GITHUB_OUTPUT"
           echo "failed_cases=${FAILED_CASES}" >> "$GITHUB_OUTPUT"
           echo "Summary stats: passed=${PASSED_CASES}, failed=${FAILED_CASES}"
 
-      - name: Upload OOT benchmark summary artifact
+      - name: Upload SGLang benchmark summary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: oot-benchmark-summary
-          path: oot_benchmark_summary.json
+          name: sglang-benchmark-summary
+          path: sglang_benchmark_summary.json
 
       - name: Download baseline from previous successful main run
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
@@ -944,7 +863,7 @@ jobs:
           mapfile -t CANDIDATE_RUN_IDS < <(
             {
               gh run list \
-                --workflow="ATOM vLLM OOT Benchmark" \
+                --workflow="ATOM SGLang Benchmark" \
                 --branch=main \
                 --event=workflow_dispatch \
                 --status=success \
@@ -969,7 +888,7 @@ jobs:
               continue
             fi
 
-            if python3 .github/scripts/oot_benchmark_validate_baseline.py /tmp/baseline_candidate; then
+            if python3 .github/scripts/sglang_benchmark_validate_baseline.py /tmp/baseline_candidate; then
               mv /tmp/baseline_candidate /tmp/baseline
               BASELINE_DIR="/tmp/baseline"
               echo "Using baseline from run #$PREV_RUN_ID"
@@ -999,7 +918,7 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          python3 .github/scripts/oot_benchmark_regression.py \
+          python3 .github/scripts/sglang_benchmark_regression.py \
             --result-dir . \
             $BASELINE_ARG \
             --output-json regression_report.json \
@@ -1020,13 +939,13 @@ jobs:
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.check-regression.outputs.has_regression == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: oot-benchmark-regression-report
+          name: sglang-benchmark-regression-report
           path: regression_report.json
 
       - name: Transform results for benchmark dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
-          python3 .github/scripts/oot_benchmark_to_dashboard.py \
+          python3 .github/scripts/sglang_benchmark_to_dashboard.py \
             . \
             --output benchmark-action-input.json \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -1059,6 +978,6 @@ jobs:
           cp /tmp/dashboard_index.html benchmark-dashboard/index.html
           cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
           git add benchmark-dashboard/
-          git diff --cached --quiet || git commit -m "Update OOT benchmark data and dashboard"
+          git diff --cached --quiet || git commit -m "Update SGLang benchmark data and dashboard"
           git push origin gh-pages
           git checkout "$CURRENT_SHA"
