@@ -46,8 +46,7 @@ class EngineArgs:
     enable_expert_parallel: bool = False
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
-    enable_tbo: bool = False
-    enable_low_latency: bool = False
+    enable_tbo: Optional[str] = None
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     mark_trace: bool = False
@@ -140,14 +139,13 @@ class EngineArgs:
         )
         parser.add_argument(
             "--enable-tbo",
-            action="store_true",
-            help="Enable TBO (Two-Batch Overlap) for comm/compute overlap.",
-        )
-        parser.add_argument(
-            "--low-latency",
-            dest="enable_low_latency",
-            action="store_true",
-            help="Use AsyncLL MORI kernel for low-latency overlap (requires --enable-tbo).",
+            nargs="?",
+            const="high-throughput",
+            default=None,
+            choices=["high-throughput", "low-latency"],
+            help="Enable TBO (Two-Batch Overlap) for comm/compute overlap. "
+            "Default mode is 'high-throughput'. Use '--enable-tbo low-latency' "
+            "for AsyncLL MORI kernel overlap.",
         )
         parser.add_argument(
             "--method",
@@ -234,6 +232,11 @@ class EngineArgs:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs["speculative_config"] = None
+
+        # --enable-tbo [high-throughput|low-latency]
+        tbo_mode = kwargs.pop("enable_tbo", None)
+        kwargs["enable_tbo"] = tbo_mode is not None
+        kwargs["enable_low_latency"] = tbo_mode == "low-latency"
 
         logger.info(f"Engine kwargs: {kwargs}")
 
