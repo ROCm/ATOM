@@ -7,14 +7,19 @@ from typing import Type
 import numpy as np
 import torch
 from aiter import (
+    decode_update_mla_metadata_v1,
     dtypes,
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
-    decode_update_mla_metadata_v1,
 )
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
+from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
+from atom.plugin.attention import (
+    AiterBackendDecoratorForPluginMode,
+    AiterMLAAttentionMetadataBuilderDecoratorForPluginMode,
+)
+from atom.plugin.prepare import is_plugin_mode
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -23,10 +28,6 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
-
-from atom.plugin.prepare import is_plugin_mode
-from atom.plugin.attention import AiterMLAAttentionMetadataBuilderDecoratorForPluginMode
-from atom.plugin.attention import AiterBackendDecoratorForPluginMode
 
 logger = logging.getLogger("atom")
 
@@ -146,7 +147,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     @property
     def prep_stream(self):
-        return self.model_runner.tokenID_processor.async_copy_stream
+        # return self.model_runner.tokenID_processor.async_copy_stream
+        return self.model_runner.async_execute_stream
 
     def set_mla_persistent_worker_buffers(
         self,
@@ -410,13 +412,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
         vars_used = [
-            ("block_tables", bs),
             ("slot_mapping", bs * max_seqlen_q),
             ("context_lens", bs),
             ("cu_seqlens_q", bs + 1),
-            ("kv_indptr", bs + 1),
+            # ("kv_indptr", bs + 1),
             ("kv_last_page_lens", bs),
+            ("block_tables", bs),
         ]
+        metadata_deps = {
+            "cu_seqlens_q",
+            "kv_last_page_lens",
+        }
+
         if self.is_sparse:
             index_topk = self.index_topk
             sparse_context_lens = np.clip(var["context_lens"].np[:bs], None, index_topk)
@@ -427,21 +434,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_indptr"
             ].np[scheduled_bs]
             vars_used.append(("sparse_kv_indptr", bs + 1))
+            metadata_deps.add("sparse_kv_indptr")
 
         prep_stream = self.prep_stream
-        metadata_deps = {
-            "cu_seqlens_q",
-            "kv_indptr",
-            "kv_last_page_lens",
-            "sparse_kv_indptr",
-        }
         vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
         vars_remaining = [(el, num) for el, num in vars_used if el not in metadata_deps]
         max_seqlen_k = context_lens.max()
 
-        # metadata copies on main_stream
-        ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata}
-
+        ctx = {}
+        ctx["kv_indptr"] = var["kv_indptr"].copy_to_gpu(bs + 1)
         # prep_stream does remaining copies + kv_indices
         current_stream = torch.cuda.current_stream()
         prep_stream.wait_stream(current_stream)
@@ -457,9 +458,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_k,
             )
 
+        # metadata copies on main_stream
+        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
         ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
         ctx.update(ctx_mla_ps)
-        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         current_stream.wait_stream(prep_stream)
         # if self.block_ratio > 1:
         #     if "block_tables" in ctx:

@@ -1,4 +1,4 @@
-name: ATOM vLLM OOT Benchmark
+name: ATOM vLLM Benchmark
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
@@ -68,7 +68,7 @@ on:
         type: boolean
         default: false
       oot_image:
-        description: "Optional OOT benchmark image override. Leave empty to use vllm-latest on main or rebuild from the selected non-main branch."
+        description: "Optional OOT benchmark image override. Leave empty to resolve main to the same-digest published nightly tag behind vllm-latest, or rebuild from the selected non-main branch."
         type: string
         default: ""
       publish_to_dashboard:
@@ -123,17 +123,10 @@ jobs:
           REBUILD_OOT_IMAGE=false
           OOT_IMAGE_SOURCE="prebuilt"
           USER_PROVIDED_OOT_IMAGE=false
-          if [[ -n "${INPUT_OOT_IMAGE}" ]]; then
-            PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE}"
-            OOT_IMAGE_SOURCE="user-provided"
-            USER_PROVIDED_OOT_IMAGE=true
-          elif [[ "${NORMALIZED_REF}" == "main" ]]; then
-            PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
-            OOT_IMAGE_SOURCE="prebuilt"
-          else
-            REBUILD_OOT_IMAGE=true
-            OOT_IMAGE_SOURCE="rebuild"
-          fi
+          RESOLVED_PREBUILT_ALIAS=""
+          RESOLVED_PREBUILT_DIGEST=""
+          PREBUILT_RESOLUTION_TYPE=""
+          RESOLVED_NIGHTLY_TAG=""
 
           PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
 
@@ -155,6 +148,47 @@ jobs:
 
           SELECTED_VLLM_COMMIT="${VLLM_META[0]}"
           SELECTED_VLLM_VERSION="${VLLM_META[1]}"
+
+          if [[ -n "${INPUT_OOT_IMAGE}" ]]; then
+            PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE}"
+            OOT_IMAGE_SOURCE="user-provided"
+            USER_PROVIDED_OOT_IMAGE=true
+          elif [[ "${NORMALIZED_REF}" == "main" ]]; then
+            if RESOLUTION_JSON="$(
+              python3 .github/scripts/resolve_vllm_atom_image.py \
+                --repository rocm/atom-dev \
+                --reference-tag vllm-latest \
+                --preferred-version "${SELECTED_VLLM_VERSION}"
+            )"; then
+              mapfile -t RESOLVED_IMAGE_META < <(
+                RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          print(resolution["reference_image"])
+          print(resolution["reference_digest"])
+          print(resolution["match_type"])
+          print(resolution.get("matched_tag", ""))
+          PY
+              )
+              PREBUILT_OOT_IMAGE="${RESOLVED_IMAGE_META[0]}"
+              RESOLVED_PREBUILT_ALIAS="${RESOLVED_IMAGE_META[1]}"
+              RESOLVED_PREBUILT_DIGEST="${RESOLVED_IMAGE_META[2]}"
+              PREBUILT_RESOLUTION_TYPE="${RESOLVED_IMAGE_META[3]}"
+              RESOLVED_NIGHTLY_TAG="${RESOLVED_IMAGE_META[4]}"
+            else
+              echo "::warning::Failed to resolve or digest-pin rocm/atom-dev:vllm-latest; falling back to the floating tag."
+              PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
+              RESOLVED_PREBUILT_ALIAS="rocm/atom-dev:vllm-latest"
+              PREBUILT_RESOLUTION_TYPE="resolution-failed"
+            fi
+            OOT_IMAGE_SOURCE="prebuilt"
+          else
+            REBUILD_OOT_IMAGE=true
+            OOT_IMAGE_SOURCE="rebuild"
+          fi
 
           {
             echo "atom_repository=${ATOM_REPOSITORY}"
@@ -193,6 +227,32 @@ jobs:
               "${PREBUILT_OOT_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
               "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
+            if [[ -n "${RESOLVED_PREBUILT_ALIAS}" ]]; then
+              printf -- '- Floating alias: `%s`\n' \
+                "${RESOLVED_PREBUILT_ALIAS}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [[ -n "${RESOLVED_PREBUILT_DIGEST}" ]]; then
+              printf -- '- Resolved digest: `%s`\n' \
+                "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            case "${PREBUILT_RESOLUTION_TYPE}" in
+              matched-nightly-tag)
+                printf -- '- Resolution: reverse-matched same digest to nightly tag `%s`\n' \
+                  "${RESOLVED_NIGHTLY_TAG}" >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              digest-pinned-latest)
+                printf -- '- Resolution: no nightly tag with the same digest was found, so this run pins `vllm-latest` to its current digest instead.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              reverse-lookup-failed-digest-pinned-latest)
+                printf -- '- Resolution: reverse lookup could not complete, so this run pins `vllm-latest` to its current digest instead of falling back to the floating tag.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
+              resolution-failed)
+                printf -- '- Resolution: digest pinning itself failed, so this run falls back to floating `vllm-latest`.\n' \
+                  >> "$GITHUB_STEP_SUMMARY"
+                ;;
+            esac
           fi
 
           printf -- '- Upload to dashboard: `%s`\n' \
@@ -1046,21 +1106,26 @@ jobs:
           max-items-in-chart: 90
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Deploy custom dashboard to gh-pages
+      - name: Push dashboard data to gh-pages
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          CURRENT_SHA=$(git rev-parse HEAD)
-          cp .github/dashboard/index.html /tmp/dashboard_index.html
-          cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
-          cp docs/assets/atom_logo_mini.png /tmp/dashboard_logo_mini.png
           git fetch origin gh-pages
           git checkout gh-pages
-          cp /tmp/dashboard_index.html benchmark-dashboard/index.html
-          cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
-          cp /tmp/dashboard_logo_mini.png benchmark-dashboard/atom_logo_mini.png
-          git add benchmark-dashboard/
-          git diff --cached --quiet || git commit -m "Update OOT benchmark data and dashboard"
-          git push origin gh-pages
-          git checkout "$CURRENT_SHA"
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/oot-benchmark-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/oot-benchmark-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update OOT benchmark dashboard data"
+          git push origin HEAD:gh-pages
