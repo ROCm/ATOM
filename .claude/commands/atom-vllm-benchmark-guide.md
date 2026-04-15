@@ -8,6 +8,7 @@ Use this guide when the user asks to benchmark ATOM vLLM Plugin performance, com
 2. Use plugin-on as default setup; optionally benchmark upstream vLLM for performance comparison.
 3. Run repeatable measurements and summarize median results.
 4. Report reproducible commands, key metrics, and known risks.
+5. Prefer model-specific launch settings from `recipes/atom_vllm/` when available; otherwise use the standard workflow in this guide.
 
 ## Inputs To Collect First
 
@@ -42,6 +43,16 @@ For each benchmark round:
 ## Benchmark Workflow (Plugin On by Default)
 
 Run plugin-on by default.
+
+### Recipe-first execution policy
+
+When running ATOM vLLM benchmark:
+
+1. First check whether the target model has a matching recipe under `recipes/atom_vllm/`.
+2. If a matching recipe exists, use its model-specific environment variables and `vllm serve` launch args as the default benchmark setup.
+3. If no matching recipe exists, follow the standard launch template and workflow in this guide.
+
+Keep benchmark methodology unchanged (smoke check, concurrency isolation, and fixed comparison variables) regardless of whether the launch config comes from a recipe or from the default template.
 
 - **Default (candidate):** plugin enabled
 - **Optional control (baseline):** plugin disabled (only when A/B comparison is requested)
@@ -79,13 +90,14 @@ Common plugin toggles:
 ```bash
 curl -sf http://localhost:8000/v1/models
 vllm bench serve \
-  --backend openai-chat \
+  --backend vllm \
   --base-url http://localhost:8000 \
-  --endpoint /v1/chat/completions \
+  --endpoint /v1/completions \
   --model <model> \
   --dataset-name random \
   --random-input-len 32 \
   --random-output-len 32 \
+  --temperature 0.0 \
   --max-concurrency <smoke_conc> \
   --num-prompts <smoke_conc_x10> \
   --num-warmups <smoke_conc_x2> \
@@ -101,14 +113,15 @@ If smoke test fails, do not continue with performance comparison.
 
 ```bash
 vllm bench serve \
-  --backend openai-chat \
+  --backend vllm \
   --base-url http://localhost:8000 \
-  --endpoint /v1/chat/completions \
+  --endpoint /v1/completions \
   --model=<model> \
   --dataset-name=random \
   --random-input-len=<isl> \
   --random-output-len=<osl> \
   --random-range-ratio=0.8 \
+  --temperature=0.0 \
   --num-prompts=<conc_x10> \
   --num-warmups=<conc_x2> \
   --max-concurrency=<conc> \
@@ -210,13 +223,14 @@ vllm serve <model_path> \
 
 # 2) Run profiled benchmark workload
 vllm bench serve \
-  --backend openai-chat \
+  --backend vllm \
   --base-url http://localhost:8000 \
-  --endpoint /v1/chat/completions \
+  --endpoint /v1/completions \
   --model <model> \
   --dataset-name random \
   --random-input-len <isl> \
   --random-output-len 20 \
+  --temperature 0.0 \
   --max-concurrency <conc> \
   --num-prompts <conc_x2> \
   --num-warmups <conc_x2> \
@@ -227,6 +241,8 @@ vllm bench serve \
 
 - `--profile` requires server-side `--profiler-config`.
 - Keep profiler config identical between plugin-off and plugin-on runs.
+- For reproducibility, keep benchmark client semantics fixed to completion mode:
+  `--backend vllm --endpoint /v1/completions` (this path uses `max_tokens`).
 
 ## Reporting Template
 
