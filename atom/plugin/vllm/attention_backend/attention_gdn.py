@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fla.ops import (
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from aiter.ops.triton.gated_delta_net.gated_delta_rule import chunk_gated_delta_rule_opt_vk
 from torch import nn
 
 # from aiter.dist.parallel_state import get_tp_group
@@ -43,7 +44,7 @@ class ChunkGatedDeltaRule(nn.Module):
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
     ):
-        return fla_chunk_gated_delta_rule(
+        return chunk_gated_delta_rule_opt_vk(
             q=q,
             k=k,
             v=v,
