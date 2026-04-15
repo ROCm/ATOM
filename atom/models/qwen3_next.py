@@ -208,8 +208,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
         # print(f"layer {prefix}, gate weight: {self.gate.weight.data}", flush=True)
 
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
-
         if (
             config.shared_expert_intermediate_size > 0
             and not is_rocm_aiter_fusion_shared_expert_enabled()
@@ -220,7 +218,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
-                expert_gate=self.shared_expert_gate,
+                expert_gate=None,
                 prefix=f"{prefix}.shared_expert",
             )
         else:
@@ -249,13 +247,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
+        # router_logits: (num_tokens, n_experts + n_shared_experts)
         router_logits = self.gate(hidden_states)
         routed_output = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
         if not is_rocm_aiter_fusion_shared_expert_enabled():
             shared_output = self.shared_expert(hidden_states)
+            # Extract shared_expert_gate logits from merged gate output
+            # gate output shape: (num_tokens, n_routed_experts + n_shared_experts)
+            shared_gate_logits = router_logits[
+                :, self.n_routed_experts :
+            ]  # (num_tokens, n_shared_experts)
+            shared_output = F.sigmoid(shared_gate_logits) * shared_output
             final_hidden_states = shared_output + routed_output
         else:
             final_hidden_states = routed_output

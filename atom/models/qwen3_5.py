@@ -331,15 +331,43 @@ class Qwen3_5ForCausalLMBase(nn.Module):
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
-    pass
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+        "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+        "in_proj_z": ("in_proj_qkvz", 3),
+        "in_proj_b": ("in_proj_ba", 0),
+        "in_proj_a": ("in_proj_ba", 1),
+    }
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+        "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+        "in_proj_z": ("in_proj_qkvz", 3),
+        "in_proj_b": ("in_proj_ba", 0),
+        "in_proj_a": ("in_proj_ba", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
+    }
+
     def __init__(self, atom_config: Config, prefix: str = ""):
-        super().__init__(atom_config=atom_config, prefix=prefix)
         config: Qwen3_5MoeTextConfig = atom_config.hf_config.text_config
+        # Set MoE hyperparameters for native mode
+        if not hasattr(config, "n_shared_experts"):
+            config.n_shared_experts = 1
+        if not hasattr(config, "n_routed_experts"):
+            config.n_routed_experts = config.num_experts
+        super().__init__(atom_config=atom_config, prefix=prefix)
         self.config = config
-        # set MoE hyperparameters
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

@@ -96,8 +96,9 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
         kwargs.setdefault("partial_rotary_factor", 0.25)
 
         self.layer_types = layer_types
+        interval_pattern = kwargs.get("full_attention_interval", 4)
+        self.full_attention_interval = interval_pattern
         if self.layer_types is None:
-            interval_pattern = kwargs.get("full_attention_interval", 4)
             self.layer_types = [
                 (
                     "linear_attention"
