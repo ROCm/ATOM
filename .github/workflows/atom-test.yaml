@@ -1,42 +1,82 @@
-name: ATOM Test
+name: ATOM Test Reusable
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]  # Triggers on PRs targeting `main`
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-  schedule:
-    # Nightly at 00:00 Beijing time (16:00 UTC)
-    - cron: '0 16 * * *'
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      checkout_repository:
+        description: 'Repository to check out into the workflow workspace'
+        required: false
+        default: 'ROCm/ATOM'
+        type: string
+      checkout_ref:
+        description: 'Git ref or commit SHA to check out into the workflow workspace'
+        required: false
+        default: 'main'
+        type: string
+      source_repo_url:
+        description: 'Clone URL used inside container-side source build flows'
+        required: false
+        default: ''
+        type: string
+      source_commit_sha:
+        description: 'Commit SHA used inside container-side source build flows'
+        required: false
+        default: ''
+        type: string
+      signal_commit_sha:
+        description: 'Commit SHA used to look up the pre-checkin signal artifact'
+        required: false
+        default: ''
+        type: string
       aiter_branch:
         description: 'ROCm/aiter branch to build inside the CI image'
         required: false
         default: 'main'
         type: string
-
-concurrency:
-  # Keep scheduled main runs from blocking push-triggered validation.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+      model_scope:
+        description: 'Model scope to run: pr, main, or nightly'
+        required: false
+        default: 'pr'
+        type: string
+      run_precheck:
+        description: 'Whether to gate the run on the pre-checkin signal artifact'
+        required: false
+        default: false
+        type: boolean
+      is_draft_pr:
+        description: 'Whether the source change is a draft pull request'
+        required: false
+        default: false
+        type: boolean
+      is_fork_pr:
+        description: 'Whether the source change comes from a fork'
+        required: false
+        default: false
+        type: boolean
+      publish_dashboard:
+        description: 'Whether to publish accuracy results to the benchmark dashboard'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      repo_token:
+        required: false
+      docker_username:
+        required: false
+      docker_password:
+        required: false
+      amd_hf_token:
+        required: false
 
 env:
   ATOM_BASE_IMAGE: rocm/atom-dev:latest
-  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
-  # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
-  AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
+  GITHUB_REPO_URL: ${{ inputs.source_repo_url || format('https://github.com/{0}.git', inputs.checkout_repository) }}
+  GITHUB_COMMIT_SHA: ${{ inputs.source_commit_sha || inputs.checkout_ref }}
+  AITER_GIT_REF: ${{ inputs.aiter_branch }}
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ !inputs.is_draft_pr && inputs.run_precheck }}
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
     permissions:
@@ -44,18 +84,21 @@ jobs:
       contents: read
     steps:
       - name: Checkout ATOM repo
-        if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.checkout_repository }}
+          ref: ${{ inputs.checkout_ref }}
+          token: ${{ secrets.repo_token || github.token }}
 
       - name: Download and check pre-checkin signal
-        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: bash ./.github/scripts/check_signal.sh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.repo_token || github.token }}
+          GITHUB_REPOSITORY: ${{ inputs.checkout_repository }}
+          GITHUB_SHA: ${{ inputs.signal_commit_sha || inputs.checkout_ref }}
 
   download_aiter_wheel:
-    if: ${{ needs.check-signal.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ !inputs.is_draft_pr && (!inputs.run_precheck || needs.check-signal.result == 'success') }}
     needs: [check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
@@ -67,7 +110,7 @@ jobs:
 
           S3_MAIN_MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json"
           API_URL="https://api.github.com"
-          AUTH_HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
+          AUTH_HEADER="Authorization: token ${{ secrets.repo_token || github.token }}"
           AITER_TEST_WORKFLOW_ID=179476100
 
           download_from_s3_manifest() {
@@ -162,28 +205,32 @@ jobs:
           retention-days: 1
 
   load-test-models:
+    if: ${{ !inputs.is_draft_pr }}
     name: Load test model configs
     runs-on: ubuntu-latest
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.checkout_repository }}
+          ref: ${{ inputs.checkout_ref }}
+          token: ${{ secrets.repo_token || github.token }}
       - id: load
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          MODEL_SCOPE: ${{ inputs.model_scope }}
         run: |
           python3 << 'PY'
           import json, os
-          event = os.environ["EVENT_NAME"]
-          # pr → pr models only; push to main → pr+main; schedule/dispatch → all
-          level_map = {"schedule": "nightly", "workflow_dispatch": "nightly", "push": "main"}
-          current = level_map.get(event, "pr")
-          allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
+          current = os.environ["MODEL_SCOPE"]
+          allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}.get(current)
+          if allowed is None:
+              raise SystemExit(f"Unsupported model_scope: {current}")
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
           filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
-          print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
+          print(f"Scope={current}: {len(filtered)}/{len(models)} models")
           print(f"{'Model':<45} {'Level':<10} {'Runner'}")
           print("-" * 80)
           for m in models:
@@ -198,7 +245,7 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json) }}
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ !inputs.is_draft_pr }}
     runs-on: ${{ matrix.runner }}
 
     env:
@@ -229,17 +276,28 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.checkout_repository }}
+          ref: ${{ inputs.checkout_ref }}
+          token: ${{ secrets.repo_token || github.token }}
       
       - name: Docker Login
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: ${{ !inputs.is_fork_pr }}
+        env:
+          DOCKER_USERNAME: ${{ secrets.docker_username }}
+          DOCKER_PASSWORD: ${{ secrets.docker_password }}
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+          if [ -z "${DOCKER_USERNAME:-}" ] || [ -z "${DOCKER_PASSWORD:-}" ]; then
+            echo "Docker credentials not provided; skipping docker login."
+            exit 0
+          fi
+          echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin
 
       - name: Generate Dockerfile for forked repo
-        if: ${{ github.event.pull_request.head.repo.fork }}
+        if: ${{ inputs.is_fork_pr }}
         run: |
           cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
+          FROM ${{ env.ATOM_BASE_IMAGE }}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -274,7 +332,7 @@ jobs:
 
       - name: Set HF token for predownload runner
         if: matrix.runner == 'atom-mi355-8gpu.predownload'
-        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.amd_hf_token }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
         run: |
@@ -579,10 +637,17 @@ jobs:
   accuracy-dashboard:
     name: Update accuracy dashboard
     needs: [atom-test]
-    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')
+    if: ${{ always() && inputs.publish_dashboard }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.checkout_repository }}
+          ref: ${{ inputs.checkout_ref }}
+          token: ${{ secrets.repo_token || github.token }}
 
       - uses: actions/setup-python@v6
         with:
@@ -619,5 +684,5 @@ jobs:
           benchmark-data-dir-path: benchmark-dashboard
           auto-push: true
           max-items-in-chart: 90
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.repo_token || github.token }}
 
