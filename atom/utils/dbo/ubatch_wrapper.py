@@ -23,6 +23,13 @@ from .ubatching import make_tbo_contexts
 logger = logging.getLogger("atom")
 
 
+def _get_dp_group_handle():
+    """Return the torch.distributed process group for DP."""
+    from aiter.dist.parallel_state import get_dp_group
+
+    return get_dp_group().device_group
+
+
 @dataclass
 class TBOGraphData:
     """Stores a captured CUDAGraph alongside objects that must stay alive."""
@@ -42,10 +49,16 @@ class UBatchWrapper(nn.Module):
     ``prepare_async`` / ``finalize_async`` methods.
     """
 
-    def __init__(self, model: nn.Module, attn_metadata_builder=None):
+    def __init__(
+        self,
+        model: nn.Module,
+        attn_metadata_builder=None,
+        dp_gather_scatter: bool = False,
+    ):
         super().__init__()
         self.model = model
         self.attn_metadata_builder = attn_metadata_builder
+        self.dp_gather_scatter = dp_gather_scatter
         self.comm_stream: Optional[torch.cuda.Stream] = None
         # Barrier: ubatch threads + main thread
         self.ready_barrier = threading.Barrier(3)  # 2 ubatch threads + 1 main
@@ -74,29 +87,38 @@ class UBatchWrapper(nn.Module):
         N = len(ctx.ubatch_slices)
         compute_stream = torch.cuda.current_stream()
 
-        # Build per-ubatch ForwardContexts
-        # With DP, graph_bs is synchronized across ranks (via get_dp_padding).
-        # Each ubatch must use a consistent graph_bs across ranks so that
-        # all_gather_with_padding produces same-sized tensors on every rank.
-        # Divide the full batch's graph_bs evenly across ubatches.
         full_graph_bs = ctx.context.graph_bs
         forward_contexts = []
         ub_inputs = []
+
+        # When using DP gather/scatter (no EP/all2all), compute
+        # DP-synchronized graph_bs per ubatch so MoE's pad_for_all_gather
+        # can just read context.graph_bs.  MORI path doesn't need this.
+        dp_size = self._get_dp_size() if self.dp_gather_scatter else 1
+        ub_graph_bs_list = self._compute_ub_graph_bs(
+            ctx,
+            N,
+            full_graph_bs,
+            dp_size,
+            input_ids.device,
+        )
+
         for i, ub_slice in enumerate(ctx.ubatch_slices):
             ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
             if ctx.context.is_prefill:
-                # Prefill is eager-only (no CUDAGraph), no padding needed.
                 padded_bs = ub_num_reqs
-            elif i < N - 1:
-                padded_bs = full_graph_bs // N
             else:
-                padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
+                if i < N - 1:
+                    padded_bs = full_graph_bs // N
+                else:
+                    padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
             ub_ctx = self._make_ubatch_context(
                 original_ctx,
                 ub_slice,
                 padded_bs,
                 i,
                 ub_num_reqs,
+                ub_graph_bs=ub_graph_bs_list[i],
             )
             forward_contexts.append(ub_ctx)
             ub_inputs.append(
@@ -192,6 +214,8 @@ class UBatchWrapper(nn.Module):
 
         # Build per-ubatch ForwardContexts from pre-allocated forward_vars.
         full_graph_bs = ctx.context.graph_bs
+        # only padding for all_gather/reduce_scatter pass
+        all_gahter_dp_size = self._get_dp_size() if self.dp_gather_scatter else 1
         forward_contexts = []
         ub_inputs = []
         for i, ub_slice in enumerate(ctx.ubatch_slices):
@@ -199,7 +223,13 @@ class UBatchWrapper(nn.Module):
                 padded_bs = full_graph_bs // N
             else:
                 padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
-            ub_ctx = self._make_ubatch_context(ctx, ub_slice, padded_bs, i)
+            ub_ctx = self._make_ubatch_context(
+                ctx,
+                ub_slice,
+                padded_bs,
+                i,
+                ub_graph_bs=padded_bs * all_gahter_dp_size,
+            )
             forward_contexts.append(ub_ctx)
             ub_inputs.append(
                 (
@@ -284,6 +314,53 @@ class UBatchWrapper(nn.Module):
 
         return graph, output
 
+    @staticmethod
+    def _get_dp_size() -> int:
+        """Return DP world size (1 if DP is not active)."""
+        try:
+            from aiter.dist.parallel_state import get_dp_group
+
+            return get_dp_group().world_size
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _compute_ub_graph_bs(
+        ctx: ForwardContext,
+        N: int,
+        full_graph_bs: int,
+        dp_size: int,
+        device: torch.device,
+    ) -> list[int]:
+        """
+        For prefill (eager only): all_reduce(MAX) per-ubatch token counts
+        For decode: padded_bs * dp_size.
+        """
+        if ctx.context.is_prefill:
+            ub_sizes = []
+            for ub_slice in ctx.ubatch_slices:
+                ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
+                ub_sizes.append(ub_num_tokens)
+
+            if dp_size > 1:
+                sizes_t = torch.tensor(ub_sizes, device=device, dtype=torch.int64)
+                torch.distributed.all_reduce(
+                    sizes_t,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=_get_dp_group_handle(),
+                )
+                return sizes_t.tolist()
+            return ub_sizes
+        else:
+            result = []
+            for i in range(N):
+                if i < N - 1:
+                    padded_bs = full_graph_bs // N
+                else:
+                    padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
+                result.append(padded_bs * dp_size)
+            return result
+
     def _make_ubatch_context(
         self,
         ctx: ForwardContext,
@@ -291,17 +368,9 @@ class UBatchWrapper(nn.Module):
         padded_bs: int,
         ubatch_idx: int = 0,
         actual_num_reqs: int | None = None,
+        ub_graph_bs: int | None = None,
     ) -> ForwardContext:
-        """Build a ForwardContext for a single micro-batch.
-
-        For decode: uses pre-allocated per-ubatch forward_vars from the builder.
-        These have stable GPU addresses, so they work for both eager
-        and CUDAGraph paths. The data is pre-computed by
-        _prepare_ubatch_decode in prepare_decode.
-
-        For prefill: uses split_attn_metadata to slice the full-batch
-        attention metadata by request/token boundaries (eager only).
-        """
+        """Build a ForwardContext for a single micro-batch."""
         ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
 
         if ctx.context.is_prefill:
@@ -319,12 +388,18 @@ class UBatchWrapper(nn.Module):
 
         # Split Context
         ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
+        if ub_graph_bs is not None:
+            graph_bs = ub_graph_bs
+        elif ctx.context.is_prefill:
+            graph_bs = ub_num_tokens
+        else:
+            graph_bs = padded_bs
         ub_context = Context(
             positions=ctx.context.positions[ub_slice.token_slice],
             is_prefill=ctx.context.is_prefill,
             is_dummy_run=ctx.context.is_dummy_run,
             batch_size=ub_num_reqs,
-            graph_bs=ub_num_tokens if ctx.context.is_prefill else padded_bs,
+            graph_bs=graph_bs,
             is_draft=ctx.context.is_draft,
         )
 

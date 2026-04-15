@@ -178,7 +178,7 @@ def naive_multicast(
     return buffer
 
 
-def all_gather_with_padding(x: torch.Tensor):
+def pad_for_all_gather(x: torch.Tensor):
     max_batch_size = get_forward_context().context.graph_bs
     dim = 0
     original_batch_size = x.shape[dim]
@@ -190,10 +190,15 @@ def all_gather_with_padding(x: torch.Tensor):
         padding_shape[dim] = padding_size
 
         padding = torch.empty(padding_shape, dtype=x.dtype, device=x.device)
-        padding.zero_()
+        # padding.zero_()
         padded_x = torch.cat([x, padding], dim=dim)
 
-    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=dim)
+    return padded_x, original_batch_size
+
+
+def all_gather_with_padding(x: torch.Tensor):
+    padded_x, original_batch_size = pad_for_all_gather(x)
+    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=0)
     return gathered_hidden_states, original_batch_size
 
 
@@ -2612,13 +2617,32 @@ class FusedMoE(torch.nn.Module):
         # 3. DP attention + TP All_gahter/reduce Moe
         original_hidden_size = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
-        if (
+        use_dp_gather_scatter = (
             self.dp_size > 1
             and not self.moe_parallel_config.use_all2all_kernels
             and get_current_atom_config().enable_dp_attention
-        ):
-            hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
-            router_logits, _ = all_gather_with_padding(router_logits)
+        )
+        if use_dp_gather_scatter:
+            from atom.utils.dbo.ubatching import tbo_active
+
+            if tbo_active():
+                from atom.utils.dbo.ubatching import (
+                    tbo_switch_to_compute_sync,
+                    tbo_yield_and_switch_from_compute_to_comm,
+                    tbo_yield_and_switch_from_comm_to_compute,
+                )
+
+                padded_hs, original_hidden_size = pad_for_all_gather(hidden_states)
+                padded_rl, _ = pad_for_all_gather(router_logits)
+                tbo_yield_and_switch_from_compute_to_comm()
+                hidden_states = get_dp_group().all_gather(padded_hs, dim=0)
+                router_logits = get_dp_group().all_gather(padded_rl, dim=0)
+                tbo_switch_to_compute_sync()
+            else:
+                hidden_states, original_hidden_size = all_gather_with_padding(
+                    hidden_states
+                )
+                router_logits, _ = all_gather_with_padding(router_logits)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -2641,14 +2665,14 @@ class FusedMoE(torch.nn.Module):
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
-        if (
-            self.dp_size > 1
-            and not self.moe_parallel_config.use_all2all_kernels
-            and get_current_atom_config().enable_dp_attention
-        ):
+        if use_dp_gather_scatter:
+            if tbo_active():
+                tbo_yield_and_switch_from_compute_to_comm()
             final_hidden_states = reduce_scatter_with_unpadding(
                 final_hidden_states, original_hidden_size
             )
+            if tbo_active():
+                tbo_yield_and_switch_from_comm_to_compute()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

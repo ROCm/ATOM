@@ -605,9 +605,13 @@ class ModelRunner:
         )
         self.physical_block_size = self.attn_metadata_builder.block_size
         if config.enable_tbo:
+            dp_gather_scatter = (
+                config.enable_dp_attention and not config.enable_expert_parallel
+            )
             self.model = UBatchWrapper(
                 self.model,
                 attn_metadata_builder=self.attn_metadata_builder,
+                dp_gather_scatter=dp_gather_scatter,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
@@ -1498,26 +1502,39 @@ class ModelRunner:
         num_input_tokens = batch.total_tokens_num
         is_prefill = batch.total_tokens_num_prefill > 0
 
-        if is_prefill:
-            # Prefill: no token padding needed, only sync num_reqs for TBO.
-            _, prefill_reqs_across_dp = self.get_dp_padding(
+        dp_size = self.config.parallel_config.data_parallel_size
+        dp_rank = self.config.parallel_config.data_parallel_rank
+
+        if dp_size <= 1:
+            return num_input_tokens, None, None
+
+        reqs_across_dp = None
+        if self.config.enable_tbo:
+            from atom.utils.dbo.ubatching import sync_dp_for_tbo
+
+            sync_reqs = (
                 batch.total_seqs_num_prefill
+                if is_prefill
+                else batch.total_seqs_num_decode
             )
-            return num_input_tokens, None, prefill_reqs_across_dp
+            num_tokens_across_dp, reqs_across_dp = sync_dp_for_tbo(
+                dp_size,
+                dp_rank,
+                num_input_tokens,
+                sync_reqs,
+            )
         else:
-            # Decode: sync num_tokens for padding in DP.
-            num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
-            num_input_tokens += num_pad
-            return num_input_tokens, num_tokens_across_dp, None
+            _, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
+
+        num_input_tokens = int(torch.max(num_tokens_across_dp).item())
+        return num_input_tokens, num_tokens_across_dp, reqs_across_dp
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        num_input_tokens, num_tokens_across_dp, prefill_reqs_across_dp = (
-            self._preprocess(batch)
-        )
+        num_input_tokens, num_tokens_across_dp, reqs_across_dp = self._preprocess(batch)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
@@ -1570,12 +1587,8 @@ class ModelRunner:
         ubatch_slices = None
         if self.config.enable_tbo and (is_prefill or not batch.is_dummy_run):
             tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
-            dp_tbo_tensor = (
-                prefill_reqs_across_dp if is_prefill else num_tokens_across_dp
-            )
-            if dp_tbo_tensor is not None:
-                # use min across all ranks so all agree on TBO on/off.
-                min_reqs = int(torch.min(dp_tbo_tensor).item())
+            if reqs_across_dp is not None:
+                min_reqs = int(torch.min(reqs_across_dp).item())
                 can_tbo = min_reqs >= 2
             else:
                 can_tbo = tbo_num_reqs >= 2

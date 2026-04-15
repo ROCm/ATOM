@@ -20,6 +20,28 @@ def tbo_enabled() -> bool:
     return getattr(config, "enable_tbo", False)
 
 
+def sync_dp_for_tbo(
+    dp_size: int,
+    dp_rank: int,
+    num_input_tokens: int,
+    num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sync token counts and request counts across DP ranks in one all_reduce.
+
+    Returns (num_tokens_across_dp, reqs_across_dp).
+    reqs_across_dp is used to decide TBO on/off (min_reqs >= 2).
+    """
+    import torch.distributed as dist
+    from aiter.dist.parallel_state import get_dp_group
+
+    # Layout: [tokens_r0, ..., tokens_rN, reqs_r0, ..., reqs_rN]
+    sync_tensor = torch.zeros(dp_size * 2, device="cpu", dtype=torch.int32)
+    sync_tensor[dp_rank] = num_input_tokens
+    sync_tensor[dp_size + dp_rank] = num_reqs
+    dist.all_reduce(sync_tensor, group=get_dp_group().cpu_group)
+    return sync_tensor[:dp_size], sync_tensor[dp_size:]
+
+
 # ---------------------------------------------------------------------------
 # TBO (Two-Batch Overlap) dual-thread infrastructure
 #
