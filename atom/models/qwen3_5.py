@@ -7,6 +7,7 @@ from torch import nn
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.utils import atom_parameter
 from atom.utils.decorators import support_torch_compile
 
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -352,19 +353,19 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
-            self.attn_layer_scale = torch.nn.Parameter(
+            self.attn_layer_scale = atom_parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
-                ),
+                )
             )
-            self.ffn_layer_scale = torch.nn.Parameter(
+            self.ffn_layer_scale = atom_parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
-                ),
+                )
             )
 
 
