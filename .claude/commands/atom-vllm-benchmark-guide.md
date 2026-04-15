@@ -45,7 +45,7 @@ Run plugin-on by default.
 
 - **Default (candidate):** plugin enabled
 - **Optional control (baseline):** plugin disabled (only when A/B comparison is requested)
-- **Default ATOM vLLM Plugin image:** `rocm/amd-dev:vllm-lastest`
+- **Default ATOM vLLM Plugin image:** `rocm/atom-dev:vllm-lastest`
 
 If both conditions are run, only one variable is allowed to change between them.
 
@@ -164,7 +164,7 @@ Use this optional path when you need ATOM vs upstream runtime comparison.
 
 Reference images:
 
-- ATOM vLLM plugin default image: `rocm/amd-dev:vllm-lastest`
+- ATOM vLLM plugin default image: `rocm/atom-dev:vllm-lastest`
 - Upstream vLLM comparison image: `vllm/vllm-openai-rocm:nightly`
 
 ### 1) Pull latest upstream ROCm image
