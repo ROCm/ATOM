@@ -385,7 +385,7 @@ class AiterAttentionMetadataBuilder:
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
-        if self.model_runner.config.enable_tbo and bs >= 2:
+        if self.model_runner.config.enable_tbo_decode and bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
                 bs,

@@ -47,6 +47,7 @@ class EngineArgs:
     torch_profiler_dir: Optional[str] = None
     enable_dp_attention: bool = False
     enable_tbo: Optional[str] = None
+    all2all_backend: Optional[str] = None
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     mark_trace: bool = False
@@ -140,12 +141,22 @@ class EngineArgs:
         parser.add_argument(
             "--enable-tbo",
             nargs="?",
+            const="prefill",
+            default=None,
+            choices=["prefill", "all"],
+            help="Enable TBO (Two-Batch Overlap) for comm/compute overlap. "
+            "'--enable-tbo' or '--enable-tbo prefill': TBO for prefill only. "
+            "'--enable-tbo all': TBO for both prefill and decode.",
+        )
+        parser.add_argument(
+            "--all2all-backend",
+            nargs="?",
             const="high-throughput",
             default=None,
             choices=["high-throughput", "low-latency"],
-            help="Enable TBO (Two-Batch Overlap) for comm/compute overlap. "
-            "Default mode is 'high-throughput'. Use '--enable-tbo low-latency' "
-            "for AsyncLL MORI kernel overlap.",
+            help="All2all backend mode for MORI. "
+            "Default is 'high-throughput'. "
+            "Use '--all2all-backend low-latency' for AsyncLL MORI kernel overlap.",
         )
         parser.add_argument(
             "--method",
@@ -233,10 +244,14 @@ class EngineArgs:
             kwargs.pop("num_speculative_tokens")
             kwargs["speculative_config"] = None
 
-        # --enable-tbo [high-throughput|low-latency]
+        # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
         tbo_mode = kwargs.pop("enable_tbo", None)
         kwargs["enable_tbo"] = tbo_mode is not None
-        kwargs["enable_low_latency"] = tbo_mode == "low-latency"
+        kwargs["enable_tbo_decode"] = tbo_mode == "all"
+
+        # --all2all-backend [high-throughput|low-latency] → enable_low_latency
+        all2all_backend = kwargs.pop("all2all_backend", None)
+        kwargs["enable_low_latency"] = all2all_backend == "low-latency"
 
         logger.info(f"Engine kwargs: {kwargs}")
 

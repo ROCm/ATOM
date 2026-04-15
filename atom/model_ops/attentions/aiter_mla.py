@@ -599,7 +599,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dtype_q = self.dtype_q
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
-        if self.model_runner.config.enable_tbo and bs >= 2:
+        if self.model_runner.config.enable_tbo_decode and bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
                 bs,

@@ -1959,7 +1959,7 @@ class ModelRunner:
                 num_tokens += num_pad
                 # Create ubatch slices for TBO capture (need >= 2 requests)
                 ubatch_slices = None
-                if is_tbo and bs >= 2:
+                if is_tbo and self.config.enable_tbo_decode and bs >= 2:
                     ubatch_slices = maybe_create_ubatch_slices(
                         num_reqs=bs,
                         num_tokens=num_tokens,

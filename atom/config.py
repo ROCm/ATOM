@@ -782,6 +782,7 @@ class Config:
     speculative_config: Optional[SpeculativeConfig] = None
 
     enable_tbo: bool = False
+    enable_tbo_decode: bool = False
     enable_low_latency: bool = False
 
     # only use for plugin mode
