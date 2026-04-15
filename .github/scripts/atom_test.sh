@@ -4,6 +4,7 @@ set -euo pipefail
 TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
+ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
 
 
 if [ "$TYPE" == "launch" ]; then
@@ -124,6 +125,26 @@ if [ "$TYPE" == "accuracy" ]; then
           --num_fewshot 3 \
           --output_path "${RESULT_FILENAME}" \
           2>&1 | tee "$ATOM_CLIENT_LOG"
+
+  if [ -n "${ATOM_DOCKER_IMAGE}" ]; then
+    RESULT_FILE="${RESULT_FILENAME}" \
+    ATOM_DOCKER_IMAGE="${ATOM_DOCKER_IMAGE}" \
+    python3 - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+metadata["docker_image"] = os.environ["ATOM_DOCKER_IMAGE"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
 fi
 

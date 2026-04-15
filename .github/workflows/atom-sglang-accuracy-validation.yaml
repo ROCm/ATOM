@@ -93,7 +93,7 @@ jobs:
 
           if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF_NAME}" = "main" ]; then
             if RESOLUTION_JSON="$(
-              python3 .github/scripts/resolve_atom_plugin_image.py \
+              python3 .github/scripts/resolve_atom_image.py \
                 --repository "${VALIDATION_IMAGE_REPO}" \
                 --reference-tag sglang-latest \
                 --preferred-version "${SGLANG_REF#v}"

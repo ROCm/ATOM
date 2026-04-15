@@ -258,7 +258,7 @@ jobs:
 
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             if RESOLUTION_JSON="$(
-              python3 .github/scripts/resolve_atom_plugin_image.py \
+              python3 .github/scripts/resolve_atom_image.py \
                 --repository "${VALIDATION_IMAGE_REPO}" \
                 --reference-tag vllm-latest
             )"; then
