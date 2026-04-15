@@ -257,8 +257,26 @@ jobs:
           PY
 
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            echo "Scheduled run uses published OOT image: ${NIGHTLY_OOT_IMAGE_TAG}"
-            echo "oot_image_tag=${NIGHTLY_OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            if RESOLUTION_JSON="$(
+              python3 .github/scripts/resolve_atom_plugin_image.py \
+                --repository "${VALIDATION_IMAGE_REPO}" \
+                --reference-tag vllm-latest
+            )"; then
+              RESOLVED_OOT_IMAGE="$(
+                RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          PY
+              )"
+              echo "Scheduled run resolved published OOT image: ${RESOLVED_OOT_IMAGE}"
+            else
+              echo "::warning::Failed to resolve ${NIGHTLY_OOT_IMAGE_TAG} to an immutable reference; falling back to the floating tag."
+              RESOLVED_OOT_IMAGE="${NIGHTLY_OOT_IMAGE_TAG}"
+            fi
+            echo "oot_image_tag=${RESOLVED_OOT_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -266,7 +284,7 @@ jobs:
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           MANUAL_BASE_IMAGE_TAG="atom_oot_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
-          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vllm-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
@@ -511,6 +529,7 @@ jobs:
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
             -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
+            -e OOT_DOCKER_IMAGE="${OOT_IMAGE_TAG}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "

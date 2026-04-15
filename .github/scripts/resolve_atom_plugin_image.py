@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Resolve a stable published OOT image reference for benchmarking.
+"""Resolve a stable published ATOM plugin image reference from a floating tag.
 
-Given a floating tag like ``vllm-latest``, this script looks up its manifest
-digest and then searches the same repository for the newest
-``vllm-v*-nightly_*`` tag with that exact digest. If no nightly tag matches, or
-if the reverse lookup cannot complete after the floating tag digest is known, it
-returns a digest-pinned ``latest`` reference instead.
+Given a floating tag like ``vllm-latest`` or ``sglang-latest``, this script
+looks up its manifest digest and then searches the same repository for the
+newest same-digest nightly tag in the matching image family. If no nightly tag
+matches, or if the reverse lookup cannot complete after the floating tag digest
+is known, it returns a digest-pinned ``latest`` reference instead.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ MANIFEST_ACCEPT = ", ".join(
         "application/vnd.docker.distribution.manifest.v2+json",
     )
 )
-NIGHTLY_RE = re.compile(r"^vllm-v(?P<version>.+)-nightly_(?P<date>\d{8})$")
-USER_AGENT = "ATOM OOT Image Resolver/1.0"
+USER_AGENT = "ATOM Plugin Image Resolver/1.0"
+SUPPORTED_IMAGE_FAMILIES = ("vllm", "sglang")
 
 
 @dataclass(frozen=True)
@@ -161,12 +161,33 @@ def list_tags(repository: str, token: str) -> list[str]:
     return tags
 
 
+def nightly_regex(image_family: str) -> re.Pattern[str]:
+    if image_family not in SUPPORTED_IMAGE_FAMILIES:
+        raise ValueError(
+            f"Unsupported image family {image_family!r}; expected one of {SUPPORTED_IMAGE_FAMILIES}"
+        )
+    return re.compile(
+        rf"^{re.escape(image_family)}-v(?P<version>.+)-nightly_(?P<date>\d{{8}})$"
+    )
+
+
+def infer_image_family(reference_tag: str) -> str:
+    for family in SUPPORTED_IMAGE_FAMILIES:
+        if reference_tag == f"{family}-latest":
+            return family
+    raise ValueError(
+        f"Unable to infer image family from reference tag {reference_tag!r}; expected one of "
+        + ", ".join(f"{family}-latest" for family in SUPPORTED_IMAGE_FAMILIES)
+    )
+
+
 def nightly_candidates(
-    tags: Iterable[str], preferred_version: str | None
+    tags: Iterable[str], preferred_version: str | None, image_family: str = "vllm"
 ) -> list[CandidateTag]:
+    pattern = nightly_regex(image_family)
     candidates: list[CandidateTag] = []
     for tag in tags:
-        match = NIGHTLY_RE.match(tag)
+        match = pattern.match(tag)
         if not match:
             continue
         candidates.append(
@@ -187,13 +208,19 @@ def nightly_candidates(
 
 
 def resolve_image(
-    repository: str, reference_tag: str, preferred_version: str | None
+    repository: str,
+    reference_tag: str,
+    preferred_version: str | None,
+    image_family: str | None = None,
 ) -> dict[str, object]:
+    image_family = image_family or infer_image_family(reference_tag)
     token = get_registry_token(repository)
     reference_digest = get_manifest_digest(repository, reference_tag, token)
     candidates: list[CandidateTag] = []
     try:
-        candidates = nightly_candidates(list_tags(repository, token), preferred_version)
+        candidates = nightly_candidates(
+            list_tags(repository, token), preferred_version, image_family=image_family
+        )
         for candidate in candidates:
             if (
                 get_manifest_digest(repository, candidate.tag, token)
@@ -231,7 +258,7 @@ def resolve_image(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Resolve a floating OOT image tag to a same-digest nightly tag when possible."
+        description="Resolve a floating ATOM plugin image tag to a same-digest nightly tag when possible."
     )
     parser.add_argument(
         "--repository",
@@ -241,12 +268,17 @@ def main() -> None:
     parser.add_argument(
         "--reference-tag",
         required=True,
-        help="Floating tag to resolve, for example vllm-latest",
+        help="Floating tag to resolve, for example vllm-latest or sglang-latest",
     )
     parser.add_argument(
         "--preferred-version",
         default="",
-        help="Optional preferred vLLM version to prioritize when scanning nightly tags",
+        help="Optional preferred backend version to prioritize when scanning nightly tags",
+    )
+    parser.add_argument(
+        "--image-family",
+        default="",
+        help="Optional image family override (for example vllm or sglang). By default this is inferred from the reference tag.",
     )
     args = parser.parse_args()
 
@@ -254,6 +286,7 @@ def main() -> None:
         repository=args.repository,
         reference_tag=args.reference_tag,
         preferred_version=args.preferred_version or None,
+        image_family=args.image_family or None,
     )
     json.dump(resolution, sys.stdout, sort_keys=True)
     sys.stdout.write("\n")

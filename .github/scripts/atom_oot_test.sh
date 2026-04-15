@@ -48,6 +48,7 @@ KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
+OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
 LAST_VLLM_LOG_LINE=0
 
 declare -a ACTIVE_MODELS=()
@@ -251,6 +252,26 @@ PY
   if [[ "${result_file}" != "${flat_result_file}" ]]; then
     cp -f "${result_file}" "${flat_result_file}"
     result_file="${flat_result_file}"
+  fi
+
+  if [[ -n "${OOT_DOCKER_IMAGE}" ]]; then
+    RESULT_FILE="${result_file}" \
+    OOT_DOCKER_IMAGE="${OOT_DOCKER_IMAGE}" \
+    python - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+if os.environ.get("OOT_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["OOT_DOCKER_IMAGE"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
   fi
 
   local value
