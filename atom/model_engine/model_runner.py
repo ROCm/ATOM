@@ -1510,6 +1510,8 @@ class ModelRunner:
         """Create TBO ubatch slices if conditions are met."""
         if not self.config.enable_tbo:
             return None
+        if not is_prefill and not self.config.enable_tbo_decode:
+            return None
         if not is_prefill and batch.is_dummy_run:
             return None
 
