@@ -338,7 +338,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
             )
-            from atom.utils.dbo.ubatching import tbo_enabled
+            from atom.utils.tbo.ubatching import tbo_enabled
             from atom.config import get_current_atom_config
 
             handle = all2all_manager.get_handle(all_to_all_args)
@@ -2623,11 +2623,11 @@ class FusedMoE(torch.nn.Module):
             and get_current_atom_config().enable_dp_attention
         )
         if use_dp_gather_scatter:
-            from atom.utils.dbo.ubatching import tbo_active
+            from atom.utils.tbo.ubatching import tbo_active
 
             _tbo = tbo_active()
             if _tbo:
-                from atom.utils.dbo.ubatching import (
+                from atom.utils.tbo.ubatching import (
                     tbo_switch_to_compute_sync,
                     tbo_yield_and_switch_from_compute_to_comm,
                     tbo_yield_and_switch_from_comm_to_compute,

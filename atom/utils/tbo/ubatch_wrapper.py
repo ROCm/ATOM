@@ -41,12 +41,6 @@ class TBOGraphData:
 
 class UBatchWrapper(nn.Module):
     """Wraps a model to split decode batches into micro-batches.
-
-    Follows vLLM's UBatchWrapper pattern: each micro-batch is run in
-    its own thread calling ``self.model(input_ids, positions)`` inside
-    a ``TBOContext`` context manager.  The overlap between communication
-    and compute happens transparently inside the MoE kernel's
-    ``prepare_async`` / ``finalize_async`` methods.
     """
 
     def __init__(

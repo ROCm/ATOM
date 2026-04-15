@@ -34,7 +34,7 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.utils.dbo import UBatchWrapper, maybe_create_ubatch_slices
+from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -1510,7 +1510,7 @@ class ModelRunner:
 
         reqs_across_dp = None
         if self.config.enable_tbo:
-            from atom.utils.dbo.ubatching import sync_dp_for_tbo
+            from atom.utils.tbo.ubatching import sync_dp_for_tbo
 
             sync_reqs = (
                 batch.total_seqs_num_prefill

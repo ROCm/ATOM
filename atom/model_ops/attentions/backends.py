@@ -10,7 +10,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import block_table_convert_triton
-from atom.utils.dbo.ubatch_splitting import UBatchSlice, split_attn_metadata
+from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
 from atom.utils.forward_context import AttentionMetaData
 from torch import nn
 

@@ -9,7 +9,7 @@ import torch
 from atom.config import get_current_atom_config
 
 
-def dbo_enabled() -> bool:
+def tbo_overlap_enabled() -> bool:
     return False
 
 
@@ -41,15 +41,6 @@ def sync_dp_for_tbo(
     dist.all_reduce(sync_tensor, group=get_dp_group().cpu_group)
     return sync_tensor[:dp_size], sync_tensor[dp_size:]
 
-
-# ---------------------------------------------------------------------------
-# TBO (Two-Batch Overlap) dual-thread infrastructure
-#
-# Follows vLLM's UBatchContext pattern: each micro-batch thread runs the
-# full model forward inside a `with TBOContext(...)` block.  The context
-# manager handles thread registration, barrier synchronisation, forward
-# context restore, and stream management.
-# ---------------------------------------------------------------------------
 
 _THREAD_ID_TO_CONTEXT: dict[int, int] = {}
 _CURRENT_CONTEXTS: list["TBOContext | None"] = []
@@ -200,12 +191,6 @@ class TBOContext:
             self.recv_hook = None
 
 
-# ---------------------------------------------------------------------------
-# Module-level helpers (called from inside the model forward, e.g.
-# mori_prepare_finalize.py, modular_kernel.py)
-# ---------------------------------------------------------------------------
-
-
 def tbo_active() -> bool:
     """True if current thread is running inside TBO dual-thread execution."""
     return threading.get_ident() in _THREAD_ID_TO_CONTEXT
@@ -272,11 +257,6 @@ def tbo_switch_to_compute():
 def tbo_switch_to_comm():
     """Switch to comm stream without sync."""
     _get_current_tbo_context().update_stream(_get_current_tbo_context().comm_stream)
-
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
 
 
 def make_tbo_contexts(

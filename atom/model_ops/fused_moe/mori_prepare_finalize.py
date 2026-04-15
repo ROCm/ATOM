@@ -149,7 +149,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     def supports_async(self) -> bool:
         if not self._is_async:
             return False
-        from atom.utils.dbo.ubatching import tbo_active
+        from atom.utils.tbo.ubatching import tbo_active
 
         return tbo_active()
 
@@ -282,7 +282,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         scale: torch.Tensor | None,
     ) -> tuple[Callable, mk.ReceiverType]:
         """AsyncLL path: dispatch_send (CU-free) → yield → dispatch_recv."""
-        from atom.utils.dbo.ubatching import tbo_current_ubatch_id
+        from atom.utils.tbo.ubatching import tbo_current_ubatch_id
 
         ubatch_id = tbo_current_ubatch_id()
         mori_op = self._tbo_mori_ops[ubatch_id]
@@ -320,7 +320,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         scale: torch.Tensor | None,
     ) -> mk.ReceiverType:
-        from atom.utils.dbo.ubatching import (
+        from atom.utils.tbo.ubatching import (
             tbo_current_ubatch_id,
             tbo_yield_and_switch_from_compute_to_comm,
             tbo_switch_to_compute_sync,
@@ -384,7 +384,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
     ) -> tuple[Callable, Callable]:
         """AsyncLL path: combine_send (CU-free) → yield → combine_recv."""
-        from atom.utils.dbo.ubatching import tbo_current_ubatch_id
+        from atom.utils.tbo.ubatching import tbo_current_ubatch_id
 
         ubatch_id = tbo_current_ubatch_id()
         mori_op = self._tbo_mori_ops[ubatch_id]
@@ -407,7 +407,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         fused_expert_output: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> Callable:
-        from atom.utils.dbo.ubatching import (
+        from atom.utils.tbo.ubatching import (
             tbo_current_ubatch_id,
             tbo_yield_and_switch_from_compute_to_comm,
             tbo_switch_to_compute_sync,

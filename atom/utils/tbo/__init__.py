@@ -9,7 +9,7 @@ from .ubatch_splitting import (
 from .ubatch_wrapper import UBatchWrapper
 from .ubatching import (
     TBOContext,
-    dbo_enabled,
+    tbo_overlap_enabled,
     make_tbo_contexts,
     tbo_enabled,
     tbo_active,
@@ -30,7 +30,7 @@ __all__ = [
     "TBOContext",
     "UBatchSlice",
     "UBatchWrapper",
-    "dbo_enabled",
+    "tbo_overlap_enabled",
     "make_tbo_contexts",
     "maybe_create_ubatch_slices",
     "split_attn_metadata",

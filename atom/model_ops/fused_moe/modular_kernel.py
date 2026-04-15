@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
-from atom.utils.dbo.ubatching import dbo_enabled
+from atom.utils.tbo.ubatching import tbo_overlap_enabled
 from atom.utils.forward_context import get_forward_context
 import torch
 from typing import Callable, Optional, final
@@ -173,11 +173,10 @@ class FusedMoEModularKernel(torch.nn.Module):
     ]:
         """
         The _prepare method is a wrapper around self.prepare_finalize.prepare
-        that handles DBO and async.
+        that handles TBO and async.
         """
         if not self.prepare_finalize.supports_async():
-            # TODO: enable dbo
-            assert not dbo_enabled()
+            assert not tbo_overlap_enabled()
 
             (
                 a1q,
@@ -196,7 +195,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 quant_type,
             )
         else:
-            from atom.utils.dbo.ubatching import (
+            from atom.utils.tbo.ubatching import (
                 tbo_maybe_run_recv_hook,
                 tbo_register_recv_hook,
                 tbo_yield,
@@ -245,11 +244,11 @@ class FusedMoEModularKernel(torch.nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         The _finalize method is a wrapper around self.prepare_finalize.finalize
-        that handles DBO, async and shared expert overlap.
+        that handles TBO, async and shared expert overlap.
         """
 
         if not self.prepare_finalize.supports_async():
-            assert not dbo_enabled()
+            assert not tbo_overlap_enabled()
 
             output = self.prepare_finalize.finalize(
                 output,
@@ -259,7 +258,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 apply_router_weight_on_input,
             )
         else:
-            from atom.utils.dbo.ubatching import (
+            from atom.utils.tbo.ubatching import (
                 tbo_maybe_run_recv_hook,
                 tbo_register_recv_hook,
                 tbo_yield,

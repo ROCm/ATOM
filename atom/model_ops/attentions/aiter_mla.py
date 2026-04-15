@@ -837,7 +837,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """
         Split prefill AttentionMetaData for MLA.
         """
-        from atom.utils.dbo.ubatch_splitting import split_attn_metadata
+        from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
 
