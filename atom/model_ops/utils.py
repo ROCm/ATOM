@@ -26,7 +26,10 @@ def atom_parameter(data: torch.Tensor) -> nn.Parameter:
     inference vs. training gradient behaviour is controlled from a single
     place.
     """
-    return nn.Parameter(data, requires_grad=envs.ATOM_REQUIRES_GRAD)
+    requires_grad = envs.ATOM_REQUIRES_GRAD and (
+        data.is_floating_point() or data.is_complex()
+    )
+    return nn.Parameter(data, requires_grad=requires_grad)
 
 
 @cache
