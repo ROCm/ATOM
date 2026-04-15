@@ -20,6 +20,8 @@ from aiter import (
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import mla_decode_fwd as mla_decode_fwd_gluon
+from aiter.ops.triton.kv_cache import cat_and_cache_mla as concat_and_cache_mla_triton
+from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_cat_and_cache_mla as fused_qk_rope_concat_and_cache_mla_triton
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
@@ -42,11 +44,18 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
+concat_and_cache_mla_triton = mark_trace(
+    concat_and_cache_mla_triton, prefix="kv_cache", torch_compile=False
+)
 fused_qk_rope_concat_and_cache_mla = mark_trace(
     fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
 )
+fused_qk_rope_concat_and_cache_mla_triton = mark_trace(
+    fused_qk_rope_concat_and_cache_mla_triton, prefix="rope_and_kv_cache_triton", torch_compile=False
+)
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
+mla_decode_fwd_gluon = mark_trace(mla_decode_fwd_gluon, prefix="mla_decode_gluon", torch_compile=False)
 
 # torch.set_printoptions(threshold=10_000)
 
@@ -584,7 +593,7 @@ class MLAAttention(nn.Module):
         if envs.ATOM_ENABLE_TRITON_MLA_DECODE:
             mla_decode_fwd_gluon(
                 q,
-                kv_buffer.view(-1, 64, 1, q.shape[-1]),
+                kv_buffer.view(-1, self.num_kv_heads, 64, q.shape[-1]),
                 o,
                 attn_metadata.cu_seqlens_q,
                 attn_metadata.context_lens,
@@ -597,8 +606,7 @@ class MLAAttention(nn.Module):
                 q_descale=self._q_scale,
                 kv_descale=self._k_scale,
                 out_scale=None,
-                use_gluon=False,
-                shuffled_kv_cache=False,
+                shuffled_kv_cache=True,
             )
         else:
             mla_decode_fwd(
@@ -667,14 +675,26 @@ class MLAAttention(nn.Module):
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                concat_and_cache_mla(
-                    k_nope,
-                    k_rope.squeeze(1),
-                    kv_cache,
-                    attn_metadata.slot_mapping.flatten(),
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    scale=self._k_scale,
-                )
+                if envs.ATOM_ENABLE_TRITON_MLA_DECODE:
+                    concat_and_cache_mla_triton(
+                        k_nope.unsqueeze(1),
+                        k_rope.unsqueeze(1),
+                        kv_cache.view(
+                            -1, self.num_kv_heads, 64, self.kv_lora_rank + self.qk_rope_head_dim
+                        ),
+                        attn_metadata.slot_mapping.flatten(),
+                        self._k_scale,
+                        shuffled_kv_cache=True,
+                    )
+                else:
+                    concat_and_cache_mla(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache,
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
 
             if use_prefix_cache:
                 # k_full/v_full are used for attention compute; gather_kv_b_proj reads
@@ -741,24 +761,44 @@ class MLAAttention(nn.Module):
                 device=q_nope.device,
             )
             if kv_cache.numel() > 0:
-                fused_qk_rope_concat_and_cache_mla(
-                    q_nope,
-                    q_rope,
-                    k_nope,
-                    k_rope,
-                    kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                    ),
-                    q_out,
-                    attn_metadata.slot_mapping,
-                    self._k_scale,
-                    self._q_scale,
-                    positions,
-                    self.rotary_emb.cos_cache,
-                    self.rotary_emb.sin_cache,
-                    is_neox=self.rotary_emb.is_neox_style,
-                    is_nope_first=True,
-                )
+                if envs.ATOM_ENABLE_TRITON_MLA_DECODE:
+                    fused_qk_rope_concat_and_cache_mla_triton(
+                        q_nope,
+                        q_rope,
+                        k_nope.unsqueeze(1),
+                        k_rope.unsqueeze(1),
+                        kv_cache.view(
+                            -1, self.num_kv_heads, 64, self.kv_lora_rank + self.qk_rope_head_dim
+                        ),
+                        q_out=q_out,
+                        slot_mapping=attn_metadata.slot_mapping,
+                        k_scale=self._k_scale,
+                        # self._q_scale,
+                        pos=positions,
+                        cos=self.rotary_emb.cos_cache,
+                        sin=self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        shuffled_kv_cache=True,
+                    )
+                else:
+                    fused_qk_rope_concat_and_cache_mla(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        kv_cache.view(
+                            kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                        ),
+                        q_out,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        is_nope_first=True,
+                    )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:

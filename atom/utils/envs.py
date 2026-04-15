@@ -64,7 +64,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     == "1",
     "ATOM_ENABLE_TRITON_MLA_DECODE": lambda: os.getenv(
-        "ATOM_ENABLE_TRITON_MLA_DECODE", "1"
+        "ATOM_ENABLE_TRITON_MLA_DECODE", "0"
     )
     == "1",
     # --- Profiling & Logging ---
