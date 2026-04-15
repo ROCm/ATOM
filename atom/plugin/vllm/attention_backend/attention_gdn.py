@@ -267,25 +267,36 @@ class GatedDeltaNet(nn.Module):
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+            mixed_qkv_non_spec_prefill = mixed_qkv_non_spec[attn_metadata.num_decode_tokens + attn_metadata.num_spec_decode_tokens:num_actual_tokens]
+            mixed_qkv_non_spec_prefill_T = mixed_qkv_non_spec_prefill.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            query_non_spec, key_non_spec, value_non_spec = causal_conv1d_fn(
-                mixed_qkv_non_spec_T,
+            query_non_spec_prefill, key_non_spec_prefill, value_non_spec_prefill = causal_conv1d_fn(
+                mixed_qkv_non_spec_prefill_T,
                 conv_weights,
                 self.conv1d.bias,
                 activation=self.activation,
                 conv_states=conv_state,
                 has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
+                cache_indices=non_spec_state_indices_tensor[attn_metadata.num_decode_tokens + attn_metadata.num_spec_decode_tokens:num_actual_tokens],
                 query_start_loc=non_spec_query_start_loc,
                 k_dim_size=self.num_k_heads * self.head_k_dim // self.tp_size,
                 v_dim_size=self.num_v_heads * self.head_v_dim // self.tp_size,
                 metadata=attn_metadata,
             )
-        elif attn_metadata.num_decodes > 0:
-            query_non_spec, key_non_spec, value_non_spec = causal_conv1d_update(
-                mixed_qkv_non_spec,
+            num_tokens_nonspec_prefill = query_non_spec_prefill.shape[0]
+            query_non_spec_prefill = query_non_spec_prefill.view(
+                1, num_tokens_nonspec_prefill, -1, self.head_k_dim
+            )
+            key_non_spec_prefill = key_non_spec_prefill.view(1, num_tokens_nonspec_prefill, -1, self.head_k_dim)
+            value_non_spec_prefill = value_non_spec_prefill.view(
+                1, num_tokens_nonspec_prefill, -1, self.head_v_dim
+            )
+
+        if attn_metadata.num_decodes > 0:
+            mixed_qkv_non_spec_decode = mixed_qkv_non_spec[:attn_metadata.num_decode_tokens]
+            query_non_spec_decode, key_non_spec_decode, value_non_spec_decode = causal_conv1d_update(
+                mixed_qkv_non_spec_decode,
                 conv_state,
                 conv_weights,
                 self.num_k_heads * self.head_k_dim // self.tp_size,
@@ -293,34 +304,42 @@ class GatedDeltaNet(nn.Module):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[
-                    : attn_metadata.num_actual_tokens
+                    :attn_metadata.num_decode_tokens
                 ],
                 validate_data=True,
             )
-        else:
-            mixed_qkv_non_spec = None
+            num_tokens_nonspec_decode = query_non_spec_decode.shape[0]
+            query_non_spec_decode = query_non_spec_decode.view(
+                1, num_tokens_nonspec_decode, -1, self.head_k_dim
+            )
+            key_non_spec_decode = key_non_spec_decode.view(1, num_tokens_nonspec_decode, -1, self.head_k_dim)
+            value_non_spec_decode = value_non_spec_decode.view(
+                1, num_tokens_nonspec_decode, -1, self.head_v_dim
+            )
+        # else:
+        #     mixed_qkv_non_spec = None
 
-        if attn_metadata.num_prefills > 0 or attn_metadata.num_decodes > 0:
-            num_tokens_nonspec = query_non_spec.shape[0]
-            query_non_spec = query_non_spec.view(
-                1, num_tokens_nonspec, -1, self.head_k_dim
-            )
-            key_non_spec = key_non_spec.view(1, num_tokens_nonspec, -1, self.head_k_dim)
-            value_non_spec = value_non_spec.view(
-                1, num_tokens_nonspec, -1, self.head_v_dim
-            )
+        # if attn_metadata.num_prefills > 0 or attn_metadata.num_decodes > 0:
+        #     num_tokens_nonspec = query_non_spec.shape[0]
+        #     query_non_spec = query_non_spec.view(
+        #         1, num_tokens_nonspec, -1, self.head_k_dim
+        #     )
+        #     key_non_spec = key_non_spec.view(1, num_tokens_nonspec, -1, self.head_k_dim)
+        #     value_non_spec = value_non_spec.view(
+        #         1, num_tokens_nonspec, -1, self.head_v_dim
+        #     )
 
         if attn_metadata.num_prefills > 0:
-            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-            if spec_sequence_masks is not None:
-                g_non_spec = g.index_select(1, non_spec_token_indx)
-                beta_non_spec = beta.index_select(1, non_spec_token_indx)
-            else:
-                g_non_spec = g
-                beta_non_spec = beta
-        else:
-            g_non_spec = None
-            beta_non_spec = None
+            g_non_spec_prefill, beta_non_spec_prefill = fused_gdn_gating(self.A_log, a[attn_metadata.num_decode_tokens + attn_metadata.num_spec_decode_tokens:num_actual_tokens], b[attn_metadata.num_decode_tokens + attn_metadata.num_spec_decode_tokens:num_actual_tokens], self.dt_bias)
+            # if spec_sequence_masks is not None:
+            #     g_non_spec = g.index_select(1, non_spec_token_indx)
+            #     beta_non_spec = beta.index_select(1, non_spec_token_indx)
+            # else:
+            #     g_non_spec = g
+            #     beta_non_spec = beta
+        # else:
+        #     g_non_spec = None
+        #     beta_non_spec = None
 
         # 2. Recurrent attention
 
@@ -329,8 +348,8 @@ class GatedDeltaNet(nn.Module):
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a[:attn_metadata.num_spec_decode_tokens],
+                    b=b[:attn_metadata.num_spec_decode_tokens],
                     dt_bias=self.dt_bias,
                     q=query_spec,
                     k=key_spec,
@@ -350,42 +369,45 @@ class GatedDeltaNet(nn.Module):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+            prefill_state_indices = non_spec_state_indices_tensor[attn_metadata.num_decode_tokens + attn_metadata.num_spec_decode_tokens:num_actual_tokens]
+            initial_state = ssm_state[prefill_state_indices].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
-                core_attn_out_non_spec,
+                core_attn_out_non_spec_prefill,
                 last_recurrent_state,
             ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
+                q=query_non_spec_prefill,
+                k=key_non_spec_prefill,
+                v=value_non_spec_prefill,
+                g=g_non_spec_prefill,
+                beta=beta_non_spec_prefill,
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
                 use_qk_l2norm_in_kernel=True,
             )
             # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+            ssm_state[prefill_state_indices] = last_recurrent_state.to(
                 ssm_state.dtype
             )
-        elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
+        if attn_metadata.num_decodes > 0:
+            decode_state_indices = non_spec_state_indices_tensor[:attn_metadata.num_decode_tokens]
+            core_attn_out_non_spec_decode, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a[:attn_metadata.num_decode_tokens],
+                    b=b[:attn_metadata.num_decode_tokens],
                     dt_bias=self.dt_bias,
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
+                    q=query_non_spec_decode,
+                    k=key_non_spec_decode,
+                    v=value_non_spec_decode,
+                    o=core_attn_out[:attn_metadata.num_decode_tokens],
                     initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[
                         : attn_metadata.num_decodes + 1
                     ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
+                    ssm_state_indices=decode_state_indices,
                     use_qk_l2norm_in_kernel=True,
                 )
             )
@@ -405,6 +427,6 @@ class GatedDeltaNet(nn.Module):
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
-            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+            core_attn_out[attn_metadata.num_decode_tokens:num_actual_tokens] = core_attn_out_non_spec_prefill.squeeze(0)
 
         return core_attn_out
