@@ -19,6 +19,10 @@ on:
         description: "gpt-oss-120b TP1"
         type: boolean
         default: false
+      glm-5-1-fp8-tp8:
+        description: "GLM-5.1-FP8 TP8"
+        type: boolean
+        default: false
       kimi-k2-thinking-mxfp4-tp4:
         description: "Kimi-K2-Thinking-MXFP4 TP4"
         type: boolean
@@ -315,6 +319,7 @@ jobs:
           ENABLE_DEEPSEEK_R1_FP8: ${{ inputs.deepseek-r1-fp8 }}
           ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4 }}
           ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b }}
+          ENABLE_GLM_5_1_FP8_TP8: ${{ inputs.glm-5-1-fp8-tp8 }}
           ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
           ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
           ENABLE_KIMI_K25_TP4: ${{ inputs.kimi-k2-5-mxfp4-tp4 }}
@@ -333,6 +338,7 @@ jobs:
               (.prefix == "deepseek-r1-fp8" and env.ENABLE_DEEPSEEK_R1_FP8 == "true")
               or (.prefix == "deepseek-r1-mxfp4" and env.ENABLE_DEEPSEEK_R1_MXFP4 == "true")
               or (.prefix == "gpt-oss-120b" and env.ENABLE_GPT_OSS_120B == "true")
+              or (.prefix == "glm-5-1-fp8-tp8" and env.ENABLE_GLM_5_1_FP8_TP8 == "true")
               or (.prefix == "kimi-k2-thinking-mxfp4-tp4" and env.ENABLE_KIMI_K2_TP4 == "true")
               or (.prefix == "kimi-k2-thinking-mxfp4-tp8" and env.ENABLE_KIMI_K2_TP8 == "true")
               or (.prefix == "kimi-k25-mxfp4-tp4" and env.ENABLE_KIMI_K25_TP4 == "true")
@@ -583,6 +589,7 @@ jobs:
             deepseek-r1-fp8) echo "enabled=${{ inputs.deepseek-r1-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> "$GITHUB_OUTPUT" ;;
+            glm-5-1-fp8-tp8) echo "enabled=${{ inputs.glm-5-1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;

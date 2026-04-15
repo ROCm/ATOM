@@ -133,5 +133,17 @@
     "accuracy_threshold": 0.38,
     "accuracy_baseline": 0.38,
     "accuracy_baseline_model": "openai/gpt-oss-120b"
+  },
+  {
+    "model_name": "GLM-5.1-FP8 TP8",
+    "model_path": "zai-org/GLM-5.1-FP8",
+    "extraArgs": "--tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "env_vars": "",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.88,
+    "accuracy_baseline": 0.9545,
+    "accuracy_baseline_model": "zai-org/GLM-5.1",
+    "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
   }
 ]

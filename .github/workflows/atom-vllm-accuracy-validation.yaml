@@ -69,6 +69,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_glm5_1_fp8_tp8:
+        description: "GLM-5.1-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
       upload_accuracy_to_dashboard:
         description: "Optional: upload OOT accuracy results to dashboard after this manual run"
         required: false
@@ -121,6 +126,7 @@ jobs:
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
+          RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
         run: |
           set -euo pipefail
 
@@ -240,6 +246,15 @@ jobs:
                   "accuracy_test_threshold": 0.38,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-4",
+              },
+              {
+                  "toggle_env": "RUN_GLM5_1_FP8_TP8",
+                  "model_name": "GLM-5.1-FP8 TP8",
+                  "model_path": "zai-org/GLM-5.1-FP8",
+                  "extra_args": "--tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+                  "accuracy_test_threshold": 0.88,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-8",
               },
           ]
 

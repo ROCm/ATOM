@@ -144,7 +144,19 @@ launch_one_model() {
   resolved_model_path=$(resolve_model_path "${model_path}")
 
   if [[ -n "${extra_args}" ]]; then
-    read -r -a extra_arg_array <<< "${extra_args}"
+    while IFS= read -r -d '' token; do
+      extra_arg_array+=("${token}")
+    done < <(
+      EXTRA_ARGS="${extra_args}" python3 - <<'PY'
+import os
+import shlex
+import sys
+
+for token in shlex.split(os.environ["EXTRA_ARGS"]):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
   fi
 
   echo ""
