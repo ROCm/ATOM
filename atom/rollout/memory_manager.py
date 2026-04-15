@@ -78,6 +78,8 @@ class MemoryManagerMixin:
         if "kv_cache" in tags:
             self._resume_kv_cache()
 
+        self._recapture_cudagraphs_if_needed()
+
         logger.info(f"{self.label}: GPU memory resumed, tags={tags}")
         return True
 
@@ -124,8 +126,6 @@ class MemoryManagerMixin:
                 param.data = param.data.to(self.device, non_blocking=False)
             torch.cuda.synchronize()
             logger.info(f"{self.label}: Weights restored to {self.device}")
-        # Recapture CUDA graphs since weight GPU addresses have changed
-        self._recapture_cudagraphs_if_needed()
 
     def _release_kv_cache(self) -> None:
         if not hasattr(self, "kv_cache") or self.kv_cache is None:
@@ -184,8 +184,6 @@ class MemoryManagerMixin:
         logger.info(
             f"{self.label}: KV cache re-allocated and bound ({num_blocks} blocks)"
         )
-        # Recapture CUDA graphs after KV cache re-allocation (addresses changed)
-        self._recapture_cudagraphs_if_needed()
 
     def _recapture_cudagraphs_if_needed(self) -> None:
         """Recapture CUDA graphs if they were released during sleep.
