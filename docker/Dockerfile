@@ -13,9 +13,6 @@ ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
 ARG VLLM_COMMIT="b31e9326a7d9394aab8c767f8ebe225c65594b60"
 ARG INSTALL_LM_EVAL=1
 ARG INSTALL_FASTSAFETENSORS=1
-ARG ROCM_WHEEL_INDEX="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/"
-ARG ROCM_TORCHVISION_VERSION="0.24.0+rocm7.2.1.gitb919bd0c"
-ARG ROCM_TORCHAUDIO_VERSION="2.9.0+rocm7.2.1.gite3c6ee2b"
 # Let PR OOT CI verify whether a pulled prebuilt image still matches this vLLM commit
 LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
 
@@ -103,11 +100,7 @@ RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && 
     "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \
     "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom mori || true
 
-RUN echo "FIXME: rocm/pytorch:latest currently resolves incompatible torchvision/torchaudio wheels; pin ROCm wheels here until the base image is fixed upstream." && \
-    "${VENV_PYTHON}" -m pip uninstall -y torchvision torchaudio || true && \
-    "${VENV_PYTHON}" -m pip install --no-index --find-links "${ROCM_WHEEL_INDEX}" \
-      "torchvision==${ROCM_TORCHVISION_VERSION}" \
-      "torchaudio==${ROCM_TORCHAUDIO_VERSION}" && \
+RUN echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
 
 # Restore that exact base-image Triton after all OOT installs finish. The goal
@@ -156,18 +149,15 @@ ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGLANG_REF="v0.5.10"
 ARG SGLANG_TRITON_VERSION="3.6.0"
-ARG ROCM_WHEEL_INDEX="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/"
-ARG ROCM_TORCHVISION_VERSION="0.24.0+rocm7.2.1.gitb919bd0c"
-ARG ROCM_TORCHAUDIO_VERSION="2.9.0+rocm7.2.1.gite3c6ee2b"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
-RUN echo "========== [SGLANG 0/6] Check Aiter/FlyDSL versions before SGLang build ==========" && \
+RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom mori amd-aiter flydsl || true
 
-RUN echo "========== [SGLANG 1/6] Clone SGLang ==========" && \
+RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     rm -rf /app/sglang && \
     git clone "${SGLANG_REPO}" /app/sglang && \
     cd /app/sglang && \
@@ -176,7 +166,7 @@ RUN echo "========== [SGLANG 1/6] Clone SGLang ==========" && \
     echo "sglang ref:" && \
     git rev-parse HEAD
 
-RUN echo "========== [SGLANG 2/6] Build sglang kernel ==========" && \
+RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y sgl-kernel sglang-kernel sglang || true && \
     "${VENV_PYTHON}" -m pip install --upgrade pip setuptools wheel && \
     DETECTED_AMDGPU_TARGET="$("${VENV_PYTHON}" -c "import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(':')[0] if torch.cuda.is_available() else '')" 2>/dev/null || true)" && \
@@ -192,7 +182,7 @@ RUN echo "========== [SGLANG 2/6] Build sglang kernel ==========" && \
     AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
     "${VENV_PYTHON}" -m pip show sglang-kernel || true
 
-RUN echo "========== [SGLANG 3/6] Install SGLang dependencies ==========" && \
+RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
     cd /app/sglang/python && \
     rm -f pyproject.toml && \
     cp pyproject_other.toml pyproject.toml && \
@@ -226,11 +216,7 @@ RUN echo "========== [SGLANG 3/6] Install SGLang dependencies ==========" && \
     rm -f /tmp/sglang-runtime-common.txt && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
-RUN echo "========== [SGLANG 4/6] Pin ROCm vision/audio wheels ==========" && \
-    "${VENV_PYTHON}" -m pip uninstall -y torchvision torchaudio || true && \
-    "${VENV_PYTHON}" -m pip install --no-deps --no-index --find-links "${ROCM_WHEEL_INDEX}" \
-      "torchvision==${ROCM_TORCHVISION_VERSION}" \
-      "torchaudio==${ROCM_TORCHAUDIO_VERSION}" && \
+RUN echo "========== [SGLANG-ATOM 4/6] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
     "${VENV_PYTHON}" -c "import os, torch, torchvision, torchaudio, sglang, triton, transformers; from torchvision.io import decode_jpeg; assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'; print(f'torch: {torch.__version__}'); print(f'triton: {triton.__version__}'); print(f'transformers: {transformers.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'decode_jpeg: {decode_jpeg.__name__}'); print(f'sglang imported from: {sglang.__file__}'); print(f'PYTHONPATH={os.environ.get(\"PYTHONPATH\", \"\")}')" && \
     echo "Validated sglang launch_server entrypoint"
@@ -242,12 +228,11 @@ RUN echo "========== [SGLANG 4/6] Pin ROCm vision/audio wheels ==========" && \
 # so pip does not downgrade it back to the torch-pinned 3.5.1 dependency. Keep
 # this override local to `atom_sglang` so the OOT/atom_release flow preserves
 # its prior Triton behavior.
-RUN echo "========== [SGLANG 5/6] Install validated Triton ==========" && \
-    "${VENV_PYTHON}" -m pip uninstall -y triton || true && \
+RUN echo "========== [SGLANG-ATOM 5/6] Install validated Triton ==========" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir "triton==${SGLANG_TRITON_VERSION}" && \
-    "${VENV_PYTHON}" -c "import triton; print(f'Installed Triton: {triton.__version__}')"
+    "${VENV_PYTHON}" -m pip show triton
 
-RUN echo "========== [SGLANG 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
+RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom mori amd-aiter flydsl || true
 
 CMD ["/bin/bash"]
