@@ -40,8 +40,7 @@ class TBOGraphData:
 
 
 class UBatchWrapper(nn.Module):
-    """Wraps a model to split decode batches into micro-batches.
-    """
+    """Wraps a model to split decode batches into micro-batches."""
 
     def __init__(
         self,
