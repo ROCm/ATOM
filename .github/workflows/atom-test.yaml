@@ -59,7 +59,7 @@ on:
         default: false
         type: boolean
     secrets:
-      github_token:
+      repo_token:
         required: false
       docker_username:
         required: false
@@ -88,12 +88,12 @@ jobs:
         with:
           repository: ${{ inputs.checkout_repository }}
           ref: ${{ inputs.checkout_ref }}
-          token: ${{ secrets.github_token || github.token }}
+          token: ${{ secrets.repo_token || github.token }}
 
       - name: Download and check pre-checkin signal
         run: bash ./.github/scripts/check_signal.sh
         env:
-          GITHUB_TOKEN: ${{ secrets.github_token || github.token }}
+          GITHUB_TOKEN: ${{ secrets.repo_token || github.token }}
           GITHUB_REPOSITORY: ${{ inputs.checkout_repository }}
           GITHUB_SHA: ${{ inputs.signal_commit_sha || inputs.checkout_ref }}
 
@@ -110,7 +110,7 @@ jobs:
 
           S3_MAIN_MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json"
           API_URL="https://api.github.com"
-          AUTH_HEADER="Authorization: token ${{ secrets.github_token || github.token }}"
+          AUTH_HEADER="Authorization: token ${{ secrets.repo_token || github.token }}"
           AITER_TEST_WORKFLOW_ID=179476100
 
           download_from_s3_manifest() {
@@ -215,7 +215,7 @@ jobs:
         with:
           repository: ${{ inputs.checkout_repository }}
           ref: ${{ inputs.checkout_ref }}
-          token: ${{ secrets.github_token || github.token }}
+          token: ${{ secrets.repo_token || github.token }}
       - id: load
         env:
           MODEL_SCOPE: ${{ inputs.model_scope }}
@@ -279,7 +279,7 @@ jobs:
         with:
           repository: ${{ inputs.checkout_repository }}
           ref: ${{ inputs.checkout_ref }}
-          token: ${{ secrets.github_token || github.token }}
+          token: ${{ secrets.repo_token || github.token }}
       
       - name: Docker Login
         if: ${{ !inputs.is_fork_pr }}
@@ -634,7 +634,7 @@ jobs:
         with:
           repository: ${{ inputs.checkout_repository }}
           ref: ${{ inputs.checkout_ref }}
-          token: ${{ secrets.github_token || github.token }}
+          token: ${{ secrets.repo_token || github.token }}
 
       - uses: actions/setup-python@v6
         with:
@@ -671,5 +671,5 @@ jobs:
           benchmark-data-dir-path: benchmark-dashboard
           auto-push: true
           max-items-in-chart: 90
-          github-token: ${{ secrets.github_token || github.token }}
+          github-token: ${{ secrets.repo_token || github.token }}
 

@@ -43,7 +43,7 @@ jobs:
       is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork || false }}
       publish_dashboard: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
     secrets:
-      github_token: ${{ secrets.GITHUB_TOKEN }}
+      repo_token: ${{ secrets.GITHUB_TOKEN }}
       docker_username: ${{ secrets.DOCKER_USERNAME }}
       docker_password: ${{ secrets.DOCKER_PASSWORD }}
       amd_hf_token: ${{ secrets.AMD_HF_TOKEN }}
