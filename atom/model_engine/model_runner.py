@@ -58,6 +58,8 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5ForConditionalGenerationTextOnly",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
 }
@@ -578,8 +580,17 @@ class ModelRunner:
             ),
         )
         self.model = model_class(config)
+        fused_shared_expert_load_fn = None
+        if hasattr(self.model, "load_fused_expert_weights"):
+            fused_shared_expert_load_fn = self.model.load_fused_expert_weights
         torch.set_default_device(None)
-        load_model(self.model, config.model, config.hf_config, config.load_dummy)
+        load_model(
+            self.model,
+            config.model,
+            config.hf_config,
+            config.load_dummy,
+            load_fused_expert_weights_fn=fused_shared_expert_load_fn,
+        )
         logger.info(f"Model load done: {config.model}")
 
         if hasattr(self, "drafter"):
@@ -630,7 +641,12 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
+        elif self.hf_text_config.model_type in (
+            "qwen3_next",
+            "qwen3_next_mtp",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        ):
             return True
         return False
 
@@ -1045,8 +1061,12 @@ class ModelRunner:
                 hf_config.linear_conv_kernel_dim,
                 self.num_spec_tokens,
             )
+            mamba_dtypes = self.gated_delta_net_state_dtypes()
             one_layer_byte = (
-                sum(math.prod(subtuple) for subtuple in mamba_shape) * kv_dtype_size
+                math.prod(mamba_shape[0])
+                * torch.tensor([], dtype=mamba_dtypes[0]).element_size()
+                + math.prod(mamba_shape[1])
+                * torch.tensor([], dtype=mamba_dtypes[1]).element_size()
             )
             block_bytes += self.num_gdn_attn_state * one_layer_byte
         else:
@@ -1234,16 +1254,17 @@ class ModelRunner:
                 hf_config.linear_conv_kernel_dim,
                 self.num_spec_tokens,  # self.num_spec,
             )
+            mamba_dtypes = self.gated_delta_net_state_dtypes()
             self.mamba_k_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
                 + mamba_shape[0],
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                dtype=mamba_dtypes[0],
                 device="cuda",
             )
             self.mamba_v_cache = torch.zeros(
                 (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
                 + mamba_shape[1],
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                dtype=mamba_dtypes[1],
                 device="cuda",
             )
         else:
@@ -1405,6 +1426,9 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
+    def gated_delta_net_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
+        return self.config.torch_dtype, self.config.torch_dtype
+
     def gated_delta_net_state_shape(
         self,
         tp_world_size: int,
@@ -1425,8 +1449,8 @@ class ModelRunner:
 
         temporal_state_shape = (
             num_v_heads // tp_world_size,
-            head_k_dim,
             head_v_dim,
+            head_k_dim,
         )
         return conv_state_shape, temporal_state_shape
 

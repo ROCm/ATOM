@@ -519,6 +519,9 @@ def load_model(
         for future in concurrent.futures.as_completed(futures):
             future.result()
 
+    # Avoid holding stale Parameter refs that prevent storage release.
+    del params_dict
+
     for _, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
             module.process_weights_after_loading()

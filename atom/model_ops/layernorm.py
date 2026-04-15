@@ -18,12 +18,12 @@ from aiter import (
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
 )
-from aiter.dist.communication_op import (
-    tensor_model_parallel_fused_allreduce_rmsnorm,
-)
+import aiter
+from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 
 from aiter import (
     QuantType,
@@ -302,6 +302,7 @@ class RMSNormGated(nn.Module):
     - Standard RMS normalization
     - Group RMS normalization
     - Optional gating with SiLU activation
+    - Fused FP8 group quantization (when quant_config is provided)
     """
 
     def __init__(
@@ -312,6 +313,7 @@ class RMSNormGated(nn.Module):
         norm_before_gate: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        quant_config=None,
     ):
         """Initialize RMSNormGated.
 
@@ -325,6 +327,7 @@ class RMSNormGated(nn.Module):
             norm_before_gate: If True and z is provided: out = norm(x) * silu(z)
                               If False and z is provided: out = norm(x * silu(z))
             dtype: Data type for parameters
+            quant_config: Quantization config (enables FP8 fusion if configured)
         """
         super().__init__()
         self.eps = eps
@@ -334,21 +337,50 @@ class RMSNormGated(nn.Module):
         self.norm_before_gate = norm_before_gate
         self.reset_parameters()
 
+        # Determine if we should use fused FP8 group quantization
+        self.use_fused_fp8_quant = False
+        self.group_size_quant = 128  # Default quantization group size
+        self.transpose_scale = False  # Whether to transpose scale output
+        self.quant_config = quant_config
+
+        if quant_config is not None:
+            from aiter import QuantType
+
+            quant_type = quant_config.quant_type
+
+            # Use fused kernel for per-block quantization (per_1x128, per_1x32)
+            if quant_type in [QuantType.per_1x128, QuantType.per_1x32]:
+                self.use_fused_fp8_quant = True
+                # Extract group size from quant type
+                if quant_type == QuantType.per_1x128:
+                    self.group_size_quant = 128
+                    # per_1x128 blockscale GEMM requires transposed scale layout
+                    self.transpose_scale = True
+                elif quant_type == QuantType.per_1x32:
+                    self.group_size_quant = 32
+                    self.transpose_scale = False
+
+                # Import kernel when needed
+
+                self.gated_rmsnorm_fp8_group_quant = gated_rmsnorm_fp8_group_quant
+
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
     def forward_native(
-        self, x: torch.Tensor, z: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        self, x: torch.Tensor, z: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
         """
         Native PyTorch implementation of RMS normalization with gating.
 
         Args:
-            x: Input tensor
-            z: Optional gating tensor
+            x: Input tensor [num_tokens, num_heads, head_dim]
+            z: Gating tensor [num_tokens, num_heads, head_dim] (can be None)
 
         Returns:
-            Normalized (and optionally gated) tensor
+            Tuple of (bf16_tensor, None)
+            - bf16_tensor: BF16 output [num_tokens, num_heads*head_dim] (flattened)
+            - None: No scale
 
         If z is not None:
             - norm_before_gate=True: out = norm(x) * silu(z)
@@ -377,31 +409,84 @@ class RMSNormGated(nn.Module):
         if z is not None and self.norm_before_gate:
             out = out * silu(z)
 
-        return out
+        # Flatten to match fused kernel output: [num_tokens, num_heads, head_dim] -> [num_tokens, num_heads*head_dim]
+        if len(out.shape) == 3:
+            num_tokens = out.shape[0]
+            out = out.reshape(num_tokens, -1)
 
-    def forward_cuda(
-        self, x: torch.Tensor, z: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        return (out, None)
 
-        if torch.compiler.is_compiling():
+    def forward_fused_fp8(
+        self, x: torch.Tensor, z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fused FP8 group quantization implementation.
+
+        Args:
+            x: Input tensor [num_tokens, num_heads, head_dim]
+            z: Gating tensor [num_tokens, num_heads, head_dim]
+
+        Returns:
+            Tuple of (fp8_tensor, scale_tensor)
+            - fp8_tensor: FP8 quantized output [num_tokens, num_heads*head_dim]
+            - scale_tensor: Per-group scales [num_tokens, num_heads*num_groups]
+                           In column-major layout if transpose_scale=True
+
+        Performs: out = quantize(rms_norm(x, weight, eps) * silu(z), group_size)
+        """
+        num_tokens, num_heads, head_dim = x.shape
+        # Check kernel constraints
+        if (
+            self.group_size is not None
+            or not self.norm_before_gate
+            or head_dim != self.group_size_quant
+        ):
+            # Grouped norm not supported by kernel, fallback
             return self.forward_native(x, z)
+
+        out_fp8 = torch.empty(
+            [num_tokens, num_heads * head_dim], dtype=aiter.dtypes.fp8, device=x.device
+        )
+        out_scales = torch.empty(
+            [num_tokens, (num_heads * head_dim) // self.group_size_quant],
+            dtype=torch.float,
+            device=x.device,
+        )
+        self.gated_rmsnorm_fp8_group_quant(
+            out_fp8,
+            out_scales,
+            x,
+            z,
+            self.weight,
+            self.eps,
+            self.group_size_quant,
+            self.transpose_scale,
+        )
+        # Kernel already returns flattened outputs - no reshaping needed!
+        # out_fp8: [num_tokens, num_heads*head_dim]
+        # out_scales: [num_tokens, (num_heads*head_dim)//group_size]
+        return (out_fp8, out_scales)
+
+    def forward(
+        self, x: torch.Tensor, z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Forward pass with optional FP8 fusion.
+
+        Args:
+            x: Input tensor
+            z: Gating tensor (required positional argument, can be None)
+
+        Returns:
+            Tuple of (output, scale)
+            - FP8 case: (fp8_tensor, scale_tensor)
+            - BF16 case: (bf16_tensor, None)
+        """
+        # Use fused FP8 kernel if enabled
+        if self.use_fused_fp8_quant:
+            return self.forward_fused_fp8(x, z)
+
         return self.forward_native(x, z)
-
-        # from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
-
-        # return rmsnorm_fn(
-        #     x,
-        #     self.weight,
-        #     self.bias,
-        #     z=z,
-        #     eps=self.eps,
-        #     group_size=self.group_size,
-        #     norm_before_gate=self.norm_before_gate,
-        # )
-
-    def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
-
-        return self.forward_cuda(x, z)
 
 
 class GemmaRMSNorm(nn.Module):
