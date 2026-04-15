@@ -24,6 +24,7 @@ from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 # plugin-related utilities
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
+from atom.utils import resolve_obj_by_qualname
 
 logger = logging.getLogger("atom")
 
@@ -423,7 +424,7 @@ class QuantizationConfig:
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
         # for special models
-        if model_type in ("deepseek_mtp", "deepseek_v3", "kimi_k2"):
+        if model_type in ("deepseek_mtp", "deepseek_v3", "kimi_k2", "glm_moe_dsa"):
             if hasattr(hf_config, "q_lora_rank") and hf_config.q_lora_rank is not None:
                 self.packed_modules_mapping = {
                     "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -486,15 +487,24 @@ _CONFIG_REGISTRY: dict[str, str] = {
     "kimi_k2": "deepseek_v3",
 }
 
+_CUSTOM_TEXT_CONFIG_REGISTRY: dict[str, str] = {
+    "qwen3_5_text": "atom.model_config.qwen3_5.Qwen3_5TextConfig",
+    "qwen3_5_moe_text": "atom.model_config.qwen3_5_moe.Qwen3_5MoeTextConfig",
+}
+
 
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k25": "text_config",
+    "qwen3_5": "text_config",
+    "qwen3_5_moe": "text_config",
 }
 
 # multimodal models fully supported by plugin mode
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
+    "qwen3_5",
+    "qwen3_5_moe",
 }
 
 
@@ -534,7 +544,11 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        config_class = AutoConfig.for_model(mapped_type)
+        conf_path = _CUSTOM_TEXT_CONFIG_REGISTRY.get(mapped_type)
+        if conf_path is None:
+            config_class = AutoConfig.for_model(mapped_type)
+        else:
+            config_class = resolve_obj_by_qualname(conf_path)
         hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.
@@ -698,7 +712,7 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type == "deepseek_v3":
+        if hf_config.model_type in ("deepseek_v3", "glm_moe_dsa"):
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "qwen3_next":
             hf_config.model_type = "qwen3_next_mtp"
