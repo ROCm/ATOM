@@ -480,6 +480,11 @@ jobs:
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
       
+      - name: Dump server log
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log 2>/dev/null || true
+
       - name: Check accuracy test results
         if: success()
         env:

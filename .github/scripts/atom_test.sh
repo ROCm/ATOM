@@ -32,8 +32,9 @@ if [ "$TYPE" == "launch" ]; then
   fi
 
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  PYTHONUNBUFFERED=1 python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
+  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
+  tail -f "$ATOM_SERVER_LOG" &
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
@@ -209,6 +210,8 @@ if [ "$TYPE" == "benchmark" ]; then
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
     --result-dir=. --result-filename=${RESULT_FILENAME}.json \
     $PROFILE_ARG ${BENCH_EXTRA_ARGS:-}
+
+  kill $tail_pid 2>/dev/null || true
 
   # Inject ISL/OSL into result JSON for summary table
   if [ -f "${RESULT_FILENAME}.json" ]; then
