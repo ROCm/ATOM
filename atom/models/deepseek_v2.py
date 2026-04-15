@@ -65,7 +65,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -77,6 +77,10 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.plugin.attention_mla_sparse import (
+    IndexerDecoratorForPluginMode,
+    DeepseekV32IndexerCacheDecoratorForPluginMode,
+)
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -832,7 +836,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
+            self.gate.e_score_correction_bias = atom_parameter(
                 torch.empty(config.n_routed_experts)
             )
         else:
@@ -968,6 +972,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+@DeepseekV32IndexerCacheDecoratorForPluginMode
 class DeepseekV32IndexerCache(nn.Module):
 
     def __init__(
@@ -1144,6 +1149,7 @@ direct_register_custom_op(
 )
 
 
+@IndexerDecoratorForPluginMode
 class Indexer(nn.Module):
 
     def __init__(
@@ -1207,6 +1213,8 @@ class Indexer(nn.Module):
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
+        self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1242,7 +1250,7 @@ class Indexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        return torch.ops.aiter.sparse_attn_indexer(
+        return self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],

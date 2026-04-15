@@ -32,6 +32,8 @@ if not disable_vllm_plugin:
 
             logger.info("Use atom attention backend")
             if attn_selector_config.use_mla:
+                if getattr(attn_selector_config, "use_sparse", False):
+                    return "atom.plugin.vllm.attention_backend.mla_sparse.AiterMLASparseBackend"
                 return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"
             return "atom.model_ops.attentions.aiter_attention.AiterBackend"
 

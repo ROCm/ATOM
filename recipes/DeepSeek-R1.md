@@ -43,7 +43,7 @@ python -m atom.entrypoints.openai_server \
 
 ```bash
 python -m atom.entrypoints.openai_server \
-  --model amd/DeepSeek-R1-0528-MXFP4 \
+  --model amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 \
   --kv_cache_dtype fp8 -tp 8 \
   --method mtp --num-speculative-tokens 3
 ```
