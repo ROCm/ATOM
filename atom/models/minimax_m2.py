@@ -14,6 +14,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -47,7 +48,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             )
 
         if getattr(config, "use_routing_bias", False):
-            self.e_score_correction_bias = nn.Parameter(
+            self.e_score_correction_bias = atom_parameter(
                 torch.zeros(self.num_experts, dtype=torch.float32)
             )
         else:
@@ -80,9 +81,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         )
         # Match vLLM: gate weights in fp32 for routing precision
         old_wlp = self.gate.weight.weight_loader_process
-        self.gate.weight = nn.Parameter(
-            self.gate.weight.data.to(torch.float32), requires_grad=False
-        )
+        self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
         self.gate.weight.weight_loader_process = old_wlp
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

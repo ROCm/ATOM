@@ -160,8 +160,8 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
-
-        if self.config.hf_config.model_type == "qwen3_next":
+        mamba_model_types = {"qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"}
+        if self.config.hf_config.model_type in mamba_model_types:
             self.mamba_enabled = True
 
     def preprocess(

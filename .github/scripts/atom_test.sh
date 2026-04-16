@@ -4,6 +4,7 @@ set -euo pipefail
 TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
+ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
 
 
 if [ "$TYPE" == "launch" ]; then
@@ -17,9 +18,26 @@ if [ "$TYPE" == "launch" ]; then
     PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"
     echo "Torch profiler enabled, trace output: /app/trace"
   fi
+
+  # RTL (rocm-trace-lite) GPU kernel tracing
+  RTL_CMD=""
+  if [ "${ENABLE_RTL_PROFILER:-0}" == "1" ]; then
+    RTL_TRACE_DIR="${ATOM_RTL_TRACE_DIR:-/app/rtl_traces}"
+    mkdir -p "$RTL_TRACE_DIR"
+    if command -v rtl &>/dev/null; then
+      RTL_CMD="rtl trace -o ${RTL_TRACE_DIR}/trace.db --"
+      echo "RTL profiler enabled, trace output: ${RTL_TRACE_DIR}"
+    else
+      echo "WARNING: RTL profiler requested but rtl command not found, skipping"
+    fi
+  fi
+
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" 2>&1 | tee "$ATOM_SERVER_LOG" &
+  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
+  tail -f "$ATOM_SERVER_LOG" &
+  _tail_launch_pid=$!
+  trap 'kill $_tail_launch_pid 2>/dev/null || true' EXIT
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
@@ -77,6 +95,11 @@ if [ "$TYPE" == "launch" ]; then
       kill $atom_server_pid
       exit 1
   fi
+
+  # Stop streaming server log now that launch is complete;
+  # test phases (accuracy/benchmark) keep their output clean.
+  # Full server log is available via the workflow "Dump server log" step.
+  kill $_tail_launch_pid 2>/dev/null || true
 fi
 
 if [ "$TYPE" == "accuracy" ]; then
@@ -90,6 +113,7 @@ if [ "$TYPE" == "accuracy" ]; then
 
   echo ""
   echo "========== Running accuracy test =========="
+  ATOM_CLIENT_LOG="${ATOM_CLIENT_LOG:-/tmp/atom_client.log}"
   # Set umask so files created by lm_eval are world-readable (container runs as root,
   # host runner user needs to read results via the shared volume mount)
   umask 0022
@@ -99,13 +123,44 @@ if [ "$TYPE" == "accuracy" ]; then
           --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
           --tasks gsm8k \
           --num_fewshot 3 \
-          --output_path "${RESULT_FILENAME}"
+          --output_path "${RESULT_FILENAME}" \
+          2>&1 | tee "$ATOM_CLIENT_LOG"
+
+  if [ -n "${ATOM_DOCKER_IMAGE}" ]; then
+    RESULT_FILE="${RESULT_FILENAME}" \
+    ATOM_DOCKER_IMAGE="${ATOM_DOCKER_IMAGE}" \
+    python3 - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+metadata["docker_image"] = os.environ["ATOM_DOCKER_IMAGE"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
 fi
 
 if [ "$TYPE" == "stop" ]; then
   echo ""
   echo "========== Stopping ATOM server =========="
+
+  # Generate RTL trace summary before killing the server
+  RTL_TRACE_DIR="${ATOM_RTL_TRACE_DIR:-/app/rtl_traces}"
+  if [ -d "$RTL_TRACE_DIR" ] && ls "$RTL_TRACE_DIR"/trace*.db 1>/dev/null 2>&1; then
+    echo "Generating RTL trace summary..."
+    for db in "$RTL_TRACE_DIR"/trace*.db; do
+      rtl summary "$db" > "${db%.db}_summary.txt" 2>/dev/null || true
+    done
+    echo "RTL traces: $(ls "$RTL_TRACE_DIR"/*.db 2>/dev/null | wc -l) db files"
+  fi
 
   # Wait for trace files to finish writing (before killing the server process)
   TRACE_DIR="${TORCH_PROFILER_DIR:-/app/trace}"
@@ -151,6 +206,7 @@ fi
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
   echo "========== Running benchmark test =========="
+  ATOM_CLIENT_LOG="${ATOM_CLIENT_LOG:-/tmp/atom_client.log}"
   RESULT_FILENAME=${RESULT_FILENAME:-benchmark_result}
   PROFILE_ARG=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
@@ -168,7 +224,8 @@ if [ "$TYPE" == "benchmark" ]; then
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
     --result-dir=. --result-filename=${RESULT_FILENAME}.json \
-    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-}
+    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-} \
+    2>&1 | tee "$ATOM_CLIENT_LOG"
 
   # Inject ISL/OSL into result JSON for summary table
   if [ -f "${RESULT_FILENAME}.json" ]; then

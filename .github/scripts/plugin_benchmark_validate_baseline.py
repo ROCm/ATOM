@@ -7,8 +7,6 @@ import argparse
 import json
 from pathlib import Path
 
-SKIP_FILENAMES = {"regression_report.json", "oot_benchmark_summary.json"}
-
 
 def is_dashboard_publish_allowed(payload: dict) -> bool:
     publish_flag = payload.get("dashboard_publish_allowed")
@@ -22,7 +20,9 @@ def is_dashboard_publish_allowed(payload: dict) -> bool:
 def validate_result_dir(result_dir: Path) -> bool:
     has_valid_result = False
     for path in result_dir.rglob("*.json"):
-        if path.name in SKIP_FILENAMES:
+        if path.name == "regression_report.json" or path.name.endswith(
+            "_benchmark_summary.json"
+        ):
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -38,7 +38,7 @@ def validate_result_dir(result_dir: Path) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate dashboard-eligible OOT benchmark artifacts"
+        description="Validate dashboard-eligible benchmark artifacts"
     )
     parser.add_argument("result_dir", help="Directory containing downloaded artifacts")
     args = parser.parse_args()

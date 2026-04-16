@@ -34,6 +34,10 @@ on:
         description: "Benchmark MiniMax-M2.5"
         type: boolean
         default: true
+      llama-3-3-70b-instruct-mxfp4:
+        description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
+        type: boolean
+        default: true
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
@@ -43,6 +47,10 @@ on:
         default: "rocm/atom-dev:latest"
       enable_profiler:
         description: "Enable torch profiler to collect trace for performance debugging"
+        type: boolean
+        default: false
+      enable_rtl:
+        description: "Enable RTL (rocm-trace-lite) GPU kernel tracing for prefill/decode analysis"
         type: boolean
         default: false
       param_lists:
@@ -117,7 +125,7 @@ jobs:
     name: ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
     needs: [parse-param-lists, load-models]
     if: >-
-      always()
+      !cancelled()
       && needs.parse-param-lists.result == 'success'
       && needs.load-models.result == 'success'
     strategy:
@@ -185,6 +193,7 @@ jobs:
             -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} \
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+            -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
             $ENV_FLAGS \
             --name atom-benchmark \
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
@@ -219,6 +228,7 @@ jobs:
 
           docker exec atom-benchmark bash -lc "set -euo pipefail
             ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
+              ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
               .github/scripts/atom_test.sh launch $model_path ${{ env.ARGS }} ${{ inputs.extra_args || '' }}
             echo '========== Running benchmark =========='
             ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
@@ -227,6 +237,16 @@ jobs:
               BENCH_EXTRA_ARGS='${{ matrix.model.bench_args }}' \
               .github/scripts/atom_test.sh benchmark $model_path
           "
+
+      - name: Dump server log
+        if: always()
+        run: |
+          docker exec atom-benchmark cat /tmp/atom_server.log 2>/dev/null || true
+
+      - name: Dump client log
+        if: always()
+        run: |
+          docker exec atom-benchmark cat /tmp/atom_client.log 2>/dev/null || true
 
       - name: Inject GPU metadata into benchmark result
         run: |
@@ -262,6 +282,20 @@ jobs:
         with:
           name: profiler-traces-${{ env.RESULT_FILENAME }}
           path: profiler-traces/
+
+      - name: Stop server and collect RTL traces
+        if: inputs.enable_rtl
+        run: |
+          docker exec atom-benchmark bash -lc \
+            "ENABLE_RTL_PROFILER=1 .github/scripts/atom_test.sh stop" || true
+          docker cp atom-benchmark:/app/rtl_traces ./rtl-traces 2>/dev/null || true
+
+      - name: Upload RTL traces
+        if: inputs.enable_rtl
+        uses: actions/upload-artifact@v7
+        with:
+          name: rtl-traces-${{ env.RESULT_FILENAME }}
+          path: rtl-traces/
 
       - name: Upload benchmark result
         uses: actions/upload-artifact@v7
@@ -488,7 +522,7 @@ jobs:
   # ---------- Regression re-run (GPU, matrix by model) ----------
   regression-rerun:
     if: >-
-      always()
+      !cancelled()
       && needs.generate-regression-matrix.outputs.has_matrix == 'true'
     name: Rerun ${{ matrix.cell.prefix }}
     needs: [generate-regression-matrix]
@@ -585,7 +619,7 @@ jobs:
             docker exec atom-regression bash -lc "mkdir -p /app/trace/$TRACE_SUBDIR"
 
             # Record profiler stop count before benchmark (to detect new completions)
-            STOP_COUNT_BEFORE=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null || echo 0)
+            STOP_COUNT_BEFORE=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null) || STOP_COUNT_BEFORE=0
 
             echo "=== Profiling: $PREFIX ISL=$ISL OSL=$OSL CONC=$CONC ==="
             if ! docker exec atom-regression bash -lc "
@@ -606,7 +640,7 @@ jobs:
             # Wait for engine core to finish exporting profiler trace (blocks inference)
             # See .claude/plan/profiler-async-refactor.md for long-term fix
             for i in $(seq 1 300); do
-              STOP_COUNT=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null || echo 0)
+              STOP_COUNT=$(docker exec atom-regression grep -c "Profiler stopped." /tmp/atom_server.log 2>/dev/null) || STOP_COUNT=0
               [ "$STOP_COUNT" -gt "$STOP_COUNT_BEFORE" ] && echo "Profiler trace export done after ${i}s" && break
               [ "$i" -eq 1 ] && echo "Waiting for profiler trace export..."
               [ "$i" -eq 300 ] && echo "WARNING: Profiler did not finish after 300s, proceeding anyway"

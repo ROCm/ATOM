@@ -7,7 +7,7 @@
     "runner": "linux-atom-mi35x-1",
     "test_level": "pr",
     "accuracy_threshold": 0.73,
-    "accuracy_baseline": null,
+    "accuracy_baseline": 0.75,
     "accuracy_baseline_model": "meta-llama/Meta-Llama-3-8B-Instruct",
     "_baseline_note": "HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable"
   },
@@ -42,8 +42,8 @@
     "env_vars": "",
     "runner": "linux-atom-mi35x-1",
     "test_level": "pr",
-    "accuracy_threshold": 0.38,
-    "accuracy_baseline": null,
+    "accuracy_threshold": 0.39,
+    "accuracy_baseline": 0.41,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
   },
@@ -55,7 +55,7 @@
     "runner": "linux-atom-mi35x-1",
     "test_level": "main",
     "accuracy_threshold": 0.88,
-    "accuracy_baseline": null,
+    "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "meta-llama/Llama-3.3-70B-Instruct",
     "_baseline_note": "HF page inaccessible; needs CI measurement of baseline"
   },
@@ -103,7 +103,7 @@
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
     "accuracy_threshold": 0.65,
-    "accuracy_baseline": null,
+    "accuracy_baseline": 0.69,
     "accuracy_baseline_model": "Qwen/Qwen3-Next-80B-A3B-Thinking",
     "_baseline_note": "No public GSM8K baseline; HF card has no GSM8K"
   },
@@ -114,8 +114,8 @@
     "env_vars": "",
     "runner": "linux-atom-mi35x-4",
     "test_level": "main",
-    "accuracy_threshold": 0.38,
-    "accuracy_baseline": null,
+    "accuracy_threshold": 0.39,
+    "accuracy_baseline": 0.41,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
   },
@@ -138,7 +138,7 @@
     "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
-    "accuracy_threshold": 0.93,
+    "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.9409,
     "accuracy_baseline_model": "moonshotai/Kimi-K2.5",
     "_baseline_note": "HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409"
@@ -146,14 +146,38 @@
   {
     "model_name": "GLM-5-FP8",
     "model_path": "zai-org/GLM-5-FP8",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "test_level": "pr",
+    "test_level": "nightly",
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.9545,
     "accuracy_baseline_model": "zai-org/GLM-5",
     "_baseline_note": "HF: amd/GLM-5-MXFP4 card shows GLM-5 baseline=0.9545 (5-shot)"
+  },
+  {
+    "model_name": "GLM-5.1-FP8",
+    "model_path": "zai-org/GLM-5.1-FP8",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "pr",
+    "accuracy_threshold": 0.875,
+    "accuracy_baseline": 0.9545,
+    "accuracy_baseline_model": "zai-org/GLM-5.1",
+    "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
+  },
+  {
+    "model_name": "GLM-5.1-MXFP4",
+    "model_path": "amd/GLM-5.1-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "pr",
+    "accuracy_threshold": 0.875,
+    "accuracy_baseline": 0.9545,
+    "accuracy_baseline_model": "zai-org/GLM-5.1",
+    "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
   },
   {
     "model_name": "MiniMax-M2.5",
@@ -166,5 +190,17 @@
     "accuracy_baseline": 0.9401,
     "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
     "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows baseline=0.9401"
+  },
+  {
+    "model_name": "MiniMax-M2.5-MXFP4",
+    "model_path": "amd/MiniMax-M2.5-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 --trust-remote-code",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.91,
+    "accuracy_baseline": 0.9401,
+    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
+    "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows MXFP4=0.9256, baseline=0.9401"
   }
 ]

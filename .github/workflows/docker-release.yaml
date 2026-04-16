@@ -61,11 +61,11 @@ on:
         type: boolean
         default: true
       only_release_oot:
-        description: "Only release the OOT vLLM image: skip native image test/push and always build/push OOT"
+        description: "Release the OOT vLLM image (skips native image test/push). If both this and SGLang are checked, both will be released."
         type: boolean
         default: false
       only_release_sglang:
-        description: "Only release the SGLang+ATOM image: skip native image test/push and always build/push SGLang+ATOM"
+        description: "Release the SGLang+ATOM image (skips native image test/push). If both this and OOT are checked, both will be released."
         type: boolean
         default: false
 
@@ -193,7 +193,7 @@ jobs:
           docker push rocm/atom-dev:${TAG}
 
       - name: Build OOT Docker image
-        if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
+        if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
         timeout-minutes: 180
         run: |
           OOT_BASE_IMAGE="atom_release:ci"
@@ -209,7 +209,7 @@ jobs:
           docker inspect atom_oot_release:ci
 
       - name: Push OOT Docker image
-        if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
+        if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
         run: |
           VLLM_VER="${{ env.VLLM_VERSION }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
@@ -220,7 +220,7 @@ jobs:
           docker push rocm/atom-dev:${OOT_LATEST_TAG}
 
       - name: Build SGLang Docker image
-        if: ${{ success() && inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true || inputs.only_release_sglang == true) }}
+        if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
         timeout-minutes: 180
         run: |
           SGLANG_BASE_IMAGE="atom_release:ci"
@@ -235,7 +235,7 @@ jobs:
           docker inspect atom_sglang_release:ci
 
       - name: Push SGLang+ATOM Docker image
-        if: ${{ success() && inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true || inputs.only_release_sglang == true) }}
+        if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
         run: |
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
           SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
