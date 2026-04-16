@@ -2118,6 +2118,7 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
             self.model_config.max_model_len
@@ -2127,7 +2128,6 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
             if self.vllm_config.speculative_config
             else 0
         )
-        self.reorder_batch_threshold += self.num_speculative_tokens
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count
@@ -2194,6 +2194,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         parallel_config = config.parallel_config
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
@@ -2247,8 +2248,9 @@ def setup_mla_sparse_attn_metadata_builder_base_class_and_attributes(class_dict:
     generic_base = AttentionMetadataBuilder
     needs_generic = True
 
-    # align with vllm ROCMAiterMLASparseMetadataBuilder
-    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # The plugin sparse MLA path builds per-token ragged metadata, so uniform
+    # spec-decode batches from the main model can use full decode cudagraphs.
+    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_BATCH
     # For indexer metadata, not present in vllm sparse MLA
     class_dict["reorder_batch_threshold"] = 1
 
