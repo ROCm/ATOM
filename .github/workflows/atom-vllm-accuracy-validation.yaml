@@ -146,7 +146,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel",
                   "accuracy_test_threshold": 0.87,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP4",
@@ -155,7 +155,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_FP8_TP8",
@@ -164,7 +164,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_TP8",
@@ -173,7 +173,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_LLAMA405_FP8_TP8",
@@ -182,7 +182,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --load-format safetensors --allow-deprecated-quantization",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_LLAMA8_TP1",
@@ -191,7 +191,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.73,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
-                  "runner": "linux-atom-mi35x-1",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_KIMI_K2_TP8",
@@ -200,7 +200,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.90,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_KIMI_K25_TP8",
@@ -209,7 +209,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_DSR1_FP8_TP8",
@@ -218,7 +218,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8",
@@ -227,7 +227,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_GPT_OSS_120B_TP1",
@@ -236,7 +236,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.38,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-1",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_GPT_OSS_120B_TP2",
@@ -245,7 +245,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 2",
                   "accuracy_test_threshold": 0.38,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "linux-atom-mi35x-4",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
               {
                   "toggle_env": "RUN_GLM5_1_FP8_TP8",
@@ -254,7 +254,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
                   "accuracy_test_threshold": 0.88,
                   "env_vars": "",
-                  "runner": "linux-atom-mi35x-8",
+                  "runner": "atom-mi355-8gpu.predownload",
               },
           ]
 
