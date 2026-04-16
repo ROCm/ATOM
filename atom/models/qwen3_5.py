@@ -841,7 +841,7 @@ if is_vllm():
             Returns:
                 True if weights were loaded successfully
             """
-            return self.load_fused_expert_weights(
+            return load_fused_expert_weights(
                 original_name,
                 name,
                 params_dict,
