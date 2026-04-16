@@ -155,7 +155,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-                  "runner": "atom-mi355-8gpu.predownload",
+                  "runner": "linux-atom-mi35x-4",
               },
               {
                   "toggle_env": "RUN_QWEN35_397B_FP8_TP8",
@@ -191,7 +191,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.73,
                   "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
-                  "runner": "atom-mi355-8gpu.predownload",
+                  "runner": "linux-atom-mi35x-1",
               },
               {
                   "toggle_env": "RUN_KIMI_K2_TP8",
@@ -236,7 +236,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.38,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "atom-mi355-8gpu.predownload",
+                  "runner": "linux-atom-mi35x-1",
               },
               {
                   "toggle_env": "RUN_GPT_OSS_120B_TP2",
@@ -245,7 +245,7 @@ jobs:
                   "extra_args": "--tensor-parallel-size 2",
                   "accuracy_test_threshold": 0.38,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-                  "runner": "atom-mi355-8gpu.predownload",
+                  "runner": "linux-atom-mi35x-4",
               },
               {
                   "toggle_env": "RUN_GLM5_1_FP8_TP8",
