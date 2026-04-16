@@ -49,7 +49,9 @@ class AiterDiffusionFlashAttentionImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
 
     @staticmethod
-    def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+    def _unwrap_flash_output(
+        out: torch.Tensor | tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
         # FA3 may return (out, lse), FA2 returns out
         return out[0] if isinstance(out, tuple) else out
 
@@ -60,18 +62,25 @@ class AiterDiffusionFlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        from aiter import flash_attn_varlen_func 
+        from aiter import flash_attn_varlen_func
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             _pad_input,
             _unpad_input,
             _upad_input,
         )
 
-        assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
+        assert (
+            attention_mask.ndim == 2
+        ), "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
-        )
+        (
+            q,
+            k,
+            v,
+            indices_q,
+            (cu_seq_lens_q, cu_seq_lens_k),
+            (max_length_q, max_length_k),
+        ) = _upad_input(query, key, value, attention_mask, query_length, _unpad_input)
 
         out_unpad = flash_attn_varlen_func(
             q,

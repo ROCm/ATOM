@@ -5,15 +5,13 @@ import torch
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
 
-
 logger = logging.getLogger("atom")
 
 disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
 
 
-_VLLM_OMNI_DIFFUSION_MODEL_REGISTRY_OVERRIDES = {
-    
-}
+_VLLM_OMNI_DIFFUSION_MODEL_REGISTRY_OVERRIDES = {}
+
 
 def _ensure_atom_config_for_diffusion(od_config) -> None:
     """Set a minimal ATOM config if not already set, so LinearBase.__init__ can read torch_dtype.
@@ -26,10 +24,12 @@ def _ensure_atom_config_for_diffusion(od_config) -> None:
     (LinearBase.__init__ line 263, bias tensor allocation). A SimpleNamespace suffices.
     """
     import atom.config as _atom_cfg
+
     if _atom_cfg._current_atom_config is not None:
         return  # Already set (e.g. vLLM OOT LLM plugin ran first)
 
     import types
+
     torch_dtype = getattr(od_config, "dtype", torch.bfloat16)
     _atom_cfg.set_current_atom_config(types.SimpleNamespace(torch_dtype=torch_dtype))
     logger.info(f"ATOM: set minimal diffusion atom config (torch_dtype={torch_dtype})")
@@ -43,19 +43,26 @@ def _ensure_aiter_tp_initialized() -> None:
     group is guaranteed to be ready. One central call covers all diffusion models.
     """
     from aiter.dist import parallel_state as aiter_ps
+
     if aiter_ps._TP is not None:
         return  # Already initialized (e.g. regular vLLM plugin path ran first)
 
     import vllm.distributed.parallel_state as vllm_ps
+
     tp_size = vllm_ps.get_tensor_model_parallel_world_size()
 
     from atom.plugin.vllm.tp_group_reuse import init_aiter_tp_from_vllm
+
     if init_aiter_tp_from_vllm(tp_size):
         return  # TP>1: reused vLLM's group + aiter ca_comm (optimal path)
 
     # Fallback for TP=1 or no ca_comm: minimal adapter backed by vLLM's ProcessGroups.
     # LinearBase.forward() never calls all_reduce when tp_size==1 (guarded by tp_size>1).
-    from aiter.dist.parallel_state import GroupCoordinator as AiterGroupCoordinator, _register_group
+    from aiter.dist.parallel_state import (
+        GroupCoordinator as AiterGroupCoordinator,
+        _register_group,
+    )
+
     vllm_tp = vllm_ps.get_tp_group()
 
     class _AiterTPFromVllm(AiterGroupCoordinator):
@@ -107,11 +114,16 @@ def register_omni_model() -> None:
         from atom.plugin.vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
             ATOMQwenImageTransformer2DModel,
         )
+
         for _m in [_qwen_t2i, _qwen_edit, _qwen_edit_plus, _qwen_layered]:
             _m.QwenImageTransformer2DModel = ATOMQwenImageTransformer2DModel
-        logger.info("Patched QwenImageTransformer2DModel → ATOMQwenImageTransformer2DModel in qwen_image pipelines")
+        logger.info(
+            "Patched QwenImageTransformer2DModel → ATOMQwenImageTransformer2DModel in qwen_image pipelines"
+        )
     except ImportError as e:
-        logger.warning(f"Could not patch qwen_image pipelines with ATOM transformer: {e}")
+        logger.warning(
+            f"Could not patch qwen_image pipelines with ATOM transformer: {e}"
+        )
 
     try:
         from atom.plugin.vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
@@ -121,11 +133,14 @@ def register_omni_model() -> None:
         import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as pipeline_wan2_2
         import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v as pipeline_wan2_2_i2v
         import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_ti2v as pipeline_wan2_2_ti2v
+
         pipeline_wan2_2.WanTransformer3DModel = ATOMWanTransformer3DModel
         pipeline_wan2_2_i2v.WanTransformer3DModel = ATOMWanTransformer3DModel
         pipeline_wan2_2_ti2v.WanTransformer3DModel = ATOMWanTransformer3DModel
 
-        logger.info("Patched WanTransformer3DModel → ATOMWanTransformer3DModel in wan2_2 pipelines")
+        logger.info(
+            "Patched WanTransformer3DModel → ATOMWanTransformer3DModel in wan2_2 pipelines"
+        )
     except ImportError as e:
         logger.warning(f"Could not patch wan2_2 pipelines with ATOM transformer: {e}")
 
@@ -137,6 +152,7 @@ def register_omni_model() -> None:
     # diffusers_loader does `from vllm_omni.diffusion.registry import initialize_model`,
     # creating a local binding that is unaffected by patching the registry module.
     import vllm_omni.diffusion.model_loader.diffusers_loader as _diffusers_loader
+
     _orig_initialize_model = _diffusers_loader.initialize_model
 
     def _atom_initialize_model(od_config):

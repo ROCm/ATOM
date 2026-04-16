@@ -5,11 +5,14 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
-from atom.model_ops.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from atom.model_ops.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
-    ColumnParallelGELU,
     WanCrossAttention,
     WanFeedForward,
     WanSelfAttention,
@@ -31,8 +34,12 @@ class ATOMWanCrossAttention(WanCrossAttention):
         self.to_v = ColumnParallelLinear(self.dim, self.kv_inner_dim, bias=True)
 
         if self.added_kv_proj_dim is not None:
-            self.add_k_proj = ColumnParallelLinear(self.added_kv_proj_dim, self.inner_dim, bias=True)
-            self.add_v_proj = ColumnParallelLinear(self.added_kv_proj_dim, self.inner_dim, bias=True)
+            self.add_k_proj = ColumnParallelLinear(
+                self.added_kv_proj_dim, self.inner_dim, bias=True
+            )
+            self.add_v_proj = ColumnParallelLinear(
+                self.added_kv_proj_dim, self.inner_dim, bias=True
+            )
         else:
             self.add_k_proj = None
             self.add_v_proj = None
@@ -46,11 +53,23 @@ class ATOMWanCrossAttention(WanCrossAttention):
 
 class ATOMWanSelfAttention(WanSelfAttention):
 
-    def __init__(self, dim: int, num_heads: int, head_dim: int, eps: float = 1e-5, dropout: float = 0.0):
-        super().__init__(dim=dim, num_heads=num_heads, head_dim=head_dim, eps=eps, dropout=dropout)
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        head_dim: int,
+        eps: float = 1e-5,
+        dropout: float = 0.0,
+    ):
+        super().__init__(
+            dim=dim, num_heads=num_heads, head_dim=head_dim, eps=eps, dropout=dropout
+        )
         # Replace vllm QKVParallelLinear with atom version
         self.to_qkv = QKVParallelLinear(
-            hidden_size=dim, head_size=head_dim, total_num_heads=num_heads, bias=True,
+            hidden_size=dim,
+            head_size=head_dim,
+            total_num_heads=num_heads,
+            bias=True,
         )
         # Refresh head counts from the atom layer
         self.num_heads = self.to_qkv.num_heads
@@ -73,26 +92,32 @@ class ATOMWanSelfAttention(WanSelfAttention):
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
         query = self.norm_q(query)
-        key   = self.norm_k(key)
-        query = query.unflatten(2, (self.num_heads,    self.head_dim))
-        key   = key.unflatten(  2, (self.num_kv_heads, self.head_dim))
+        key = self.norm_k(key)
+        query = query.unflatten(2, (self.num_heads, self.head_dim))
+        key = key.unflatten(2, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
 
         if rotary_emb is not None:
             freqs_cos, freqs_sin = rotary_emb
             query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
-            key   = apply_rotary_emb_wan(key,   freqs_cos, freqs_sin)
+            key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
-        attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
+        attn_metadata = (
+            AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
+        )
         hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
-        hidden_states = self.to_out(hidden_states)  # atom RowParallelLinear: tensor + all-reduce
+        hidden_states = self.to_out(
+            hidden_states
+        )  # atom RowParallelLinear: tensor + all-reduce
         return self.dropout(hidden_states)
 
 
 class ATOMWanFeedForward(WanFeedForward):
 
-    def __init__(self, dim: int, inner_dim: int, dim_out: int | None = None, bias: bool = True):
+    def __init__(
+        self, dim: int, inner_dim: int, dim_out: int | None = None, bias: bool = True
+    ):
         super().__init__(dim=dim, inner_dim=inner_dim, dim_out=dim_out, bias=bias)
         dim_out = dim_out or dim
         # Replace net_0.proj (inside ColumnParallelGELU) with atom ColumnParallelLinear.
@@ -116,13 +141,22 @@ class ATOMWanTransformerBlock(WanTransformerBlock):
         cross_attn_norm: bool = False,
     ):
         super().__init__(
-            dim=dim, ffn_dim=ffn_dim, num_heads=num_heads, eps=eps,
-            added_kv_proj_dim=added_kv_proj_dim, cross_attn_norm=cross_attn_norm,
+            dim=dim,
+            ffn_dim=ffn_dim,
+            num_heads=num_heads,
+            eps=eps,
+            added_kv_proj_dim=added_kv_proj_dim,
+            cross_attn_norm=cross_attn_norm,
         )
         head_dim = dim // num_heads
-        self.attn1 = ATOMWanSelfAttention(dim=dim, num_heads=num_heads, head_dim=head_dim, eps=eps)
+        self.attn1 = ATOMWanSelfAttention(
+            dim=dim, num_heads=num_heads, head_dim=head_dim, eps=eps
+        )
         self.attn2 = ATOMWanCrossAttention(
-            dim=dim, num_heads=num_heads, head_dim=head_dim, eps=eps,
+            dim=dim,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            eps=eps,
             added_kv_proj_dim=added_kv_proj_dim,
         )
         self.ffn = ATOMWanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
@@ -169,10 +203,17 @@ class ATOMWanTransformer3DModel(WanTransformer3DModel):
         inner_dim = num_attention_heads * attention_head_dim
         # Replace all WanTransformerBlocks with ATOMWanTransformerBlocks.
         # rope, patch_embedding, condition_embedder, norm_out, proj_out are kept from super().
-        self.blocks = nn.ModuleList([
-            ATOMWanTransformerBlock(
-                inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm
-            )
-            for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                ATOMWanTransformerBlock(
+                    inner_dim,
+                    ffn_dim,
+                    num_attention_heads,
+                    eps,
+                    added_kv_proj_dim,
+                    cross_attn_norm,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         # forward(), load_weights(), _sp_plan, _repeated_blocks all inherited from WanTransformer3DModel
