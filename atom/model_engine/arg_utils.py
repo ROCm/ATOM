@@ -249,7 +249,6 @@ class EngineArgs:
         kwargs["enable_tbo"] = tbo_mode is not None
         kwargs["enable_tbo_decode"] = tbo_mode == "all"
 
-        # --all2all-backend [high-throughput|low-latency] → enable_low_latency
         all2all_backend = kwargs.pop("all2all_backend", None)
         kwargs["enable_low_latency"] = all2all_backend == "low-latency"
 

@@ -1994,7 +1994,6 @@ class ModelRunner:
                 ):
                     if ubatch_slices is not None:
                         # TBO capture: threads + multi-stream captured in graph.
-                        # Pass output_buffer so the copy is captured in the graph.
                         graph, graph_output = self.model.capture_tbo_graph(
                             input_ids[:num_tokens],
                             positions[:num_tokens],
