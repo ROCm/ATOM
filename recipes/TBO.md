@@ -131,7 +131,14 @@ python -m atom.benchmarks.benchmark_serving \
 | 512 | dp + tbo (all) | 14,898 | 29,796 | -15.2% |
 | 512 | dp + tbo (prefill only) | 19,944 | 39,889 | **+13.6%** |
 
-> **Note**: TBO on both prefill+decode shows a throughput regression due to ubatch splitting and synchronization overhead in the decode phase. **Prefill-only TBO** eliminates this regression and delivers positive gains: up to **+16.9%** with EP MORI and **+13.6%** without EP at 512 concurrency. The improvement increases with higher concurrency as prefill communication cost becomes a larger fraction of total time.
+#### DP + EP MORI + TBO + MTP 3 (Speculative Decoding)
+
+| Concurrency | Configuration | Output Throughput (tok/s) | Total Throughput (tok/s) | TBO Impact |
+|---|---|---|---|---|
+| 256 | dp + ep mori + mtp3 | 6,375 | 12,764 | — |
+| 256 | dp + ep mori + tbo + mtp3 | 6,590 | 13,196 | **+3.4%** |
+
+> **Note**: TBO on both prefill+decode shows a throughput regression due to ubatch splitting and synchronization overhead in the decode phase. **Prefill-only TBO** eliminates this regression and delivers positive gains: up to **+16.9%** with EP MORI and **+13.6%** without EP at 512 concurrency. TBO also stacks with MTP speculative decoding (**+3.4%**).
 
 ## How it works
 
