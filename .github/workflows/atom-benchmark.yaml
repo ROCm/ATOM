@@ -205,6 +205,9 @@ jobs:
         run: |
           # Run rocm-smi inside the container for consistent output across runners
           GPU_NAME=$(docker exec atom-benchmark rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          if [ -z "$GPU_NAME" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; then
+            GPU_NAME=$(docker exec atom-benchmark rocminfo 2>/dev/null | grep -A1 "Uuid:.*GPU-" | grep "Marketing Name" | head -1 | sed 's/.*:\s*//' | xargs || echo "")
+          fi
           GPU_VRAM_GB=$(docker exec atom-benchmark rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
           ROCM_VERSION=$(docker exec atom-benchmark cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
           echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
