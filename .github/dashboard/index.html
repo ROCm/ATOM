@@ -1102,13 +1102,14 @@ function renderKPICards() {
     regSub = `${warningCount} warning`;
   }
 
-  // Accuracy KPI — health-based status (not regression-based)
-  const accEntries = Object.entries(latestAccuracy);
+  // Accuracy KPI — health-based status (not regression-based); respect backend/model filters
+  const accEntries = filteredAccuracyEntries();
   const failCount = accEntries.filter(([, a]) => a.threshold && (a.score < 0.1 || a.score < a.threshold)).length;
   const atRiskCount = accEntries.filter(([, a]) => a.threshold && a.score >= 0.1 && a.score >= a.threshold && (a.score - a.threshold) < 0.005).length;
   const healthyCount = accEntries.filter(([, a]) => a.threshold && a.score >= 0.1 && a.score >= a.threshold && (a.score - a.threshold) >= 0.005).length;
   const accCardClass = failCount > 0 ? 'alert clickable' : atRiskCount > 0 ? 'alert-warning clickable' : (accEntries.length > 0 ? 'ok clickable' : 'clickable');
-  const accSub = accEntries.length === 0 ? 'No accuracy data'
+  const accSub = accEntries.length === 0
+    ? (Object.keys(latestAccuracy).length === 0 ? 'No accuracy data' : 'No rows match Backend/Model filters')
     : failCount > 0 ? `${failCount} failed` + (atRiskCount > 0 ? ` · ${atRiskCount} at risk` : '')
     : atRiskCount > 0 ? `${healthyCount} healthy · ${atRiskCount} at risk`
     : 'All healthy';
@@ -2343,15 +2344,27 @@ function readFromHash() {
 /* ================================================================
    16. ACCURACY TAB
    ================================================================ */
+/** Accuracy keys are "backend|model"; ISL/conc do not apply to GSM8K rows. */
+function filteredAccuracyEntries() {
+  return Object.entries(latestAccuracy).filter(([key]) => {
+    const [backend, model] = key.split('|');
+    return state.filters.backends.includes(backend) && state.filters.models.includes(model);
+  });
+}
+
 function renderAccuracyTab() {
   const container = document.getElementById('tab-accuracy');
   if (!hasAccuracyData) {
     container.innerHTML = '<p style="color:var(--text-tertiary);padding:var(--gap-lg)">No accuracy data available yet. Accuracy data will appear after CI accuracy tests run on the main branch.</p>';
     return;
   }
-  // Not filtered by model/backend — accuracy tab always shows all models
-  const models = Object.entries(latestAccuracy)
+  const models = filteredAccuracyEntries()
     .sort((a, b) => _lc(a[0].split('|')[1], b[0].split('|')[1]));
+
+  if (models.length === 0) {
+    container.innerHTML = '<div class="chart-empty">No accuracy rows match the current Backend / Model filters.<br><span style="font-size:12px;color:var(--text-tertiary)">Widen filters above or click Reset. (Concurrency / ISL filters do not apply to accuracy.)</span></div>';
+    return;
+  }
 
   let html = `
     <div class="section-container"><div class="section-header"><span class="section-title">Model Accuracy (GSM8K)</span></div>

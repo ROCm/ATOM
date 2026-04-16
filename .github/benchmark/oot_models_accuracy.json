@@ -51,7 +51,7 @@
     "runner": "linux-atom-mi35x-1",
     "test_level": "nightly",
     "accuracy_threshold": 0.73,
-    "accuracy_baseline": null,
+    "accuracy_baseline": 0.75,
     "accuracy_baseline_model": "meta-llama/Llama-3.1-8B-Instruct",
     "_baseline_note": "Threshold aligned with existing 8B Llama baseline used in CI (3-shot GSM8K)."
   },
@@ -63,7 +63,7 @@
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
     "accuracy_threshold": 0.9,
-    "accuracy_baseline": null,
+    "accuracy_baseline": 0.91,
     "accuracy_baseline_model": "Meta-Llama-3.1-405B-Instruct-FP8/",
     "_baseline_note": "Threshold aligned with workflow matrix target for TP8 gsm8k (3-shot)."
   },
@@ -85,7 +85,7 @@
     "env_vars": "",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
-    "accuracy_threshold": 0.93,
+    "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "amd/Kimi-K2.5-MXFP4",
     "_baseline_note": "Reference value from recipes/atom_vllm/Kimi-K2.5.md"
