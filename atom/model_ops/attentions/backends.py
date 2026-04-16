@@ -391,12 +391,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
         var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
         var["cu_seqlens_k"].np[: bs + 1] = cu_seqlens_k
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True)
         var["context_lens"].np[:bs] = batch.context_lens[:bs]
         min_seqlen_q = 0
         dropout_p = 0.0
         vars_used = [
             ("cu_seqlens_q", bs + 1),
+            ("cu_seqlens_k", bs + 1),
             ("slot_mapping", sum_scheduled_tokens),
             ("context_lens", bs),
         ]
@@ -413,7 +413,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             total_tokens = sum(batch.context_lens[:bs])
         total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
-            cu_seqlens_k=cu_seqlens_k.cuda(non_blocking=True),
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
             # (numpy array) and breaks downstream Triton kernel constexpr
             # binding (`tl.minimum` rejects numpy scalars).
