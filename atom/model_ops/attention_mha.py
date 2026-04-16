@@ -9,7 +9,6 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
-from atom.config import get_current_atom_config
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 
@@ -537,14 +536,7 @@ class PagedAttentionImpl(nn.Module):
         if ctx.is_prefill:
             return self.prefill_attention
         else:
-            if self.use_triton_attn:
-                return self.paged_attention_triton
-            else:
-                # Only use pa persistent when block_size == 1024
-                atom_config = get_current_atom_config()
-                if atom_config.kv_cache_block_size == 1024:
-                    return self.paged_attention_persistent_asm
-                return self.paged_attention_asm
+            return self.paged_attention_asm
 
     def forward(
         self,

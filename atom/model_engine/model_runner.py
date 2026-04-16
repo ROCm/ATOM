@@ -232,10 +232,21 @@ class tokenIDProcessor:
     def get_token_locations(
         self, batch: ScheduledBatch
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-        prev_req_ids = self.prev_batch.req_ids
         cur_req_ids = batch.req_ids
-        num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
+
+        if self.prev_batch is None:
+            # No previous batch (e.g. first decode step in disagg mode after warmup clean).
+            # All sequences are new — no deferred outputs to copy.
+            return (
+                np.empty(0, dtype=np.intp),
+                np.empty(0, dtype=np.intp),
+                np.arange(num_cur, dtype=np.intp),
+                False,
+            )
+
+        prev_req_ids = self.prev_batch.req_ids
+        num_prev = len(prev_req_ids)
 
         prev_id_to_idx = dict(zip(prev_req_ids, range(num_prev)))
 
@@ -304,6 +315,15 @@ class tokenIDProcessor:
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         """for decode: input ids are from prev_sampled_token_ids"""
+        if self.prev_batch is None:
+            # No previous batch (e.g. first decode step in disagg mode).
+            # No deferred outputs exist — read tokens directly from scheduled_tokens.
+            token_ids = scheduled_tokens[
+                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
+            ]
+            self.input_ids.np[:total_tokens_decode] = token_ids
+            return self.input_ids.copy_to_gpu(total_tokens_decode)
+
         deferred_curr_indices, deferred_prev_indices, new_curr_indices, is_all_same = (
             self.get_token_locations(batch)
         )
@@ -576,8 +596,10 @@ class ModelRunner:
         )
         self.model = model_class(config)
         torch.set_default_device(None)
-        load_model(self.model, config.model, config.hf_config, config.load_dummy)
-        logger.info(f"Model load done: {config.model}")
+        if not config.disagg_is_decode:
+            # Decode skips weight loading: weights arrive via import_model_weight_ipc_handles.
+            load_model(self.model, config.model, config.hf_config, config.load_dummy)
+            logger.info(f"Model load done: {config.model}")
 
         if hasattr(self, "drafter"):
             logger.info("Loading drafter model...")
@@ -1045,6 +1067,10 @@ class ModelRunner:
         return int(activation_bytes * 0.2)
 
     def get_num_blocks(self):
+        # Decode in disagg mode owns no GPU memory — kvcache is imported from prefill.
+        if self.config.disagg_is_decode:
+            return 0
+
         torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
@@ -1072,8 +1098,9 @@ class ModelRunner:
         available_for_kv = budget - peak_torch - cudagraph_overhead - safety_margin
 
         # Physical clamp: never exceed what's actually free on the GPU.
-        # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv, free)
+        # Subtract safety_margin again here so NCCL/system allocs (e.g. the
+        # 512MB NCCL barrier buffer) don't OOM after kvcache is committed.
+        available_for_kv = min(available_for_kv, free - safety_margin)
 
         torch.set_default_device("cpu")
 
@@ -1106,6 +1133,10 @@ class ModelRunner:
         return num_kvcache_blocks
 
     def allocate_kv_cache(self, num_kvcache_blocks):
+        # Decode in disagg mode: kvcache is imported from prefill, not allocated here.
+        if self.config.disagg_is_decode:
+            return True
+
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         config = self.config
@@ -1358,6 +1389,200 @@ class ModelRunner:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
+
+    # ------------------------------------------------------------------
+    # Disaggregation: KV cache IPC sharing (Phase 1)
+    # ------------------------------------------------------------------
+
+    def _bind_kv_cache_to_modules(self):
+        """Bind self.kv_cache (and self.kv_scale if present) to all attention
+        modules.  Extracted from allocate_kv_cache() so it can be called
+        again after replacing self.kv_cache with an IPC-imported tensor."""
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads >= self.world_size:
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            num_kv_heads = 1
+        x = 16 // self.kv_cache.element_size()
+
+        models_to_bind = [("target", self.model)]
+        if self.config.speculative_config and hasattr(self, "drafter"):
+            models_to_bind.append(("draft", self.drafter.model))
+
+        kv_cache_tensors = []
+        layer_id = 0
+        for _model_name, model in models_to_bind:
+            for module in model.modules():
+                if hasattr(module, "base_attention"):
+                    if hasattr(module, "use_mla") and not module.use_mla:
+                        if self.is_qwen_next():
+                            attn_idx = layer_id // self.full_attention_interval
+                        else:
+                            attn_idx = layer_id
+                        k_cache = self.kv_cache[0, attn_idx].view(
+                            self.num_physical_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim // x,
+                            self.physical_block_size,
+                            x,
+                        )
+                        v_cache = self.kv_cache[1, attn_idx].view(
+                            self.num_physical_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim,
+                            self.physical_block_size,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        if config.kv_cache_dtype == "fp8":
+                            module.k_scale = self.kv_scale[0, attn_idx]
+                            module.v_scale = self.kv_scale[1, attn_idx]
+                        from atom.config import KVCacheTensor
+
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                layer_num=layer_id,
+                                k_cache=k_cache,
+                                v_cache=v_cache,
+                                k_scale=module.k_scale,
+                                v_scale=module.v_scale,
+                            )
+                        )
+                        module.k_cache = k_cache
+                        module.v_cache = v_cache
+                        layer_id += 1
+                    elif hasattr(module, "use_mla") and module.use_mla:
+                        kv_cache = self.kv_cache[layer_id].view(
+                            self.num_physical_kvcache_blocks * self.physical_block_size,
+                            1,
+                            576,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        from atom.config import KVCacheTensor
+
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                layer_num=layer_id,
+                                k_cache=kv_cache,
+                                v_cache=None,
+                                k_scale=None,
+                                v_scale=None,
+                            )
+                        )
+                        module.kv_cache = kv_cache
+                        layer_id += 1
+
+        from atom.utils.forward_context import set_kv_cache_data
+
+        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
+        set_kv_cache_data(kv_cache_data)
+
+    def export_model_weight_ipc_handles(self) -> dict:
+        """Export all model parameters as CUDA IPC handles (prefill process only).
+
+        Called by PrefillEngineCore._send_ready_signal() after load_model() completes.
+        Returns a dict {param_name: meta_dict} that can be pickled and sent to
+        decode over ZMQ.  Decode calls import_model_weight_ipc_handles() to
+        replace its own weight tensors with zero-copy views into this allocation.
+        """
+        from atom.model_engine.ipc_utils import export_model_weight_handles
+
+        logger.info("ModelRunner: export_model_weight_ipc_handles called")
+        result = export_model_weight_handles(self.model)
+        logger.info(
+            f"ModelRunner: export_model_weight_ipc_handles done ({len(result)} params)"
+        )
+        return result
+
+    def import_model_weight_ipc_handles(self, handles: dict) -> bool:
+        """Replace model parameters with views into prefill's GPU allocation.
+
+        Called by DecodeEngineCore._init_disagg() after receiving the handles
+        dict from prefill.  After this call decode's model parameters point into
+        prefill's GPU memory — the decode process's original weight tensors are
+        freed.  Returns True as sentinel for async_proc wait_out=True.
+        """
+        from atom.model_engine.ipc_utils import import_model_weights
+        import gc
+        import torch
+
+        import_model_weights(self.model, handles)
+        # Release the now-unreferenced original weight storage.
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("ModelRunner: model weight IPC import complete — own weights freed")
+        return True
+
+    def export_kv_cache_ipc_handle(self) -> dict:
+        """Export self.kv_cache (and self.kv_scale for fp8) as CUDA IPC handles.
+
+        Call after allocate_kv_cache().  The returned dict can be pickled
+        and sent to the decode process over ZMQ.
+        """
+        from atom.model_engine.ipc_utils import export_kv_cache_handle
+
+        logger.info("ModelRunner: export_kv_cache_ipc_handle called")
+        kv_scale = getattr(self, "kv_scale", None)
+        result = export_kv_cache_handle(self.kv_cache, kv_scale)
+        logger.info("ModelRunner: export_kv_cache_ipc_handle done")
+        return result
+
+    def import_kv_cache_ipc_handle(self, args: dict, num_kvcache_blocks: int) -> bool:
+        """Import kvcache from prefill's GPU allocation into this (decode) process.
+
+        Sets self.num_physical_kvcache_blocks (required by _bind_kv_cache_to_modules)
+        from num_kvcache_blocks since allocate_kv_cache() was skipped for decode.
+        Also imports kv_scale when present (fp8 kv cache dtype).
+        All attention module bindings are refreshed immediately.
+        Returns True as sentinel for async_proc wait_out=True.
+        """
+        from atom.model_engine.ipc_utils import import_kv_cache
+
+        self.num_physical_kvcache_blocks = (
+            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
+        )
+        logger.info("ModelRunner: calling rebuild_cuda_tensor (hipIpcOpenMemHandle)...")
+        self.kv_cache, kv_scale = import_kv_cache(args)
+        if kv_scale is not None:
+            self.kv_scale = kv_scale
+        logger.info("ModelRunner: rebuild_cuda_tensor complete, binding KV cache...")
+        self._bind_kv_cache_to_modules()
+        logger.info("ModelRunner: import_kv_cache_ipc_handle done")
+        return True
+
+    def create_prefill_stream(self) -> bool:
+        """Create a dedicated CUDA stream for disaggregated prefill KV writes.
+
+        Called once by PrefillEngineCore._init_disagg() after IPC import.
+        All subsequent prefill_forward() calls run on this stream so that
+        decode's default stream never observes partial KV writes.
+        """
+        self._prefill_stream = torch.cuda.Stream()
+        return True  # sentinel so async_proc enqueues the result for wait_out=True
+
+    @torch.inference_mode()
+    def prefill_forward(self, batch: ScheduledBatch) -> list[int]:
+        """Run a prefill forward pass on the dedicated prefill stream.
+
+        Writes KV for all prompt tokens, samples the first generated token for
+        each sequence, then synchronizes before returning so decode's default
+        stream sees all KV writes.  Returns a list of sampled token IDs (one
+        per sequence, in batch order) — these are included in PrefillDone so
+        the decode process can append them before the first decode step,
+        matching the num_tokens state that non-disagg postprocess would produce.
+        """
+        with torch.cuda.stream(self._prefill_stream):
+            input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(
+                batch
+            )
+            logits, _ = self.run_model(input_ids, batch)
+            # Sample the first generated token from each sequence's last logit.
+            sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            sampled_cpu = sampled.view(-1).tolist()
+        # Synchronize so decode's default stream sees all KV writes.
+        self._prefill_stream.synchronize()
+        reset_forward_context()
+        return sampled_cpu
 
     def gated_delta_net_state_shape(
         self,

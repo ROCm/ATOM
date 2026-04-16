@@ -8,7 +8,7 @@ from dataclasses import fields
 from typing import List, Union
 
 from atom.config import Config
-from atom.model_engine.engine_core_mgr import CoreManager
+from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -52,7 +52,10 @@ class LLMEngine:
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
-        self.core_mgr = CoreManager(config)
+        if config.enable_disagg:
+            self.core_mgr = DisaggCoreManager(config)
+        else:
+            self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
         logger.info(

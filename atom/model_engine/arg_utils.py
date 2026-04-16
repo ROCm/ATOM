@@ -46,6 +46,7 @@ class EngineArgs:
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     mark_trace: bool = False
+    enable_disagg: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -175,6 +176,11 @@ class EngineArgs:
             "--mark-trace",
             action="store_true",
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
+        )
+        parser.add_argument(
+            "--enable-disagg",
+            action="store_true",
+            help="Enable intra-GPU prefill/decode disaggregation.",
         )
 
         return parser

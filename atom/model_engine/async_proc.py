@@ -120,7 +120,9 @@ class AsyncIOProc:
 
     def busy_loop(self):
         while True:
+            logger.info(f"{self.label}: dequeue() waiting...")
             func_name, args = self.get_func()
+            logger.info(f"{self.label}: dequeue() got func={func_name!r}")
             for runner in self.runners:
                 func = getattr(runner, func_name, None)
                 if func is None:
@@ -128,6 +130,7 @@ class AsyncIOProc:
                 out = func(*args)
                 if self.io_addrs[1] is not None and out is not None:
                     self.io_queues[1].put_nowait(out)
+            logger.info(f"{self.label}: func={func_name!r} done, looping back")
             if func_name == "exit":
                 break
         logger.debug(f"{self.label}: exit busy_loop...")

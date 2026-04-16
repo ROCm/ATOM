@@ -741,6 +741,21 @@ class Config:
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
 
+    # Intra-GPU prefill/decode disaggregation
+    enable_disagg: bool = False
+    # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages)
+    disagg_d2p_addr: str = ""
+    # ZMQ IPC address: prefill PUSH → decode PULL (PrefillDone messages)
+    disagg_p2d_addr: str = ""
+    # Bootstrap round 1: prefill PUSH → decode PULL (weight IPC handles)
+    disagg_weight_ipc_addr: str = ""
+    # Bootstrap round 1 ACK: decode PUSH → prefill PULL (signals weights freed)
+    disagg_weight_ack_addr: str = ""
+    # Bootstrap round 2: prefill PUSH → decode PULL (kvcache_args + num_blocks)
+    disagg_kvcache_ipc_addr: str = ""
+    # True for the decode process in disagg mode: skip GPU weight/kvcache allocation.
+    disagg_is_decode: bool = False
+
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.compilation_config.cudagraph_capture_sizes

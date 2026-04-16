@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import threading
 import time
 from collections import deque
 from typing import Optional
@@ -615,3 +616,259 @@ class Scheduler:
         else:
             passed_delay = True
         return passed_delay
+
+
+class PrefillScheduler:
+    """Scheduler for the disaggregated prefill process.
+
+    Key differences from the base Scheduler:
+    - No BlockManager: KV blocks are pre-assigned by DecodeEngineCore and
+      written into seq.block_table before schedule() is called.
+    - schedule() only runs sequences that already have a non-empty block_table.
+      Sequences still waiting for a BlockAssignment message stay in waiting.
+    - postprocess() is a no-op: prefill produces no sampled tokens.
+    - Decode scheduling is never performed.
+    """
+
+    def __init__(self, config: Config):
+        self.max_num_seqs = config.max_num_seqs
+        self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.block_manager = None  # blocks managed by decode process
+        self.waiting: deque[Sequence] = deque()
+        self.running: deque[Sequence] = deque()
+        # spec decode not used on prefill side
+        self.use_spec = False
+        self.mtp_k = 0
+        self.spec_stats = None
+        self.cache_stats = None
+
+    def is_finished(self) -> bool:
+        return not self.waiting and not self.running
+
+    def has_requests(self) -> bool:
+        return bool(self.waiting) or bool(self.running)
+
+    def add(self, seq: Sequence):
+        self.waiting.append(seq)
+
+    def extend(self, seqs: list):
+        self.waiting.extend(seqs)
+
+    def schedule(self):
+        """Schedule only sequences whose block_table has been populated.
+
+        Sequences that do not yet have a block assignment (block_table is
+        empty) remain in the waiting queue and will be reconsidered on the
+        next call.
+
+        Returns (ScheduledBatch, dict[seq_id, Sequence]) or (None, {}) when
+        no sequence is ready.
+        """
+        scheduled_seqs = {}
+        num_scheduled_tokens = []
+        num_batched_tokens = 0
+        num_seqs = 0
+
+        # Collect ready sequences (have received BlockAssignment from decode)
+        ready = [s for s in self.waiting if s.block_table]
+
+        for seq in ready:
+            if num_seqs >= self.max_num_seqs:
+                break
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
+                break
+            self.waiting.remove(seq)
+            seq.status = SequenceStatus.RUNNING
+            seq.type = SequenceType.PREFILL
+            self.running.append(seq)
+            scheduled_seqs[seq.id] = seq
+            num_scheduled_tokens.append(num_new_tokens)
+            num_batched_tokens += num_new_tokens
+            num_seqs += 1
+
+        if not scheduled_seqs:
+            return None, {}
+
+        logger.info(
+            f"[PrefillScheduler] scheduled {num_seqs} seqs, "
+            f"{num_batched_tokens} tokens, req_ids: {tuple(scheduled_seqs.keys())}"
+        )
+        return (
+            ScheduledBatch(
+                seqs=scheduled_seqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=num_batched_tokens,
+                total_tokens_num_prefill=num_batched_tokens,
+                total_seqs_num=num_seqs,
+                total_seqs_num_prefill=num_seqs,
+            ),
+            scheduled_seqs,
+        )
+
+    def postprocess(self, seqs, fwd_output, stream_output_queue=None) -> list:
+        """No-op: prefill produces no sampled tokens."""
+        return []
+
+    def get_next_batch_info(self) -> tuple:
+        if self.waiting:
+            seq = self.waiting[0]
+            return (True, seq.num_tokens - seq.num_cached_tokens)
+        return (False, 0)
+
+    def get_num_unfinished_requests(self) -> int:
+        return len(self.waiting) + len(self.running)
+
+
+class DecodeScheduler(Scheduler):
+    """Scheduler for the disaggregated decode process.
+
+    Manages 4 queues:
+    - waiting:         new requests pending block allocation
+    - prefill_waiting: blocks allocated, BlockAssignment sent, awaiting PrefillDone
+    - prefill_done:    received PrefillDone, ready to be promoted to running
+    - running:         ongoing decode sequences
+
+    Block allocation is separated from scheduling: allocate_waiting() is called
+    by DecodeEngineCore after draining the input queue, and returns newly
+    allocated sequences so the engine can send BlockAssignment to prefill.
+
+    schedule() never returns a prefill batch — only decode batches, after
+    promoting prefill_done sequences into running.
+    """
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
+        self.prefill_waiting: dict[int, Sequence] = {}
+        # Sequences that have received PrefillDone and are ready to start decode.
+        self.prefill_done: deque[Sequence] = deque()
+        # Protects prefill_waiting and prefill_done: on_prefill_done is called
+        # from the _recv_prefill_done background thread.
+        self._prefill_lock = threading.Lock()
+
+    def is_finished(self) -> bool:
+        return (
+            not self.waiting
+            and not self.prefill_waiting
+            and not self.prefill_done
+            and not self.running
+        )
+
+    def has_requests(self) -> bool:
+        return bool(
+            self.waiting or self.prefill_waiting or self.prefill_done or self.running
+        )
+
+    def get_num_unfinished_requests(self) -> int:
+        return (
+            len(self.waiting)
+            + len(self.prefill_waiting)
+            + len(self.prefill_done)
+            + len(self.running)
+        )
+
+    def allocate_waiting(self) -> list[Sequence]:
+        """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.
+
+        Returns newly allocated sequences so DecodeEngineCore can send a
+        BlockAssignment message to the prefill process for each one.
+        Called from the main busy_loop thread only.
+        """
+        newly_allocated = []
+        while self.waiting:
+            seq = self.waiting[0]
+            if not self.block_manager.can_allocate(seq):
+                break
+            self.block_manager.allocate(seq)
+            self.waiting.popleft()
+            with self._prefill_lock:
+                self.prefill_waiting[seq.id] = seq
+            newly_allocated.append(seq)
+        return newly_allocated
+
+    def on_prefill_done(
+        self, seq_id: int, num_tokens_computed: int, sampled_token_id: int
+    ) -> None:
+        """Move a sequence from prefill_waiting to prefill_done.
+
+        Called from the _recv_prefill_done background thread.
+        sampled_token_id is the first generated token sampled by the prefill
+        process; it is appended to seq.token_ids when the sequence is promoted
+        to running so that context_lens and slot_mapping match the non-disagg
+        postprocess state before the first decode step.
+        """
+        with self._prefill_lock:
+            seq = self.prefill_waiting.pop(seq_id, None)
+            if seq is not None:
+                seq.num_cached_tokens = num_tokens_computed
+                seq._disagg_sampled_token_id = sampled_token_id
+                self.prefill_done.append(seq)
+
+    def schedule(self):
+        """Schedule decode-only batches.
+
+        Promotes sequences from prefill_done → running, then schedules the
+        running queue as decode.  Never returns a prefill batch.
+        """
+        # Promote prefill_done → running under lock.
+        with self._prefill_lock:
+            while self.prefill_done:
+                seq = self.prefill_done.popleft()
+                seq.status = SequenceStatus.RUNNING
+                seq.type = SequenceType.DECODE
+                # Append the first generated token sampled by the prefill process.
+                # In non-disagg mode, Scheduler.postprocess() does this after the
+                # prefill forward (is_deferred_out=True always appends one placeholder
+                # that is later overwritten with the real token from the async queue).
+                # In disagg mode the prefill process ran sampling and sent us the real
+                # token; appending it here puts num_tokens, context_lens, and
+                # slot_mapping in the same state as non-disagg before the first decode
+                # step.
+                token_id = seq._disagg_sampled_token_id
+                del seq._disagg_sampled_token_id
+                seq.append_token(token_id)
+                self.running.append(seq)
+
+        if not self.running:
+            return None
+
+        scheduled_seqs: dict[int, Sequence] = {}
+        num_scheduled_tokens: list[int] = []
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
+
+        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq, self.mtp_k + 1):
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                if seq.spec_token_ids.size > 0:
+                    scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
+                num_new_tokens = self.mtp_k + 1
+                self.block_manager.may_append(seq, num_new_tokens)
+                scheduled_seqs[seq.id] = seq
+                seq.type = SequenceType.DECODE
+                num_scheduled_tokens.append(num_new_tokens)
+
+        if not scheduled_seqs:
+            return None
+
+        total_tokens_num_decode = sum(num_scheduled_tokens)
+        self.running.extendleft(reversed(scheduled_seqs.values()))
+        return (
+            ScheduledBatch(
+                seqs=scheduled_seqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=total_tokens_num_decode,
+                total_tokens_num_decode=total_tokens_num_decode,
+                total_seqs_num=len(scheduled_seqs),
+                total_seqs_num_decode=len(scheduled_seqs),
+                num_spec_step=self.mtp_k,
+                scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            ),
+            scheduled_seqs,
+        )
