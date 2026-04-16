@@ -103,6 +103,22 @@ RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && 
 RUN echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
     "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
 
+# Rebuild mori against the current torch after vLLM deps may have changed it.
+# The ATOM base image compiled mori against its own torch (e.g. 2.10.0), but
+# vLLM's requirements/rocm.txt can downgrade torch (e.g. to 2.9.1), causing
+# ABI mismatches (missing symbols in libc10.so). Re-running setup.py install
+# links mori against the torch actually present in the OOT image
+RUN echo "========== [VLLM-ATOM] Rebuild mori against current torch ==========" && \
+    if [ -d /app/mori ]; then \
+      cd /app/mori && \
+      pip install -r requirements-build.txt && \
+      python setup.py install && \
+      "${VENV_PYTHON}" -c "import mori; print(f'mori rebuilt successfully')" && \
+      "${VENV_PYTHON}" -m pip show mori || true; \
+    else \
+      echo "No mori source found at /app/mori, skipping rebuild"; \
+    fi
+
 # Restore that exact base-image Triton after all OOT installs finish. The goal
 # is not to choose a new Triton version, but to preserve ATOM base-image runtime
 # behavior and fail fast if `pip show triton` would disagree with `import triton`.
