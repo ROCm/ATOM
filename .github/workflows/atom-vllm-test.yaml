@@ -415,6 +415,7 @@ jobs:
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
           OOT_ENV_VARS: ${{ matrix.env_vars }}
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
@@ -423,6 +424,7 @@ jobs:
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
             -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
