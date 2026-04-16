@@ -58,11 +58,15 @@ def is_dashboard_publish_allowed(payload: dict) -> bool:
     return str(publish_flag).strip().lower() not in {"0", "false", "no"}
 
 
-def build_entries(result_dir: Path, run_url: str | None, default_backend: str) -> list[dict]:
+def build_entries(
+    result_dir: Path, run_url: str | None, default_backend: str
+) -> list[dict]:
     entries: list[dict] = []
 
     for result_path in sorted(result_dir.glob("*.json")):
-        if result_path.name == "regression_report.json" or result_path.name.endswith("_benchmark_summary.json"):
+        if result_path.name == "regression_report.json" or result_path.name.endswith(
+            "_benchmark_summary.json"
+        ):
             continue
 
         try:
@@ -85,10 +89,10 @@ def build_entries(result_dir: Path, run_url: str | None, default_backend: str) -
         gpu_name = payload.get("gpu_name", "")
         gpu_vram = payload.get("gpu_vram_gb", 0)
         rocm_ver = payload.get("rocm_version", "")
-        
+
         # Support both OOT and SGLang image tag fields
         image_tag = payload.get("oot_image_tag", payload.get("sglang_image_tag", ""))
-        
+
         if gpu_name:
             extra += f" | GPU: {gpu_name}"
         if gpu_vram:
@@ -149,9 +153,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert benchmark JSON files to github-action-benchmark input"
     )
-    parser.add_argument(
-        "result_dir", help="Directory containing benchmark JSON files"
-    )
+    parser.add_argument("result_dir", help="Directory containing benchmark JSON files")
     parser.add_argument("--output", required=True, help="Output JSON path")
     parser.add_argument(
         "--run-url",

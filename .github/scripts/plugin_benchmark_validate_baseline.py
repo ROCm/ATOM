@@ -20,7 +20,9 @@ def is_dashboard_publish_allowed(payload: dict) -> bool:
 def validate_result_dir(result_dir: Path) -> bool:
     has_valid_result = False
     for path in result_dir.rglob("*.json"):
-        if path.name == "regression_report.json" or path.name.endswith("_benchmark_summary.json"):
+        if path.name == "regression_report.json" or path.name.endswith(
+            "_benchmark_summary.json"
+        ):
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
