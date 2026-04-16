@@ -8,7 +8,6 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# this flag is used to enable the vllm-omni plugin mode
 disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
 
 
@@ -101,11 +100,24 @@ def register_omni_model() -> None:
         return
 
     try:
+        import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image as _qwen_t2i
+        import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit as _qwen_edit
+        import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus as _qwen_edit_plus
+        import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered as _qwen_layered
+        from atom.plugin.vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+            ATOMQwenImageTransformer2DModel,
+        )
+        for _m in [_qwen_t2i, _qwen_edit, _qwen_edit_plus, _qwen_layered]:
+            _m.QwenImageTransformer2DModel = ATOMQwenImageTransformer2DModel
+        logger.info("Patched QwenImageTransformer2DModel → ATOMQwenImageTransformer2DModel in qwen_image pipelines")
+    except ImportError as e:
+        logger.warning(f"Could not patch qwen_image pipelines with ATOM transformer: {e}")
+
+    try:
         from atom.plugin.vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
             ATOMWanTransformer3DModel,
         )
 
-        # Approach 1: works
         import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as pipeline_wan2_2
         import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v as pipeline_wan2_2_i2v
         import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_ti2v as pipeline_wan2_2_ti2v
@@ -113,9 +125,6 @@ def register_omni_model() -> None:
         pipeline_wan2_2_i2v.WanTransformer3DModel = ATOMWanTransformer3DModel
         pipeline_wan2_2_ti2v.WanTransformer3DModel = ATOMWanTransformer3DModel
 
-        # Approach 2: doesn't work
-        # import vllm_omni.diffusion.models.wan2_2.wan2_2_transformer as _wan2_2_transformer
-        # _wan2_2_transformer.WanTransformer3DModel = ATOMWanTransformer3DModel # doesn work
         logger.info("Patched WanTransformer3DModel → ATOMWanTransformer3DModel in wan2_2 pipelines")
     except ImportError as e:
         logger.warning(f"Could not patch wan2_2 pipelines with ATOM transformer: {e}")

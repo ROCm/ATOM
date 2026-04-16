@@ -40,3 +40,7 @@ _, b64_data = img_url.split(",", 1)
 with open("output.png", "wb") as f:
     f.write(base64.b64decode(b64_data))
 ```
+
+### Benchmark tools
+
+vLLM-Omni offers performance benchmarking scripts through https://github.com/vllm-project/vllm-omni/tree/main/benchmarks/diffusion .
