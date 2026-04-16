@@ -238,6 +238,16 @@ jobs:
               .github/scripts/atom_test.sh benchmark $model_path
           "
 
+      - name: Dump server log
+        if: always()
+        run: |
+          docker exec atom-benchmark cat /tmp/atom_server.log 2>/dev/null || true
+
+      - name: Dump client log
+        if: always()
+        run: |
+          docker exec atom-benchmark cat /tmp/atom_client.log 2>/dev/null || true
+
       - name: Inject GPU metadata into benchmark result
         run: |
           docker exec \

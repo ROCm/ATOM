@@ -402,6 +402,16 @@ class QuantizationConfig:
                 return True
         return False
 
+    def apply_exclude_name_mapping(self, mapping: dict[str, str]):
+        if not mapping or not self.exclude_layers:
+            return
+        new_excludes = []
+        for name in self.exclude_layers:
+            for old, new in mapping.items():
+                name = name.replace(old, new)
+            new_excludes.append(name)
+        self.exclude_layers = list(dict.fromkeys(new_excludes))
+
     def remap_layer_name(
         self,
         hf_config: PretrainedConfig,
@@ -468,23 +478,13 @@ class QuantizationConfig:
         # Models that have a mismatch between their HF quant config names and ATOM
         # module paths declare `quant_exclude_name_mapping` as a class attribute.
         if quant_exclude_name_mapping:
-            new_excludes = []
-            for name in self.exclude_layers:
-                for old, new in quant_exclude_name_mapping.items():
-                    name = name.replace(old, new)
-                new_excludes.append(name)
-            self.exclude_layers = list(dict.fromkeys(new_excludes))
+            self.apply_exclude_name_mapping(quant_exclude_name_mapping)
 
 
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
     "glm_moe_dsa": "deepseek_v3",  # GLM 5.0 MoE, structure similar to DeepSeek v3.2
     "kimi_k2": "deepseek_v3",
-}
-
-_CUSTOM_TEXT_CONFIG_REGISTRY: dict[str, str] = {
-    "qwen3_5_text": "atom.model_config.qwen3_5.Qwen3_5TextConfig",
-    "qwen3_5_moe_text": "atom.model_config.qwen3_5_moe.Qwen3_5MoeTextConfig",
 }
 
 
@@ -539,11 +539,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        conf_path = _CUSTOM_TEXT_CONFIG_REGISTRY.get(mapped_type)
-        if conf_path is None:
-            config_class = AutoConfig.for_model(mapped_type)
-        else:
-            config_class = resolve_obj_by_qualname(conf_path)
+        config_class = AutoConfig.for_model(mapped_type)
         hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.

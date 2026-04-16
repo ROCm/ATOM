@@ -14,6 +14,7 @@ from typing import Optional
 
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import BaseAttention
+from atom.model_ops.utils import atom_parameter
 from atom.plugin.prepare import is_plugin_mode, is_sglang
 from atom.models.utils import maybe_prefix
 
@@ -84,14 +85,12 @@ class RadixAttention(BaseAttention):
             # device="cuda" is safe here: this branch is guarded by is_sglang(),
             # which only activates in GPU-based sglang plugin mode.
             if self.attn.k_scale is None:
-                self.attn.k_scale = torch.nn.Parameter(
-                    torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    requires_grad=False,
+                self.attn.k_scale = atom_parameter(
+                    torch.tensor([1.0], dtype=torch.float32, device="cuda")
                 )
             if self.attn.v_scale is None:
-                self.attn.v_scale = torch.nn.Parameter(
-                    torch.tensor([1.0], dtype=torch.float32, device="cuda"),
-                    requires_grad=False,
+                self.attn.v_scale = atom_parameter(
+                    torch.tensor([1.0], dtype=torch.float32, device="cuda")
                 )
             # Some SGLang attention backends consume the host-side float scales
             # directly. Keep them in sync with the device-side defaults so the
