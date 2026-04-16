@@ -217,7 +217,7 @@ jobs:
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8",
                   "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
-                  "model_path": "amd/DeepSeek-R1-0528-MXFP4",
+                  "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",

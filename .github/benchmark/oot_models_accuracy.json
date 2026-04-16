@@ -103,7 +103,7 @@
   },
   {
     "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
-    "model_path": "amd/DeepSeek-R1-0528-MXFP4",
+    "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "extraArgs": "--tensor-parallel-size 8",
     "env_vars": "",
     "runner": "linux-atom-mi35x-8",
