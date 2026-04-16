@@ -179,7 +179,11 @@ def naive_multicast(
 
 
 def pad_for_all_gather(x: torch.Tensor):
-    max_batch_size = get_forward_context().context.graph_bs
+    ctx = get_forward_context()
+    max_batch_size = ctx.context.graph_bs
+    if not ctx.context.is_prefill and ctx.attn_metadata is not None:
+        # For MTP > 1
+        max_batch_size *= ctx.attn_metadata.max_seqlen_q
     dim = 0
     original_batch_size = x.shape[dim]
     padded_x = x

@@ -849,6 +849,9 @@ class ModelRunner:
             )
             if i == 0:
                 hidden_states = hidden_states[:draft_bs]
+                # pad_for_all_gather uses graph_bs * 1, consistent with
+                # ranks running propose
+                forward_context.attn_metadata.max_seqlen_q = 1
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
