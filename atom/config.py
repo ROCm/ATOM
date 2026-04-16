@@ -24,6 +24,7 @@ from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 # plugin-related utilities
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
+from atom.utils import resolve_obj_by_qualname
 
 logger = logging.getLogger("atom")
 
@@ -401,6 +402,16 @@ class QuantizationConfig:
                 return True
         return False
 
+    def apply_exclude_name_mapping(self, mapping: dict[str, str]):
+        if not mapping or not self.exclude_layers:
+            return
+        new_excludes = []
+        for name in self.exclude_layers:
+            for old, new in mapping.items():
+                name = name.replace(old, new)
+            new_excludes.append(name)
+        self.exclude_layers = list(dict.fromkeys(new_excludes))
+
     def remap_layer_name(
         self,
         hf_config: PretrainedConfig,
@@ -467,12 +478,7 @@ class QuantizationConfig:
         # Models that have a mismatch between their HF quant config names and ATOM
         # module paths declare `quant_exclude_name_mapping` as a class attribute.
         if quant_exclude_name_mapping:
-            new_excludes = []
-            for name in self.exclude_layers:
-                for old, new in quant_exclude_name_mapping.items():
-                    name = name.replace(old, new)
-                new_excludes.append(name)
-            self.exclude_layers = list(dict.fromkeys(new_excludes))
+            self.apply_exclude_name_mapping(quant_exclude_name_mapping)
 
 
 _CONFIG_REGISTRY: dict[str, str] = {
@@ -485,11 +491,15 @@ _CONFIG_REGISTRY: dict[str, str] = {
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k25": "text_config",
+    "qwen3_5": "text_config",
+    "qwen3_5_moe": "text_config",
 }
 
 # multimodal models fully supported by plugin mode
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
+    "qwen3_5",
+    "qwen3_5_moe",
 }
 
 
@@ -770,6 +780,10 @@ class Config:
     enable_dp_attention: bool = False
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
+
+    enable_tbo: bool = False
+    enable_tbo_decode: bool = False
+    enable_low_latency: bool = False
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None

@@ -621,6 +621,19 @@ class MLAAttentionImplPluginModeMethods:
         output=None,
     ):
         assert output is not None, "Output tensor must be provided."
+
+        # Dispatch using explicit sparse-mode marker set during plugin init.
+        if getattr(self, "_is_sparse_mla", False):
+            return self.forward_impl_sparse_plugin_mode(
+                layer=layer,
+                q=q,
+                k_c_normed=k_c_normed,
+                k_pe=k_pe,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                output=output,
+            )
+
         if not hasattr(self, "_cached_ops"):
             from vllm.distributed.parallel_state import get_dcp_group
             from vllm import _custom_ops as ops
@@ -951,6 +964,8 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
             else:
                 # TODO: support other quant types for fallback path
                 assert False, "Unsupported quant type"
+
+        self._is_sparse_mla = False
 
 
 def MLAAttentionImplDecoratorForPluginMode(cls):

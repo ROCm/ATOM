@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Resolve a stable published OOT image reference for benchmarking.
+"""Resolve a stable published ATOM image reference from a floating tag.
 
-Given a floating tag like ``vllm-latest``, this script looks up its manifest
-digest and then searches the same repository for the newest
-``vllm-v*-nightly_*`` tag with that exact digest. If no nightly tag matches, or
-if the reverse lookup cannot complete after the floating tag digest is known, it
-returns a digest-pinned ``latest`` reference instead.
+Supported floating tags:
+- ``latest`` -> native nightly tags like ``nightly_YYYYMMDDHHMM``
+- ``vllm-latest`` -> plugin nightly tags like ``vllm-vVERSION-nightly_YYYYMMDD``
+- ``sglang-latest`` -> plugin nightly tags like ``sglang-vVERSION-nightly_YYYYMMDD``
+
+The resolver first looks up the floating tag digest, then scans the same
+repository for the newest same-digest nightly tag in the matching family. If no
+nightly tag matches, or if reverse lookup cannot complete after the floating tag
+digest is known, it returns a digest-pinned floating reference instead.
 """
 
 from __future__ import annotations
@@ -30,15 +34,33 @@ MANIFEST_ACCEPT = ", ".join(
         "application/vnd.docker.distribution.manifest.v2+json",
     )
 )
-NIGHTLY_RE = re.compile(r"^vllm-v(?P<version>.+)-nightly_(?P<date>\d{8})$")
-USER_AGENT = "ATOM OOT Image Resolver/1.0"
+USER_AGENT = "ATOM Image Resolver/1.0"
+IMAGE_FAMILY_CONFIG = {
+    "native": {
+        "reference_tag": "latest",
+        "nightly_regex": re.compile(r"^nightly_(?P<date>\d{12})$"),
+        "supports_version": False,
+    },
+    "vllm": {
+        "reference_tag": "vllm-latest",
+        "nightly_regex": re.compile(r"^vllm-v(?P<version>.+)-nightly_(?P<date>\d{8})$"),
+        "supports_version": True,
+    },
+    "sglang": {
+        "reference_tag": "sglang-latest",
+        "nightly_regex": re.compile(
+            r"^sglang-v(?P<version>.+)-nightly_(?P<date>\d{8})$"
+        ),
+        "supports_version": True,
+    },
+}
 
 
 @dataclass(frozen=True)
 class CandidateTag:
     tag: str
-    version: str
     date: str
+    version: str = ""
 
 
 def build_resolution(
@@ -161,39 +183,66 @@ def list_tags(repository: str, token: str) -> list[str]:
     return tags
 
 
+def infer_image_family(reference_tag: str) -> str:
+    for family, config in IMAGE_FAMILY_CONFIG.items():
+        if reference_tag == config["reference_tag"]:
+            return family
+    expected = ", ".join(
+        config["reference_tag"] for config in IMAGE_FAMILY_CONFIG.values()
+    )
+    raise ValueError(
+        f"Unable to infer image family from reference tag {reference_tag!r}; expected one of {expected}"
+    )
+
+
 def nightly_candidates(
-    tags: Iterable[str], preferred_version: str | None
+    tags: Iterable[str], preferred_version: str | None, image_family: str = "vllm"
 ) -> list[CandidateTag]:
+    if image_family not in IMAGE_FAMILY_CONFIG:
+        raise ValueError(
+            f"Unsupported image family {image_family!r}; expected one of {tuple(IMAGE_FAMILY_CONFIG)}"
+        )
+
+    config = IMAGE_FAMILY_CONFIG[image_family]
+    pattern = config["nightly_regex"]
     candidates: list[CandidateTag] = []
     for tag in tags:
-        match = NIGHTLY_RE.match(tag)
+        match = pattern.match(tag)
         if not match:
             continue
         candidates.append(
             CandidateTag(
                 tag=tag,
-                version=match.group("version"),
                 date=match.group("date"),
+                version=match.groupdict().get("version", ""),
             )
         )
 
     def sort_key(candidate: CandidateTag) -> tuple[int, str, str]:
-        preferred = (
-            1 if preferred_version and candidate.version == preferred_version else 0
-        )
+        preferred = 0
+        if config["supports_version"]:
+            preferred = (
+                1 if preferred_version and candidate.version == preferred_version else 0
+            )
         return (preferred, candidate.date, candidate.tag)
 
     return sorted(candidates, key=sort_key, reverse=True)
 
 
 def resolve_image(
-    repository: str, reference_tag: str, preferred_version: str | None
+    repository: str,
+    reference_tag: str,
+    preferred_version: str | None,
+    image_family: str | None = None,
 ) -> dict[str, object]:
+    image_family = image_family or infer_image_family(reference_tag)
     token = get_registry_token(repository)
     reference_digest = get_manifest_digest(repository, reference_tag, token)
     candidates: list[CandidateTag] = []
     try:
-        candidates = nightly_candidates(list_tags(repository, token), preferred_version)
+        candidates = nightly_candidates(
+            list_tags(repository, token), preferred_version, image_family=image_family
+        )
         for candidate in candidates:
             if (
                 get_manifest_digest(repository, candidate.tag, token)
@@ -231,7 +280,7 @@ def resolve_image(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Resolve a floating OOT image tag to a same-digest nightly tag when possible."
+        description="Resolve a floating ATOM image tag to a same-digest nightly tag when possible."
     )
     parser.add_argument(
         "--repository",
@@ -241,12 +290,17 @@ def main() -> None:
     parser.add_argument(
         "--reference-tag",
         required=True,
-        help="Floating tag to resolve, for example vllm-latest",
+        help="Floating tag to resolve, for example latest, vllm-latest, or sglang-latest",
     )
     parser.add_argument(
         "--preferred-version",
         default="",
-        help="Optional preferred vLLM version to prioritize when scanning nightly tags",
+        help="Optional preferred backend version to prioritize when scanning nightly tags",
+    )
+    parser.add_argument(
+        "--image-family",
+        default="",
+        help="Optional image family override (for example native, vllm, or sglang). By default this is inferred from the reference tag.",
     )
     args = parser.parse_args()
 
@@ -254,6 +308,7 @@ def main() -> None:
         repository=args.repository,
         reference_tag=args.reference_tag,
         preferred_version=args.preferred_version or None,
+        image_family=args.image_family or None,
     )
     json.dump(resolution, sys.stdout, sort_keys=True)
     sys.stdout.write("\n")

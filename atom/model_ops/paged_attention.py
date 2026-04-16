@@ -92,9 +92,6 @@ class PagedAttention(BaseAttention):
                     extra_impl_args["mla_modules"] = mla_modules
 
             if use_mla:
-                assert (
-                    mla_modules.indexer is None
-                ), "MLAAttention is not supported for sparse mode"
                 self.num_heads = num_heads
                 self.v_head_dim = mla_modules.v_head_dim
                 self.qk_head_dim = mla_modules.qk_head_dim
@@ -114,7 +111,7 @@ class PagedAttention(BaseAttention):
                     quant_config=quant_config,
                     prefix=f"{prefix}.attn",
                     kv_b_proj=mla_modules.kv_b_proj,
-                    use_sparse=False,
+                    use_sparse=mla_modules.indexer is not None,
                     indexer=mla_modules.indexer,
                     **extra_impl_args,
                 )

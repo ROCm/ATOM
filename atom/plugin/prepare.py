@@ -82,4 +82,12 @@ def prepare_model(config: Any, engine: str):
     # init aiter dist for using aiter custom collective ops
     init_aiter_dist(config=atom_config)
 
+    # Patch SGLang graph_capture to also enter aiter's ca_comm.capture(),
+    # avoiding hipMemcpyAsync in aiter collectives when model uses aiter's
+    # custom all_reduce (same fix as atom/plugin/vllm/graph_capture_patch.py)
+    if is_sglang():
+        from atom.plugin.sglang.graph_capture_patch import apply_graph_capture_patch
+
+        apply_graph_capture_patch()
+
     return model_cls(atom_config=atom_config)

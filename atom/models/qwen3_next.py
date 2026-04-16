@@ -37,6 +37,7 @@ from atom.utils.decorators import support_torch_compile
 from aiter.rotary_embedding import get_rope
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -206,21 +207,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        # print(f"layer {prefix}, gate weight: {self.gate.weight.data}", flush=True)
-
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if (
             config.shared_expert_intermediate_size > 0
             and not is_rocm_aiter_fusion_shared_expert_enabled()
         ):
+            # When shared expert fusion is disabled (e.g. MXFP4 where shared
+            # experts are BF16 while routed experts are FP4), run the shared
+            # expert MLP separately.  The sigmoid gating is applied in
+            # forward() using the shared-expert portion of the merged gate
+            # output — no separate nn.Linear needed here.
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
-                expert_gate=self.shared_expert_gate,
+                expert_gate=None,
                 prefix=f"{prefix}.shared_expert",
             )
         else:
@@ -249,13 +252,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
+        # router_logits: (num_tokens, n_experts + 1)
+        logits = self.gate(hidden_states)
+        if not is_rocm_aiter_fusion_shared_expert_enabled():
+            router_logits = logits[:, : self.n_routed_experts]
+        else:
+            router_logits = logits
         routed_output = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
         if not is_rocm_aiter_fusion_shared_expert_enabled():
             shared_output = self.shared_expert(hidden_states)
+            # Apply shared expert gate: the merged gate output contains
+            # [routed_logits, shared_expert_gate_logits], extract the tail
+            shared_gate_logits = logits[:, self.n_routed_experts :]
+            shared_output = F.sigmoid(shared_gate_logits) * shared_output
             final_hidden_states = shared_output + routed_output
         else:
             final_hidden_states = routed_output
@@ -513,13 +524,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
-        self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.tp_size),
-        )
-        self.A_log = nn.Parameter(
+        self.dt_bias = atom_parameter(torch.ones(self.num_v_heads // self.tp_size))
+        self.A_log = atom_parameter(
             torch.empty(
                 (self.num_v_heads // self.tp_size),
             )
+        )
+
+        # Get downstream out_proj quant_config for norm
+        norm_quant_config = (
+            quant_config.get_layer_quant_config(f"{prefix}.out_proj")
+            if quant_config is not None
+            else None
         )
 
         self.norm = RMSNormGated(
@@ -528,6 +544,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             group_size=None,
             norm_before_gate=True,
             dtype=config.dtype,
+            quant_config=norm_quant_config,
         )
 
         self.out_proj = RowParallelLinear(
@@ -738,14 +755,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        z_shape_og = z.shape
-        # Reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens] = self.out_proj(core_attn_out)
+
+        core_attn_out, maybe_scale = self.norm(core_attn_out, z)
+        output[:num_tokens] = self.out_proj(core_attn_out, x_scale=maybe_scale)
 
 
 if is_vllm():
@@ -873,21 +885,21 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
-            self.attn_layer_scale = torch.nn.Parameter(
+            self.attn_layer_scale = atom_parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
                     dtype=config.dtype,
-                ),
+                )
             )
-            self.ffn_layer_scale = torch.nn.Parameter(
+            self.ffn_layer_scale = atom_parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
                     dtype=config.dtype,
-                ),
+                )
             )
 
     def forward(
