@@ -180,6 +180,18 @@
     "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
   },
   {
+    "model_name": "Qwen3.5-397B-A17B-MXFP4",
+    "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "pr",
+    "accuracy_threshold": 0.87,
+    "accuracy_baseline": 0.909,
+    "accuracy_baseline_model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "_baseline_note": "Using Qwen3-235B baseline as proxy; needs CI measurement for Qwen3.5 specific baseline"
+  },
+  {
     "model_name": "MiniMax-M2.5",
     "model_path": "MiniMaxAI/MiniMax-M2.5",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
