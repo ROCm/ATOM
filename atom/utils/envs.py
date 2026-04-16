@@ -83,6 +83,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0"
     ).lower()
     == "1",
+    # In ATOM-vLLM plugin mode, ATOM uses ATOM's own mori path rather than
+    # vLLM's optional mori integration. Keep vLLM from detecting/importing its
+    # own mori path by default to avoid ABI/environment conflicts during vLLM's
+    # early quantization/config validation. Set to "0" only if you explicitly
+    # want vLLM to use its mori path and have installed a mori build compatible
+    # with that vLLM environment.
+    "ATOM_DISABLE_VLLM_MORI": lambda: os.getenv("ATOM_DISABLE_VLLM_MORI", "1").lower()
+    == "1",
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: os.getenv(
         "ATOM_USE_CUSTOM_ALL_GATHER", "1"
     ).lower()
