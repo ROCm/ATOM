@@ -118,13 +118,46 @@ if [ "$TYPE" == "accuracy" ]; then
   # host runner user needs to read results via the shared volume mount)
   umask 0022
   mkdir -p accuracy_test_results
-  RESULT_FILENAME=accuracy_test_results/$(date +%Y%m%d%H%M%S).json
+  RUN_TAG=$(date +%Y%m%d%H%M%S)
+  OUTPUT_PATH=accuracy_test_results/${RUN_TAG}
+  FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
   lm_eval --model local-completions \
           --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
           --tasks gsm8k \
           --num_fewshot 3 \
-          --output_path "${RESULT_FILENAME}" \
+          --output_path "${OUTPUT_PATH}" \
           2>&1 | tee "$ATOM_CLIENT_LOG"
+
+  RESULT_FILENAME=$(
+    python3 - <<PY
+from pathlib import Path
+
+candidate_roots = [Path("${OUTPUT_PATH}"), Path("accuracy_test_results")]
+json_candidates = []
+for root in candidate_roots:
+    if root.is_file() and root.suffix == ".json":
+        json_candidates.append(root)
+    elif root.is_dir():
+        for path in root.rglob("*.json"):
+            if path.is_file():
+                json_candidates.append(path)
+
+if not json_candidates:
+    print("")
+else:
+    latest = max(json_candidates, key=lambda path: path.stat().st_mtime_ns)
+    print(str(latest))
+PY
+  )
+  if [[ -z "${RESULT_FILENAME}" || ! -f "${RESULT_FILENAME}" ]]; then
+    echo "ERROR: No results JSON file found under ${OUTPUT_PATH} or accuracy_test_results"
+    exit 2
+  fi
+
+  if [[ "${RESULT_FILENAME}" != "${FLAT_RESULT_FILE}" ]]; then
+    cp -f "${RESULT_FILENAME}" "${FLAT_RESULT_FILE}"
+    RESULT_FILENAME="${FLAT_RESULT_FILE}"
+  fi
 
   if [ -n "${ATOM_DOCKER_IMAGE}" ]; then
     RESULT_FILE="${RESULT_FILENAME}" \
