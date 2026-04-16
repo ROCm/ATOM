@@ -37,6 +37,7 @@ from atom.utils.decorators import support_torch_compile
 from aiter.rotary_embedding import get_rope
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -513,10 +514,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
-        self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.tp_size),
-        )
-        self.A_log = nn.Parameter(
+        self.dt_bias = atom_parameter(torch.ones(self.num_v_heads // self.tp_size))
+        self.A_log = atom_parameter(
             torch.empty(
                 (self.num_v_heads // self.tp_size),
             )
@@ -876,21 +875,21 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
-            self.attn_layer_scale = torch.nn.Parameter(
+            self.attn_layer_scale = atom_parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
                     dtype=config.dtype,
-                ),
+                )
             )
-            self.ffn_layer_scale = torch.nn.Parameter(
+            self.ffn_layer_scale = atom_parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
                     dtype=config.dtype,
-                ),
+                )
             )
 
     def forward(

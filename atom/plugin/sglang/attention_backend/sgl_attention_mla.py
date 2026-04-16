@@ -909,11 +909,6 @@ def _split_and_assign_kc_vc(
             w_vc = w_vc.contiguous()
         attn.w_vc = bind_or_assign(attn.w_vc, w_vc)
 
-        if hasattr(attn.kv_b_proj, "weight_scale") and attn.w_scale is None:
-            attn.w_scale = bind_or_assign(attn.w_scale, attn.kv_b_proj.weight_scale)
-            if _is_hip:
-                attn.w_scale *= 2.0
-
         if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
             attn.w_kc = attn.w_kc.to(torch.bfloat16) * attn.w_scale
             attn.w_vc = attn.w_vc.to(torch.bfloat16) * attn.w_scale

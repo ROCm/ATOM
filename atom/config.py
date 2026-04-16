@@ -487,11 +487,6 @@ _CONFIG_REGISTRY: dict[str, str] = {
     "kimi_k2": "deepseek_v3",
 }
 
-_CUSTOM_TEXT_CONFIG_REGISTRY: dict[str, str] = {
-    "qwen3_5_text": "atom.model_config.qwen3_5.Qwen3_5TextConfig",
-    "qwen3_5_moe_text": "atom.model_config.qwen3_5_moe.Qwen3_5MoeTextConfig",
-}
-
 
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
@@ -544,11 +539,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        conf_path = _CUSTOM_TEXT_CONFIG_REGISTRY.get(mapped_type)
-        if conf_path is None:
-            config_class = AutoConfig.for_model(mapped_type)
-        else:
-            config_class = resolve_obj_by_qualname(conf_path)
+        config_class = AutoConfig.for_model(mapped_type)
         hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.

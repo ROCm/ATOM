@@ -235,7 +235,7 @@ jobs:
         if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode == 'fast' }}
         run: |
           DOCKER_BUILDKIT=1 docker build --network=host \
-            -t atom_sglang:ci \
+            -t sglang_atom:ci \
             --build-arg SGLANG_BASE_IMAGE="${NIGHTLY_SGLANG_IMAGE_TAG}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
@@ -249,7 +249,7 @@ jobs:
         run: |
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
-            -t atom_sglang_base:ci \
+            -t sglang_atom_base:ci \
             --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
@@ -263,9 +263,9 @@ jobs:
         run: |
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
-            -t atom_sglang:ci \
-            --target atom_sglang \
-            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
+            -t sglang_atom:ci \
+            --target sglang_atom \
+            --build-arg SGLANG_BASE_IMAGE="sglang_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -275,7 +275,7 @@ jobs:
       - name: Push Docker image
         if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' }}
         run: |
-          docker tag atom_sglang:ci "${SGLANG_IMAGE_TAG}"
+          docker tag sglang_atom:ci "${SGLANG_IMAGE_TAG}"
           docker push "${SGLANG_IMAGE_TAG}"
 
       - name: Skip remote build for fork PR
@@ -287,8 +287,8 @@ jobs:
         if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && always() }}
         run: |
           rm -f Dockerfile.mod || true
-          docker rmi "atom_sglang_base:ci" || true
-          docker rmi "atom_sglang:ci" || true
+          docker rmi "sglang_atom_base:ci" || true
+          docker rmi "sglang_atom:ci" || true
           docker rmi "${SGLANG_IMAGE_TAG}" || true
 
   atom-sglang-accuracy:
@@ -312,7 +312,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
-      CONTAINER_NAME: atom_sglang_${{ strategy.job-index }}
+      CONTAINER_NAME: sglang_atom_${{ strategy.job-index }}
       SGLANG_REF: v0.5.10
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
 
@@ -389,8 +389,8 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           set -euo pipefail
-          docker rmi "atom_sglang_base:ci" || true
-          docker rmi "atom_sglang:ci" || true
+          docker rmi "sglang_atom_base:ci" || true
+          docker rmi "sglang_atom:ci" || true
 
           BUILD_MODE="full"
           if ! docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
@@ -412,7 +412,7 @@ jobs:
 
           if [ "${BUILD_MODE}" = "fast" ]; then
             DOCKER_BUILDKIT=1 docker build --network=host \
-              -t atom_sglang:ci \
+              -t sglang_atom:ci \
               --build-arg SGLANG_BASE_IMAGE="${NIGHTLY_SGLANG_IMAGE_TAG}" \
               --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
               --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
@@ -425,7 +425,7 @@ jobs:
 
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
-            -t atom_sglang_base:ci \
+            -t sglang_atom_base:ci \
             --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
@@ -436,9 +436,9 @@ jobs:
 
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
-            -t atom_sglang:ci \
-            --target atom_sglang \
-            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
+            -t sglang_atom:ci \
+            --target sglang_atom \
+            --build-arg SGLANG_BASE_IMAGE="sglang_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -450,7 +450,7 @@ jobs:
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           if [ "${IS_FORK_PR}" = "true" ]; then
-            echo "SGLANG_IMAGE_TAG=atom_sglang:ci" >> "$GITHUB_ENV"
+            echo "SGLANG_IMAGE_TAG=sglang_atom:ci" >> "$GITHUB_ENV"
           else
             echo "SGLANG_IMAGE_TAG=rocm/atom-dev:sglang-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
           fi
@@ -602,16 +602,16 @@ jobs:
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_sglang_test.sh accuracy
+              bash .github/scripts/sglang_atom_test.sh accuracy
             "
 
       - name: Check SGLANG accuracy test results
         if: success()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
-          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
+          docker cp "$CONTAINER_NAME":/tmp/sglang_atom_accuracy_results ./sglang_atom_accuracy_results || true
+          result_file=$(ls -1t sglang_atom_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
-            echo "ERROR: No results JSON file found in atom_sglang_accuracy_results/"
+            echo "ERROR: No results JSON file found in sglang_atom_accuracy_results/"
             exit 2
           fi
 
@@ -633,14 +633,14 @@ jobs:
         if: success()
         run: |
           echo "SGLANG Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/sglang_atom_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect SGLANG logs and results
         if: always()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          docker cp "$CONTAINER_NAME":/tmp/sglang_atom.log ./sglang_atom.log || true
+          docker cp "$CONTAINER_NAME":/tmp/sglang_atom_accuracy_output.txt ./sglang_atom_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/sglang_atom_accuracy_results ./sglang_atom_accuracy_results || true
 
       - name: Upload SGLANG artifacts
         if: always()
@@ -648,19 +648,19 @@ jobs:
         with:
           name: sglang-${{ matrix.model_name }}-artifacts
           path: |
-            atom_sglang.log
-            atom_sglang_accuracy_output.txt
-            atom_sglang_accuracy_results
+            sglang_atom.log
+            sglang_atom_accuracy_output.txt
+            sglang_atom_accuracy_results
 
       - name: Clean up SGLANG test
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/sglang_atom.pid ]; then kill \$(cat /tmp/sglang_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           rm -f Dockerfile.mod || true
-          docker rmi "atom_sglang_base:ci" || true
-          docker rmi "atom_sglang:ci" || true
+          docker rmi "sglang_atom_base:ci" || true
+          docker rmi "sglang_atom:ci" || true
           KEEP_COUNT="${SGLANG_IMAGE_CACHE_KEEP:-3}"
           if [[ "${SGLANG_IMAGE_TAG}" == rocm/atom-dev:sglang-pre-build-* ]]; then
             echo "Keeping current SGLANG image tag and the ${KEEP_COUNT} most recent sglang-pre-build tags."

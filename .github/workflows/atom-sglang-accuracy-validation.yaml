@@ -99,7 +99,7 @@ jobs:
           fi
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
-          MANUAL_BASE_IMAGE_TAG="atom_sglang_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          MANUAL_BASE_IMAGE_TAG="sglang_atom_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
           SGLANG_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:sglang-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
@@ -148,7 +148,7 @@ jobs:
 
           docker build --network=host --no-cache \
             -t "${SGLANG_IMAGE_TAG}" \
-            --target atom_sglang \
+            --target sglang_atom \
             --build-arg SGLANG_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
             --build-arg SGLANG_REF="${SGLANG_REF}" \
@@ -181,7 +181,7 @@ jobs:
       actions: read
       contents: write
     env:
-      CONTAINER_NAME: atom_sglang_validation_${{ strategy.job-index }}
+      CONTAINER_NAME: sglang_atom_validation_${{ strategy.job-index }}
       SGLANG_IMAGE_TAG: ${{ needs.prepare-sglang-image.outputs.sglang_image_tag }}
     steps:
       - name: Checkout ATOM repo
@@ -351,16 +351,16 @@ jobs:
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_sglang_test.sh accuracy
+              bash .github/scripts/sglang_atom_test.sh accuracy
             "
 
       - name: Check SGLANG accuracy test results
         if: success()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
-          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
+          docker cp "$CONTAINER_NAME":/tmp/sglang_atom_accuracy_results ./sglang_atom_accuracy_results || true
+          result_file=$(ls -1t sglang_atom_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
-            echo "ERROR: No results JSON file found in atom_sglang_accuracy_results/"
+            echo "ERROR: No results JSON file found in sglang_atom_accuracy_results/"
             exit 2
           fi
 
@@ -382,14 +382,14 @@ jobs:
         if: success()
         run: |
           echo "SGLANG gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/sglang_atom_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect artifacts
         if: always()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          docker cp "$CONTAINER_NAME":/tmp/sglang_atom.log ./sglang_atom.log || true
+          docker cp "$CONTAINER_NAME":/tmp/sglang_atom_accuracy_output.txt ./sglang_atom_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/sglang_atom_accuracy_results ./sglang_atom_accuracy_results || true
 
       - name: Upload model artifacts
         if: always()
@@ -397,22 +397,22 @@ jobs:
         with:
           name: sglang-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
-            atom_sglang.log
-            atom_sglang_accuracy_output.txt
-            atom_sglang_accuracy_results
+            sglang_atom.log
+            sglang_atom_accuracy_output.txt
+            sglang_atom_accuracy_results
 
       - name: Upload accuracy results for dashboard
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
-          path: atom_sglang_accuracy_results/*.json
+          path: sglang_atom_accuracy_results/*.json
           if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/sglang_atom.pid ]; then kill \$(cat /tmp/sglang_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           docker rmi "${SGLANG_IMAGE_TAG}" || true

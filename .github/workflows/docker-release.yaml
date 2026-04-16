@@ -225,14 +225,14 @@ jobs:
         run: |
           SGLANG_BASE_IMAGE="atom_release:ci"
           echo "Using SGLang+ATOM base image: ${SGLANG_BASE_IMAGE}"
-          docker build --network=host -t atom_sglang_release:ci \
-            --target atom_sglang \
+          docker build --network=host -t sglang_atom_release:ci \
+            --target sglang_atom \
             --build-arg SGLANG_BASE_IMAGE="${SGLANG_BASE_IMAGE}" \
             --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
             --build-arg SGLANG_REPO="${{ inputs.sglang_repo || env.SGLANG_REPO }}" \
             --build-arg SGLANG_REF="${{ inputs.sglang_ref || env.SGLANG_REF }}" \
             -f docker/Dockerfile .
-          docker inspect atom_sglang_release:ci
+          docker inspect sglang_atom_release:ci
 
       - name: Push SGLang+ATOM Docker image
         if: ${{ success() && inputs.only_release_vllm_atom != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true || inputs.only_release_sglang_atom == true) }}
@@ -240,9 +240,9 @@ jobs:
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
           SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
           SGLANG_LATEST_TAG="sglang-latest"
-          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_TAG}
+          docker tag sglang_atom_release:ci rocm/atom-dev:${SGLANG_TAG}
           docker push rocm/atom-dev:${SGLANG_TAG}
-          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
+          docker tag sglang_atom_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
           docker push rocm/atom-dev:${SGLANG_LATEST_TAG}
 
       - name: Clean Up
@@ -254,7 +254,7 @@ jobs:
           docker rmi atom_release:ci || true
           docker rmi rocm/atom-dev:latest || true
           docker rmi atom_vllm_atom_release:ci || true
-          docker rmi atom_sglang_release:ci || true
+          docker rmi sglang_atom_release:ci || true
           # Remove nightly tagged image if it exists
           docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true
           docker images "rocm/atom-dev:vllm-v*-nightly_*" -q | xargs -r docker rmi || true
