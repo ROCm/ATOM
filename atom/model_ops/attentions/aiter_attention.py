@@ -127,6 +127,113 @@ class AiterAttentionMetadataBuilder:
             ),
         }
         self.model_runner.forward_vars.update(pa_persistent_metadata)
+        # Per-ubatch buffers for CUDAGraph TBO
+        if model_runner.config.enable_tbo:
+            self._allocate_ubatch_buffers(
+                max_qlen,
+                work_meta_data_size,
+                work_meta_data_type,
+                work_indptr_size,
+                work_indptr_type,
+                work_info_set_size,
+                work_info_set_type,
+                reduce_indptr_size,
+                reduce_indptr_type,
+                reduce_final_map_size,
+                reduce_final_map_type,
+                reduce_partial_map_size,
+                reduce_partial_map_type,
+            )
+
+    _NUM_TBO_UBATCHES = 2
+
+    def _allocate_ubatch_buffers(
+        self,
+        max_seqlen_qo,
+        work_meta_data_size,
+        work_meta_data_type,
+        work_indptr_size,
+        work_indptr_type,
+        work_info_set_size,
+        work_info_set_type,
+        reduce_indptr_size,
+        reduce_indptr_type,
+        reduce_final_map_size,
+        reduce_final_map_type,
+        reduce_partial_map_size,
+        reduce_partial_map_type,
+    ):
+        """Allocate per-ubatch CpuGpuBuffers for CUDAGraph TBO."""
+        i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        i64_kwargs = {"dtype": torch.int64, "device": self.device}
+        var = self.model_runner.forward_vars
+        ub_max_bs = self.max_bs
+
+        for ub_idx in range(self._NUM_TBO_UBATCHES):
+            p = f"ub{ub_idx}_"
+            var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            var[f"{p}kv_indices"] = CpuGpuBuffer(
+                self.max_bs * self.max_num_blocks_per_seq,
+                **i32_kwargs,
+            )
+            var[f"{p}context_lens"] = CpuGpuBuffer(ub_max_bs, **i32_kwargs)
+            var[f"{p}slot_mapping"] = CpuGpuBuffer(
+                ub_max_bs * max_seqlen_qo,
+                **i64_kwargs,
+            )
+            var[f"{p}block_tables"] = CpuGpuBuffer(
+                ub_max_bs,
+                self.max_num_blocks_per_seq // self.block_ratio,
+                **i32_kwargs,
+            )
+            if self.block_ratio > 1:
+                var[f"{p}block_tables_converted"] = CpuGpuBuffer(
+                    ub_max_bs,
+                    self.max_num_blocks_per_seq,
+                    **i32_kwargs,
+                )
+            var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            var[f"{p}cu_seqlens_q"].cpu.copy_(
+                torch.arange(
+                    0,
+                    (ub_max_bs + 1) * max_seqlen_qo,
+                    step=max_seqlen_qo,
+                    dtype=torch.int32,
+                )
+            )
+            var[f"{p}cu_seqlens_q"].copy_to_gpu()
+
+            # PA work buffers per ubatch (GPU only)
+            var[f"{p}work_meta_data"] = torch.empty(
+                work_meta_data_size,
+                dtype=work_meta_data_type,
+                device=self.device,
+            )
+            var[f"{p}work_indptr"] = torch.empty(
+                work_indptr_size,
+                dtype=work_indptr_type,
+                device=self.device,
+            )
+            var[f"{p}work_info_set"] = torch.empty(
+                work_info_set_size,
+                dtype=work_info_set_type,
+                device=self.device,
+            )
+            var[f"{p}reduce_indptr"] = torch.empty(
+                reduce_indptr_size,
+                dtype=reduce_indptr_type,
+                device=self.device,
+            )
+            var[f"{p}reduce_final_map"] = torch.empty(
+                reduce_final_map_size,
+                dtype=reduce_final_map_type,
+                device=self.device,
+            )
+            var[f"{p}reduce_partial_map"] = torch.empty(
+                reduce_partial_map_size,
+                dtype=reduce_partial_map_type,
+                device=self.device,
+            )
 
     def set_aiter_persistent_worker_buffers(self, bs: int):
         config = self.model_runner.config
@@ -278,7 +385,172 @@ class AiterAttentionMetadataBuilder:
             **ctx,
         )
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        if self.model_runner.config.enable_tbo_decode and bs >= 2:
+            self._prepare_ubatch_decode(
+                scheduled_bs,
+                bs,
+                max_seqlen_q,
+                context_lens,
+            )
+
         return attn_metadata, positions
+
+    def _prepare_ubatch_decode(
+        self,
+        scheduled_bs: int,
+        bs: int,
+        max_seqlen_q: int,
+        context_lens: np.ndarray,
+    ):
+        """Compute per-ubatch forward_vars for CUDAGraph TBO.
+
+        Splits the full-batch data into per-ubatch CpuGpuBuffers.
+        The split point is bs // 2 to match CUDAGraph's baked-in token slices.
+        """
+        var = self.model_runner.forward_vars
+        N = self._NUM_TBO_UBATCHES
+        half = bs // N
+
+        ub_ranges = [(0, half), (half, bs)]
+        padded_bs_list = [half, bs - half]
+
+        for ub_idx, ((req_start, req_end), padded_bs) in enumerate(
+            zip(ub_ranges, padded_bs_list)
+        ):
+            p = f"ub{ub_idx}_"
+            ub_real_reqs = max(0, min(scheduled_bs, req_end) - req_start)
+
+            var[f"{p}context_lens"].np[:ub_real_reqs] = var["context_lens"].np[
+                req_start : req_start + ub_real_reqs
+            ]
+            var[f"{p}context_lens"].np[ub_real_reqs:padded_bs] = 0
+
+            tok_start = req_start * max_seqlen_q
+            ub_real_tokens = ub_real_reqs * max_seqlen_q
+            padded_tok_count = padded_bs * max_seqlen_q
+            var[f"{p}slot_mapping"].np[:ub_real_tokens] = var["slot_mapping"].np[
+                tok_start : tok_start + ub_real_tokens
+            ]
+            var[f"{p}slot_mapping"].np[ub_real_tokens:padded_tok_count] = -1
+
+            var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
+                req_start : req_start + ub_real_reqs
+            ]
+            var[f"{p}block_tables"].np[ub_real_reqs:padded_bs] = 0
+
+            full_kv_indptr = var["kv_indptr"].np
+            base = full_kv_indptr[req_start]
+            var[f"{p}kv_indptr"].np[0] = 0
+            if ub_real_reqs > 0:
+                var[f"{p}kv_indptr"].np[1 : ub_real_reqs + 1] = (
+                    full_kv_indptr[req_start + 1 : req_start + ub_real_reqs + 1] - base
+                )
+            last_val = var[f"{p}kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
+            var[f"{p}kv_indptr"].np[ub_real_reqs + 1 : padded_bs + 1] = last_val
+
+            last_cu = ub_real_reqs * max_seqlen_q
+            var[f"{p}cu_seqlens_q"].np[: ub_real_reqs + 1] = np.arange(
+                0,
+                (ub_real_reqs + 1) * max_seqlen_q,
+                max_seqlen_q,
+                dtype=np.int32,
+            )
+            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : padded_bs + 1] = last_cu
+
+            vars_used = [
+                (f"{p}context_lens", padded_bs),
+                (f"{p}slot_mapping", padded_tok_count),
+                (f"{p}block_tables", padded_bs),
+                (f"{p}kv_indptr", padded_bs + 1),
+                (f"{p}cu_seqlens_q", padded_bs + 1),
+            ]
+            for el, num in vars_used:
+                var[el].copy_to_gpu(num)
+
+            ub_max_seqlen_k = (
+                int(context_lens[req_start : req_start + ub_real_reqs].max())
+                if ub_real_reqs > 0
+                else 0
+            )
+            kv_indices_generate_triton(
+                var[f"{p}block_tables"].gpu[:padded_bs],
+                var[f"{p}kv_indices"].gpu,
+                var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
+                self.block_ratio,
+                ub_max_seqlen_k,
+            )
+
+            # Set PA persistent worker buffers for this ubatch
+            if self.block_size == 1024:
+                self._set_ubatch_pa_buffers(padded_bs, max_seqlen_q, ub_idx)
+
+    def _set_ubatch_pa_buffers(self, padded_bs, max_q_len, ubatch_idx):
+        """Compute PA work buffers for a per-ubatch forward_vars set."""
+        config = self.model_runner.config
+        hf_config = config.hf_config
+        num_query_heads = self.num_attention_heads
+        num_kv_heads = max(
+            1, hf_config.num_key_value_heads // get_tp_group().world_size
+        )
+        p = f"ub{ubatch_idx}_"
+        var = self.model_runner.forward_vars
+
+        aiter.get_pa_metadata_v1(
+            var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
+            var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
+            var[f"{p}context_lens"].gpu[:padded_bs],
+            num_query_heads // num_kv_heads,
+            num_kv_heads,
+            True,
+            var[f"{p}work_meta_data"],
+            var[f"{p}work_indptr"],
+            var[f"{p}work_info_set"],
+            var[f"{p}reduce_indptr"],
+            var[f"{p}reduce_final_map"],
+            var[f"{p}reduce_partial_map"],
+            kv_granularity=max(self.block_size, 16),
+            block_size=self.block_size,
+            max_seqlen_qo=max_q_len,
+            uni_seqlen_qo=max_q_len,
+            fast_mode=True,
+            max_split_per_batch=-1,
+        )
+
+    def build_ubatch_metadata(
+        self,
+        ubatch_idx: int,
+        padded_bs: int,
+    ) -> AttentionMetaData:
+        """Create per-ubatch AttentionMetaData from pre-allocated forward_vars."""
+        var = self.model_runner.forward_vars
+        p = f"ub{ubatch_idx}_"
+        max_q_len = var["max_qlen"]
+
+        # Compute PA work buffers for this ubatch
+        if self.block_size == 1024:
+            self._set_ubatch_pa_buffers(padded_bs, max_q_len, ubatch_idx)
+
+        attn = AttentionMetaData(
+            slot_mapping=var[f"{p}slot_mapping"].gpu[: padded_bs * max_q_len],
+            context_lens=var[f"{p}context_lens"].gpu[:padded_bs],
+            block_tables=var[f"{p}block_tables"].gpu[:padded_bs],
+            max_seqlen_q=max_q_len,
+            cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
+            kv_indptr=var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
+            kv_indices=var[f"{p}kv_indices"].gpu,
+            block_tables_converted=(
+                var[f"{p}block_tables_converted"].gpu[:padded_bs]
+                if f"{p}block_tables_converted" in var
+                else None
+            ),
+            work_meta_data=var[f"{p}work_meta_data"],
+            work_info_set=var[f"{p}work_info_set"],
+            work_indptr=var[f"{p}work_indptr"],
+            reduce_indptr=var[f"{p}reduce_indptr"],
+            reduce_final_map=var[f"{p}reduce_final_map"],
+            reduce_partial_map=var[f"{p}reduce_partial_map"],
+        )
+        return attn
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars

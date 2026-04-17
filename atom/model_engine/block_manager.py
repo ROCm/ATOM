@@ -132,7 +132,7 @@ class BlockManager:
             # For mamba, we need to ensure the last block is always allocated
             # even if it has less than block_size tokens
             for i in range(seq.num_mamba_blocks):
-                block_id = self.free_block_ids[0]
+                block_id = self._pop_free_block()
                 self._allocate_block(block_id)
                 # No prefix caching support for mamba arch
                 seq.mamba_block_table.append(block_id)

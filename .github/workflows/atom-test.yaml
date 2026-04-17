@@ -235,6 +235,39 @@ jobs:
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
+      - name: Resolve immutable native dashboard image
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+        run: |
+          set -euo pipefail
+          if RESOLUTION_JSON="$(
+            python3 .github/scripts/resolve_atom_image.py \
+              --repository rocm/atom-dev \
+              --reference-tag latest \
+              --image-family native
+          )"; then
+            RESOLVED_ATOM_IMAGE="$(
+              RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          PY
+            )"
+            echo "Resolved native dashboard image: ${RESOLVED_ATOM_IMAGE}"
+          else
+            echo "::error::Failed to resolve ${ATOM_BASE_IMAGE} to an immutable reference for dashboard-uploading native runs."
+            exit 1
+          fi
+          echo "RESOLVED_ATOM_BASE_IMAGE=${RESOLVED_ATOM_IMAGE}" >> "$GITHUB_ENV"
+          echo "ATOM_DASHBOARD_DOCKER_IMAGE=${RESOLVED_ATOM_IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Pull immutable native dashboard image
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+        run: |
+          echo "Pulling immutable native dashboard image: ${RESOLVED_ATOM_BASE_IMAGE}"
+          docker pull "${RESOLVED_ATOM_BASE_IMAGE}"
+
       - name: Generate Dockerfile for forked repo
         if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
@@ -298,13 +331,15 @@ jobs:
           # Write env_vars via env block (avoids expression injection)
           printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
 
-          IMAGE_TAG=${{ env.ATOM_BASE_IMAGE }}
+          IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
           echo "Starting container with image: $IMAGE_TAG"
           echo "Model-specific environment variables:"
           cat /tmp/env_file.txt
 
           PULL_FLAG=""
-          if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+          if [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
+            PULL_FLAG=""
+          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
             PULL_FLAG="--pull always"
           fi
 
@@ -317,6 +352,7 @@ jobs:
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
+          -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
           --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \

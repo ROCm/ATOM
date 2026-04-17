@@ -8,7 +8,19 @@ on:
   workflow_dispatch:
     inputs:
       deepseek-r1-fp8-tp8:
-        description: "DeepSeek-R1 FP8 TP8"
+        description: "DeepSeek-R1-0528 FP8 TP8"
+        type: boolean
+        default: false
+      deepseek-r1-fp8-tp4:
+        description: "DeepSeek-R1-0528 FP8 TP4"
+        type: boolean
+        default: false
+      deepseek-r1-fp4-tp8:
+        description: "DeepSeek-R1-0528-MXFP4 FP4 TP8"
+        type: boolean
+        default: false
+      deepseek-r1-fp4-tp4:
+        description: "DeepSeek-R1-0528-MXFP4 FP4 TP4"
         type: boolean
         default: false
       sglang_image:
@@ -27,7 +39,7 @@ on:
           Example (single set): 1024,1024,64,0.8
           Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
         type: string
-        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
 
 jobs:
   resolve-atom-source:
@@ -157,7 +169,7 @@ jobs:
       - name: Parse parameter lists
         id: parse-param-lists
         run: |
-          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
+          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
           echo "Using param_lists: ${PARAM_LISTS}"
           printf 'param_lists=%s\n' "${PARAM_LISTS}" >> "$GITHUB_OUTPUT"
           IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
@@ -197,41 +209,26 @@ jobs:
       - id: load
         env:
           ENABLE_DEEPSEEK_R1_FP8_TP8: ${{ inputs.deepseek-r1-fp8-tp8 }}
+          ENABLE_DEEPSEEK_R1_FP8_TP4: ${{ inputs.deepseek-r1-fp8-tp4 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP8: ${{ inputs.deepseek-r1-fp4-tp8 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP4: ${{ inputs.deepseek-r1-fp4-tp4 }}
         run: |
-          set -euo pipefail
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          import sys
-
-          event = os.environ["GITHUB_EVENT_NAME"]
-          models = [
-              {
-                  "toggle_env": "ENABLE_DEEPSEEK_R1_FP8_TP8",
-                  "display": "DeepSeek-R1-FP8 TP8",
-                  "source_path": "deepseek-ai/DeepSeek-R1-0528",
-                  "path": "deepseek-ai/DeepSeek-R1-0528",
-                  "prefix": "deepseek-r1-fp8-tp8",
-                  "extra_args": "--trust-remote-code --tensor-parallel-size 8",
-                  "bench_args": "",
-                  "runner": "atom-mi355-8gpu-oot-benchmark",
-                  "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\\nSGLANG_AITER_FP8_PREFILL_ATTN=0\\nSGLANG_USE_AITER=1\\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1"
-              }
-          ]
-
-          selected = []
-          for model in models:
-              enabled = event != "workflow_dispatch" or os.environ.get(model["toggle_env"], "").lower() == "true"
-              if enabled:
-                  selected.append({k: v for k, v in model.items() if k != "toggle_env"})
-
-          if event == "workflow_dispatch" and not selected:
-              print("No models selected for manual run.", file=sys.stderr)
-              sys.exit(1)
-
-          print(f"models_json={json.dumps(selected)}")
-          print(f"has_enabled_models={'true' if selected else 'false'}")
-          PY
+          MODELS_JSON="$(jq -c '
+            map(select(
+              (.prefix == "deepseek-r1-fp8-tp8" and env.ENABLE_DEEPSEEK_R1_FP8_TP8 == "true")
+              or (.prefix == "deepseek-r1-fp8-tp4" and env.ENABLE_DEEPSEEK_R1_FP8_TP4 == "true")
+              or (.prefix == "deepseek-r1-fp4-tp8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8 == "true")
+              or (.prefix == "deepseek-r1-fp4-tp4" and env.ENABLE_DEEPSEEK_R1_FP4_TP4 == "true")
+            ))
+          ' .github/benchmark/sglang_benchmark_models.json)"
+          echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
+          if [ "${MODELS_JSON}" = "[]" ]; then
+            echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
+            echo "No models selected for SGLang benchmark."
+          else
+            echo "has_enabled_models=true" >> "$GITHUB_OUTPUT"
+            echo "Selected models: ${MODELS_JSON}"
+          fi
 
   build-benchmark-matrix:
     name: Build SGLang benchmark matrix
@@ -281,10 +278,10 @@ jobs:
                       model_params.append(variant)
 
               for param in model_params:
-                  pair = f"{param['input_length']}_{param['output_length']}"
+                  pair = f"{param['input_length']}x{param['output_length']}"
                   if supported_pairs and pair not in supported_pairs:
                       continue
-                  if excluded_pairs and pair in excluded_pairs:
+                  if pair in excluded_pairs:
                       continue
                   
                   include.append({"model": model, "params": param})
@@ -454,7 +451,10 @@ jobs:
         run: |
           case "${{ matrix.model.prefix }}" in
             deepseek-r1-fp8-tp8) echo "enabled=${{ inputs.deepseek-r1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            *) echo "enabled=false" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp8-tp4) echo "enabled=${{ inputs.deepseek-r1-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp4) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
       - name: Clean up containers and workspace
@@ -832,11 +832,12 @@ jobs:
           BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python3 .github/scripts/sglang_benchmark_summary.py \
+          python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
             --matrix-json "${BENCHMARK_MATRIX}" \
             --run-url "${RUN_URL}" \
             --output-json sglang_benchmark_summary.json \
+            --title "SGLang Benchmark Summary" \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Read summary stats
@@ -888,7 +889,7 @@ jobs:
               continue
             fi
 
-            if python3 .github/scripts/sglang_benchmark_validate_baseline.py /tmp/baseline_candidate; then
+            if python3 .github/scripts/plugin_benchmark_validate_baseline.py /tmp/baseline_candidate; then
               mv /tmp/baseline_candidate /tmp/baseline
               BASELINE_DIR="/tmp/baseline"
               echo "Using baseline from run #$PREV_RUN_ID"
@@ -918,7 +919,7 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          python3 .github/scripts/sglang_benchmark_regression.py \
+          python3 .github/scripts/plugin_benchmark_regression.py \
             --result-dir . \
             $BASELINE_ARG \
             --output-json regression_report.json \
@@ -945,10 +946,11 @@ jobs:
       - name: Transform results for benchmark dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
-          python3 .github/scripts/sglang_benchmark_to_dashboard.py \
+          python3 .github/scripts/plugin_benchmark_to_dashboard.py \
             . \
             --output benchmark-action-input.json \
-            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --default-backend "ATOM-SGLang"
 
       - name: Store benchmark result to dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
@@ -965,19 +967,26 @@ jobs:
           max-items-in-chart: 90
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Deploy custom dashboard to gh-pages
+      - name: Push dashboard data to gh-pages
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          CURRENT_SHA=$(git rev-parse HEAD)
-          cp .github/dashboard/index.html /tmp/dashboard_index.html
-          cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
           git fetch origin gh-pages
           git checkout gh-pages
-          cp /tmp/dashboard_index.html benchmark-dashboard/index.html
-          cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
-          git add benchmark-dashboard/
-          git diff --cached --quiet || git commit -m "Update SGLang benchmark data and dashboard"
-          git push origin gh-pages
-          git checkout "$CURRENT_SHA"
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/sglang-benchmark-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/sglang-benchmark-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update SGLang benchmark dashboard data"
+          git push origin HEAD:gh-pages
