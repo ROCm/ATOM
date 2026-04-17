@@ -1,8 +1,8 @@
 ---
 name: Question or Request
 about: Ask a question or make a general request
-title: "[QUESTION] "
-labels: question
+title: "[QUESTION/REQUEST] "
+labels: question/request
 assignees: ''
 ---
 
