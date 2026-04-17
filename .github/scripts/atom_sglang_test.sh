@@ -50,6 +50,7 @@ MODEL_NAME=${SGLANG_MODEL_NAME:-}
 MODEL_PATH=${SGLANG_MODEL_PATH:-}
 MODEL_EXTRA_ARGS=${SGLANG_EXTRA_ARGS:-}
 MODEL_ENV_VARS=${SGLANG_ENV_VARS:-}
+SGLANG_DOCKER_IMAGE=${SGLANG_DOCKER_IMAGE:-}
 
 LAST_SGLANG_LOG_LINE=0
 
@@ -254,6 +255,26 @@ PY
   if [[ "${result_file}" != "${flat_result_file}" ]]; then
     cp -f "${result_file}" "${flat_result_file}"
     result_file="${flat_result_file}"
+  fi
+
+  if [[ -n "${SGLANG_DOCKER_IMAGE}" ]]; then
+    RESULT_FILE="${result_file}" \
+    SGLANG_DOCKER_IMAGE="${SGLANG_DOCKER_IMAGE}" \
+    python3 - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+if os.environ.get("SGLANG_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["SGLANG_DOCKER_IMAGE"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
   fi
 
   local value

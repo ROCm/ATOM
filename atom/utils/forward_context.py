@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Union
@@ -325,6 +326,8 @@ class ForwardContext:
 
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None
 
+    ubatch_slices: Optional[list[Any]] = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -335,9 +338,18 @@ class ForwardContext:
 _forward_context: Optional[ForwardContext] = ForwardContext()
 _forward_kv_cache_context: Optional[ForwardContext] = ForwardContext()
 
+# Thread-local storage for TBO dual-thread execution
+
+_forward_context_local = threading.local()
+
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
+    # Check thread-local first (used by TBO threads)
+    ctx = getattr(_forward_context_local, "ctx", None)
+    if ctx is not None:
+        return ctx
+
     assert _forward_context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
@@ -352,6 +364,7 @@ def set_forward_context(
     num_tokens: Optional[int] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
+    ubatch_slices: Optional[list[Any]] = None,
 ) -> None:
     global _forward_context
     dp_metadata: Optional[DPMetadata] = None
@@ -370,6 +383,7 @@ def set_forward_context(
         context=context,
         dp_metadata=dp_metadata,
         spec_decode_metadata=spec_decode_metadata,
+        ubatch_slices=ubatch_slices,
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)

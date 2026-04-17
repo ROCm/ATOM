@@ -4,6 +4,7 @@ set -euo pipefail
 TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
+ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
 
 
 if [ "$TYPE" == "launch" ]; then
@@ -32,8 +33,11 @@ if [ "$TYPE" == "launch" ]; then
   fi
 
   ATOM_SERVER_LOG="/tmp/atom_server.log"
-  $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" 2>&1 | tee "$ATOM_SERVER_LOG" &
+  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
+  tail -f "$ATOM_SERVER_LOG" &
+  _tail_launch_pid=$!
+  trap 'kill $_tail_launch_pid 2>/dev/null || true' EXIT
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
@@ -91,6 +95,11 @@ if [ "$TYPE" == "launch" ]; then
       kill $atom_server_pid
       exit 1
   fi
+
+  # Stop streaming server log now that launch is complete;
+  # test phases (accuracy/benchmark) keep their output clean.
+  # Full server log is available via the workflow "Dump server log" step.
+  kill $_tail_launch_pid 2>/dev/null || true
 fi
 
 if [ "$TYPE" == "accuracy" ]; then
@@ -104,16 +113,71 @@ if [ "$TYPE" == "accuracy" ]; then
 
   echo ""
   echo "========== Running accuracy test =========="
+  ATOM_CLIENT_LOG="${ATOM_CLIENT_LOG:-/tmp/atom_client.log}"
   # Set umask so files created by lm_eval are world-readable (container runs as root,
   # host runner user needs to read results via the shared volume mount)
   umask 0022
   mkdir -p accuracy_test_results
-  RESULT_FILENAME=accuracy_test_results/$(date +%Y%m%d%H%M%S).json
+  RUN_TAG=$(date +%Y%m%d%H%M%S)
+  OUTPUT_PATH=accuracy_test_results/${RUN_TAG}
+  FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
   lm_eval --model local-completions \
           --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
           --tasks gsm8k \
           --num_fewshot 3 \
-          --output_path "${RESULT_FILENAME}"
+          --output_path "${OUTPUT_PATH}" \
+          2>&1 | tee "$ATOM_CLIENT_LOG"
+
+  RESULT_FILENAME=$(
+    python3 - <<PY
+from pathlib import Path
+
+candidate_roots = [Path("${OUTPUT_PATH}"), Path("accuracy_test_results")]
+json_candidates = []
+for root in candidate_roots:
+    if root.is_file() and root.suffix == ".json":
+        json_candidates.append(root)
+    elif root.is_dir():
+        for path in root.rglob("*.json"):
+            if path.is_file():
+                json_candidates.append(path)
+
+if not json_candidates:
+    print("")
+else:
+    latest = max(json_candidates, key=lambda path: path.stat().st_mtime_ns)
+    print(str(latest))
+PY
+  )
+  if [[ -z "${RESULT_FILENAME}" || ! -f "${RESULT_FILENAME}" ]]; then
+    echo "ERROR: No results JSON file found under ${OUTPUT_PATH} or accuracy_test_results"
+    exit 2
+  fi
+
+  if [[ "${RESULT_FILENAME}" != "${FLAT_RESULT_FILE}" ]]; then
+    cp -f "${RESULT_FILENAME}" "${FLAT_RESULT_FILE}"
+    RESULT_FILENAME="${FLAT_RESULT_FILE}"
+  fi
+
+  if [ -n "${ATOM_DOCKER_IMAGE}" ]; then
+    RESULT_FILE="${RESULT_FILENAME}" \
+    ATOM_DOCKER_IMAGE="${ATOM_DOCKER_IMAGE}" \
+    python3 - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+metadata["docker_image"] = os.environ["ATOM_DOCKER_IMAGE"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
 fi
 
@@ -175,6 +239,7 @@ fi
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
   echo "========== Running benchmark test =========="
+  ATOM_CLIENT_LOG="${ATOM_CLIENT_LOG:-/tmp/atom_client.log}"
   RESULT_FILENAME=${RESULT_FILENAME:-benchmark_result}
   PROFILE_ARG=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
@@ -192,7 +257,8 @@ if [ "$TYPE" == "benchmark" ]; then
     --request-rate=inf --ignore-eos \
     --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
     --result-dir=. --result-filename=${RESULT_FILENAME}.json \
-    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-}
+    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-} \
+    2>&1 | tee "$ATOM_CLIENT_LOG"
 
   # Inject ISL/OSL into result JSON for summary table
   if [ -f "${RESULT_FILENAME}.json" ]; then

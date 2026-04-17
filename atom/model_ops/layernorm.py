@@ -4,11 +4,13 @@
 from typing import Tuple, Optional
 import torch
 from torch import Tensor
+
 from torch.overrides import (
     has_torch_function_unary,
     handle_torch_function,
 )
 from atom.config import QuantizationConfig
+from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.decorators import mark_trace
 from torch import nn
@@ -186,7 +188,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = atom_parameter(torch.ones(dim))
         self.x_pad_to_multiple = x_pad_to_multiple
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
@@ -331,7 +333,7 @@ class RMSNormGated(nn.Module):
         """
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.empty(hidden_size))
+        self.weight = atom_parameter(torch.empty(hidden_size))
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
@@ -503,7 +505,7 @@ class GemmaRMSNorm(nn.Module):
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.weight = atom_parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
     @staticmethod
@@ -596,8 +598,8 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.bias = nn.Parameter(torch.zeros(dim))
+        self.weight = atom_parameter(torch.ones(dim))
+        self.bias = atom_parameter(torch.zeros(dim))
 
     def forward(
         self,

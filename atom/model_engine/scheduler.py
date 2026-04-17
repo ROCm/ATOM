@@ -391,9 +391,10 @@ class Scheduler:
 
         # decode
         num_seqs_decode = 0
+        num_new_tokens = self.mtp_k + 1
         while self.running and num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq, self.mtp_k + 1):
+            while not self.block_manager.can_append(seq, num_new_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -403,7 +404,6 @@ class Scheduler:
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
-                num_new_tokens = self.mtp_k + 1
                 self.block_manager.may_append(seq, num_new_tokens)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
@@ -584,19 +584,27 @@ class Scheduler:
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests()
 
-    def get_next_batch_info(self) -> tuple[bool, int]:
+    def get_next_batch_info(self) -> tuple[bool, int, int]:
         if self.waiting:
             # new request is waiting, will do prefill
-            seq = self.waiting[0]
-            num_tokens = seq.num_tokens - seq.num_cached_tokens
-            return (True, num_tokens)
+            num_reqs = 0
+            total_tokens = 0
+            for seq in self.waiting:
+                tokens = seq.num_tokens - seq.num_cached_tokens
+                if total_tokens + tokens > self.max_num_batched_tokens:
+                    break
+                if num_reqs >= self.max_num_seqs:
+                    break
+                total_tokens += tokens
+                num_reqs += 1
+            return (True, total_tokens, num_reqs)
         elif self.running:
             # decode
             num_tokens = len(self.running)
-            return (False, num_tokens)
+            return (False, num_tokens, num_tokens)
         else:
             # No requests
-            return (False, 0)
+            return (False, 0, 0)
 
     def _passed_delay(self, now: float) -> bool:
         # borrowed from https://github.com/vllm-project/vllm/pull/3279

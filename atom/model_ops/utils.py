@@ -13,7 +13,23 @@ from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from torch import nn
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
+
+
+def atom_parameter(data: torch.Tensor) -> nn.Parameter:
+    """Create an ``nn.Parameter`` with gradient tracking controlled by
+    the ``ATOM_REQUIRES_GRAD`` environment variable (default: disabled).
+
+    Use this instead of ``nn.Parameter(...)`` everywhere in ATOM so that
+    inference vs. training gradient behaviour is controlled from a single
+    place.
+    """
+    requires_grad = envs.ATOM_REQUIRES_GRAD and (
+        data.is_floating_point() or data.is_complex()
+    )
+    return nn.Parameter(data, requires_grad=requires_grad)
 
 
 @cache

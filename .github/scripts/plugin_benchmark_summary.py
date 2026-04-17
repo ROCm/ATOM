@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a resilient OOT benchmark summary table.
+"""Generate a resilient benchmark summary table.
 
 This script is intentionally tolerant of partial or total benchmark failure:
 - missing result JSON => case is marked FAIL
@@ -143,12 +143,12 @@ def _build_rows(result_dir: Path, matrix_payload: dict) -> list[dict]:
     return rows
 
 
-def _print_markdown_table(rows: list[dict], run_url: str | None) -> None:
+def _print_markdown_table(rows: list[dict], run_url: str | None, title: str) -> None:
     total_cases = len(rows)
     passed_cases = sum(1 for row in rows if row["status"] == "PASS")
     failed_cases = total_cases - passed_cases
 
-    print("## OOT Benchmark Summary\n")
+    print(f"## {title}\n")
     if run_url:
         print(f"Run: {run_url}\n")
     print(
@@ -185,11 +185,11 @@ def _print_markdown_table(rows: list[dict], run_url: str | None) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Summarize OOT benchmark results")
+    parser = argparse.ArgumentParser(description="Summarize benchmark results")
     parser.add_argument(
         "--result-dir",
         required=True,
-        help="Directory containing downloaded OOT benchmark JSON files",
+        help="Directory containing downloaded benchmark JSON files",
     )
     parser.add_argument(
         "--matrix-json",
@@ -206,12 +206,17 @@ def main() -> int:
         default=None,
         help="Optional path to write a structured summary report",
     )
+    parser.add_argument(
+        "--title",
+        default="Benchmark Summary",
+        help="Title for the markdown report",
+    )
     args = parser.parse_args()
 
     matrix_payload = json.loads(args.matrix_json)
     rows = _build_rows(Path(args.result_dir), matrix_payload)
 
-    _print_markdown_table(rows, args.run_url)
+    _print_markdown_table(rows, args.run_url, args.title)
 
     if args.output_json:
         report = {
