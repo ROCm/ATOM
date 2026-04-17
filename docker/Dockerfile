@@ -1,5 +1,5 @@
 # Default base images
-ARG BASE_IMAGE="rocm/pytorch:latest"
+ARG BASE_IMAGE="rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0"
 ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
@@ -18,7 +18,7 @@ LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV MAX_JOBS=${MAX_JOBS}
-ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}"
 ENV VLLM_TARGET_DEVICE=rocm
 ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 
@@ -42,11 +42,10 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     echo "========== [OOT 2/7] Back up base image triton ==========" && \
     BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
     mkdir -p /tmp/triton-base-backup && \
-    cp -a /opt/venv/lib/python3.12/site-packages/triton /tmp/triton-base-backup/ && \
+    cp -a /opt/venv/lib/python3.10/site-packages/triton /tmp/triton-base-backup/ && \
     MATCHED_DIST_INFO="" && \
     MATCH_COUNT=0 && \
-    BACKUP_COUNT=0 && \
-    for f in /opt/venv/lib/python3.12/site-packages/triton-*.dist-info; do \
+    for f in /opt/venv/lib/python3.10/site-packages/triton-*.dist-info; do \
       [ -d "$f" ] || continue; \
       DIST_VERSION="$(awk -F': ' '$1 == "Version" { print $2; exit }' "$f/METADATA")"; \
       if [ "${DIST_VERSION}" = "${BASE_TRITON_VERSION}" ]; then \
@@ -55,22 +54,12 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
         MATCH_COUNT=$((MATCH_COUNT + 1)); \
       fi; \
     done && \
-    if [ "${MATCH_COUNT}" -eq 1 ]; then \
-      BACKUP_COUNT="${MATCH_COUNT}"; \
-    else \
-      echo "WARNING: Expected exactly one triton dist-info matching imported version ${BASE_TRITON_VERSION}, found ${MATCH_COUNT}. Falling back to backing up all available triton dist-info entries to preserve the base image state." && \
-      rm -rf /tmp/triton-base-backup/triton-*.dist-info && \
-      MATCHED_DIST_INFO="" && \
-      BACKUP_COUNT=0 && \
-      for f in /opt/venv/lib/python3.12/site-packages/triton-*.dist-info; do \
-        [ -d "$f" ] || continue; \
-        cp -a "$f" /tmp/triton-base-backup/; \
-        echo "Backed up fallback triton dist-info: $(basename "$f")"; \
-        BACKUP_COUNT=$((BACKUP_COUNT + 1)); \
-      done; \
-      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true; \
+    if [ "${MATCH_COUNT}" -ne 1 ]; then \
+      echo "ERROR: Expected exactly one triton dist-info matching imported version ${BASE_TRITON_VERSION}, found ${MATCH_COUNT}." && \
+      ls -d /opt/venv/lib/python3.10/site-packages/triton-*.dist-info || true && \
+      exit 1; \
     fi && \
-    echo "Base image triton backup summary: version=${BASE_TRITON_VERSION}, matched_dist_info=${MATCHED_DIST_INFO:-<none>}, backed_up_count=${BACKUP_COUNT}"
+    echo "Base image triton backed up: version=${BASE_TRITON_VERSION}, dist-info=${MATCHED_DIST_INFO}"
 
 RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
     rm -rf /app/vllm && \
@@ -123,35 +112,34 @@ RUN echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
 # behavior and fail fast if `pip show triton` would disagree with `import triton`.
 RUN echo "========== [OOT] Restore base image triton ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
-    rm -rf /opt/venv/lib/python3.12/site-packages/triton \
-           /opt/venv/lib/python3.12/site-packages/triton-*.dist-info && \
-    cp -a /tmp/triton-base-backup/triton /opt/venv/lib/python3.12/site-packages/ && \
+    rm -rf /opt/venv/lib/python3.10/site-packages/triton \
+           /opt/venv/lib/python3.10/site-packages/triton-*.dist-info && \
+    cp -a /tmp/triton-base-backup/triton /opt/venv/lib/python3.10/site-packages/ && \
     RESTORED_DIST_INFO="" && \
     RESTORED_COUNT=0 && \
     for f in /tmp/triton-base-backup/triton-*.dist-info; do \
       [ -d "$f" ] || continue; \
-      cp -a "$f" /opt/venv/lib/python3.12/site-packages/; \
+      cp -a "$f" /opt/venv/lib/python3.10/site-packages/; \
       RESTORED_DIST_INFO="$(basename "$f")"; \
       RESTORED_COUNT=$((RESTORED_COUNT + 1)); \
     done && \
     rm -rf /tmp/triton-base-backup && \
-    if [ "${RESTORED_COUNT}" -eq 1 ]; then \
-      echo "Restored base image triton dist-info: ${RESTORED_DIST_INFO}"; \
-    else \
-      echo "WARNING: Restored ${RESTORED_COUNT} triton dist-info directories from the base image backup. Keeping build non-fatal to preserve the base image state." && \
-      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true; \
+    if [ "${RESTORED_COUNT}" -ne 1 ]; then \
+      echo "ERROR: Expected exactly one restored triton dist-info, found ${RESTORED_COUNT}." && \
+      ls -d /opt/venv/lib/python3.10/site-packages/triton-*.dist-info || true && \
+      exit 1; \
     fi && \
-    "${VENV_PYTHON}" -m pip show triton > /tmp/triton_pip_show.txt 2>&1 || true && \
+    "${VENV_PYTHON}" -m pip show triton > /tmp/triton_pip_show.txt && \
     PIP_TRITON_VERSION="$(awk -F': ' '/^Version: / { print $2; exit }' /tmp/triton_pip_show.txt)" && \
     IMPORT_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
     if [ -z "${PIP_TRITON_VERSION}" ] || [ "${PIP_TRITON_VERSION}" != "${IMPORT_TRITON_VERSION}" ]; then \
-      echo "WARNING: pip show triton reports '${PIP_TRITON_VERSION:-<missing>}', but import triton reports '${IMPORT_TRITON_VERSION}'. Keeping build non-fatal so OOT image release is not blocked by pre-existing base image metadata drift." && \
+      echo "ERROR: pip show triton reports '${PIP_TRITON_VERSION}', but import triton reports '${IMPORT_TRITON_VERSION}'." && \
       cat /tmp/triton_pip_show.txt || true && \
-      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true; \
-    else \
-      echo "Restored base image triton: version=${IMPORT_TRITON_VERSION}, dist-info=${RESTORED_DIST_INFO}" && \
-      cat /tmp/triton_pip_show.txt; \
+      ls -d /opt/venv/lib/python3.10/site-packages/triton-*.dist-info || true && \
+      exit 1; \
     fi && \
+    echo "Restored base image triton: version=${IMPORT_TRITON_VERSION}, dist-info=${RESTORED_DIST_INFO}" && \
+    cat /tmp/triton_pip_show.txt && \
     rm -f /tmp/triton_pip_show.txt && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')"
 
@@ -322,12 +310,7 @@ RUN echo "========== [Parallel] Building Triton ==========" && \
     cd /triton-test && \
     pip install -r python/requirements.txt && \
     pip install filecheck && \
-    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install . && \
-    # Companion `triton_kernels` package (pure-Python). Required by ATOM when
-    # `ATOM_USE_TRITON_MOE=1` (e.g. DeepSeek-V4 launch path). Lives under
-    # python/triton_kernels in the same ROCm/triton checkout.
-    pip install ./python/triton_kernels && \
-    python -c "import triton_kernels; print(f'triton_kernels: {triton_kernels.__file__}')"
+    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
 
 # --------------------------------------------------------------------
 # Stage 4: Aiter — parallel
@@ -340,7 +323,7 @@ ARG MAX_JOBS
 
 RUN pip install --upgrade setuptools_scm
 RUN echo "========== [Parallel] Building Aiter ==========" && \
-    git clone $AITER_REPO /app/aiter-test && \
+    git clone --depth 1 $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \
@@ -370,15 +353,10 @@ RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
 
 # Triton: copy package from build stage into current venv
 # Use RUN --mount to avoid COPY glob issues, and preserve mori already in venv
-# Also copy the companion `triton_kernels` package (pure-Python, built in the
-# same stage) — required by ATOM_USE_TRITON_MOE=1 model paths.
-RUN --mount=from=build_triton,source=/opt/venv/lib/python3.12/site-packages,target=/triton-pkgs \
-    cp -a /triton-pkgs/triton /opt/venv/lib/python3.12/site-packages/ && \
-    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.12/site-packages/ && \
-    cp -a /triton-pkgs/triton_kernels /opt/venv/lib/python3.12/site-packages/ && \
-    cp -a /triton-pkgs/triton_kernels-*.dist-info /opt/venv/lib/python3.12/site-packages/ && \
-    pip show triton triton_kernels && \
-    python -c "import triton, triton_kernels; print(f'triton {triton.__version__}; triton_kernels {triton_kernels.__file__}')"
+RUN --mount=from=build_triton,source=/opt/venv/lib/python3.10/site-packages,target=/triton-pkgs \
+    cp -a /triton-pkgs/triton /opt/venv/lib/python3.10/site-packages/ && \
+    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.10/site-packages/ && \
+    pip show triton
 
 # Aiter: copy compiled source tree + re-register editable install
 # (pip install -e creates egg-link automatically, no need to COPY them)
