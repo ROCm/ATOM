@@ -207,21 +207,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        # print(f"layer {prefix}, gate weight: {self.gate.weight.data}", flush=True)
-
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if (
             config.shared_expert_intermediate_size > 0
             and not is_rocm_aiter_fusion_shared_expert_enabled()
         ):
+            # When shared expert fusion is disabled (e.g. MXFP4 where shared
+            # experts are BF16 while routed experts are FP4), run the shared
+            # expert MLP separately.  The sigmoid gating is applied in
+            # forward() using the shared-expert portion of the merged gate
+            # output — no separate nn.Linear needed here.
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
-                expert_gate=self.shared_expert_gate,
+                expert_gate=None,
                 prefix=f"{prefix}.shared_expert",
             )
         else:
@@ -250,13 +252,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
+        # router_logits: (num_tokens, n_experts + 1)
+        logits = self.gate(hidden_states)
+        if not is_rocm_aiter_fusion_shared_expert_enabled():
+            router_logits = logits[:, : self.n_routed_experts]
+        else:
+            router_logits = logits
         routed_output = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
         if not is_rocm_aiter_fusion_shared_expert_enabled():
             shared_output = self.shared_expert(hidden_states)
+            # Apply shared expert gate: the merged gate output contains
+            # [routed_logits, shared_expert_gate_logits], extract the tail
+            shared_gate_logits = logits[:, self.n_routed_experts :]
+            shared_output = F.sigmoid(shared_gate_logits) * shared_output
             final_hidden_states = shared_output + routed_output
         else:
             final_hidden_states = routed_output

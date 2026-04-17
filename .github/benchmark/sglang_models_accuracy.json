@@ -1,0 +1,14 @@
+[
+  {
+    "model_name": "DeepSeek-R1-FP8 TP4",
+    "model_path": "deepseek-ai/DeepSeek-R1-0528",
+    "extraArgs": "--tensor-parallel-size 4",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  }
+]

@@ -178,8 +178,12 @@ def naive_multicast(
     return buffer
 
 
-def all_gather_with_padding(x: torch.Tensor):
-    max_batch_size = get_forward_context().context.graph_bs
+def pad_for_all_gather(x: torch.Tensor):
+    ctx = get_forward_context()
+    max_batch_size = ctx.context.graph_bs
+    if not ctx.context.is_prefill and ctx.attn_metadata is not None:
+        # For MTP > 1
+        max_batch_size *= ctx.attn_metadata.max_seqlen_q
     dim = 0
     original_batch_size = x.shape[dim]
     padded_x = x
@@ -190,10 +194,15 @@ def all_gather_with_padding(x: torch.Tensor):
         padding_shape[dim] = padding_size
 
         padding = torch.empty(padding_shape, dtype=x.dtype, device=x.device)
-        padding.zero_()
+        # padding.zero_()
         padded_x = torch.cat([x, padding], dim=dim)
 
-    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=dim)
+    return padded_x, original_batch_size
+
+
+def all_gather_with_padding(x: torch.Tensor):
+    padded_x, original_batch_size = pad_for_all_gather(x)
+    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=0)
     return gathered_hidden_states, original_batch_size
 
 
@@ -333,18 +342,57 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
             )
+            from atom.utils.tbo.ubatching import tbo_enabled
+            from atom.config import get_current_atom_config
+
             handle = all2all_manager.get_handle(all_to_all_args)
+            is_async = tbo_enabled()
+            atom_config = get_current_atom_config()
+            low_latency = getattr(atom_config, "enable_low_latency", False)
 
             # We not use quant for mori now
             use_fp8_dispatch = False
             quant_type = None
 
+            common_args = dict(
+                rank=all2all_manager.rank,
+                world_size=all2all_manager.world_size,
+                hidden_dim=moe.hidden_dim,
+                scale_dim=scale_dim,
+                max_num_inp_token_per_rank=16384,
+                num_local_experts=moe.num_experts // all2all_manager.world_size,
+                num_experts_per_token=moe.experts_per_token,
+                gpu_per_node=moe.moe_parallel_config.local_ep_size,
+                data_type_itemsize=moe.in_dtype.itemsize,
+                max_token_type_size=moe.in_dtype.itemsize,
+            )
+
+            tbo_mori_ops = None
+            sync_handle = handle  # IntraNode handle for prefill (sync path)
+            if is_async:
+                from atom.model_ops.fused_moe.mori_prepare_finalize import (
+                    init_mori_op,
+                    _NUM_TBO_UBATCHES,
+                )
+
+                tbo_mori_ops = [
+                    init_mori_op(
+                        **common_args,
+                        low_latency=low_latency,
+                        instance_id=i,
+                    )
+                    for i in range(_NUM_TBO_UBATCHES)
+                ]
+
             prepare_finalize = MoriPrepareAndFinalize(
-                handle,
+                sync_handle,
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
                 quant_type=quant_type,
+                is_async=is_async,
+                tbo_mori_ops=tbo_mori_ops,
+                low_latency=low_latency,
             )
 
         return prepare_finalize
@@ -2573,13 +2621,27 @@ class FusedMoE(torch.nn.Module):
         # 3. DP attention + TP All_gahter/reduce Moe
         original_hidden_size = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
-        if (
+        use_dp_gather_scatter = (
             self.dp_size > 1
             and not self.moe_parallel_config.use_all2all_kernels
             and get_current_atom_config().enable_dp_attention
-        ):
+        )
+        if use_dp_gather_scatter:
+            from atom.utils.tbo.ubatching import tbo_active
+
+            _tbo = tbo_active()
+            if _tbo:
+                from atom.utils.tbo.ubatching import (
+                    tbo_switch_to_compute_sync,
+                    tbo_yield_and_switch_from_compute_to_comm,
+                    tbo_yield_and_switch_from_comm_to_compute,
+                )
+
+                tbo_yield_and_switch_from_compute_to_comm()
             hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
             router_logits, _ = all_gather_with_padding(router_logits)
+            if _tbo:
+                tbo_switch_to_compute_sync()
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -2602,14 +2664,14 @@ class FusedMoE(torch.nn.Module):
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
-        if (
-            self.dp_size > 1
-            and not self.moe_parallel_config.use_all2all_kernels
-            and get_current_atom_config().enable_dp_attention
-        ):
+        if use_dp_gather_scatter:
+            if _tbo:
+                tbo_yield_and_switch_from_compute_to_comm()
             final_hidden_states = reduce_scatter_with_unpadding(
                 final_hidden_states, original_hidden_size
             )
+            if _tbo:
+                tbo_yield_and_switch_from_comm_to_compute()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

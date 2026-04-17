@@ -868,7 +868,8 @@ class DeepseekV2MoE(nn.Module):
 
         if config.n_shared_experts is not None:
             if not is_rocm_aiter_fusion_shared_expert_enabled():
-                if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0:
+                tbo_active = get_current_atom_config().enable_tbo
+                if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
                     compilation_config = get_current_atom_config().compilation_config
                     compilation_config.static_forward_context[prefix] = self
