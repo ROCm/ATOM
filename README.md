@@ -13,7 +13,7 @@
 
 ## 📢 News
 
-- **[2026/03]** ATOM now supports **Prefill/Decode (P/D) disaggregation** — run prefill and decode on separate GPU nodes with RDMA-based KV cache transfer via [MORI-IO](https://github.com/ROCm/mori). See [disaggregation docs](atom/mesh/disaggregation/README.md).
+- **[2026/03]** ATOM now supports **Prefill/Decode (P/D) disaggregation** — run prefill and decode on separate GPU nodes with RDMA-based KV cache transfer via [MORI-IO](https://github.com/ROCm/mori). See [disaggregation docs](atom/kv_transfer/disaggregation/README.md).
 
 ## 🚀 Features
 
@@ -21,6 +21,7 @@
 - **OpenAI-Compatible API**: Drop-in server with `/v1/chat/completions` and `/v1/completions` endpoints
 - **Piecewise torch.compile**: 4 compilation levels with CUDA graph capture for low-latency decode
 - **Multi-GPU Parallelism**: Tensor parallelism (TP), data parallelism (DP), and expert parallelism (EP) with MORI all-to-all
+- **Two-Batch Overlap (TBO)**: Following [DeepSeek's system design](https://arxiv.org/abs/2501.12948), TBO splits each batch into two micro-batches and pipelines them across compute and communication streams. Effectively hiding expert-parallel communication latency and reducing peak memory usage. See [recipe](recipes/TBO.md)
 - **Quantization**: FP8, MXFP4, INT8, INT4 with auto-detection from HuggingFace configs
 - **Speculative Decoding**: Multi-Token Prediction (MTP) with EAGLE proposer
 - **Prefix Caching**: xxhash64-based KV cache block sharing across sequences
@@ -102,6 +103,13 @@ git clone https://github.com/ROCm/ATOM.git && pip install ./ATOM
 
 ### Basic Example
 
+Before running the example, please install ninja and the Hugging Face CLI, and log in to your account.
+```bash
+pip install ninja
+pip install -U "huggingface_hub"
+hf auth login
+```
+
 The default optimization level is 3 (piecewise torch.compile with CUDA graphs).
 
 ```bash
@@ -139,7 +147,7 @@ The dashboard tracks nightly performance across models and configurations:
 - **Regression detection** — Automatic alerts when throughput drops >5% or latency increases >10%
 - **Profiler trace collection** — On regression, automatically re-runs with PyTorch profiler and uploads traces
 
-Models tracked: DeepSeek-R1-0528 (BF16 & MTP3), GLM-5-FP8, gpt-oss-120b
+Models tracked: DeepSeek-R1-0528 (FP8 & MTP3), GLM-5-FP8, gpt-oss-120b
 
 ### Online Serving Throughput
 
@@ -237,12 +245,13 @@ lm_eval --model local-completions \
 
 **Deployment Recipes:**
 
-- [DeepSeek-R1](recipes/DeepSeek-R1.md) — BF16/MXFP4 with MTP speculative decoding on 8 GPUs
+- [DeepSeek-R1](recipes/DeepSeek-R1.md) — FP8/MXFP4 with MTP speculative decoding on 8 GPUs
 - [Qwen3-235B-A22B](recipes/Qwen3-235b.md) — TP8 + EP with FP8 KV cache
 - [Qwen3-Next](recipes/Qwen3-Next.md) — Hybrid GDN + MoE architecture
 - [Kimi-K2-Thinking](recipes/Kimi-K2-Thinking.md) — MXFP4 MoE on 4 GPUs
 - [GLM-5](recipes/GLM-5.md) — FP8 MoE with MLA on 8 GPUs
 - [GPT-OSS-120B](recipes/GPT-OSS.md) — Single GPU or DP+EP on 2 GPUs
+- [TBO (Two-Batch Overlap)](recipes/TBO.md) — Compute-communication overlap for MoE models with DP attention
 
 **Framework Integration:**
 

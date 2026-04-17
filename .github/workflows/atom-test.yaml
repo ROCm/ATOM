@@ -23,11 +23,12 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep scheduled main runs from blocking push-triggered validation.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  ATOM_BASE_IMAGE: rocm/atom-dev:latest
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
@@ -53,166 +54,150 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  build_atom_image:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+  download_aiter_wheel:
+    if: ${{ needs.check-signal.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     needs: [check-signal]
-    name: Build ATOM image
-    runs-on: build-only-atom
+    name: Download aiter wheel
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout ATOM repo
-        if: ${{ !github.event.pull_request.head.repo.fork }}
-        uses: actions/checkout@v6
-
-      - name: Generate Dockerfile
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+      - name: Prefer latest main aiter wheel manifest and fallback to artifact
         run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
-          RUN pip install -U lm-eval[api]
-          RUN pip show lm-eval || true
-          RUN pip install hf_transfer
-          RUN pip show hf_transfer || true
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
-          RUN pip uninstall -y amd-aiter
-          RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip show pybind11
-          RUN wget https://github.com/stedolan/jq/releases/download/jq-1.7/jq-linux64 -O jq
-          RUN chmod +x jq
-          RUN mv jq /usr/local/bin/jq
-          RUN rm -rf /app/aiter-test
-          RUN git clone --depth 1 -b ${{ env.AITER_GIT_REF }} https://github.com/ROCm/aiter.git /app/aiter-test && \\
-              cd /app/aiter-test && \\
-              git submodule sync && git submodule update --init --recursive && \\
-              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
-          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
-          
-          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
-          RUN pip uninstall -y atom
-          RUN rm -rf /app/ATOM
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
-              cd /app/ATOM && \\
-              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
-              pip install -e .
+          set -euo pipefail
+          echo "=== Trying latest main aiter wheel manifest from S3 first ==="
 
-          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          EOF
+          S3_MAIN_MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/main/latest.json"
+          API_URL="https://api.github.com"
+          AUTH_HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
+          AITER_TEST_WORKFLOW_ID=179476100
 
-      - name: Build Docker image 
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+          download_from_s3_manifest() {
+            local manifest_file manifest_branch manifest_timestamp manifest_commit wheel_name wheel_url
+
+            mkdir -p aiter-whl
+            rm -f aiter-whl/amd_aiter*.whl
+
+            manifest_file=$(mktemp)
+            trap 'rm -f "$manifest_file"' RETURN
+            curl -fsSL "$S3_MAIN_MANIFEST_URL" -o "$manifest_file" || return 1
+
+            manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
+            manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
+            manifest_commit=$(jq -r '.commit // empty' "$manifest_file")
+            wheel_name=$(jq -r '.wheel_name // empty' "$manifest_file")
+            wheel_url=$(jq -r '.wheel_url // empty' "$manifest_file")
+
+            if [ "$manifest_branch" != "main" ] || [ -z "$manifest_timestamp" ] || [ -z "$manifest_commit" ] || [ -z "$wheel_name" ] || [ -z "$wheel_url" ]; then
+              echo "Invalid latest main wheel manifest"
+              return 1
+            fi
+
+            echo "Selected latest main wheel manifest: $S3_MAIN_MANIFEST_URL"
+            echo "Manifest timestamp: $manifest_timestamp"
+            echo "Manifest commit: $manifest_commit"
+            echo "Manifest wheel: $wheel_name"
+            echo "Downloading manifest-selected wheel: $wheel_url"
+            curl -fsSL "$wheel_url" -o "aiter-whl/$wheel_name" || return 1
+            echo "Downloaded wheel from manifest: aiter-whl/$wheel_name"
+
+            rm -f "$manifest_file"
+            trap - RETURN
+          }
+
+          download_from_artifact() {
+            echo "=== Falling back to latest aiter-whl-main artifact from ROCm/aiter ==="
+
+            RUNS=$(curl -fsSL -H "$AUTH_HEADER" \
+              "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
+
+            ARTIFACT_ID=""
+            ARTIFACT_NAME=""
+            for RUN_ID in $(echo "$RUNS" | jq -r '.workflow_runs[].id'); do
+              ARTIFACT_JSON=$(curl -fsSL -H "$AUTH_HEADER" \
+                "$API_URL/repos/ROCm/aiter/actions/runs/$RUN_ID/artifacts" \
+                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-main")) | select(.expired == false)] | first')
+
+              if [ "$ARTIFACT_JSON" != "null" ] && [ -n "$ARTIFACT_JSON" ]; then
+                ARTIFACT_ID=$(echo "$ARTIFACT_JSON" | jq -r '.id')
+                ARTIFACT_NAME=$(echo "$ARTIFACT_JSON" | jq -r '.name')
+                echo "Found artifact in run $RUN_ID: $ARTIFACT_NAME (ID: $ARTIFACT_ID)"
+                break
+              fi
+            done
+
+            if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
+              echo "ERROR: No aiter-whl-main artifact found in recent Aiter Test runs"
+              return 1
+            fi
+
+            mkdir -p aiter-whl
+            rm -f aiter-whl/amd_aiter*.whl
+            curl -fsSL -H "$AUTH_HEADER" \
+              "$API_URL/repos/ROCm/aiter/actions/artifacts/$ARTIFACT_ID/zip" \
+              -o aiter-whl.zip
+            unzip -o aiter-whl.zip -d aiter-whl
+            rm -f aiter-whl.zip
+          }
+
+          if download_from_s3_manifest; then
+            echo "Using wheel from S3 main manifest"
+          else
+            echo "Main wheel manifest download failed, falling back to GitHub artifact"
+            download_from_artifact
+          fi
+
+          AITER_WHL=$(ls -t aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
+          if [ -z "$AITER_WHL" ]; then
+            echo "ERROR: No amd_aiter wheel available after S3/artifact attempts"
+            ls -la aiter-whl/ || true
+            exit 1
+          fi
+
+          echo "Selected wheel: $AITER_WHL"
+
+      - name: Upload aiter wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-whl
+          path: aiter-whl/amd_aiter*.whl
+          retention-days: 1
+
+  load-test-models:
+    name: Load test model configs
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.load.outputs.models_json }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: load
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          docker build --pull --network=host \
-            --no-cache \
-            -t atom_test:ci \
-            -f Dockerfile.mod .
+          python3 << 'PY'
+          import json, os
+          event = os.environ["EVENT_NAME"]
+          # pr → pr models only; push to main → pr+main; schedule/dispatch → all
+          level_map = {"schedule": "nightly", "workflow_dispatch": "nightly", "push": "main"}
+          current = level_map.get(event, "pr")
+          allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
+          models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
+          filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"models_json={json.dumps(filtered)}\n")
+          print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
+          print(f"{'Model':<45} {'Level':<10} {'Runner'}")
+          print("-" * 80)
+          for m in models:
+              enabled = "✓" if m in filtered else "·"
+              print(f"  {enabled} {m['model_name']:<43} {m.get('test_level','?'):<10} {m['runner']}")
+          PY
 
-      - name: Push Docker image
-        if: ${{ !github.event.pull_request.head.repo.fork }}
-        run: |
-          IMAGE_TAG=rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}
-          docker tag atom_test:ci $IMAGE_TAG
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
-          docker push $IMAGE_TAG
-
-      - name: Clean up build images
-        if: ${{ !github.event.pull_request.head.repo.fork && always() }}
-        run: |
-          docker rmi "atom_test:ci" || true
-          docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
-
-  atom:
-    needs: [check-signal, build_atom_image]
-    name: ATOM Test
+  atom-test:
+    needs: [download_aiter_wheel, load-test-models]
+    name: Accuracy
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # run_on_pr: true = run on all events; false = skip on PR (still runs on push/schedule/workflow_dispatch)
-          - model_name: "Meta-Llama-3-8B-Instruct"
-            model_path: "meta-llama/Meta-Llama-3-8B-Instruct"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: ""
-            accuracy_test_threshold: "0.73"
-            runner: linux-atom-mi355-1
-            run_on_pr: true
-          - model_name: "Llama-3.3-70B-Instruct-MXFP4-Preview"
-            model_path: "amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: ""
-            accuracy_test_threshold: "0.88"
-            runner: linux-atom-mi355-1
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528"
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8"
-            env_vars: ""
-            accuracy_test_threshold: "0.94"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528 MTP"
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
-            env_vars: ""
-            accuracy_test_threshold: "0.94"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528-FP4"
-            model_path: "amd/DeepSeek-R1-0528-MXFP4"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8"
-            env_vars: ""
-            accuracy_test_threshold: "0.93"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528-FP4 MTP"
-            model_path: "amd/DeepSeek-R1-0528-MXFP4"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8 --method mtp"
-            env_vars: ""
-            accuracy_test_threshold: "0.93"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "gpt-oss-120b"
-            model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: ""
-            accuracy_test_threshold: "0.38"
-            runner: linux-atom-mi355-1
-            run_on_pr: true
-          - model_name: "gpt-oss-120b (2 GPUs)"
-            model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3"
-            env_vars: ""
-            accuracy_test_threshold: "0.38"
-            runner: linux-atom-mi355-4
-            run_on_pr: false
-          - model_name: "Qwen3-235B-A22B-Instruct-2507-FP8"
-            model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
-            env_vars: |
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
-            accuracy_test_threshold: "0.87"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
-          - model_name: "Qwen3-235B-A22B-Instruct-2507-MXFP4"
-            model_path: "amd/Qwen3-235B-A22B-Instruct-2507-MXFP4"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel"
-            env_vars: |
-              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
-            accuracy_test_threshold: "0.87"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: false
-          - model_name: "Kimi-K2.5-MXFP4"
-            model_path: "amd/Kimi-K2.5-MXFP4"
-            extraArgs: "--kv_cache_dtype fp8 -tp 4 --trust-remote-code"
-            env_vars: "HSA_NO_SCRATCH_RECLAIM=1"
-            accuracy_test_threshold: "0.93"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: false
-          - model_name: "Qwen3-Next-80B-A3B-Thinking"
-            model_path: "Qwen/Qwen3-Next-80B-A3B-Thinking"
-            extraArgs: "-tp 8"
-            env_vars: ""
-            accuracy_test_threshold: "0.65"
-            runner: atom-mi355-8gpu.predownload
-            run_on_pr: true
+        include: ${{ fromJson(needs.load-test-models.outputs.models_json) }}
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ${{ matrix.runner }}
 
@@ -220,12 +205,8 @@ jobs:
       CONTAINER_NAME: atom_test_${{ strategy.job-index }}
 
     steps:
-      - name: Set HF_TOKEN
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
-        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
-
       - name: Kill all Docker containers and clean up workspace
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -235,28 +216,60 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true 
 
       - name: Show Docker containers
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: docker ps -a
 
       - name: Show ROCm memory usage
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: rocm-smi --showmemuse
 
       - name: Show ROCm GPU processes
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.runner == 'atom-mi355-8gpu.predownload'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         uses: actions/checkout@v6
       
       - name: Docker Login
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && !github.event.pull_request.head.repo.fork
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
+      - name: Resolve immutable native dashboard image
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+        run: |
+          set -euo pipefail
+          if RESOLUTION_JSON="$(
+            python3 .github/scripts/resolve_atom_image.py \
+              --repository rocm/atom-dev \
+              --reference-tag latest \
+              --image-family native
+          )"; then
+            RESOLVED_ATOM_IMAGE="$(
+              RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          PY
+            )"
+            echo "Resolved native dashboard image: ${RESOLVED_ATOM_IMAGE}"
+          else
+            echo "::error::Failed to resolve ${ATOM_BASE_IMAGE} to an immutable reference for dashboard-uploading native runs."
+            exit 1
+          fi
+          echo "RESOLVED_ATOM_BASE_IMAGE=${RESOLVED_ATOM_IMAGE}" >> "$GITHUB_ENV"
+          echo "ATOM_DASHBOARD_DOCKER_IMAGE=${RESOLVED_ATOM_IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Pull immutable native dashboard image
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+        run: |
+          echo "Pulling immutable native dashboard image: ${RESOLVED_ATOM_BASE_IMAGE}"
+          docker pull "${RESOLVED_ATOM_BASE_IMAGE}"
+
       - name: Generate Dockerfile for forked repo
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && github.event.pull_request.head.repo.fork
+        if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.ATOM_BASE_NIGHTLY_IMAGE }}
@@ -286,16 +299,17 @@ jobs:
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
-      - name: Build Docker image for forked repo
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && github.event.pull_request.head.repo.fork
-        run: |
-          docker build --pull --network=host \
-            --no-cache \
-            -t atom_test:ci \
-            -f Dockerfile.mod .
+      - name: Download aiter wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: aiter-whl
+          path: /tmp/aiter-whl
+
+      - name: Set HF token for predownload runner
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           echo "Clean up containers..."
           (docker ps -aq -f name="^${CONTAINER_NAME}$" | xargs -r docker stop) || true
@@ -314,22 +328,22 @@ jobs:
             MODEL_MOUNT=""
           fi
 
-          cat > /tmp/env_file.txt << 'EOF'
-          ${{ matrix.env_vars }}
-          EOF
+          # Write env_vars via env block (avoids expression injection)
+          printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
 
-          echo "Starting container: atom_test:ci"
-          echo "Model-specific environment variables for ${{ matrix.model_name }}:"
+          IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
+          echo "Starting container with image: $IMAGE_TAG"
+          echo "Model-specific environment variables:"
           cat /tmp/env_file.txt
 
-          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
-            IMAGE_TAG=atom_test:ci
-          else
-            IMAGE_TAG=rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          PULL_FLAG=""
+          if [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
+            PULL_FLAG=""
+          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+            PULL_FLAG="--pull always"
           fi
 
-
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          docker run -dt $PULL_FLAG --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
           $MODEL_MOUNT \
           -w /workspace \
@@ -338,6 +352,7 @@ jobs:
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
+          -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
           --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
@@ -350,28 +365,88 @@ jobs:
 
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          MODEL_ENV_VARS: ${{ matrix.env_vars }}
 
       - name: Check shm size
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
-      - name: Download models
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+      - name: Install aiter from wheel
         run: |
+          AITER_WHL=$(ls -t /tmp/aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)
+          if [ -z "$AITER_WHL" ]; then
+            echo "ERROR: No amd_aiter wheel found"
+            ls -la /tmp/aiter-whl/
+            exit 1
+          fi
+
+          echo "=== Copying wheel into container ==="
+          WHL_NAME=$(basename "$AITER_WHL")
+          docker cp "$AITER_WHL" "$CONTAINER_NAME:/tmp/$WHL_NAME"
+
+          docker exec "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            echo '=== Uninstalling existing amd-aiter ==='
+            pip uninstall -y amd-aiter || true
+
+            echo '=== Installing amd-aiter from wheel ==='
+            pip install /tmp/$WHL_NAME
+
+            echo '=== Installed amd-aiter version ==='
+            pip show amd-aiter
+          "
+
+      - name: Install ATOM and dependencies
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            pip install --timeout 60 --retries 10 -U 'lm-eval[api]'
+            pip install --timeout 60 --retries 10 hf_transfer
+            pip install --timeout 60 --retries 10 --upgrade 'pybind11>=3.0.1'
+
+            echo '=== Installing ATOM ==='
+            cd /workspace
+            git config --global --add safe.directory /workspace
+            pip install -e .
+
+            echo '=== Installed package versions ==='
+            pip show amd-aiter | grep -E '^(Name|Version):'
+            pip show atom | grep -E '^(Name|Version):'
+            pip show triton | grep -E '^(Name|Version):'
+            pip show torch | grep -E '^(Name|Version):'
+          "
+
+      - name: Download models
+        timeout-minutes: 150
+        run: |
+          set -euo pipefail
           if [ -d "/models" ]; then
-            echo "/models directory found, downloading model to /models/${{ matrix.model_path }}"
-            if ! docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} "$CONTAINER_NAME" bash -lc "hf download ${{ matrix.model_path }} --local-dir /models/${{ matrix.model_path }}"; then
+            model_dir="/models/${{ matrix.model_path }}"
+            echo "/models directory found, checking cache and lock-protected download for ${model_dir}"
+            if ! docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${{ matrix.model_path }}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
           else
             echo "/models directory not found, skipping model download"
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "30m"
+          MODEL_LOCK_WAIT_SECONDS: "1800"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Run ATOM simple inference
         # Skip simple inference; accuracy test already validates correctness
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && false
+        if: false
         timeout-minutes: 30
         run: |
           # Run the inference and capture output
@@ -408,7 +483,7 @@ jobs:
           cat atom_test_output.txt
 
       - name: Compare output with golden outputs
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && false
+        if: false
         timeout-minutes: 30
         # TODO: skip for all test until it's fixed
         run: |
@@ -423,8 +498,9 @@ jobs:
           fi
       
       - name: Run ATOM accuracy test
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         timeout-minutes: 30
+        env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
         run: |
           set -euo pipefail
           echo ""
@@ -434,17 +510,30 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
-          docker exec "$CONTAINER_NAME" bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
-          "
+          # Pipe via stdin so container bash parses shell quoting in extraArgs
+          # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
+          echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
+            docker exec -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
           docker exec "$CONTAINER_NAME" bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
       
+      - name: Dump server log
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log 2>/dev/null || true
+
+      - name: Dump client log
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" cat /tmp/atom_client.log 2>/dev/null || true
+
       - name: Check accuracy test results
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
+        if: success()
+        env:
+          MODEL_NAME: ${{ matrix.model_name }}
         run: |
           result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
@@ -455,33 +544,60 @@ jobs:
           fi
           flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
           echo "Flexible extract value: $flexible_extract_value"
-          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
 
-          # Compare as float: use awk for decimal value comparison
-          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          # Read threshold from models_accuracy.json (via env var to avoid shell injection)
+          threshold=$(python3 -c "
+          import json, os
+          models = json.load(open('.github/benchmark/models_accuracy.json', encoding='utf-8'))
+          name = os.environ['MODEL_NAME']
+          t = next((m.get('accuracy_threshold', 0) for m in models if m['model_name'] == name), 0)
+          print(t)
+          ")
+          echo "Accuracy test threshold: $threshold"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="$threshold" 'BEGIN {print (val < threshold) ? 1 : 0}')
           if [ "$result" -eq 1 ]; then
-            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than the threshold ${{ matrix.accuracy_test_threshold }}."
+            echo "Accuracy test failed: $flexible_extract_value < $threshold"
             exit 1
           else
-            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to the threshold ${{ matrix.accuracy_test_threshold }}."
-            exit 0
+            echo "Accuracy test passed: $flexible_extract_value >= $threshold"
           fi
 
       - name: Collect Test Summary
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
+        if: success()
+        env:
+          MODEL_NAME: ${{ matrix.model_name }}
         run: |
-          echo "Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          # Read threshold and score for summary
+          threshold=$(python3 -c "
+          import json, os
+          models = json.load(open('.github/benchmark/models_accuracy.json', encoding='utf-8'))
+          name = os.environ['MODEL_NAME']
+          print(next((m.get('accuracy_threshold', 0) for m in models if m['model_name'] == name), 0))
+          ")
+          result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
+          score=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file" 2>/dev/null || echo "N/A")
+
+          echo "Accuracy Test Summary for ${{ matrix.model_name }} (threshold: ${threshold}, score: ${score}):" >> $GITHUB_STEP_SUMMARY
           awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.model_name }}_atom_test_output.txt
           path: atom_test_output.txt
 
+      - name: Upload accuracy results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: accuracy-${{ matrix.model_name }}
+          path: accuracy_test_results/*.json
+          if-no-files-found: ignore
+
       - name: Clean Up
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        if: always()
         run: |
           # TODO: run a separate container for cleanup of the workspace due to permission issue to remove some pyc files under __pycache__ whose owners are root.
           # We should use non-root user to run the test to avoid this issue.
@@ -494,4 +610,50 @@ jobs:
           docker rm "$CONTAINER_NAME" || true
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
+
+  # ---------- Push accuracy data to benchmark dashboard ----------
+  accuracy-dashboard:
+    name: Update accuracy dashboard
+    needs: [atom-test]
+    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Download accuracy artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/accuracy-results
+          pattern: accuracy-*
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== Downloaded accuracy artifacts ==="
+          find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
+
+      - name: Transform accuracy results for dashboard
+        run: |
+          python3 .github/scripts/accuracy_to_dashboard.py \
+            /tmp/accuracy-results \
+            --output accuracy-benchmark-input.json \
+            --models .github/benchmark/models_accuracy.json \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "=== Generated entries ==="
+          cat accuracy-benchmark-input.json
+
+      - name: Store accuracy result to dashboard
+        if: hashFiles('accuracy-benchmark-input.json') != ''
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: accuracy-benchmark-input.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-dashboard
+          auto-push: true
+          max-items-in-chart: 90
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 

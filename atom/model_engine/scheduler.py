@@ -25,7 +25,7 @@ from typing import Optional
 import numpy as np
 
 from atom.config import Config
-from atom.mesh.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -497,9 +497,10 @@ class Scheduler:
 
         # --- Decode scheduling ---
         num_seqs_decode = 0
+        num_new_tokens = self.mtp_k + 1
         while self.running and num_seqs_decode < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq, self.mtp_k + 1):
+            while not self.block_manager.can_append(seq, num_new_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -509,8 +510,6 @@ class Scheduler:
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
-                num_new_tokens = self.mtp_k + 1
-
                 # Skip block append for the first decode step after remote
                 # prefill — blocks were already allocated during prefill.
                 if not getattr(seq, "is_first_decode", False):
@@ -745,19 +744,34 @@ class Scheduler:
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests()
 
-    def get_next_batch_info(self) -> tuple[bool, int]:
-        for seq in self.waiting:
-            if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
-                return (True, num_tokens)
-
-        if self.running:
+    def get_next_batch_info(self) -> tuple[bool, int, int]:
+        # Only consider waiting seqs that are not blocked on a remote KV
+        # transfer (P/D disaggregation) when deciding if we can prefill.
+        eligible_waiting = [
+            seq
+            for seq in self.waiting
+            if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        if eligible_waiting:
+            # new request is waiting, will do prefill
+            num_reqs = 0
+            total_tokens = 0
+            for seq in eligible_waiting:
+                tokens = seq.num_tokens - seq.num_cached_tokens
+                if total_tokens + tokens > self.max_num_batched_tokens:
+                    break
+                if num_reqs >= self.max_num_seqs:
+                    break
+                total_tokens += tokens
+                num_reqs += 1
+            return (True, total_tokens, num_reqs)
+        elif self.running:
             # decode
             num_tokens = len(self.running)
-            return (False, num_tokens)
+            return (False, num_tokens, num_tokens)
         else:
             # No requests
-            return (False, 0)
+            return (False, 0, 0)
 
     def _passed_delay(self, now: float) -> bool:
         # borrowed from https://github.com/vllm-project/vllm/pull/3279

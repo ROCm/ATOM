@@ -25,6 +25,9 @@ from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.plugin import is_plugin_mode
 from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
+from atom.plugin.attention_mla_sparse import (
+    MLASparseAttentionImplDecoratorForPluginMode,
+)
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
@@ -106,6 +109,7 @@ def dynamic_per_batched_tensor_quant(
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
+@MLASparseAttentionImplDecoratorForPluginMode
 @MLAAttentionImplDecoratorForPluginMode
 class MLAAttention(nn.Module):
     def __init__(

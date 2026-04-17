@@ -85,11 +85,23 @@ class EagleProposer:
                 " from the target model."
             )
 
-        if self.config.speculative_config.method != "eagle3" and hasattr(
-            target_model, "lm_head"
-        ):
-            logger.info("Loading EAGLE LM head weights from the target model.")
-            self.model.lm_head = target_model.lm_head
+        # If MTP shared_head.head was not in checkpoint (weight is all zeros),
+        # share lm_head from the target model as fallback.
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            layers = self.model.model.layers
+            layer_iter = layers.values() if hasattr(layers, "values") else layers
+            for layer in layer_iter:
+                if (
+                    hasattr(layer, "shared_head")
+                    and hasattr(layer.shared_head, "head")
+                    and not layer.shared_head.head.weight.any()
+                ):
+                    logger.info(
+                        "MTP shared_head.head not found in checkpoint, "
+                        "sharing lm_head from the target model."
+                    )
+                    del layer.shared_head.head
+                    layer.shared_head.head = target_model.lm_head
 
     def propose(
         self,
@@ -140,8 +152,13 @@ class EagleProposer:
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
-                    do_attn_metadata_update = not context.is_prefill
+                    do_attn_metadata_update = (
+                        not context.is_prefill
+                        # TODO: FIX this condition after we support3 attention head numbers=32
+                        and self.runner.attn_metadata_builder.num_attention_heads != 32
+                    )
                     if i == 0:
+                        i0_max_seqlen_q = attn_metadata.max_seqlen_q
                         attn_metadata.max_seqlen_q = 1
                         kv_indptr = var["kv_indptr"].gpu[: bs + 1]
                         kv_indices = var["kv_indices"].gpu
@@ -164,7 +181,11 @@ class EagleProposer:
                     attn_metadata.max_seqlen_k += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
-                        attn_metadata.max_seqlen_q,
+                        (
+                            attn_metadata.max_seqlen_q
+                            if not do_attn_metadata_update
+                            else i0_max_seqlen_q
+                        ),
                         attn_metadata.max_seqlen_k,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,

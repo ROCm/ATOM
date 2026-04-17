@@ -239,6 +239,24 @@ def load_model(
                 return maybe_matching_name
         return None
 
+    def extract_expert_target_and_id(name: str) -> Tuple[str, int] | None:
+        """Extract fused parameter name and expert id from expert checkpoint name.
+        like 'model.layers.10.mlp.experts.100.w2_bias' -> model.layers.10.mlp.experts.w2_bias and 100
+        """
+        if "experts" not in name:
+            return None
+        parts = name.split(".")
+        ids = [s for s in parts if s.isdigit()]
+        if len(ids) != 2:
+            return None
+        expert_id = int(ids[-1])
+        expert_token = str(expert_id)
+        if expert_token not in parts:
+            return None
+        fused_parts = parts.copy()
+        fused_parts.pop(len(parts) - 1 - parts[::-1].index(expert_token))
+        return ".".join(fused_parts), expert_id
+
     # need to record the loaded weight name for vllm load check
     # it is only used in plugin mode for vllm
     loaded_weights_record: set[str] = set()
@@ -306,9 +324,9 @@ def load_model(
                     if remapped_name is None:
                         continue
                     name = remapped_name
-            name_suffix = name.split(".")[-1]
-            if name_suffix in weights_mapping.keys():
-                name = name.replace(name_suffix, weights_mapping[name_suffix])
+            for mapping_part in weights_mapping.keys():
+                if mapping_part in name:
+                    name = name.replace(mapping_part, weights_mapping[mapping_part])
             if "weight_scale_inv" in name:
                 name = name.replace("weight_scale_inv", "weight_scale")
 
@@ -341,7 +359,10 @@ def load_model(
                         for shard_idx, target_name in enumerate(packed_value):
                             param_name = name.replace(k, target_name)
                             if "output_scale" not in param_name:
-                                param = model.get_parameter(param_name)
+                                try:
+                                    param = model.get_parameter(param_name)
+                                except AttributeError:
+                                    continue
                                 weight_loader = getattr(param, "weight_loader")
                                 futures.append(
                                     executor.submit(
@@ -355,7 +376,10 @@ def load_model(
                         param_name = name.replace(k, v)
                         # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
                         if "output_scale" not in param_name:
-                            param = model.get_parameter(param_name)
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                break
                             weight_loader = getattr(param, "weight_loader")
                             # weight_loader(param, weight_tensor, shard_id)
                             futures.append(
@@ -424,7 +448,13 @@ def load_model(
                         if "mtp" in name and not spec_decode:
                             matched = True
                             break
-                        param = model.get_parameter(name)
+                        try:
+                            param = model.get_parameter(name)
+                        except AttributeError:
+                            # Parameter absent from model (e.g. weight scales for
+                            # an unquantized drafter MTP block); skip silently.
+                            matched = True
+                            break
                         weight_loader = getattr(param, "weight_loader")
                         futures.append(
                             executor.submit(
@@ -442,7 +472,30 @@ def load_model(
                     if not matched:
                         if "mtp" in name and not spec_decode:
                             continue
-                        param = model.get_parameter(name)
+                        if merged_target := extract_expert_target_and_id(name):
+                            fused_name, expert_id = merged_target
+                            try:
+                                param = model.get_parameter(fused_name)
+                            except AttributeError:
+                                continue
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            futures.append(
+                                executor.submit(
+                                    weight_loader,
+                                    param,
+                                    weight_tensor,
+                                    "",  # use merged moe loader
+                                    "",
+                                    expert_id,
+                                )
+                            )
+                            loaded_weights_record.add(prefix + name)
+                        try:
+                            param = model.get_parameter(name)
+                        except AttributeError:
+                            continue
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -452,7 +505,10 @@ def load_model(
                         loaded_weights_record.add(prefix + name)
                 else:
                     # Model doesn't have expert mapping, use generic loading
-                    param = model.get_parameter(name)
+                    try:
+                        param = model.get_parameter(name)
+                    except AttributeError:
+                        continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -462,6 +518,9 @@ def load_model(
         # Wait for all tasks to complete and raise any exceptions.
         for future in concurrent.futures.as_completed(futures):
             future.result()
+
+    # Avoid holding stale Parameter refs that prevent storage release.
+    del params_dict
 
     for _, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):

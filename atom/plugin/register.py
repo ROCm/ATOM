@@ -3,6 +3,7 @@ import logging
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
+from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang
 
@@ -12,11 +13,16 @@ _ATOM_SUPPORTED_MODELS = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
+    "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
 }
 
 
 def _register_custom_attention_to_sglang() -> None:
+    """Override sglang's built-in "aiter" attention backend with ATOM's implementation.
 
+    sglang only accepts pre-registered backend names, so we reuse the "aiter"
+    name to inject ATOMAttnBackendForSgl without modifying sglang source.
+    """
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
     )
@@ -24,13 +30,15 @@ def _register_custom_attention_to_sglang() -> None:
     # here register the custom attention backend with the name "aiter"
     # as sglang defines the fixed attention backend choices, which must be
     # in-tree
-    logger.info("Register custom attention backend AiterBackend to SGLang")
+    logger.info("Register custom attention backend ATOMAttnBackendForSgl to SGLang")
 
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
-        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+        from atom.plugin.sglang.attention_backend.sgl_attn_backend import (
+            ATOMAttnBackendForSgl,
+        )
 
-        return AiterAttnBackend(runner)
+        return ATOMAttnBackendForSgl(runner)
 
 
 def register_ops_to_sglang(atom_config: Config) -> None:
@@ -41,8 +49,10 @@ def register_ops_to_sglang(atom_config: Config) -> None:
 
 
 def set_attn_cls() -> None:
-    """
-    Set the attention class for constructing the model based on the framework
+    """Swap ``atom.model_ops.Attention`` to the framework-appropriate class.
+
+    ATOM models reference ``ops.Attention`` generically; this function binds
+    it to PagedAttention (vLLM) or RadixAttention (sglang) at plugin init time.
     """
     import atom.model_ops as ops
 

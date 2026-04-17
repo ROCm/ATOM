@@ -47,6 +47,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1"
     )
     == "1",
+    "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: os.getenv(
+        "ATOM_ENABLE_DS_QKNORM_FUSION", "1"
+    )
+    == "1",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv(
         "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1"
     )
@@ -63,6 +67,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
+    # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
+    # GPU timestamps for both prefill and decode phases.
+    "ATOM_RTL_TRACE_DIR": lambda: os.getenv("ATOM_RTL_TRACE_DIR", None),
     # --- Model Loading ---
     "ATOM_DISABLE_MMAP": lambda: os.getenv("ATOM_DISABLE_MMAP", "false").lower()
     == "true",
@@ -84,6 +92,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # --- MTP (relaxed mtp for quantized mtp) ---
+    "ATOM_ENABLE_RELAXED_MTP": lambda: os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower()
+    == "1",
+    # --- Gradient Control ---
+    # Enable gradient tracking on model parameters.  Default "0" (disabled)
+    # is correct for inference; set to "1" only for training / fine-tuning.
+    "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
 }
 
 

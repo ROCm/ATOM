@@ -4,8 +4,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
-import triton
-import triton.language as tl
 
 from aiter.dist.parallel_state import get_tensor_model_parallel_rank
 from transformers.activations import ACT2FN
@@ -13,6 +11,10 @@ from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.split_chunk import (
+    fused_split_chunk_qwen_next_qkvz_ba,
+    fused_split_chunk_qwen_next_qkvzba,
+)
 
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
@@ -26,15 +28,16 @@ from atom.model_ops.linear import (
     ColumnParallelLinear,
 )
 from atom.model_config.qwen3_next import Qwen3NextConfig
+from atom.plugin.prepare import is_vllm
 
 
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.utils.decorators import support_torch_compile
-from atom.plugin.prepare import is_vllm
 
 from aiter.rotary_embedding import get_rope
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -50,83 +53,13 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 
+if is_vllm():
+    from vllm.config import get_current_vllm_config
+
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
-
-
-@triton.jit
-def shard_qkvzba_kernel(
-    qkvzba_ptr,  # [num_tokens,  (2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim + 2 * num_v_heads)]
-    qkv_ptr,  # [num_tokens, (2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim)]
-    z_ptr,  # [num_tokens, num_v_heads * head_v_dim]
-    b_ptr,  # [num_tokens, num_v_heads]
-    a_ptr,  # [num_tokens, num_v_heads]
-    num_k_heads: tl.constexpr,
-    num_v_heads: tl.constexpr,
-    head_k_dim: tl.constexpr,
-    head_v_dim: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-    QKVZ_TOTAL_SIZE = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
-    QKVZ_DIM_SIZE = 2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads
-    BA_TOTAL_SIZE = 2 * num_v_heads
-    KV_HEAD_RATIO: tl.constexpr = num_v_heads // num_k_heads
-    ROW_SIZE = QKVZ_TOTAL_SIZE + BA_TOTAL_SIZE
-    if head_id == num_k_heads:  # ba
-        load_ptr = qkvzba_ptr + token_id * ROW_SIZE + QKVZ_TOTAL_SIZE
-        b_offset = (
-            tl.arange(0, num_v_heads) // KV_HEAD_RATIO * KV_HEAD_RATIO * 2
-            + tl.arange(0, num_v_heads) % KV_HEAD_RATIO
-        )
-        a_offset = b_offset + KV_HEAD_RATIO
-        b_val = tl.load(load_ptr + b_offset)
-        a_val = tl.load(load_ptr + a_offset)
-        store_offset = tl.arange(0, num_v_heads)
-        tl.store(b_ptr + token_id * num_v_heads + store_offset, b_val)
-        tl.store(a_ptr + token_id * num_v_heads + store_offset, a_val)
-    else:
-        base_ptr = qkvzba_ptr + token_id * ROW_SIZE + head_id * QKVZ_DIM_SIZE
-        qkv_base_ptr = qkv_ptr + token_id * (
-            2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
-        )
-        k_dim_offset = tl.arange(0, head_k_dim)
-        v_dim_offset = tl.arange(0, head_v_dim)
-        q_val = tl.load(base_ptr + k_dim_offset)
-        q_store_ptr = qkv_base_ptr + head_id * head_k_dim
-        tl.store(q_store_ptr + k_dim_offset, q_val)
-
-        k_val = tl.load(base_ptr + head_k_dim + k_dim_offset)
-        k_store_ptr = qkv_base_ptr + num_k_heads * head_k_dim + head_id * head_k_dim
-        tl.store(k_store_ptr + k_dim_offset, k_val)
-
-        for sub_head in tl.static_range(0, KV_HEAD_RATIO):
-            v_val = tl.load(
-                base_ptr + 2 * head_k_dim + sub_head * head_v_dim + v_dim_offset
-            )
-            v_store_ptr = (
-                qkv_base_ptr
-                + 2 * num_k_heads * head_k_dim
-                + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
-            )
-            tl.store(v_store_ptr + v_dim_offset, v_val)
-
-        for sub_head in tl.static_range(0, KV_HEAD_RATIO):
-            z_val = tl.load(
-                base_ptr
-                + 2 * head_k_dim
-                + KV_HEAD_RATIO * head_v_dim
-                + sub_head * head_v_dim
-                + v_dim_offset
-            )
-            z_store_ptr = (
-                z_ptr
-                + token_id * num_v_heads * head_v_dim
-                + (head_id * KV_HEAD_RATIO + sub_head) * head_v_dim
-            )
-            tl.store(z_store_ptr + v_dim_offset, z_val)
 
 
 def mamba_v2_sharded_weight_loader(
@@ -274,21 +207,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        # print(f"layer {prefix}, gate weight: {self.gate.weight.data}", flush=True)
-
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if (
             config.shared_expert_intermediate_size > 0
             and not is_rocm_aiter_fusion_shared_expert_enabled()
         ):
+            # When shared expert fusion is disabled (e.g. MXFP4 where shared
+            # experts are BF16 while routed experts are FP4), run the shared
+            # expert MLP separately.  The sigmoid gating is applied in
+            # forward() using the shared-expert portion of the merged gate
+            # output — no separate nn.Linear needed here.
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
-                expert_gate=self.shared_expert_gate,
+                expert_gate=None,
                 prefix=f"{prefix}.shared_expert",
             )
         else:
@@ -303,6 +238,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
             use_grouped_topk=False,
+            has_bias=False,
             shared_expert_scoring_func=(
                 "sigmoid" if self.shared_expert is None else None
             ),
@@ -316,13 +252,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
+        # router_logits: (num_tokens, n_experts + 1)
+        logits = self.gate(hidden_states)
+        if not is_rocm_aiter_fusion_shared_expert_enabled():
+            router_logits = logits[:, : self.n_routed_experts]
+        else:
+            router_logits = logits
         routed_output = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
         if not is_rocm_aiter_fusion_shared_expert_enabled():
             shared_output = self.shared_expert(hidden_states)
+            # Apply shared expert gate: the merged gate output contains
+            # [routed_logits, shared_expert_gate_logits], extract the tail
+            shared_gate_logits = logits[:, self.n_routed_experts :]
+            shared_output = F.sigmoid(shared_gate_logits) * shared_output
             final_hidden_states = shared_output + routed_output
         else:
             final_hidden_states = routed_output
@@ -389,8 +333,21 @@ class Qwen3NextAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        rope_parameters = getattr(config, "rope_parameters", None)
-
+        if is_vllm():
+            # print("hf_config: ", atom_config.plugin_config.vllm_config.model_config.hf_config, flush=True)
+            model_config = atom_config.plugin_config.vllm_config.model_config
+            text_hf_config = (
+                model_config.hf_text_config
+                if hasattr(model_config, "hf_text_config")
+                else model_config
+            )
+            rope_parameters = getattr(
+                text_hf_config,
+                "rope_parameters",
+                None,
+            )
+        else:
+            rope_parameters = getattr(config, "rope_parameters", None)
         rope_parameters = rope_parameters or {}
         rope_theta = rope_parameters.get("rope_theta", 10000)
         partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
@@ -434,6 +391,7 @@ class Qwen3NextAttention(nn.Module):
                 self.head_dim,
                 self.scaling,
                 num_kv_heads=self.num_kv_heads,
+                kv_cache_dtype=atom_config.kv_cache_dtype,
                 quant_config=quant_config,
                 use_mla=False,
                 layer_num=extract_layer_index(prefix),
@@ -535,6 +493,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             input_size=self.conv_kernel_size,
             output_size=self.conv_dim,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.conv1d",
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -542,7 +501,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # projection of the input hidden states
         self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         self.projection_size_ba = self.num_v_heads * 2
-        self.create_qkvzba_proj()
+        self.create_qkvzba_proj(quant_config, prefix)
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -566,13 +525,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
-        self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.tp_size),
-        )
-        self.A_log = nn.Parameter(
+        self.dt_bias = atom_parameter(torch.ones(self.num_v_heads // self.tp_size))
+        self.A_log = atom_parameter(
             torch.empty(
                 (self.num_v_heads // self.tp_size),
             )
+        )
+
+        # Get downstream out_proj quant_config for norm
+        norm_quant_config = (
+            quant_config.get_layer_quant_config(f"{prefix}.out_proj")
+            if quant_config is not None
+            else None
         )
 
         self.norm = RMSNormGated(
@@ -581,6 +545,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             group_size=None,
             norm_before_gate=True,
             dtype=config.dtype,
+            quant_config=norm_quant_config,
         )
 
         self.out_proj = RowParallelLinear(
@@ -608,43 +573,74 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             prefix=self.prefix,
         )
 
-    def create_qkvzba_proj(self):
+    def create_qkvzba_proj(self, quant_config, prefix):
+        # This projection fusion should only opened when model type is bfloat16
+        if self.quant_config.global_quant_config.quant_dtype == torch.bfloat16:
+            self.in_proj_qkvzba = QKVZBAParallelLinear(
+                input_size=self.hidden_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                num_k_heads=self.num_k_heads,
+                num_v_heads=self.num_v_heads,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{self.prefix}.in_proj_qkvzba",
+            )
+        else:
+            self.in_proj_qkvz = self.create_qkvz_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
 
-        self.in_proj_qkvzba = QKVZBAParallelLinear(
-            input_size=self.hidden_size,
-            head_k_dim=self.head_k_dim,
-            head_v_dim=self.head_v_dim,
-            num_k_heads=self.num_k_heads,
-            num_v_heads=self.num_v_heads,
+            self.in_proj_ba = self.create_ba_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[sum((key_dim, key_dim, value_dim, value_dim))],
             bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{self.prefix}.in_proj_qkvzba",
+            quant_config=quant_config,
+            prefix=f"{prefix}.in_proj_qkvz",
+        )
+
+    def create_ba_proj(
+        self,
+        hidden_size: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[num_v_heads, num_v_heads],
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.in_proj_ba",
         )
 
     def fix_query_key_value_ordering(
         self,
-        mixed_qkvzba,
+        mixed_qkvz: torch.Tensor,
+        mixed_ba: torch.Tensor,
     ):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
-        qkvz_split_size = (
-            self.num_k_heads
-            // self.tp_size
-            * (
-                self.head_k_dim
-                + self.head_k_dim
-                + (self.head_v_dim + self.head_v_dim)
-                * self.num_v_heads
-                // self.num_k_heads
-            )
-        )
-        ba_split_size = (
-            self.num_k_heads // self.tp_size * 2 * self.num_v_heads // self.num_k_heads
-        )
-        mixed_qkvz, mixed_ba = torch.split(
-            mixed_qkvzba, [qkvz_split_size, ba_split_size], dim=-1
-        )
         new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
             self.num_k_heads // self.tp_size,
             (
@@ -707,42 +703,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
-    def shard_qkvzba(
-        self,
-        qkvzba: torch.Tensor,
-        num_k_heads: int,
-        num_v_heads: int,
-        head_k_dim: int,
-        head_v_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_tokens, dtype, device = qkvzba.shape[0], qkvzba.dtype, qkvzba.device
-        mixed_qkv = torch.empty(
-            [
-                num_tokens,
-                2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
-            ],
-            dtype=dtype,
-            device=device,
-        )
-        z = torch.empty(
-            [num_tokens, num_v_heads, head_v_dim], dtype=dtype, device=device
-        )
-        b = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-        a = torch.empty([num_tokens, num_v_heads], dtype=dtype, device=device)
-        grid = (num_tokens, num_k_heads + 1)
-        shard_qkvzba_kernel[grid](
-            qkvzba,
-            mixed_qkv,
-            z,
-            b,
-            a,
-            num_k_heads,
-            num_v_heads,
-            head_k_dim,
-            head_v_dim,
-        )
-        return mixed_qkv, z, b, a
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -759,42 +719,103 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
-        k_heads_after_tp = self.num_k_heads // self.tp_size
-        v_heads_after_tp = self.num_v_heads // self.tp_size
-
-        mixed_qkv, z, b, a = self.shard_qkvzba(
-            projected_states_qkvzba,
-            k_heads_after_tp,
-            v_heads_after_tp,
-            self.head_k_dim,
-            self.head_v_dim,
-        )
+        if hasattr(self, "in_proj_qkvzba"):
+            projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
+            k_heads_after_tp = self.num_k_heads // self.tp_size
+            v_heads_after_tp = self.num_v_heads // self.tp_size
+            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_qwen_next_qkvzba(
+                projected_states_qkvzba,
+                k_heads_after_tp,
+                v_heads_after_tp,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        else:
+            projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+            projected_states_ba = self.in_proj_ba(hidden_states)
+            # Use Triton kernel to process qkvz and ba
+            num_k_heads_tp = self.num_k_heads // self.tp_size
+            num_v_heads_tp = self.num_v_heads // self.tp_size
+            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_qwen_next_qkvz_ba(
+                projected_states_qkvz,
+                projected_states_ba,
+                num_k_heads_tp,
+                num_v_heads_tp,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
 
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
 
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        z_shape_og = z.shape
-        # Reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens] = self.out_proj(core_attn_out)
+
+        core_attn_out, maybe_scale = self.norm(core_attn_out, z)
+        output[:num_tokens] = self.out_proj(core_attn_out, x_scale=maybe_scale)
+
+
+if is_vllm():
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateShapeCalculator,
+        MambaStateDtypeCalculator,
+        MambaStateCopyFunc,
+        MambaStateCopyFuncCalculator,
+    )
+
+    class Qwen3NextGatedDeltaNetVllm(Qwen3NextGatedDeltaNet, MambaBase):
+        def __init__(
+            self,
+            atom_config: Qwen3NextConfig,
+            quant_config=None,
+            speculative_config=None,
+            prefix: str = "",
+        ) -> None:
+            super().__init__(
+                atom_config=atom_config,
+                quant_config=quant_config,
+                speculative_config=speculative_config,
+                prefix=prefix,
+            )
+            self.model_config = atom_config.plugin_config.vllm_config.model_config
+            self.cache_config = atom_config.plugin_config.vllm_config.cache_config
+            self.tp_rank = get_tensor_model_parallel_rank()
+            compilation_config = get_current_vllm_config().compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
+
+        def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+            return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                self.model_config.dtype,
+                self.cache_config.mamba_cache_dtype,
+                self.cache_config.mamba_ssm_cache_dtype,
+            )
+
+        def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+            return MambaStateShapeCalculator.gated_delta_net_state_shape(
+                self.tp_size,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.conv_kernel_size,
+                self.num_spec,
+            )
+
+        @property
+        def mamba_type(self) -> str:
+            return "gdn_attention"
+
+    # If oot case, override the Qwen3NextGatedDeltaNet with the VLLM version which inherits from MambaBase to ensure it gets registered in the static_forward_context for vLLM compilation.
+    Qwen3NextGatedDeltaNet = Qwen3NextGatedDeltaNetVllm
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -865,21 +886,21 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
-            self.attn_layer_scale = torch.nn.Parameter(
+            self.attn_layer_scale = atom_parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
                     dtype=config.dtype,
-                ),
+                )
             )
-            self.ffn_layer_scale = torch.nn.Parameter(
+            self.ffn_layer_scale = atom_parameter(
                 torch.zeros(
                     1,
                     1,
                     config.hidden_size,
                     dtype=config.dtype,
-                ),
+                )
             )
 
     def forward(
@@ -1038,8 +1059,6 @@ class Qwen3NextForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
-        "in_proj_qkvz": ("in_proj_qkvzba", "qkvz"),
-        "in_proj_ba": ("in_proj_qkvzba", "ba"),
         ".gate.": (".gate.", 0),
         "shared_expert_gate": ("gate", 1),
     }
@@ -1054,6 +1073,9 @@ class Qwen3NextForCausalLM(nn.Module):
         quant_config = atom_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        if self.quant_config.global_quant_config.quant_dtype == torch.bfloat16:
+            self.packed_modules_mapping["in_proj_qkvz"] = ("in_proj_qkvzba", "qkvz")
+            self.packed_modules_mapping["in_proj_ba"] = ("in_proj_qkvzba", "ba")
         # Only perform the following mapping when Qwen3NextMLP exists
         if getattr(config, "mlp_only_layers", []):
             self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
@@ -1113,3 +1135,49 @@ class Qwen3NextForCausalLM(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+
+if is_vllm():
+    from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
+    from vllm.model_executor.models.interfaces import IsHybrid
+    from vllm.config import VllmConfig
+
+    class Qwen3NextForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
+        @classmethod
+        def get_mamba_state_dtype_from_config(
+            cls,
+            vllm_config: "VllmConfig",
+        ) -> tuple[torch.dtype, torch.dtype]:
+            return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            )
+
+        @classmethod
+        def get_mamba_state_shape_from_config(
+            cls, vllm_config: "VllmConfig"
+        ) -> tuple[tuple[int, int], tuple[int, int]]:
+            parallel_config = vllm_config.parallel_config
+            hf_config = vllm_config.model_config.hf_text_config
+            tp_size = parallel_config.tensor_parallel_size
+            num_spec = (
+                vllm_config.speculative_config.num_speculative_tokens
+                if vllm_config.speculative_config
+                else 0
+            )
+            return MambaStateShapeCalculator.gated_delta_net_state_shape(
+                tp_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                hf_config.linear_conv_kernel_dim,
+                num_spec,
+            )
+
+        @classmethod
+        def get_mamba_state_copy_func(
+            cls,
+        ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+            return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()

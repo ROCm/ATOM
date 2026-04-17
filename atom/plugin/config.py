@@ -1,5 +1,3 @@
-import sys
-
 from typing import Any, Optional
 from dataclasses import dataclass
 
@@ -109,9 +107,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
 
 def _generate_atom_config_from_sglang_config(config: Any):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
     from sglang.srt.server_args import (
-        ServerArgs,
-        prepare_server_args,
+        get_global_server_args,
         PortArgs,
     )
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
@@ -119,10 +117,23 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.load_config import LoadConfig
     from atom.config import Config, ParallelConfig, CompilationConfig
 
-    # sglang has no global config variable like vllm,
-    # so here construct the server args from sys.argv passed by users
-    # this is the only way to get full arguments
-    server_args: ServerArgs = prepare_server_args(sys.argv[1:])
+    # sglang's ModelRunner already parsed and stored ServerArgs globally
+    # before OOT model loading, so we can retrieve it directly.
+    try:
+        server_args = get_global_server_args()
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to retrieve SGLang global ServerArgs. Ensure this "
+            "function is called after SGLang has initialized its server "
+            "arguments."
+        ) from exc
+
+    if server_args is None:
+        raise RuntimeError(
+            "SGLang global ServerArgs are not initialized. Ensure this "
+            "function is called after SGLang has parsed and set its "
+            "server arguments."
+        )
 
     sgl_model_config = SglangModelConfig.from_server_args(server_args)
     sgl_model_opt_config = ModelOptConfig(
@@ -148,9 +159,18 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # get rank number through the torch.distributed.get_rank()
     rank = torch.distributed.get_rank()
 
+    # Derive DP rank from SGLang's TP-local rank rather than the global
+    # distributed rank so PP/multi-stage layouts do not skew the result.
+    data_parallel_rank = 0
+    if server_args.dp_size > 1:
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_group_size = max(1, server_args.tp_size // server_args.dp_size)
+        data_parallel_rank = tp_rank // tp_group_size
+
     # sglang uses the atom parallel config
     sgl_parallel_config = ParallelConfig(
         data_parallel_size=server_args.dp_size,
+        data_parallel_rank=data_parallel_rank,
     )
 
     # use sglang torch compile policy and cuda graph policy
@@ -182,13 +202,17 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # force max num batched tokens to 16K because sgl doesn't have
     # concept for max num batched tokens
     return Config(
-        model=None,
+        model=server_args.model_path,
         max_num_batched_tokens=16384,
         max_num_seqs=server_args.max_running_requests,
         max_model_len=server_args.context_length,
         gpu_memory_utilization=server_args.mem_fraction_static,
         tensor_parallel_size=server_args.tp_size,
-        enforce_eager=True,  # disable using atom cuda graph
+        # Disable ATOM's own torch.compile and CUDA graph capture —
+        # sglang manages its own compilation/graph strategy, and the
+        # @support_torch_compile decorator checks enforce_eager to skip,
+        # preventing double-compile.
+        enforce_eager=True,
         parallel_config=sgl_parallel_config,
         kv_cache_dtype=server_args.kv_cache_dtype,
         enable_prefix_caching=False,
@@ -214,7 +238,6 @@ def generate_atom_config_for_plugin_mode(config: Any = None):
     """
 
     logger.info("Generate atom config for plugin mode from passed config")
-
     atom_config = None
     from atom.plugin import is_vllm, is_sglang
     from atom.config import set_current_atom_config

@@ -9,16 +9,18 @@ set -euo pipefail
 #   OOT_MODEL_NAME
 #   OOT_MODEL_PATH
 #   OOT_EXTRA_ARGS
+#   LM_EVAL_NUM_FEWSHOT
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
 #   accuracy - run gsm8k accuracy test and save result JSON
 #
 # MODE:
-#   ci    - only Kimi-K2
-#   full  - all OOT-supported models
+#   ci    - workflow-provided OOT CI model entry
+#   full  - workflow-provided OOT full-validation model entry
 #
-# Optional model_name can be used to run a single model in full mode.
+# Optional model_name can be used to run a single model when a caller passes
+# multiple explicit entries.
 
 TYPE=${1:-launch}
 MODE=${2:-ci}
@@ -37,7 +39,7 @@ fi
 MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
 VLLM_PORT=${VLLM_PORT:-8000}
-VLLM_HOST=${VLLM_HOST:-0.0.0.0}
+VLLM_HOST=${VLLM_HOST:-localhost}
 VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
 VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_oot.log}
 RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
@@ -47,24 +49,14 @@ KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
+OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
+LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LAST_VLLM_LOG_LINE=0
 
-# Default model format:
-#   MODEL_NAME|MODEL_PATH|EXTRA_ARGS
-# Default lists are kept for ad hoc/manual runs. CI workflows pass the exact
-# current matrix entry via OOT_MODEL_* env vars so model coverage does not drift
-# when the workflow matrix changes.
-CI_MODE_MODELS=(
-  "Kimi-K2-Thinking-MXFP4|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --enable-expert-parallel"
-)
-
-FULL_MODE_MODELS=(
-  "Qwen3 MoE|Qwen/Qwen3-235B-A22B-Instruct-2507-FP8|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
-  "DeepSeek-R1 FP8|deepseek-ai/DeepSeek-R1-0528|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
-  "DeepSeek-R1 MXFP4|amd/DeepSeek-R1-0528-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8"
-  "GPT-OSS|openai/gpt-oss-120b|--trust-remote-code --kv-cache-dtype fp8 --gpu-memory-utilization 0.3"
-  "Kimi-K2|amd/Kimi-K2-Thinking-MXFP4|--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --enable-expert-parallel"
-)
+if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
+  exit 2
+fi
 
 declare -a ACTIVE_MODELS=()
 if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
@@ -73,10 +65,9 @@ if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLIC
     exit 2
   fi
   ACTIVE_MODELS=("${EXPLICIT_MODEL_NAME}|${EXPLICIT_MODEL_PATH}|${EXPLICIT_EXTRA_ARGS}")
-elif [[ "$MODE" == "ci" ]]; then
-  ACTIVE_MODELS=("${CI_MODE_MODELS[@]}")
 else
-  ACTIVE_MODELS=("${FULL_MODE_MODELS[@]}")
+  echo "${MODE} mode requires OOT_MODEL_NAME and OOT_MODEL_PATH env vars from the workflow."
+  exit 2
 fi
 
 resolve_model_path() {
@@ -160,7 +151,19 @@ launch_one_model() {
   resolved_model_path=$(resolve_model_path "${model_path}")
 
   if [[ -n "${extra_args}" ]]; then
-    read -r -a extra_arg_array <<< "${extra_args}"
+    while IFS= read -r -d '' token; do
+      extra_arg_array+=("${token}")
+    done < <(
+      EXTRA_ARGS="${extra_args}" python3 - <<'PY'
+import os
+import shlex
+import sys
+
+for token in shlex.split(os.environ["EXTRA_ARGS"]):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
   fi
 
   echo ""
@@ -170,23 +173,32 @@ launch_one_model() {
   echo "Extra args: ${extra_args}"
 
   export SAFETENSORS_FAST_GPU=1
-  export VLLM_ROCM_USE_AITER=1
   export VLLM_RPC_TIMEOUT=1800000
-  export VLLM_CACHE_ROOT=/tmp/.cache/vllm
-  export TORCHINDUCTOR_CACHE_DIR=/tmp/.cache/inductor
-  # FIXME here disable the dual stream in OOT CI for avoid the hang issue
-  export ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0
-  rm -rf /tmp/.cache
+  export VLLM_CACHE_ROOT=/root/.cache/vllm
+  export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
+
+  if [[ -n "${OOT_ENV_VARS:-}" ]]; then
+    while IFS= read -r _env_line; do
+      [[ -n "${_env_line}" ]] && export "${_env_line}" && echo "Exported: ${_env_line}"
+    done <<< "$(printf '%b' "${OOT_ENV_VARS}")"
+  fi
+  rm -rf /root/.cache
 
   rm -f "${VLLM_PID_FILE}" || true
 
+  # Avoid importing a host-mounted source tree as a namespace package.
+  cd /tmp
   nohup vllm serve "${resolved_model_path}" \
     --host "${VLLM_HOST}" \
     --port "${VLLM_PORT}" \
     --async-scheduling \
     --load-format fastsafetensors \
-    --max-model-len 16384 \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
     "${extra_arg_array[@]}" \
+    --gpu-memory-utilization 0.9 \
+    --no-enable-prefix-caching \
     > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"
   echo "Server PID: $(cat "${VLLM_PID_FILE}")"
@@ -217,11 +229,12 @@ accuracy_one_model() {
   echo ""
   echo "========== Running OOT gsm8k accuracy =========="
   echo "Model name: ${model_name}"
+  echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
 
   lm_eval --model local-completions \
     --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
     --tasks gsm8k \
-    --num_fewshot 3 \
+    --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
     --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
 
   # lm-eval output layout differs across versions: output_path may be a file
@@ -259,6 +272,26 @@ PY
   if [[ "${result_file}" != "${flat_result_file}" ]]; then
     cp -f "${result_file}" "${flat_result_file}"
     result_file="${flat_result_file}"
+  fi
+
+  if [[ -n "${OOT_DOCKER_IMAGE}" ]]; then
+    RESULT_FILE="${result_file}" \
+    OOT_DOCKER_IMAGE="${OOT_DOCKER_IMAGE}" \
+    python - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+if os.environ.get("OOT_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["OOT_DOCKER_IMAGE"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
   fi
 
   local value

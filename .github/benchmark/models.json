@@ -20,10 +20,20 @@
     "env_vars": ""
   },
   {
-    "display": "DeepSeek-R1-0528 MXFP4-MTP3",
-    "path": "amd/DeepSeek-R1-0528-MoE-MXFP4-Attn-MTP-PTPC-FP8",
+    "display": "DeepSeek-R1-0528 MXFP4",
+    "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "prefix": "deepseek-r1-0528-mxfp4",
-    "args": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",
+    "args": "--kv_cache_dtype fp8 -tp 4",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "DeepSeek-R1-0528 MXFP4-MTP3",
+    "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+    "prefix": "deepseek-r1-0528-mxfp4",
+    "args": "--kv_cache_dtype fp8 -tp 4 --method mtp --num-speculative-tokens 3",
     "bench_args": "--use-chat-template",
     "suffix": "-mtp3",
     "runner": "atom-mi355-8gpu.predownload",
@@ -34,6 +44,16 @@
     "path": "zai-org/GLM-5-FP8",
     "prefix": "glm-5-fp8",
     "args": "--kv_cache_dtype fp8 -tp 8",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "GLM-5.1-MXFP4",
+    "path": "amd/GLM-5.1-MXFP4",
+    "prefix": "glm-5.1-fp4",
+    "args": "--kv_cache_dtype fp8 -tp 4",
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
@@ -57,6 +77,36 @@
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
-    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1"
+    "env_vars": ""
+  },
+  {
+    "display": "MiniMax-M2.5",
+    "path": "MiniMaxAI/MiniMax-M2.5",
+    "prefix": "MiniMax-M2.5",
+    "args": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "MiniMax-M2.5-MXFP4",
+    "path": "amd/MiniMax-M2.5-MXFP4",
+    "prefix": "MiniMax-M2.5-MXFP4",
+    "args": "--kv_cache_dtype fp8 --trust-remote-code",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "Llama-3.3-70B-Instruct-MXFP4",
+    "path": "amd/Llama-3.3-70B-Instruct-MXFP4-Preview",
+    "prefix": "llama-3-3-70b-instruct-mxfp4",
+    "args": "--kv_cache_dtype fp8 -tp 1",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
   }
 ]

@@ -64,23 +64,15 @@ class PagedAttentionImplPluginModeMethods:
         flash_layout: bool = False,
     ):
         num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
+        x = 16 // k_cache.element_size()
 
         if not flash_layout:
-            x = 16 // k_cache.element_size()
-            k_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, head_size // x, block_size, x],
-                dtype=k_cache.dtype,
-                device="meta",
+            new_key_cache = k_cache.view(
+                num_blocks, num_kv_heads, head_size // x, block_size, x
             )
-            # ATOM: [num_blocks, num_kv_heads, head_size, block_size],
-            # vLLM: [num_blocks, num_kv_heads, block_size // x, head_size, x],
-            v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, block_size // x, head_size, x],
-                dtype=v_cache.dtype,
-                device="meta",
+            new_value_cache = v_cache.view(
+                num_blocks, num_kv_heads, block_size // x, head_size, x
             )
-            new_key_cache = k_cache.view_as(k_cache_template)
-            new_value_cache = v_cache.view_as(v_cache_template)
         else:
             new_key_cache = k_cache
             new_value_cache = v_cache
@@ -349,7 +341,7 @@ class PagedAttentionImplPluginModeMethods:
             token_to_batch=swa_token_to_batch,
             seq_starts=swa_seq_starts,
             dequant=self.kv_cache_dtype.startswith("fp8"),
-            kv_cache_layout="NHD",
+            kv_cache_layout="SHUFFLE",
             total_tokens=swa_total_tokens,
             per_token_quant=self.per_token_quant,
         )
@@ -570,17 +562,21 @@ class PagedAttentionImplPluginModeMethods:
                     dtype=dtypes.fp32,
                     device=self.device,
                 )
-            # update the layer kv scale tensor
-            self.k_scale = self.kv_scale[0]
-            self.v_scale = self.kv_scale[1]
-            layer.k_scale = self.k_scale
-            layer.v_scale = self.v_scale
+                # update the layer kv scale tensor
+                self.k_scale = self.kv_scale[0]
+                self.v_scale = self.kv_scale[1]
+                layer.k_scale = self.k_scale
+                layer.v_scale = self.v_scale
 
         # as vLLM cuda graph capture padding mechanism, here split the qkvo with
         # the actual tokens
         query = query[:num_actual_tokens]
-        qkv = qkv[:num_actual_tokens]
-        position = position[:num_actual_tokens]
+        # vLLM can call plugin attention without fused qkv/position tensors for
+        # some dense-model paths (for example Llama). Slice them only when present.
+        if qkv is not None:
+            qkv = qkv[:num_actual_tokens]
+        if position is not None:
+            position = position[:num_actual_tokens]
         if key is not None:
             key = key[:num_actual_tokens]
         if value is not None:
@@ -610,6 +606,14 @@ class PagedAttentionImplPluginModeMethods:
         num_decode_tokens = attn_metadata.plugin_metadata.num_decode_tokens
         num_extend_tokens = attn_metadata.plugin_metadata.num_extend_tokens
 
+        num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
+        x = 16 // k_cache.element_size()
+        new_key_cache = k_cache.view(
+            num_blocks, num_kv_heads, head_size // x, block_size, x
+        )
+        new_value_cache = v_cache.view(
+            num_blocks, num_kv_heads, block_size // x, head_size, x
+        )
         # calculate for prefills
         if num_prefills > 0:
             assert attn_metadata.plugin_metadata.prefill_metadata is not None
@@ -645,6 +649,7 @@ class PagedAttentionImplPluginModeMethods:
 
         # calculate for extends
         if num_extends > 0:
+
             assert attn_metadata.plugin_metadata.extend_metadata is not None
             extend_tokens_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_extend_tokens
@@ -664,8 +669,8 @@ class PagedAttentionImplPluginModeMethods:
                 query=extend_querys,
                 key=extend_keys,
                 value=extend_values,
-                key_cache=k_cache,
-                value_cache=v_cache,
+                key_cache=new_key_cache,
+                value_cache=new_value_cache,
                 output=extend_outputs,
                 cu_seqlens_q=attn_metadata.plugin_metadata.extend_metadata.query_start_loc,
                 max_seqlen_q=attn_metadata.plugin_metadata.extend_metadata.max_query_len,
@@ -680,21 +685,6 @@ class PagedAttentionImplPluginModeMethods:
         # calculate for decodes
         if num_decodes > 0:
             assert attn_metadata.plugin_metadata.decode_metadata is not None
-
-            num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
-            x = 16 // k_cache.element_size()
-            k_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, head_size // x, block_size, x],
-                dtype=k_cache.dtype,
-                device="meta",
-            )
-            v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, block_size // x, head_size, x],
-                dtype=v_cache.dtype,
-                device="meta",
-            )
-            new_key_cache = k_cache.view_as(k_cache_template)
-            new_value_cache = v_cache.view_as(v_cache_template)
 
             if self.use_triton_attn:
                 self.paged_attention_triton_plugin_mode(

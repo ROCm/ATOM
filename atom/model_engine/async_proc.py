@@ -25,7 +25,7 @@ from threading import Thread
 import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
-from atom.mesh.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.utils import (
     get_mp_context,
     get_open_zmq_ipc_path,
@@ -410,9 +410,11 @@ class AsyncIOProcManager:
             _self = self_ref()
             if not _self or not _self.keep_monitoring:
                 return
-            proc_name = next(proc.name for proc in procs if proc.sentinel == died[0])
+            dead_proc = next(proc for proc in procs if proc.sentinel == died[0])
+            dead_proc.join(timeout=5)
             logger.error(
-                f"{self.label}: [{proc_name}] proc died unexpectedly, shutting down.",
+                f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
+                f"(exitcode={dead_proc.exitcode}), shutting down.",
             )
             _self.exit()
 

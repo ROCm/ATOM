@@ -21,8 +21,10 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
-from atom.config import QuantizationConfig, get_current_atom_config, LayerQuantConfig
+from atom.config import QuantizationConfig, get_current_atom_config
+from atom.quant_spec import LayerQuantConfig
 from atom.model_ops.utils import (
+    atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
     requantize_with_max_scale,
     shuffle_weights,
@@ -218,8 +220,8 @@ class LinearBase(nn.Module):
             if quant_config is not None
             else LayerQuantConfig()
         )
-        quant_type = layer_quant_config["quant_type"]
-        params_dtype = layer_quant_config["quant_dtype"]
+        quant_type = layer_quant_config.quant_type
+        params_dtype = layer_quant_config.quant_dtype
         self.source_quant_dtype = source_quant_dtype
         self.layer_quant_config = layer_quant_config
         super().__init__()
@@ -244,9 +246,8 @@ class LinearBase(nn.Module):
 
         if self.source_quant_dtype is not None:
             weight_size = (self.output_size, self.input_size)
-            self.weight = nn.Parameter(
-                torch.empty(weight_size, dtype=self.source_quant_dtype),
-                requires_grad=False,
+            self.weight = atom_parameter(
+                torch.empty(weight_size, dtype=self.source_quant_dtype)
             )
         else:
             weight_size = (
@@ -254,15 +255,10 @@ class LinearBase(nn.Module):
                 if params_dtype not in [dtypes.fp4x2, dtypes.i4x2]
                 else (self.output_size, self.input_size // 2)
             )
-            self.weight = nn.Parameter(
-                torch.empty(weight_size, dtype=params_dtype),
-                requires_grad=False,
-            )
+            self.weight = atom_parameter(torch.empty(weight_size, dtype=params_dtype))
         if bias:
             output_type = get_current_atom_config().torch_dtype
-            self.bias = nn.Parameter(
-                torch.empty(self.output_size, dtype=output_type), requires_grad=False
-            )
+            self.bias = atom_parameter(torch.empty(self.output_size, dtype=output_type))
             self.bias.weight_loader_process = self.weight_loader_process
         else:
             self.register_parameter("bias", None)
@@ -271,41 +267,36 @@ class LinearBase(nn.Module):
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
             if quant_type == QuantType.per_Tensor:
-                self.weight_scale = nn.Parameter(
-                    torch.empty(len(self.output_partition_sizes), 1, dtype=dtypes.fp32),
-                    requires_grad=False,
+                self.weight_scale = atom_parameter(
+                    torch.empty(len(self.output_partition_sizes), 1, dtype=dtypes.fp32)
                 )
-                if not layer_quant_config["is_dynamic"]:
-                    self.input_scale = nn.Parameter(
+                if not layer_quant_config.is_dynamic:
+                    self.input_scale = atom_parameter(
                         torch.empty(
                             len(self.output_partition_sizes), 1, dtype=dtypes.fp32
-                        ),
-                        requires_grad=False,
+                        )
                     )
                     self.input_scale.weight_loader_process = self.weight_loader_process
                     self.input_scale.weight_loader = self.weight_loader
             elif quant_type == QuantType.per_Token:
-                self.weight_scale = nn.Parameter(
-                    torch.empty(self.output_size, 1, dtype=dtypes.fp32),
-                    requires_grad=False,
+                self.weight_scale = atom_parameter(
+                    torch.empty(self.output_size, 1, dtype=dtypes.fp32)
                 )
             elif quant_type == QuantType.per_1x128:
-                self.weight_scale = nn.Parameter(
+                self.weight_scale = atom_parameter(
                     torch.empty(
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
                         dtype=dtypes.fp32,
-                    ),
-                    requires_grad=False,
+                    )
                 )
             elif quant_type == QuantType.per_1x32:
-                self.weight_scale = nn.Parameter(
+                self.weight_scale = atom_parameter(
                     torch.empty(
                         self.output_size,
                         (self.input_size + 31) // 32,
                         dtype=dtypes.fp8_e8m0,
-                    ),
-                    requires_grad=False,
+                    )
                 )
             self.weight.weight_loader_process = self.weight_loader_process
             self.weight_scale.weight_loader_process = self.weight_loader_process
@@ -380,7 +371,7 @@ class LinearBase(nn.Module):
                 shuffle=False,
             )
             self.weight.data = w_q
-            self.weight_scale = torch.nn.Parameter(w_s, requires_grad=False)
+            self.weight_scale = atom_parameter(w_s)
             shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
@@ -558,7 +549,7 @@ class MergedColumnParallelLinear(LinearBase):
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: int | tuple[int, ...],
+        loaded_shard_id: int | tuple[int, ...] | None = None,
     ):
         # Support loading multiple consecutive shards in a single tensor.
         # This mirrors vLLM's behavior for packed modules like QKV.
@@ -587,6 +578,33 @@ class MergedColumnParallelLinear(LinearBase):
                     self, "input_scale", None
                 ):
                     shard_size //= 128
+                shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
+                self.weight_loader(param, shard, shard_id)
+                current_offset += shard_size
+            return
+
+        if loaded_shard_id is None:
+            # Loaded weight is already fused on disk
+            # Split it and load each shard individually.
+            param_data = param.data
+            # Check if this is weight or weight_scale
+            is_scale_param = param is getattr(
+                self, "weight_scale", None
+            ) or param is getattr(self, "input_scale", None)
+
+            # For fused weight, need to match param shape
+            if param_data.shape == loaded_weight.shape:
+                # Shapes match - direct copy
+                param.weight_loader_process(param_data, loaded_weight)
+                return
+
+            # Otherwise, split the fused weight and load each output shard
+            current_offset = 0
+            for shard_id, output_size in enumerate(self.output_sizes):
+                shard_size = output_size
+                if is_scale_param and self.quant_type == QuantType.per_1x128:
+                    shard_size //= 128
+
                 shard = loaded_weight.narrow(self.tp_dim, current_offset, shard_size)
                 self.weight_loader(param, shard, shard_id)
                 current_offset += shard_size

@@ -10,6 +10,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import block_table_convert_triton
+from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
 from atom.utils.forward_context import AttentionMetaData
 from torch import nn
 
@@ -246,6 +247,14 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
 
         return attn_metadata, positions
         # return var["positions"].copy_to_gpu(sum_scheduled_tokens)
+
+    def build_ubatch_prefill_metadata(
+        self,
+        attn_metadata: AttentionMetaData,
+        ub_slice: UBatchSlice,
+        padded_bs: int,
+    ) -> AttentionMetaData:
+        return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
 
     def build(self, batch: ScheduledBatch, bs: int):
         is_prefill = batch.total_tokens_num_prefill > 0
