@@ -73,6 +73,11 @@ RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
 RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" && \
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip install --upgrade pip && \
+    # OOT keeps the base image's ATOM-installed transformers rather than letting
+    # cloned vLLM re-resolve it back below 5.
+    sed -i -e '/^transformers[[:space:]]/d' requirements/common.txt && \
+    echo "Removed transformers constraint from cloned vLLM requirements/common.txt to preserve base image transformers" && \
+    ! grep '^transformers' requirements/common.txt && \
     sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt && \
     "${VENV_PYTHON}" -m pip install --no-deps xgrammar==0.1.29 compressed-tensors==0.13.0 loguru && \
     sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' requirements/rocm.txt && \
