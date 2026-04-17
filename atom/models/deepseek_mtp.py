@@ -11,6 +11,7 @@ from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
+from atom.plugin import is_vllm
 
 from atom.utils.decorators import support_torch_compile
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
@@ -89,10 +90,12 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # masked_inputs_embeds = torch.where(
-        #     positions.unsqueeze(-1) == 0, 0, inputs_embeds
-        # )
-        masked_inputs_embeds = inputs_embeds
+        if is_vllm():
+            masked_inputs_embeds = torch.where(
+                    positions.unsqueeze(-1) == 0, 0, inputs_embeds
+                )
+        else:
+            masked_inputs_embeds = inputs_embeds
         inputs_embeds = self.enorm(masked_inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -168,11 +171,6 @@ class DeepSeekMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
-        # Native ATOM MTP drafts at the next RoPE position, while vLLM's
-        # speculative decoder advances its public positions buffer after each
-        # draft step. Expose the required offset so the vLLM wrapper can adapt
-        # positions on the ATOM side without patching vLLM's rollout logic.
-        self.vllm_draft_position_offset = 1
 
         if hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None:
             self.packed_modules_mapping = {

@@ -292,7 +292,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
-        positions = self._maybe_adjust_draft_positions(positions)
+        # positions = self._maybe_adjust_draft_positions(positions)
 
         # pass positions from vLLM to OOT execution path via vLLM's per-forward context
         if is_forward_context_available():
