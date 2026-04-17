@@ -78,6 +78,23 @@ def build_entries(
         docker_image = ci_metadata.get("docker_image")
         if docker_image:
             extra_parts.append(f"Docker: {docker_image}")
+        gpu_name = ci_metadata.get("gpu_name")
+        if gpu_name:
+            extra_parts.append(f"GPU: {gpu_name}")
+        gpu_vram_gb = ci_metadata.get("gpu_vram_gb")
+        if gpu_vram_gb not in (None, ""):
+            try:
+                gpu_vram_val = float(gpu_vram_gb)
+            except (TypeError, ValueError):
+                gpu_vram_val = None
+            if gpu_vram_val is not None:
+                if gpu_vram_val.is_integer():
+                    extra_parts.append(f"VRAM: {int(gpu_vram_val)}GB")
+                else:
+                    extra_parts.append(f"VRAM: {gpu_vram_val:g}GB")
+        rocm_version = ci_metadata.get("rocm_version")
+        if rocm_version:
+            extra_parts.append(f"ROCm: {rocm_version}")
 
         try:
             if strict_score is not None:
