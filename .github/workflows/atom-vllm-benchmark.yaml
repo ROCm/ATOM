@@ -63,6 +63,10 @@ on:
         description: "Qwen3.5-397B-A17B-FP8 TP8"
         type: boolean
         default: false
+      qwen3-5-397b-a17b-mxfp4:
+        description: "Qwen3.5-397B-A17B-MXFP4 TP4"
+        type: boolean
+        default: false
       qwen3-next-80b-a3b-instruct-fp8-tp1:
         description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1"
         type: boolean
@@ -330,6 +334,7 @@ jobs:
           ENABLE_QWEN3_5_397B_A17B_FP8_TP2: ${{ inputs.qwen3-5-397b-a17b-fp8-tp2 }}
           ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}
           ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
+          ENABLE_QWEN3_5_397B_A17B_MXFP4: ${{ inputs.qwen3-5-397b-a17b-mxfp4 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}
         run: |
@@ -349,6 +354,7 @@ jobs:
               or (.prefix == "qwen3-5-397b-a17b-fp8-tp2" and env.ENABLE_QWEN3_5_397B_A17B_FP8_TP2 == "true")
               or (.prefix == "qwen3-5-397b-a17b-fp8-tp4" and env.ENABLE_QWEN3_5_397B_A17B_FP8_TP4 == "true")
               or (.prefix == "qwen3-5-397b-a17b-fp8" and env.ENABLE_QWEN3_5_397B_A17B_FP8 == "true")
+              or (.prefix == "qwen3-5-397b-a17b-mxfp4" and env.ENABLE_QWEN3_5_397B_A17B_MXFP4 == "true")
               or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp1" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1 == "true")
               or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp4" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4 == "true")
             ))
@@ -600,6 +606,7 @@ jobs:
             qwen3-5-397b-a17b-fp8-tp2) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-fp8-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-5-397b-a17b-mxfp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-next-80b-a3b-instruct-fp8-tp1) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-next-80b-a3b-instruct-fp8-tp4) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
