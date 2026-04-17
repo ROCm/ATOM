@@ -387,10 +387,7 @@ async def chat_completions(request: ChatCompletionRequest):
         # Streaming
         if request.stream:
             seq_id, stream_queue = await setup_streaming_request(
-                prompt,
-                sampling_params,
-                request_id,
-                kv_transfer_params=request.kv_transfer_params,
+                prompt, sampling_params, request_id
             )
             gen = stream_chat_response(
                 request_id,
@@ -408,12 +405,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Non-streaming
         final_output = None
-        async for output in generate_async(
-            prompt,
-            sampling_params,
-            request_id,
-            kv_transfer_params=request.kv_transfer_params,
-        ):
+        async for output in generate_async(prompt, sampling_params, request_id):
             final_output = output
 
         if final_output is None:

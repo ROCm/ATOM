@@ -85,8 +85,6 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Any] = (
         None  # "auto", "none", "required", or {function: {name}}
     )
-    # Optional KV-transfer metadata for P/D disaggregation.
-    kv_transfer_params: Optional[Dict[str, Any]] = None
     # Accepted for compatibility, not actively used:
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0

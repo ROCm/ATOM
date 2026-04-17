@@ -26,7 +26,6 @@ def create_chat_chunk(
     delta: Optional[Dict[str, Any]] = None,
     finish_reason: Optional[str] = None,
     usage: Optional[Dict] = None,
-    **extra_fields: Any,
 ) -> str:
     """Create a chat completion chunk in SSE format."""
     chunk = {
@@ -43,7 +42,6 @@ def create_chat_chunk(
             }
         ],
     }
-    chunk.update(extra_fields)
     if usage is not None:
         chunk["usage"] = usage
     return f"data: {json.dumps(chunk)}\n\n"
@@ -131,12 +129,6 @@ async def stream_chat_response(
 
     cleanup_fn(request_id, seq_id)
 
-    # Propagate any KV-transfer metadata emitted with the final chunk so
-    # proxies can tie prefill/decode requests together.
-    final_extra: Dict[str, Any] = {}
-    if "kv_transfer_params" in chunk_data:
-        final_extra["kv_transfer_params"] = chunk_data["kv_transfer_params"]
-
     # Final chunks
     finish_reason = "tool_calls" if has_tool_calls else "stop"
     usage = {
@@ -144,9 +136,7 @@ async def stream_chat_response(
         "completion_tokens": num_tokens_output,
         "total_tokens": num_tokens_input + num_tokens_output,
     }
-    yield create_chat_chunk(
-        request_id, model, finish_reason=finish_reason, **final_extra
-    )
+    yield create_chat_chunk(request_id, model, finish_reason=finish_reason)
     usage_chunk = {
         "id": request_id,
         "object": CHAT_COMPLETION_CHUNK_OBJECT,
@@ -178,7 +168,7 @@ def build_chat_response(
 
     finish_reason = "tool_calls" if tool_calls else final_output["finish_reason"]
 
-    response = ChatCompletionResponse(
+    return ChatCompletionResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
@@ -199,10 +189,3 @@ def build_chat_response(
             "latency_s": round(final_output.get("latency", 0.0), 4),
         },
     )
-    if "kv_transfer_output_meta_info" in final_output:
-        response = response.model_copy(
-            update={
-                "kv_transfer_params": final_output["kv_transfer_output_meta_info"],
-            }
-        )
-    return response
