@@ -391,6 +391,7 @@ class Qwen3NextAttention(nn.Module):
                 self.head_dim,
                 self.scaling,
                 num_kv_heads=self.num_kv_heads,
+                kv_cache_dtype=atom_config.kv_cache_dtype,
                 quant_config=quant_config,
                 use_mla=False,
                 layer_num=extract_layer_index(prefix),
