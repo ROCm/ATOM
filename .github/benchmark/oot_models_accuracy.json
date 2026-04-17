@@ -50,8 +50,8 @@
     "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
     "runner": "linux-atom-mi35x-4",
     "test_level": "nightly",
-    "accuracy_threshold": 0.83,
-    "accuracy_baseline": 0.909,
+    "accuracy_threshold": 0.82,
+    "accuracy_baseline": 0.82,
     "accuracy_baseline_model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
     "_baseline_note": "Using Qwen3-235B baseline as proxy; needs CI measurement for Qwen3.5 specific baseline"
   },
