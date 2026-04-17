@@ -80,7 +80,7 @@ on:
         type: boolean
         default: false
       rebuild_atom_base_from_dockerfile:
-        description: "Rebuild ATOM base image from docker/Dockerfile before OOT validation (slow)"
+        description: "Full build image before validation"
         required: false
         type: boolean
         default: false
