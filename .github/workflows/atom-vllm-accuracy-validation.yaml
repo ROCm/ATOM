@@ -1,4 +1,4 @@
-name: vLLM-ATOM Nightly
+name: vLLM ATOM Nightly
 
 on:
   schedule:
@@ -69,6 +69,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_glm5_1_fp8_tp8:
+        description: "GLM-5.1-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
       upload_accuracy_to_dashboard:
         description: "Optional: upload vLLM-ATOM accuracy results to dashboard after this manual run"
         required: false
@@ -90,7 +95,7 @@ env:
 
 jobs:
   # ---------- vLLM-ATOM full validation path (schedule / workflow_dispatch) ----------
-  prepare-vLLM-ATOM-image:
+  prepare-vllm-atom-image:
     name: Prepare validation image
     runs-on: build-only-atom
     outputs:
@@ -121,6 +126,7 @@ jobs:
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
+          RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
         run: |
           set -euo pipefail
 
@@ -217,7 +223,7 @@ jobs:
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8",
                   "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
-                  "model_path": "amd/DeepSeek-R1-0528-MXFP4",
+                  "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
@@ -241,6 +247,16 @@ jobs:
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-4",
               },
+              {
+                  "toggle_env": "RUN_GLM5_1_FP8_TP8",
+                  "model_name": "GLM-5.1-FP8 TP8",
+                  "model_path": "zai-org/GLM-5.1-FP8",
+                  "extra_args": "--tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.88,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-8",
+              },
           ]
 
           selected = []
@@ -257,8 +273,26 @@ jobs:
           PY
 
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            echo "Scheduled run uses published vLLM-ATOM image: ${NIGHTLY_vLLM_ATOM_IMAGE_TAG}"
-            echo "vllm_atom_image_tag=${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            if RESOLUTION_JSON="$(
+              python3 .github/scripts/resolve_atom_image.py \
+                --repository "${VALIDATION_IMAGE_REPO}" \
+                --reference-tag vllm-latest
+            )"; then
+              RESOLVED_vLLM_ATOM_IMAGE="$(
+                RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          PY
+              )"
+              echo "Scheduled run resolved published vLLM-ATOM image: ${RESOLVED_vLLM_ATOM_IMAGE}"
+            else
+              echo "::warning::Failed to resolve ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} to an immutable reference; falling back to the floating tag."
+              RESOLVED_vLLM_ATOM_IMAGE="${NIGHTLY_vLLM_ATOM_IMAGE_TAG}"
+            fi
+            echo "vllm_atom_image_tag=${RESOLVED_vLLM_ATOM_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -266,7 +300,7 @@ jobs:
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           MANUAL_BASE_IMAGE_TAG="vllm_atom_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
-          vLLM_ATOM_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vLLM-ATOM-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          VLLM_ATOM_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vllm-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
@@ -313,7 +347,7 @@ jobs:
             "${BUILD_CONTEXT}"
 
           docker build --network=host --no-cache \
-            -t "${vLLM_ATOM_IMAGE_TAG}" \
+            -t "${VLLM_ATOM_IMAGE_TAG}" \
             --target vllm_atom \
             --build-arg vLLM_ATOM_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
@@ -323,9 +357,9 @@ jobs:
             -f "${BUILD_CONTEXT}/docker/Dockerfile" \
             "${BUILD_CONTEXT}"
 
-          docker push "${vLLM_ATOM_IMAGE_TAG}"
+          docker push "${VLLM_ATOM_IMAGE_TAG}"
 
-          echo "vllm_atom_image_tag=${vLLM_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "vllm_atom_image_tag=${VLLM_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
           echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
@@ -335,20 +369,20 @@ jobs:
           docker rmi "${{ steps.meta.outputs.vllm_atom_image_tag }}" || true
           docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
 
-  vLLM-ATOM-model-accuracy:
+  vllm-atom-model-accuracy:
     name: Model Accuracy (${{ matrix.model_name }})
-    needs: [prepare-vLLM-ATOM-image]
+    needs: [prepare-vllm-atom-image]
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare-vLLM-ATOM-image.outputs.model_matrix) }}
+      matrix: ${{ fromJSON(needs.prepare-vllm-atom-image.outputs.model_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     permissions:
       actions: read
       contents: write
     env:
-      CONTAINER_NAME: vllm_atom_validation_${{ strategy.job-index }}
-      vLLM_ATOM_IMAGE_TAG: ${{ needs.prepare-vLLM-ATOM-image.outputs.vllm_atom_image_tag }}
+      CONTAINER_NAME: atom_vllm_atom_validation_${{ strategy.job-index }}
+      VLLM_ATOM_IMAGE_TAG: ${{ needs.prepare-vllm-atom-image.outputs.vllm_atom_image_tag }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -362,7 +396,7 @@ jobs:
 
       - name: Pull vLLM-ATOM image
         run: |
-          docker pull "${vLLM_ATOM_IMAGE_TAG}"
+          docker pull "${VLLM_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -417,7 +451,7 @@ jobs:
             --env-file /tmp/vllm_atom_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${vLLM_ATOM_IMAGE_TAG}"
+            "${VLLM_ATOM_IMAGE_TAG}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -489,10 +523,10 @@ jobs:
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "VLLM_ATOM_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
           else
-            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "VLLM_ATOM_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
@@ -503,14 +537,17 @@ jobs:
           vLLM_ATOM_MODEL_PATH: ${{ matrix.model_path }}
           vLLM_ATOM_EXTRA_ARGS: ${{ matrix.extra_args }}
           vLLM_ATOM_ENV_VARS: ${{ matrix.env_vars }}
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
             -e vLLM_ATOM_MODEL_NAME="${vLLM_ATOM_MODEL_NAME}" \
-            -e vLLM_ATOM_MODEL_PATH="${vLLM_ATOM_RESOLVED_MODEL_PATH:-$vLLM_ATOM_MODEL_PATH}" \
+            -e vLLM_ATOM_MODEL_PATH="${VLLM_ATOM_RESOLVED_MODEL_PATH:-$vLLM_ATOM_MODEL_PATH}" \
             -e vLLM_ATOM_EXTRA_ARGS="${vLLM_ATOM_EXTRA_ARGS}" \
             -e vLLM_ATOM_ENV_VARS="${vLLM_ATOM_ENV_VARS}" \
+            -e VLLM_ATOM_DOCKER_IMAGE="${VLLM_ATOM_IMAGE_TAG}" \
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
@@ -559,7 +596,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vLLM-ATOM-validation-${{ matrix.model_name }}-${{ github.run_id }}
+          name: vllm-atom-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
             vllm_atom.log
             vllm_atom_accuracy_output.txt
@@ -579,14 +616,14 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_atom.pid ]; then kill \$(cat /tmp/vllm_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          docker rmi "${vLLM_ATOM_IMAGE_TAG}" || true
+          docker rmi "${VLLM_ATOM_IMAGE_TAG}" || true
 
   # Build the dashboard payload from all uploaded accuracy artifacts after the
   # full matrix completes. This keeps dashboard writes off the GPU runners and
   # ensures each nightly/manual run publishes at most once.
   accuracy-dashboard:
     name: Update accuracy dashboard
-    needs: [vLLM-ATOM-model-accuracy]
+    needs: [vllm-atom-model-accuracy]
     if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
     runs-on: ubuntu-latest
     permissions:
@@ -642,7 +679,7 @@ jobs:
           output-file-path: accuracy-benchmark-input.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
-          auto-push: false
+          auto-push: true
           max-items-in-chart: 90
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -669,3 +706,229 @@ jobs:
           git add benchmark-dashboard/data.js
           git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
           git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
+
+      - name: Push dashboard data to gh-pages
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          if [ ! -f benchmark-dashboard/data.js ]; then
+            echo "::error::benchmark-dashboard/data.js was not produced by github-action-benchmark"
+            exit 1
+          fi
+
+          cp benchmark-dashboard/data.js /tmp/vllm-atom-accuracy-data.js
+
+          # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
+          git checkout -B gh-pages-data-only origin/gh-pages
+          mkdir -p benchmark-dashboard
+          cp /tmp/vllm-atom-accuracy-data.js benchmark-dashboard/data.js
+
+          git add benchmark-dashboard/data.js
+          git diff --cached --quiet || git commit -m "Update vLLM-ATOM accuracy dashboard data"
+          git push origin HEAD:gh-pages
+
