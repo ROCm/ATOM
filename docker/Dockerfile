@@ -195,7 +195,8 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     rm -f pyproject.toml && \
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
-    "${VENV_PYTHON}" -c "import tomllib; from pathlib import Path; deps = tomllib.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'transformers==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
+    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'transformers==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       -r /tmp/sglang-runtime-common.txt \
       airportsdata \
@@ -207,6 +208,7 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       nest_asyncio \
       outlines_core==0.1.26 \
       pycountry \
+      pybase64 \
       referencing \
       safetensors && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps \
@@ -376,5 +378,89 @@ RUN git clone $ATOM_REPO /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     pip install -e .
 RUN pip show atom || true
+
+# ========== Mooncake TransferEngine ==========
+ARG INSTALL_MOONCAKE=1
+ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ARG MOONCAKE_COMMIT="v0.3.10.post1"
+ARG VENV_PYTHON="/opt/venv/bin/python"
+
+# [MC 1/4] Clone
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 1/4] Clone Mooncake =========="; \
+        git clone --depth 1 ${MOONCAKE_REPO} /app/mooncake; \
+        if [ -n "${MOONCAKE_COMMIT}" ]; then \
+            cd /app/mooncake && git fetch --depth 1 origin "${MOONCAKE_COMMIT}" && git checkout "${MOONCAKE_COMMIT}"; \
+        fi; \
+        cd /app/mooncake && echo "Mooncake commit: $(git rev-parse HEAD)"; \
+    else \
+        echo "========== Skipped Mooncake (INSTALL_MOONCAKE=0) =========="; \
+    fi
+
+# [MC 2/4] Install dependencies (system packages + yalantinglibs + Go + submodules)
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
+        apt-get update \
+        && apt --fix-broken install -y \
+        && apt-mark hold rccl rccl-dev rocm-hip 2>/dev/null || true \
+        && cd /app/mooncake && bash dependencies.sh -y; \
+    fi
+
+# [MC 3/4] CMake build with HIP support
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 3/4] Build Mooncake (USE_HIP=ON) =========="; \
+        mkdir -p /app/mooncake/build && cd /app/mooncake/build \
+        && cmake .. \
+            -DUSE_HIP=ON \
+            -DUSE_TCP=ON \
+            -DUSE_HTTP=ON \
+            -DUSE_CUDA=OFF \
+            -DBUILD_UNIT_TESTS=ON \
+            -DBUILD_EXAMPLES=OFF \
+            -DWITH_STORE=OFF \
+            -DWITH_STORE_RUST=OFF \
+            -DWITH_P2P_STORE=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+        && make -j$(nproc); \
+    fi
+
+# [MC 4/4] Install Python wheel, copy artifacts, clean up
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 4/4] Install Mooncake Python package =========="; \
+        cd /app/mooncake \
+        && "${VENV_PYTHON}" -m pip install mooncake-wheel/ \
+        && MOONCAKE_PKG=$("${VENV_PYTHON}" -c "import mooncake, os; print(os.path.dirname(mooncake.__file__))") \
+        && cp build/mooncake-integration/engine.cpython-310-x86_64-linux-gnu.so \
+              "${MOONCAKE_PKG}/engine.so" \
+        && cp build/mooncake-asio/libasio.so \
+              "${MOONCAKE_PKG}/" \
+        && echo "Mooncake engine.so linkage:" \
+        && ldd "${MOONCAKE_PKG}/engine.so" | grep -E "hip|cuda" || true \
+        && echo "--- Save RDMA test binaries ---" \
+        && mkdir -p /usr/local/bin/mooncake-tests \
+        && cp build/mooncake-transfer-engine/tests/rdma_loopback_test \
+              build/mooncake-transfer-engine/tests/rdma_transport_test \
+              build/mooncake-transfer-engine/tests/rdma_transport_test2 \
+              /usr/local/bin/mooncake-tests/ 2>/dev/null || true \
+        && ls -lh /usr/local/bin/mooncake-tests/ \
+        && echo "--- Clean up build artifacts ---" \
+        && rm -rf /app/mooncake/build /app/mooncake/.git; \
+    fi
+
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/mooncake:${LD_LIBRARY_PATH}"
+
+# ========== Install Rust toolchain ==========
+ARG RUST_VERSION="1.94.0"
+
+RUN echo "========== Install Rust toolchain ==========" \
+    && apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
+    && . "$HOME/.cargo/env" \
+    && rustc --version && cargo --version
+
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 CMD ["/bin/bash"]
