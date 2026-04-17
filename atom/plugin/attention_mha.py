@@ -210,16 +210,23 @@ class PagedAttentionImplPluginModeMethods:
         v_scale: torch.Tensor,
         out: torch.Tensor,
         attn_metadata: "AttentionMetaData",
+        ps: bool = True,
     ):
         o = out
         num_seqs, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
         query_group_size = num_q_heads_total // num_kv_heads
         assert num_q_heads_total % num_kv_heads == 0
-
-        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
-
         context_partition_size = 256
+
+        def cdiv(a, b):
+            return (a + b - 1) // b
+
+        if ps:
+            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        else:
+            max_context_partition_num = cdiv(attn_metadata.max_seqlen_k, context_partition_size)
+
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
@@ -512,6 +519,12 @@ class PagedAttentionImplPluginModeMethods:
             suffix_lse=lse,
         )
 
+    def adopt_persistent_kernel(self, head_size, num_kv_heads, num_q_heads):
+        non_ps_database = {(256, 4, 1)}
+        if (head_size, num_kv_heads, num_q_heads) in non_ps_database:
+            return False
+        return True
+
     def forward_impl_plugin_mode(
         self,
         layer: torch.nn.Module,
@@ -709,6 +722,7 @@ class PagedAttentionImplPluginModeMethods:
             assert attn_metadata.plugin_metadata.decode_metadata is not None
 
             num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
+            _, num_heads, _ = query.shape
             x = 16 // k_cache.element_size()
             k_cache_template = torch.empty(
                 [num_blocks, num_kv_heads, head_size // x, block_size, x],
@@ -722,7 +736,7 @@ class PagedAttentionImplPluginModeMethods:
             )
             new_key_cache = k_cache.view_as(k_cache_template)
             new_value_cache = v_cache.view_as(v_cache_template)
-
+            use_ps = self.adopt_persistent_kernel(head_size, num_kv_heads, num_heads)
             if self.use_triton_attn:
                 self.paged_attention_triton_plugin_mode(
                     q=query[:num_decode_tokens],
@@ -732,6 +746,7 @@ class PagedAttentionImplPluginModeMethods:
                     v_scale=v_scale,
                     out=output_actual_tokens[:num_decode_tokens],
                     attn_metadata=attn_metadata,
+                    ps=use_ps,
                 )
             else:
                 # Qwen only uses gluon pa decode when bs=64
@@ -744,6 +759,7 @@ class PagedAttentionImplPluginModeMethods:
                         v_scale=v_scale,
                         out=output_actual_tokens[:num_decode_tokens],
                         attn_metadata=attn_metadata,
+                        ps=use_ps
                     )
                 else:
                     self.paged_attention_asm_plugin_mode(
@@ -772,6 +788,7 @@ def PagedAttentionImplDecoratorForPluginMode(cls):
         "extend_for_sliding_window",
         "extend_forward",
         "forward_impl_plugin_mode",
+        "adopt_persistent_kernel",
     ]
 
     logger.info(
