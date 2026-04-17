@@ -86,7 +86,7 @@ concurrency:
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
-  NIGHTLY_vLLM_ATOM_IMAGE_TAG: rocm/atom-dev:vllm-latest
+  NIGHTLY_VLLM_ATOM_IMAGE_TAG: rocm/atom-dev:vllm-latest
   VALIDATION_IMAGE_REPO: rocm/atom-dev
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
@@ -278,7 +278,7 @@ jobs:
                 --repository "${VALIDATION_IMAGE_REPO}" \
                 --reference-tag vllm-latest
             )"; then
-              RESOLVED_vLLM_ATOM_IMAGE="$(
+              RESOLVED_VLLM_ATOM_IMAGE="$(
                 RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
           import json
           import os
@@ -287,12 +287,12 @@ jobs:
           print(resolution["resolved_image"])
           PY
               )"
-              echo "Scheduled run resolved published vLLM-ATOM image: ${RESOLVED_vLLM_ATOM_IMAGE}"
+              echo "Scheduled run resolved published vLLM-ATOM image: ${RESOLVED_VLLM_ATOM_IMAGE}"
             else
-              echo "::warning::Failed to resolve ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} to an immutable reference; falling back to the floating tag."
-              RESOLVED_vLLM_ATOM_IMAGE="${NIGHTLY_vLLM_ATOM_IMAGE_TAG}"
+              echo "::warning::Failed to resolve ${NIGHTLY_VLLM_ATOM_IMAGE_TAG} to an immutable reference; falling back to the floating tag."
+              RESOLVED_VLLM_ATOM_IMAGE="${NIGHTLY_VLLM_ATOM_IMAGE_TAG}"
             fi
-            echo "vllm_atom_image_tag=${RESOLVED_vLLM_ATOM_IMAGE}" >> "$GITHUB_OUTPUT"
+            echo "vllm_atom_image_tag=${RESOLVED_VLLM_ATOM_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -349,7 +349,7 @@ jobs:
           docker build --network=host --no-cache \
             -t "${VLLM_ATOM_IMAGE_TAG}" \
             --target vllm_atom \
-            --build-arg vLLM_ATOM_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
+            --build-arg VLLM_ATOM_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -533,19 +533,19 @@ jobs:
       - name: Run vLLM-ATOM launch and gsm8k accuracy via script (full mode)
         timeout-minutes: 120
         env:
-          vLLM_ATOM_MODEL_NAME: ${{ matrix.model_name }}
-          vLLM_ATOM_MODEL_PATH: ${{ matrix.model_path }}
-          vLLM_ATOM_EXTRA_ARGS: ${{ matrix.extra_args }}
-          vLLM_ATOM_ENV_VARS: ${{ matrix.env_vars }}
+          VLLM_ATOM_MODEL_NAME: ${{ matrix.model_name }}
+          VLLM_ATOM_MODEL_PATH: ${{ matrix.model_path }}
+          VLLM_ATOM_EXTRA_ARGS: ${{ matrix.extra_args }}
+          VLLM_ATOM_ENV_VARS: ${{ matrix.env_vars }}
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
-            -e vLLM_ATOM_MODEL_NAME="${vLLM_ATOM_MODEL_NAME}" \
-            -e vLLM_ATOM_MODEL_PATH="${VLLM_ATOM_RESOLVED_MODEL_PATH:-$vLLM_ATOM_MODEL_PATH}" \
-            -e vLLM_ATOM_EXTRA_ARGS="${vLLM_ATOM_EXTRA_ARGS}" \
-            -e vLLM_ATOM_ENV_VARS="${vLLM_ATOM_ENV_VARS}" \
+            -e VLLM_ATOM_MODEL_NAME="${VLLM_ATOM_MODEL_NAME}" \
+            -e VLLM_ATOM_MODEL_PATH="${VLLM_ATOM_RESOLVED_MODEL_PATH:-$VLLM_ATOM_MODEL_PATH}" \
+            -e VLLM_ATOM_EXTRA_ARGS="${VLLM_ATOM_EXTRA_ARGS}" \
+            -e VLLM_ATOM_ENV_VARS="${VLLM_ATOM_ENV_VARS}" \
             -e VLLM_ATOM_DOCKER_IMAGE="${VLLM_ATOM_IMAGE_TAG}" \
             -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
