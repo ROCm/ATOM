@@ -79,6 +79,11 @@ on:
         required: false
         type: boolean
         default: false
+      rebuild_atom_base_from_dockerfile:
+        description: "Rebuild ATOM base image from docker/Dockerfile before OOT validation (slow)"
+        required: false
+        type: boolean
+        default: false
       upload_accuracy_to_dashboard:
         description: "Optional: upload OOT accuracy results to dashboard after this manual run"
         required: false
@@ -133,6 +138,7 @@ jobs:
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
           RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
+          REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
         run: |
           set -euo pipefail
 
@@ -287,6 +293,15 @@ jobs:
           print(f"model_matrix={json.dumps({'include': selected})}")
           PY
 
+          REBUILD_FROM_DOCKERFILE="${REBUILD_ATOM_BASE_FROM_DOCKERFILE:-false}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+              echo "Manual run selected full ATOM base rebuild from docker/Dockerfile"
+            else
+              echo "Manual run selected fast overlay rebuild from ${ATOM_BASE_NIGHTLY_IMAGE}"
+            fi
+          fi
+
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             if RESOLUTION_JSON="$(
               python3 .github/scripts/resolve_atom_image.py \
@@ -310,16 +325,58 @@ jobs:
             echo "oot_image_tag=${RESOLVED_OOT_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           MANUAL_BASE_IMAGE_TAG="atom_oot_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          REBUILT_ATOM_BASE_IMAGE_TAG="atom_oot_rebuilt_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
           OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vllm-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
+          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
+          if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+            echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=${REBUILT_ATOM_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
           git archive --format=tar HEAD | tar -xf - -C "${BUILD_CONTEXT}"
+
+          if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+            echo "Manual run rebuilds ATOM base and OOT image from branch ${GITHUB_REF_NAME}"
+
+            DOCKER_BUILDKIT=1 docker build --pull --network=host --no-cache \
+              -t "${REBUILT_ATOM_BASE_IMAGE_TAG}" \
+              --target atom_image \
+              --build-arg GPU_ARCH="${GPU_ARCH}" \
+              --build-arg AITER_REPO="${AITER_REPO}" \
+              --build-arg AITER_COMMIT="${AITER_COMMIT}" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg ATOM_REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+              --build-arg ATOM_COMMIT="${GITHUB_SHA}" \
+              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              "${BUILD_CONTEXT}"
+
+            DOCKER_BUILDKIT=1 docker build --network=host --no-cache \
+              -t "${OOT_IMAGE_TAG}" \
+              --target atom_oot \
+              --build-arg OOT_BASE_IMAGE="${REBUILT_ATOM_BASE_IMAGE_TAG}" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
+              --build-arg INSTALL_LM_EVAL=1 \
+              --build-arg INSTALL_FASTSAFETENSORS=1 \
+              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              "${BUILD_CONTEXT}"
+
+            docker push "${OOT_IMAGE_TAG}"
+            exit 0
+          fi
 
           cat <<'EOF' > "${BUILD_CONTEXT}/Dockerfile.mod"
           ARG ATOM_BASE_NIGHTLY_IMAGE
@@ -374,15 +431,17 @@ jobs:
 
           docker push "${OOT_IMAGE_TAG}"
 
-          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
-          echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker rmi "${{ steps.meta.outputs.oot_image_tag }}" || true
-          docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
+          for image in \
+            "${{ steps.meta.outputs.oot_image_tag }}" \
+            "${{ steps.meta.outputs.manual_base_image_tag }}" \
+            "${{ steps.meta.outputs.rebuilt_atom_base_image_tag }}"; do
+            if [ -n "${image}" ]; then
+              docker rmi "${image}" || true
+            fi
+          done
 
   oot-model-accuracy:
     name: Model Accuracy (${{ matrix.model_name }})
