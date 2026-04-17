@@ -19,11 +19,11 @@ for _sym in ["fused_qk_rmsnorm", "fused_add_rmsnorm", "rmsnorm", "fused_moe_fwd"
 
 from atom import LLMEngine, SamplingParams  # noqa: E402
 
-MODEL = "deepseek-ai/DeepSeek-R1" #"Qwen/Qwen3-0.6B"
+MODEL = "Qwen/Qwen3-0.6B" #"deepseek-ai/DeepSeek-R1"
 PROMPTS = [
-    "What is 2+2?",
-    "Name the capital of France.",
-    "Write a haiku about the ocean.",
+    100*"What is 2+2?",
+    100*"Name the capital of France.",
+    100*"Write a haiku about the ocean.",
 ]
 SAMPLING = SamplingParams(temperature=0.0, max_tokens=64)
 
@@ -48,15 +48,15 @@ def main():
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size")
     args = parser.parse_args()
 
-    print(f"--- Running baseline (no disagg, TP={args.tp}) ---")
-    baseline = run(enable_disagg=False, tp=args.tp)
-    for p, o in zip(PROMPTS, baseline):
-        print(f"  [{p!r}] → {o!r}")
-
-    # print(f"\n--- Running disagg (TP={args.tp}) ---")
-    # disagg = run(enable_disagg=True, tp=args.tp)
-    # for p, o in zip(PROMPTS, disagg):
+    # print(f"--- Running baseline (no disagg, TP={args.tp}) ---")
+    # baseline = run(enable_disagg=False, tp=args.tp)
+    # for p, o in zip(PROMPTS, baseline):
     #     print(f"  [{p!r}] → {o!r}")
+
+    print(f"\n--- Running disagg (TP={args.tp}) ---")
+    disagg = run(enable_disagg=True, tp=args.tp)
+    for p, o in zip(PROMPTS, disagg):
+        print(f"  [{p!r}] → {o!r}")
 
     # print("\n--- Comparison ---")
     # all_match = True

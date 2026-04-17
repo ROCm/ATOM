@@ -1640,6 +1640,17 @@ class ModelRunner:
         self._prefill_stream = torch.cuda.Stream()
         return True  # sentinel so async_proc enqueues the result for wait_out=True
 
+    def create_decode_stream(self) -> bool:
+        """Create a dedicated CUDA stream for disaggregated decode forward passes.
+
+        Called once by DecodeEngineCore._init_disagg(). run_model() runs on
+        this stream; postprocess() runs on the default stream after waiting on
+        _model_fwd_event.
+        """
+        self._decode_stream = torch.cuda.Stream()
+        self._model_fwd_event = torch.cuda.Event()
+        return True  # sentinel so async_proc enqueues the result for wait_out=True
+
     @torch.inference_mode()
     def prefill_forward(self, batch: ScheduledBatch) -> list[int]:
         """Run a prefill forward pass on the dedicated prefill stream.
@@ -1995,8 +2006,22 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
-        logits, hidden_states = self.run_model(input_ids, batch)
+        decode_stream = getattr(self, "_decode_stream", None)
+        if decode_stream is not None:
+            with torch.cuda.stream(decode_stream):
+                input_ids, temperatures, top_ks, top_ps, all_greedy = (
+                    self.prepare_model(batch)
+                )
+                logits, hidden_states = self.run_model(input_ids, batch)
+            # Signal default stream to wait until run_model is done on decode_stream.
+            self._model_fwd_event.record(decode_stream)
+            torch.cuda.current_stream().wait_event(self._model_fwd_event)
+        else:
+            input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(
+                batch
+            )
+            logits, hidden_states = self.run_model(input_ids, batch)
+        # postprocess (sampling + async CPU copy) always runs on default stream.
         fwd_output = self.postprocess(
             batch,
             logits,

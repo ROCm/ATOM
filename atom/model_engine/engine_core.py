@@ -831,6 +831,9 @@ class DecodeEngineCore(EngineCore):
         self._p2d_recv_sock = self._disagg_ctx.socket(zmq.PULL)
         self._p2d_recv_sock.bind(self._disagg_p2d_addr)
 
+        # Create a dedicated CUDA stream for decode forward passes.
+        self.runner_mgr.call_func("create_decode_stream", wait_out=True)
+
         # Start thread to receive PrefillDone from prefill.
         self._prefill_done_thread = threading.Thread(
             target=self._recv_prefill_done,
