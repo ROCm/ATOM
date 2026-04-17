@@ -41,7 +41,10 @@ import numpy as np
 import zmq
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation.base import KVConnectorBase, KVConnectorSchedulerBase
+from atom.kv_transfer.disaggregation.base import (
+    KVConnectorBase,
+    KVConnectorSchedulerBase,
+)
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     EngineId,

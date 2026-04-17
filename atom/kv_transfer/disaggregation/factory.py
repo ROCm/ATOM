@@ -15,7 +15,10 @@ import importlib
 import logging
 from typing import Any
 
-from atom.kv_transfer.disaggregation.base import KVConnectorBase, KVConnectorSchedulerBase
+from atom.kv_transfer.disaggregation.base import (
+    KVConnectorBase,
+    KVConnectorSchedulerBase,
+)
 
 logger = logging.getLogger("atom")
 
