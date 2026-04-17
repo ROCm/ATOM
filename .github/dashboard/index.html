@@ -371,7 +371,8 @@ const BACKEND_HUE_OFFSETS = {
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
 function getModelHue(backend, model) {
-  const backendModelKey = backend ? `${backend}::${model}` : model;
+  const normalizedBackend = backend === 'vLLM-ATOM' ? 'vLLM-ATOM' : backend;
+  const backendModelKey = normalizedBackend ? `${normalizedBackend}::${model}` : model;
   if (MODEL_HUES[backendModelKey] != null) return MODEL_HUES[backendModelKey];
   let baseHue = MODEL_HUES[model];
   if (baseHue == null) {
@@ -379,9 +380,9 @@ function getModelHue(backend, model) {
     MODEL_HUES[model] = baseHue;
     fallbackHueIdx++;
   }
-  const offset = BACKEND_HUE_OFFSETS[backend] ?? 0;
-  const derivedHue = backend ? (baseHue + offset) % 360 : baseHue;
-  if (backend) MODEL_HUES[backendModelKey] = derivedHue;
+  const offset = BACKEND_HUE_OFFSETS[normalizedBackend] ?? 0;
+  const derivedHue = normalizedBackend ? (baseHue + offset) % 360 : baseHue;
+  if (normalizedBackend) MODEL_HUES[backendModelKey] = derivedHue;
   return derivedHue;
 }
 function getModelColor(backend, model) {

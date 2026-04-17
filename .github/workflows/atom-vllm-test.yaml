@@ -152,7 +152,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
-      CONTAINER_NAME: atom_vllm_atom_${{ strategy.job-index }}
+      CONTAINER_NAME: vllm_atom_${{ strategy.job-index }}
       VLLM_COMMIT: 2a69949bdadf0e8942b7a1619b229cb475beef20
       VLLM_VERSION: "0.19.0"
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
@@ -227,8 +227,8 @@ jobs:
       - name: Build vLLM-ATOM image locally
         run: |
           set -euo pipefail
-          docker rmi "atom_vllm_atom_base:ci" || true
-          docker rmi "atom_vllm_atom:ci" || true
+          docker rmi "vllm_atom_base:ci" || true
+          docker rmi "vllm_atom:ci" || true
 
           BUILD_MODE="full"
           if ! docker pull "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}"; then
@@ -250,7 +250,7 @@ jobs:
 
           if [ "${BUILD_MODE}" = "fast" ]; then
             DOCKER_BUILDKIT=1 docker build --network=host \
-              -t atom_vllm_atom:ci \
+              -t vllm_atom:ci \
               --build-arg VLLM_ATOM_BASE_IMAGE="${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" \
               --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
               --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
@@ -263,7 +263,7 @@ jobs:
 
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
-            -t atom_vllm_atom_base:ci \
+            -t vllm_atom_base:ci \
             --build-arg VLLM_ATOM_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
@@ -274,9 +274,9 @@ jobs:
 
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
-            -t atom_vllm_atom:ci \
-            --target atom_vllm_atom \
-            --build-arg VLLM_ATOM_BASE_IMAGE="atom_vllm_atom_base:ci" \
+            -t vllm_atom:ci \
+            --target vllm_atom \
+            --build-arg VLLM_ATOM_BASE_IMAGE="vllm_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -285,7 +285,7 @@ jobs:
 
       - name: Set vLLM-ATOM image tag
         run: |
-          echo "VLLM_ATOM_IMAGE_TAG=atom_vllm_atom:ci" >> "$GITHUB_ENV"
+          echo "VLLM_ATOM_IMAGE_TAG=vllm_atom:ci" >> "$GITHUB_ENV"
 
       - name: Prepare model cache mount
         run: |
@@ -486,6 +486,6 @@ jobs:
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           rm -f Dockerfile.mod || true
-          docker rmi "atom_vllm_atom_base:ci" || true
-          docker rmi "atom_vllm_atom:ci" || true
+          docker rmi "vllm_atom_base:ci" || true
+          docker rmi "vllm_atom:ci" || true
 

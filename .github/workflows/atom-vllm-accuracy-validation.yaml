@@ -396,7 +396,7 @@ jobs:
       actions: read
       contents: write
     env:
-      CONTAINER_NAME: atom_vllm_atom_validation_${{ strategy.job-index }}
+      CONTAINER_NAME: vllm_atom_validation_${{ strategy.job-index }}
       VLLM_ATOM_IMAGE_TAG: ${{ needs.prepare-vllm-atom-image.outputs.vllm_atom_image_tag }}
     steps:
       - name: Checkout ATOM repo

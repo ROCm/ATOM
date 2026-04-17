@@ -198,7 +198,7 @@ jobs:
         run: |
           vLLM_ATOM_BASE_IMAGE="atom_release:ci"
           echo "Using vLLM-ATOM base image: ${vLLM_ATOM_BASE_IMAGE}"
-          docker build --network=host -t atom_vllm_atom_release:ci \
+          docker build --network=host -t vllm_atom_release:ci \
             --target vllm_atom \
             --build-arg vLLM_ATOM_BASE_IMAGE="${vLLM_ATOM_BASE_IMAGE}" \
             --build-arg MAX_JOBS=64 \
@@ -206,7 +206,7 @@ jobs:
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
-          docker inspect atom_vllm_atom_release:ci
+          docker inspect vllm_atom_release:ci
 
       - name: Push vLLM-ATOM Docker image
         if: ${{ success() && (inputs.only_release_vllm_atom == true || (inputs.only_release_sglang_atom != true && (github.event_name == 'schedule' || inputs.build_vllm_atom_image == true))) }}
@@ -214,9 +214,9 @@ jobs:
           VLLM_VER="${{ env.VLLM_VERSION }}"
           VLLM_ATOM_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
           VLLM_ATOM_LATEST_TAG="vllm-latest"
-          docker tag atom_vllm_atom_release:ci rocm/atom-dev:${VLLM_ATOM_TAG}
+          docker tag vllm_atom_release:ci rocm/atom-dev:${VLLM_ATOM_TAG}
           docker push rocm/atom-dev:${VLLM_ATOM_TAG}
-          docker tag atom_vllm_atom_release:ci rocm/atom-dev:${VLLM_ATOM_LATEST_TAG}
+          docker tag vllm_atom_release:ci rocm/atom-dev:${VLLM_ATOM_LATEST_TAG}
           docker push rocm/atom-dev:${VLLM_ATOM_LATEST_TAG}
 
       - name: Build SGLang Docker image
@@ -253,7 +253,7 @@ jobs:
           # Remove build and tagged images to free disk space
           docker rmi atom_release:ci || true
           docker rmi rocm/atom-dev:latest || true
-          docker rmi atom_vllm_atom_release:ci || true
+          docker rmi vllm_atom_release:ci || true
           docker rmi sglang_atom_release:ci || true
           # Remove nightly tagged image if it exists
           docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true
