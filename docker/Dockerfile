@@ -73,8 +73,7 @@ RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
 RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" && \
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip install --upgrade pip && \
-    # OOT keeps the base image's ATOM-installed transformers rather than letting
-    # cloned vLLM re-resolve it back below 5.
+    # keeps the base image's ATOM-installed transformers
     sed -i -e '/^transformers[[:space:]]/d' requirements/common.txt && \
     echo "Removed transformers constraint from cloned vLLM requirements/common.txt to preserve base image transformers" && \
     ! grep '^transformers' requirements/common.txt && \
@@ -143,6 +142,10 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     cat /tmp/triton_pip_show.txt && \
     rm -f /tmp/triton_pip_show.txt && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')"
+
+RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
+    "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
+    "${VENV_PYTHON}" -m pip show transformers || true
 
 CMD ["/bin/bash"]
 
