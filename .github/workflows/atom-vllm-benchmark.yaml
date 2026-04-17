@@ -64,7 +64,7 @@ on:
         type: boolean
         default: false
       qwen3-5-397b-a17b-mxfp4:
-        description: "Qwen3.5-397B-A17B-MXFP4 TP8"
+        description: "Qwen3.5-397B-A17B-MXFP4 TP4"
         type: boolean
         default: false
       qwen3-next-80b-a3b-instruct-fp8-tp1:
