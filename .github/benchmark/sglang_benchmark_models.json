@@ -22,8 +22,8 @@
   },
   {
     "display": "DeepSeek-R1-0528-MXFP4 FP4 TP8",
-    "source_path": "amd/DeepSeek-R1-0528-MXFP4",
-    "path": "amd/DeepSeek-R1-0528-MXFP4",
+    "source_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+    "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "prefix": "deepseek-r1-fp4-tp8",
     "extra_args": "--trust-remote-code --tensor-parallel-size 8",
     "bench_args": "",
@@ -33,8 +33,8 @@
   {
     "display": "DeepSeek-R1-0528-MXFP4 FP4 TP4",
     "dashboard_model": "DeepSeek-R1-0528-MXFP4-tp4",
-    "source_path": "amd/DeepSeek-R1-0528-MXFP4",
-    "path": "amd/DeepSeek-R1-0528-MXFP4",
+    "source_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
+    "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "prefix": "deepseek-r1-fp4-tp4",
     "extra_args": "--trust-remote-code --tensor-parallel-size 4",
     "bench_args": "",
