@@ -14,6 +14,11 @@ on:
         required: false
         type: boolean
         default: false
+      rebuild_atom_base_from_dockerfile:
+        description: "Full build image before validation"
+        required: false
+        type: boolean
+        default: false
       upload_accuracy_to_dashboard:
         description: "Optional: upload SGLANG accuracy results to dashboard after this manual run"
         required: false
@@ -47,7 +52,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Docker Login
-        if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != 'main' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && (github.ref_name != 'main' || inputs.rebuild_atom_base_from_dockerfile) }}
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
@@ -55,6 +60,7 @@ jobs:
         id: meta
         env:
           RUN_DSR1_FP8_TP4: ${{ inputs.run_dsr1_fp8_tp4 }}
+          REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
         run: |
           set -euo pipefail
 
@@ -91,7 +97,18 @@ jobs:
           print(f"model_matrix={json.dumps({'include': selected})}")
           PY
 
-          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF_NAME}" = "main" ]; then
+          REBUILD_FROM_DOCKERFILE="${REBUILD_ATOM_BASE_FROM_DOCKERFILE:-false}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+              echo "Manual run selected full ATOM base rebuild from docker/Dockerfile"
+            elif [ "${GITHUB_REF_NAME}" = "main" ]; then
+              echo "Manual run on main reuses published SGLANG image"
+            else
+              echo "Manual run selected fast overlay rebuild from ${ATOM_BASE_NIGHTLY_IMAGE}"
+            fi
+          fi
+
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || { [ "${GITHUB_REF_NAME}" = "main" ] && [ "${REBUILD_FROM_DOCKERFILE}" != "true" ]; }; then
             if RESOLUTION_JSON="$(
               python3 .github/scripts/resolve_atom_image.py \
                 --repository "${VALIDATION_IMAGE_REPO}" \
@@ -119,16 +136,58 @@ jobs:
             echo "sglang_image_tag=${RESOLVED_SGLANG_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           MANUAL_BASE_IMAGE_TAG="atom_sglang_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          REBUILT_ATOM_BASE_IMAGE_TAG="atom_sglang_rebuilt_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
           SGLANG_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:sglang-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
+          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
+          if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+            echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=${REBUILT_ATOM_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "rebuilt_atom_base_image_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
           git archive --format=tar HEAD | tar -xf - -C "${BUILD_CONTEXT}"
+
+          if [ "${REBUILD_FROM_DOCKERFILE}" = "true" ]; then
+            echo "Manual run rebuilds ATOM base and SGLANG image from branch ${GITHUB_REF_NAME}"
+
+            DOCKER_BUILDKIT=1 docker build --pull --network=host --no-cache \
+              -t "${REBUILT_ATOM_BASE_IMAGE_TAG}" \
+              --target atom_image \
+              --build-arg GPU_ARCH="${GPU_ARCH}" \
+              --build-arg AITER_REPO="${AITER_REPO}" \
+              --build-arg AITER_COMMIT="${AITER_COMMIT}" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg ATOM_REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+              --build-arg ATOM_COMMIT="${GITHUB_SHA}" \
+              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              "${BUILD_CONTEXT}"
+
+            DOCKER_BUILDKIT=1 docker build --network=host --no-cache \
+              -t "${SGLANG_IMAGE_TAG}" \
+              --target atom_sglang \
+              --build-arg SGLANG_BASE_IMAGE="${REBUILT_ATOM_BASE_IMAGE_TAG}" \
+              --build-arg MAX_JOBS=64 \
+              --build-arg SGLANG_REF="${SGLANG_REF}" \
+              --build-arg INSTALL_LM_EVAL=1 \
+              --build-arg INSTALL_FASTSAFETENSORS=1 \
+              -f "${BUILD_CONTEXT}/docker/Dockerfile" \
+              "${BUILD_CONTEXT}"
+
+            docker push "${SGLANG_IMAGE_TAG}"
+            exit 0
+          fi
 
           cat <<'EOF' > "${BUILD_CONTEXT}/Dockerfile.mod"
           ARG ATOM_BASE_NIGHTLY_IMAGE
@@ -183,15 +242,17 @@ jobs:
 
           docker push "${SGLANG_IMAGE_TAG}"
 
-          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
-          echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker rmi "${{ steps.meta.outputs.sglang_image_tag }}" || true
-          docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
+          for image in \
+            "${{ steps.meta.outputs.sglang_image_tag }}" \
+            "${{ steps.meta.outputs.manual_base_image_tag }}" \
+            "${{ steps.meta.outputs.rebuilt_atom_base_image_tag }}"; do
+            if [ -n "${image}" ]; then
+              docker rmi "${image}" || true
+            fi
+          done
 
   sglang-model-accuracy:
     name: SGLANG Model Accuracy (${{ matrix.model_name }})
