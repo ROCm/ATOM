@@ -110,7 +110,7 @@
   {
     "model_name": "gpt-oss-120b (2 GPUs)",
     "model_path": "openai/gpt-oss-120b",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --enable-tbo all --gpu-memory-utilization 0.3",
     "env_vars": "",
     "runner": "linux-atom-mi35x-4",
     "test_level": "main",
