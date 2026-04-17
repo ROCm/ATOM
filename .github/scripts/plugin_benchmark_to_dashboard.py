@@ -91,7 +91,9 @@ def build_entries(
         rocm_ver = payload.get("rocm_version", "")
 
         # Support both vLLM-ATOM and SGLang-ATOM image tag fields
-        image_tag = payload.get("vllm_atom_image_tag", payload.get("sglang_atom_image_tag", ""))
+        image_tag = payload.get(
+            "vllm_atom_image_tag", payload.get("sglang_atom_image_tag", "")
+        )
 
         if gpu_name:
             extra += f" | GPU: {gpu_name}"
