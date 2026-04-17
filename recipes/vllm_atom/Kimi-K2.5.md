@@ -1,10 +1,10 @@
 # Kimi-K2.5 with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Kimi-K2.5` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Kimi-K2.5` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_atom_guide.md).
 
 This model uses remote code, so the launch command keeps `--trust-remote-code`.
 
-## Step 1: Pull the OOT Docker
+## Step 1: Pull the vLLM-ATOM Docker
 
 ```bash
 docker pull rocm/atom-dev:vllm-latest
@@ -43,11 +43,11 @@ curl -X POST "http://localhost:8000/v1/completions" \
 ```
 
 ### Curl with text + image
-Let's use the image of a dog located at `ATOM/recipes/atom_vllm/dog.png` as an example.
+Let's use the image of a dog located at `ATOM/recipes/vllm_atom/dog.png` as an example.
 <img src="./dog.png" width="400">
 ```bash
 # Convert image to base64
-IMAGE_BASE64=$(base64 -w 0 ATOM/recipes/atom_vllm/dog.png)
+IMAGE_BASE64=$(base64 -w 0 ATOM/recipes/vllm_atom/dog.png)
 curl -X POST "http://localhost:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{

@@ -251,7 +251,7 @@ lm_eval --model local-completions \
 
 **Framework Integration:**
 
-- [vLLM Plugin Backend](docs/vllm_plugin_backend_guide.md) — ATOM as the out-of-tree plugin backend for vLLM
+- [vLLM Plugin Backend](docs/vllm_atom_guide.md) — ATOM as the out-of-tree plugin backend for vLLM
 
 ## Acknowledgements
 

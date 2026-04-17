@@ -352,7 +352,7 @@
    1. CONSTANTS & COLOR PALETTE
    ================================================================ */
 // HSL-based palette: each model gets a distinct base hue; backend offsets keep
-// ATOM, ATOM-vLLM, and ATOM-SGLang visually related but not identical.
+// ATOM, vLLM-ATOM, and SGLang-ATOM visually related but not identical.
 const MODEL_HUES = {
   'DeepSeek-R1-0528':      210,   // blue
   'DeepSeek-R1-0528-mtp3': 175,   // cyan/teal — distinct from base DeepSeek
@@ -365,13 +365,13 @@ const MODEL_HUES = {
 };
 const BACKEND_HUE_OFFSETS = {
   'ATOM': 0,
-  'ATOM-vLLM': 28,
-  'ATOM-SGLang': -30,
+  'vLLM-ATOM': 28,
+  'SGLang-ATOM': -30,
 };
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
 function getModelHue(backend, model) {
-  const normalizedBackend = backend === 'OOT' ? 'ATOM-vLLM' : backend;
+  const normalizedBackend = backend === 'vLLM-ATOM' ? 'vLLM-ATOM' : backend;
   const backendModelKey = normalizedBackend ? `${normalizedBackend}::${model}` : model;
   if (MODEL_HUES[backendModelKey] != null) return MODEL_HUES[backendModelKey];
   let baseHue = MODEL_HUES[model];
@@ -511,7 +511,6 @@ function parseBenchName(name) {
     backend = backendMatch[1];
     rawName = backendMatch[2];
   }
-  if (backend === 'OOT') backend = 'ATOM-vLLM';
   // Accuracy entries: "ModelName accuracy (GSM8K)" — (.+?) for multi-word model names
   let m = rawName.match(/^(.+?)\s+accuracy\s+\((\w+)\)$/);
   if (m) return { backend, model: m[1], metric: 'accuracy', unit: m[2], isAccuracy: true };
@@ -545,7 +544,7 @@ function parseRunConfigs(run) {
       const rcm = b.extra.match(/ROCm:\s*([\d.]+)/);
       if (rcm) configs[key]._rocm_version = rcm[1];
       const dm = b.extra.match(/Docker:\s*([^|]+)/);
-      if (dm) configs[key]._oot_image_tag = dm[1].trim();
+      if (dm) configs[key]._vllm_atom_image_tag = dm[1].trim();
     }
   }
   return configs;
@@ -1347,7 +1346,7 @@ function renderPerformanceTab() {
     `<button class="sel-btn ${m.key === state.perfMetric ? 'active' : ''}" data-metric="${m.key}">${m.label}</button>`
   ).join('');
 
-  // Group entries by backend + model so native/OOT stay distinct
+  // Group entries by backend + model so native/vLLM-ATOM stay distinct
   const byModel = {};
   for (const [key, cfg] of entries) {
     const groupKey = `${cfg.backend}|${cfg.model}`;
@@ -1884,7 +1883,7 @@ function renderTrendsTab() {
   const container = document.getElementById('tab-trends');
   destroyChartsIn(container);
 
-  // Mode+model selector — keeps native and ATOM-vLLM trend lines distinct
+  // Mode+model selector — keeps native and vLLM-ATOM trend lines distinct
   const trendOptions = [...new Set(Object.values(latestConfigs)
     .filter(cfg => state.filters.backends.includes(cfg.backend) && state.filters.models.includes(cfg.model))
     .map(cfg => `${cfg.backend}|${cfg.model}`))]
@@ -2320,7 +2319,7 @@ function buildDetailHTML(key, cfg) {
       <div class="detail-item"><span class="detail-key">GPU</span><span class="detail-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">VRAM</span><span class="detail-val">${cfg._gpu_vram_gb ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_vram_gb + ' GB' : '—'}</span></div>
       <div class="detail-item"><span class="detail-key">ROCm</span><span class="detail-val">${escHTML(cfg._rocm_version || '—')}</span></div>
-      <div class="detail-item"><span class="detail-key">Docker</span><span class="detail-val" style="max-width:250px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_tag || '—')}</span></div>
+      <div class="detail-item"><span class="detail-key">Docker</span><span class="detail-val" style="max-width:250px;overflow-wrap:anywhere">${escHTML(cfg._vllm_atom_image_tag || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Commit</span><span class="detail-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Message</span><span class="detail-val" style="font-family:inherit;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHTML(cfg.commit.message || '')}">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Author</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>
@@ -2353,7 +2352,7 @@ function showPopover(key, cfg) {
       <div class="pop-row"><span class="pop-key">Backend</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.backend)}</span></div>
       <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}${cfg._gpu_vram_gb ? ' · ' + cfg._gpu_vram_gb + 'GB' : ''}</span></div>
       <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(cfg._rocm_version || '—')}</span></div>
-      <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_tag || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(cfg._vllm_atom_image_tag || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>

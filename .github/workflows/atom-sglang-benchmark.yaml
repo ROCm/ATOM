@@ -307,7 +307,7 @@ jobs:
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     runs-on: build-only-atom
     outputs:
-      sglang_image_tag: ${{ steps.image-meta.outputs.sglang_image_tag }}
+      sglang_atom_image_tag: ${{ steps.image-meta.outputs.sglang_atom_image_tag }}
       atom_source_sha: ${{ steps.source-meta.outputs.atom_source_sha }}
     env:
       ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
@@ -372,7 +372,7 @@ jobs:
         run: |
           docker build --pull --network=host \
             --no-cache \
-            -t atom_sglang_base:ci \
+            -t sglang_atom_base:ci \
             -f Dockerfile.sglang-base .
 
       - name: Build custom SGLang image
@@ -381,28 +381,28 @@ jobs:
           SHORT_SHA="$(git rev-parse --short HEAD)"
           SHORT_SGLANG="$(printf '%s' "${SGLANG_REF}" | cut -c1-12)"
           SAFE_SGLANG_VERSION="$(printf '%s' "${SGLANG_VERSION}" | tr '/:' '--')"
-          SGLANG_IMAGE_TAG="${SGLANG_IMAGE_REPO}:sglang-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_SGLANG_VERSION}-${SHORT_SGLANG}"
+          SGLANG_ATOM_IMAGE_TAG="${SGLANG_IMAGE_REPO}:sglang-atom-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_SGLANG_VERSION}-${SHORT_SGLANG}"
           docker build --network=host \
             --no-cache \
-            -t "${SGLANG_IMAGE_TAG}" \
-            --target atom_sglang \
-            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
+            -t "${SGLANG_ATOM_IMAGE_TAG}" \
+            --target sglang_atom \
+            --build-arg SGLANG_BASE_IMAGE="sglang_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg SGLANG_REF="${SGLANG_REF}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
-          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "sglang_atom_image_tag=${SGLANG_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom SGLang image
         run: |
-          docker push "${{ steps.image-meta.outputs.sglang_image_tag }}"
+          docker push "${{ steps.image-meta.outputs.sglang_atom_image_tag }}"
 
       - name: Clean up build images
         if: always()
         run: |
-          docker rmi "${{ steps.image-meta.outputs.sglang_image_tag }}" || true
-          docker rmi atom_sglang_base:ci || true
+          docker rmi "${{ steps.image-meta.outputs.sglang_atom_image_tag }}" || true
+          docker rmi sglang_atom_base:ci || true
 
   benchmark:
     name: SGLang ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
@@ -434,10 +434,10 @@ jobs:
       CONC: ${{ matrix.params.concurrency }}
       RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
       RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
-      CONTAINER_NAME: atom_sglang_benchmark_${{ strategy.job-index }}
-      CONTAINER_RESULT_DIR: /tmp/sglang-benchmark-results
+      CONTAINER_NAME: sglang_atom_benchmark_${{ strategy.job-index }}
+      CONTAINER_RESULT_DIR: /tmp/sglang-atom-benchmark-results
       CONTAINER_BENCH_SERVING_DIR: /tmp/sglang-benchmark/bench_serving
-      SGLANG_IMAGE_TAG: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
+      SGLANG_ATOM_IMAGE_TAG: ${{ needs.build-sglang-image.outputs.sglang_atom_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
       SGLANG_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.sglang_image_source }}
       BENCH_SERVING_REPO_URL: https://github.com/kimbochen/bench_serving.git
       ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
@@ -481,7 +481,7 @@ jobs:
         run: |
           SOURCE_SHA="$(git rev-parse HEAD)"
           echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
-          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${SGLANG_IMAGE_SOURCE} image ${SGLANG_IMAGE_TAG}"
+          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${SGLANG_IMAGE_SOURCE} image ${SGLANG_ATOM_IMAGE_TAG}"
 
       - name: Docker Login
         if: steps.check.outputs.enabled == 'true'
@@ -495,8 +495,8 @@ jobs:
       - name: Pull SGLang benchmark image
         if: steps.check.outputs.enabled == 'true'
         run: |
-          echo "Pulling SGLang benchmark image: ${SGLANG_IMAGE_TAG}"
-          docker pull "${SGLANG_IMAGE_TAG}"
+          echo "Pulling SGLang benchmark image: ${SGLANG_ATOM_IMAGE_TAG}"
+          docker pull "${SGLANG_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
@@ -532,7 +532,7 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/oot_env_file.txt << 'EOF'
+          cat > /tmp/sglang_atom_env_file.txt << 'EOF'
           ${{ matrix.model.env_vars }}
           EOF
 
@@ -547,10 +547,10 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --env-file /tmp/oot_env_file.txt \
+            --env-file /tmp/sglang_atom_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${SGLANG_IMAGE_TAG}"
+            "${SGLANG_ATOM_IMAGE_TAG}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -638,7 +638,7 @@ jobs:
             -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_sglang_test.sh launch
+              bash .github/scripts/sglang_atom_test.sh launch
             "
 
           TRUST_REMOTE_CODE_ARG=""
@@ -692,7 +692,7 @@ jobs:
             -e SGLANG_REF_USED="${SGLANG_REF_USED}" \
             -e SGLANG_VERSION_USED="${SGLANG_VERSION_USED}" \
             -e SGLANG_IMAGE_SOURCE="${SGLANG_IMAGE_SOURCE}" \
-            -e SGLANG_IMAGE_TAG_USED="${SGLANG_IMAGE_TAG}" \
+            -e SGLANG_ATOM_IMAGE_TAG_USED="${SGLANG_ATOM_IMAGE_TAG}" \
             -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
             "$CONTAINER_NAME" python3 - <<'PY'
           import json
@@ -705,7 +705,7 @@ jobs:
 
           data["random_input_len"] = int(os.environ["ISL"])
           data["random_output_len"] = int(os.environ["OSL"])
-          data["benchmark_backend"] = "ATOM-SGLang"
+          data["benchmark_backend"] = "SGLang-ATOM"
 
           display_name = os.environ.get("DASHBOARD_MODEL_NAME", "")
           if display_name:
@@ -724,7 +724,7 @@ jobs:
           data["sglang_ref"] = os.environ.get("SGLANG_REF_USED", "")
           data["sglang_version"] = os.environ.get("SGLANG_VERSION_USED", "")
           data["sglang_image_source"] = os.environ.get("SGLANG_IMAGE_SOURCE", "")
-          data["sglang_image_tag"] = os.environ.get("SGLANG_IMAGE_TAG_USED", "")
+          data["sglang_atom_image_tag"] = os.environ.get("SGLANG_ATOM_IMAGE_TAG_USED", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
           )
@@ -769,19 +769,19 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: sglang-benchmark-${{ env.RESULT_FILENAME }}
+          name: sglang-atom-benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
       - name: Clean up SGLang benchmark container
         if: always() && steps.check.outputs.enabled == 'true'
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/sglang_atom.pid ]; then kill \$(cat /tmp/sglang_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           if [[ "${SGLANG_IMAGE_SOURCE}" == "rebuild" ]]; then
-            docker rmi "$SGLANG_IMAGE_TAG" || true
+            docker rmi "$SGLANG_ATOM_IMAGE_TAG" || true
           else
-            echo "Keeping prebuilt SGLang image cached on runner: ${SGLANG_IMAGE_TAG}"
+            echo "Keeping prebuilt SGLang image cached on runner: ${SGLANG_ATOM_IMAGE_TAG}"
           fi
 
   summarize-benchmark-result:
@@ -800,7 +800,7 @@ jobs:
       - name: Download all benchmark results
         uses: actions/download-artifact@v8
         with:
-          pattern: 'sglang-benchmark-*'
+          pattern: 'sglang-atom-benchmark-*'
           merge-multiple: true
           path: .
         continue-on-error: true
@@ -852,7 +852,7 @@ jobs:
       - name: Upload SGLang benchmark summary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sglang-benchmark-summary
+          name: sglang-atom-benchmark-summary
           path: sglang_benchmark_summary.json
 
       - name: Download baseline from previous successful main run
@@ -940,7 +940,7 @@ jobs:
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.check-regression.outputs.has_regression == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: sglang-benchmark-regression-report
+          name: sglang-atom-benchmark-regression-report
           path: regression_report.json
 
       - name: Transform results for benchmark dashboard
@@ -950,7 +950,7 @@ jobs:
             . \
             --output benchmark-action-input.json \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --default-backend "ATOM-SGLang"
+            --default-backend "SGLang-ATOM"
 
       - name: Store benchmark result to dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
@@ -980,12 +980,12 @@ jobs:
             exit 1
           fi
 
-          cp benchmark-dashboard/data.js /tmp/sglang-benchmark-data.js
+          cp benchmark-dashboard/data.js /tmp/sglang-atom-benchmark-data.js
 
           # Rebuild the publish branch from origin/gh-pages so only dashboard data is updated.
           git checkout -B gh-pages-data-only origin/gh-pages
           mkdir -p benchmark-dashboard
-          cp /tmp/sglang-benchmark-data.js benchmark-dashboard/data.js
+          cp /tmp/sglang-atom-benchmark-data.js benchmark-dashboard/data.js
 
           git add benchmark-dashboard/data.js
           git diff --cached --quiet || git commit -m "Update SGLang benchmark dashboard data"

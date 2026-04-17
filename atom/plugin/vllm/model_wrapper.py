@@ -52,7 +52,7 @@ def _get_atom_model_cls(model_arch: str) -> type:
     if model_arch is not None and model_arch in _ATOM_MODEL_CLASSES:
         model_ref = _ATOM_MODEL_CLASSES[model_arch]
     else:
-        raise ValueError(f"The {model_arch} is not supported by ATOM OOT backend")
+        raise ValueError(f"The {model_arch} is not supported by vLLM-ATOM")
 
     module_path, class_name = model_ref.split(":", 1)
     return getattr(importlib.import_module(module_path), class_name)
@@ -210,7 +210,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
-        # pass positions from vLLM to OOT execution path via vLLM's per-forward context
+        # pass positions from vLLM to vLLM-ATOM execution path via vLLM's per-forward context
         if is_forward_context_available():
             get_vllm_forward_context().additional_kwargs["atom_positions"] = positions
         elif "positions" in self.atom_config.compilation_config.static_forward_context:

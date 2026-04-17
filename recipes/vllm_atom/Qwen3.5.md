@@ -1,8 +1,8 @@
 # Qwen3.5 with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Qwen3.5-35B-A3B-Instruct-FP8`, `Qwen3.5-397B-A17B-FP8`, and `Qwen3.5-397B-A17B-MXFP4` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Qwen3.5-35B-A3B-Instruct-FP8`, `Qwen3.5-397B-A17B-FP8`, and `Qwen3.5-397B-A17B-MXFP4` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_atom_guide.md).
 
-## Step 1: Pull the OOT Docker
+## Step 1: Pull the vLLM-ATOM Docker
 
 ```bash
 docker pull rocm/atom-dev:vllm-latest
@@ -190,14 +190,14 @@ Here is the reference value when deploying on 8 ranks:
 # Multimodal input example
 Since Qwen3.5 is a multimodal model, you can also pass it with image input, you can refer to below script for image request
 
-Let's take this dog image as example, this image located at `ATOM/recipes/atom_vllm/dog.png`.
+Let's take this dog image as example, this image located at `ATOM/recipes/vllm_atom/dog.png`.
 <img src="./dog.png" width="400">
 
 ```bash 
 PORT=${1:-8000}
 
 # Convert image to base64
-IMAGE_BASE64=$(base64 -w 0 ATOM/recipes/atom_vllm/dog.png)
+IMAGE_BASE64=$(base64 -w 0 ATOM/recipes/vllm_atom/dog.png)
 curl -X POST "http://localhost:${PORT}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{

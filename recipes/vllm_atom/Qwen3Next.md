@@ -1,8 +1,8 @@
 # Qwen3-Next with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Qwen3-Next-80B-A3B-Instruct-FP8` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Qwen3-Next-80B-A3B-Instruct-FP8` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_atom_guide.md).
 
-## Step 1: Pull the OOT Docker
+## Step 1: Pull the vLLM-ATOM Docker
 
 ```bash
 docker pull rocm/atom-dev:vllm-latest

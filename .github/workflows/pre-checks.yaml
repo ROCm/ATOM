@@ -30,7 +30,7 @@ jobs:
       - name: Describe Pre Checkin scope
         run: |
           echo "Pre Checkin is the shared gate for lightweight validation before GPU CI starts."
-          echo "Future fast, non-GPU checks can be added here so Native and OOT reuse one result."
+          echo "Future fast, non-GPU checks can be added here so Native and vLLM-ATOM reuse one result."
       - name: Run Black
         uses: psf/black@stable
 

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Usage:
-#   .github/scripts/atom_sglang_test.sh launch
-#   .github/scripts/atom_sglang_test.sh accuracy
+#   .github/scripts/sglang_atom_test.sh launch
+#   .github/scripts/sglang_atom_test.sh accuracy
 #
 # Required environment variables:
 #   SGLANG_MODEL_NAME
@@ -36,10 +36,10 @@ MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
 SGLANG_PORT=${SGLANG_PORT:-8000}
 SGLANG_HOST=${SGLANG_HOST:-localhost}
-SGLANG_PID_FILE=${SGLANG_PID_FILE:-/tmp/atom_sglang.pid}
-SGLANG_LOG_FILE=${SGLANG_LOG_FILE:-/tmp/atom_sglang.log}
-RESULT_DIR=${RESULT_DIR:-/tmp/atom_sglang_accuracy_results}
-ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/atom_sglang_accuracy_output.txt}
+SGLANG_PID_FILE=${SGLANG_PID_FILE:-/tmp/sglang_atom.pid}
+SGLANG_LOG_FILE=${SGLANG_LOG_FILE:-/tmp/sglang_atom.log}
+RESULT_DIR=${RESULT_DIR:-/tmp/sglang_atom_accuracy_results}
+ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/sglang_atom_accuracy_output.txt}
 STREAM_SGLANG_LOGS=${STREAM_SGLANG_LOGS:-1}
 KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 LM_EVAL_TASK=${LM_EVAL_TASK:-gsm8k}

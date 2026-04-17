@@ -2,22 +2,21 @@
 set -euo pipefail
 
 # Usage:
-#   .github/scripts/atom_oot_test.sh launch <mode> [model_name]
-#   .github/scripts/atom_oot_test.sh accuracy <mode> [model_name]
+#   .github/scripts/vllm_atom_test.sh launch <mode> [model_name]
+#   .github/scripts/vllm_atom_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
-#   OOT_MODEL_NAME
-#   OOT_MODEL_PATH
-#   OOT_EXTRA_ARGS
-#   LM_EVAL_NUM_FEWSHOT
+#   VLLM_ATOM_MODEL_NAME
+#   VLLM_ATOM_MODEL_PATH
+#   VLLM_ATOM_EXTRA_ARGS
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
 #   accuracy - run gsm8k accuracy test and save result JSON
 #
 # MODE:
-#   ci    - workflow-provided OOT CI model entry
-#   full  - workflow-provided OOT full-validation model entry
+#   ci    - workflow-provided vLLM-ATOM CI model entry
+#   full  - workflow-provided vLLM-ATOM full-validation model entry
 #
 # Optional model_name can be used to run a single model when a caller passes
 # multiple explicit entries.
@@ -40,17 +39,17 @@ MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
 VLLM_PORT=${VLLM_PORT:-8000}
 VLLM_HOST=${VLLM_HOST:-localhost}
-VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
-VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_oot.log}
-RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
-ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/oot_accuracy_output.txt}
+VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_atom.pid}
+VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_atom.log}
+RESULT_DIR=${RESULT_DIR:-/tmp/vllm_atom_accuracy_results}
+ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/vllm_atom_accuracy_output.txt}
 STREAM_VLLM_LOGS=${STREAM_VLLM_LOGS:-1}
 KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
-EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
-EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
-EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
-OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
+VLLM_ATOM_DOCKER_IMAGE=${VLLM_ATOM_DOCKER_IMAGE:-}
+EXPLICIT_MODEL_NAME=${VLLM_ATOM_MODEL_NAME:-}
+EXPLICIT_MODEL_PATH=${VLLM_ATOM_MODEL_PATH:-}
+EXPLICIT_EXTRA_ARGS=${VLLM_ATOM_EXTRA_ARGS:-}
 LAST_VLLM_LOG_LINE=0
 
 if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
@@ -61,12 +60,12 @@ fi
 declare -a ACTIVE_MODELS=()
 if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
   if [[ -z "${EXPLICIT_MODEL_NAME}" || -z "${EXPLICIT_MODEL_PATH}" ]]; then
-    echo "OOT_MODEL_NAME and OOT_MODEL_PATH must both be set when using explicit model overrides."
+    echo "VLLM_ATOM_MODEL_NAME and VLLM_ATOM_MODEL_PATH must both be set when using explicit model overrides."
     exit 2
   fi
   ACTIVE_MODELS=("${EXPLICIT_MODEL_NAME}|${EXPLICIT_MODEL_PATH}|${EXPLICIT_EXTRA_ARGS}")
 else
-  echo "${MODE} mode requires OOT_MODEL_NAME and OOT_MODEL_PATH env vars from the workflow."
+  echo "${MODE} mode requires VLLM_ATOM_MODEL_NAME and VLLM_ATOM_MODEL_PATH env vars from the workflow."
   exit 2
 fi
 
@@ -177,10 +176,10 @@ PY
   export VLLM_CACHE_ROOT=/root/.cache/vllm
   export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
 
-  if [[ -n "${OOT_ENV_VARS:-}" ]]; then
+  if [[ -n "${VLLM_ATOM_ENV_VARS:-}" ]]; then
     while IFS= read -r _env_line; do
       [[ -n "${_env_line}" ]] && export "${_env_line}" && echo "Exported: ${_env_line}"
-    done <<< "$(printf '%b' "${OOT_ENV_VARS}")"
+    done <<< "$(printf '%b' "${VLLM_ATOM_ENV_VARS}")"
   fi
   rm -rf /root/.cache
 
@@ -227,7 +226,7 @@ accuracy_one_model() {
   flat_result_file="${RESULT_DIR}/${run_tag}.json"
 
   echo ""
-  echo "========== Running OOT gsm8k accuracy =========="
+  echo "========== Running vLLM-ATOM gsm8k accuracy =========="
   echo "Model name: ${model_name}"
   echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
 
@@ -274,9 +273,9 @@ PY
     result_file="${flat_result_file}"
   fi
 
-  if [[ -n "${OOT_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then
+  if [[ -n "${VLLM_ATOM_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then
     RESULT_FILE="${result_file}" \
-    OOT_DOCKER_IMAGE="${OOT_DOCKER_IMAGE:-}" \
+    VLLM_ATOM_DOCKER_IMAGE="${VLLM_ATOM_DOCKER_IMAGE:-}" \
     GPU_NAME="${GPU_NAME:-}" \
     GPU_VRAM_GB="${GPU_VRAM_GB:-}" \
     ROCM_VERSION="${ROCM_VERSION:-}" \
@@ -289,8 +288,8 @@ with open(result_file, "r", encoding="utf-8") as f:
     data = json.load(f)
 
 metadata = data.setdefault("atom_ci_metadata", {})
-if os.environ.get("OOT_DOCKER_IMAGE"):
-    metadata["docker_image"] = os.environ["OOT_DOCKER_IMAGE"]
+if os.environ.get("VLLM_ATOM_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["VLLM_ATOM_DOCKER_IMAGE"]
 if os.environ.get("GPU_NAME"):
     metadata["gpu_name"] = os.environ["GPU_NAME"]
 if os.environ.get("GPU_VRAM_GB"):

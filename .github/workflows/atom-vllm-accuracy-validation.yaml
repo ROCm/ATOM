@@ -1,4 +1,4 @@
-name: ATOM vLLM Nightly
+name: vLLM ATOM Nightly
 
 on:
   schedule:
@@ -80,7 +80,7 @@ on:
         type: boolean
         default: false
       upload_accuracy_to_dashboard:
-        description: "Optional: upload OOT accuracy results to dashboard after this manual run"
+        description: "Optional: upload vLLM-ATOM accuracy results to dashboard after this manual run"
         required: false
         type: boolean
         default: false
@@ -91,7 +91,7 @@ concurrency:
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
-  NIGHTLY_OOT_IMAGE_TAG: rocm/atom-dev:vllm-latest
+  NIGHTLY_VLLM_ATOM_IMAGE_TAG: rocm/atom-dev:vllm-latest
   VALIDATION_IMAGE_REPO: rocm/atom-dev
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
@@ -99,12 +99,12 @@ env:
   VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
 
 jobs:
-  # ---------- OOT full validation path (schedule / workflow_dispatch) ----------
-  prepare-oot-image:
+  # ---------- vLLM-ATOM full validation path (schedule / workflow_dispatch) ----------
+  prepare-vllm-atom-image:
     name: Prepare validation image
     runs-on: build-only-atom
     outputs:
-      oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
+      vllm_atom_image_tag: ${{ steps.meta.outputs.vllm_atom_image_tag }}
       cleanup_temp_image: ${{ steps.meta.outputs.cleanup_temp_image }}
       model_matrix: ${{ steps.meta.outputs.model_matrix }}
     steps:
@@ -136,7 +136,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Keep this Python model list as the single source of truth for OOT
+          # Keep this Python model list as the single source of truth for vLLM-ATOM
           # full-validation coverage and manual checkbox filtering.
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -293,7 +293,7 @@ jobs:
                 --repository "${VALIDATION_IMAGE_REPO}" \
                 --reference-tag vllm-latest
             )"; then
-              RESOLVED_OOT_IMAGE="$(
+              RESOLVED_VLLM_ATOM_IMAGE="$(
                 RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
           import json
           import os
@@ -302,20 +302,20 @@ jobs:
           print(resolution["resolved_image"])
           PY
               )"
-              echo "Scheduled run resolved published OOT image: ${RESOLVED_OOT_IMAGE}"
+              echo "Scheduled run resolved published vLLM-ATOM image: ${RESOLVED_VLLM_ATOM_IMAGE}"
             else
-              echo "::warning::Failed to resolve ${NIGHTLY_OOT_IMAGE_TAG} to an immutable reference; falling back to the floating tag."
-              RESOLVED_OOT_IMAGE="${NIGHTLY_OOT_IMAGE_TAG}"
+              echo "::warning::Failed to resolve ${NIGHTLY_VLLM_ATOM_IMAGE_TAG} to an immutable reference; falling back to the floating tag."
+              RESOLVED_VLLM_ATOM_IMAGE="${NIGHTLY_VLLM_ATOM_IMAGE_TAG}"
             fi
-            echo "oot_image_tag=${RESOLVED_OOT_IMAGE}" >> "$GITHUB_OUTPUT"
+            echo "vllm_atom_image_tag=${RESOLVED_VLLM_ATOM_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
-          MANUAL_BASE_IMAGE_TAG="atom_oot_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
-          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vllm-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          MANUAL_BASE_IMAGE_TAG="vllm_atom_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          VLLM_ATOM_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vllm-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
@@ -350,7 +350,7 @@ jobs:
           RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
           EOF
 
-          echo "Manual run rebuilds OOT image from branch ${GITHUB_REF_NAME}"
+          echo "Manual run rebuilds vLLM-ATOM image from branch ${GITHUB_REF_NAME}"
 
           docker build --pull --network=host --no-cache \
             -t "${MANUAL_BASE_IMAGE_TAG}" \
@@ -362,9 +362,9 @@ jobs:
             "${BUILD_CONTEXT}"
 
           docker build --network=host --no-cache \
-            -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
+            -t "${VLLM_ATOM_IMAGE_TAG}" \
+            --target vllm_atom \
+            --build-arg VLLM_ATOM_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -372,32 +372,32 @@ jobs:
             -f "${BUILD_CONTEXT}/docker/Dockerfile" \
             "${BUILD_CONTEXT}"
 
-          docker push "${OOT_IMAGE_TAG}"
+          docker push "${VLLM_ATOM_IMAGE_TAG}"
 
-          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "vllm_atom_image_tag=${VLLM_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
           echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker rmi "${{ steps.meta.outputs.oot_image_tag }}" || true
+          docker rmi "${{ steps.meta.outputs.vllm_atom_image_tag }}" || true
           docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
 
-  oot-model-accuracy:
+  vllm-atom-model-accuracy:
     name: Model Accuracy (${{ matrix.model_name }})
-    needs: [prepare-oot-image]
+    needs: [prepare-vllm-atom-image]
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare-oot-image.outputs.model_matrix) }}
+      matrix: ${{ fromJSON(needs.prepare-vllm-atom-image.outputs.model_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     permissions:
       actions: read
       contents: write
     env:
-      CONTAINER_NAME: atom_vllm_oot_validation_${{ strategy.job-index }}
-      OOT_IMAGE_TAG: ${{ needs.prepare-oot-image.outputs.oot_image_tag }}
+      CONTAINER_NAME: vllm_atom_validation_${{ strategy.job-index }}
+      VLLM_ATOM_IMAGE_TAG: ${{ needs.prepare-vllm-atom-image.outputs.vllm_atom_image_tag }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -409,9 +409,9 @@ jobs:
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
-      - name: Pull OOT image
+      - name: Pull vLLM-ATOM image
         run: |
-          docker pull "${OOT_IMAGE_TAG}"
+          docker pull "${VLLM_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -448,7 +448,7 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/oot_env_file.txt << 'EOF'
+          cat > /tmp/vllm_atom_env_file.txt << 'EOF'
           ${{ matrix.env_vars }}
           EOF
 
@@ -463,10 +463,10 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --env-file /tmp/oot_env_file.txt \
+            --env-file /tmp/vllm_atom_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${OOT_IMAGE_TAG}"
+            "${VLLM_ATOM_IMAGE_TAG}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -545,34 +545,34 @@ jobs:
             echo "/models directory not mounted; skipping model download"
           fi
 
-      - name: Resolve OOT model path
+      - name: Resolve vLLM-ATOM model path
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "VLLM_ATOM_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
           else
-            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "VLLM_ATOM_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
-      - name: Run OOT launch and gsm8k accuracy via script (full mode)
+      - name: Run vLLM-ATOM launch and gsm8k accuracy via script (full mode)
         timeout-minutes: 120
         env:
-          OOT_MODEL_NAME: ${{ matrix.model_name }}
-          OOT_MODEL_PATH: ${{ matrix.model_path }}
-          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
-          OOT_ENV_VARS: ${{ matrix.env_vars }}
+          VLLM_ATOM_MODEL_NAME: ${{ matrix.model_name }}
+          VLLM_ATOM_MODEL_PATH: ${{ matrix.model_path }}
+          VLLM_ATOM_EXTRA_ARGS: ${{ matrix.extra_args }}
+          VLLM_ATOM_ENV_VARS: ${{ matrix.env_vars }}
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
-            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
-            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
-            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
-            -e OOT_DOCKER_IMAGE="${OOT_IMAGE_TAG}" \
+            -e VLLM_ATOM_MODEL_NAME="${VLLM_ATOM_MODEL_NAME}" \
+            -e VLLM_ATOM_MODEL_PATH="${VLLM_ATOM_RESOLVED_MODEL_PATH:-$VLLM_ATOM_MODEL_PATH}" \
+            -e VLLM_ATOM_EXTRA_ARGS="${VLLM_ATOM_EXTRA_ARGS}" \
+            -e VLLM_ATOM_ENV_VARS="${VLLM_ATOM_ENV_VARS}" \
+            -e VLLM_ATOM_DOCKER_IMAGE="${VLLM_ATOM_IMAGE_TAG}" \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
@@ -581,16 +581,16 @@ jobs:
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
               set -euo pipefail
-              bash .github/scripts/atom_oot_test.sh accuracy full
+              bash .github/scripts/vllm_atom_test.sh accuracy full
             "
 
-      - name: Check OOT accuracy test results
+      - name: Check vLLM-ATOM accuracy test results
         if: success()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
-          result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_results ./vllm_atom_accuracy_results || true
+          result_file=$(ls -1t vllm_atom_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
-            echo "ERROR: No results JSON file found in oot_accuracy_results/"
+            echo "ERROR: No results JSON file found in vllm_atom_accuracy_results/"
             exit 2
           fi
 
@@ -611,48 +611,48 @@ jobs:
       - name: Collect summary
         if: success()
         run: |
-          echo "OOT gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          echo "vLLM-ATOM gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/vllm_atom_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect artifacts
         if: always()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom.log ./vllm_atom.log || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_output.txt ./vllm_atom_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_results ./vllm_atom_accuracy_results || true
 
       - name: Upload model artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: oot-validation-${{ matrix.model_name }}-${{ github.run_id }}
+          name: vllm-atom-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
-            vllm_oot.log
-            oot_accuracy_output.txt
-            oot_accuracy_results
+            vllm_atom.log
+            vllm_atom_accuracy_output.txt
+            vllm_atom_accuracy_results
 
       - name: Upload accuracy results for dashboard
         if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
-          path: oot_accuracy_results/*.json
+          path: vllm_atom_accuracy_results/*.json
           if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_atom.pid ]; then kill \$(cat /tmp/vllm_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          docker rmi "${OOT_IMAGE_TAG}" || true
+          docker rmi "${VLLM_ATOM_IMAGE_TAG}" || true
 
   # Build the dashboard payload from all uploaded accuracy artifacts after the
   # full matrix completes. This keeps dashboard writes off the GPU runners and
   # ensures each nightly/manual run publishes at most once.
   accuracy-dashboard:
     name: Update accuracy dashboard
-    needs: [oot-model-accuracy]
+    needs: [vllm-atom-model-accuracy]
     if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
     runs-on: ubuntu-latest
     permissions:
@@ -680,27 +680,27 @@ jobs:
         run: |
           json_count=$(find /tmp/accuracy-results -type f -name '*.json' | wc -l | tr -d ' ')
           echo "json_count=${json_count}" >> "$GITHUB_OUTPUT"
-          echo "Downloaded ${json_count} OOT accuracy JSON files"
+          echo "Downloaded ${json_count} vLLM-ATOM accuracy JSON files"
 
       - name: List downloaded accuracy artifacts
         if: steps.downloaded.outputs.json_count != '0'
         run: |
-          echo "=== Downloaded OOT accuracy artifacts ==="
+          echo "=== Downloaded vLLM-ATOM accuracy artifacts ==="
           find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
 
-      - name: Transform OOT accuracy results for dashboard
+      - name: Transform vLLM-ATOM accuracy results for dashboard
         if: steps.downloaded.outputs.json_count != '0'
         run: |
           python3 .github/scripts/accuracy_to_dashboard.py \
             /tmp/accuracy-results \
             --output accuracy-benchmark-input.json \
-            --models .github/benchmark/oot_models_accuracy.json \
-            --backend "ATOM-vLLM" \
+            --models .github/benchmark/vllm_atom_models_accuracy.json \
+            --backend "vLLM-ATOM" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
 
-      - name: Store OOT accuracy result to dashboard
+      - name: Store vLLM-ATOM accuracy result to dashboard
         if: steps.downloaded.outputs.json_count != '0'
         uses: benchmark-action/github-action-benchmark@v1
         with:

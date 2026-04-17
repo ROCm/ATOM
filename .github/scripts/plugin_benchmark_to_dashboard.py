@@ -90,8 +90,10 @@ def build_entries(
         gpu_vram = payload.get("gpu_vram_gb", 0)
         rocm_ver = payload.get("rocm_version", "")
 
-        # Support both OOT and SGLang image tag fields
-        image_tag = payload.get("oot_image_tag", payload.get("sglang_image_tag", ""))
+        # Support both vLLM-ATOM and SGLang-ATOM image tag fields
+        image_tag = payload.get(
+            "vllm_atom_image_tag", payload.get("sglang_atom_image_tag", "")
+        )
 
         if gpu_name:
             extra += f" | GPU: {gpu_name}"
@@ -163,7 +165,7 @@ def main() -> None:
     parser.add_argument(
         "--default-backend",
         required=True,
-        help="Default backend name (e.g. ATOM-SGLang or ATOM-vLLM)",
+        help="Default backend name (e.g. SGLang-ATOM or vLLM-ATOM)",
     )
     args = parser.parse_args()
 

@@ -1,5 +1,5 @@
 ---
-name: add-atom-vllm-model
+name: add-vllm-atom-model
 description: Add a new model architecture to ATOM vLLM plugin by reusing or implementing model code, registering architecture mappings, updating plugin model registry, validating with smoke and accuracy tests, and adding CI matrix entries. Use when the user asks to onboard/support a new model in ATOM or ATOM plugin mode.
 ---
 
@@ -32,7 +32,7 @@ Model onboarding progress:
 - [ ] 5) Smoke test passed
 - [ ] 6) Accuracy eval completed
 - [ ] 7) Accuracy result table inserted into recipe
-- [ ] 8) `recipes/atom_vllm` recipe added/updated
+- [ ] 8) `recipes/vllm_atom` recipe added/updated
 - [ ] 9) CI matrix entry added
 ```
 
@@ -104,7 +104,7 @@ lm_eval --model local-completions \
 ### 6.5) Insert Accuracy Result Into Recipe
 
 After `lm_eval` finishes, insert the measured result into the corresponding
-`recipes/atom_vllm/<Model-Name>.md` section using this table format:
+`recipes/vllm_atom/<Model-Name>.md` section using this table format:
 
 ```text
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
@@ -119,11 +119,11 @@ Requirements:
 - Keep the table adjacent to the `lm_eval` command in the recipe.
 - Include the raw result JSON path for traceability.
 
-### 7) Add `recipes/atom_vllm` Entry
+### 7) Add `recipes/vllm_atom` Entry
 
 For every new model added to ATOM vLLM plugin support, also add or update a usage recipe under:
 
-- `recipes/atom_vllm/<Model-Name>.md`
+- `recipes/vllm_atom/<Model-Name>.md`
 
 Minimum recipe content:
 
@@ -135,18 +135,18 @@ Minimum recipe content:
 6. Accuracy result table using the standard `|Tasks|Version|...|` format + raw JSON path
 7. Any model-specific env vars and caveats (for example, plugin attention toggle if required)
 
-Use existing files in `recipes/atom_vllm/` (such as `DeepSeek-R1.md`, `Qwen3.5.md`, `Kimi-K2.5.md`) as style references.
+Use existing files in `recipes/vllm_atom/` (such as `DeepSeek-R1.md`, `Qwen3.5.md`, `Kimi-K2.5.md`) as style references.
 
 If this onboarding also updates CI matrix arguments (TP size, env vars, model id), make sure the recipe launch command is aligned with those CI settings.
 
 ### 8) Add CI Test Entry
 
-Update `.github/workflows/atom-vllm-oot-test.yaml` and add the model entry to the
+Update `.github/workflows/atom-vllm-test.yaml` and add the model entry to the
 **nightly accuracy path only**.
 
-Do **not** add this model to the pull-request OOT matrix (`jobs.atom-vllm-oot.strategy.matrix.include`).
+Do **not** add this model to the pull-request vLLM-ATOM matrix (`jobs.vllm-atom.strategy.matrix.include`).
 
-Add it in `jobs.prepare-oot-image -> step "Resolve image source and model matrix"` in
+Add it in `jobs.prepare-vllm-atom-image -> step "Resolve image source and model matrix"` in
 the Python `models = [...]` list:
 
 ```python

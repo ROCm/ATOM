@@ -100,7 +100,7 @@
     "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "amd/Kimi-K2.5-MXFP4",
-    "_baseline_note": "Reference value from recipes/atom_vllm/Kimi-K2.5.md"
+    "_baseline_note": "Reference value from recipes/vllm_atom/Kimi-K2.5.md"
   },
   {
     "model_name": "DeepSeek-R1-FP8 TP8",
