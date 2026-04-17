@@ -268,15 +268,13 @@ RUN pip install --upgrade pip && \
 # Stage 1: MORI — parallel
 # --------------------------------------------------------------------
 FROM base AS build_mori
-ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG MORI_COMMIT="v1.1.0"
 
 RUN echo "========== [Parallel] Building MORI ==========" && \
     git clone https://github.com/ROCm/mori.git /app/mori && \
     cd /app/mori && \
     git checkout $MORI_COMMIT && \
-    pip install -r requirements-build.txt && \
-    git submodule update --init --recursive && \
-    python setup.py install
+    pip install .
 
 # --------------------------------------------------------------------
 # Stage 2: RCCL — parallel
