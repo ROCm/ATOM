@@ -394,9 +394,13 @@ class LinearBase(nn.Module):
                 and self.params_dtype == dtypes.fp8
             ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
                 if self.quant_type == QuantType.per_1x32 and self.params_dtype in [dtypes.fp4x2, dtypes.i4x2]:
-                    _ASM_K_ALIGN = 128
                     w_u8 = self.weight.data.view(torch.uint8)
                     k_packed = w_u8.shape[-1]
+                    _ASM_K_ALIGN = 128
+                    if k_packed % _ASM_K_ALIGN != 0:
+                        k_pad_128 = (k_packed + _ASM_K_ALIGN - 1) // _ASM_K_ALIGN * _ASM_K_ALIGN
+                        if k_pad_128 % 256 != 0:
+                            _ASM_K_ALIGN = 256
                     if k_packed % _ASM_K_ALIGN != 0:
                         k_pad = (k_packed + _ASM_K_ALIGN - 1) // _ASM_K_ALIGN * _ASM_K_ALIGN
                         w_new = torch.zeros(w_u8.shape[0], k_pad, dtype=torch.uint8, device=w_u8.device)
