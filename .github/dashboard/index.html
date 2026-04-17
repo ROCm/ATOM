@@ -591,6 +591,8 @@ for (const run of allRuns) {
     if (b.extra) {
       const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/);
       if (rm) entry.runUrl = rm[1];
+      const dm = b.extra.match(/Docker:\s*([^|]+)/);
+      if (dm) entry.dockerImage = dm[1].trim();
       const tm = b.extra.match(/Threshold:\s*([\d.]+)/);
       if (tm) entry.threshold = +tm[1];
       const sm = b.extra.match(/strict-match:\s*([\d.]+)/);
@@ -2435,6 +2437,9 @@ function renderAccuracyTab() {
       if (acc.baselineNote) html += `<p style="color:var(--text-tertiary);font-size:11px;margin-top:4px;font-style:italic">${escHTML(acc.baselineNote)}</p>`;
       html += `</div>`;
     }
+    if (acc.dockerImage) {
+      html += `<div class="detail-section"><h4>Docker</h4><p style="color:var(--text-secondary);font-size:11px;overflow-wrap:anywhere">${escHTML(acc.dockerImage)}</p></div>`;
+    }
     if (healthLevel !== 'healthy' && healthLevel !== 'unknown') {
       html += `<div class="detail-section"><h4>Status: ${healthLabel.replace('● ','')}</h4><p style="color:${healthColor}">${healthLevel === 'anomaly' ? 'Score suspiciously low — possible test failure' : healthLevel === 'fail' ? 'Below threshold by ' + fmtNum(Math.abs(margin), 4) : 'Margin to threshold only ' + fmtNum(margin, 4)}</p></div>`;
     }
@@ -2559,6 +2564,10 @@ function renderAccuracyMiniChart(key, chartCache) {
         tooltip: { ...chartTooltipOpts(), callbacks: {
           title: (items) => model + ' · ' + labels[items[0].dataIndex],
           label: (item) => ` ${item.dataset.label}: ${fmtNum(item.raw, 4)}  (${(item.raw * 100).toFixed(1)}%)`,
+          afterBody: (items) => {
+            const dockerImage = sorted[items[0].dataIndex]?.dockerImage;
+            return dockerImage ? ['', `Docker: ${dockerImage}`] : [];
+          },
         }},
         datalabels: { display: false },
       },
