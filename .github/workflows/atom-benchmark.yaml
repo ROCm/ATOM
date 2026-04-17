@@ -300,7 +300,7 @@ jobs:
       - name: Upload benchmark result
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.RESULT_FILENAME }}
+          name: benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
       - name: Clean Up
@@ -325,7 +325,7 @@ jobs:
       - name: Download all benchmark results
         uses: actions/download-artifact@v8
         with:
-          pattern: '*'
+          pattern: 'benchmark-*'
           merge-multiple: true
           path: .
 
@@ -346,7 +346,9 @@ jobs:
           if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
             echo "Downloading baseline from run #$PREV_RUN_ID"
             mkdir -p /tmp/baseline
-            gh run download "$PREV_RUN_ID" --dir /tmp/baseline || echo "::warning::Failed to download baseline artifacts"
+            # Only download benchmark result artifacts (prefix: benchmark-),
+            # not profiler/regression traces which can be multi-GB.
+            gh run download "$PREV_RUN_ID" --dir /tmp/baseline --pattern 'benchmark-*' || echo "::warning::Failed to download baseline artifacts"
             BASELINE_COUNT=$(find /tmp/baseline -name '*.json' | wc -l)
             echo "Downloaded $BASELINE_COUNT baseline files"
             echo "baseline_dir=/tmp/baseline" >> $GITHUB_OUTPUT
