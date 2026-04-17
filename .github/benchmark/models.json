@@ -100,6 +100,26 @@
     "env_vars": ""
   },
   {
+    "display": "Qwen3.5-397B-A17B-FP8",
+    "path": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "prefix": "qwen35-397b-fp8",
+    "args": "--kv_cache_dtype fp8 -tp 4",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "Qwen3.5-397B-A17B-MXFP4",
+    "path": "amd/Qwen3.5-397B-A17B-MXFP4",
+    "prefix": "qwen35-397b-mxfp4",
+    "args": "--kv_cache_dtype fp8 -tp 4",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
     "display": "Llama-3.3-70B-Instruct-MXFP4",
     "path": "amd/Llama-3.3-70B-Instruct-MXFP4-Preview",
     "prefix": "llama-3-3-70b-instruct-mxfp4",
