@@ -246,7 +246,7 @@ class MiniMaxM2Attention(nn.Module):
             k = (k * torch.rsqrt(k_var + self.rms_norm_eps) * self.k_norm.weight).to(
                 orig_dtype
             )
-            
+
             # TODO: is_vllm will be removed after vllm plugin supporting q,k,v rather than qkv
             if is_vllm():
                 qkv = torch.cat([q, k, v], dim=-1)

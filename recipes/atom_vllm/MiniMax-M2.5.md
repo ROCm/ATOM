@@ -26,8 +26,7 @@ vllm serve MiniMaxAI/MiniMax-M2.5 \
     --gpu_memory_utilization 0.9 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
-    --no-enable-prefix-caching \
-    --enforce-eager
+    --no-enable-prefix-caching
 ```
 
 Caveat: the upstream `config.json` may advertise MTP-related fields; the current ATOM `MiniMaxM2ForCausalLM` path targets the main transformer. If you hit load or shape errors around MTP modules, compare with native ATOM server behavior and upstream vLLM release notes.
