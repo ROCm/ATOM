@@ -34,6 +34,7 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
+from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -603,6 +604,16 @@ class ModelRunner:
             model_runner=self
         )
         self.physical_block_size = self.attn_metadata_builder.block_size
+        if config.enable_tbo:
+            dp_gather_scatter = (
+                config.enable_dp_attention and not config.enable_expert_parallel
+            )
+            self.model = UBatchWrapper(
+                self.model,
+                attn_metadata_builder=self.attn_metadata_builder,
+                dp_gather_scatter=dp_gather_scatter,
+            )
+            logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
@@ -690,6 +701,8 @@ class ModelRunner:
         # 2. Release CUDA graphs
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
+        if isinstance(self.model, UBatchWrapper):
+            self.model.tbo_graphs.clear()
         # 3. Release GPU tensors
         for attr in (
             "kv_cache",
@@ -836,6 +849,9 @@ class ModelRunner:
             )
             if i == 0:
                 hidden_states = hidden_states[:draft_bs]
+                # pad_for_all_gather uses graph_bs * 1, consistent with
+                # ranks running propose
+                forward_context.attn_metadata.max_seqlen_q = 1
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
@@ -871,19 +887,29 @@ class ModelRunner:
         )
         return True
 
-    def dummy_prefill_execution(self, num_tokens: int):
+    def dummy_prefill_execution(self, num_tokens: int, num_reqs: int = 1):
         """Execute dummy prefill batch for DP synchronization."""
-        if num_tokens <= 0:
-            num_tokens = 1
-        seq = Sequence([0] * num_tokens, block_size=self.block_size)
+        if num_reqs < 1:
+            num_reqs = 1
+        if num_tokens < num_reqs:
+            num_tokens = num_reqs
+        # Distribute tokens evenly across requests
+        base = num_tokens // num_reqs
+        remainder = num_tokens % num_reqs
+        tokens_per_seq = [base + (1 if i < remainder else 0) for i in range(num_reqs)]
+
+        seqs = {}
+        for t in tokens_per_seq:
+            seq = Sequence([0] * t, block_size=self.block_size)
+            seqs[seq.id] = seq
 
         dummy_batch = ScheduledBatch(
-            seqs={seq.id: seq},
-            num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
+            seqs=seqs,
+            num_scheduled_tokens=np.array(tokens_per_seq, dtype=np.int32),
             total_tokens_num=num_tokens,
             total_tokens_num_prefill=num_tokens,
-            total_seqs_num=1,
-            total_seqs_num_prefill=1,
+            total_seqs_num=num_reqs,
+            total_seqs_num_prefill=num_reqs,
             is_dummy_run=True,
         )
 
@@ -899,7 +925,7 @@ class ModelRunner:
         reset_forward_context()
 
         logger.info(
-            f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens"
+            f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens, {num_reqs} reqs"
         )
         return True
 
@@ -1475,18 +1501,81 @@ class ModelRunner:
 
         return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
 
+    def _maybe_create_tbo_slices(
+        self,
+        batch,
+        is_prefill,
+        scheduled_bs,
+        actual_num_tokens,
+        num_scheduled_tokens,
+        reqs_across_dp,
+    ):
+        """Create TBO ubatch slices if conditions are met."""
+        if not self.config.enable_tbo:
+            return None
+        if not is_prefill and not self.config.enable_tbo_decode:
+            return None
+        if not is_prefill and batch.is_dummy_run:
+            return None
+
+        tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        if reqs_across_dp is not None:
+            can_tbo = int(torch.min(reqs_across_dp).item()) >= 2
+        else:
+            can_tbo = tbo_num_reqs >= 2
+        if not can_tbo:
+            return None
+
+        ubatch_slices = maybe_create_ubatch_slices(
+            num_reqs=tbo_num_reqs,
+            num_tokens=actual_num_tokens,
+            is_prefill=is_prefill,
+            num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
+        )
+        if ubatch_slices is not None:
+            logger.debug(
+                f"[TBO] splitting {'prefill' if is_prefill else 'decode'} batch: "
+                f"num_reqs={tbo_num_reqs}, ubatches={len(ubatch_slices)}"
+            )
+        return ubatch_slices
+
     def _preprocess(self, batch: ScheduledBatch):
         num_input_tokens = batch.total_tokens_num
-        num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
-        num_input_tokens += num_pad
-        return num_input_tokens, num_tokens_across_dp
+        is_prefill = batch.total_tokens_num_prefill > 0
+
+        dp_size = self.config.parallel_config.data_parallel_size
+        dp_rank = self.config.parallel_config.data_parallel_rank
+
+        if dp_size <= 1:
+            return num_input_tokens, None, None
+
+        reqs_across_dp = None
+        if self.config.enable_tbo:
+            from atom.utils.tbo.ubatching import sync_dp_for_tbo
+
+            sync_reqs = (
+                batch.total_seqs_num_prefill
+                if is_prefill
+                else batch.total_seqs_num_decode
+            )
+            num_tokens_across_dp, reqs_across_dp = sync_dp_for_tbo(
+                dp_size,
+                dp_rank,
+                num_input_tokens,
+                sync_reqs,
+            )
+        else:
+            _, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
+
+        num_input_tokens = int(torch.max(num_tokens_across_dp).item())
+        return num_input_tokens, num_tokens_across_dp, reqs_across_dp
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        num_input_tokens, num_tokens_across_dp = self._preprocess(batch)
+        num_input_tokens, num_tokens_across_dp, reqs_across_dp = self._preprocess(batch)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
@@ -1496,7 +1585,8 @@ class ModelRunner:
             padded_scheduled_bs = num_input_tokens
             # for MTP, we need to divide by (mtp_k + 1) to get the actual batch size
             if hasattr(self, "drafter"):
-                padded_scheduled_bs = padded_scheduled_bs // (self.drafter.mtp_k + 1)
+                mtp_step = self.drafter.mtp_k + 1
+                padded_scheduled_bs = (padded_scheduled_bs + mtp_step - 1) // mtp_step
             bs = (
                 padded_scheduled_bs
                 if self.enforce_eager
@@ -1535,6 +1625,15 @@ class ModelRunner:
                 input_ids,
             )
 
+        ubatch_slices = self._maybe_create_tbo_slices(
+            batch,
+            is_prefill,
+            scheduled_bs if not is_prefill else 0,
+            actual_num_tokens,
+            num_scheduled_tokens,
+            reqs_across_dp,
+        )
+
         set_forward_context(
             attn_metadata=attn_metadata,
             atom_config=self.config,
@@ -1542,6 +1641,7 @@ class ModelRunner:
             num_tokens=actual_num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             spec_decode_metadata=spec_decode_metadata,
+            ubatch_slices=ubatch_slices,
         )
         return graph_bs
 
@@ -1831,7 +1931,9 @@ class ModelRunner:
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
         self.graph_pool = None
-        self.logits_in_graph = self.world_size == 1
+        is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
+        # TBO graphs don't capture compute_logits, so disable logits_in_graph.
+        self.logits_in_graph = self.world_size == 1 and not is_tbo
 
         with graph_capture() as gc:
             capture_range = (
@@ -1860,12 +1962,21 @@ class ModelRunner:
                 )
                 num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
                 num_tokens += num_pad
+                # Create ubatch slices for TBO capture (need >= 2 requests)
+                ubatch_slices = None
+                if is_tbo and self.config.enable_tbo_decode and bs >= 2:
+                    ubatch_slices = maybe_create_ubatch_slices(
+                        num_reqs=bs,
+                        num_tokens=num_tokens,
+                    )
+
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
                     num_tokens=num_tokens,
                     num_tokens_across_dp=num_tokens_across_dp,
+                    ubatch_slices=ubatch_slices,
                 )
 
                 # Warmup
@@ -1875,26 +1986,36 @@ class ModelRunner:
                 if self.logits_in_graph:
                     self.model.compute_logits(outputs[:num_tokens])
 
-                # Capture: include compute_logits only when TP=1 since
-                # ParallelLMHead uses NCCL all_gather which is not
-                # graph-capturable on HIP when TP > 1.
+                # Capture
                 with (
                     record_function(f"capture_graph_bs_{bs}")
                     if self.mark_trace
                     else nullcontext()
                 ):
-                    with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
-                        outputs[:num_tokens] = self.model(
-                            input_ids[:num_tokens], positions[:num_tokens]
+                    if ubatch_slices is not None:
+                        # TBO capture: threads + multi-stream captured in graph.
+                        graph, graph_output = self.model.capture_tbo_graph(
+                            input_ids[:num_tokens],
+                            positions[:num_tokens],
+                            self.graph_pool,
+                            gc.stream,
+                            output_buffer=outputs[:num_tokens],
                         )
-                        if self.logits_in_graph:
-                            graph_logits = self.model.compute_logits(
-                                outputs[:num_tokens]
+                    else:
+                        # Standard single-stream capture
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph, self.graph_pool, stream=gc.stream):
+                            outputs[:num_tokens] = self.model(
+                                input_ids[:num_tokens], positions[:num_tokens]
                             )
+                            if self.logits_in_graph:
+                                graph_logits = self.model.compute_logits(
+                                    outputs[:num_tokens]
+                                )
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
                 self.graphs[(bs, max_q_len)] = graph
-                if self.logits_in_graph:
+                if self.logits_in_graph and ubatch_slices is None:
                     self.graph_logits[(bs, max_q_len)] = graph_logits
                 torch.cuda.synchronize()
         self.graph_bs.sort(reverse=False)

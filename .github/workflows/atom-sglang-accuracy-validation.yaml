@@ -14,6 +14,11 @@ on:
         required: false
         type: boolean
         default: false
+      upload_accuracy_to_dashboard:
+        description: "Optional: upload SGLANG accuracy results to dashboard after this manual run"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -87,12 +92,31 @@ jobs:
           PY
 
           if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF_NAME}" = "main" ]; then
-            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-              echo "Manual run on main reuses published SGLANG image: ${NIGHTLY_SGLANG_IMAGE_TAG}"
+            if RESOLUTION_JSON="$(
+              python3 .github/scripts/resolve_atom_image.py \
+                --repository "${VALIDATION_IMAGE_REPO}" \
+                --reference-tag sglang-latest \
+                --preferred-version "${SGLANG_REF#v}"
+            )"; then
+              RESOLVED_SGLANG_IMAGE="$(
+                RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          PY
+              )"
             else
-              echo "Scheduled run uses published SGLANG image: ${NIGHTLY_SGLANG_IMAGE_TAG}"
+              echo "::warning::Failed to resolve ${NIGHTLY_SGLANG_IMAGE_TAG} to an immutable reference; falling back to the floating tag."
+              RESOLVED_SGLANG_IMAGE="${NIGHTLY_SGLANG_IMAGE_TAG}"
             fi
-            echo "sglang_image_tag=${NIGHTLY_SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "Manual run on main reuses published SGLANG image: ${RESOLVED_SGLANG_IMAGE}"
+            else
+              echo "Scheduled run uses published SGLANG image: ${RESOLVED_SGLANG_IMAGE}"
+            fi
+            echo "sglang_image_tag=${RESOLVED_SGLANG_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -346,6 +370,7 @@ jobs:
             -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
             -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
             -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
+            -e SGLANG_DOCKER_IMAGE="${SGLANG_IMAGE_TAG}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
@@ -402,7 +427,7 @@ jobs:
             atom_sglang_accuracy_results
 
       - name: Upload accuracy results for dashboard
-        if: always()
+        if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
@@ -416,3 +441,65 @@ jobs:
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           docker rmi "${SGLANG_IMAGE_TAG}" || true
+
+  accuracy-dashboard:
+    name: Update SGLANG accuracy dashboard
+    needs: [sglang-model-accuracy]
+    if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Prepare accuracy artifact directory
+        run: mkdir -p /tmp/accuracy-results
+
+      - name: Download accuracy artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/accuracy-results
+          pattern: accuracy-*
+        continue-on-error: true
+
+      - name: Count downloaded accuracy artifacts
+        id: downloaded
+        run: |
+          json_count=$(find /tmp/accuracy-results -type f -name '*.json' | wc -l | tr -d ' ')
+          echo "json_count=${json_count}" >> "$GITHUB_OUTPUT"
+          echo "Downloaded ${json_count} SGLANG accuracy JSON files"
+
+      - name: List downloaded accuracy artifacts
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          echo "=== Downloaded SGLANG accuracy artifacts ==="
+          find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
+
+      - name: Transform SGLANG accuracy results for dashboard
+        if: steps.downloaded.outputs.json_count != '0'
+        run: |
+          python3 .github/scripts/accuracy_to_dashboard.py \
+            /tmp/accuracy-results \
+            --output accuracy-benchmark-input.json \
+            --models .github/benchmark/sglang_models_accuracy.json \
+            --backend "ATOM-SGLang" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "=== Generated entries ==="
+          cat accuracy-benchmark-input.json
+
+      - name: Store SGLANG accuracy result to dashboard
+        if: steps.downloaded.outputs.json_count != '0'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: customBiggerIsBetter
+          output-file-path: accuracy-benchmark-input.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmark-dashboard
+          auto-push: true
+          max-items-in-chart: 90
+          github-token: ${{ secrets.GITHUB_TOKEN }}

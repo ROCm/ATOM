@@ -74,6 +74,11 @@ def build_entries(
         if baseline_note:
             extra_parts.append(f"BaselineNote: {baseline_note}")
 
+        ci_metadata = data.get("atom_ci_metadata", {})
+        docker_image = ci_metadata.get("docker_image")
+        if docker_image:
+            extra_parts.append(f"Docker: {docker_image}")
+
         try:
             if strict_score is not None:
                 extra_parts.append(f"strict-match: {round(float(strict_score), 4)}")

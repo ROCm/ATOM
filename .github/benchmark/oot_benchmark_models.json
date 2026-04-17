@@ -30,6 +30,17 @@
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
   },
   {
+    "display": "GLM-5.1-FP8 TP8",
+    "dashboard_model": "GLM-5.1-FP8",
+    "source_path": "zai-org/GLM-5.1-FP8",
+    "path": "zai-org/GLM-5.1-FP8",
+    "prefix": "glm-5-1-fp8-tp8",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": ""
+  },
+  {
     "display": "Kimi-K2-Thinking-MXFP4 TP4",
     "dashboard_model": "Kimi-K2-Thinking-MXFP4-tp4",
     "source_path": "amd/Kimi-K2-Thinking-MXFP4",

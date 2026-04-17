@@ -22,9 +22,17 @@ from vllm.model_executor.layers.fla.ops import (
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
+
 from torch import nn
 
-# from aiter.dist.parallel_state import get_tp_group
+USE_FLYDSL_GDR = True
+try:
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+except ImportError:
+    USE_FLYDSL_GDR = False
+    print(
+        "Failed to import flydsl_gdr_decode. Please make sure you have the latest version of aiter installed."
+    )
 
 
 class ChunkGatedDeltaRule(nn.Module):
@@ -371,24 +379,43 @@ class GatedDeltaNet(nn.Module):
                 ssm_state.dtype
             )
         elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
+            if USE_FLYDSL_GDR:
+                core_attn_out_non_spec = query_non_spec.new_empty(*value_non_spec.shape)
+                flydsl_gdr_decode(
+                    query=query_non_spec,
+                    key=key_non_spec,
+                    value=value_non_spec,
                     a=a,
                     b=b,
                     dt_bias=self.dt_bias,
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[
-                        : attn_metadata.num_decodes + 1
-                    ],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
+                    A_log=self.A_log,
+                    indices=non_spec_state_indices_tensor,
+                    state=ssm_state,
+                    out=core_attn_out_non_spec,
+                    use_qk_l2norm=True,
+                    need_shuffle_state=False,
                 )
-            )
+
+                last_recurrent_state = None
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a,
+                        b=b,
+                        dt_bias=self.dt_bias,
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : attn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 

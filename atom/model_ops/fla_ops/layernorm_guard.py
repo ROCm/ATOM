@@ -23,6 +23,9 @@ from einops import rearrange
 import triton
 import triton.language as tl
 
+
+from atom.model_ops.utils import atom_parameter
+
 from .utils import input_guard
 
 
@@ -347,8 +350,8 @@ class LayerNormGated(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
-        self.bias = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.weight = atom_parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.bias = atom_parameter(torch.empty(hidden_size, **factory_kwargs))
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
         self.reset_parameters()
@@ -386,7 +389,7 @@ class RMSNormGated(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.weight = atom_parameter(torch.empty(hidden_size, **factory_kwargs))
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
