@@ -45,11 +45,17 @@ RESULT_DIR=${RESULT_DIR:-/tmp/vllm_atom_accuracy_results}
 ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/vllm_atom_accuracy_output.txt}
 STREAM_VLLM_LOGS=${STREAM_VLLM_LOGS:-1}
 KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
+LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 EXPLICIT_MODEL_NAME=${vLLM_ATOM_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${vLLM_ATOM_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${vLLM_ATOM_EXTRA_ARGS:-}
 EXPLICIT_ENV_VARS=${vLLM_ATOM_ENV_VARS:-}
 LAST_VLLM_LOG_LINE=0
+
+if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
+  exit 2
+fi
 
 declare -a ACTIVE_MODELS=()
 if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
@@ -222,11 +228,12 @@ accuracy_one_model() {
   echo ""
   echo "========== Running vLLM-ATOM gsm8k accuracy =========="
   echo "Model name: ${model_name}"
+  echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
 
   lm_eval --model local-completions \
     --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
     --tasks gsm8k \
-    --num_fewshot 3 \
+    --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
     --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
 
   # lm-eval output layout differs across versions: output_path may be a file
