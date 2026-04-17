@@ -348,38 +348,11 @@ COPY --from=build_mori /opt/venv /opt/venv
 COPY --from=build_mori /app/mori /app/mori
 RUN pip show mori || true
 
-# RCCL: install .deb from build stage
-COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
-RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
-    rm -rf /tmp/rccl
-
-# Triton: copy package from build stage into current venv
-# Use RUN --mount to avoid COPY glob issues, and preserve mori already in venv
-RUN --mount=from=build_triton,source=/opt/venv/lib/python3.10/site-packages,target=/triton-pkgs \
-    cp -a /triton-pkgs/triton /opt/venv/lib/python3.10/site-packages/ && \
-    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.10/site-packages/ && \
-    pip show triton
-
-# Aiter: copy compiled source tree + re-register editable install
-# (pip install -e creates egg-link automatically, no need to COPY them)
-COPY --from=build_aiter /app/aiter-test /app/aiter-test
-RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
-    pip show amd-aiter
-
-# RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
-RUN pip install rocm-trace-lite && \
-    rtl --version || true
-
-# ATOM: lightweight install (no compilation needed)
-# CACHEBUST invalidates only this layer so parallel stages stay cached
-ARG CACHEBUST=1
-RUN git clone $ATOM_REPO /app/ATOM && \
-    cd /app/ATOM && \
-    git checkout $ATOM_COMMIT && \
-    pip install -e .
-RUN pip show atom || true
-
 # ========== Mooncake TransferEngine ==========
+# Mooncake and Rust apt operations MUST run before the RCCL dpkg -i --force-all
+# step below, because that step overwrites the Ubuntu-repo rccl with a custom
+# ROCm build whose version string doesn't match rocm-hip's declared dependency,
+# leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="v0.3.10.post1"
@@ -388,10 +361,10 @@ ARG VENV_PYTHON="/opt/venv/bin/python"
 # [MC 1/4] Clone
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 1/4] Clone Mooncake =========="; \
-        git clone --depth 1 ${MOONCAKE_REPO} /app/mooncake; \
+        git clone --depth 1 ${MOONCAKE_REPO} /app/mooncake && \
         if [ -n "${MOONCAKE_COMMIT}" ]; then \
-            cd /app/mooncake && git fetch --depth 1 origin "${MOONCAKE_COMMIT}" && git checkout "${MOONCAKE_COMMIT}"; \
-        fi; \
+            cd /app/mooncake && git fetch --depth 1 origin "${MOONCAKE_COMMIT}" && git checkout FETCH_HEAD; \
+        fi && \
         cd /app/mooncake && echo "Mooncake commit: $(git rev-parse HEAD)"; \
     else \
         echo "========== Skipped Mooncake (INSTALL_MOONCAKE=0) =========="; \
@@ -402,8 +375,6 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
         apt-get update \
-        && apt --fix-broken install -y \
-        && apt-mark hold rccl rccl-dev rocm-hip 2>/dev/null || true \
         && cd /app/mooncake && bash dependencies.sh -y; \
     fi
 
@@ -462,5 +433,39 @@ RUN echo "========== Install Rust toolchain ==========" \
     && rustc --version && cargo --version
 
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+# RCCL: install .deb from build stage
+# WARNING: dpkg -i --force-all overwrites Ubuntu-repo rccl with the ROCm custom
+# build, breaking rocm-hip's version dep in dpkg metadata. All apt-get install
+# operations (Mooncake, Rust, etc.) MUST be completed before this step.
+COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
+RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
+    rm -rf /tmp/rccl
+
+# Triton: copy package from build stage into current venv
+# Use RUN --mount to avoid COPY glob issues, and preserve mori already in venv
+RUN --mount=from=build_triton,source=/opt/venv/lib/python3.10/site-packages,target=/triton-pkgs \
+    cp -a /triton-pkgs/triton /opt/venv/lib/python3.10/site-packages/ && \
+    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.10/site-packages/ && \
+    pip show triton
+
+# Aiter: copy compiled source tree + re-register editable install
+# (pip install -e creates egg-link automatically, no need to COPY them)
+COPY --from=build_aiter /app/aiter-test /app/aiter-test
+RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
+    pip show amd-aiter
+
+# RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
+RUN pip install rocm-trace-lite && \
+    rtl --version || true
+
+# ATOM: lightweight install (no compilation needed)
+# CACHEBUST invalidates only this layer so parallel stages stay cached
+ARG CACHEBUST=1
+RUN git clone $ATOM_REPO /app/ATOM && \
+    cd /app/ATOM && \
+    git checkout $ATOM_COMMIT && \
+    pip install -e .
+RUN pip show atom || true
 
 CMD ["/bin/bash"]
