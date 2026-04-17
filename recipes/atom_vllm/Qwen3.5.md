@@ -1,6 +1,6 @@
 # Qwen3.5 with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Qwen3.5-35B-A3B-Instruct-FP8` and `Qwen3.5-397B-A5B-Instruct-FP8` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Qwen3.5-35B-A3B-Instruct-FP8`, `Qwen3.5-397B-A17B-FP8`, and `Qwen3.5-397B-A17B-MXFP4` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
 ## Step 1: Pull the OOT Docker
 
@@ -46,6 +46,23 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
     --no-enable-prefix-caching
 ```
 
+### Qwen3.5-397B-A17B-MXFP4 (TP=4)
+
+```bash
+export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+
+vllm serve amd/Qwen3.5-397B-A17B-MXFP4 \
+    --host localhost \
+    --port 8000 \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype fp8 \
+    --gpu_memory_utilization 0.9 \
+    --async-scheduling \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --max-model-len 16384 \
+    --no-enable-prefix-caching
+```
+
 **Important**: `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` is required for Qwen3.5 because it uses a hybrid architecture with both linear attention (GatedDeltaNet) and full attention layers. This env var ensures full attention layers use vLLM's default implementation.
 
 ## Step 3: Performance Benchmark
@@ -83,6 +100,24 @@ lm_eval --model local-completions \
         --model_args model=Qwen/Qwen3.5-35B-A3B-FP8,base_url=http://localhost:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False \
         --tasks gsm8k \
         --num_fewshot 3
+```
+
+### Qwen3.5-397B-A17B-MXFP4 accuracy example
+
+```bash
+lm_eval --model local-completions \
+        --model_args model=amd/Qwen3.5-397B-A17B-MXFP4,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+        --tasks gsm8k \
+        --num_fewshot 5
+```
+
+Reference result (TP=4):
+
+```bash
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.8332|±  |0.0103|
+|     |       |strict-match    |     5|exact_match|↑  |0.8218|±  |0.0105|
 ```
 
 
