@@ -273,6 +273,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     f"static_forward_context, skipping"
                 )
 
+    def _maybe_adjust_draft_positions(self, positions: torch.Tensor) -> torch.Tensor:
+        position_offset = getattr(self.model, "vllm_draft_position_offset", 0)
+        if position_offset == 0:
+            return positions
+        return positions + position_offset
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -285,6 +291,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             assert intermediate_tensors is not None
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
+
+        positions = self._maybe_adjust_draft_positions(positions)
 
         # pass positions from vLLM to OOT execution path via vLLM's per-forward context
         if is_forward_context_available():

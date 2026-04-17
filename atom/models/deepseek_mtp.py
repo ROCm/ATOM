@@ -168,6 +168,11 @@ class DeepSeekMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
+        # Native ATOM MTP drafts at the next RoPE position, while vLLM's
+        # speculative decoder advances its public positions buffer after each
+        # draft step. Expose the required offset so the vLLM wrapper can adapt
+        # positions on the ATOM side without patching vLLM's rollout logic.
+        self.vllm_draft_position_offset = 1
 
         if hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None:
             self.packed_modules_mapping = {

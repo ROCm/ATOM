@@ -821,7 +821,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
             if query_start_loc_cpu.numel() > 1
             else 1
         )
-
         kv_indices_generate_triton(
             block_table_tensor,
             self.paged_kv_indices,
@@ -858,7 +857,12 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
+        # MTP/spec decode can verify multiple decode tokens per request in one
+        # forward pass. The persistent MLA metadata must use the actual query
+        # length rather than assuming single-token decode.
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
+            num_reqs, qo_indptr, max_qo_len
+        )
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(
@@ -912,7 +916,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
-
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
@@ -2123,11 +2126,25 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
             self.model_config.max_model_len
         )
-        self.num_speculative_tokens = (
-            self.vllm_config.speculative_config.num_speculative_tokens
-            if self.vllm_config.speculative_config
-            else 0
-        )
+        # Determine if this builder is for draft model layers (MTP).
+        # Draft model layers have layer indices >= num_hidden_layers.
+        # The draft model itself does not do speculative decoding, so
+        # num_speculative_tokens should be 0 for its builders.
+        _is_draft_layer = False
+        if layer_names:
+            if len(layer_names) < config.model_config.hf_config.num_hidden_layers:
+                _is_draft_layer = True
+        if torch.distributed.get_rank() == 0:
+            print(f"layer_names: {layer_names}")
+            print(f"_is_draft_layer: {_is_draft_layer}")
+        if _is_draft_layer:
+            self.num_speculative_tokens = 0
+        else:
+            self.num_speculative_tokens = (
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config
+                else 0
+            )
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count

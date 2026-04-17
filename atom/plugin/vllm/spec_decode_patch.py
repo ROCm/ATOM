@@ -5,7 +5,7 @@ logger = logging.getLogger("atom")
 
 
 def apply_vllm_spec_decode_patch() -> None:
-    """Allow ATOM attention metadata in vLLM speculative decoding checks."""
+    """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     try:
         from atom.utils.forward_context import AttentionMetaData as AtomAttentionMetaData
         from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
@@ -21,12 +21,13 @@ def apply_vllm_spec_decode_patch() -> None:
     def wrapped_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         allowed = getattr(self, "allowed_attn_types", None)
-        if isinstance(allowed, tuple) and AtomAttentionMetaData not in allowed:
+        if allowed is not None and AtomAttentionMetaData not in allowed:
             self.allowed_attn_types = (*allowed, AtomAttentionMetaData)
 
     setattr(wrapped_init, "_atom_allowed_attn_types_patched", True)
     SpecDecodeBaseProposer.__init__ = wrapped_init
+
     logger.info(
-        "ATOM plugin: patched vLLM speculative decoder to accept "
-        "atom.utils.forward_context.AttentionMetaData."
+        "ATOM plugin: patched vLLM speculative decoder for "
+        "ATOM attention-metadata compatibility."
     )
