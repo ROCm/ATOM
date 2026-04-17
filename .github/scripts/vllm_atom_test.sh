@@ -6,9 +6,9 @@ set -euo pipefail
 #   .github/scripts/vllm_atom_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
-#   vLLM_ATOM_MODEL_NAME
-#   vLLM_ATOM_MODEL_PATH
-#   vLLM_ATOM_EXTRA_ARGS
+#   VLLM_ATOM_MODEL_NAME
+#   VLLM_ATOM_MODEL_PATH
+#   VLLM_ATOM_EXTRA_ARGS
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
@@ -47,10 +47,10 @@ STREAM_VLLM_LOGS=${STREAM_VLLM_LOGS:-1}
 KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 VLLM_ATOM_DOCKER_IMAGE=${VLLM_ATOM_DOCKER_IMAGE:-}
-EXPLICIT_MODEL_NAME=${vLLM_ATOM_MODEL_NAME:-}
-EXPLICIT_MODEL_PATH=${vLLM_ATOM_MODEL_PATH:-}
-EXPLICIT_EXTRA_ARGS=${vLLM_ATOM_EXTRA_ARGS:-}
-EXPLICIT_ENV_VARS=${vLLM_ATOM_ENV_VARS:-}
+VLLM_ATOM_MODEL_NAME=${VLLM_ATOM_MODEL_NAME:-}
+VLLM_ATOM_MODEL_PATH=${VLLM_ATOM_MODEL_PATH:-}
+VLLM_ATOM_EXTRA_ARGS=${VLLM_ATOM_EXTRA_ARGS:-}
+VLLM_ATOM_ENV_VARS=${VLLM_ATOM_ENV_VARS:-}
 LAST_VLLM_LOG_LINE=0
 
 if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
@@ -59,14 +59,14 @@ if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
 fi
 
 declare -a ACTIVE_MODELS=()
-if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
-  if [[ -z "${EXPLICIT_MODEL_NAME}" || -z "${EXPLICIT_MODEL_PATH}" ]]; then
-    echo "vLLM_ATOM_MODEL_NAME and vLLM_ATOM_MODEL_PATH must both be set when using explicit model overrides."
+if [[ -n "${VLLM_ATOM_MODEL_NAME}" || -n "${VLLM_ATOM_MODEL_PATH}" || -n "${VLLM_ATOM_EXTRA_ARGS}" ]]; then
+  if [[ -z "${VLLM_ATOM_MODEL_NAME}" || -z "${VLLM_ATOM_MODEL_PATH}" ]]; then
+    echo "VLLM_ATOM_MODEL_NAME and VLLM_ATOM_MODEL_PATH must both be set when using explicit model overrides."
     exit 2
   fi
-  ACTIVE_MODELS=("${EXPLICIT_MODEL_NAME}|${EXPLICIT_MODEL_PATH}|${EXPLICIT_EXTRA_ARGS}")
+  ACTIVE_MODELS=("${VLLM_ATOM_MODEL_NAME}|${VLLM_ATOM_MODEL_PATH}|${VLLM_ATOM_EXTRA_ARGS}")
 else
-  echo "${MODE} mode requires vLLM_ATOM_MODEL_NAME and vLLM_ATOM_MODEL_PATH env vars from the workflow."
+  echo "${MODE} mode requires VLLM_ATOM_MODEL_NAME and VLLM_ATOM_MODEL_PATH env vars from the workflow."
   exit 2
 fi
 
@@ -177,10 +177,10 @@ PY
   export VLLM_CACHE_ROOT=/root/.cache/vllm
   export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
 
-  if [[ -n "${EXPLICIT_ENV_VARS:-}" ]]; then
+  if [[ -n "${VLLM_ATOM_ENV_VARS:-}" ]]; then
     while IFS= read -r _env_line; do
       [[ -n "${_env_line}" ]] && export "${_env_line}" && echo "Exported: ${_env_line}"
-    done <<< "$(printf '%b' "${EXPLICIT_ENV_VARS}")"
+    done <<< "$(printf '%b' "${VLLM_ATOM_ENV_VARS}")"
   fi
   rm -rf /root/.cache
 

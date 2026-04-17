@@ -16,10 +16,10 @@ concurrency:
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
-  vLLM_ATOM_IMAGE_CACHE_KEEP: "3"
+  VLLM_ATOM_IMAGE_CACHE_KEEP: "3"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
-  NIGHTLY_vLLM_ATOM_IMAGE_TAG: rocm/atom-dev:vllm-latest
+  NIGHTLY_VLLM_ATOM_IMAGE_TAG: rocm/atom-dev:vllm-latest
   VLLM_COMMIT: "2a69949bdadf0e8942b7a1619b229cb475beef20"
 
 jobs:
@@ -120,7 +120,7 @@ jobs:
     steps:
       - name: Initialize vLLM-ATOM image tag
         run: |
-          echo "vLLM_ATOM_IMAGE_TAG=rocm/atom-dev:vLLM-ATOM-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
+          echo "VLLM_ATOM_IMAGE_TAG=rocm/atom-dev:vLLM-ATOM-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
 
       - name: Checkout ATOM repo
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -138,22 +138,22 @@ jobs:
           set -euo pipefail
           echo "image_exists=false" >> "$GITHUB_OUTPUT"
 
-          if ! docker manifest inspect "${vLLM_ATOM_IMAGE_TAG}" >/dev/null 2>&1; then
-            echo "No existing vLLM-ATOM image found for ${vLLM_ATOM_IMAGE_TAG}; building a new one."
+          if ! docker manifest inspect "${VLLM_ATOM_IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "No existing vLLM-ATOM image found for ${VLLM_ATOM_IMAGE_TAG}; building a new one."
             exit 0
           fi
 
-          echo "Found existing vLLM-ATOM image for ${vLLM_ATOM_IMAGE_TAG}; validating vLLM commit label."
-          if ! docker pull "${vLLM_ATOM_IMAGE_TAG}"; then
-            echo "Failed to pull existing image ${vLLM_ATOM_IMAGE_TAG}; rebuilding it."
+          echo "Found existing vLLM-ATOM image for ${VLLM_ATOM_IMAGE_TAG}; validating vLLM commit label."
+          if ! docker pull "${VLLM_ATOM_IMAGE_TAG}"; then
+            echo "Failed to pull existing image ${VLLM_ATOM_IMAGE_TAG}; rebuilding it."
             exit 0
           fi
 
-          EXISTING_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${vLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
-          EXISTING_AITER_ARTIFACT_ID="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.aiter_artifact_id" }}' "${vLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
+          EXISTING_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${VLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
+          EXISTING_AITER_ARTIFACT_ID="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.aiter_artifact_id" }}' "${VLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
           if [ -n "${EXISTING_VLLM_COMMIT}" ] && [ "${EXISTING_VLLM_COMMIT}" = "${VLLM_COMMIT}" ] && [ -n "${EXISTING_AITER_ARTIFACT_ID}" ] && [ "${EXISTING_AITER_ARTIFACT_ID}" = "${AITER_ARTIFACT_ID}" ]; then
             echo "image_exists=true" >> "$GITHUB_OUTPUT"
-            echo "Reusing existing vLLM-ATOM image for ${vLLM_ATOM_IMAGE_TAG} (vLLM commit ${EXISTING_VLLM_COMMIT}, aiter artifact ${EXISTING_AITER_ARTIFACT_ID})."
+            echo "Reusing existing vLLM-ATOM image for ${VLLM_ATOM_IMAGE_TAG} (vLLM commit ${EXISTING_VLLM_COMMIT}, aiter artifact ${EXISTING_AITER_ARTIFACT_ID})."
           else
             echo "Existing image label mismatch or missing."
             echo "Expected vLLM commit ${VLLM_COMMIT}, got ${EXISTING_VLLM_COMMIT:-<missing>}."
@@ -171,8 +171,8 @@ jobs:
         if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' }}
         run: |
           cat <<'EOF' > Dockerfile.mod
-          ARG vLLM_ATOM_BASE_IMAGE
-          FROM ${vLLM_ATOM_BASE_IMAGE}
+          ARG VLLM_ATOM_BASE_IMAGE
+          FROM ${VLLM_ATOM_BASE_IMAGE}
           ARG GITHUB_REPO_URL
           ARG GITHUB_COMMIT_SHA
           ARG VLLM_COMMIT
@@ -213,20 +213,20 @@ jobs:
           set -euo pipefail
           echo "build_mode=full" >> "$GITHUB_OUTPUT"
 
-          if ! docker pull "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}"; then
-            echo "Unable to pull ${NIGHTLY_vLLM_ATOM_IMAGE_TAG}; falling back to a full vLLM rebuild."
+          if ! docker pull "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}"; then
+            echo "Unable to pull ${NIGHTLY_VLLM_ATOM_IMAGE_TAG}; falling back to a full vLLM rebuild."
             exit 0
           fi
 
-          echo "Inspecting ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} labels before deciding whether to reuse it."
-          docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" || true
-          docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" || true
-          LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
+          echo "Inspecting ${NIGHTLY_VLLM_ATOM_IMAGE_TAG} labels before deciding whether to reuse it."
+          docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" || true
+          docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" || true
+          LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
           echo "Expected vLLM commit label: ${VLLM_COMMIT}"
-          echo "Resolved ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
+          echo "Resolved ${NIGHTLY_VLLM_ATOM_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
           if [ -n "${LATEST_VLLM_COMMIT}" ] && [ "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" ]; then
             echo "build_mode=fast" >> "$GITHUB_OUTPUT"
-            echo "Reusing ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} as the vLLM-ATOM CI base (vLLM commit ${LATEST_VLLM_COMMIT})."
+            echo "Reusing ${NIGHTLY_VLLM_ATOM_IMAGE_TAG} as the vLLM-ATOM CI base (vLLM commit ${LATEST_VLLM_COMMIT})."
           else
             echo "vLLM-ATOM CI latest image label mismatch or missing. Expected ${VLLM_COMMIT}, got ${LATEST_VLLM_COMMIT:-<missing>}; rebuilding vLLM."
           fi
@@ -236,7 +236,7 @@ jobs:
         run: |
           DOCKER_BUILDKIT=1 docker build --network=host \
             -t vllm_atom:ci \
-            --build-arg vLLM_ATOM_BASE_IMAGE="${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" \
+            --build-arg VLLM_ATOM_BASE_IMAGE="${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -250,7 +250,7 @@ jobs:
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
             -t vllm_atom_base:ci \
-            --build-arg vLLM_ATOM_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            --build-arg VLLM_ATOM_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -265,7 +265,7 @@ jobs:
             --no-cache \
             -t vllm_atom:ci \
             --target vllm_atom \
-            --build-arg vLLM_ATOM_BASE_IMAGE="vllm_atom_base:ci" \
+            --build-arg VLLM_ATOM_BASE_IMAGE="vllm_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -275,8 +275,8 @@ jobs:
       - name: Push Docker image
         if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' }}
         run: |
-          docker tag vllm_atom:ci "${vLLM_ATOM_IMAGE_TAG}"
-          docker push "${vLLM_ATOM_IMAGE_TAG}"
+          docker tag vllm_atom:ci "${VLLM_ATOM_IMAGE_TAG}"
+          docker push "${VLLM_ATOM_IMAGE_TAG}"
 
       - name: Skip remote build for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
@@ -289,7 +289,7 @@ jobs:
           rm -f Dockerfile.mod || true
           docker rmi "vllm_atom_base:ci" || true
           docker rmi "vllm_atom:ci" || true
-          docker rmi "${vLLM_ATOM_IMAGE_TAG}" || true
+          docker rmi "${VLLM_ATOM_IMAGE_TAG}" || true
 
   vllm-atom:
     needs: [check-signal, download_aiter_wheel, build_vllm_atom_image]
@@ -373,8 +373,8 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           cat <<'EOF' > Dockerfile.mod
-          ARG vLLM_ATOM_BASE_IMAGE
-          FROM ${vLLM_ATOM_BASE_IMAGE}
+          ARG VLLM_ATOM_BASE_IMAGE
+          FROM ${VLLM_ATOM_BASE_IMAGE}
           ARG GITHUB_REPO_URL
           ARG GITHUB_COMMIT_SHA
           ARG VLLM_COMMIT
@@ -416,18 +416,18 @@ jobs:
           docker rmi "vllm_atom:ci" || true
 
           BUILD_MODE="full"
-          if ! docker pull "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}"; then
-            echo "Unable to pull ${NIGHTLY_vLLM_ATOM_IMAGE_TAG}; rebuilding vLLM locally."
+          if ! docker pull "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}"; then
+            echo "Unable to pull ${NIGHTLY_VLLM_ATOM_IMAGE_TAG}; rebuilding vLLM locally."
           else
-            echo "Inspecting ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} labels before deciding whether to reuse it locally."
-            docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" || true
-            docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" || true
-            LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
+            echo "Inspecting ${NIGHTLY_VLLM_ATOM_IMAGE_TAG} labels before deciding whether to reuse it locally."
+            docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" || true
+            docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" || true
+            LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
             echo "Expected vLLM commit label: ${VLLM_COMMIT}"
-            echo "Resolved ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
+            echo "Resolved ${NIGHTLY_VLLM_ATOM_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
             if [ -n "${LATEST_VLLM_COMMIT}" ] && [ "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" ]; then
               BUILD_MODE="fast"
-              echo "Reusing ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} locally for fork PR vLLM-ATOM CI."
+              echo "Reusing ${NIGHTLY_VLLM_ATOM_IMAGE_TAG} locally for fork PR vLLM-ATOM CI."
             else
               echo "vLLM-ATOM CI latest image label mismatch or missing. Expected ${VLLM_COMMIT}, got ${LATEST_VLLM_COMMIT:-<missing>}; rebuilding vLLM locally."
             fi
@@ -436,7 +436,7 @@ jobs:
           if [ "${BUILD_MODE}" = "fast" ]; then
             DOCKER_BUILDKIT=1 docker build --network=host \
               -t vllm_atom:ci \
-              --build-arg vLLM_ATOM_BASE_IMAGE="${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" \
+              --build-arg VLLM_ATOM_BASE_IMAGE="${NIGHTLY_VLLM_ATOM_IMAGE_TAG}" \
               --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
               --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
               --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -449,7 +449,7 @@ jobs:
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
             -t vllm_atom_base:ci \
-            --build-arg vLLM_ATOM_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            --build-arg VLLM_ATOM_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -461,7 +461,7 @@ jobs:
             --no-cache \
             -t vllm_atom:ci \
             --target vllm_atom \
-            --build-arg vLLM_ATOM_BASE_IMAGE="vllm_atom_base:ci" \
+            --build-arg VLLM_ATOM_BASE_IMAGE="vllm_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -473,15 +473,15 @@ jobs:
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           if [ "${IS_FORK_PR}" = "true" ]; then
-            echo "vLLM_ATOM_IMAGE_TAG=vllm_atom:ci" >> "$GITHUB_ENV"
+            echo "VLLM_ATOM_IMAGE_TAG=vllm_atom:ci" >> "$GITHUB_ENV"
           else
-            echo "vLLM_ATOM_IMAGE_TAG=rocm/atom-dev:vLLM-ATOM-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
+            echo "VLLM_ATOM_IMAGE_TAG=rocm/atom-dev:vLLM-ATOM-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
           fi
 
       - name: Pull vLLM-ATOM image
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         run: |
-          docker pull "${vLLM_ATOM_IMAGE_TAG}"
+          docker pull "${VLLM_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -523,7 +523,7 @@ jobs:
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
             --name "$CONTAINER_NAME" \
-            "$vLLM_ATOM_IMAGE_TAG"
+            "$VLLM_ATOM_IMAGE_TAG"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -596,10 +596,10 @@ jobs:
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "VLLM_ATOM_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
           else
-            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "VLLM_ATOM_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
@@ -607,18 +607,18 @@ jobs:
         if: success()
         timeout-minutes: 120
         env:
-          vLLM_ATOM_MODEL_NAME: ${{ matrix.model_name }}
-          vLLM_ATOM_MODEL_PATH: ${{ matrix.model_path }}
-          vLLM_ATOM_EXTRA_ARGS: ${{ matrix.extra_args }}
-          vLLM_ATOM_ENV_VARS: ${{ matrix.env_vars }}
+          VLLM_ATOM_MODEL_NAME: ${{ matrix.model_name }}
+          VLLM_ATOM_MODEL_PATH: ${{ matrix.model_path }}
+          VLLM_ATOM_EXTRA_ARGS: ${{ matrix.extra_args }}
+          VLLM_ATOM_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
-            -e vLLM_ATOM_MODEL_NAME="${vLLM_ATOM_MODEL_NAME}" \
-            -e vLLM_ATOM_MODEL_PATH="${vLLM_ATOM_RESOLVED_MODEL_PATH:-$vLLM_ATOM_MODEL_PATH}" \
-            -e vLLM_ATOM_EXTRA_ARGS="${vLLM_ATOM_EXTRA_ARGS}" \
-            -e vLLM_ATOM_ENV_VARS="${vLLM_ATOM_ENV_VARS}" \
+            -e VLLM_ATOM_MODEL_NAME="${VLLM_ATOM_MODEL_NAME}" \
+            -e VLLM_ATOM_MODEL_PATH="${VLLM_ATOM_RESOLVED_MODEL_PATH:-$VLLM_ATOM_MODEL_PATH}" \
+            -e VLLM_ATOM_EXTRA_ARGS="${VLLM_ATOM_EXTRA_ARGS}" \
+            -e VLLM_ATOM_ENV_VARS="${VLLM_ATOM_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
@@ -682,10 +682,10 @@ jobs:
           rm -f Dockerfile.mod || true
           docker rmi "vllm_atom_base:ci" || true
           docker rmi "vllm_atom:ci" || true
-          KEEP_COUNT="${vLLM_ATOM_IMAGE_CACHE_KEEP:-3}"
-          if [[ "${vLLM_ATOM_IMAGE_TAG}" == rocm/atom-dev:vLLM-ATOM-pre-build-* ]]; then
+          KEEP_COUNT="${VLLM_ATOM_IMAGE_CACHE_KEEP:-3}"
+          if [[ "${VLLM_ATOM_IMAGE_TAG}" == rocm/atom-dev:vLLM-ATOM-pre-build-* ]]; then
             echo "Keeping current vLLM-ATOM image tag and the ${KEEP_COUNT} most recent vLLM-ATOM-pre-build tags."
-            mapfile -t OLD_vLLM_ATOM_TAGS < <(
+            mapfile -t OLD_VLLM_ATOM_TAGS < <(
               docker image ls --filter=reference='rocm/atom-dev:vLLM-ATOM-pre-build-*' --format '{{.Repository}}:{{.Tag}}' \
                 | while read -r tag; do
                     [ -n "${tag}" ] || continue
@@ -695,8 +695,8 @@ jobs:
                 | sort -r \
                 | awk -v keep="${KEEP_COUNT}" 'NR > keep { print $2 }'
             )
-            for tag in "${OLD_vLLM_ATOM_TAGS[@]}"; do
-              if [ "${tag}" = "${vLLM_ATOM_IMAGE_TAG}" ]; then
+            for tag in "${OLD_VLLM_ATOM_TAGS[@]}"; do
+              if [ "${tag}" = "${VLLM_ATOM_IMAGE_TAG}" ]; then
                 continue
               fi
               echo "Removing old vLLM-ATOM image tag: ${tag}"
