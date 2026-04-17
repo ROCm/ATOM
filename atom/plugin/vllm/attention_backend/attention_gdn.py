@@ -395,6 +395,7 @@ class GatedDeltaNet(nn.Module):
                     out=core_attn_out_non_spec,
                     use_qk_l2norm=True,
                     need_shuffle_state=False,
+                    stream=torch.cuda.current_stream(),
                 )
 
                 last_recurrent_state = None
