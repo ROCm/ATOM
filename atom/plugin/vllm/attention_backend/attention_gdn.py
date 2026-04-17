@@ -381,6 +381,7 @@ class GatedDeltaNet(nn.Module):
         elif attn_metadata.num_decodes > 0:
             if USE_FLYDSL_GDR:
                 core_attn_out_non_spec = query_non_spec.new_empty(*value_non_spec.shape)
+                query_non_spec = query_non_spec.permute(1, 0, 2, 3)
                 flydsl_gdr_decode(
                     query=query_non_spec,
                     key=key_non_spec,
