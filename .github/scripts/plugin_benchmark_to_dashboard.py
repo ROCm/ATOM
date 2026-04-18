@@ -16,6 +16,7 @@ def derive_model_name(result_path: Path, payload: dict) -> str:
     if display_name:
         return str(display_name)
 
+    # Fallback: derive from model_id + filename variant
     model = str(payload.get("model_id", "")).split("/")[-1]
     if not model:
         model = result_path.stem

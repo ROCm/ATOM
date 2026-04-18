@@ -345,6 +345,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js" integrity="sha384-y49Zu59jZHJL/PLKgZPv3k2WI9c0Yp3pWB76V8OBVCb0QBKS8l4Ff3YslzHVX76Y" crossorigin="anonymous"></script>
 <script src="data.js"></script>
+<script src="models_map.js"></script>
 <script>
 'use strict';
 (function() {
@@ -503,6 +504,17 @@ const REGRESSION_CRITICAL = 0.10;  // 10% → critical
    ================================================================ */
 const rawData = window.BENCHMARK_DATA;
 
+// Normalize legacy model names using HF-path->display mapping from models_map.js
+const _displayMap = window.MODELS_DISPLAY_MAP || {};
+const _displayEntries = Object.entries(_displayMap).sort((a, b) => b[0].length - a[0].length);
+function normalizeModelName(name) {
+  const lc = name.toLowerCase();
+  for (const [key, display] of _displayEntries) {
+    if (lc === key) return display;
+  }
+  return name;
+}
+
 function parseBenchName(name) {
   let backend = 'ATOM';
   let rawName = name;
@@ -514,11 +526,17 @@ function parseBenchName(name) {
   if (backend === 'OOT') backend = 'ATOM-vLLM';
   // Accuracy entries: "ModelName accuracy (GSM8K)" — (.+?) for multi-word model names
   let m = rawName.match(/^(.+?)\s+accuracy\s+\((\w+)\)$/);
-  if (m) return { backend, model: m[1], metric: 'accuracy', unit: m[2], isAccuracy: true };
+  if (m) return { backend, model: normalizeModelName(m[1]), metric: 'accuracy', unit: m[2], isAccuracy: true };
+  // MTP acceptance: "ModelName MTP acceptance (%)"
+  m = rawName.match(/^(.+?)\s+MTP acceptance\s+\((%)\)$/);
+  if (m) return { backend, model: normalizeModelName(m[1]), metric: 'MTP acceptance', unit: m[2] };
+  // avg toks/fwd: "ModelName avg toks/fwd (tok/fwd)"
+  m = rawName.match(/^(.+?)\s+avg toks\/fwd\s+\((.+)\)$/);
+  if (m) return { backend, model: normalizeModelName(m[1]), metric: 'avg toks/fwd', unit: m[2] };
   m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
-  if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
+  if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
   m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count)$/);
-  if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: '_gpu_count', unit: '' };
+  if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: '_gpu_count', unit: '' };
   return null;
 }
 
@@ -530,7 +548,7 @@ function parseRunConfigs(run) {
   const configs = {}; // key: "backend|model|isl/osl|conc"
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
-    if (!p || p.isAccuracy || p.islOsl === '0/0') continue;
+    if (!p || p.isAccuracy || !p.islOsl || p.islOsl === '0/0') continue;
     const key = `${p.backend}|${p.model}|${p.islOsl}|${p.conc}`;
     if (!configs[key]) configs[key] = { backend: p.backend, model: p.model, islOsl: p.islOsl, conc: p.conc, commit: run.commit, date: run.date, runUrl: '' };
     configs[key][p.metric] = b.value;
@@ -591,10 +609,27 @@ const regressions = detectRegressions();
 
 /* ---- Accuracy data ---- */
 const accuracyMap = {}; // "backend|model" -> [{date, commit, score, runUrl, threshold}, ...]
+const mtpAcceptanceMap = {}; // "backend|model" -> [{date, commit, rate, avgToks, runUrl}, ...]
 for (const run of allRuns) {
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
-    if (!p || !p.isAccuracy) continue;
+    if (!p) continue;
+    // MTP acceptance entries from perf benchmark
+    if (p.metric === 'MTP acceptance') {
+      const mkey = `${p.backend}|${p.model}`;
+      if (!mtpAcceptanceMap[mkey]) mtpAcceptanceMap[mkey] = [];
+      const mEntry = { date: run.date, commit: run.commit, rate: b.value, runUrl: '' };
+      if (b.extra) { const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/); if (rm) mEntry.runUrl = rm[1]; }
+      mtpAcceptanceMap[mkey].push(mEntry);
+      continue;
+    }
+    if (p.metric === 'avg toks/fwd') {
+      const mkey = `${p.backend}|${p.model}`;
+      const arr = mtpAcceptanceMap[mkey];
+      if (arr && arr.length > 0) { const last = arr[arr.length - 1]; if (last.date === run.date) last.avgToks = b.value; }
+      continue;
+    }
+    if (!p.isAccuracy) continue;
     const key = `${p.backend}|${p.model}`;
     if (!accuracyMap[key]) accuracyMap[key] = [];
     const entry = { date: run.date, commit: run.commit, score: b.value, runUrl: '' };
@@ -620,6 +655,7 @@ for (const run of allRuns) {
 for (const history of Object.values(accuracyMap)) {
   history.sort((a, b) => b.date - a.date);
 }
+for (const h of Object.values(mtpAcceptanceMap)) h.sort((a, b) => b.date - a.date);
 const latestAccuracy = {};
 for (const [key, history] of Object.entries(accuracyMap)) {
   if (!history.length) continue;
@@ -727,12 +763,14 @@ function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+
 
 // Model family grouping: "DeepSeek-R1-0528-mtp3" → family "DeepSeek-R1-0528", variant "mtp3"
 function modelFamily(name) {
-  const m = name.match(/^([A-Za-z][\w.]*(?:-[A-Za-z0-9.]+){1,3}?)(?:[-_](?:mtp|MTP|moe|MoE|MXFP|mxfp).*)?$/);
-  return m ? m[1] : name;
+  // Strip space-separated quant/MTP suffixes (e.g. "DeepSeek-R1-0528 MXFP4 MTP3" -> "DeepSeek-R1-0528")
+  const base = name.replace(/(\s+(?:MTP|MXFP|FP)\d*)+$/i, '');
+  const m = base.match(/^([A-Za-z][\w.]*(?:-[A-Za-z0-9.]+){1,6}?)(?:[-_](?:mtp|MTP|moe|MoE|MXFP|mxfp|FP|fp)\d*.*)?$/);
+  return m ? m[1] : base;
 }
 function modelVariant(name) {
   const fam = modelFamily(name);
-  return name === fam ? 'base' : name.slice(fam.length).replace(/^[-_]+/, '');
+  return name === fam ? 'base' : name.slice(fam.length).replace(/^[-_\s]+/, '');
 }
 const MERGED_KIMI_TRADEOFF_FAMILY = 'Kimi-K2&K2.5-MXFP4';
 function tradeoffFamilyInfo(name) {
@@ -1188,8 +1226,7 @@ function renderKPICards() {
   const atRiskCount = accEntries.filter(([, a]) => a.threshold && a.score >= 0.1 && a.score >= a.threshold && (a.score - a.threshold) < 0.005).length;
   const healthyCount = accEntries.filter(([, a]) => a.threshold && a.score >= 0.1 && a.score >= a.threshold && (a.score - a.threshold) >= 0.005).length;
   const accCardClass = failCount > 0 ? 'alert clickable' : atRiskCount > 0 ? 'alert-warning clickable' : (accEntries.length > 0 ? 'ok clickable' : 'clickable');
-  const accSub = accEntries.length === 0
-    ? (Object.keys(latestAccuracy).length === 0 ? 'No accuracy data' : 'No rows match Backend/Model filters')
+  const accSub = accEntries.length === 0 ? 'No accuracy data'
     : failCount > 0 ? `${failCount} failed` + (atRiskCount > 0 ? ` · ${atRiskCount} at risk` : '')
     : atRiskCount > 0 ? `${healthyCount} healthy · ${atRiskCount} at risk`
     : 'All healthy';
@@ -2473,8 +2510,8 @@ function readFromHash() {
 /** Accuracy keys are "backend|model"; ISL/conc do not apply to GSM8K rows. */
 function filteredAccuracyEntries() {
   return Object.entries(latestAccuracy).filter(([key]) => {
-    const [backend, model] = key.split('|');
-    return state.filters.backends.includes(backend) && state.filters.models.includes(model);
+    const [backend] = key.split('|');
+    return state.filters.backends.includes(backend);
   });
 }
 
@@ -2501,7 +2538,7 @@ function renderAccuracyTab() {
           <th class="num">flexible-extract</th><th class="num">strict-match</th>
           <th class="num">Baseline</th><th class="num">Recovery</th>
           <th class="num">Threshold</th><th class="num">Margin</th>
-          <th>Trend</th><th>Fewshot</th><th>Last Tested</th><th>Run</th>
+          <th>Trend</th><th>Fewshot</th><th class="num">MTP Accept%</th><th class="num">toks/fwd</th><th>Last Tested</th><th>Run</th>
         </tr></thead>
         <tbody>`;
 
@@ -2532,6 +2569,11 @@ function renderAccuracyTab() {
     const dateStr = fmtDate(acc.date);
     const href = safeHref(acc.runUrl);
 
+    // MTP acceptance lookup — exact key match
+    let mtpRate = null, mtpToks = null, mtpHistory = null;
+    const mh = mtpAcceptanceMap[key];
+    if (mh && mh.length > 0) { mtpRate = mh[0].rate; mtpToks = mh[0].avgToks; mtpHistory = mh; }
+
     html += `
       <tr class="${rowClass}" data-acc-key="${escHTML(key)}">
         <td style="white-space:nowrap;font-weight:600">${escHTML(backend)}</td>
@@ -2544,15 +2586,23 @@ function renderAccuracyTab() {
         <td class="num"><span class="${marginClass}">${hasThreshold ? (margin >= 0 ? '+' : '') + fmtNum(margin, 4) : '—'}</span></td>
         <td>${trendHTML(acc.score, prev?.score, false)}</td>
         <td class="num">${acc.fewshot != null ? acc.fewshot : '—'}</td>
+        <td class="num">${mtpRate != null ? '<span style="color:var(--accent-green)">' + fmtNum(mtpRate, 1) + '%</span>' : '—'}</td>
+        <td class="num">${mtpToks != null ? fmtNum(mtpToks, 2) : '—'}</td>
         <td>${dateStr}</td>
         <td>${href ? `<a href="${escHTML(href)}" target="_blank" rel="noopener noreferrer">→</a>` : '—'}</td>
       </tr>`;
 
     // Detail row with inline trend chart
     const canvasId = 'acc-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
-    html += `<tr class="detail-row" data-detail-acc="${escHTML(key)}"><td colspan="12"><div class="detail-inner" style="display:flex;gap:var(--gap-lg);flex-wrap:wrap;align-items:flex-start">`;
-    // Left: trend chart
-    html += `<div style="flex:1;min-width:280px"><canvas id="${canvasId}" style="height:180px"></canvas></div>`;
+    html += `<tr class="detail-row" data-detail-acc="${escHTML(key)}"><td colspan="14"><div class="detail-inner" style="display:flex;gap:var(--gap-lg);flex-wrap:wrap;align-items:flex-start">`;
+    // Left: charts stacked vertically (accuracy trend + MTP acceptance)
+    const mtpCanvasId = 'mtp-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+    html += `<div style="flex:1;min-width:280px;display:flex;flex-direction:column;gap:var(--gap-md)">`;
+    html += `<div><canvas id="${canvasId}" style="height:180px"></canvas></div>`;
+    if (mtpHistory && mtpHistory.length > 0) {
+      html += `<div data-mtp-history="${escHTML(JSON.stringify(mtpHistory.slice(0, 30)))}"><canvas id="${mtpCanvasId}" style="height:180px"></canvas></div>`;
+    }
+    html += `</div>`;
     // Right: info
     html += `<div style="flex:0 0 auto;min-width:200px">`;
     if (acc.baselineModel || acc.baselineNote) {
@@ -2593,7 +2643,10 @@ function renderAccuracyTab() {
       detail.classList.toggle('expanded');
       row.classList.toggle('row-open');
       if (expanding && !accCharts[key]) {
-        requestAnimationFrame(() => renderAccuracyMiniChart(key, accCharts));
+        requestAnimationFrame(() => {
+          renderAccuracyMiniChart(key, accCharts);
+          renderMtpAcceptanceMiniChart(key);
+        });
       }
     });
   });
@@ -2751,6 +2804,87 @@ function renderAccuracyMiniChart(key, chartCache) {
         const prevEntry = pointIdx > 0 ? sorted[pointIdx - 1] : null;
         hideAccuracyHover();
         showAccuracyPopover(key, accEntry, prevEntry);
+      },
+    },
+  });
+}
+
+function renderMtpAcceptanceMiniChart(key) {
+  const mtpCanvasId = 'mtp-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+  const canvas = document.getElementById(mtpCanvasId);
+  if (!canvas) return;
+  const wrapper = canvas.parentElement;
+  let history;
+  try { history = JSON.parse(wrapper.dataset.mtpHistory || '[]'); } catch { return; }
+  if (!history.length) return;
+  const sorted = [...history].sort((a, b) => a.date - b.date);
+  const labels = sorted.map(h => { const dt = new Date(h.date); return `${dt.getMonth()+1}/${dt.getDate()}`; });
+  const datasets = [{
+    label: 'Acceptance %', data: sorted.map(h => h.rate),
+    borderColor: 'hsl(145,63%,49%)', backgroundColor: 'hsla(145,63%,49%,0.15)',
+    borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, tension: 0.3, fill: true, yAxisID: 'y',
+  }];
+  const hasAvgToks = sorted.some(h => h.avgToks != null);
+  if (hasAvgToks) {
+    datasets.push({
+      label: 'avg toks/fwd', data: sorted.map(h => h.avgToks ?? null),
+      borderColor: 'hsl(210,80%,60%)', backgroundColor: 'hsla(210,80%,60%,0.1)',
+      borderWidth: 1.5, borderDash: [4,3], pointRadius: 3, tension: 0.3, fill: false, yAxisID: 'y2',
+    });
+  }
+  new Chart(canvas, {
+    type: 'line', data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
+        title: { display: true, text: 'MTP Acceptance Rate', color: C_LEGEND, font: { size: 12 } },
+        tooltip: { ...chartTooltipOpts() },
+        datalabels: { display: false },
+      },
+      scales: {
+        x: { grid: chartGridOpts(), ticks: { color: C_TICK, font: { size: 10 } } },
+        y: { position: 'left', grid: chartGridOpts(),
+          title: { display: true, text: 'Acceptance %', color: C_TICK, font: { size: 10 } },
+          ticks: { color: C_TICK } },
+        ...(hasAvgToks ? { y2: { position: 'right', grid: { display: false },
+          title: { display: true, text: 'toks/fwd', color: C_TICK, font: { size: 10 } },
+          ticks: { color: C_TICK } } } : {}),
+      },
+      onClick: (_e, elems) => {
+        if (!elems.length) return;
+        const h = sorted[elems[0].index];
+        if (!h) return;
+        const [backend, model] = key.split('|');
+        const acc = latestAccuracy[key] || {};
+        const gpuParts = [];
+        if (acc._gpu_name) gpuParts.push(acc._gpu_name);
+        if (acc._gpu_vram_gb) gpuParts.push(acc._gpu_vram_gb + 'GB');
+        const gpuLabel = gpuParts.length ? gpuParts.join(' · ') : '—';
+        const commitHref = safeHref(h.commit?.url);
+        const runHref = safeHref(h.runUrl);
+        const pop = document.getElementById('popover');
+        pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
+          <h3>${escHTML(model)} MTP Acceptance</h3>
+          <div class="pop-row"><span class="pop-key">Acceptance Rate</span><span class="pop-val" style="color:var(--accent-green)">${fmtNum(h.rate, 2)}%</span></div>
+          ${h.avgToks != null ? `<div class="pop-row"><span class="pop-key">Avg toks/fwd</span><span class="pop-val">${fmtNum(h.avgToks, 2)}</span></div>` : ''}
+          <div class="pop-section">
+            <div class="pop-row"><span class="pop-key">Model</span><span class="pop-val" style="font-family:inherit">${escHTML(model)}</span></div>
+            <div class="pop-row"><span class="pop-key">Backend</span><span class="pop-val" style="font-family:inherit">${escHTML(backend)}</span></div>
+            <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${escHTML(gpuLabel)}</span></div>
+            <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(acc._rocm_version || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(acc.dockerImage || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${commitHref ? '<a href="' + escHTML(commitHref) + '" target="_blank" rel="noopener noreferrer">' + (h.commit.id?.slice(0,7) || '—') + '</a>' : (h.commit?.id?.slice(0,7) || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(h.commit?.message?.split('\\n')[0] || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(h.commit?.author?.name || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${fmtDate(h.date)}</span></div>
+          </div>
+          <div class="action-row">
+            ${runHref ? '<a class="action-btn" href="' + escHTML(runHref) + '" target="_blank" rel="noopener noreferrer">Open Run ↗</a>' : ''}
+            ${commitHref ? '<a class="action-btn" href="' + escHTML(commitHref) + '" target="_blank" rel="noopener noreferrer">View Commit ↗</a>' : ''}
+          </div>`;
+        document.getElementById('popover-overlay').classList.add('open');
+        document.getElementById('pop-close-btn').addEventListener('click', (e) => { e.stopPropagation(); hidePopover(); });
       },
     },
   });

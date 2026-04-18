@@ -191,6 +191,39 @@ with open(result_file, "w", encoding="utf-8") as f:
 PY
   fi
 
+  # Extract MTP acceptance rate from server log (if MTP enabled)
+  ATOM_SERVER_LOG="${ATOM_SERVER_LOG:-/tmp/atom_server.log}"
+  SERVER_ARGS="${SERVER_ARGS:-${EXTRA_ARGS[*]:-}}"
+  if [ -f "$ATOM_SERVER_LOG" ] && echo "$SERVER_ARGS" | grep -qi mtp; then
+    RESULT_FILE="${RESULT_FILENAME}" \
+    ATOM_SERVER_LOG="$ATOM_SERVER_LOG" \
+    python3 - <<'PY'
+import json, os, re
+
+result_file = os.environ["RESULT_FILE"]
+server_log = os.environ["ATOM_SERVER_LOG"]
+
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+with open(server_log, encoding="utf-8", errors="replace") as f:
+    for line in reversed(f.readlines()):
+        if "[MTP Stats " in line and "Interval" not in line:
+            m = re.search(
+                r"Average toks/fwd: ([\d.]+).*Acceptance rate: ([\d.]+)%",
+                line,
+            )
+            if m:
+                meta = data.setdefault("atom_ci_metadata", {})
+                meta["mtp_acceptance_rate"] = float(m.group(2))
+                meta["avg_tokens_per_forward"] = float(m.group(1))
+                break
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
 fi
 

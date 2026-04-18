@@ -192,6 +192,18 @@
     "_baseline_note": "CI baseline=0.8605 (FP8 tp=4, 3-shot completions API, thinking mode active). HF card reports 0.9538 but uses chat API with reasoning_parser"
   },
   {
+    "model_name": "Qwen3.5-397B-A17B-FP8 MTP3",
+    "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --method mtp --num-speculative-tokens 3",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "main",
+    "accuracy_threshold": 0.85,
+    "accuracy_baseline": 0.9538,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "_baseline_note": "Same base model as Qwen3.5-397B-A17B-FP8; MTP3 speculative decoding"
+  },
+  {
     "model_name": "Qwen3.5-397B-A17B-MXFP4",
     "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
     "extraArgs": "--kv_cache_dtype fp8 -tp 4",

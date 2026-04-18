@@ -136,6 +136,28 @@ def build_entries(
             entry["extra"] = extra
         entries.append(entry)
 
+        # MTP acceptance rate (extracted from server log during accuracy test)
+        mtp_rate = ci_metadata.get("mtp_acceptance_rate")
+        if mtp_rate is not None:
+            mtp_entry = {
+                "name": f"{backend}::{model_name} MTP acceptance (%)",
+                "unit": "%",
+                "value": round(float(mtp_rate), 2),
+            }
+            if extra:
+                mtp_entry["extra"] = extra
+            entries.append(mtp_entry)
+
+            avg_toks = ci_metadata.get("avg_tokens_per_forward")
+            if avg_toks is not None:
+                entries.append(
+                    {
+                        "name": f"{backend}::{model_name} avg toks/fwd (tok/fwd)",
+                        "unit": "tok/fwd",
+                        "value": round(float(avg_toks), 2),
+                    }
+                )
+
     return entries
 
 

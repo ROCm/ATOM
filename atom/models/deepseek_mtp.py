@@ -171,6 +171,12 @@ class DeepSeekMTP(nn.Module):
             atom_config=atom_config, prefix=maybe_prefix(prefix, "model")
         )
 
+    def remap_mtp_weight_name(self, name: str) -> str | None:
+        spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+        if spec_layer is None:
+            return None
+        return rewrite_spec_layer_name(spec_layer, name)
+
     def forward(
         self,
         input_ids: torch.Tensor,

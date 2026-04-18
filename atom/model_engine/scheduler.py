@@ -434,6 +434,18 @@ class Scheduler:
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
+        # Strip placeholder + rejected draft tokens added by postprocess.
+        # Real token count = seq.num_tokens - mtp_k - num_rejected
+        # (same formula as postprocess line: num_tokens = seq.num_tokens - self.mtp_k - num_rejected)
+        if self.mtp_k > 0:
+            strip = self.mtp_k + seq.num_rejected
+            if strip > 0:
+                del seq.token_ids[-strip:]
+                del seq.output_tokens[-strip:]
+                seq.num_tokens -= strip
+        seq.num_rejected = 0
+        seq.num_bonus_tokens = 0
+        seq.spec_token_ids = np.array([], dtype=np.int32)
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 

@@ -267,6 +267,7 @@ jobs:
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
             -e DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}" \
             -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
+            -e DISPLAY_NAME="${{ matrix.model.display }}" \
             atom-benchmark python3 -c "
           import json, os
           p = os.environ['RESULT_PATH']
@@ -279,6 +280,9 @@ jobs:
               d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
               d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
               d['docker_image'] = os.environ.get('DOCKER_IMAGE', '')
+              display_name = os.environ.get('DISPLAY_NAME', '')
+              if display_name:
+                  d['benchmark_model_name'] = display_name
               with open(p, 'w') as f:
                   json.dump(d, f, indent=2)
           "
@@ -411,51 +415,11 @@ jobs:
 
       - name: Transform results for benchmark dashboard
         run: |
-          python3 -c "
-          import json, glob, re
-          run_url = f'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          entries = []
-          for f in sorted(glob.glob('*.json')):
-              if f == 'regression_report.json':
-                  continue
-              try:
-                  d = json.load(open(f))
-              except (json.JSONDecodeError, OSError):
-                  continue
-              if 'output_throughput' not in d:
-                  continue
-              model = d.get('model_id', '').split('/')[-1]
-              m = re.search(r'-(mtp\d*)-', f)
-              if m:
-                  model = f'{model}-{m.group(1)}'
-              isl = d.get('random_input_len', 0)
-              osl = d.get('random_output_len', 0)
-              conc = d.get('max_concurrency', 0)
-              label = f'{model} {isl}/{osl} c={conc}'
-              gpu_name = d.get('gpu_name', '')
-              gpu_vram = d.get('gpu_vram_gb', 0)
-              rocm_ver = d.get('rocm_version', '')
-              extra = f'Run: {run_url}'
-              if gpu_name:
-                  extra += f' | GPU: {gpu_name}'
-              if gpu_vram:
-                  extra += f' | VRAM: {gpu_vram}GB'
-              if rocm_ver:
-                  extra += f' | ROCm: {rocm_ver}'
-              entries.append({'name': f'{label} throughput (tok/s)', 'unit': 'tok/s',
-                              'value': round(d['output_throughput'], 2), 'extra': extra})
-              entries.append({'name': f'{label} Total Tput (tok/s)', 'unit': 'tok/s',
-                              'value': round(d.get('total_token_throughput', 0), 2), 'extra': extra})
-              entries.append({'name': f'{label} TTFT (ms)', 'unit': 'ms',
-                              'value': round(d.get('mean_ttft_ms', 0), 2), 'extra': extra})
-              entries.append({'name': f'{label} TPOT (ms)', 'unit': 'ms',
-                              'value': round(d.get('mean_tpot_ms', 0), 2), 'extra': extra})
-              tp = d.get('tensor_parallel_size', 1)
-              entries.append({'name': f'{label} _gpu_count', 'unit': '',
-                              'value': int(tp)})
-          json.dump(entries, open('benchmark-action-input.json', 'w'), indent=2)
-          print(f'Generated {len(entries)} entries for benchmark dashboard')
-          "
+          python3 .github/scripts/plugin_benchmark_to_dashboard.py \
+            . \
+            --output benchmark-action-input.json \
+            --default-backend ATOM \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Store benchmark result to dashboard
         uses: benchmark-action/github-action-benchmark@v1
@@ -476,6 +440,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           CURRENT_SHA=$(git rev-parse HEAD)
+          # Generate prefix→display name mapping from models.json
+          python3 -c "
+          import json
+          models = json.loads(open('.github/benchmark/models.json').read())
+          mapping = {}
+          for m in models:
+              display = m.get('display','')
+              path = m.get('path','')
+              suffix = m.get('suffix','')
+              if not display or not path: continue
+              hf_name = path.split('/')[-1].lower()
+              # HF path-derived key (old data used model_id last segment + optional suffix)
+              hf_key = hf_name + suffix.lower() if suffix else hf_name
+              mapping[hf_key] = display
+          with open('/tmp/dashboard_models_map.js','w') as f:
+              f.write('window.MODELS_DISPLAY_MAP = ' + json.dumps(mapping) + ';')
+          "
           # Save dashboard assets before switching branches
           cp .github/dashboard/index.html /tmp/dashboard_index.html
           cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
@@ -484,6 +465,7 @@ jobs:
           git checkout gh-pages
           # Replace auto-generated index.html with custom dashboard + logo
           cp /tmp/dashboard_index.html benchmark-dashboard/index.html
+          cp /tmp/dashboard_models_map.js benchmark-dashboard/models_map.js
           cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
           cp /tmp/dashboard_logo_mini.png benchmark-dashboard/atom_logo_mini.png
           git add benchmark-dashboard/

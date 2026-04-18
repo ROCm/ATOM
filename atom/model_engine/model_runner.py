@@ -34,7 +34,6 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -44,6 +43,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.selector import get_attn_backend
+from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -545,22 +545,6 @@ class ModelRunner:
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
         )
-        if self.config.speculative_config and get_pp_group().is_last_rank:
-            from atom.utils.backends import set_model_tag
-
-            with set_model_tag("drafter"):
-                self.drafter = EagleProposer(self.config, self.device, self)
-            self.rejection_sampler = RejectionSampler()
-            self.mtp_total_draft_tokens = 0
-            self.mtp_total_accepted_tokens = 0
-        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
-        self.tokenID_processor = tokenIDProcessor(
-            self,
-            self.config.max_num_batched_tokens,
-            hasattr(self, "drafter"),
-            self.num_spec_tokens,
-        )
-        self.sampler = Sampler()
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -594,9 +578,24 @@ class ModelRunner:
         )
         logger.info(f"Model load done: {config.model}")
 
-        if hasattr(self, "drafter"):
+        if self.config.speculative_config and get_pp_group().is_last_rank:
+            from atom.utils.backends import set_model_tag
+
+            torch.set_default_device(self.device)
+            with set_model_tag("drafter"):
+                self.drafter = EagleProposer(self.config, self.device, self)
+            self.rejection_sampler = RejectionSampler()
+            torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.tokenID_processor = tokenIDProcessor(
+            self,
+            self.config.max_num_batched_tokens,
+            hasattr(self, "drafter"),
+            self.num_spec_tokens,
+        )
+        self.sampler = Sampler()
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
@@ -1327,6 +1326,11 @@ class ModelRunner:
         kv_cache_tensors = []
         layer_id = 0
         x = 16 // self.kv_cache.element_size()
+        mtp_start_layer_idx = (
+            self.drafter.model.model.mtp_start_layer_idx
+            if hasattr(self, "drafter")
+            else hf_config.num_hidden_layers
+        )
         for model_name, model in models_to_bind:
             logger.info(
                 f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
@@ -1336,9 +1340,17 @@ class ModelRunner:
                 # Since use attention base and there are child in attention, add base condition
                 if hasattr(module, "base_attention"):
                     if hasattr(module, "use_mla") and not module.use_mla:
-                        # Non-MLA attention
+                        # Non-MLA attention: hybrid models interleave full
+                        # attention and linear attention, so attn_idx must
+                        # skip linear-attention layers for target, and use
+                        # consecutive slots after num_full_attn for draft.
                         if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
+                            if layer_id < mtp_start_layer_idx:
+                                attn_idx = layer_id // self.full_attention_interval
+                            else:
+                                attn_idx = self.num_full_attn + (
+                                    layer_id - mtp_start_layer_idx
+                                )
                         else:
                             attn_idx = layer_id
                         k_cache = self.kv_cache[0, attn_idx].view(
@@ -1712,6 +1724,7 @@ class ModelRunner:
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
+
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             # prefill[bs=1 tok=115 ctx=115]
             label = f"prefill[bs={bs}"

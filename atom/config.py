@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
 import torch
 from aiter import QuantType
@@ -24,7 +24,6 @@ from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 # plugin-related utilities
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
-from atom.utils import resolve_obj_by_qualname
 
 logger = logging.getLogger("atom")
 
@@ -696,46 +695,63 @@ class SpeculativeConfig:
     num_speculative_tokens: Optional[int] = None
     draft_model_hf_config: Optional[PretrainedConfig] = None
 
+    # model_type → mtp_model_type mapping
+    _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
+        "deepseek_v3": "deepseek_mtp",
+        "glm_moe_dsa": "deepseek_mtp",
+        "qwen3_next": "qwen3_next_mtp",
+        "qwen3_5": "qwen3_5_mtp",
+        "qwen3_5_moe": "qwen3_5_mtp",
+        "qwen3_5_text": "qwen3_5_mtp",
+        "qwen3_5_moe_text": "qwen3_5_mtp",
+    }
+
+    # mtp_model_type → (n_predict_attr, architecture)
+    _MTP_CONFIG: ClassVar[dict[str, tuple[str, str]]] = {
+        "deepseek_mtp": ("num_nextn_predict_layers", "DeepSeekMTPModel"),
+        "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
+        "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
+    }
+
     def __post_init__(self):
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
+        # For multimodal models, extract text_config
+        if hasattr(self.draft_model_hf_config, "text_config"):
+            self.draft_model_hf_config = self.draft_model_hf_config.text_config
         self.hf_config_override(self.draft_model_hf_config)
 
     @staticmethod
-    def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type in ("deepseek_v3", "glm_moe_dsa"):
-            hf_config.model_type = "deepseek_mtp"
-        if hf_config.model_type == "qwen3_next":
-            hf_config.model_type = "qwen3_next_mtp"
+    def hf_config_override(hf_config: PretrainedConfig) -> None:
+        # Step 1: resolve model_type → mtp model_type
+        mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
+        if mtp_type is not None:
+            hf_config.model_type = mtp_type
 
-        if hf_config.model_type == "deepseek_mtp":
-            # DeepSeek MTP typically uses only 1 layer that gets reused
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
-            # Override to use only 1 layer if config says otherwise
+        # Step 2: apply MTP-specific config overrides
+        entry = SpeculativeConfig._MTP_CONFIG.get(hf_config.model_type)
+        if entry is not None:
+            n_predict_attr, arch = entry
+            n_predict = getattr(hf_config, n_predict_attr, 1)
             if n_predict != 1:
                 logger.warning(
-                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                    f"Overriding {n_predict_attr} from {n_predict} to 1 "
                     "(MTP typically uses 1 layer that gets reused)"
                 )
                 n_predict = 1
-            hf_config.update(
-                {
-                    "n_predict": n_predict,
-                    "num_nextn_predict_layers": n_predict,
-                    "architectures": ["DeepSeekMTPModel"],
-                }
-            )
-        if hf_config.model_type == "qwen3_next_mtp":
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
-            if n_predict != 1:
-                logger.warning(
-                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
-                    "(MTP typically uses 1 layer that gets reused)"
-                )
-                n_predict = 1
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["Qwen3NextMTPModel"]}
-            )
+
+            updates: dict[str, Any] = {
+                "n_predict": n_predict,
+                "num_nextn_predict_layers": n_predict,
+                "architectures": [arch],
+            }
+            # Qwen3.5 MTP needs expert counts for MoE layer construction
+            if hf_config.model_type == "qwen3_5_mtp":
+                updates["n_shared_experts"] = 1
+                updates["n_routed_experts"] = getattr(hf_config, "num_experts", 0)
+
+            hf_config.update(updates)
+
         logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
