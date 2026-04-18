@@ -80,7 +80,7 @@
 - **[COMMON] "Failed to allocate kv cache":** `num_blocks` returned 0. Model + KV cache don't fit in VRAM. **Fix:** Reduce `max_num_seqs` or use `--kv_cache_dtype fp8`
 - **Block exhaustion during serving:** Scheduler preempts last running sequence when blocks run out
 - **Block leak (ref_count never reaches 0):** Verify `seq.block_table` is cleared on sequence completion
-- **Mamba/GDN block table:** Hybrid models use separate `mamba_block_table` for linear attention state. No prefix caching support
+- **Mamba/GDN state slots:** Hybrid models use `mamba_state_slot` (per-request slot from unified pool) for recurrent state. Pool tracks mamba memory via equiv-block accounting
 
 ## Scheduler
 

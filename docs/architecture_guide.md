@@ -192,6 +192,7 @@ The `Sequence` class (in `atom/model_engine/sequence.py`) is the central data st
 | `num_prompt_tokens` | `int` | Length of the original prompt |
 | `num_tokens` | `int` (property) | Total length including generated tokens |
 | `block_table` | `list[int]` | KV cache block IDs allocated to this sequence |
+| `mamba_state_slot` | `int` | Per-request GDN recurrent state slot index for hybrid models (Qwen3-Next, Qwen3.5); `-1` if unallocated or not a hybrid model |
 | `status` | `SequenceStatus` | Current lifecycle state |
 | `type` | `SequenceType` | Current execution type |
 | `temperature` | `float` | Sampling temperature |

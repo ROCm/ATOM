@@ -138,16 +138,18 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
-        for idx, mamba_block_table in enumerate(batch.mamba_block_tables):
+        slots_per_group = 1 + self.num_spec
+        for idx, slot_group in enumerate(batch.mamba_state_slots):
             non_spec_state_indices[idx] = 0
             spec_state_indices[idx] = 0
+            base = slot_group * slots_per_group
 
             if not with_spec:
-                non_spec_state_indices[idx] = mamba_block_table[0]
+                non_spec_state_indices[idx] = base
             else:
-                spec_state_indices[idx, : 1 + self.num_spec] = mamba_block_table[
-                    : 1 + self.num_spec
-                ]
+                spec_state_indices[idx, : 1 + self.num_spec] = np.arange(
+                    base, base + 1 + self.num_spec
+                )
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
         self.num_accepted_tokens.fill_(1)

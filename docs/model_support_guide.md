@@ -133,6 +133,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Architecture:** Hybrid MoE transformer with two attention types: full attention (`Qwen3NextAttention`) and Gated DeltaNet linear attention (`Qwen3NextGatedDeltaNet`). Layer type is determined by `config.layer_types`.
 - **Layer structure:** `Qwen3NextDecoderLayer` containing either full attention or linear attention, plus either `Qwen3NextSparseMoeBlock` (MoE layers) or `Qwen3NextMLP` (dense layers).
 - **Attention:** Full attention layers use `QKVParallelLinear` with QK norm, RoPE, GQA. Linear attention layers use `QKVZBAParallelLinear` for fused QKVZ+BA projections with Gated DeltaNet recurrence.
+- **GDN Recurrent State:** The Gated DeltaNet linear attention layers maintain per-request recurrent state. ATOM manages this state via a dedicated per-request slot pool (separate from KV cache blocks). Each sequence is assigned a `mamba_state_slot` index during allocation, and the state memory is accounted for dynamically as block equivalents within the unified KV pool.
 - **MoE:** `Qwen3NextSparseMoeBlock` with `FusedMoE`, shared expert fusion support.
 - **Normalization:** Uses `GemmaRMSNorm` (aliased as `Qwen3NextRMSNorm`).
 - **MTP:** Separate draft model in `atom/models/qwen3_next_mtp.py` (`Qwen3NextMTP`).
@@ -142,6 +143,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Architecture:** Hybrid transformer with two attention types: full attention and Gated DeltaNet linear attention. Layer type is determined by `config.layer_types`. Dense or MoE variants.
 - **Layer structure:** `Qwen3_5DecoderLayer` containing either full attention or linear attention, plus either `Qwen3_5SparseMoeBlock` (MoE variants) or `Qwen3_5MLP` (dense variants).
 - **Attention:** Full attention layers use `QKVParallelLinear` with QK norm, RoPE, GQA. Linear attention layers use `QKVZBAParallelLinear` for fused QKVZ+BA projections with Gated DeltaNet.
+- **GDN Recurrent State:** Like Qwen3-Next, the Gated DeltaNet layers maintain per-request recurrent state managed via the slot pool. Qwen3.5 models (both dense and MoE variants) use the same unified memory management as Qwen3-Next.
 - **MoE:** `Qwen3_5SparseMoeBlock` with `FusedMoE`, shared expert fusion support.
 - **Normalization:** RMSNorm with optional fused allreduce for MoE models.
 - **MTP:** Separate draft model in `atom/models/qwen3_5_mtp.py` (`Qwen3_5MTP`). The MTP predictor uses only full attention layers (no Gated DeltaNet) for efficiency, supporting both MTP1 and MTP3 variants via `num_speculative_tokens`.

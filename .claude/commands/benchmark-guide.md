@@ -75,6 +75,12 @@ curl -X POST http://127.0.0.1:8000/stop_profile
 | E2EL | End-to-End Latency |
 | Throughput | Output tokens/s |
 
+## Critical Rules
+
+- **Never run accuracy and performance tests simultaneously** — they interfere with each other's results. Always finish one before starting the other.
+- **Report Total Token throughput (tok/s)**, not Output token throughput — Total includes input+output.
+- **MTP models require `--use-chat-template`** — tokenizer mismatch without it causes inaccurate results.
+
 ## CI Benchmark Workflow
 
 - File: `.github/workflows/atom-benchmark.yaml`

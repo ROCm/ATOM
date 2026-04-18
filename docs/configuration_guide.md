@@ -61,12 +61,15 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `eos_token_id` | `int` | `-1` | End-of-sequence token ID (`-1` = use model default) |
 | `stop_token_ids` | `list[int]` | `[]` | Additional stop token IDs; populated from `GenerationConfig.eos_token_id` during init |
 
-**Auto-derived fields** (set in `__post_init__`, not user-supplied):
+**Auto-derived fields** (set in `__post_init__` or by `ModelRunner.get_num_blocks()`, not user-supplied):
 
 | Field | Type | Description |
 |---|---|---|
 | `hf_config` | `PretrainedConfig` | Loaded automatically via `get_hf_config(model)` |
 | `generation_config` | `GenerationConfig` | Loaded automatically via `get_generation_config(model)` |
+| `mamba_equiv_per_req` | `int` | Number of KV cache block equivalents reserved per request for GDN recurrent state (hybrid models only); computed by `ModelRunner.get_num_blocks()` |
+| `num_mamba_groups` | `int` | Number of per-request GDN state slot groups available (= `max_num_seqs` for hybrid models, 0 otherwise); computed by `ModelRunner.get_num_blocks()` |
+| `max_mamba_slots` | `int` | Maximum number of GDN state slots (including slots for speculative tokens); computed by `ModelRunner.get_num_blocks()` |
 
 ---
 
