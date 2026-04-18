@@ -29,6 +29,7 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
+_NO_PS_FIXED_SPLITS = 64  # covers up to 64 * 256 = 16384 context length
 
 
 class PagedAttentionImplPluginModeMethods:
@@ -219,13 +220,13 @@ class PagedAttentionImplPluginModeMethods:
         assert num_q_heads_total % num_kv_heads == 0
         context_partition_size = 256
 
-        def cdiv(a, b):
-            return (a + b - 1) // b
-
-        if ps:
+        use_ps = self.adopt_persistent_kernel(
+            head_size, num_kv_heads, num_q_heads_total
+        )
+        if use_ps:
             max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
         else:
-            max_context_partition_num = cdiv(attn_metadata.max_seqlen_k, context_partition_size)
+            max_context_partition_num = _NO_PS_FIXED_SPLITS
 
         if self.sliding_window > 0:
             max_context_partition_num = 1
@@ -238,6 +239,9 @@ class PagedAttentionImplPluginModeMethods:
             max_context_partition_num,
             query_group_size,
         )
+        compute_type = (
+            torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
+        )
         exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
         max_logits = torch.empty(
             intermediate_shape, dtype=torch.float32, device=q.device
@@ -249,15 +253,9 @@ class PagedAttentionImplPluginModeMethods:
             device=q.device,
         )
 
-        per_tensor = False
         if k_scale is not None and k_scale.numel() > 1:
             k_scale = k_scale.unsqueeze(-1)
             v_scale = v_scale.unsqueeze(-1)
-        compute_type = (
-            torch.bfloat16
-            if self.kv_cache_dtype == "bf16" or per_tensor
-            else aiter.dtypes.fp8
-        )
 
         num_decode_seqs = q.shape[0]
         seq_lens_decode = attn_metadata.plugin_metadata.seq_lens[:num_decode_seqs]
@@ -286,7 +284,7 @@ class PagedAttentionImplPluginModeMethods:
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
-            ps=True,
+            ps=use_ps,
         )
 
         return o
@@ -521,7 +519,7 @@ class PagedAttentionImplPluginModeMethods:
 
     def adopt_persistent_kernel(self, head_size, num_kv_heads, num_q_heads):
         non_ps_database = {(256, 4, 1)}
-        if (head_size, num_kv_heads, num_q_heads) in non_ps_database:
+        if (head_size, num_q_heads, num_kv_heads) in non_ps_database:
             return False
         return True
 
@@ -553,9 +551,9 @@ class PagedAttentionImplPluginModeMethods:
         # when not using this optimization, the position is not
         # needed as the ROPE has been calculated outside of attention
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            assert position is None, (
-                "position should be None because it is passed through k"
-            )
+            assert (
+                position is None
+            ), "position should be None because it is passed through k"
 
             position = key
             qkv = value
@@ -746,7 +744,6 @@ class PagedAttentionImplPluginModeMethods:
                     v_scale=v_scale,
                     out=output_actual_tokens[:num_decode_tokens],
                     attn_metadata=attn_metadata,
-                    ps=use_ps,
                 )
             else:
                 # Qwen only uses gluon pa decode when bs=64
@@ -759,7 +756,6 @@ class PagedAttentionImplPluginModeMethods:
                         v_scale=v_scale,
                         out=output_actual_tokens[:num_decode_tokens],
                         attn_metadata=attn_metadata,
-                        ps=use_ps
                     )
                 else:
                     self.paged_attention_asm_plugin_mode(
