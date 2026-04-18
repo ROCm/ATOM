@@ -86,6 +86,13 @@
 <li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#forward-context-pattern">4. Forward Context Pattern</a></li>
 <li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#multi-process-architecture">5. Multi-Process Architecture</a></li>
 <li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#sequence-lifecycle">6. Sequence Lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#speculative-decoding-mtp-eagle">7. Speculative Decoding (MTP / EAGLE)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#supported-mtp-architectures">Supported MTP architectures</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#weight-sharing">Weight sharing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#propose-loop-mha-vs-mla-branching">Propose loop: MHA vs MLA branching</a></li>
+<li class="toctree-l3"><a class="reference internal" href="architecture_guide.html#prepare-mtp-decode"><code class="docutils literal notranslate"><span class="pre">prepare_mtp_decode()</span></code></a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="architecture_guide.html#source-files">Source Files</a></li>
 </ul>
 </li>
@@ -108,7 +115,11 @@
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#parallel-configuration-parallelconfig">4. Parallel Configuration (<code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#speculative-decoding-configuration-speculativeconfig">5. Speculative Decoding Configuration (<code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#speculative-decoding-configuration-speculativeconfig">5. Speculative Decoding Configuration (<code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#table-driven-mtp-config">5.1 Table-Driven MTP Config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="configuration_guide.html#post-init-behaviour-hf-config-override">5.2 Post-init behaviour (<code class="docutils literal notranslate"><span class="pre">hf_config_override</span></code>)</a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#sampling-parameters-samplingparams">6. Sampling Parameters (<code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#cli-arguments-engineargs">7. CLI Arguments (<code class="docutils literal notranslate"><span class="pre">EngineArgs</span></code>)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="configuration_guide.html#environment-variables">8. Environment Variables</a><ul>
@@ -134,6 +145,8 @@
 <li class="toctree-l3"><a class="reference internal" href="#glm-5-glmmoedsa-glmmoedsaforcausallm">GLM-5 / GlmMoeDsa (<code class="docutils literal notranslate"><span class="pre">GlmMoeDsaForCausalLM</span></code>)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#glm4-moe-glm4moeforcausallm">GLM4-MoE (<code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code>)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#qwen3-next-qwen3nextforcausallm">Qwen3-Next (<code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#qwen3-5-qwen3-5forconditionalgeneration-and-qwen3-5moeforconditionalgeneration">Qwen3.5 (<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code> and <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#qwen3-5-mtp-qwen3-5mtp">Qwen3.5 MTP (<code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>)</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#weight-loading">3. Weight Loading</a><ul>
@@ -154,7 +167,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#llama-fused-rmsnorm-quant-and-silu-mul-quant">Llama: Fused RMSNorm+Quant and SiLU+Mul+Quant</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#deepseek-v2-v3-mla-fused-input-norm-qk-norm-fusion">DeepSeek V2/V3: MLA + Fused Input Norm + QK Norm Fusion</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#qwen3-moe-qk-norm-rope-cache-quant-fusion">Qwen3-MoE: QK Norm + RoPE + Cache + Quant Fusion</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#mtp-deepseek-multi-token-prediction">MTP: DeepSeek Multi-Token Prediction</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#mtp-multi-token-prediction-speculative-decoding">MTP: Multi-Token Prediction (Speculative Decoding)</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
@@ -544,6 +557,8 @@
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">support_model_arch_dict</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s2">&quot;Qwen3ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;atom.models.qwen3.Qwen3ForCausalLM&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Qwen3MoeForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;atom.models.qwen3_moe.Qwen3MoeForCausalLM&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Qwen3_5ForConditionalGeneration&quot;</span><span class="p">:</span> <span class="s2">&quot;atom.models.qwen3_5.Qwen3_5ForConditionalGenerationTextOnly&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Qwen3_5MoeForConditionalGeneration&quot;</span><span class="p">:</span> <span class="s2">&quot;atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly&quot;</span><span class="p">,</span>
     <span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;atom.models.llama.LlamaForCausalLM&quot;</span><span class="p">,</span>
     <span class="s2">&quot;MixtralForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;atom.models.mixtral.MixtralForCausalLM&quot;</span><span class="p">,</span>
     <span class="s2">&quot;DeepseekV3ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;atom.models.deepseek_v2.DeepseekV2ForCausalLM&quot;</span><span class="p">,</span>
@@ -584,6 +599,20 @@
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>GQA, QK norm, FusedMoE, sparse+dense layer mixing, QK norm+RoPE+cache+quant fusion</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atom.models.qwen3_5</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGenerationTextOnly</span></code></p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, RoPE</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atom.models.qwen3_5</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGenerationTextOnly</span></code></p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Hybrid architecture: full attention + Gated DeltaNet, GQA, QK norm, FusedMoE</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">atom.models.llama</span></code></p></td>
@@ -643,7 +672,7 @@
 </tr>
 </tbody>
 </table>
-<p><strong>Note:</strong> <code class="docutils literal notranslate"><span class="pre">DeepSeekMTP</span></code> (<code class="docutils literal notranslate"><span class="pre">atom.models.deepseek_mtp.DeepSeekMTP</span></code>) and <code class="docutils literal notranslate"><span class="pre">Qwen3NextMTP</span></code> (<code class="docutils literal notranslate"><span class="pre">atom.models.qwen3_next_mtp</span></code>) are not in the registry – they are used exclusively as speculative draft models and are loaded separately.</p>
+<p><strong>Note:</strong> <code class="docutils literal notranslate"><span class="pre">DeepSeekMTP</span></code> (<code class="docutils literal notranslate"><span class="pre">atom.models.deepseek_mtp.DeepSeekMTP</span></code>), <code class="docutils literal notranslate"><span class="pre">Qwen3NextMTP</span></code> (<code class="docutils literal notranslate"><span class="pre">atom.models.qwen3_next_mtp.Qwen3NextMTP</span></code>), and <code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code> (<code class="docutils literal notranslate"><span class="pre">atom.models.qwen3_5_mtp.Qwen3_5MTP</span></code>) are not in the registry – they are used exclusively as speculative draft models and are loaded separately via <code class="docutils literal notranslate"><span class="pre">EagleProposer</span></code>.</p>
 </section>
 <hr class="docutils" />
 <section id="model-architecture-details">
@@ -759,6 +788,29 @@
 <li><p><strong>MoE:</strong> <code class="docutils literal notranslate"><span class="pre">Qwen3NextSparseMoeBlock</span></code> with <code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code>, shared expert fusion support.</p></li>
 <li><p><strong>Normalization:</strong> Uses <code class="docutils literal notranslate"><span class="pre">GemmaRMSNorm</span></code> (aliased as <code class="docutils literal notranslate"><span class="pre">Qwen3NextRMSNorm</span></code>).</p></li>
 <li><p><strong>MTP:</strong> Separate draft model in <code class="docutils literal notranslate"><span class="pre">atom/models/qwen3_next_mtp.py</span></code> (<code class="docutils literal notranslate"><span class="pre">Qwen3NextMTP</span></code>).</p></li>
+</ul>
+</section>
+<section id="qwen3-5-qwen3-5forconditionalgeneration-and-qwen3-5moeforconditionalgeneration">
+<h3>Qwen3.5 (<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGeneration</span></code> and <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGeneration</span></code>)<a class="headerlink" href="#qwen3-5-qwen3-5forconditionalgeneration-and-qwen3-5moeforconditionalgeneration" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Architecture:</strong> Hybrid transformer with two attention types: full attention and Gated DeltaNet linear attention. Layer type is determined by <code class="docutils literal notranslate"><span class="pre">config.layer_types</span></code>. Dense or MoE variants.</p></li>
+<li><p><strong>Layer structure:</strong> <code class="docutils literal notranslate"><span class="pre">Qwen3_5DecoderLayer</span></code> containing either full attention or linear attention, plus either <code class="docutils literal notranslate"><span class="pre">Qwen3_5SparseMoeBlock</span></code> (MoE variants) or <code class="docutils literal notranslate"><span class="pre">Qwen3_5MLP</span></code> (dense variants).</p></li>
+<li><p><strong>Attention:</strong> Full attention layers use <code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code> with QK norm, RoPE, GQA. Linear attention layers use <code class="docutils literal notranslate"><span class="pre">QKVZBAParallelLinear</span></code> for fused QKVZ+BA projections with Gated DeltaNet.</p></li>
+<li><p><strong>MoE:</strong> <code class="docutils literal notranslate"><span class="pre">Qwen3_5SparseMoeBlock</span></code> with <code class="docutils literal notranslate"><span class="pre">FusedMoE</span></code>, shared expert fusion support.</p></li>
+<li><p><strong>Normalization:</strong> RMSNorm with optional fused allreduce for MoE models.</p></li>
+<li><p><strong>MTP:</strong> Separate draft model in <code class="docutils literal notranslate"><span class="pre">atom/models/qwen3_5_mtp.py</span></code> (<code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>). The MTP predictor uses only full attention layers (no Gated DeltaNet) for efficiency, supporting both MTP1 and MTP3 variants via <code class="docutils literal notranslate"><span class="pre">num_speculative_tokens</span></code>.</p></li>
+</ul>
+</section>
+<section id="qwen3-5-mtp-qwen3-5mtp">
+<h3>Qwen3.5 MTP (<code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>)<a class="headerlink" href="#qwen3-5-mtp-qwen3-5mtp" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Architecture:</strong> Multi-Token Prediction draft model for speculative decoding with Qwen3.5.</p></li>
+<li><p><strong>Layer structure:</strong> <code class="docutils literal notranslate"><span class="pre">Qwen3_5MultiTokenPredictor</span></code> containing embedding, projection, and full-attention-only layers (no linear attention), followed by an LM head.</p></li>
+<li><p><strong>Design:</strong> Takes main model’s hidden states and the next token’s embedding as inputs. Concatenates normalized embeddings with normalized hidden states, applies a linear projection, then processes through one or more full-attention decoder layers.</p></li>
+<li><p><strong>Weight loading:</strong> Uses <code class="docutils literal notranslate"><span class="pre">weights_mapping</span> <span class="pre">=</span> <span class="pre">{&quot;mtp.&quot;:</span> <span class="pre">&quot;model.&quot;}</span></code> to map MTP weights from checkpoint. The <code class="docutils literal notranslate"><span class="pre">fc</span></code> layer uses a <code class="docutils literal notranslate"><span class="pre">prefix</span></code> parameter to enable weight quantization exclusion.</p></li>
+<li><p><strong>Shared weights:</strong> <code class="docutils literal notranslate"><span class="pre">embed_tokens</span></code> and <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> are shared with the main model when loaded from the same checkpoint.</p></li>
+<li><p><strong>Performance:</strong> Typical acceptance rates of ~94% for MTP1 and ~83% for MTP3, with draft token generation overhead of ~1.94 and ~3.49 tokens per forward pass respectively.</p></li>
+<li><p><strong>Attention metadata:</strong> Since MTP only uses full attention (not MLA), the attention builder calls <code class="docutils literal notranslate"><span class="pre">prepare_mtp_decode()</span></code> with block table and context length updates (unlike MLA which uses kv_indptr).</p></li>
 </ul>
 </section>
 </section>
@@ -966,13 +1018,33 @@
 </ol>
 <p>Additionally, <code class="docutils literal notranslate"><span class="pre">ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION</span></code> fuses allreduce with RMSNorm for both attention output and MoE output, reducing communication overhead.</p>
 </section>
-<section id="mtp-deepseek-multi-token-prediction">
-<h3>MTP: DeepSeek Multi-Token Prediction<a class="headerlink" href="#mtp-deepseek-multi-token-prediction" title="Link to this heading"></a></h3>
-<p>The <code class="docutils literal notranslate"><span class="pre">DeepSeekMTP</span></code> model serves as a speculative draft model:</p>
+<section id="mtp-multi-token-prediction-speculative-decoding">
+<h3>MTP: Multi-Token Prediction (Speculative Decoding)<a class="headerlink" href="#mtp-multi-token-prediction-speculative-decoding" title="Link to this heading"></a></h3>
+<p>Multi-Token Prediction (MTP) models serve as lightweight draft models for speculative decoding, proposing multiple tokens per forward pass to improve throughput while maintaining accuracy through rejection sampling. ATOM supports three MTP variants:</p>
+<p><strong>DeepSeekMTP</strong> (<code class="docutils literal notranslate"><span class="pre">DeepSeekMTP</span></code>):</p>
 <ul class="simple">
 <li><p>Each <code class="docutils literal notranslate"><span class="pre">DeepSeekMultiTokenPredictorLayer</span></code> takes the previous hidden state and the next token’s embedding, normalizes both (<code class="docutils literal notranslate"><span class="pre">enorm</span></code>, <code class="docutils literal notranslate"><span class="pre">hnorm</span></code>), concatenates them, and passes through a linear projection (<code class="docutils literal notranslate"><span class="pre">eh_proj</span></code>) followed by a standard <code class="docutils literal notranslate"><span class="pre">DeepseekV2DecoderLayer</span></code>.</p></li>
-<li><p>The <code class="docutils literal notranslate"><span class="pre">SharedHead</span></code> provides per-layer norm + LM head for logit computation.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">SharedHead</span></code> provides per-layer norm + LM head for logit computation (one shared head per MTP layer).</p></li>
 <li><p>For FP4 quantized main models, MTP blocks fall back to non-FP4 quantization config to maintain draft model accuracy.</p></li>
+</ul>
+<p><strong>Qwen3NextMTP</strong> (<code class="docutils literal notranslate"><span class="pre">Qwen3NextMTP</span></code>):</p>
+<ul class="simple">
+<li><p>Similar layer-by-layer structure to DeepSeek MTP with per-layer <code class="docutils literal notranslate"><span class="pre">SharedHead</span></code>.</p></li>
+<li><p>Uses Qwen3-Next decoder layers with full attention only (no Gated DeltaNet linear attention).</p></li>
+<li><p>Supports the hybrid architecture of the main Qwen3-Next model.</p></li>
+</ul>
+<p><strong>Qwen3_5MTP</strong> (<code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>):</p>
+<ul class="simple">
+<li><p>Simpler single-stage design: takes hidden states and token embeddings, projects them through a single full-attention block, then computes logits via a top-level <code class="docutils literal notranslate"><span class="pre">lm_head</span></code>.</p></li>
+<li><p>All MTP layers are full-attention only (no Gated DeltaNet) for efficiency, even though the main Qwen3.5 model is hybrid.</p></li>
+<li><p>Weight loading maps MTP weights via <code class="docutils literal notranslate"><span class="pre">weights_mapping</span> <span class="pre">=</span> <span class="pre">{&quot;mtp.&quot;:</span> <span class="pre">&quot;model.&quot;}</span></code>, allowing flexible quantization via the <code class="docutils literal notranslate"><span class="pre">fc</span></code> layer’s prefix parameter.</p></li>
+<li><p>Shares <code class="docutils literal notranslate"><span class="pre">embed_tokens</span></code> and <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> with the main model when available.</p></li>
+</ul>
+<p><strong>General MTP Properties</strong>:</p>
+<ul class="simple">
+<li><p>Loaded separately via <code class="docutils literal notranslate"><span class="pre">EagleProposer</span></code> in <code class="docutils literal notranslate"><span class="pre">atom/spec_decode/eagle.py</span></code>, registered in <code class="docutils literal notranslate"><span class="pre">support_eagle_model_arch_dict</span></code>.</p></li>
+<li><p>Each MTP variant uses <code class="docutils literal notranslate"><span class="pre">num_speculative_tokens</span></code> to control the number of draft tokens (e.g., MTP1 = 1 token, MTP3 = 3 tokens).</p></li>
+<li><p>Attention metadata is updated incrementally: MLA models use <code class="docutils literal notranslate"><span class="pre">kv_indptr</span></code> tracking, while hybrid/GDN models (Qwen3.5 MTP) use block tables and context length updates.</p></li>
 </ul>
 </section>
 </section>
@@ -1013,11 +1085,17 @@
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/models/glm4_moe.py</span></code></p></td>
 <td><p>GLM4-MoE model: <code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code>, <code class="docutils literal notranslate"><span class="pre">Glm4MoeModel</span></code>, <code class="docutils literal notranslate"><span class="pre">Glm4MoeDecoderLayer</span></code>, <code class="docutils literal notranslate"><span class="pre">Glm4MoeAttention</span></code>, <code class="docutils literal notranslate"><span class="pre">Glm4MoE</span></code>, <code class="docutils literal notranslate"><span class="pre">Glm4MoeMLP</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/models/qwen3_next.py</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/models/qwen3_5.py</span></code></p></td>
+<td><p>Qwen3.5 model: <code class="docutils literal notranslate"><span class="pre">Qwen3_5ForConditionalGenerationTextOnly</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForConditionalGenerationTextOnly</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5Model</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeModel</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5DecoderLayer</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5RMSNorm</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5Attention</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5GatedDeltaNet</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5SparseMoeBlock</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5MLP</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/models/qwen3_next.py</span></code></p></td>
 <td><p>Qwen3-Next model: <code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3NextModel</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3NextDecoderLayer</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3NextAttention</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3NextGatedDeltaNet</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3NextSparseMoeBlock</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3NextMLP</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/models/qwen3_next_mtp.py</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/models/qwen3_next_mtp.py</span></code></p></td>
 <td><p>Qwen3-Next MTP draft model</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/models/qwen3_5_mtp.py</span></code></p></td>
+<td><p>Qwen3.5 MTP draft model: <code class="docutils literal notranslate"><span class="pre">Qwen3_5MTP</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3_5MultiTokenPredictor</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/models/utils.py</span></code></p></td>
 <td><p>Model utilities: <code class="docutils literal notranslate"><span class="pre">IntermediateTensors</span></code>, <code class="docutils literal notranslate"><span class="pre">PPMissingLayer</span></code>, <code class="docutils literal notranslate"><span class="pre">make_layers</span></code>, <code class="docutils literal notranslate"><span class="pre">maybe_prefix</span></code>, <code class="docutils literal notranslate"><span class="pre">extract_layer_index</span></code></p></td>

@@ -111,11 +111,25 @@ When a decode step cannot extend a sequence's KV cache (no free blocks), the sch
 ```python
 def preempt(self, seq: Sequence):
     seq.status = SequenceStatus.WAITING
+    # Strip placeholder + rejected draft tokens added by postprocess.
+    if self.mtp_k > 0:
+        strip = self.mtp_k + seq.num_rejected
+        if strip > 0:
+            del seq.token_ids[-strip:]
+            del seq.output_tokens[-strip:]
+            seq.num_tokens -= strip
+    seq.num_rejected = 0
+    seq.num_bonus_tokens = 0
+    seq.spec_token_ids = np.array([], dtype=np.int32)
     self.block_manager.deallocate(seq)
     self.waiting.appendleft(seq)
 ```
 
 The preempted sequence is pushed to the front of the waiting queue and its blocks are fully deallocated, so it will be re-prefilled on the next scheduling cycle.
+
+**MTP placeholder stripping:** When speculative decoding is active (`mtp_k > 0`), `postprocess()` appends placeholder tokens (EOS) to running sequences to reserve KV cache slots for the next step (see section 5.6). If a sequence is preempted before those placeholders are consumed, they must be removed so that re-prefill starts from the correct token history. The strip count is `mtp_k + seq.num_rejected` -- this accounts for both the `mtp_k` placeholder slots and any tokens that were rejected during the last verification step. The method deletes that many trailing entries from both `seq.token_ids` and `seq.output_tokens` and decrements `seq.num_tokens` accordingly.
+
+**Speculative state reset:** After stripping, the sequence's speculative decoding state is fully cleared: `num_rejected` and `num_bonus_tokens` are zeroed, and `spec_token_ids` is set to an empty array. This ensures the sequence re-enters the scheduling pipeline with a clean state -- no stale draft predictions or acceptance metadata carry over across preemption.
 
 ---
 
