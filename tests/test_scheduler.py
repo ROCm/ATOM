@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/scheduler.py — public API only
 
-import pytest
 
 from atom.model_engine.scheduler import Scheduler, ScheduledBatchOutput, SpecStats
 from atom.model_engine.sequence import SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 from conftest import MockConfig
-
 
 # ── SpecStats ──────────────────────────────────────────────────────────────
 
@@ -28,6 +26,7 @@ class TestSpecStats:
     def test_acceptance_rate_zero_when_no_updates(self):
         stats = SpecStats(mtp_k=3)
         assert stats.acceptance_rate == 0.0
+
 
 # ── add / extend / query ───────────────────────────────────────────────────
 
