@@ -234,6 +234,11 @@ class EngineArgs:
             ),
         )
         if self.method:
+            if self.num_speculative_tokens <= 0:
+                raise ValueError(
+                    f"num_speculative_tokens must be >= 1 when method is set, "
+                    f"got {self.num_speculative_tokens}."
+                )
             kwargs["speculative_config"] = SpeculativeConfig(
                 method=kwargs.pop("method"),
                 model=self.model,

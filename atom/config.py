@@ -895,9 +895,10 @@ class Config:
         )
 
         if self.speculative_config is not None:
-            if self.speculative_config.num_speculative_tokens > 4:
+            num_spec = self.speculative_config.num_speculative_tokens
+            if num_spec is None or num_spec < 1 or num_spec > 4:
                 raise ValueError(
-                    f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
+                    f"num_speculative_tokens must be between 1 and 4, got {num_spec}."
                 )
 
     def compute_hash(self) -> str:
