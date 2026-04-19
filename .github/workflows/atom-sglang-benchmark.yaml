@@ -353,6 +353,7 @@ jobs:
           RUN pip uninstall -y amd-aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
+          RUN pip install "vcs-versioning>=1"
           RUN rm -rf /app/aiter-test
           RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
               cd /app/aiter-test && \\
