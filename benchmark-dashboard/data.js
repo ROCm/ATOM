@@ -1,104 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776550169632,
+  "lastUpdate": 1776558423810,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "email": "Xin.Huang@amd.com",
-            "name": "Xin Huang",
-            "username": "gyohuangxin"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "7618e5a54c3010b5d29a7abf65a821547b3f8acf",
-          "message": "CI: add lock-protected model downloads to ATOM tests (#509)\n\nProtect ATOM model downloads with cache checks, per-model file locks, and explicit timeouts so concurrent runners do not corrupt shared /models state and stalled downloads fail faster with better logs.",
-          "timestamp": "2026-04-08T00:05:29+08:00",
-          "tree_id": "1d3ba69f90382ee9aa3e7fee22035633d4cf8fb6",
-          "url": "https://github.com/ROCm/ATOM/commit/7618e5a54c3010b5d29a7abf65a821547b3f8acf"
-        },
-        "date": 1775618571798,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-R1-0528 accuracy (GSM8K)",
-            "value": 0.9462,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | strict-match: 0.9431 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
-            "value": 0.9409,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | strict-match: 0.9401 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
-            "value": 0.9401,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | strict-match: 0.9348 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
-            "value": 0.5732,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | strict-match: 0.5027 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::GLM-5-FP8 accuracy (GSM8K)",
-            "value": 0.9378,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.93 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5 | BaselineNote: HF: amd/GLM-5-MXFP4 card shows GLM-5 baseline=0.9545 (5-shot) | strict-match: 0.9439 | fewshot: 3 | Model: /models/zai-org/GLM-5-FP8"
-          },
-          {
-            "name": "ATOM::Kimi-K2.5-MXFP4 accuracy (GSM8K)",
-            "value": 0.9401,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.93 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.5 | BaselineNote: HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409 | strict-match: 0.9386 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
-          },
-          {
-            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
-            "value": 0.9083,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.88 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | strict-match: 0.6103 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-          },
-          {
-            "name": "ATOM::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
-            "value": 0.7422,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.73 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | strict-match: 0.7415 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
-            "value": 0.8961,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | strict-match: 0.8787 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
-            "value": 0.7119,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.65 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | strict-match: 0.7945 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
-            "value": 0.4223,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2153 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
-            "value": 0.4215,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24091460550 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2252 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -57445,6 +57349,5572 @@ window.BENCHMARK_DATA = {
             "value": 0.0008,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24610716334 | Threshold: 0.82 | Baseline: 0.82 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: Using Qwen3-235B baseline as proxy; needs CI measurement for Qwen3.5 specific baseline | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260418 | GPU: AMD Radeon Graphics | VRAM: 252GB | ROCm: 7.2.2 | strict-match: 0.0 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "3138d9a432c0448e205b6a6860605d807ec665bc",
+          "message": "feat: decouple GDN recurrent state from KV cache block pool (#602)\n\nPreviously, GDN (Gated DeltaNet) recurrent state was packed into every\nKV cache block (23.41 MB/block, 96% being GDN state), causing 98%\nmemory waste (148 GB allocated, only 2.9 GB used).\n\nThis change decouples recurrent state into a per-request slot pool that\ndynamically competes with KV cache blocks in a unified pool:\n\n- block_bytes now contains only KV cache + scale (not GDN state)\n- GDN state is allocated as a separate tensor sized to max_num_seqs\n- BlockManager tracks mamba memory via equiv-block accounting\n- Sequence.mamba_block_table replaced with mamba_state_slot (int)\n- State indices in gdn_attn use slot_group mapping instead of block_id\n\nResults on Qwen3.5-397B-A17B-FP8 tp=4:\n- Pool blocks: 6,906 → 565,016 (82x increase)\n- Throughput: 4,657 → 7,415 tok/s (+59%)\n- GSM8K accuracy: 0.8711 (no regression)\n- DeepSeek-R1 (pure MLA): no regression (0.9575 accuracy)",
+          "timestamp": "2026-04-18T16:30:12Z",
+          "url": "https://github.com/ROCm/ATOM/commit/3138d9a432c0448e205b6a6860605d807ec665bc"
+        },
+        "date": 1776558421904,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=128 throughput (tok/s)",
+            "value": 3698.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 7404.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=128 TTFT (ms)",
+            "value": 373.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=128 TPOT (ms)",
+            "value": 33.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=128 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=16 throughput (tok/s)",
+            "value": 1035.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2082.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=16 TTFT (ms)",
+            "value": 125.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=16 TPOT (ms)",
+            "value": 15,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=16 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=256 throughput (tok/s)",
+            "value": 5501.93,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 10998.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=256 TTFT (ms)",
+            "value": 565.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=256 TPOT (ms)",
+            "value": 44.89,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=256 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=32 throughput (tok/s)",
+            "value": 1561.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3117.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=32 TTFT (ms)",
+            "value": 149.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=32 TPOT (ms)",
+            "value": 19.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=32 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=4 throughput (tok/s)",
+            "value": 398.89,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 801.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=4 TTFT (ms)",
+            "value": 82.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=4 TPOT (ms)",
+            "value": 9.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=4 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=64 throughput (tok/s)",
+            "value": 2354.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 4709.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=64 TTFT (ms)",
+            "value": 205.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=64 TPOT (ms)",
+            "value": 26.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=64 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=8 throughput (tok/s)",
+            "value": 663.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1322.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=8 TTFT (ms)",
+            "value": 98.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=8 TPOT (ms)",
+            "value": 11.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 1024/1024 c=8 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=128 throughput (tok/s)",
+            "value": 1872.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 16902.51,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=128 TTFT (ms)",
+            "value": 1911.82,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=128 TPOT (ms)",
+            "value": 65.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=128 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=16 throughput (tok/s)",
+            "value": 779.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 7037.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=16 TTFT (ms)",
+            "value": 475.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=16 TPOT (ms)",
+            "value": 19.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=16 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=256 throughput (tok/s)",
+            "value": 2221.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 19990.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=256 TTFT (ms)",
+            "value": 3619.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=256 TPOT (ms)",
+            "value": 109.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=256 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=32 throughput (tok/s)",
+            "value": 1091.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 9763.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=32 TTFT (ms)",
+            "value": 717.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=32 TPOT (ms)",
+            "value": 27.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=32 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=4 throughput (tok/s)",
+            "value": 325.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2928.11,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=4 TTFT (ms)",
+            "value": 332.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=4 TPOT (ms)",
+            "value": 11.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=4 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=64 throughput (tok/s)",
+            "value": 1456.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 13128.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=64 TTFT (ms)",
+            "value": 1154.66,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=64 TPOT (ms)",
+            "value": 41.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=64 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=8 throughput (tok/s)",
+            "value": 514.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 4578.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=8 TTFT (ms)",
+            "value": 412.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=8 TPOT (ms)",
+            "value": 14.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5 8192/1024 c=8 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=128 throughput (tok/s)",
+            "value": 3957.89,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 7924.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=128 TTFT (ms)",
+            "value": 221.28,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=128 TPOT (ms)",
+            "value": 31.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=16 throughput (tok/s)",
+            "value": 1069.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2151.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=16 TTFT (ms)",
+            "value": 99.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=16 TPOT (ms)",
+            "value": 14.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=256 throughput (tok/s)",
+            "value": 5831.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 11657.76,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=256 TTFT (ms)",
+            "value": 349.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=256 TPOT (ms)",
+            "value": 42.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1639.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3273.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=32 TTFT (ms)",
+            "value": 129.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=32 TPOT (ms)",
+            "value": 18.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=4 throughput (tok/s)",
+            "value": 386.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 776.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=4 TTFT (ms)",
+            "value": 69.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=4 TPOT (ms)",
+            "value": 9.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=64 throughput (tok/s)",
+            "value": 2577.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 5155.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=64 TTFT (ms)",
+            "value": 147.24,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=64 TPOT (ms)",
+            "value": 24.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=8 throughput (tok/s)",
+            "value": 668.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1331.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=8 TTFT (ms)",
+            "value": 81.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 1024/1024 c=8 TPOT (ms)",
+            "value": 11.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 1947.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 17585.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 1291.8,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 63.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 819.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 7395.35,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 364.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 18.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 1885,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 16962.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 55213.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 72.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1166,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 10426.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 491.03,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 26.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 317.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2854.82,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 223.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 12.03,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1558.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 14044.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 755.59,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 39.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 549.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 4888.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 285.87,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.5-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 13.99,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=128 throughput (tok/s)",
+            "value": 4436.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 8881.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=128 TTFT (ms)",
+            "value": 276.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=128 TPOT (ms)",
+            "value": 27.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=16 throughput (tok/s)",
+            "value": 1197.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2407.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=16 TTFT (ms)",
+            "value": 112.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=16 TPOT (ms)",
+            "value": 12.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=256 throughput (tok/s)",
+            "value": 6509.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 13013.39,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=256 TTFT (ms)",
+            "value": 542.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=256 TPOT (ms)",
+            "value": 37.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 throughput (tok/s)",
+            "value": 1758.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3510.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 TTFT (ms)",
+            "value": 161.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 TPOT (ms)",
+            "value": 17.6,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=4 throughput (tok/s)",
+            "value": 347.93,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 699.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=4 TTFT (ms)",
+            "value": 80.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=4 TPOT (ms)",
+            "value": 11.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 throughput (tok/s)",
+            "value": 2871.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 5744.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 TTFT (ms)",
+            "value": 184.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 TPOT (ms)",
+            "value": 21.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=8 throughput (tok/s)",
+            "value": 652.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1300.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=8 TTFT (ms)",
+            "value": 101.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=8 TPOT (ms)",
+            "value": 11.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 1024/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=128 throughput (tok/s)",
+            "value": 2329.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 21035.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=128 TTFT (ms)",
+            "value": 1654.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=128 TPOT (ms)",
+            "value": 52.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=16 throughput (tok/s)",
+            "value": 943.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 8519.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=16 TTFT (ms)",
+            "value": 397.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=16 TPOT (ms)",
+            "value": 15.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=256 throughput (tok/s)",
+            "value": 2768.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 24912.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=256 TTFT (ms)",
+            "value": 3073.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=256 TPOT (ms)",
+            "value": 88.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=32 throughput (tok/s)",
+            "value": 1300.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 11626.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=32 TTFT (ms)",
+            "value": 615.8,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=32 TPOT (ms)",
+            "value": 23.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=4 throughput (tok/s)",
+            "value": 317.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2851.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=4 TTFT (ms)",
+            "value": 284.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=4 TPOT (ms)",
+            "value": 12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=64 throughput (tok/s)",
+            "value": 1842.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 16611.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=64 TTFT (ms)",
+            "value": 1030.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=64 TPOT (ms)",
+            "value": 32.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=8 throughput (tok/s)",
+            "value": 588.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5232.93,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=8 TTFT (ms)",
+            "value": 343.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=8 TPOT (ms)",
+            "value": 12.99,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=128 throughput (tok/s)",
+            "value": 5610.39,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 11251.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=128 TTFT (ms)",
+            "value": 330.15,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=128 TPOT (ms)",
+            "value": 21.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=16 throughput (tok/s)",
+            "value": 1568.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 3159.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=16 TTFT (ms)",
+            "value": 140.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=16 TPOT (ms)",
+            "value": 9.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=256 throughput (tok/s)",
+            "value": 7514.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 15045.61,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=256 TTFT (ms)",
+            "value": 519.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=256 TPOT (ms)",
+            "value": 32.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=32 throughput (tok/s)",
+            "value": 2355.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 4710.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=32 TTFT (ms)",
+            "value": 167.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=32 TPOT (ms)",
+            "value": 12.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=4 throughput (tok/s)",
+            "value": 504.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 1016.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=4 TTFT (ms)",
+            "value": 89.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=4 TPOT (ms)",
+            "value": 7.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=64 throughput (tok/s)",
+            "value": 3814.19,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 7642.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=64 TTFT (ms)",
+            "value": 223.87,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=64 TPOT (ms)",
+            "value": 16.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=8 throughput (tok/s)",
+            "value": 934.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1864.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=8 TTFT (ms)",
+            "value": 110.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=8 TPOT (ms)",
+            "value": 8.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 1024/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 2849.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 25793.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 1810.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 42.24,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1246.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 11278.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=16 TTFT (ms)",
+            "value": 488.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=16 TPOT (ms)",
+            "value": 11.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 3201.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 28888,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 3383.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 75.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=32 throughput (tok/s)",
+            "value": 1817.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 16297.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=32 TTFT (ms)",
+            "value": 656.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=32 TPOT (ms)",
+            "value": 16.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=4 throughput (tok/s)",
+            "value": 602.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 5432.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=4 TTFT (ms)",
+            "value": 305.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=4 TPOT (ms)",
+            "value": 6.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 2356.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 21304.08,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 1073.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 25.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=8 throughput (tok/s)",
+            "value": 849.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 7574.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=8 TTFT (ms)",
+            "value": 368.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=8 TPOT (ms)",
+            "value": 8.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP3 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=128 throughput (tok/s)",
+            "value": 3962.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 7934.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=128 TTFT (ms)",
+            "value": 340.2,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=128 TPOT (ms)",
+            "value": 31.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=16 throughput (tok/s)",
+            "value": 1102.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2215.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=16 TTFT (ms)",
+            "value": 157.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=16 TPOT (ms)",
+            "value": 14.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=256 throughput (tok/s)",
+            "value": 5594.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 11183.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=256 TTFT (ms)",
+            "value": 731.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=256 TPOT (ms)",
+            "value": 44.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1720.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3435.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=32 TTFT (ms)",
+            "value": 212.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=32 TPOT (ms)",
+            "value": 17.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=4 throughput (tok/s)",
+            "value": 424.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 852.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=4 TTFT (ms)",
+            "value": 85.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=4 TPOT (ms)",
+            "value": 9.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=64 throughput (tok/s)",
+            "value": 2786.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 5573.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=64 TTFT (ms)",
+            "value": 242.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=64 TPOT (ms)",
+            "value": 22.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=8 throughput (tok/s)",
+            "value": 736.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1468.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=8 TTFT (ms)",
+            "value": 100.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=8 TPOT (ms)",
+            "value": 10.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 1816.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 16397.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 2220.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 67.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 850.28,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 7673.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 570.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 17.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 2013.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 18113.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 3983.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 121.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1150.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 10291.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 819.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 26.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 367.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3302.11,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 383.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 10.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1516.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 13673.32,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 1320.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 40.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 605.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5384.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 426.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 12.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=128 throughput (tok/s)",
+            "value": 5180.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 10388.25,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=128 TTFT (ms)",
+            "value": 401.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=128 TPOT (ms)",
+            "value": 23.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=16 throughput (tok/s)",
+            "value": 1568.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 3159.32,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=16 TTFT (ms)",
+            "value": 224.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=16 TPOT (ms)",
+            "value": 9.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=256 throughput (tok/s)",
+            "value": 6717.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 13448.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=256 TTFT (ms)",
+            "value": 641.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=256 TPOT (ms)",
+            "value": 36.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=32 throughput (tok/s)",
+            "value": 2476.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 4953.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=32 TTFT (ms)",
+            "value": 250.55,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=32 TPOT (ms)",
+            "value": 12.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=4 throughput (tok/s)",
+            "value": 578.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 1163.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=4 TTFT (ms)",
+            "value": 508.24,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=4 TPOT (ms)",
+            "value": 6.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=64 throughput (tok/s)",
+            "value": 3763.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 7539.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=64 TTFT (ms)",
+            "value": 302.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=64 TPOT (ms)",
+            "value": 16.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=8 throughput (tok/s)",
+            "value": 1001.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1997.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=8 TTFT (ms)",
+            "value": 113.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=8 TPOT (ms)",
+            "value": 7.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 2162.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 19579.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 2399.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 55.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1115.93,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10101.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 TTFT (ms)",
+            "value": 561.59,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 TPOT (ms)",
+            "value": 13.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 2383.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 21510.72,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 4305.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 101.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 throughput (tok/s)",
+            "value": 1451.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 13017.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 TTFT (ms)",
+            "value": 867.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 TPOT (ms)",
+            "value": 20.65,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 throughput (tok/s)",
+            "value": 528.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4761.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 TTFT (ms)",
+            "value": 382.65,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 TPOT (ms)",
+            "value": 6.8,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 1840.26,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 16638.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 1466.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 32.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 throughput (tok/s)",
+            "value": 717.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 6401.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 TTFT (ms)",
+            "value": 478.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 TPOT (ms)",
+            "value": 10.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=128 throughput (tok/s)",
+            "value": 2930.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 5866.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=128 TTFT (ms)",
+            "value": 400.65,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=128 TPOT (ms)",
+            "value": 41.99,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=16 throughput (tok/s)",
+            "value": 661.93,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1330.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=16 TTFT (ms)",
+            "value": 146.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=16 TPOT (ms)",
+            "value": 23.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=256 throughput (tok/s)",
+            "value": 4259.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 8515.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=256 TTFT (ms)",
+            "value": 573.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=256 TPOT (ms)",
+            "value": 57.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=32 throughput (tok/s)",
+            "value": 1094.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2185.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=32 TTFT (ms)",
+            "value": 187.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=32 TPOT (ms)",
+            "value": 28.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=4 throughput (tok/s)",
+            "value": 195.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 393.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=4 TTFT (ms)",
+            "value": 110.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=4 TPOT (ms)",
+            "value": 19.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=64 throughput (tok/s)",
+            "value": 1879.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 3760.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=64 TTFT (ms)",
+            "value": 241.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=64 TPOT (ms)",
+            "value": 32.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=8 throughput (tok/s)",
+            "value": 366.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 730.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=8 TTFT (ms)",
+            "value": 125.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=8 TPOT (ms)",
+            "value": 21.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 1024/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=128 throughput (tok/s)",
+            "value": 1490.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 13460.72,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=128 TTFT (ms)",
+            "value": 3174.66,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=128 TPOT (ms)",
+            "value": 81.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=16 throughput (tok/s)",
+            "value": 534.35,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 4822.35,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=16 TTFT (ms)",
+            "value": 775.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=16 TPOT (ms)",
+            "value": 28.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=256 throughput (tok/s)",
+            "value": 1761.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 15848.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=256 TTFT (ms)",
+            "value": 5767.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=256 TPOT (ms)",
+            "value": 137.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=32 throughput (tok/s)",
+            "value": 783.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 7003.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=32 TTFT (ms)",
+            "value": 1116.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=32 TPOT (ms)",
+            "value": 38.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=4 throughput (tok/s)",
+            "value": 173.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 1559.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=4 TTFT (ms)",
+            "value": 492.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=4 TPOT (ms)",
+            "value": 21.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=64 throughput (tok/s)",
+            "value": 1151.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 10375.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=64 TTFT (ms)",
+            "value": 1821.85,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=64 TPOT (ms)",
+            "value": 52.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=8 throughput (tok/s)",
+            "value": 312.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 2784.11,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=8 TTFT (ms)",
+            "value": 618.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=8 TPOT (ms)",
+            "value": 24.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=128 throughput (tok/s)",
+            "value": 2639.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 5284.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=128 TTFT (ms)",
+            "value": 510,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=128 TPOT (ms)",
+            "value": 46.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=16 throughput (tok/s)",
+            "value": 694.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1396.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=16 TTFT (ms)",
+            "value": 185.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=16 TPOT (ms)",
+            "value": 22.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=256 throughput (tok/s)",
+            "value": 3780.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 7558.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=256 TTFT (ms)",
+            "value": 881.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=256 TPOT (ms)",
+            "value": 65.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1115.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2227.39,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=32 TTFT (ms)",
+            "value": 240.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=32 TPOT (ms)",
+            "value": 27.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=4 throughput (tok/s)",
+            "value": 228.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 460.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=4 TTFT (ms)",
+            "value": 117.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=4 TPOT (ms)",
+            "value": 16.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=64 throughput (tok/s)",
+            "value": 1772.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 3546.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=64 TTFT (ms)",
+            "value": 331.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=64 TPOT (ms)",
+            "value": 34.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=8 throughput (tok/s)",
+            "value": 403.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 804.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=8 TTFT (ms)",
+            "value": 138.82,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=8 TPOT (ms)",
+            "value": 19.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 1195.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 10796.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 4440.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 100.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 518.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 4676.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 1046.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 28.82,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 1335.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 12017.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 8024.85,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 181.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 762.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 6816.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 1554.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 39.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 196.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 1770.61,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 649.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 19.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1005.93,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 9067.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 2537.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 59.85,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 331.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 2949.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 791.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 22.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::GLM-5.1-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=128 throughput (tok/s)",
+            "value": 8608.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 17235.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=128 TTFT (ms)",
+            "value": 399.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=128 TPOT (ms)",
+            "value": 14.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=16 throughput (tok/s)",
+            "value": 2256.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 4537,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=16 TTFT (ms)",
+            "value": 303.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=16 TPOT (ms)",
+            "value": 6.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=256 throughput (tok/s)",
+            "value": 13178.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 26343.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=256 TTFT (ms)",
+            "value": 1626.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=256 TPOT (ms)",
+            "value": 17.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=32 throughput (tok/s)",
+            "value": 3517.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 7024.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=32 TTFT (ms)",
+            "value": 161.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=32 TPOT (ms)",
+            "value": 8.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=4 throughput (tok/s)",
+            "value": 914.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 1836.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=4 TTFT (ms)",
+            "value": 50.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=4 TPOT (ms)",
+            "value": 4.2,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=64 throughput (tok/s)",
+            "value": 5791.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 11585.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=64 TTFT (ms)",
+            "value": 120.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=64 TPOT (ms)",
+            "value": 10.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=8 throughput (tok/s)",
+            "value": 1539,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 3066.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=8 TTFT (ms)",
+            "value": 49.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 1024/1024 c=8 TPOT (ms)",
+            "value": 5.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 throughput (tok/s)",
+            "value": 5317.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 48003.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 TTFT (ms)",
+            "value": 730.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 TPOT (ms)",
+            "value": 22.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 throughput (tok/s)",
+            "value": 2099.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 18949.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 TTFT (ms)",
+            "value": 188.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 TPOT (ms)",
+            "value": 7.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 throughput (tok/s)",
+            "value": 6532.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 58771.26,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 TTFT (ms)",
+            "value": 1646.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 TPOT (ms)",
+            "value": 36.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 throughput (tok/s)",
+            "value": 3099.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 27713.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 TTFT (ms)",
+            "value": 236.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 TPOT (ms)",
+            "value": 9.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 throughput (tok/s)",
+            "value": 872.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 7839.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 TTFT (ms)",
+            "value": 119.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 TPOT (ms)",
+            "value": 4.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 throughput (tok/s)",
+            "value": 4223.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 38065.51,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 TTFT (ms)",
+            "value": 410.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 TPOT (ms)",
+            "value": 14.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 throughput (tok/s)",
+            "value": 1365.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 12145.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 TTFT (ms)",
+            "value": 174.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 TPOT (ms)",
+            "value": 5.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=128 throughput (tok/s)",
+            "value": 3305.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 6619.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=128 TTFT (ms)",
+            "value": 791.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=128 TPOT (ms)",
+            "value": 36.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=16 throughput (tok/s)",
+            "value": 1075.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2161.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=16 TTFT (ms)",
+            "value": 480.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=16 TPOT (ms)",
+            "value": 14.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=256 throughput (tok/s)",
+            "value": 5061.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 10118.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=256 TTFT (ms)",
+            "value": 1096.24,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=256 TPOT (ms)",
+            "value": 48.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1452.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2900.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=32 TTFT (ms)",
+            "value": 185.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=32 TPOT (ms)",
+            "value": 21.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=4 throughput (tok/s)",
+            "value": 428.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 860.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=4 TTFT (ms)",
+            "value": 90.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=4 TPOT (ms)",
+            "value": 8.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=64 throughput (tok/s)",
+            "value": 2027.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 4056.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=64 TTFT (ms)",
+            "value": 294.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=64 TPOT (ms)",
+            "value": 30.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=8 throughput (tok/s)",
+            "value": 752.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1498.89,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=8 TTFT (ms)",
+            "value": 104.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=8 TPOT (ms)",
+            "value": 10.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 1816.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 16397.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 2266.82,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 67.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 865.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 7810.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 526.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 17.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 2196.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 19765.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 4608.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 110.15,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1092.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 9772.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 737.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 27.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 370.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3334.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 333.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 10.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1386.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 12493.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 1194.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 44.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 633.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5639.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 408.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 11.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Kimi-K2.5-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=128 throughput (tok/s)",
+            "value": 4670.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 9350.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=128 TTFT (ms)",
+            "value": 489.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=128 TPOT (ms)",
+            "value": 26.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=128 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=16 throughput (tok/s)",
+            "value": 965.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1941.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=16 TTFT (ms)",
+            "value": 182.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=16 TPOT (ms)",
+            "value": 15.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=256 throughput (tok/s)",
+            "value": 6102.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 12199.39,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=256 TTFT (ms)",
+            "value": 820.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=256 TPOT (ms)",
+            "value": 40.08,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=256 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1737.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3468.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=32 TTFT (ms)",
+            "value": 242.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=32 TPOT (ms)",
+            "value": 17.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=4 throughput (tok/s)",
+            "value": 258.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 519.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=4 TTFT (ms)",
+            "value": 145.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=4 TPOT (ms)",
+            "value": 14.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=64 throughput (tok/s)",
+            "value": 2977.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 5955.61,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=64 TTFT (ms)",
+            "value": 377.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=64 TPOT (ms)",
+            "value": 20.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=8 throughput (tok/s)",
+            "value": 510.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1018.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=8 TTFT (ms)",
+            "value": 155.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=8 TPOT (ms)",
+            "value": 15.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 1024/1024 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 1462.61,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 13204.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 2735.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 83.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 645.08,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 5821.72,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 654.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 23.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 1408.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 12677.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 55685.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 117.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 954.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 8539.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 959.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 31.6,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 205.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 1848.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 552.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 18.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1242.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 11203.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 1526.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 48.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 384.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 3417.11,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 591.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 19.8,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=128 throughput (tok/s)",
+            "value": 3858.59,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 7725.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=128 TTFT (ms)",
+            "value": 331.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=128 TPOT (ms)",
+            "value": 32.08,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=16 throughput (tok/s)",
+            "value": 1213.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2440.28,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=16 TTFT (ms)",
+            "value": 143.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=16 TPOT (ms)",
+            "value": 12.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=256 throughput (tok/s)",
+            "value": 5646.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 11286.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=256 TTFT (ms)",
+            "value": 565.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=256 TPOT (ms)",
+            "value": 43.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=32 throughput (tok/s)",
+            "value": 1907.69,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3809.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=32 TTFT (ms)",
+            "value": 180.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=32 TPOT (ms)",
+            "value": 16.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=4 throughput (tok/s)",
+            "value": 403.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 811,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=4 TTFT (ms)",
+            "value": 109.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=4 TPOT (ms)",
+            "value": 9.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=64 throughput (tok/s)",
+            "value": 2665.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 5332.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=64 TTFT (ms)",
+            "value": 341.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=64 TPOT (ms)",
+            "value": 23.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=8 throughput (tok/s)",
+            "value": 725.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1445.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=8 TTFT (ms)",
+            "value": 124.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=8 TPOT (ms)",
+            "value": 10.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 throughput (tok/s)",
+            "value": 2377.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 21460.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 TTFT (ms)",
+            "value": 1584.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 TPOT (ms)",
+            "value": 51.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 throughput (tok/s)",
+            "value": 1002.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 9046.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 TTFT (ms)",
+            "value": 574.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 TPOT (ms)",
+            "value": 14.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 throughput (tok/s)",
+            "value": 2898.59,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 26079.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 TTFT (ms)",
+            "value": 3016.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 TPOT (ms)",
+            "value": 83.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 throughput (tok/s)",
+            "value": 1451.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 12977.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 TTFT (ms)",
+            "value": 587.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 TPOT (ms)",
+            "value": 20.87,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 throughput (tok/s)",
+            "value": 373.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3359.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 TTFT (ms)",
+            "value": 322.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 TPOT (ms)",
+            "value": 10.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 throughput (tok/s)",
+            "value": 1887.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 17011.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 TTFT (ms)",
+            "value": 995.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 TPOT (ms)",
+            "value": 32.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 throughput (tok/s)",
+            "value": 649.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5776.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 TTFT (ms)",
+            "value": 355.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 TPOT (ms)",
+            "value": 11.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=128 throughput (tok/s)",
+            "value": 5765.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 11557.25,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=128 TTFT (ms)",
+            "value": 369.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=128 TPOT (ms)",
+            "value": 21.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=16 throughput (tok/s)",
+            "value": 2004.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 4035.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=16 TTFT (ms)",
+            "value": 166.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=16 TPOT (ms)",
+            "value": 7.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=256 throughput (tok/s)",
+            "value": 7360.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 14729.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=256 TTFT (ms)",
+            "value": 580.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=256 TPOT (ms)",
+            "value": 33.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=32 throughput (tok/s)",
+            "value": 2904.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 5806.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=32 TTFT (ms)",
+            "value": 227.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=32 TPOT (ms)",
+            "value": 10.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=4 throughput (tok/s)",
+            "value": 794.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 1598.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=4 TTFT (ms)",
+            "value": 125.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=4 TPOT (ms)",
+            "value": 4.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=64 throughput (tok/s)",
+            "value": 4266.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 8544.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=64 TTFT (ms)",
+            "value": 252.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=64 TPOT (ms)",
+            "value": 14.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=8 throughput (tok/s)",
+            "value": 1383.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 2760.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=8 TTFT (ms)",
+            "value": 149.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=8 TPOT (ms)",
+            "value": 5.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 3012.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 27254.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 1737.82,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 40.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1523.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 13776.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 TTFT (ms)",
+            "value": 679.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 TPOT (ms)",
+            "value": 9.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 3343.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 30140.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 3215.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 72.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 throughput (tok/s)",
+            "value": 2088.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 18710.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 TTFT (ms)",
+            "value": 691.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 TPOT (ms)",
+            "value": 14.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 throughput (tok/s)",
+            "value": 713.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 6429.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 TTFT (ms)",
+            "value": 291.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 TPOT (ms)",
+            "value": 5.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 2576.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 23269.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 1061.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 23.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 throughput (tok/s)",
+            "value": 1158.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 10324.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 TTFT (ms)",
+            "value": 463.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 TPOT (ms)",
+            "value": 6.24,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=128 throughput (tok/s)",
+            "value": 4411.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 8832.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=128 TTFT (ms)",
+            "value": 321.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=128 TPOT (ms)",
+            "value": 28.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=16 throughput (tok/s)",
+            "value": 1221.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2455.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=16 TTFT (ms)",
+            "value": 150.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=16 TPOT (ms)",
+            "value": 12.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=256 throughput (tok/s)",
+            "value": 6071.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 12136.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=256 TTFT (ms)",
+            "value": 483.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=256 TPOT (ms)",
+            "value": 40.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1984.82,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3963.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=32 TTFT (ms)",
+            "value": 176.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=32 TPOT (ms)",
+            "value": 15.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=4 throughput (tok/s)",
+            "value": 407.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 818.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=4 TTFT (ms)",
+            "value": 113.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=4 TPOT (ms)",
+            "value": 9.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=64 throughput (tok/s)",
+            "value": 3047.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 6097.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=64 TTFT (ms)",
+            "value": 233.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=64 TPOT (ms)",
+            "value": 20.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=8 throughput (tok/s)",
+            "value": 738.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1471.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=8 TTFT (ms)",
+            "value": 122.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=8 TPOT (ms)",
+            "value": 10.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 2660.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 24019.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 1605.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 45.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 1054.35,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 9515.28,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 441.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 14.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 3144.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 28291.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 2851.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 77.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1564.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 13994.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 628.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 19.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 369.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3320.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 292.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 10.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 2101.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 18945.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 973.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 28.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 649.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5777.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 345.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 11.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24609760525 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
           }
         ]
       }
