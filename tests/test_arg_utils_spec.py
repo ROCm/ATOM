@@ -36,18 +36,19 @@ class TestEngineArgsSpeculativeValidation:
         kwargs = args._get_engine_kwargs()
         assert kwargs.get("speculative_config") is None
 
-    def test_method_mtp_zero_tokens_raises_value_error(self):
-        """method='mtp', num_speculative_tokens=0 → ValueError before any
-        SpeculativeConfig is constructed (regression for ZeroDivisionError)."""
+    def test_method_mtp_zero_tokens_disables_speculation(self):
+        """method='mtp', num_speculative_tokens=0 → treated as disabled,
+        speculative_config is None (regression for ZeroDivisionError)."""
         args = EngineArgs(method="mtp", num_speculative_tokens=0)
-        with pytest.raises(ValueError, match="num_speculative_tokens must be >= 1"):
-            args._get_engine_kwargs()
+        kwargs = args._get_engine_kwargs()
+        assert kwargs.get("speculative_config") is None
 
-    def test_method_mtp_negative_tokens_raises_value_error(self):
-        """method='mtp', num_speculative_tokens=-1 → ValueError."""
+    def test_method_mtp_negative_tokens_disables_speculation(self):
+        """method='mtp', num_speculative_tokens=-1 → treated as disabled,
+        speculative_config is None."""
         args = EngineArgs(method="mtp", num_speculative_tokens=-1)
-        with pytest.raises(ValueError, match="num_speculative_tokens must be >= 1"):
-            args._get_engine_kwargs()
+        kwargs = args._get_engine_kwargs()
+        assert kwargs.get("speculative_config") is None
 
     def test_method_mtp_valid_tokens_builds_speculative_config(self):
         """method='mtp', num_speculative_tokens=3 → SpeculativeConfig constructed."""
