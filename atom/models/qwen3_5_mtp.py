@@ -1,37 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inference-only Qwen3Next MTP model."""
+"""Inference-only Qwen3.5 MTP model."""
 
 import torch
 import torch.nn as nn
+from aiter.dist.parallel_state import get_tp_group
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.moe import FusedMoE
-from aiter.dist.parallel_state import get_tp_group
-from atom.models.utils import IntermediateTensors
-from atom.models.qwen3_next import Qwen3NextDecoderLayer, Qwen3NextRMSNorm
 from atom.model_ops.linear import ColumnParallelLinear
-from atom.model_config.qwen3_next import Qwen3NextConfig
+from atom.model_ops.moe import FusedMoE
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.models.qwen3_5 import (
+    Qwen3_5DecoderLayer,
+    Qwen3_5RMSNorm,
+    get_qwen3_5_text_config,
+)
+from atom.models.utils import IntermediateTensors
 from .utils import maybe_prefix
-
-KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 # @support_torch_compile
-class Qwen3NextMultiTokenPredictor(nn.Module):
+class Qwen3_5MultiTokenPredictor(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
 
         quant_config = atom_config.quant_config
 
-        config: Qwen3NextConfig = atom_config.hf_config
+        config = get_qwen3_5_text_config(atom_config)
 
         self.config = config
 
         self.vocab_size = config.vocab_size
 
         self.mtp_start_layer_idx = config.num_hidden_layers
-        self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1)
+        self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
@@ -43,25 +45,27 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             self.config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.fc",
         )
 
         self.layers = torch.nn.ModuleList(
-            Qwen3NextDecoderLayer(
+            Qwen3_5DecoderLayer(
                 atom_config,
                 layer_type="full_attention",
                 prefix=f"{prefix}.layers.{idx}",
                 layer_num=idx,
             )
             for idx in range(
-                self.mtp_start_layer_idx, self.mtp_start_layer_idx + self.num_mtp_layers
+                self.mtp_start_layer_idx,
+                self.mtp_start_layer_idx + self.num_mtp_layers,
             )
         )
 
-        self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = Qwen3NextRMSNorm(
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_fc_norm_embedding = Qwen3NextRMSNorm(
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -100,13 +104,15 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
 
 
 # @support_torch_compile
-class Qwen3NextMTP(nn.Module):
+class Qwen3_5MTP(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
     }
     weights_mapping = {"mtp.": "model."}
 
@@ -127,11 +133,11 @@ class Qwen3NextMTP(nn.Module):
 
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
-        config = atom_config.hf_config
+        config = get_qwen3_5_text_config(atom_config)
         if atom_config.enable_prefix_caching:
-            raise ValueError("Qwen3NextMTP currently does not support prefix caching")
+            raise ValueError("Qwen3_5MTP currently does not support prefix caching")
         self.config = config
-        self.model = Qwen3NextMultiTokenPredictor(
+        self.model = Qwen3_5MultiTokenPredictor(
             atom_config=atom_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
@@ -165,12 +171,17 @@ class Qwen3NextMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:  # noqa: D401
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.n_routed_experts
+            + (
+                self.config.n_shared_experts
+                if is_rocm_aiter_fusion_shared_expert_enabled()
+                else 0
+            ),
         )

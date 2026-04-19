@@ -894,21 +894,24 @@ def _causal_conv1d_update_kernel(
     dim_limits = dim
     if idx_feats_start < k_start_point:
         o_ptr = query_ptr
-        stride_o_token = stride_q_token
+        # In VARLEN mode, tokens are indexed along dim-0 of the output tensor,
+        # so the token stride is stride_q_seq (not stride_q_token which is the
+        # last-dim stride of the [num_tokens, k_dim, 1] output).
+        stride_o_token = stride_q_seq if IS_VARLEN else stride_q_token
         stride_o_dim = stride_q_dim
         idx_feats_o = idx_feats
         dim_limits = k_dim_size
         stride_o_seq = stride_q_seq
     elif idx_feats_start < v_start_point:
         o_ptr = key_ptr
-        stride_o_token = stride_k_token
+        stride_o_token = stride_k_seq if IS_VARLEN else stride_k_token
         stride_o_dim = stride_k_dim
         idx_feats_o = idx_feats - k_start_point
         dim_limits = k_dim_size
         stride_o_seq = stride_k_seq
     elif idx_feats_start < dim:
         o_ptr = value_ptr
-        stride_o_token = stride_v_token
+        stride_o_token = stride_v_seq if IS_VARLEN else stride_v_token
         stride_o_dim = stride_v_dim
         idx_feats_o = idx_feats - v_start_point
         dim_limits = v_dim_size

@@ -214,8 +214,10 @@ class ScheduledBatch:
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
-        self.mamba_block_tables = [
-            seq.mamba_block_table for seq in seqs.values() if seq.mamba_block_table
+        self.mamba_state_slots = [
+            seq.mamba_state_slot
+            for seq in seqs.values()
+            if seq.mamba_enabled and seq.mamba_state_slot >= 0
         ]
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
@@ -434,6 +436,18 @@ class Scheduler:
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
+        # Strip placeholder + rejected draft tokens added by postprocess.
+        # Real token count = seq.num_tokens - mtp_k - num_rejected
+        # (same formula as postprocess line: num_tokens = seq.num_tokens - self.mtp_k - num_rejected)
+        if self.mtp_k > 0:
+            strip = self.mtp_k + seq.num_rejected
+            if strip > 0:
+                del seq.token_ids[-strip:]
+                del seq.output_tokens[-strip:]
+                seq.num_tokens -= strip
+        seq.num_rejected = 0
+        seq.num_bonus_tokens = 0
+        seq.spec_token_ids = np.array([], dtype=np.int32)
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 

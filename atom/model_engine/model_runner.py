@@ -34,7 +34,6 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
-from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -44,6 +43,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.selector import get_attn_backend
+from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -545,22 +545,6 @@ class ModelRunner:
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
         )
-        if self.config.speculative_config and get_pp_group().is_last_rank:
-            from atom.utils.backends import set_model_tag
-
-            with set_model_tag("drafter"):
-                self.drafter = EagleProposer(self.config, self.device, self)
-            self.rejection_sampler = RejectionSampler()
-            self.mtp_total_draft_tokens = 0
-            self.mtp_total_accepted_tokens = 0
-        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
-        self.tokenID_processor = tokenIDProcessor(
-            self,
-            self.config.max_num_batched_tokens,
-            hasattr(self, "drafter"),
-            self.num_spec_tokens,
-        )
-        self.sampler = Sampler()
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -594,9 +578,24 @@ class ModelRunner:
         )
         logger.info(f"Model load done: {config.model}")
 
-        if hasattr(self, "drafter"):
+        if self.config.speculative_config and get_pp_group().is_last_rank:
+            from atom.utils.backends import set_model_tag
+
+            torch.set_default_device(self.device)
+            with set_model_tag("drafter"):
+                self.drafter = EagleProposer(self.config, self.device, self)
+            self.rejection_sampler = RejectionSampler()
+            torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
+        self.tokenID_processor = tokenIDProcessor(
+            self,
+            self.config.max_num_batched_tokens,
+            hasattr(self, "drafter"),
+            self.num_spec_tokens,
+        )
+        self.sampler = Sampler()
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
@@ -1077,24 +1076,9 @@ class ModelRunner:
                 * 4  # float32
             )
 
-            # gdn attn bytes
-            mamba_shape = self.gated_delta_net_state_shape(
-                get_tp_group().world_size,
-                hf_config.linear_num_key_heads,
-                hf_config.linear_num_value_heads,
-                hf_config.linear_key_head_dim,
-                hf_config.linear_value_head_dim,
-                hf_config.linear_conv_kernel_dim,
-                self.num_spec_tokens,
-            )
-            mamba_dtypes = self.gated_delta_net_state_dtypes()
-            one_layer_byte = (
-                math.prod(mamba_shape[0])
-                * torch.tensor([], dtype=mamba_dtypes[0]).element_size()
-                + math.prod(mamba_shape[1])
-                * torch.tensor([], dtype=mamba_dtypes[1]).element_size()
-            )
-            block_bytes += self.num_gdn_attn_state * one_layer_byte
+            # GDN recurrent state is per-request (not per-block).
+            # It is accounted for separately via _compute_mamba_per_slot_bytes().
+            # Do NOT add it to block_bytes.
         else:
             # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
             # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
@@ -1117,6 +1101,31 @@ class ModelRunner:
             )
         return block_bytes
 
+    def _compute_mamba_per_slot_bytes(self) -> int:
+        """Compute per-slot recurrent state bytes (all GDN layers, one slot).
+
+        A slot holds one request's state (or one spec token's state).
+        Returns 0 for non-GDN models.
+        """
+        if not self.is_qwen_next():
+            return 0
+        hf_config = self.config.hf_config
+        mamba_shape = self.gated_delta_net_state_shape(
+            get_tp_group().world_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            self.num_spec_tokens,
+        )
+        mamba_dtypes = self.gated_delta_net_state_dtypes()
+        one_layer_byte = (
+            math.prod(mamba_shape[0]) * mamba_dtypes[0].itemsize
+            + math.prod(mamba_shape[1]) * mamba_dtypes[1].itemsize
+        )
+        return self.num_gdn_attn_state * one_layer_byte
+
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
 
@@ -1136,7 +1145,7 @@ class ModelRunner:
         # memory due to pooling across multiple captured batch sizes.
         return int(activation_bytes * 0.2)
 
-    def get_num_blocks(self):
+    def get_num_blocks(self) -> dict[str, int]:
         torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
@@ -1170,7 +1179,33 @@ class ModelRunner:
         torch.set_default_device("cpu")
 
         block_bytes = self._compute_block_bytes()
-        num_kvcache_blocks = available_for_kv // block_bytes
+
+        # GDN recurrent state: deduct mamba tensor memory from pool budget
+        mamba_per_slot = self._compute_mamba_per_slot_bytes()
+        slots_per_req = 1 + self.num_spec_tokens
+        max_mamba_slots = (
+            config.max_num_seqs * slots_per_req if mamba_per_slot > 0 else 0
+        )
+        mamba_tensor_bytes = max_mamba_slots * mamba_per_slot
+        available_for_pool = available_for_kv - mamba_tensor_bytes
+        if available_for_pool <= 0:
+            raise RuntimeError(
+                f"GDN mamba tensor ({mamba_tensor_bytes / (1 << 30):.2f}GB for "
+                f"{max_mamba_slots} slots) exceeds available KV budget "
+                f"({available_for_kv / (1 << 30):.2f}GB). "
+                f"Reduce --max-num-seqs or increase gpu_memory_utilization."
+            )
+        mamba_equiv = (
+            math.ceil(mamba_per_slot / block_bytes) if mamba_per_slot > 0 else 0
+        )
+
+        # Store for BlockManager and allocate_kv_cache
+        config.mamba_equiv_per_req = mamba_equiv
+        config.max_mamba_slots = max_mamba_slots
+        config.num_mamba_groups = config.max_num_seqs if mamba_per_slot > 0 else 0
+        self.max_mamba_slots = max_mamba_slots
+
+        num_kvcache_blocks = available_for_pool // block_bytes
 
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
@@ -1184,6 +1219,14 @@ class ModelRunner:
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
         )
+        if mamba_per_slot > 0:
+            logger.info(
+                f"GDN state pool: mamba_per_slot={mamba_per_slot / (1 << 20):.2f}MB, "
+                f"max_mamba_slots={max_mamba_slots}, "
+                f"mamba_tensor={mamba_tensor_bytes / (1 << 30):.2f}GB, "
+                f"mamba_equiv_blocks_per_req={mamba_equiv}, "
+                f"pool_blocks={num_kvcache_blocks}"
+            )
 
         assert num_kvcache_blocks > 0, (
             f"Not enough memory for KV cache with block size({self.block_size}). "
@@ -1195,7 +1238,11 @@ class ModelRunner:
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
         )
-        return num_kvcache_blocks
+        return {
+            "num_kvcache_blocks": num_kvcache_blocks,
+            "mamba_equiv_per_req": mamba_equiv,
+            "num_mamba_groups": config.max_num_seqs if mamba_per_slot > 0 else 0,
+        }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -1282,14 +1329,12 @@ class ModelRunner:
             )
             mamba_dtypes = self.gated_delta_net_state_dtypes()
             self.mamba_k_cache = torch.zeros(
-                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
-                + mamba_shape[0],
+                (self.num_gdn_attn_state, self.max_mamba_slots) + mamba_shape[0],
                 dtype=mamba_dtypes[0],
                 device="cuda",
             )
             self.mamba_v_cache = torch.zeros(
-                (self.num_gdn_attn_state, self.num_physical_kvcache_blocks)
-                + mamba_shape[1],
+                (self.num_gdn_attn_state, self.max_mamba_slots) + mamba_shape[1],
                 dtype=mamba_dtypes[1],
                 device="cuda",
             )
@@ -1327,6 +1372,11 @@ class ModelRunner:
         kv_cache_tensors = []
         layer_id = 0
         x = 16 // self.kv_cache.element_size()
+        mtp_start_layer_idx = (
+            self.drafter.model.model.mtp_start_layer_idx
+            if hasattr(self, "drafter")
+            else hf_config.num_hidden_layers
+        )
         for model_name, model in models_to_bind:
             logger.info(
                 f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
@@ -1336,9 +1386,17 @@ class ModelRunner:
                 # Since use attention base and there are child in attention, add base condition
                 if hasattr(module, "base_attention"):
                     if hasattr(module, "use_mla") and not module.use_mla:
-                        # Non-MLA attention
+                        # Non-MLA attention: hybrid models interleave full
+                        # attention and linear attention, so attn_idx must
+                        # skip linear-attention layers for target, and use
+                        # consecutive slots after num_full_attn for draft.
                         if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
+                            if layer_id < mtp_start_layer_idx:
+                                attn_idx = layer_id // self.full_attention_interval
+                            else:
+                                attn_idx = self.num_full_attn + (
+                                    layer_id - mtp_start_layer_idx
+                                )
                         else:
                             attn_idx = layer_id
                         k_cache = self.kv_cache[0, attn_idx].view(
@@ -1712,6 +1770,7 @@ class ModelRunner:
         bs = context.batch_size
         is_prefill = context.is_prefill
         positions = context.positions
+
         if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             # prefill[bs=1 tok=115 ctx=115]
             label = f"prefill[bs={bs}"
