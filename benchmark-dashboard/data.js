@@ -1,98 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776622726813,
+  "lastUpdate": 1776623024221,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "email": "lirzhang@amd.com",
-            "name": "ZhangLirong",
-            "username": "ZhangLirong-amd"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "5fd265cbbd8ddc8e1c0c5c0919cc17cdd8030b4e",
-          "message": "support dual stream in prepare decode (#499)\n\n* support dual stream in prefill\n\n* support get_meta_data and copy overlap\n\n* reformat",
-          "timestamp": "2026-04-08T13:55:49+08:00",
-          "tree_id": "feaf069399bb9ecb87dc70a534c5a676c7fe854c",
-          "url": "https://github.com/ROCm/ATOM/commit/5fd265cbbd8ddc8e1c0c5c0919cc17cdd8030b4e"
-        },
-        "date": 1775629245155,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-R1-0528 accuracy (GSM8K)",
-            "value": 0.9515,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
-            "value": 0.9462,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | strict-match: 0.9416 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
-            "value": 0.9431,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | strict-match: 0.9393 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
-            "value": 0.5322,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | strict-match: 0.4875 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::GLM-5-FP8 accuracy (GSM8K)",
-            "value": 0.9477,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.93 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5 | BaselineNote: HF: amd/GLM-5-MXFP4 card shows GLM-5 baseline=0.9545 (5-shot) | strict-match: 0.9545 | fewshot: 3 | Model: /models/zai-org/GLM-5-FP8"
-          },
-          {
-            "name": "ATOM::Kimi-K2.5-MXFP4 accuracy (GSM8K)",
-            "value": 0.9287,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.93 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.5 | BaselineNote: HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409 | strict-match: 0.928 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
-          },
-          {
-            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
-            "value": 0.9045,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.88 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | strict-match: 0.5929 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
-            "value": 0.8946,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | strict-match: 0.8764 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
-            "value": 0.6907,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.65 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | strict-match: 0.7998 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
-            "value": 0.4193,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2365 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
-            "value": 0.4193,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24120302671 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2237 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -63045,6 +62955,898 @@ window.BENCHMARK_DATA = {
             "value": 0.4147,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24633489710 | Threshold: 0.39 | Baseline: 0.41 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202604191502 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.2274 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "zhuyuhua-v",
+            "username": "zhuyuhua-v",
+            "email": "yuhzhu@amd.com"
+          },
+          "committer": {
+            "name": "zhuyuhua-v",
+            "username": "zhuyuhua-v",
+            "email": "yuhzhu@amd.com"
+          },
+          "id": "e5be553149fcb4077db2aea1fba1aeaecb9afbb5",
+          "message": "fix some podman cmds\n\nSigned-off-by: zhuyuhua-v <yuhzhu@amd.com>",
+          "timestamp": "2026-04-19T13:35:20Z",
+          "url": "https://github.com/ROCm/ATOM/commit/e5be553149fcb4077db2aea1fba1aeaecb9afbb5"
+        },
+        "date": 1776623021554,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=16 throughput (tok/s)",
+            "value": 743.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1495.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=16 TTFT (ms)",
+            "value": 487.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=16 TPOT (ms)",
+            "value": 20.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1132.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2260.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=32 TTFT (ms)",
+            "value": 319.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=32 TPOT (ms)",
+            "value": 27.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=4 throughput (tok/s)",
+            "value": 344.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 691.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=4 TTFT (ms)",
+            "value": 337,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=4 TPOT (ms)",
+            "value": 10.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=64 throughput (tok/s)",
+            "value": 1675.5,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 3351.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=64 TTFT (ms)",
+            "value": 267.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=64 TPOT (ms)",
+            "value": 37.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=8 throughput (tok/s)",
+            "value": 537.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1071.76,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=8 TTFT (ms)",
+            "value": 94.59,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=8 TPOT (ms)",
+            "value": 14.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=16 throughput (tok/s)",
+            "value": 351.32,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 3170.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=16 TTFT (ms)",
+            "value": 746.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=16 TPOT (ms)",
+            "value": 43.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=32 throughput (tok/s)",
+            "value": 392.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 3510.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=32 TTFT (ms)",
+            "value": 1094.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=32 TPOT (ms)",
+            "value": 79.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=4 throughput (tok/s)",
+            "value": 224.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2020.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=4 TTFT (ms)",
+            "value": 411.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=4 TPOT (ms)",
+            "value": 16.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=64 throughput (tok/s)",
+            "value": 562.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 5074.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=64 TTFT (ms)",
+            "value": 1878.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=64 TPOT (ms)",
+            "value": 110.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=8 throughput (tok/s)",
+            "value": 302.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 2687.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=8 TTFT (ms)",
+            "value": 571.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=8 TPOT (ms)",
+            "value": 25.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-MXFP4-tp4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=16 throughput (tok/s)",
+            "value": 619.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1245.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=16 TTFT (ms)",
+            "value": 161.78,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=16 TPOT (ms)",
+            "value": 25.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=32 throughput (tok/s)",
+            "value": 983.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 1963.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=32 TTFT (ms)",
+            "value": 213.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=32 TPOT (ms)",
+            "value": 31.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=4 throughput (tok/s)",
+            "value": 269.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 542.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=4 TTFT (ms)",
+            "value": 111.55,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=4 TPOT (ms)",
+            "value": 14.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=64 throughput (tok/s)",
+            "value": 1309.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 2620.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=64 TTFT (ms)",
+            "value": 306.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=64 TPOT (ms)",
+            "value": 47.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=8 throughput (tok/s)",
+            "value": 439.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 876.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=8 TTFT (ms)",
+            "value": 130.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=8 TPOT (ms)",
+            "value": 17.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=16 throughput (tok/s)",
+            "value": 319.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 2885.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=16 TTFT (ms)",
+            "value": 916.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=16 TPOT (ms)",
+            "value": 48.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=32 throughput (tok/s)",
+            "value": 376.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 3364.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=32 TTFT (ms)",
+            "value": 1377.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=32 TPOT (ms)",
+            "value": 82.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=4 throughput (tok/s)",
+            "value": 187.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 1689.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=4 TTFT (ms)",
+            "value": 555.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=4 TPOT (ms)",
+            "value": 20.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=64 throughput (tok/s)",
+            "value": 500.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 4507.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=64 TTFT (ms)",
+            "value": 2334.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=64 TPOT (ms)",
+            "value": 123.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=8 throughput (tok/s)",
+            "value": 265.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 2364.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=8 TTFT (ms)",
+            "value": 706.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=8 TPOT (ms)",
+            "value": 28.89,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528-tp4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=16 throughput (tok/s)",
+            "value": 1180.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2373.69,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=16 TTFT (ms)",
+            "value": 120.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=16 TPOT (ms)",
+            "value": 13.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=32 throughput (tok/s)",
+            "value": 1746.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3488.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=32 TTFT (ms)",
+            "value": 140.15,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=32 TPOT (ms)",
+            "value": 17.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=4 throughput (tok/s)",
+            "value": 355.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 715.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=4 TTFT (ms)",
+            "value": 80.03,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=4 TPOT (ms)",
+            "value": 10.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=64 throughput (tok/s)",
+            "value": 2866.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 5734.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=64 TTFT (ms)",
+            "value": 189.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=64 TPOT (ms)",
+            "value": 21.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=8 throughput (tok/s)",
+            "value": 670.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1335.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=8 TTFT (ms)",
+            "value": 99.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=8 TPOT (ms)",
+            "value": 11.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 1024/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=16 throughput (tok/s)",
+            "value": 973.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 8782.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=16 TTFT (ms)",
+            "value": 410.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=16 TPOT (ms)",
+            "value": 15.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=32 throughput (tok/s)",
+            "value": 1356.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 12127.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=32 TTFT (ms)",
+            "value": 566.08,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=32 TPOT (ms)",
+            "value": 22.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=4 throughput (tok/s)",
+            "value": 315.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2837.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=4 TTFT (ms)",
+            "value": 267.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=4 TPOT (ms)",
+            "value": 12.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=64 throughput (tok/s)",
+            "value": 1945.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 17538.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=64 TTFT (ms)",
+            "value": 906.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=64 TPOT (ms)",
+            "value": 31.28,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=8 throughput (tok/s)",
+            "value": 593.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5275.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=8 TTFT (ms)",
+            "value": 326.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=8 TPOT (ms)",
+            "value": 12.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24630374829 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:sglang-benchmark-24630374829-1-e5be553-0.5.10-v0.5.10"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-0528 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
           }
         ]
       }
