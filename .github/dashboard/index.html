@@ -507,7 +507,13 @@ const rawData = window.BENCHMARK_DATA;
 // Normalize legacy model names using HF-path->display mapping from models_map.js
 const _displayMap = window.MODELS_DISPLAY_MAP || {};
 const _displayEntries = Object.entries(_displayMap).sort((a, b) => b[0].length - a[0].length);
+// Accuracy model name renames: unify legacy "MTP3" suffix to "MTP"
+// TODO: Remove after old "MTP3" data ages out of dashboard history (~90 runs)
+const _accuracyRenames = {
+  'Qwen3.5-397B-A17B-FP8 MTP3': 'Qwen3.5-397B-A17B-FP8 MTP',
+};
 function normalizeModelName(name) {
+  if (_accuracyRenames[name]) return _accuracyRenames[name];
   const lc = name.toLowerCase();
   for (const [key, display] of _displayEntries) {
     if (lc === key) return display;
@@ -533,10 +539,10 @@ function parseBenchName(name) {
   // avg toks/fwd: "ModelName avg toks/fwd (tok/fwd)"
   m = rawName.match(/^(.+?)\s+avg toks\/fwd\s+\((.+)\)$/);
   if (m) return { backend, model: normalizeModelName(m[1]), metric: 'avg toks/fwd', unit: m[2] };
-  m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
+  m = rawName.match(/^(.+?)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
   if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
-  m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count)$/);
-  if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: '_gpu_count', unit: '' };
+  m = rawName.match(/^(.+?)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count|_tp)$/);
+  if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: m[4], unit: '' };
   return null;
 }
 
@@ -597,6 +603,9 @@ function detectRegressions() {
     if (!prev || !prev['Total Tput'] || !cfg['Total Tput']) continue;
     const tputChange = (cfg['Total Tput'] - prev['Total Tput']) / prev['Total Tput'];
     const tpotChange = (prev.TPOT && cfg.TPOT) ? (cfg.TPOT - prev.TPOT) / prev.TPOT : 0;
+    // Skip regression check when throughput improved significantly —
+    // TPOT increase alongside throughput gain is a normal batching tradeoff, not a regression.
+    if (tputChange >= REGRESSION_WARNING) continue;
     const worstDelta = Math.max(-tputChange, tpotChange);
     if (worstDelta >= REGRESSION_WARNING) {
       const severity = worstDelta >= REGRESSION_CRITICAL ? 'critical' : 'warning';
@@ -1178,7 +1187,7 @@ function renderKPICards() {
 
   const models = new Set(entries.map(([, c]) => c.model));
   const backends = new Set(entries.map(([, c]) => c.backend));
-  const gpuCounts = [...new Set(entries.map(([, c]) => c._gpu_count).filter(Boolean))].sort((a, b) => a - b);
+  const gpuCounts = [...new Set(entries.map(([, c]) => c._gpu_count || c._tp).filter(Boolean))].sort((a, b) => a - b);
   const gpuLabel = gpuCounts.length === 1 ? gpuCounts[0] + '× GPU' : gpuCounts.length > 1 ? gpuCounts[0] + '-' + gpuCounts[gpuCounts.length - 1] + '× GPU' : '';
 
   // GPU platform info from latest configs
@@ -1462,7 +1471,7 @@ function renderPerformanceTab() {
       <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
-      <td class="num">${cfg._gpu_count || '—'}</td>
+      <td class="num">${cfg._tp || cfg._gpu_count || 1}</td>
       <td style="white-space:nowrap;font-size:11px">${cfg._gpu_name ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_name : '—'}</td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${totalTputPct}%;background:rgba(109,191,128,0.12)"></div><span class="data-bar-text">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</span></td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${outTputPct}%;background:rgba(126,143,174,0.10)"></div><span class="data-bar-text">${fmtNum(cfg.throughput, 1)}</span></td>
@@ -1604,7 +1613,7 @@ function renderTradeoffTab() {
     if (!seriesMap[sKey]) seriesMap[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, points: [], concLabels: [], configKeys: [] };
     const tpot = cfg.TPOT;
     const totalTput = cfg['Total Tput'];
-    const gpuCount = cfg._gpu_count || 8;
+    const gpuCount = cfg._gpu_count || cfg._tp || 1;
     if (tpot && tpot > 0 && totalTput) {
       seriesMap[sKey].points.push({ x: 1000 / tpot, y: totalTput / gpuCount });
       seriesMap[sKey].concLabels.push(cfg.conc);
@@ -1817,7 +1826,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
   for (const [key, cfg] of Object.entries(configs)) {
     const sKey = `${cfg.backend}|${cfg.model}|${cfg.islOsl}`;
     if (!byKey[sKey]) byKey[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, tputPoints: [], tpotPoints: [], tputKeys: [], tpotKeys: [] };
-    const gpuCount = cfg._gpu_count || 8;
+    const gpuCount = cfg._gpu_count || cfg._tp || 1;
     if (cfg['Total Tput'] != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg['Total Tput'] / gpuCount }); byKey[sKey].tputKeys.push(key); }
     if (cfg.TPOT != null) { byKey[sKey].tpotPoints.push({ x: cfg.conc, y: cfg.TPOT }); byKey[sKey].tpotKeys.push(key); }
   }
@@ -2010,8 +2019,8 @@ function renderTrendsTab() {
           let val = pt[met.key];
           // Normalize Total Tput to per-GPU for cross-config comparability
           if (met.key === 'Total Tput') {
-            const gpuCount = pt._gpu_count;
-            if (!Number.isFinite(gpuCount) || gpuCount <= 0) continue;
+            const gpuCount = pt._gpu_count || pt._tp;
+            if (!gpuCount) continue;
             val = val / gpuCount;
           }
           pointMap[matchLabel] = val;
@@ -2161,7 +2170,7 @@ function renderDataTab() {
           if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
           if (!state.filters.conc.includes(cfg.conc)) continue;
           rows.push([fmtDate(cfg.date), cfg.commit.id?.slice(0,7), cfg.backend, cfg.model, cfg.islOsl, cfg.conc,
-            cfg._gpu_count ?? '', cfg['Total Tput'] ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
+            cfg._tp ?? cfg._gpu_count ?? '', cfg['Total Tput'] ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
         }
       }
       navigator.clipboard.writeText(header + '\n' + rows.join('\n'));
@@ -2229,7 +2238,7 @@ function renderDataTable() {
       case 'model': return dir * a.cfg.model.localeCompare(b.cfg.model);
       case 'islOsl': return dir * a.cfg.islOsl.localeCompare(b.cfg.islOsl);
       case 'conc': return dir * (a.cfg.conc - b.cfg.conc);
-      case 'tp': return dir * ((a.cfg._gpu_count || 0) - (b.cfg._gpu_count || 0));
+      case 'tp': return dir * ((a.cfg._tp || a.cfg._gpu_count || 0) - (b.cfg._tp || b.cfg._gpu_count || 0));
       case 'gpu': return dir * (a.cfg._gpu_name || '').localeCompare(b.cfg._gpu_name || '');
       case 'totalTput': return dir * ((a.cfg['Total Tput'] || 0) - (b.cfg['Total Tput'] || 0));
       case 'tpot': return dir * ((a.cfg.TPOT || 0) - (b.cfg.TPOT || 0));
@@ -2263,7 +2272,7 @@ function renderDataTable() {
       <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
-      <td class="num">${cfg._gpu_count || '—'}</td>
+      <td class="num">${cfg._tp || cfg._gpu_count || 1}</td>
       <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
       <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
       <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
@@ -2313,7 +2322,7 @@ function renderTimeline() {
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
+        <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._tp || cfg._gpu_count || 1}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
         <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
@@ -2341,6 +2350,7 @@ function buildDetailHTML(key, cfg) {
     ['Interactive', interactive, 'tok/s/user', prevInteractive, false],
     ['TPOT', cfg.TPOT, 'ms', prev?.TPOT, true],
     ['TTFT', cfg.TTFT, 'ms', prev?.TTFT, true],
+    ['TP', cfg._tp || cfg._gpu_count, '', null, false],
     ['GPU Count', cfg._gpu_count, '', null, false],
   ].map(([label, val, unit, prevVal, inv]) =>
     `<div class="detail-item"><span class="detail-key">${label}</span><span class="detail-val">${val != null ? fmtNum(val, 2) + ' ' + unit : '—'} ${prevVal != null ? trendHTML(val, prevVal, inv) : ''}</span></div>`

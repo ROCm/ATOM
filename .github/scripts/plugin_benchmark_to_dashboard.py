@@ -91,8 +91,13 @@ def build_entries(
         gpu_vram = payload.get("gpu_vram_gb", 0)
         rocm_ver = payload.get("rocm_version", "")
 
-        # Support both OOT and SGLang image tag fields
-        image_tag = payload.get("oot_image_tag", payload.get("sglang_image_tag", ""))
+        # Support ATOM, OOT, and SGLang image tag fields
+        image_tag = (
+            payload.get("docker_image")
+            or payload.get("oot_image_tag")
+            or payload.get("sglang_image_tag")
+            or ""
+        )
 
         if gpu_name:
             extra += f" | GPU: {gpu_name}"
@@ -137,13 +142,26 @@ def build_entries(
             extra=extra,
         )
 
-        gpu_count = payload.get("tensor_parallel_size")
-        if gpu_count is not None:
+        if "tensor_parallel_size" in payload:
+            tp = int(payload["tensor_parallel_size"])
+            dp = int(payload.get("data_parallel_size", 1))
+            dp_attn = payload.get("enable_dp_attention", False)
+            # dp_attention folds DP into TP — each GPU runs independently,
+            # so effective GPU count for throughput normalization is tp alone.
+            gpu_count = tp if dp_attn else tp * dp
+
             entries.append(
                 {
                     "name": f"{label_prefix} _gpu_count",
                     "unit": "",
-                    "value": int(gpu_count),
+                    "value": gpu_count,
+                }
+            )
+            entries.append(
+                {
+                    "name": f"{label_prefix} _tp",
+                    "unit": "",
+                    "value": tp,
                 }
             )
 

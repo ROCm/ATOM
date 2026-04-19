@@ -191,10 +191,9 @@ with open(result_file, "w", encoding="utf-8") as f:
 PY
   fi
 
-  # Extract MTP acceptance rate from server log (if MTP enabled)
+  # Extract MTP acceptance rate from server log (if present)
   ATOM_SERVER_LOG="${ATOM_SERVER_LOG:-/tmp/atom_server.log}"
-  SERVER_ARGS="${SERVER_ARGS:-${EXTRA_ARGS[*]:-}}"
-  if [ -f "$ATOM_SERVER_LOG" ] && echo "$SERVER_ARGS" | grep -qi mtp; then
+  if [ -f "$ATOM_SERVER_LOG" ]; then
     RESULT_FILE="${RESULT_FILENAME}" \
     ATOM_SERVER_LOG="$ATOM_SERVER_LOG" \
     python3 - <<'PY'
@@ -321,9 +320,12 @@ d["random_input_len"] = int(os.environ["ISL"])
 d["random_output_len"] = int(os.environ["OSL"])
 d["benchmark_backend"] = "ATOM"
 
-tp_match = re.search(r"-tp\s+(\d+)", os.environ.get("SERVER_ARGS", ""))
-if tp_match:
-    d["tensor_parallel_size"] = int(tp_match.group(1))
+server_args = os.environ.get("SERVER_ARGS", "")
+tp_match = re.search(r"(?:^|\s)-tp\s+(\d+)", server_args)
+d["tensor_parallel_size"] = int(tp_match.group(1)) if tp_match else 1
+dp_match = re.search(r"(?:--data-parallel-size|(?:^|\s)-dp)\s+(\d+)", server_args)
+d["data_parallel_size"] = int(dp_match.group(1)) if dp_match else 1
+d["enable_dp_attention"] = "--enable-dp-attention" in server_args
 
 with open(result_path, "w", encoding="utf-8") as f:
     json.dump(d, f, indent=2)
