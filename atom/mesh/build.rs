@@ -1,12 +1,12 @@
 use std::process::Command;
 
 const DEFAULT_VERSION: &str = "0.0.0";
-const DEFAULT_PROJECT_NAME: &str = "sgl-model-gateway";
+const DEFAULT_PROJECT_NAME: &str = "atom-mesh";
 
-/// Set a compile-time environment variable with the SGL_MODEL_GATEWAY_ prefix
+/// Set a compile-time environment variable with the ATOM_MESH_ prefix
 macro_rules! set_env {
     ($name:expr, $value:expr) => {
-        println!("cargo:rustc-env=SGL_MODEL_GATEWAY_{}={}", $name, $value);
+        println!("cargo:rustc-env=ATOM_MESH_{}={}", $name, $value);
     };
 }
 
