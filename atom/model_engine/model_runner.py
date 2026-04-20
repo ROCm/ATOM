@@ -61,6 +61,8 @@ support_model_arch_dict = {
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -630,7 +632,12 @@ class ModelRunner:
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
-        elif self.hf_text_config.model_type in ("qwen3_next", "qwen3_next_mtp"):
+        elif self.hf_text_config.model_type in (
+            "qwen3_next",
+            "qwen3_next_mtp",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        ):
             return True
         return False
 
@@ -1560,7 +1567,31 @@ class ModelRunner:
                 label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
             label += "]"
             with record_function(label):
-                hidden_states = self.model(input_ids, positions)
+                # Handle multimodal prefill: compute vision embeddings and merge
+                inputs_embeds = None
+                if (
+                    is_prefill
+                    and hasattr(self.model, "get_vision_embeddings")
+                    and batch is not None
+                    and hasattr(batch, "multimodal_data")
+                    and batch.multimodal_data
+                ):
+                    mm_data = next(iter(batch.multimodal_data.values()))
+                    pixel_values = mm_data["pixel_values"].to(
+                        device=self.device, dtype=self.config.torch_dtype
+                    )
+                    grid_thw = mm_data["image_grid_thw"].to(device=self.device)
+                    vision_embeds = self.model.get_vision_embeddings(
+                        pixel_values, grid_thw
+                    )
+                    text_embeds = self.model.embed_input_ids(input_ids)
+                    inputs_embeds = self.model.merge_multimodal_embeddings(
+                        input_ids, text_embeds, vision_embeds
+                    )
+
+                hidden_states = self.model(
+                    input_ids, positions, inputs_embeds=inputs_embeds
+                )
                 logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]

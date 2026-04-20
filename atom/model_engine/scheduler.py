@@ -255,6 +255,14 @@ class ScheduledBatch:
 
         self.num_spec_step = num_spec_step
 
+        # Collect multimodal data from prefill sequences
+        self.multimodal_data = {}
+        for seq in seqs.values():
+            if getattr(seq, "multimodal_data", None) is not None:
+                self.multimodal_data[seq.id] = seq.multimodal_data
+                # Clear after first use to avoid re-sending on decode steps
+                seq.multimodal_data = None
+
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
         # logger.info(f"{self.context_lens=}")

@@ -42,6 +42,7 @@ class Sequence:
         id=None,
         num_draft_tokens: int = 0,
         mamba_enabled: bool = False,
+        multimodal_data: Optional[dict] = None,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -51,6 +52,7 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_draft_tokens = num_draft_tokens
         self.mamba_enabled = mamba_enabled
+        self.multimodal_data = multimodal_data
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
