@@ -640,7 +640,7 @@ def _fused_qk_norm_single_kernel(
     var = tl.sum(x * x, 1)[:, None]
     rstd = tl.rsqrt(var / head_dim + eps)
 
-    out = (x * rstd * w).to(tl.bfloat16)
+    out = (x * rstd * w).to(q_out_ptr.dtype.element_ty)
     tl.store(
         q_out_ptr + out_bases + cols,
         out,
