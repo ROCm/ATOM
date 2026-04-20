@@ -42,6 +42,7 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
 export SGLANG_HOST_IP=${PREFILL_IP}
 export MOONCAKE_CONFIG_PATH=/workspace/mooncake_prefill.json
+export SGLANG_MOONCAKE_SEND_AUX_TCP=1
 export LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 python3 -m sglang.launch_server \
