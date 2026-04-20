@@ -4,7 +4,7 @@
 
 macro_rules! build_env {
     ($name:ident) => {
-        env!(concat!("SGL_MODEL_GATEWAY_", stringify!($name)))
+        env!(concat!("ATOM_MESH_", stringify!($name)))
     };
 }
 
