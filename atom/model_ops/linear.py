@@ -165,8 +165,17 @@ def gemm_a4w4_quant(
             x_uint8 = x.view(torch.uint8)
             x_padded = torch.zeros(m_padded, x_uint8.shape[-1], dtype=torch.uint8, device=x.device)
             x_padded[:m] = x_uint8
-            xs_padded = torch.zeros(m_padded, x_scale.shape[-1], dtype=torch.uint8, device=x.device)
-            xs_padded[:m] = x_scale
+            if m >= MXFP4_QUANT_BLOCK_SIZE:
+                scale_rows_padded = m_padded // MXFP4_QUANT_BLOCK_SIZE
+                xs_padded = torch.zeros(
+                    scale_rows_padded, x_scale.shape[-1], dtype=torch.uint8, device=x.device
+                )
+                xs_padded[: x_scale.shape[0]] = x_scale
+            else:
+                xs_padded = torch.zeros(
+                    m_padded, x_scale.shape[-1], dtype=torch.uint8, device=x.device
+                )
+                xs_padded[:m] = x_scale
             x_scale = xs_padded
             x_uint8_final = x_padded
         else:
@@ -491,7 +500,6 @@ class LinearBase(nn.Module):
                     k_pad = self._fp4_k_padded
                     elem_size = x.element_size()
                     fp4_elem_size = 1
-                    x_logical_k = x.shape[-1] * elem_size // fp4_elem_size
                     x_k_target = x.shape[-1] * k_pad // k_orig
                     if x.shape[-1] != x_k_target:
                         if x.dtype in [dtypes.fp4x2, dtypes.i4x2, torch.uint8]:

@@ -1438,19 +1438,37 @@ def AiterBackendDecoratorForPluginMode(cls):
             if name.startswith("_"):
                 continue
             setattr(cls, name, getattr(methods_cls, name))
-        # Rebase onto vLLM v1 AttentionBackend so cls inherits default method
-        # stubs (get_preferred_block_size, validate_configuration, supports_*,
-        # etc.) that the vLLM v1 attention selector requires.
+        # Create a subclass that also inherits the vLLM v1 AttentionBackend
+        # so cls gets the default method stubs (get_preferred_block_size,
+        # validate_configuration, supports_*, etc.) required by the vLLM v1
+        # attention selector. Avoid mutating __bases__ at runtime because it
+        # can raise TypeError for incompatible layouts/metaclasses.
         try:
             from vllm.v1.attention.backend import (
                 AttentionBackend as _VllmAttnBackend,
             )
-            cls.__bases__ = (_VllmAttnBackend,)
+            if not issubclass(cls, _VllmAttnBackend):
+                cls = type(
+                    cls.__name__,
+                    (cls, _VllmAttnBackend),
+                    {
+                        "__module__": cls.__module__,
+                        "__qualname__": cls.__qualname__,
+                        "__doc__": cls.__doc__,
+                    },
+                )
         except ImportError:
             logger.warning(
                 "vllm.v1.attention.backend not found; %s will not inherit "
                 "vLLM v1 AttentionBackend stubs — attention selector may "
                 "reject this backend.", cls.__name__)
+        except TypeError as exc:
+            logger.warning(
+                "Unable to create vLLM AttentionBackend-compatible subclass "
+                "for %s; keeping original class without vLLM v1 stubs: %s",
+                cls.__name__,
+                exc,
+            )
     return cls
 
 

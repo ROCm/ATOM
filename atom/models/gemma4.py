@@ -7,7 +7,6 @@ from collections.abc import Iterable
 from typing import Any, Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from aiter import gelu_tanh_and_mul
@@ -15,7 +14,7 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
 
 from atom.config import Config, QuantizationConfig
-from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
+from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding

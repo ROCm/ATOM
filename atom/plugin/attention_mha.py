@@ -50,30 +50,71 @@ def _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
         lse = torch.empty(num_heads_q, total_q, dtype=torch.float32,
                           device=q.device)
 
-    for i in range(num_seqs):
-        sq_s, sq_e = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
-        sk_s, sk_e = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
-        qi = q[sq_s:sq_e].transpose(0, 1).unsqueeze(0)
-        ki = k[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
-        vi = v[sk_s:sk_e].transpose(0, 1).unsqueeze(0)
-        num_q_heads, num_kv_heads = qi.shape[1], ki.shape[1]
-        if num_q_heads != num_kv_heads:
-            rep = num_q_heads // num_kv_heads
-            ki = ki.repeat_interleave(rep, dim=1)
-            vi = vi.repeat_interleave(rep, dim=1)
-        oi = F.scaled_dot_product_attention(
-            qi, ki, vi, scale=softmax_scale, is_causal=causal,
-        )
-        out[sq_s:sq_e] = oi.squeeze(0).transpose(0, 1)
-
+    # Expand KV heads once, then execute a single batched SDPA over padded
+    # tensors instead of launching one SDPA per sequence from Python.
+    num_kv_heads = k.shape[1]
+    if num_heads_q != num_kv_heads:
+        rep = num_heads_q // num_kv_heads
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+    q_starts = cu_seqlens_q[:-1].tolist()
+    q_ends = cu_seqlens_q[1:].tolist()
+    k_starts = cu_seqlens_k[:-1].tolist()
+    k_ends = cu_seqlens_k[1:].tolist()
+    q_lens = [q_e - q_s for q_s, q_e in zip(q_starts, q_ends)]
+    k_lens = [k_e - k_s for k_s, k_e in zip(k_starts, k_ends)]
+    max_q = max(q_lens) if q_lens else 0
+    max_k = max(k_lens) if k_lens else 0
+    if max_q == 0 or max_k == 0:
         if return_lse:
-            scores = torch.matmul(qi * softmax_scale, ki.transpose(-1, -2))
-            if causal and (sq_e - sq_s) == (sk_e - sk_s):
-                mask = torch.triu(
-                    torch.full_like(scores, float("-inf")), diagonal=1)
-                scores = scores + mask
-            lse[:, sq_s:sq_e] = torch.logsumexp(scores, dim=-1).squeeze(0)
-
+            lse.zero_()
+            return out, lse
+        return out
+    batch_q = q.new_zeros((num_seqs, num_heads_q, max_q, q.shape[-1]))
+    batch_k = k.new_zeros((num_seqs, num_heads_q, max_k, k.shape[-1]))
+    batch_v = v.new_zeros((num_seqs, num_heads_q, max_k, v.shape[-1]))
+    attn_mask = q.new_full((num_seqs, 1, max_q, max_k), float("-inf"))
+    for i, (sq_s, sq_e, sk_s, sk_e, q_len, k_len) in enumerate(
+        zip(q_starts, q_ends, k_starts, k_ends, q_lens, k_lens)
+    ):
+        if q_len == 0 or k_len == 0:
+            continue
+        batch_q[i, :, :q_len] = q[sq_s:sq_e].transpose(0, 1)
+        batch_k[i, :, :k_len] = k[sk_s:sk_e].transpose(0, 1)
+        batch_v[i, :, :k_len] = v[sk_s:sk_e].transpose(0, 1)
+        attn_mask[i, :, :q_len, :k_len] = 0
+        if causal:
+            causal_mask = torch.triu(
+                torch.full((q_len, k_len), float("-inf"),
+                           dtype=q.dtype, device=q.device),
+                diagonal=1,
+            )
+            attn_mask[i, :, :q_len, :k_len] = (
+                attn_mask[i, :, :q_len, :k_len] + causal_mask
+            )
+    batch_out = F.scaled_dot_product_attention(
+        batch_q,
+        batch_k,
+        batch_v,
+        attn_mask=attn_mask,
+        scale=softmax_scale,
+        is_causal=False,
+    )
+    for i, (sq_s, sq_e, q_len) in enumerate(zip(q_starts, q_ends, q_lens)):
+        if q_len == 0:
+            continue
+        out[sq_s:sq_e] = batch_out[i, :, :q_len].transpose(0, 1)
+    if return_lse:
+        scores = torch.matmul(
+            batch_q.to(torch.float32) * softmax_scale,
+            batch_k.transpose(-1, -2).to(torch.float32),
+        )
+        scores = scores + attn_mask.to(torch.float32)
+        batch_lse = torch.logsumexp(scores, dim=-1)
+        for i, (sq_s, sq_e, q_len) in enumerate(zip(q_starts, q_ends, q_lens)):
+            if q_len == 0:
+                continue
+            lse[:, sq_s:sq_e] = batch_lse[i, :, :q_len]
     return (out, lse) if return_lse else out
 
 
@@ -120,7 +161,6 @@ def _triton_flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
     GQA head expansion.
     """
     import torch
-    import torch.nn.functional as F
 
     try:
         from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.interface_v2 import (  # noqa: E501
