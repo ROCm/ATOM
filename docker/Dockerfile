@@ -470,10 +470,11 @@ RUN pip show atom || true
 
 # atom-mesh: build Rust binary, strip, install to /usr/local/bin
 RUN echo "========== Build atom-mesh ==========" && \
+    rustup update stable && rustup default stable && \
     cd /app/ATOM/atom/mesh && \
     cargo build --release && \
     strip target/release/atom-mesh && \
     cp target/release/atom-mesh /usr/local/bin/atom-mesh && \
-    atom-mesh --version || true
+    atom-mesh --version
 
 CMD ["/bin/bash"]
