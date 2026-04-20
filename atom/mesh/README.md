@@ -1,19 +1,17 @@
 # ATOM Mesh
 
-> Forked from [sgl-model-gateway v0.3.2](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway).
-
-High-performance model routing gateway for PD (Prefill-Decode) disaggregated LLM serving. Routes inference requests across heterogeneous worker fleets with cache-aware load balancing, gRPC pipeline with Rust-native tokenization, and built-in reliability primitives.
+High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
 ## Features
 
-- **PD Disaggregation**: Separate prefill and decode workers with independent routing policies and bootstrap port handling
-- **Regular Mode**: Non-disaggregated routing as performance baseline
-- **Dual Protocol**: HTTP and gRPC routing with shared reliability layer
-- **gRPC Pipeline**: Fully Rust tokenization, reasoning parsing, and tool-call execution for high-throughput serving
-- **Load Balancing**: Random, round-robin, cache-aware (prefix tree), power-of-two, prefix-hash strategies with DP-aware scheduling
+- **PD disaggregation**: Separate prefill and decode workers, independent routing policies, and optional bootstrap ports for KV transfer
+- **Regular mode**: Single-pool routing as a performance baseline
+- **Dual protocol**: HTTP and gRPC through a shared reliability layer
+- **gRPC pipeline**: Rust-side tokenization, reasoning parsing, and tool-call execution for high throughput
+- **Load balancing**: Random, round-robin, cache-aware (prefix tree), power-of-two, and prefix-hash strategies, with DP-aware scheduling where applicable
 - **Reliability**: Retries with exponential backoff, per-worker circuit breakers, rate limiting, and request queuing
-- **Observability**: 40+ Prometheus metrics, structured logging
-- **Multi-Backend**: SGLang worker backend
+- **Observability**: 40+ Prometheus metrics and structured logging
+- **Multi-backend**: SGLang worker backend
 
 ### Supported Endpoints
 
@@ -26,7 +24,7 @@ High-performance model routing gateway for PD (Prefill-Decode) disaggregated LLM
 | `POST /v1/tokenize` / `/v1/detokenize` | Tokenization with batch support |
 | `POST /parse/reasoning` / `/parse/function_call` | Reasoning and tool-call parsing |
 | `GET /health` / `/readiness` / `/liveness` | Health probes |
-| `GET /v1/models` | Model info |
+| `GET /v1/models` | Model metadata |
 
 ## Installation
 
@@ -37,7 +35,8 @@ High-performance model routing gateway for PD (Prefill-Decode) disaggregated LLM
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   source "$HOME/.cargo/env"
   ```
-### Build from Source
+
+### Build from source
 
 ```bash
 # Debug build
@@ -47,7 +46,7 @@ cargo build
 cargo build --release
 ```
 
-Binaries: `target/release/atom-mesh`, `target/release/mesh`
+Artifacts: `target/release/atom-mesh`, `target/release/mesh`.
 
 ### Verify
 
@@ -57,13 +56,13 @@ Binaries: `target/release/atom-mesh`, `target/release/mesh`
 
 ## Usage
 
-### Regular HTTP Routing
+### Regular HTTP routing
 
 ```bash
 mesh launch --worker-urls http://worker1:8000 http://worker2:8000 --policy cache_aware
 ```
 
-### Prefill/Decode Disaggregation
+### Prefill / decode disaggregation
 
 ```bash
 mesh launch --pd-disaggregation \
@@ -74,9 +73,9 @@ mesh launch --pd-disaggregation \
   --prefill-policy cache_aware --decode-policy power_of_two
 ```
 
-Prefill entries accept an optional bootstrap port (for Mooncake KV cache transfer).
+Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cache transfer).
 
-### gRPC Routing
+### gRPC routing
 
 ```bash
 mesh launch \
@@ -86,23 +85,23 @@ mesh launch \
   --tool-call-parser json
 ```
 
-Supported reasoning parsers: `deepseek-r1`, `qwen3`, `qwen3-thinking`, `kimi`, `glm45`, `glm47`, `step3`, `minimax`.
+Supported reasoning parsers: `deepseek-r1`, `qwen3`, `qwen3-thinking`, `kimi`, `glm45`, `glm47`, `step3`, `minimax`.  
 Supported tool parsers: `json`, `python`, `xml`.
 
 ## Architecture
 
-### Control Plane
+### Control plane
 
-- **Worker Registry**: Centralized registration with model-based indexing and consistent hash ring
-- **Worker Manager**: Validates workers, discovers capabilities, tracks load
-- **Job Queue**: Async add/remove operations with status tracking via `/workers/{id}`
-- **Health Checker**: Background probes feeding circuit breakers and policies
+- **Worker registry**: Central registration with model-based indexing and a consistent hash ring
+- **Worker manager**: Validates workers, discovers capabilities, tracks load
+- **Job queue**: Async add/remove with status via `/workers/{id}`
+- **Health checker**: Background probes feeding circuit breakers and policies
 
-### Data Plane
+### Data plane
 
-- **HTTP Router**: Regular and PD routing with per-model policy overrides
-- **gRPC Router**: Rust-native tokenizer, reasoning parser, and tool parser pipeline
-- **Resilience Layer**: Rate limiting, queuing, retries, circuit breakers
+- **HTTP router**: Regular and PD routing with per-model policy overrides
+- **gRPC router**: Rust-native tokenizer, reasoning parser, and tool parser pipeline
+- **Resilience layer**: Rate limiting, queuing, retries, circuit breakers
 
 ### Worker APIs
 
@@ -110,34 +109,34 @@ Supported tool parsers: `json`, `python`, `xml`.
 |--------|------|-------------|
 | `POST` | `/workers` | Register worker (async, returns 202) |
 | `GET` | `/workers` | List workers with health and load |
-| `GET/PUT/DELETE` | `/workers/{id}` | Inspect, update, or remove worker |
+| `GET` / `PUT` / `DELETE` | `/workers/{id}` | Inspect, update, or remove worker |
 | `POST` | `/flush_cache` | Flush cache across HTTP workers |
 | `GET` | `/get_loads` | Sample current worker loads |
 
-## Load Balancing
+## Load balancing
 
 | Policy | Description |
 |--------|-------------|
 | `random` | Uniform random selection |
 | `round_robin` | Sequential rotation with atomic counters |
-| `cache_aware` | Prefix tree matching for cache reuse, with configurable balance thresholds |
-| `power_of_two` | Picks lighter worker among two random candidates |
+| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds |
+| `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 
-Per-mode overrides via `--prefill-policy` and `--decode-policy` in PD mode.
+In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 ## Reliability
 
-- **Retries**: Max 5 with exponential backoff and jitter (`--retry-max-retries`, `--retry-initial-backoff-ms`)
-- **Circuit Breakers**: Per-worker with configurable failure/success thresholds (`--cb-failure-threshold`, `--cb-timeout-duration-secs`)
-- **Rate Limiting**: Token bucket via `--max-concurrent-requests` with optional request queue (`--queue-size`, `--queue-timeout-secs`)
-- **Health Checks**: Configurable interval, timeout, and failure thresholds (`--health-check-interval-secs`)
+- **Retries**: Up to 5 attempts with exponential backoff and jitter (`--retry-max-retries`, `--retry-initial-backoff-ms`)
+- **Circuit breakers**: Per-worker failure/success thresholds (`--cb-failure-threshold`, `--cb-timeout-duration-secs`)
+- **Rate limiting**: Token bucket via `--max-concurrent-requests`, optional queue (`--queue-size`, `--queue-timeout-secs`)
+- **Health checks**: Configurable interval, timeout, and failure thresholds (`--health-check-interval-secs`)
 
 ## Observability
 
-### Prometheus Metrics
+### Prometheus metrics
 
-Default endpoint: `0.0.0.0:29000` (`--prometheus-host` / `--prometheus-port`)
+Default bind: `0.0.0.0:29000` (`--prometheus-host` / `--prometheus-port`)
 
 | Layer | Prefix | Description |
 |-------|--------|-------------|
@@ -145,27 +144,31 @@ Default endpoint: `0.0.0.0:29000` (`--prometheus-host` / `--prometheus-port`)
 | Router | `mesh_router_*` | Requests by model/endpoint, latency, errors |
 | Inference | `mesh_router_ttft/tpot/tokens_*` | TTFT, TPOT, token counts (gRPC) |
 | Worker | `mesh_worker_*` | Pool size, connections, health, selection |
-| Circuit Breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
-| Retry | `mesh_worker_retries_*` | Attempts, exhausted, backoff |
+| Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
+| Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
 
 ### Logging
 
-Structured logging via `tracing` with optional file sink (`--log-dir`) and configurable level (`--log-level`).
+Structured logging via `tracing`, optional file sink (`--log-dir`), and log level (`--log-level`).
 
 ## Security
 
-Simple API key protection for router endpoints:
+Optional API key protection for router endpoints:
 
 ```bash
 mesh launch --api-key "your-secret-key" \
   --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
-Clients must provide `Authorization: Bearer <key>`. Workers declared via CLI inherit the router key.
+Clients send `Authorization: Bearer <key>`. Workers declared on the CLI inherit the router key.
 
 ## Development
 
 ```bash
-cargo build                              # build
-cargo build --release                    # release build
+cargo build           # debug
+cargo build --release # release
 ```
+
+## Acknowledgments and upstream
+
+[**sgl-model-gateway**](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway) is an excellent reference implementation for disaggregated model routing and high-throughput serving. ATOM Mesh builds on that design, then adapts it for the **ATOM** stack and **AMD** hardware: scheduling, defaults, and performance-related paths are tuned for AMD accelerators and typical AMD deployment constraints so the gateway remains a strong fit for AMD-centric clusters.
