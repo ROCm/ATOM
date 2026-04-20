@@ -11,6 +11,7 @@ from aiter import (
     dtypes,
     gemm_a4w4,
     gemm_a8w8,
+    gemm_a16w16,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
     get_hip_quant,
@@ -58,9 +59,19 @@ if use_triton_gemm():
     except ImportError as e:
         logger.warning(f"Triton w8a8 GEMM not available: {e}")
         gemm_a8w8_blockscale_bpreshuffle_triton = None
+    
+    # for gptoss -- double check that this is not meant to be anywhere else
+    try:
+        from aiter.ops.triton.gemm_a16w16 import ( # gluon?
+            gemm_a16w16,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton w16a16 GEMM not available: {e}")
+        gemm_a16w16 = None
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
+    gemm_a16w16 = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
@@ -199,6 +210,31 @@ def gemm_a8w8_blockscale_preshuffle_impl(
         )
     else:
         y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+    return y
+
+
+def gemm_a16w16_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    prefix: str = "",
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@mark_trace(torch_compile=False)
+@torch_compile_guard(gen_fake=gemm_a16w16_fake, mutates_args=[])
+def gemm_a16w16_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    prefix: str = "",
+) -> torch.Tensor:
+    y = gemm_a16w16(x, weight, x_scale, w_scale, dtype)
     return y
 
 
@@ -390,11 +426,20 @@ class LinearBase(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
+            # y = tgemm.mm(
+            #     x,
+            #     self.weight,
+            #     self.bias,
+            #     otype=otype,
+            # )
+            # changed to a16w16 but need to check if that's the correct approach
+            y = gemm_a16w16(
                 x,
                 self.weight,
+                x_scale,
+                self.weight_scale,
                 self.bias,
-                otype=otype,
+                dtype=otype,
             )
         else:
             if x_scale is None:
