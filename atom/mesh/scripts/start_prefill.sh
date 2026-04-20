@@ -56,7 +56,7 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
     --max-running-requests "${MAX_RUNNING_REQUESTS}" \
     --disable-radix-cache \
-    --log-level warning \
+    --log-level info \
     --watchdog-timeout 3600 \
     --disaggregation-mode prefill \
     --disaggregation-transfer-backend mooncake \
