@@ -195,6 +195,8 @@ class MiniMaxM2Attention(nn.Module):
             layer_num=layer_num,
             use_mla=False,
             rotary_emb=self.rotary_emb,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
         )
 
     def forward(
@@ -204,14 +206,6 @@ class MiniMaxM2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        # TP-aware RMSNorm: all-reduce variance across TP ranks so
-        # normalization uses the global variance (over 6144/1024 dims)
-        # rather than per-rank variance (768/128 dims).
-        q, k = MiniMaxText01RMSNormTP.forward_qk(
-            self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
-        )
-
         attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output

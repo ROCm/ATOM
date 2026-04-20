@@ -365,6 +365,14 @@ class MiniMaxText01RMSNormTP(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_dim = q.dim()
+        k_dim = k.dim()
+        orig_q_shape = q.shape
+        orig_k_shape = k.shape
+        assert q_dim == k_dim, "q and k must have the same number of dimensions."
+        if q_dim == 3:
+            q = q.reshape(q.shape[0], -1)
+            k = k.reshape(k.shape[0], -1)
         orig_dtype = q.dtype
         q = q.to(torch.float32)
         k = k.to(torch.float32)
@@ -378,7 +386,7 @@ class MiniMaxText01RMSNormTP(nn.Module):
         k = k * torch.rsqrt(k_var + k_norm.variance_epsilon) * k_norm.weight
         q = q.to(orig_dtype)
         k = k.to(orig_dtype)
-        return q, k
+        return q.view(orig_q_shape), k.view(orig_k_shape)
 
 
 class RMSNormGated(nn.Module):
