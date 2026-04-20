@@ -238,5 +238,29 @@
     "accuracy_baseline": 0.9401,
     "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.5",
     "_baseline_note": "HF: amd/MiniMax-M2.5-MXFP4 card shows MXFP4=0.9256, baseline=0.9401"
+  },
+  {
+    "model_name": "gemma-4-31b-it",
+    "model_path": "google/gemma-4-31b-it",
+    "extraArgs": "-tp 8 --trust-remote-code --max-model-len 4096",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.45,
+    "accuracy_baseline": 0.9598,
+    "accuracy_baseline_model": "google/gemma-4-31b-it",
+    "_baseline_note": "3-shot gsm8k with local-completions scores ~0.50 (Gemma4 needs chat template); 8-shot gsm8k_cot with chat template scores 0.9598"
+  },
+  {
+    "model_name": "gemma-4-31b-it-MXFP4",
+    "model_path": "amd/gemma-4-31b-it-MXFP4",
+    "extraArgs": "-tp 8 --trust-remote-code --max-model-len 4096",
+    "env_vars": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.45,
+    "accuracy_baseline": 0.9598,
+    "accuracy_baseline_model": "google/gemma-4-31b-it",
+    "_baseline_note": "Quark MXFP4 W4A4 all-linear; 3-shot gsm8k ~0.50; 8-shot gsm8k_cot with chat template scores 0.9484"
   }
 ]
