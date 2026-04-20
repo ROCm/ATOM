@@ -1,7 +1,7 @@
 # Default base images
 ARG BASE_IMAGE="rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0"
-ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
-ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
+ARG OOT_BASE_IMAGE="rocm/atom-mesh:latest"
+ARG SGLANG_BASE_IMAGE="rocm/atom-mesh:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # OOT image extends an ATOM base image that already contains atom/aiter/mori.
@@ -361,65 +361,41 @@ ARG VENV_PYTHON="/opt/venv/bin/python"
 # [MC 1/4] Clone
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 1/4] Clone Mooncake =========="; \
-        git clone --depth 1 ${MOONCAKE_REPO} /app/mooncake && \
-        if [ -n "${MOONCAKE_COMMIT}" ]; then \
-            cd /app/mooncake && git fetch --depth 1 origin "${MOONCAKE_COMMIT}" && git checkout FETCH_HEAD; \
-        fi && \
-        cd /app/mooncake && echo "Mooncake commit: $(git rev-parse HEAD)"; \
+        git clone ${MOONCAKE_REPO} /app/mooncake && \
+        cd /app/mooncake && \
+        git checkout "${MOONCAKE_COMMIT}" && \
+        git submodule update --init --recursive && \
+        echo "Mooncake commit: $(git rev-parse HEAD)"; \
     else \
         echo "========== Skipped Mooncake (INSTALL_MOONCAKE=0) =========="; \
     fi
 
-# [MC 2/4] Install dependencies (system packages + yalantinglibs + Go + submodules)
+# [MC 2/4] Install dependencies (system packages + RDMA + Go + submodules)
 ENV PATH="/usr/local/go/bin:${PATH}"
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
-        apt-get update \
-        && cd /app/mooncake && bash dependencies.sh -y; \
+        apt-get update && apt-get install -y --no-install-recommends \
+            zip unzip wget gcc make libtool autoconf \
+            librdmacm-dev rdmacm-utils infiniband-diags perftest ethtool \
+            libibverbs-dev rdma-core \
+            openssh-server openmpi-common && \
+        cd /app/mooncake && bash dependencies.sh -y && \
+        rm -rf /usr/local/go && \
+        wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
+        tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
+        rm go1.22.2.linux-amd64.tar.gz; \
     fi
 
-# [MC 3/4] CMake build with HIP support
+# [MC 3/4] CMake build with HIP support + system install
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        echo "========== [MC 3/4] Build Mooncake (USE_HIP=ON) =========="; \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON) =========="; \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
-        && cmake .. \
-            -DUSE_HIP=ON \
-            -DUSE_TCP=ON \
-            -DUSE_HTTP=ON \
-            -DUSE_CUDA=OFF \
-            -DBUILD_UNIT_TESTS=ON \
-            -DBUILD_EXAMPLES=OFF \
-            -DWITH_STORE=OFF \
-            -DWITH_STORE_RUST=OFF \
-            -DWITH_P2P_STORE=OFF \
-            -DCMAKE_BUILD_TYPE=Release \
-        && make -j$(nproc); \
-    fi
-
-# [MC 4/4] Install Python wheel, copy artifacts, clean up
-RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        echo "========== [MC 4/4] Install Mooncake Python package =========="; \
-        cd /app/mooncake \
-        && "${VENV_PYTHON}" -m pip install mooncake-wheel/ \
-        && MOONCAKE_PKG=$("${VENV_PYTHON}" -c "import mooncake, os; print(os.path.dirname(mooncake.__file__))") \
-        && cp build/mooncake-integration/engine.cpython-310-x86_64-linux-gnu.so \
-              "${MOONCAKE_PKG}/engine.so" \
-        && cp build/mooncake-asio/libasio.so \
-              "${MOONCAKE_PKG}/" \
-        && echo "Mooncake engine.so linkage:" \
-        && ldd "${MOONCAKE_PKG}/engine.so" | grep -E "hip|cuda" || true \
-        && echo "--- Save RDMA test binaries ---" \
-        && mkdir -p /usr/local/bin/mooncake-tests \
-        && cp build/mooncake-transfer-engine/tests/rdma_loopback_test \
-              build/mooncake-transfer-engine/tests/rdma_transport_test \
-              build/mooncake-transfer-engine/tests/rdma_transport_test2 \
-              /usr/local/bin/mooncake-tests/ 2>/dev/null || true \
-        && ls -lh /usr/local/bin/mooncake-tests/ \
+        && cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON \
+        && make -j$(nproc) && make install \
+        && ldconfig \
         && echo "--- Clean up build artifacts ---" \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi
-
-ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/mooncake:${LD_LIBRARY_PATH}"
 
 # ========== Install Rust toolchain ==========
 ARG RUST_VERSION="1.94.0"

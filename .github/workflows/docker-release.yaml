@@ -8,11 +8,9 @@ on:
       base_image:
         description: "Base Docker image for ATOM build"
         type: choice
-        default: "rocm/pytorch:latest"
+        default: "rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0"
         options:
-          - rocm/pytorch:latest
-          - rocm/pytorch-nightly:latest
-          - rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.10.0
+          - rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0
       atom_repo:
         description: "ATOM repo"
         default: "https://github.com/ROCm/ATOM.git"
@@ -80,7 +78,7 @@ jobs:
       fail-fast: false
       matrix:
         base_image:
-          - ${{ inputs.base_image || 'rocm/pytorch:latest' }}
+          - ${{ inputs.base_image || 'rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0' }}
 
     env:
       ATOM_REPO: "https://github.com/ROCm/ATOM.git"
@@ -191,10 +189,10 @@ jobs:
         run: |
           # Push both the versioned tag and update the 'latest' tag for the Docker image
           TAG=nightly_$(date +%Y%m%d%H%M)
-          docker tag atom_release:ci rocm/atom-dev:latest
-          docker push rocm/atom-dev:latest
-          docker tag atom_release:ci rocm/atom-dev:${TAG}
-          docker push rocm/atom-dev:${TAG}
+          docker tag atom_release:ci rocm/atom-mesh:latest
+          docker push rocm/atom-mesh:latest
+          docker tag atom_release:ci rocm/atom-mesh:${TAG}
+          docker push rocm/atom-mesh:${TAG}
 
       - name: Build OOT Docker image
         if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
@@ -227,13 +225,13 @@ jobs:
             fi
             OOT_TAG="${OOT_TAG}-${OOT_TAG_SUFFIX}"
           fi
-          docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
-          docker push rocm/atom-dev:${OOT_TAG}
+          docker tag atom_oot_release:ci rocm/atom-mesh:${OOT_TAG}
+          docker push rocm/atom-mesh:${OOT_TAG}
           if [ -z "${OOT_TAG_SUFFIX}" ]; then
-            docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
-            docker push rocm/atom-dev:${OOT_LATEST_TAG}
+            docker tag atom_oot_release:ci rocm/atom-mesh:${OOT_LATEST_TAG}
+            docker push rocm/atom-mesh:${OOT_LATEST_TAG}
           else
-            echo "Custom OOT tag suffix '${OOT_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${OOT_LATEST_TAG} update."
+            echo "Custom OOT tag suffix '${OOT_TAG_SUFFIX}' provided; skipping rocm/atom-mesh:${OOT_LATEST_TAG} update."
           fi
 
       - name: Build SGLang Docker image
@@ -257,10 +255,10 @@ jobs:
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
           SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
           SGLANG_LATEST_TAG="sglang-latest"
-          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_TAG}
-          docker push rocm/atom-dev:${SGLANG_TAG}
-          docker tag atom_sglang_release:ci rocm/atom-dev:${SGLANG_LATEST_TAG}
-          docker push rocm/atom-dev:${SGLANG_LATEST_TAG}
+          docker tag atom_sglang_release:ci rocm/atom-mesh:${SGLANG_TAG}
+          docker push rocm/atom-mesh:${SGLANG_TAG}
+          docker tag atom_sglang_release:ci rocm/atom-mesh:${SGLANG_LATEST_TAG}
+          docker push rocm/atom-mesh:${SGLANG_LATEST_TAG}
 
       - name: Clean Up
         if: always()
@@ -269,12 +267,12 @@ jobs:
           docker rm atom_release_ci || true
           # Remove build and tagged images to free disk space
           docker rmi atom_release:ci || true
-          docker rmi rocm/atom-dev:latest || true
+          docker rmi rocm/atom-mesh:latest || true
           docker rmi atom_oot_release:ci || true
           docker rmi atom_sglang_release:ci || true
           # Remove nightly tagged image if it exists
-          docker images "rocm/atom-dev:nightly_*" -q | xargs -r docker rmi || true
-          docker images "rocm/atom-dev:vllm-v*-nightly_*" -q | xargs -r docker rmi || true
-          docker images "rocm/atom-dev:sglang-v*-nightly_*" -q | xargs -r docker rmi || true
-          docker rmi rocm/atom-dev:vllm-latest || true
-          docker rmi rocm/atom-dev:sglang-latest || true
+          docker images "rocm/atom-mesh:nightly_*" -q | xargs -r docker rmi || true
+          docker images "rocm/atom-mesh:vllm-v*-nightly_*" -q | xargs -r docker rmi || true
+          docker images "rocm/atom-mesh:sglang-v*-nightly_*" -q | xargs -r docker rmi || true
+          docker rmi rocm/atom-mesh:vllm-latest || true
+          docker rmi rocm/atom-mesh:sglang-latest || true
