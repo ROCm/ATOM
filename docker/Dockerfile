@@ -338,7 +338,7 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
 # --------------------------------------------------------------------
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
-ARG ATOM_COMMIT="HEAD"
+ARG ATOM_COMMIT="Jasen/atom_mesh"
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
@@ -459,7 +459,7 @@ RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
 RUN pip install rocm-trace-lite && \
     rtl --version || true
 
-# ATOM: lightweight install (no compilation needed)
+# ATOM: Python install (editable) + atom-mesh Rust binary
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
 RUN git clone $ATOM_REPO /app/ATOM && \
@@ -467,5 +467,13 @@ RUN git clone $ATOM_REPO /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     pip install -e .
 RUN pip show atom || true
+
+# atom-mesh: build Rust binary, strip, install to /usr/local/bin
+RUN echo "========== Build atom-mesh ==========" && \
+    cd /app/ATOM/atom/mesh && \
+    cargo build --release && \
+    strip target/release/atom-mesh && \
+    cp target/release/atom-mesh /usr/local/bin/atom-mesh && \
+    atom-mesh --version || true
 
 CMD ["/bin/bash"]
