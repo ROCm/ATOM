@@ -1,57 +1,54 @@
 from typing import Optional, Union
 
 import torch
-from torch import nn
 import torch.nn.functional as F
-from einops import rearrange
-
-from aiter.dist.parallel_state import get_tensor_model_parallel_rank
-from transformers.activations import ACT2FN
-from atom.config import QuantizationConfig, Config
-
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.parallel_state import (
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from aiter.rotary_embedding import get_rope
+from atom.config import Config, QuantizationConfig
+from atom.model_config.qwen3_next import Qwen3NextConfig
 from atom.model_ops.activation import SiluAndMul
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.base_attention import LinearAttention
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.layernorm import DualRMSNorm
+from atom.model_ops.layernorm import GemmaRMSNorm
+from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
+from atom.model_ops.layernorm import RMSNormGated
+from atom.model_ops.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    MergedReplicatedLinear,
+    QKVGParallelLinear,
+    QKVParallelLinear,
+    QKVZBAParallelLinear,
+    RowParallelLinear,
+)
+from atom.model_ops.moe import FusedMoE
 from atom.model_ops.split_chunk import (
     fused_split_chunk_qwen_next_qkvz_ba,
     fused_split_chunk_qwen_next_qkvzba,
 )
-
-from atom.model_ops.base_attention import LinearAttention
-from atom.model_ops.layernorm import RMSNormGated, GemmaRMSNorm
-from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
-from atom.model_ops.linear import (
-    QKVZBAParallelLinear,
-    QKVParallelLinear,
-    MergedColumnParallelLinear,
-    MergedReplicatedLinear,
-    RowParallelLinear,
-    ColumnParallelLinear,
-)
-from atom.model_config.qwen3_next import Qwen3NextConfig
-from atom.plugin.prepare import is_vllm
-
-
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from atom.utils.decorators import support_torch_compile
-
-from aiter.rotary_embedding import get_rope
-from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import atom_parameter
-from aiter.dist.parallel_state import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-    get_ep_group,
-)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
+    extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
-    extract_layer_index,
 )
+from atom.plugin.prepare import is_vllm
 from atom.utils import envs
+from atom.utils.decorators import support_torch_compile
+from einops import rearrange
+from torch import nn
+from transformers.activations import ACT2FN
 
 if is_vllm():
     from vllm.config import get_current_vllm_config
@@ -316,10 +313,11 @@ class Qwen3NextAttention(nn.Module):
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
 
-        self.qkv_proj = QKVParallelLinear(
+        qkv_cls = QKVGParallelLinear if self.attn_output_gate else QKVParallelLinear
+        self.qkv_proj = qkv_cls(
             config.hidden_size,
             self.head_dim,
-            self.total_num_heads * (1 + self.attn_output_gate),
+            self.total_num_heads,
             self.total_num_kv_heads,
             bias=getattr(config, "qkv_bias", False),
             quant_config=quant_config,
@@ -400,6 +398,14 @@ class Qwen3NextAttention(nn.Module):
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.qk_norm = DualRMSNorm(
+            self.q_norm,
+            self.k_norm,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            prefix=f"{prefix}.qk_norm",
+        )
 
     def forward(
         self,
@@ -410,25 +416,15 @@ class Qwen3NextAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            q_gate, k, v = torch.split(
-                qkv, [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            gate, q, k, v = torch.split(
+                qkv, [self.q_size, self.q_size, self.kv_size, self.kv_size], dim=-1
             )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
 
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim
-        )
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim
-        )
+        q, k = self.qk_norm(q, k)
 
         q, k = self.rotary_emb(positions, q, k)
 
@@ -764,10 +760,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 if is_vllm():
     from vllm.model_executor.layers.mamba.abstract import MambaBase
     from vllm.model_executor.layers.mamba.mamba_utils import (
-        MambaStateShapeCalculator,
-        MambaStateDtypeCalculator,
         MambaStateCopyFunc,
         MambaStateCopyFuncCalculator,
+        MambaStateDtypeCalculator,
+        MambaStateShapeCalculator,
     )
 
     class Qwen3NextGatedDeltaNetVllm(Qwen3NextGatedDeltaNet, MambaBase):
@@ -1139,8 +1135,8 @@ class Qwen3NextForCausalLM(nn.Module):
 
 if is_vllm():
     from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
-    from vllm.model_executor.models.interfaces import IsHybrid
     from vllm.config import VllmConfig
+    from vllm.model_executor.models.interfaces import IsHybrid
 
     class Qwen3NextForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
         @classmethod
