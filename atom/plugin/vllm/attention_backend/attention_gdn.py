@@ -22,10 +22,11 @@ from vllm.model_executor.layers.fla.ops import (
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from atom.utils import envs
 
 from torch import nn
 
-USE_FLYDSL_GDR = True
+USE_FLYDSL_GDR = envs.ATOM_USE_FLYDSL_GDR
 try:
     from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
 except ImportError:
