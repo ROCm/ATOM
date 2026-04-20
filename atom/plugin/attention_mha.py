@@ -108,6 +108,8 @@ class PagedAttentionImplPluginModeMethods:
             and self.q_norm is not None
             and self.k_norm is not None
         ):
+            from atom.model_ops.layernorm import GemmaRMSNorm
+
             fused_qk_norm_rope_cache_quant_shuffle(
                 qkv,
                 num_heads_q=self.num_heads,
@@ -128,6 +130,7 @@ class PagedAttentionImplPluginModeMethods:
                 ),
                 k_scale=k_scale,
                 v_scale=v_scale,
+                is_gemma=isinstance(self.q_norm, GemmaRMSNorm),
             )
 
             qkv = qkv.view(qkv.shape[0], -1, self.head_dim)

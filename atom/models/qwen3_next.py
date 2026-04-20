@@ -110,9 +110,7 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (
-                    loaded_start_idx + take
-                )  # type: ignore[misc]
+                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries
@@ -354,6 +352,19 @@ class Qwen3NextAttention(nn.Module):
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
 
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        self.use_fused_qk_norm_rope = ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+        if self.use_fused_qk_norm_rope:
+            cos, sin = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
+            joint_cache = torch.cat((cos, sin), dim=-1)
+            self.rotary_emb.register_buffer(
+                "cos_sin_cache",
+                joint_cache.view(joint_cache.size(0), self.head_dim),
+                persistent=False,
+            )
+
         from atom.model_ops.base_attention import Attention
 
         self.attn = Attention(
@@ -367,10 +378,10 @@ class Qwen3NextAttention(nn.Module):
             layer_num=extract_layer_index(prefix),
             config=atom_config,
             prefix=f"{prefix}",
+            rotary_emb=self.rotary_emb,
+            q_norm=self.q_norm if self.use_fused_qk_norm_rope else None,
+            k_norm=self.k_norm if self.use_fused_qk_norm_rope else None,
         )
-
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -394,16 +405,30 @@ class Qwen3NextAttention(nn.Module):
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
 
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim
-        )
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim
-        )
+        if self.use_fused_qk_norm_rope:
+            # Build contiguous qkv without gate for the fused kernel.
+            # The fused kernel handles q_norm, k_norm, RoPE, and cache update.
+            qkv_no_gate = torch.cat([q, k, v], dim=-1)
+            attn_output = self.attn(
+                query=q,
+                key=k,
+                value=v,
+                positions=positions,
+                q_scale=None,
+                qkv=qkv_no_gate,
+            )
+        else:
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+                -1, self.num_heads * self.head_dim
+            )
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
 
-        q, k = self.rotary_emb(positions, q, k)
+            q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v)
+
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
