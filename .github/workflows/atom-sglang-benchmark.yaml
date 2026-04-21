@@ -353,6 +353,7 @@ jobs:
           RUN pip uninstall -y amd-aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
+          RUN pip install "vcs-versioning>=1"
           RUN rm -rf /app/aiter-test
           RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
               cd /app/aiter-test && \\
@@ -446,6 +447,19 @@ jobs:
       SGLANG_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
     steps:
+      - name: Detect container engine
+        run: |
+          if docker info > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
+            echo "Container engine: docker"
+          elif command -v podman > /dev/null 2>&1; then
+            echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
+            echo "Container engine: podman"
+          else
+            echo "ERROR: Neither docker nor podman is available on this runner."
+            exit 1
+          fi
+
       - name: Check if model is enabled
         id: check
         run: |
@@ -461,12 +475,12 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
-          containers=$(docker ps -q)
+          containers=$($CONTAINER_ENGINE ps -q)
           if [ -n "$containers" ]; then
-            docker kill $containers || true
+            $CONTAINER_ENGINE kill $containers || true
           fi
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
+          $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Checkout benchmark ATOM source
         if: steps.check.outputs.enabled == 'true'
@@ -483,10 +497,17 @@ jobs:
           echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
           echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${SGLANG_IMAGE_SOURCE} image ${SGLANG_IMAGE_TAG}"
 
-      - name: Docker Login
+      - name: Container Engine Login
         if: steps.check.outputs.enabled == 'true'
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          # Podman requires an explicit registry when registries.conf has no search list;
+          # Docker Hub short names (e.g. rocm/foo) must use docker.io here.
+          REG="${SGLANG_IMAGE_TAG%%/*}"
+          if [[ "$REG" != *.* && "$REG" != localhost* && "$REG" != *:* ]]; then
+            REG="docker.io"
+          fi
+          echo "Logging in to registry: ${REG}"
+          echo "${{ secrets.DOCKER_PASSWORD }}" | $CONTAINER_ENGINE login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Set HF_TOKEN
         if: steps.check.outputs.enabled == 'true'
@@ -495,8 +516,21 @@ jobs:
       - name: Pull SGLang benchmark image
         if: steps.check.outputs.enabled == 'true'
         run: |
-          echo "Pulling SGLang benchmark image: ${SGLANG_IMAGE_TAG}"
-          docker pull "${SGLANG_IMAGE_TAG}"
+          set -euo pipefail
+          IMG="${SGLANG_IMAGE_TAG}"
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            if [[ "${IMG}" != */* ]]; then
+              IMG="docker.io/library/${IMG}"
+            else
+              reg="${IMG%%/*}"
+              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
+                IMG="docker.io/${IMG}"
+              fi
+            fi
+          fi
+          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          echo "Pulling SGLang benchmark image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
+          $CONTAINER_ENGINE pull "${IMG}"
 
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
@@ -536,12 +570,17 @@ jobs:
           ${{ matrix.model.env_vars }}
           EOF
 
-          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          SHM_FLAG=(--shm-size=16G)
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            SHM_FLAG=()
+          fi
+
+          $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
             --ipc=host --group-add video \
-            --shm-size=16G \
+            "${SHM_FLAG[@]}" \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -550,7 +589,7 @@ jobs:
             --env-file /tmp/oot_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${SGLANG_IMAGE_TAG}"
+            "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -558,12 +597,12 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         id: gpu-info
         run: |
-          GPU_NAME=$(docker exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          GPU_NAME=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
           if [ -z "$GPU_NAME" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; then
-            GPU_NAME=$(docker exec "$CONTAINER_NAME" rocminfo 2>/dev/null | grep -A1 "Uuid:.*GPU-" | grep "Marketing Name" | head -1 | sed 's/.*:\s*//' | xargs || echo "")
+            GPU_NAME=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" rocminfo 2>/dev/null | grep -A1 "Uuid:.*GPU-" | grep "Marketing Name" | head -1 | sed 's/.*:\s*//' | xargs || echo "")
           fi
-          GPU_VRAM_GB=$(docker exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
-          ROCM_VERSION=$(docker exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          GPU_VRAM_GB=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
+          ROCM_VERSION=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
           echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
           echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
           echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
@@ -584,7 +623,7 @@ jobs:
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             echo "/models directory found, downloading model to ${model_dir}"
-            if ! docker exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
+            if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
               echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
               exit 1
             fi
@@ -616,7 +655,7 @@ jobs:
       - name: Prepare SGLang benchmark runner in container
         if: steps.check.outputs.enabled == 'true'
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
             set -euo pipefail
             rm -rf \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
             mkdir -p \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
@@ -632,7 +671,7 @@ jobs:
           STREAM_SGLANG_LOGS: "1"
         run: |
           set -euo pipefail
-          docker exec \
+          $CONTAINER_ENGINE exec \
             -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
             -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
             -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
@@ -651,7 +690,7 @@ jobs:
 
           echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
 
-          docker exec \
+          $CONTAINER_ENGINE exec \
             -e ISL="${ISL}" \
             -e OSL="${OSL}" \
             -e CONC="${CONC}" \
@@ -683,7 +722,7 @@ jobs:
                 ${BENCH_EXTRA_ARGS:-}
             "
 
-          docker exec -i \
+          $CONTAINER_ENGINE exec -i \
             -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
             -e ISL="${ISL}" \
             -e OSL="${OSL}" \
@@ -736,7 +775,7 @@ jobs:
               json.dump(data, f, indent=2)
           PY
 
-          docker cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"
+          $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"
 
       - name: Inject GPU metadata into benchmark results
         if: steps.check.outputs.enabled == 'true'
@@ -778,11 +817,11 @@ jobs:
       - name: Clean up SGLang benchmark container
         if: always() && steps.check.outputs.enabled == 'true'
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
-          docker stop "$CONTAINER_NAME" || true
-          docker rm "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
+          $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
           if [[ "${SGLANG_IMAGE_SOURCE}" == "rebuild" ]]; then
-            docker rmi "$SGLANG_IMAGE_TAG" || true
+            $CONTAINER_ENGINE rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
           else
             echo "Keeping prebuilt SGLang image cached on runner: ${SGLANG_IMAGE_TAG}"
           fi

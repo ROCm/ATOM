@@ -114,6 +114,52 @@ def _unwrap_linear_output(output: Any) -> torch.Tensor:
     return output
 
 
+def _fuse_qk_rmsnorm_and_q_quant(
+    attn: DeepseekV2MLAAttention,
+    q: torch.Tensor,
+    k_nope: torch.Tensor,
+    *,
+    output_unquantized_q: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Fuse q/k RMSNorm and q quant using ATOM's DeepSeek-V2 path."""
+    from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
+
+    (q_quantized, q_scale), q_normed, k_nope_normed, _ = _fuse_rmsnorm_quant(
+        q,
+        attn.q_a_layernorm.weight,
+        attn.q_a_layernorm.eps,
+        k_nope,
+        attn.kv_a_layernorm.weight,
+        attn.kv_a_layernorm.eps,
+        None,
+        dtype_quant=attn.quant_dtype,
+        shuffle=False,
+        scale_shuffle_padding=False,
+        group_size=128,
+        output_unquantized_inp1=output_unquantized_q,
+        transpose_scale=True,
+    )
+    return q_quantized, q_scale, q_normed, k_nope_normed
+
+
+def _fuse_qk_rmsnorm(
+    attn: DeepseekV2MLAAttention,
+    q: torch.Tensor,
+    k_nope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse q/k RMSNorm without quantizing q."""
+    from atom.models.deepseek_v2 import _fused_qk_rmsnorm
+
+    return _fused_qk_rmsnorm(
+        q,
+        attn.q_a_layernorm.weight,
+        attn.q_a_layernorm.eps,
+        k_nope,
+        attn.kv_a_layernorm.weight,
+        attn.kv_a_layernorm.eps,
+    )
+
+
 # Init helpers
 def init_sgl_attrs(
     attn: DeepseekV2MLAAttention,
@@ -321,9 +367,22 @@ def forward_sgl_prepare(
             )
 
         k_nope = latent_cache[..., : attn.kv_lora_rank]
+        q_scale = None
 
-        # overlap qk norm
-        if attn.alt_stream is not None and get_is_capture_mode():
+        # Reuse native ATOM gating for q/k RMSNorm fusion. Quant fusion is used
+        # when DeepSeek enables qknorm-quant; otherwise keep the non-quant fused
+        # path aligned with native ATOM before falling back to plain layernorm.
+        if getattr(attn, "fuse_qknorm_quant", False):
+            q, q_scale, q_lora, k_nope = _fuse_qk_rmsnorm_and_q_quant(
+                attn,
+                q,
+                k_nope,
+                output_unquantized_q=attn.use_nsa,
+            )
+        elif getattr(attn, "fuse_qknorm", False):
+            q, k_nope = _fuse_qk_rmsnorm(attn, q, k_nope)
+        # Otherwise keep the original overlap path for unfused qk norm.
+        elif attn.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             attn.alt_stream.wait_stream(current_stream)
             q = attn.q_a_layernorm(q)
@@ -349,7 +408,11 @@ def forward_sgl_prepare(
             attn.alt_stream.wait_stream(current_stream)
             with torch.cuda.stream(attn.alt_stream):
                 k_nope = k_nope.unsqueeze(1)
-                q = attn.q_b_proj(q).view(-1, attn.num_local_heads, attn.qk_head_dim)
+                q = _unwrap_linear_output(
+                    attn.q_b_proj(q, q_scale)
+                    if q_scale is not None
+                    else attn.q_b_proj(q)
+                ).view(-1, attn.num_local_heads, attn.qk_head_dim)
             topk_indices = attn.indexer(
                 x=hidden_states,
                 q_lora=q_lora,
@@ -360,7 +423,9 @@ def forward_sgl_prepare(
             current_stream.wait_stream(attn.alt_stream)
         else:
             k_nope = k_nope.unsqueeze(1)
-            q = attn.q_b_proj(q).view(-1, attn.num_local_heads, attn.qk_head_dim)
+            q = _unwrap_linear_output(
+                attn.q_b_proj(q, q_scale) if q_scale is not None else attn.q_b_proj(q)
+            ).view(-1, attn.num_local_heads, attn.qk_head_dim)
             if q_lora is not None:
                 topk_indices = attn.indexer(
                     x=hidden_states,
