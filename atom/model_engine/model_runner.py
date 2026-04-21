@@ -67,6 +67,9 @@ support_model_arch_dict = {
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
 }
+# seed = 34567
+# np.random.seed(seed)
+# torch.cuda.manual_seed_all(seed)
 
 
 class tokenIDProcessor:
@@ -1804,6 +1807,7 @@ class ModelRunner:
                     label += f" spec={batch.num_spec_step}"
             label += "]"
             with record_function(label):
+                graph_bs = context.graph_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
                 graph_key = (graph_bs, max_q_len)
                 self.graphs[graph_key].replay()
@@ -1988,6 +1992,7 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         start_time = time.time()
+        # self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         if self.config.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.config.compilation_config.cudagraph_capture_sizes
         else:
