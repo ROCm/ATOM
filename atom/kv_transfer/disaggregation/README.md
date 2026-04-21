@@ -48,6 +48,9 @@ across the tensor-parallel group.
 ## How to Run
 
 ### TP-only Mode (Tensor Parallelism)
+```
+pip install msgpack msgspec quart
+```
 
 #### 1. Start the Proxy
 
@@ -153,3 +156,126 @@ curl -s http://<PROXY_IP>:10001/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt":"1 2 3 4 5","max_tokens":10,"temperature":0}'
 ```
+
+### Example: gpt-oss-120b (2-GPU per role)
+
+This example runs prefill and decode on the same node using different GPU
+pairs.
+
+#### Determine `proxy_ip`
+
+`proxy_ip` must be the **RDMA network IP** of the machine running the proxy,
+not the management/SSH IP.  To find it:
+
+```bash
+# List RDMA device GIDs — the IPv4 address is embedded in GID index 1
+cat /sys/class/infiniband/rdma0/ports/1/gids/1
+# Output: 0000:0000:0000:0000:0000:ffff:0a65:4097
+#                                      ^^^^^^^^^^^
+# Convert hex → decimal: 0a65:4097 = <RDMA_IP>
+
+# Or check which IP the RDMA route uses
+ip route get <remote_rdma_ip>
+# Look at the "src" field — that is your local RDMA IP
+```
+
+Set `ATOM_HOST_IP` on **each machine** to its own RDMA IP so MoRIIO binds to
+the correct NIC:
+
+```bash
+export ATOM_HOST_IP=<RDMA_IP>   # this machine's RDMA IP
+```
+
+#### 1. Start the Proxy
+
+```bash
+python -m atom.kv_transfer.disaggregation.proxy --port 10001
+```
+
+#### 2. Start Prefill (GPU 0,1)
+
+```bash
+HIP_VISIBLE_DEVICES=0,1 \
+ATOM_HOST_IP=<RDMA_IP> \
+MORI_RDMA_SL=3 \
+MORI_RDMA_TC=104 \
+AITER_LOG_LEVEL=WARNING \
+python -m atom.entrypoints.openai_server \
+  --model /data/models/gpt-oss-120b/ \
+  --kv_cache_dtype fp8 -tp 2 \
+  --server-port 8003 \
+  --kv-transfer-config '{
+    "kv_role": "kv_producer",
+    "kv_connector": "moriio",
+    "proxy_ip": "<RDMA_IP>",
+    "proxy_ping_port": 36367,
+    "http_port": 8003
+  }'
+```
+
+#### 3. Start Decode (GPU 2,3)
+
+```bash
+HIP_VISIBLE_DEVICES=2,3 \
+ATOM_HOST_IP=<RDMA_IP> \
+MORI_RDMA_SL=3 \
+MORI_RDMA_TC=104 \
+NCCL_SOCKET_IFNAME=eno0 \
+AITER_LOG_LEVEL=WARNING \
+python -m atom.entrypoints.openai_server \
+  --model /data/models/gpt-oss-120b/ \
+  --kv_cache_dtype fp8 -tp 2 \
+  --server-port 8004 \
+  --kv-transfer-config '{
+    "kv_role": "kv_consumer",
+    "kv_connector": "moriio",
+    "proxy_ip": "<RDMA_IP>",
+    "proxy_ping_port": 36367,
+    "http_port": 8004
+  }'
+```
+
+#### 4. Send Requests
+
+```bash
+curl -s http://localhost:10001/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/data/models/gpt-oss-120b/","prompt":"Hello, how are you","max_tokens":32}'
+```
+
+
+## RDMA Environment Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `ATOM_HOST_IP` | RDMA IP of this machine (overrides auto-detect) | `<RDMA_IP>` |
+| `MORI_RDMA_SL` | RDMA Service Level (must match PFC no-drop priority) | `3` |
+| `MORI_RDMA_TC` | RDMA Traffic Class (DSCP × 4) | `104` |
+| `MORI_RDMA_DEVICES` | Restrict to specific RDMA device(s) | `rdma5` or `rdma0,rdma5` |
+
+## RDMA Backend Tuning (`kv-transfer-config`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `qp_per_transfer` | 4 | QPs per RDMA transfer (more = higher parallelism) |
+| `num_worker_threads` | 4 | RDMA I/O worker threads |
+| `post_batch_size` | -1 (auto) | WRs posted per batch |
+| `max_send_wr` | 0 (auto) | QP send queue depth |
+| `max_cqe_num` | 0 (auto) | Max CQ entries |
+| `max_msg_sge` | 0 (auto) | Max scatter/gather per WR |
+| `enable_notification` | false | Transfer completion notification |
+
+Example with tuning:
+
+```bash
+--kv-transfer-config '{
+  "kv_role": "kv_consumer",
+  "kv_connector": "moriio",
+  "proxy_ip": "<RDMA_IP>",
+  "proxy_ping_port": 36367,
+  "http_port": 8004,
+  "qp_per_transfer": 8,
+  "num_worker_threads": 8
+}'
+```
+

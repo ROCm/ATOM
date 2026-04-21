@@ -77,6 +77,9 @@ try:
         IOEngine,
         IOEngineConfig,
         MemoryDesc,
+        MemoryLocationType,
+        PollCqMode,
+        RdmaBackendConfig,
     )
 
     _MORIIO_AVAILABLE = True
@@ -222,6 +225,38 @@ def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return (dp_rank) * tp_size + tp_rank
 
 
+MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024  # just under 2 GiB
+
+
+def _chunk_tensor_for_rdma(
+    tensor: "torch.Tensor", block_size_in_dim0: int = 1
+) -> tuple[list[tuple[int, int]], int]:
+    """Split a tensor into <2 GiB RDMA-registrable chunks along dim 0.
+
+    Args:
+        tensor: contiguous torch.Tensor whose dim-0 is the block (or
+            token) axis.
+        block_size_in_dim0: elements per logical block in dim 0.
+            Non-MLA: 1 (dim 0 = num_blocks).
+            MLA: block_size (dim 0 = num_blocks * block_size).
+
+    Returns:
+        ``(chunks, blocks_per_chunk)`` where *chunks* is a list of
+        ``(data_ptr, size_bytes)`` pairs and *blocks_per_chunk* is
+        the number of logical blocks in each full chunk.
+    """
+    elem_sz = tensor.element_size()
+    per_block_bytes = block_size_in_dim0 * tensor.stride(0) * elem_sz
+    total_blocks = tensor.shape[0] // block_size_in_dim0
+    bpc = max(1, MAX_RDMA_CHUNK_BYTES // per_block_bytes)
+    chunks: list[tuple[int, int]] = []
+    base = tensor.data_ptr()
+    for start in range(0, total_blocks, bpc):
+        end = min(start + bpc, total_blocks)
+        chunks.append((base + start * per_block_bytes, (end - start) * per_block_bytes))
+    return chunks, bpc
+
+
 # ===================================================================
 # MoRIIOWrapper — thin abstraction over the RDMA engine
 # ===================================================================
@@ -258,7 +293,11 @@ class MoRIIOWrapper:
 
         self.remote_memory_metadata: Any = None
         self.local_memory_registered: bool = False
-        self.local_memory_metadata: Any = None
+        # Raw-pointer registration produces multiple MemoryDesc per layer
+        # (e.g. K + V on MHA) to keep each ibv_reg_mr below the AINIC ~2 GiB
+        # limit. We retain handles here purely so they aren't GC'd; nothing
+        # in the active session/transfer path indexes into this list.
+        self.local_memory_descs: list[Any] = []
         self.transfer_status: list[Any] = []
         self.remote_engine_ip: str | None = None
         self.notify_port: int | None = None
@@ -277,9 +316,12 @@ class MoRIIOWrapper:
             raise ValueError("Cannot assign a None MoRIIO engine")
         self.moriio_engine = moriio_engine
 
-    def set_backend_type(self, backend_type):
+    def set_backend_type(self, backend_type, backend_config=None):
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        self.moriio_engine.create_backend(backend_type)
+        if backend_config is not None:
+            self.moriio_engine.create_backend(backend_type, backend_config)
+        else:
+            self.moriio_engine.create_backend(backend_type)
 
     def get_agent_metadata(self):
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
@@ -296,20 +338,41 @@ class MoRIIOWrapper:
         )
         return consumer_engine_metadata.key
 
-    def register_local_tensor(self, tensor):
+    def register_local_buffer(self, ptr: int, size: int, device_id: int) -> bytes:
+        """Register one raw GPU memory region with MoRIIO.
+
+        Using ``register_memory(ptr, size, ...)`` directly (instead of
+        ``register_torch_tensor``) lets callers split a single tensor into
+        multiple smaller regions, which is required to stay under the
+        AINIC ~2 GiB ``ibv_reg_mr`` limit.
+        """
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
         try:
-            self.local_memory_metadata = self.moriio_engine.register_torch_tensor(
-                tensor
+            desc = self.moriio_engine.register_memory(
+                ptr, size, device_id, MemoryLocationType.GPU
             )
-            assert (
-                self.local_memory_metadata is not None
-            ), "register_torch_tensor returned None"
-            local_memory_metadata_packed = self.local_memory_metadata.pack()
+            assert desc is not None, "register_memory returned None"
+            packed = desc.pack()
         except Exception as e:
             raise ValueError(f"Failed to register local memory: {e}") from e
+        self.local_memory_descs.append(desc)
         self.local_memory_registered = True
-        return local_memory_metadata_packed
+        return packed
+
+    def register_local_tensor(self, tensor):
+        """Back-compat helper: register an entire contiguous torch tensor.
+
+        Prefer :meth:`register_local_buffer` from new code so that callers
+        explicitly choose how to chunk large tensors before registration.
+        """
+        if not tensor.is_contiguous():
+            raise RuntimeError("input tensor must be contiguous")
+        ptr = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        device_id = (
+            tensor.device.index if tensor.device.index is not None else -1
+        )
+        return self.register_local_buffer(ptr, size, device_id)
 
     def get_unpack_memory_metadata(self, packed_memory_metadata):
         return MemoryDesc.unpack(packed_memory_metadata)
@@ -558,10 +621,12 @@ class KVConnector(KVConnectorBase):
         self.proxy_ping_port = kv_transfer_config.get("proxy_ping_port", 36367)
         self.proxy_ip = kv_transfer_config.get("proxy_ip")
         self.request_address = f"{self.local_ip}:{self.http_port}"
-        self.base_handshake_port = MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
+        self.base_handshake_port = kv_transfer_config.get(
+            "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
+        )
 
         # Compute unique side-channel port for this (dp, tp) rank
-        handshake_port = MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
+        handshake_port = self.base_handshake_port
         self.side_channel_port = handshake_port + get_port_offset(
             self.dp_rank, self.tp_rank
         )
@@ -580,7 +645,30 @@ class KVConnector(KVConnectorBase):
             IOEngineConfig(host=str(self.local_ip), port=0),
         )
         self.moriio_wrapper = MoRIIOWrapper(moriio_engine=self.moriio_engine)
-        self.moriio_wrapper.set_backend_type(BackendType.RDMA)
+
+        qp_per_transfer = kv_transfer_config.get("qp_per_transfer", 4)
+        post_batch_size = kv_transfer_config.get("post_batch_size", -1)
+        num_worker_threads = kv_transfer_config.get("num_worker_threads", 4)
+        poll_mode = PollCqMode.POLLING
+        enable_notification = kv_transfer_config.get("enable_notification", False)
+
+        rdma_cfg = RdmaBackendConfig(
+            qp_per_transfer,
+            post_batch_size,
+            num_worker_threads,
+            poll_mode,
+            enable_notification,
+        )
+        rdma_cfg.max_send_wr = kv_transfer_config.get("max_send_wr", 0)
+        rdma_cfg.max_cqe_num = kv_transfer_config.get("max_cqe_num", 0)
+        rdma_cfg.max_msg_sge = kv_transfer_config.get("max_msg_sge", 0)
+        logger.info(
+            "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
+            "poll_mode=%s, notification=%s",
+            qp_per_transfer, num_worker_threads,
+            poll_mode.name, enable_notification,
+        )
+        self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
 
         # Per-layer local metadata (populated in register_kv_caches)
         self.layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]] = {}
@@ -588,6 +676,9 @@ class KVConnector(KVConnectorBase):
         self.remote_kv_cache_metadata: list[bytes] = []
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.kv_caches: dict[str, Any] | None = None
+        self.kv_cache_block_size: int = config.kv_cache_block_size
+        self.blocks_per_chunk: int | None = None
+        self.num_k_chunks: int = 0
 
         # Session cache: remote_engine_id -> list[session]
         self._built_sessions: defaultdict[str, list] = defaultdict(list)
@@ -605,6 +696,7 @@ class KVConnector(KVConnectorBase):
             max_workers=1,
             thread_name_prefix="atom-moriio-handshake-initiator",
         )
+
 
         # In-flight receive transfers
         self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)
@@ -631,26 +723,76 @@ class KVConnector(KVConnectorBase):
 
         Must be called after model loading and KV cache allocation, before any
         transfers can occur.
+
+        Each K (and V, when present) tensor is split into block-aligned
+        chunks of < 2 GiB via :func:`_chunk_tensor_for_rdma` and each
+        chunk is registered independently with ``ibv_reg_mr``.  Per-layer
+        metadata list layout:
+        ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
+        ``self.num_k_chunks`` marks the K/V boundary.
         """
         self.kv_caches = kv_caches
         cache_tensor = None
 
         for layer_name, kv_cache in kv_caches.items():
             cache_tensor = kv_cache.k_cache
+            v_cache = kv_cache.v_cache
+            is_mla = v_cache is None
+
             if self.kv_cache_shape is None:
                 self.kv_cache_shape = cache_tensor.shape
-            if layer_name not in self.layer_name_to_local_kv_cache_metadata:
-                self.layer_name_to_local_kv_cache_metadata[layer_name] = []
 
-            packed_meta = self.moriio_wrapper.register_local_tensor(cache_tensor)
-            self.layer_name_to_local_kv_cache_metadata[layer_name].append(packed_meta)
+            device_id = (
+                cache_tensor.device.index
+                if cache_tensor.device.index is not None
+                else -1
+            )
+
+            # MLA: dim 0 = num_blocks * block_size tokens, so block_size_in_dim0
+            # equals the KV cache block_size (typically 16).
+            # Non-MLA: dim 0 = num_blocks directly, so 1.
+            bsd0 = self.kv_cache_block_size if is_mla else 1
+            k_chunks, bpc = _chunk_tensor_for_rdma(cache_tensor, bsd0)
+
+            if self.blocks_per_chunk is None:
+                self.blocks_per_chunk = bpc
+
+            meta_list: list[bytes] = []
+            for ptr, size in k_chunks:
+                meta_list.append(
+                    self.moriio_wrapper.register_local_buffer(ptr, size, device_id)
+                )
+            self.num_k_chunks = len(k_chunks)
+
+            if not is_mla:
+                v_device_id = (
+                    v_cache.device.index
+                    if v_cache.device.index is not None
+                    else -1
+                )
+                v_chunks, _ = _chunk_tensor_for_rdma(v_cache, 1)
+                for ptr, size in v_chunks:
+                    meta_list.append(
+                        self.moriio_wrapper.register_local_buffer(ptr, size, v_device_id)
+                    )
+
+            self.layer_name_to_local_kv_cache_metadata[layer_name] = meta_list
+
+        logger.info(
+            "RDMA chunked registration: %d K chunks + %d V chunks, "
+            "%d blocks/chunk",
+            self.num_k_chunks,
+            len(meta_list) - self.num_k_chunks,
+            self.blocks_per_chunk,
+        )
 
         # Extract block geometry from the last registered tensor
-        if len(cache_tensor.shape) == 5:
-            self.num_blocks, _num_kv_heads, _, self.block_len, _ = cache_tensor.shape
+        is_mla = len(cache_tensor.shape) == 3
+        self.block_len = self.kv_cache_block_size
+        if is_mla:
+            self.num_blocks = cache_tensor.shape[0] // self.block_len
         else:
-            self.num_blocks, self.block_len, _hs = cache_tensor.shape
-        self.num_blocks = cache_tensor.shape[0]
+            self.num_blocks = cache_tensor.shape[0]
         metadata = MoRIIOAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
@@ -829,67 +971,91 @@ class KVConnector(KVConnectorBase):
         remote_block_ids: list[int],
         remote_moriio_meta: MoRIIOAgentMetadata,
     ) -> tuple[list[int], list[int], list[int]]:
-        """Compute transfer offsets for block data.
-        Args:
-            layer_name: Name of the layer to transfer
-            local_block_ids: IDs of local blocks
-            remote_block_ids: IDs of remote blocks
-            remote_moriio_meta: Metadata of the remote MoRIIO agent
-        Returns:
-            Tuple of (local_offsets, remote_offsets, transfer_sizes)
+        """Compute per-block byte offsets within a single registered region.
+
+        With chunked registration every region's base address corresponds
+        to block 0 of that chunk.  The byte offset of block ``b`` is
+        ``b * per_block_bytes``.  For cross-chunk transfers, callers
+        must convert to chunk-relative block IDs first (see
+        ``_read_blocks``).
+
+        This method is kept for test compatibility; the hot path in
+        ``_read_blocks`` does its own chunk-aware grouping.
         """
+        del remote_moriio_meta
         assert self.kv_cache_shape is not None, "KV caches shape not initialized"
         is_mla = len(self.kv_cache_shape) == 3
-        stride = self.kv_caches[layer_name].k_cache.stride()
-        sz = self.kv_caches[layer_name].k_cache.element_size()
+        cache_tensor = self.kv_caches[layer_name].k_cache
+        sz = cache_tensor.element_size()
         if is_mla:
-            blknum, blksize, hs = self.kv_cache_shape
-            hn = 1
-            block_stride = stride[0]
+            per_block_bytes = self.kv_cache_block_size * cache_tensor.stride(0) * sz
         else:
-            _, blknum, blksize, hn, hs = self.kv_cache_shape
-            local_ktov_stride = stride[0]
-            block_stride = stride[1]
-            remote_ktov_stride = block_stride * remote_moriio_meta.num_blocks
+            per_block_bytes = cache_tensor.stride(0) * sz
 
-        transfer_size_byte = blksize * hn * hs * sz
-        per_block = 1 if is_mla else 2
-        total = len(local_block_ids) * per_block
-        offset_local = [0] * total
-        offset_remote = [0] * total
-        sizes = [transfer_size_byte] * total
-
-        w = 0
-        for i, lb in enumerate(local_block_ids):
-            rb = remote_block_ids[i]
-            # K
-            offset_local[w] = sz * (lb * block_stride)
-            offset_remote[w] = sz * (rb * block_stride)
-            w += 1
-            if not is_mla:
-                # Handle num_block variations originating from PD (different kv strides)
-                # TODO: address block_sz differences in heterogeneous TP scenarios
-                # In MLA, we don't need to consider these two cases.
-                offset_local[w] = sz * (1 * local_ktov_stride + lb * block_stride)
-                offset_remote[w] = sz * (1 * remote_ktov_stride + rb * block_stride)
-                w += 1
-
-        merged_l, merged_r, merged_s = offset_local, offset_remote, sizes
-        return merged_l, merged_r, merged_s
+        n = len(local_block_ids)
+        offset_local = [lb * per_block_bytes for lb in local_block_ids]
+        offset_remote = [rb * per_block_bytes for rb in remote_block_ids]
+        sizes = [per_block_bytes] * n
+        return offset_local, offset_remote, sizes
 
     def _get_or_build_sessions(
         self, remote_engine_id: str
-    ) -> tuple[list[Any], MoRIIOAgentMetadata]:
-        """Return cached RDMA sessions for the remote engine, building if needed."""
+    ) -> tuple[list[tuple[dict, dict]], MoRIIOAgentMetadata]:
+        """Return cached RDMA sessions for the remote engine, building if needed.
+
+        With chunked registration, local block ``b`` and remote block ``r``
+        may reside in different chunks, so we build an NxN session grid
+        for K chunks and another NxN grid for V chunks.
+
+        Returns ``(per_layer_sessions, remote_meta)`` where each layer
+        entry is ``(k_sessions_dict, v_sessions_dict)`` keyed by
+        ``(local_chunk_idx, remote_chunk_idx)``.
+        """
         if remote_engine_id not in self._built_sessions:
-            sessions = []
-            for ln, local_meta in self.layer_name_to_local_kv_cache_metadata.items():
-                local_md = self.moriio_wrapper.get_unpack_memory_metadata(local_meta[0])
-                remote_md = self.moriio_wrapper.get_unpack_memory_metadata(
-                    self.layer_name_to_remote_kv_cache_metadata[remote_engine_id][ln][0]
+            nk = self.num_k_chunks
+            per_layer_sessions: list[tuple[dict, dict]] = []
+            for ln, local_metas in self.layer_name_to_local_kv_cache_metadata.items():
+                remote_metas = self.layer_name_to_remote_kv_cache_metadata[
+                    remote_engine_id
+                ][ln]
+                assert len(local_metas) == len(remote_metas), (
+                    f"layer {ln}: local has {len(local_metas)} descs, "
+                    f"remote has {len(remote_metas)} — chunk count mismatch"
                 )
-                sessions.append(self.moriio_wrapper.build_session(local_md, remote_md))
-            self._built_sessions[remote_engine_id] = sessions
+
+                def _unpack(packed):
+                    return self.moriio_wrapper.get_unpack_memory_metadata(packed)
+
+                # K sessions: NxN grid over first nk entries
+                k_sessions: dict[tuple[int, int], Any] = {}
+                for lci in range(nk):
+                    for rci in range(nk):
+                        local_md = _unpack(local_metas[lci])
+                        remote_md = _unpack(remote_metas[rci])
+                        k_sessions[(lci, rci)] = (
+                            self.moriio_wrapper.build_session(local_md, remote_md)
+                        )
+
+                # V sessions: NxN grid over entries [nk:]
+                v_sessions: dict[tuple[int, int], Any] = {}
+                nv = len(local_metas) - nk
+                for lci in range(nv):
+                    for rci in range(nv):
+                        local_md = _unpack(local_metas[nk + lci])
+                        remote_md = _unpack(remote_metas[nk + rci])
+                        v_sessions[(lci, rci)] = (
+                            self.moriio_wrapper.build_session(local_md, remote_md)
+                        )
+
+                per_layer_sessions.append((k_sessions, v_sessions))
+
+            logger.info(
+                "Built %d K sessions + %d V sessions per layer for %s",
+                len(k_sessions),
+                len(v_sessions),
+                remote_engine_id,
+            )
+            self._built_sessions[remote_engine_id] = per_layer_sessions
 
         return (
             self._built_sessions[remote_engine_id],
@@ -908,12 +1074,14 @@ class KVConnector(KVConnectorBase):
     ) -> None:
         """Issue RDMA reads for all layers of a single request.
 
-        Virtual block IDs are expanded to physical pages before computing
-        byte offsets.  Transfer statuses are stored for later polling in
+        Block pairs are grouped by ``(local_chunk_idx, remote_chunk_idx)``
+        and chunk-relative offsets are computed.  Each group issues a
+        separate RDMA batch read using the matching session from the NxN
+        chunk grid.
+
+        Transfer statuses are stored for later polling in
         :meth:`_pop_done_transfers`.
         """
-        local_block_ids = convert_virtual_to_physical_pages(local_block_ids)
-        remote_block_ids = convert_virtual_to_physical_pages(remote_block_ids)
 
         logger.debug(
             "Reading %d blocks for req %s from %s (tp_rank=%d, remote_dp_rank=%d)",
@@ -925,13 +1093,30 @@ class KVConnector(KVConnectorBase):
         )
 
         dp_engine_id = self._engine_name_with_dp(dst_engine_id, remote_dp_rank)
-        sessions, remote_meta = self._get_or_build_sessions(dp_engine_id)
+        sessions, _remote_meta = self._get_or_build_sessions(dp_engine_id)
 
-        # Compute offsets once (identical across layers for uniform caches)
+        bpc = self.blocks_per_chunk
         first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
-        offsets = self._compute_block_transfer_offsets(
-            first_layer, local_block_ids, remote_block_ids, remote_meta
-        )
+        cache_tensor = self.kv_caches[first_layer].k_cache
+        is_mla = self.kv_caches[first_layer].v_cache is None
+        sz = cache_tensor.element_size()
+
+        if is_mla:
+            per_block_bytes = self.kv_cache_block_size * cache_tensor.stride(0) * sz
+        else:
+            per_block_bytes = cache_tensor.stride(0) * sz
+
+        # Group block pairs by (local_chunk, remote_chunk)
+        groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
+        for lb, rb in zip(local_block_ids, remote_block_ids):
+            lci = lb // bpc
+            rci = rb // bpc
+            key = (lci, rci)
+            if key not in groups:
+                groups[key] = ([], [], [])
+            groups[key][0].append((lb % bpc) * per_block_bytes)
+            groups[key][1].append((rb % bpc) * per_block_bytes)
+            groups[key][2].append(per_block_bytes)
 
         # Notify port = base handshake port + offset(remote_dp_rank, local_tp_rank)
         notify_port = remote_handshake_port + get_port_offset(
@@ -940,20 +1125,34 @@ class KVConnector(KVConnectorBase):
 
         layer_names = list(self.layer_name_to_local_kv_cache_metadata.keys())
         for layer_idx, layer_name in enumerate(layer_names):
-            transfer_status = self.moriio_wrapper.read_remote_data(
-                offsets[2], offsets[0], offsets[1], sessions[layer_idx]
-            )
-            with self.moriio_wrapper.lock:
-                self._recving_transfers[request_id].append(transfer_status)
-                self._recving_transfers_callback_addr[request_id] = (
-                    remote_host,
-                    str(notify_port),
+            k_sessions, v_sessions = sessions[layer_idx]
+
+            for (lci, rci), (l_offs, r_offs, szs) in groups.items():
+                # K read
+                status = self.moriio_wrapper.read_remote_data(
+                    szs, l_offs, r_offs, k_sessions[(lci, rci)]
                 )
+                with self.moriio_wrapper.lock:
+                    self._recving_transfers[request_id].append(status)
+                    self._recving_transfers_callback_addr[request_id] = (
+                        remote_host,
+                        str(notify_port),
+                    )
+
+                # V read (same chunk-relative offsets)
+                if v_sessions:
+                    status = self.moriio_wrapper.read_remote_data(
+                        szs, l_offs, r_offs, v_sessions[(lci, rci)]
+                    )
+                    with self.moriio_wrapper.lock:
+                        self._recving_transfers[request_id].append(status)
 
         logger.debug(
-            "RDMA read issued for req %s (%d layers) from %s (dp_rank=%d, notify_port=%d)",
+            "RDMA read issued for req %s (%d layers, %d chunk groups) "
+            "from %s (dp_rank=%d, notify_port=%d)",
             request_id,
             len(layer_names),
+            len(groups),
             dst_engine_id,
             remote_dp_rank,
             notify_port,
@@ -1237,8 +1436,19 @@ class KVConnector(KVConnectorBase):
             ``(done_sending, done_recving)`` tuple.
         """
         done_recving = self._pop_done_transfers()
-        done_sending = self.done_sending.copy()
-        self.done_sending.clear()
+        if self.is_producer:
+            done_sending = self.done_sending.copy()
+            self.done_sending.clear()
+        else:
+            if self.done_sending:
+                logger.warning(
+                    "Consumer received %d stale done_sending notifications "
+                    "(single-machine port collision?) — discarding: %s",
+                    len(self.done_sending),
+                    self.done_sending,
+                )
+                self.done_sending.clear()
+            done_sending = set()
         return done_sending, done_recving
 
 
