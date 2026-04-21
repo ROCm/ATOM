@@ -229,7 +229,20 @@ class ScheduledBatch:
             scheduled_spec_decode_tokens = {}
 
         self.req_ids = list(seqs.keys())
+        # self.scheduled_tokens = [
+        #     seq.token_ids[-num_tokens:]
+        #     for seq, num_tokens in zip(seqs.values(), num_scheduled_tokens)
+        # ]
+        # logger.info(f"{num_scheduled_tokens=}")
+        # logger.info(f"{self.scheduled_tokens=}")
+        # num_scheduled_tokens for each sequence in the batch
         self.num_scheduled_tokens = np.asarray(num_scheduled_tokens, dtype=np.int32)
+        self.temperatures = np.asarray(
+            [seq.temperature for seq in seqs.values()], dtype=np.float32
+        )
+        self.context_lens = np.asarray(
+            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
+        )
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
         )
@@ -247,14 +260,7 @@ class ScheduledBatch:
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
         ]
-        self.temperatures = np.asarray(
-            [seq.temperature for seq in seqs.values()], dtype=np.float32
-        )
-        self.context_lens = np.asarray(
-            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
-        )
 
-        # Build the flat scheduled-token array
         offs = self.context_lens - self.num_rejected - self.num_scheduled_tokens
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
         pos = 0
@@ -276,10 +282,12 @@ class ScheduledBatch:
         ]
         self.num_cached_tokens = [seq.num_cached_tokens for seq in seqs.values()]
 
+        # Total number of tokens scheduled for all requests.
         self.total_tokens_num = total_tokens_num
         self.total_tokens_num_prefill = total_tokens_num_prefill
         self.total_tokens_num_decode = total_tokens_num_decode
 
+        # Total number of reqs scheduled for all requests.
         self.total_seqs_num = total_seqs_num
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
@@ -580,6 +588,10 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
+        # logger.info(
+        #     f"Scheduler postprocess: received output for req_ids={fwd_output.req_ids}, draft_token_ids shape={fwd_output.draft_token_ids.shape}, accepted token ids: {prev_token_ids}"
+        # )
+        # update token_ids with the actual sampled token ids
 
         finished_seqs = []
         stream_outputs = []
