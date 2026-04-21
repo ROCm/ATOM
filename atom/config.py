@@ -602,7 +602,7 @@ class ParallelConfig:
     set only in SPMD mode."""
     world_size: int = field(init=False)
     """world_size is TPxPP, it affects the number of workers we create."""
-    data_parallel_master_port: int = field(default_factory=get_open_port)
+    data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
     data_parallel_base_port: int = get_open_port()
