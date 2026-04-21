@@ -313,7 +313,7 @@ ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
 
-RUN pip install --upgrade "setuptools_scm<9"
+RUN pip install --upgrade setuptools_scm
 RUN echo "========== [Parallel] Building Aiter ==========" && \
     git clone --depth 1 $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
