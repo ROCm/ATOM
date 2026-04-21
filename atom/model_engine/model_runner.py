@@ -792,7 +792,7 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
                 record_shapes=enable_detailed_profiling,
-                with_stack=True,
+                with_stack=enable_detailed_profiling,
                 profile_memory=enable_detailed_profiling,
                 on_trace_ready=_on_trace_ready,
             )
