@@ -33,12 +33,15 @@ import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgpack
 import msgspec
 import numpy as np
 import zmq
+
+if TYPE_CHECKING:
+    import torch
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation.base import (
@@ -229,7 +232,7 @@ MAX_RDMA_CHUNK_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024  # just under 2 GiB
 
 
 def _chunk_tensor_for_rdma(
-    tensor: "torch.Tensor", block_size_in_dim0: int = 1
+    tensor: torch.Tensor, block_size_in_dim0: int = 1
 ) -> tuple[list[tuple[int, int]], int]:
     """Split a tensor into <2 GiB RDMA-registrable chunks along dim 0.
 
