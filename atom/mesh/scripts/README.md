@@ -146,9 +146,9 @@ bash run_benchmark.sh
 ## One-Shot SLURM Automation
 
 For two-node SLURM clusters, `ds_fp8_1p_tp4_1d_tp8_slurm.sh` runs the entire flow
-(pre-cleanup → containers → prefill + decode servers → router → benchmark → cleanup)
-in a single `sbatch` submission. It is **self-contained** — does not depend on any
-of the other scripts above.
+(pre-cleanup → containers → prefill + decode servers → router → GSM8K accuracy →
+performance benchmark → cleanup) in a single `sbatch` submission. It is
+**self-contained** — does not depend on any of the other scripts above.
 
 ### Submit
 
@@ -160,12 +160,15 @@ sbatch atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
 ### Override defaults
 
 ```bash
-# Run with real weights (default is LOAD_DUMMY=1 for fast validation)
-sbatch --export=ALL,LOAD_DUMMY= atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
+# Fast smoke test with random weights (skips weight load + GSM8K)
+sbatch --export=ALL,LOAD_DUMMY=1 atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
 
 # Custom workload (multiple ISL, custom concurrency)
 sbatch --export=ALL,ISL_LIST="1024,4096,8192",CONC_LIST="32,64,128" \
     atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
+
+# Skip GSM8K even with real weights (just run perf benchmark)
+sbatch --export=ALL,RUN_GSM8K=0 atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
 ```
 
 ### Defaults
@@ -175,10 +178,14 @@ sbatch --export=ALL,ISL_LIST="1024,4096,8192",CONC_LIST="32,64,128" \
 | `MODEL_PATH` | `/mnt/models/deepseek-ai/DeepSeek-R1` | Model path |
 | `DOCKER_IMAGE` | `rocm/atom-dev:mesh-sglang-latest` | Container image |
 | `PREFILL_TP` / `DECODE_TP` | `4` / `8` | Tensor parallel sizes |
-| `LOAD_DUMMY` | `1` | Skip weight loading for fast smoke-test (set empty for real run) |
+| `LOAD_DUMMY` | `<empty>` | Load real weights by default. Set `LOAD_DUMMY=1` to skip weight loading for fast smoke-test |
 | `ISL_LIST` | `8192` | Input sequence lengths (comma-separated) |
 | `OSL` | `1024` | Output sequence length |
 | `CONC_LIST` | `16,32,64` | Concurrency levels |
+| `RUN_GSM8K` | `auto` | Run GSM8K accuracy eval before perf benchmark. `auto` = on iff real weights; `0` to force-skip; `1` to force-run |
+| `GSM8K_LIMIT` | `100` | Number of GSM8K samples |
+| `GSM8K_NUM_FEWSHOT` | `3` | Few-shot examples |
+| `GSM8K_NUM_CONCURRENT` | `65` | Concurrent eval requests |
 | `WAIT_SERVER_TIMEOUT` | `1800` | Per-server cold-start timeout (s) |
 
 SBATCH directives (edit in script if your cluster differs):
@@ -196,6 +203,7 @@ SBATCH directives (edit in script if your cluster differs):
     ├── prefill/prefill.log               # sglang prefill server
     ├── decode/decode.log                 # sglang decode server
     ├── router/                           # atom-mesh router
+    ├── gsm8k/<timestamp>_gsm8k/          # lm_eval GSM8K results (if enabled)
     ├── bench/pd-mesh-<isl>-<osl>-<conc>-<ratio>.json
     └── scripts/                          # generated in-container scripts
 ```
