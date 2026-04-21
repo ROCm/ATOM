@@ -143,6 +143,73 @@ bash run_benchmark.sh
 | `RESULT_DIR` | `/workspace/benchmark_results` | Results directory |
 | `BACKEND` | `sglang` | Benchmark backend |
 
+## One-Shot SLURM Automation
+
+For two-node SLURM clusters, `ds_fp8_1p_tp4_1d_tp8_slurm.sh` runs the entire flow
+(pre-cleanup → containers → prefill + decode servers → router → benchmark → cleanup)
+in a single `sbatch` submission. It is **self-contained** — does not depend on any
+of the other scripts above.
+
+### Submit
+
+```bash
+mkdir -p /it-share/yajizhan/slurm_logs
+sbatch atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
+```
+
+### Override defaults
+
+```bash
+# Run with real weights (default is LOAD_DUMMY=1 for fast validation)
+sbatch --export=ALL,LOAD_DUMMY= atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
+
+# Custom workload (multiple ISL, custom concurrency)
+sbatch --export=ALL,ISL_LIST="1024,4096,8192",CONC_LIST="32,64,128" \
+    atom/mesh/scripts/ds_fp8_1p_tp4_1d_tp8_slurm.sh
+```
+
+### Defaults
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_PATH` | `/mnt/models/deepseek-ai/DeepSeek-R1` | Model path |
+| `DOCKER_IMAGE` | `rocm/atom-dev:mesh-sglang-latest` | Container image |
+| `PREFILL_TP` / `DECODE_TP` | `4` / `8` | Tensor parallel sizes |
+| `LOAD_DUMMY` | `1` | Skip weight loading for fast smoke-test (set empty for real run) |
+| `ISL_LIST` | `8192` | Input sequence lengths (comma-separated) |
+| `OSL` | `1024` | Output sequence length |
+| `CONC_LIST` | `16,32,64` | Concurrency levels |
+| `WAIT_SERVER_TIMEOUT` | `1800` | Per-server cold-start timeout (s) |
+
+SBATCH directives (edit in script if your cluster differs):
+- partition / account: `amd-frameworks`
+- nodelist: `mia1-p02-g42,mia1-p02-g44`
+- 2 nodes × 8 GPUs, exclusive, 4-hour walltime
+
+### Outputs
+
+```
+/it-share/yajizhan/slurm_logs/
+├── ds_fp8_1p_tp4_1d_tp8-<jobid>.out      # sbatch stdout (orchestration log)
+├── ds_fp8_1p_tp4_1d_tp8-<jobid>.err      # sbatch stderr
+└── <MMDD>_ds_fp8_1p_tp4_1d_tp8_<jobid>/
+    ├── prefill/prefill.log               # sglang prefill server
+    ├── decode/decode.log                 # sglang decode server
+    ├── router/                           # atom-mesh router
+    ├── bench/pd-mesh-<isl>-<osl>-<conc>-<ratio>.json
+    └── scripts/                          # generated in-container scripts
+```
+
+### Cancel / Cleanup
+
+```bash
+scancel <jobid>
+```
+
+`scancel` does not propagate into docker containers, so the script's pre-cleanup
+step force-stops all stale containers on both nodes at the start of every run.
+Residual GPU memory from a prior failed run is cleared automatically.
+
 ## Script Summary
 
 | Script | Where to Run | Purpose |
@@ -153,3 +220,4 @@ bash run_benchmark.sh
 | `start_router.sh` | Container | Launch mesh router (waits for prefill/decode) |
 | `run_gsm8k.sh` | Container | Run GSM8K accuracy evaluation |
 | `run_benchmark.sh` | Container | Run performance benchmark |
+| `ds_fp8_1p_tp4_1d_tp8_slurm.sh` | SLURM head node | One-shot end-to-end PD benchmark on 2 nodes |
