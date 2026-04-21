@@ -430,13 +430,10 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
-        logger.warning("forward")
         if self.quant_type.value == QuantType.No.value:
-            logger.warning("no quant")
             # fairly certain this is always true but check just in case
             if (gemm_a16w16):
                 # changed to a16w16 but need to check if that's the correct approach
-                logger.warning("gemma16w16")
                 y = gemm_a16w16_impl(
                     x,
                     self.weight,
