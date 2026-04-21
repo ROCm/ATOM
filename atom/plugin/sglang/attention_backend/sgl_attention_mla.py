@@ -23,7 +23,10 @@ from aiter import dtypes
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
 from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.attention_mla import fused_qk_rope_concat_and_cache_mla
+from atom.model_ops.attention_mla import (
+    dynamic_per_batched_tensor_quant,
+    fused_qk_rope_concat_and_cache_mla,
+)
 from atom.models.utils import maybe_prefix
 
 # sglang imports
@@ -160,6 +163,20 @@ def _fuse_qk_rmsnorm(
     )
 
 
+def _prepare_weight_for_bmm(
+    weight: torch.Tensor, in_dim: int, out_dim: int
+) -> torch.Tensor:
+    """Normalize absorbed weight layout for torch.bmm fallback."""
+    if weight.shape[1] == in_dim and weight.shape[2] == out_dim:
+        return weight
+    if weight.shape[1] == out_dim and weight.shape[2] == in_dim:
+        return weight.transpose(-2, -1)
+    raise RuntimeError(
+        "Unexpected absorbed weight shape for bmm fallback: "
+        f"{tuple(weight.shape)} with in_dim={in_dim}, out_dim={out_dim}"
+    )
+
+
 # Init helpers
 def init_sgl_attrs(
     attn: DeepseekV2MLAAttention,
@@ -209,6 +226,10 @@ def mla_absorbed_bmm(
     inp: (num_tokens, num_heads, in_dim) — token-major
     Returns: (num_tokens, num_heads, out_dim) — token-major
     """
+    effective_weight_scale = (
+        weight_scale_k if weight_scale_k is not None else weight_scale
+    )
+
     if attn.use_deep_gemm_bmm:
         from sglang.srt.layers import deep_gemm_wrapper
 
@@ -247,23 +268,26 @@ def mla_absorbed_bmm(
         if (_use_aiter_gfx95 and weight.dtype == torch.float8_e4m3fn) or (
             get_is_capture_mode() and weight.dtype == torch.float8_e4m3fnuz
         ):
+            x = inp.transpose(0, 1)
             out = (
                 batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                    X=inp,
-                    WQ=weight.transpose(-1, -2),
-                    w_scale=weight_scale,
+                    X=x,
+                    WQ=weight,
+                    w_scale=effective_weight_scale,
                     group_size=128,
                     YQ=None,
-                    transpose_bm=False,
-                    transpose_bm_in=True,
+                    transpose_bm=True,
+                    transpose_bm_in=False,
                     dtype=torch.bfloat16,
                 )
             )
-            return out.transpose(0, 1)
+            return out
 
-        w_bf16 = weight.to(torch.bfloat16)
-        if weight_scale is not None:
-            w_bf16 = w_bf16 * weight_scale
+        w_bf16 = _prepare_weight_for_bmm(weight, inp.shape[-1], out_dim).to(
+            torch.bfloat16
+        )
+        if effective_weight_scale is not None:
+            w_bf16 = w_bf16 * effective_weight_scale
         out = torch.bmm(
             inp.to(torch.bfloat16).transpose(0, 1),
             w_bf16,
@@ -276,7 +300,7 @@ def mla_absorbed_bmm(
             inp.transpose(0, 1),
             torch.zeros((1,), dtype=torch.float32, device=inp.device),
         )
-        out = bmm_fp8(val, weight, scale, weight_scale, torch.bfloat16)
+        out = bmm_fp8(val, weight, scale, effective_weight_scale, torch.bfloat16)
         return out.transpose(0, 1)
 
     # bf16 fallback
@@ -292,6 +316,9 @@ def mla_v_up_proj(
     out_dim: int,
 ) -> torch.Tensor:
     """Project MLA decode output to a flat o_proj input."""
+    effective_weight_scale = (
+        weight_scale_k if weight_scale_k is not None else weight_scale
+    )
     if _is_hip and (
         (_use_aiter_gfx95 and weight.dtype == torch.float8_e4m3fn)
         or (get_is_capture_mode() and weight.dtype == torch.float8_e4m3fnuz)
@@ -305,8 +332,8 @@ def mla_v_up_proj(
         out_3d = out.view(inp.shape[0], attn.num_local_heads, out_dim)
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             X=x,
-            WQ=weight.transpose(-1, -2),
-            w_scale=weight_scale,
+            WQ=weight,
+            w_scale=effective_weight_scale,
             group_size=128,
             YQ=out_3d,
             transpose_bm=True,
@@ -976,6 +1003,32 @@ def _process_int8_weight(
         return w.to(torch.bfloat16) * attn.kv_b_proj.weight_scale.to(torch.bfloat16)
 
 
+def _split_kc_vc_like_vllm(
+    attn: DeepseekV2MLAAttention, w: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split kv_b_proj weight using vLLM's transpose-first layout."""
+    kv_b_proj_weight = w.T
+    assert kv_b_proj_weight.shape == (
+        attn.kv_lora_rank,
+        attn.num_local_heads * (attn.qk_nope_head_dim + attn.v_head_dim),
+    ), (
+        f"{kv_b_proj_weight.shape=}, "
+        f"{attn.kv_lora_rank=}, "
+        f"{attn.num_local_heads=}, "
+        f"{attn.qk_nope_head_dim=}, "
+        f"{attn.v_head_dim=}"
+    )
+    kv_b_proj_weight = kv_b_proj_weight.view(
+        attn.kv_lora_rank,
+        attn.num_local_heads,
+        attn.qk_nope_head_dim + attn.v_head_dim,
+    )
+    w_uk, w_uv = kv_b_proj_weight.split(
+        [attn.qk_nope_head_dim, attn.v_head_dim], dim=-1
+    )
+    return w_uk.transpose(0, 1).contiguous(), w_uv.permute(1, 2, 0).contiguous()
+
+
 def _split_and_assign_kc_vc(
     attn: DeepseekV2MLAAttention,
     w: torch.Tensor,
@@ -1003,10 +1056,25 @@ def _split_and_assign_kc_vc(
         )
 
     if not use_deep_gemm_bmm:
-        attn.w_kc = bind_or_assign(
-            attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+        use_vllm_weight_layout = _is_hip and not (
+            quant_config is not None and quant_config.get_name() == "quark"
         )
-        w_vc = w_vc.contiguous().transpose(1, 2)
+
+        if use_vllm_weight_layout:
+            w_kc, w_vc = _split_kc_vc_like_vllm(attn, w)
+        else:
+            w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            w_vc = w_vc.contiguous().transpose(1, 2)
+
+        # Align bf16 kv_b_proj post-load handling with vLLM: split first, then
+        # quantize kc/vc independently for the fp8 BMM path.
+        if w.dtype == torch.bfloat16 and (_is_hip or _is_cuda):
+            w_kc, w_scale_k = dynamic_per_batched_tensor_quant(w_kc, dtype=dtypes.fp8)
+            w_vc, w_scale_v = dynamic_per_batched_tensor_quant(w_vc, dtype=dtypes.fp8)
+            attn.w_scale_k = bind_or_assign(attn.w_scale_k, w_scale_k)
+            attn.w_scale_v = bind_or_assign(attn.w_scale_v, w_scale_v)
+
+        attn.w_kc = bind_or_assign(attn.w_kc, w_kc)
         if _is_npu:
             w_vc = w_vc.contiguous()
         attn.w_vc = bind_or_assign(attn.w_vc, w_vc)

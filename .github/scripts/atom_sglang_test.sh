@@ -224,6 +224,12 @@ run_accuracy() {
     --tasks "${LM_EVAL_TASK}" \
     --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
     --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+  # Capture lm_eval exit code explicitly; tee always exits 0 so PIPESTATUS is needed.
+  lm_eval_exit="${PIPESTATUS[0]}"
+  if [[ "${lm_eval_exit}" -ne 0 ]]; then
+    echo "ERROR: lm_eval exited with code ${lm_eval_exit}"
+    return "${lm_eval_exit}"
+  fi
 
   local result_file=""
   result_file=$(python3 - <<PY

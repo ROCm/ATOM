@@ -495,6 +495,7 @@ jobs:
           find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
 
       - name: Transform SGLANG accuracy results for dashboard
+        id: transform
         if: steps.downloaded.outputs.json_count != '0'
         run: |
           python3 .github/scripts/accuracy_to_dashboard.py \
@@ -505,9 +506,14 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
+          entries_count=$(python3 -c "import json; data=json.load(open('accuracy-benchmark-input.json')); print(len(data))")
+          echo "entries_count=${entries_count}" >> "$GITHUB_OUTPUT"
+          if [ "${entries_count}" = "0" ]; then
+            echo "::warning::No valid SGLANG accuracy entries were produced. Check that the result JSON files contain 'results.gsm8k[\"exact_match,flexible-extract\"]'."
+          fi
 
       - name: Store SGLANG accuracy result to dashboard
-        if: steps.downloaded.outputs.json_count != '0'
+        if: steps.transform.outputs.entries_count != '0' && steps.transform.outputs.entries_count != ''
         uses: benchmark-action/github-action-benchmark@v1
         with:
           tool: customBiggerIsBetter
