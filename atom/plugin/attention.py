@@ -2134,9 +2134,6 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
         if layer_names:
             if len(layer_names) < config.model_config.hf_config.num_hidden_layers:
                 _is_draft_layer = True
-        if torch.distributed.get_rank() == 0:
-            print(f"layer_names: {layer_names}")
-            print(f"_is_draft_layer: {_is_draft_layer}")
         if _is_draft_layer:
             self.num_speculative_tokens = 0
         else:

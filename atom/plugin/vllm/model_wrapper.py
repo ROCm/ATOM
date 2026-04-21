@@ -135,8 +135,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         main_model_arch = vllm_config.model_config.architectures[0]
         model_arch = _select_model_arch(vllm_config)
-        print(f"model_arch: {model_arch}")
-        print(f"main_model_arch: {main_model_arch}")
         self.model_arch = model_arch
         # if self.forced_model_arch is not None:
         #     model_arch = self.forced_model_arch
@@ -182,31 +180,57 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.pp_group = get_pp_group()
         self.tp_group = get_tp_group()
 
+    # Attributes whose writes on the outer model must propagate to the
+    # inner model so vLLM's weight-sharing reaches the forward path.
+    _WEIGHT_SHARED_ATTRS = frozenset({"embed_tokens", "embedding", "lm_head"})
+
     def _expose_spec_decode_attrs(self) -> None:
-        """Mirror nested attrs needed by vLLM speculative decoding.
+        """Bridge the extra nesting level between vLLM and ATOM for spec decode.
 
-        vLLM EAGLE/MTP logic reads attributes from wrapper.model directly:
-        - embedding sharing: `embed_tokens` / `embedding`
-        - lm_head sharing: `lm_head`
-        - MTP extra sharing: `model.layers` path on draft model
+        ATOM wraps the HF model with one extra level:
+          vLLM sees:  wrapper.model  (DeepSeekMTP)
+          forward uses:              .model (DeepSeekMultiTokenPredictor)
 
-        ATOM models can introduce one extra nesting level (`model.model`), so
-        mirror these attrs to `self.model` when absent. Also expose `lm_head`
-        on wrapper itself for vLLM's wrapper-level lm_head checks.
+        vLLM's EagleSpeculator reads/writes embed_tokens, lm_head, layers on
+        the outer model.  The forward path reads them from the inner model.
+
+        We need two things:
+        1. Mirror inner → outer so vLLM can discover the attrs.
+        2. When vLLM later *replaces* embed_tokens / lm_head with shared
+           target-model weights, propagate the write to the inner model
+           so the forward path picks up the shared tensor.
         """
         model = self.model
-        nested_model = getattr(model, "model", None)
-        if nested_model is None:
+        inner = getattr(model, "model", None)
+        if inner is None:
             if hasattr(model, "lm_head") and not hasattr(self, "lm_head"):
                 self.lm_head = model.lm_head
             return
 
-        for attr in ("embed_tokens", "embedding", "lm_head", "layers"):
-            if not hasattr(model, attr) and hasattr(nested_model, attr):
-                setattr(model, attr, getattr(nested_model, attr))
+        # (1) Mirror: make attrs visible on the outer model for vLLM discovery.
+        for attr in (*self._WEIGHT_SHARED_ATTRS, "layers"):
+            if not hasattr(model, attr) and hasattr(inner, attr):
+                setattr(model, attr, getattr(inner, attr))
 
         if not hasattr(self, "lm_head") and hasattr(model, "lm_head"):
             self.lm_head = model.lm_head
+
+        # (2) Propagate: future writes on the outer model sync to the inner
+        #     model.  We create a one-off subclass so the hook only affects
+        #     this particular draft-model instance, not the base class.
+        shared = self._WEIGHT_SHARED_ATTRS
+        base_setattr = model.__class__.__setattr__
+
+        def _syncing_setattr(self_model, name, value):
+            base_setattr(self_model, name, value)
+            if name in shared and hasattr(inner, name):
+                base_setattr(inner, name, value)
+
+        model.__class__ = type(
+            model.__class__.__name__,
+            (model.__class__,),
+            {"__setattr__": _syncing_setattr},
+        )
 
     def _register_indexer_caches_with_vllm(self):
         """Register DeepseekV32IndexerCache instances with vLLM so that:
@@ -315,6 +339,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
+
 
         return hidden_states
 
