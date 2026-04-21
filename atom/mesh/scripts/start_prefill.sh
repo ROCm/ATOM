@@ -12,6 +12,7 @@ set -euo pipefail
 #   PREFILL_PORT=8010  BOOTSTRAP_PORT=8998  MEM_FRACTION=0.85
 #   KV_CACHE_DTYPE=fp8_e4m3  CHUNKED_PREFILL_SIZE=16384
 #   MAX_RUNNING_REQUESTS=128  IB_DEVICE=rdma0,...
+#   LOAD_DUMMY=1            skip weight loading (for benchmarking infra)
 
 : "${PREFILL_IP:?}"
 : "${MODEL_PATH:?}"
@@ -24,6 +25,7 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
 IB_DEVICE="${IB_DEVICE:-rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7}"
+LOAD_DUMMY="${LOAD_DUMMY:-}"
 
 GPU_IDS=$(seq -s, 0 $((PREFILL_TP - 1)))
 
@@ -45,6 +47,13 @@ export MOONCAKE_CONFIG_PATH=/workspace/mooncake_prefill.json
 export SGLANG_MOONCAKE_SEND_AUX_TCP=1
 export LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
+EXTRA_ARGS=()
+if [[ -n "${LOAD_DUMMY}" ]]; then
+    EXTRA_ARGS+=(--load-format dummy)
+    export LOAD_DUMMY=1
+    echo "[prefill] LOAD_DUMMY enabled — skipping weight loading"
+fi
+
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --host 0.0.0.0 --port "${PREFILL_PORT}" \
@@ -63,4 +72,5 @@ python3 -m sglang.launch_server \
     --disaggregation-transfer-backend mooncake \
     --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
     --disaggregation-ib-device "${IB_DEVICE}" \
+    "${EXTRA_ARGS[@]}" \
     2>&1 | tee /workspace/logs/prefill.log
