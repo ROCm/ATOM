@@ -8,37 +8,12 @@ End-to-end guide for building, deploying, and benchmarking the ATOM Mesh prefill
 - RDMA network between nodes
 - Docker installed on both nodes
 
-## 1. Build Docker Image
+## 1. Start Docker Container
 
-Run from the **ATOM repository root** on a machine with GPU access:
-
-```bash
-# Stage 1: build base image with ATOM + atom-mesh binary
-DOCKER_BUILDKIT=1 docker build \
-    --target atom_image \
-    --build-arg MAX_JOBS=$(nproc) \
-    -t atom-mesh-$(date +%Y%m%d)-v0.1:latest \
-    -f docker/Dockerfile .
-
-# Stage 2: build SGLang image on top of base
-DOCKER_BUILDKIT=1 docker build \
-    --target atom_sglang \
-    --build-arg SGLANG_BASE_IMAGE=atom-mesh-$(date +%Y%m%d)-v0.1:latest \
-    -t sglang-atom-mesh-$(date +%Y%m%d)-v0.1:latest \
-    -f docker/Dockerfile .
-```
-
-Distribute the final image `sglang-atom-mesh-YYYYMMDD-v0.1:latest` to both nodes.
-
-## 2. Start Docker Container
-
-Run on **each node** (prefill and decode):
-
-> **NOTE:** The default image in `docker_start.sh` is hardcoded to `sglang-atom-mesh-20260420-v0.1:latest`. If your built image has a different tag (e.g. a different date), you **must** pass it via the `DOCKER_IMAGE` environment variable, otherwise the container will fail to start with an image-not-found error.
+Pre-built images are available at `rocm/atom-dev:mesh-sglang-latest`. Run on **each node** (prefill and decode):
 
 ```bash
-# Adjust DOCKER_IMAGE to match your built image tag
-DOCKER_IMAGE=sglang-atom-mesh-20260420-v0.1:latest bash docker_start.sh
+bash docker_start.sh
 ```
 
 Then enter the container:
@@ -49,7 +24,7 @@ docker exec -it atom_sglang_mesh bash
 
 All remaining scripts are run **inside the container**.
 
-## 3. Launch Prefill Server
+## 2. Launch Prefill Server
 
 On the **prefill node** container:
 
@@ -73,7 +48,7 @@ bash start_prefill.sh
 | `MAX_RUNNING_REQUESTS` | `128` | Max concurrent requests |
 | `IB_DEVICE` | `rdma0,...,rdma7` | RDMA devices |
 
-## 4. Launch Decode Server
+## 3. Launch Decode Server
 
 On the **decode node** container:
 
@@ -95,7 +70,7 @@ bash start_decode.sh
 
 Other optional variables are the same as prefill (`BOOTSTRAP_PORT`, `MEM_FRACTION`, etc.).
 
-## 5. Launch Router
+## 4. Launch Router
 
 On either node's container (typically the **prefill node**):
 
@@ -118,7 +93,7 @@ The script waits for both prefill and decode servers to be ready before starting
 | `MESH_BIN` | `/usr/local/bin/atom-mesh` | Path to atom-mesh binary |
 | `WAIT_TIMEOUT` | `900` | Timeout waiting for prefill/decode (seconds) |
 
-## 6. Verify
+## 5. Verify
 
 Quick health check:
 
