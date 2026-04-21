@@ -53,6 +53,10 @@ on:
         description: "Image to use for the benchmark"
         type: string
         default: "rocm/atom-dev:latest"
+      runner:
+        description: "Optional runner label override for benchmark and regression jobs"
+        type: string
+        default: ""
       enable_profiler:
         description: "Enable torch profiler to collect trace for performance debugging"
         type: boolean
@@ -114,6 +118,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUTS_JSON: ${{ toJson(inputs) }}
+          RUNNER_OVERRIDE: ${{ inputs.runner }}
         run: |
           python3 << 'PY'
           import json, os
@@ -124,6 +129,10 @@ jobs:
               filtered = models
           else:
               filtered = [m for m in models if inputs.get(m["prefix"], True)]
+              runner_override = os.environ.get("RUNNER_OVERRIDE", "").strip()
+              if runner_override:
+                  for model in filtered:
+                      model["runner"] = runner_override
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event}: {len(filtered)}/{len(models)} models enabled")
@@ -491,11 +500,33 @@ jobs:
 
       - name: Generate matrix from regression report
         id: gen
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUNNER_OVERRIDE: ${{ inputs.runner }}
         run: |
           python3 .github/scripts/regression_rerun.py \
             regression_report.json \
             .github/benchmark/models.json \
             --output-matrix /tmp/matrix.json
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$RUNNER_OVERRIDE" ] && [ -s /tmp/matrix.json ]; then
+            python3 - <<'PY'
+            import json, os
+
+            matrix_path = "/tmp/matrix.json"
+            with open(matrix_path, encoding="utf-8") as f:
+                cells = json.load(f)
+
+            runner_override = os.environ["RUNNER_OVERRIDE"]
+            for cell in cells:
+                cell["runner"] = runner_override
+
+            with open(matrix_path, "w", encoding="utf-8") as f:
+                json.dump(cells, f)
+
+            print(f"Overriding regression runner with {runner_override} for {len(cells)} matrix cells")
+            PY
+          fi
 
           if [ -s /tmp/matrix.json ] && [ "$(cat /tmp/matrix.json)" != "[]" ]; then
             echo "matrix_json=$(cat /tmp/matrix.json)" >> $GITHUB_OUTPUT
