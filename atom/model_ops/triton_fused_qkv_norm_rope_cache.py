@@ -66,6 +66,8 @@ def _fused_qkv_norm_rope_cache_kernel(
     vs_stride_head,
     # Slot mapping
     slot_mapping_ptr,
+    # M-RoPE parameters
+    pos_stride_row,  # stride between position rows (for 2D positions)
     # Dimensions
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -77,6 +79,10 @@ def _fused_qkv_norm_rope_cache_kernel(
     ROTARY_DIM: tl.constexpr,
     ROTARY_DIM_HALF: tl.constexpr,
     IS_FP8: tl.constexpr,
+    # M-RoPE section boundaries (cumulative)
+    MROPE_S0: tl.constexpr = 0,
+    MROPE_S1: tl.constexpr = 0,
+    IS_MROPE: tl.constexpr = False,
 ):
     # Grid: (num_tokens * (num_heads + num_kv_heads),)
     pid = tl.program_id(0)
@@ -102,8 +108,6 @@ def _fused_qkv_norm_rope_cache_kernel(
         q_normed = q_normed * (1.0 + qw)
 
         # RoPE (neox-style, partial rotary)
-        pos = tl.load(pos_ptr + token_id)
-
         rot_mask = d_offs < ROTARY_DIM
         first_half_mask = d_offs < ROTARY_DIM_HALF
         d_cos_idx = tl.where(
@@ -115,7 +119,22 @@ def _fused_qkv_norm_rope_cache_kernel(
                 tl.zeros_like(d_offs),
             ),
         )
-        cos_base = pos * cos_sin_stride_pos
+
+        if IS_MROPE:
+            # M-RoPE: per-dim position selection based on mrope_section
+            pos_t = tl.load(pos_ptr + 0 * pos_stride_row + token_id)
+            pos_h = tl.load(pos_ptr + 1 * pos_stride_row + token_id)
+            pos_w = tl.load(pos_ptr + 2 * pos_stride_row + token_id)
+            pos_per_dim = tl.where(
+                d_cos_idx < MROPE_S0,
+                pos_t,
+                tl.where(d_cos_idx < MROPE_S1, pos_h, pos_w),
+            )
+            cos_base = pos_per_dim * cos_sin_stride_pos
+        else:
+            pos = tl.load(pos_ptr + token_id)
+            cos_base = pos * cos_sin_stride_pos
+
         cos_vals = tl.load(
             cos_cache_ptr + cos_base + d_cos_idx, mask=rot_mask, other=1.0
         ).to(tl.float32)
@@ -161,8 +180,6 @@ def _fused_qkv_norm_rope_cache_kernel(
         k_normed = k_normed * (1.0 + kw)
 
         # RoPE on k (neox-style, partial rotary)
-        pos = tl.load(pos_ptr + token_id)
-
         rot_mask = d_offs < ROTARY_DIM
         first_half_mask = d_offs < ROTARY_DIM_HALF
         d_cos_idx = tl.where(
@@ -172,7 +189,21 @@ def _fused_qkv_norm_rope_cache_kernel(
                 d_offs < ROTARY_DIM, d_offs - ROTARY_DIM_HALF, tl.zeros_like(d_offs)
             ),
         )
-        cos_base = pos * cos_sin_stride_pos
+
+        if IS_MROPE:
+            pos_t = tl.load(pos_ptr + 0 * pos_stride_row + token_id)
+            pos_h = tl.load(pos_ptr + 1 * pos_stride_row + token_id)
+            pos_w = tl.load(pos_ptr + 2 * pos_stride_row + token_id)
+            pos_per_dim = tl.where(
+                d_cos_idx < MROPE_S0,
+                pos_t,
+                tl.where(d_cos_idx < MROPE_S1, pos_h, pos_w),
+            )
+            cos_base = pos_per_dim * cos_sin_stride_pos
+        else:
+            pos = tl.load(pos_ptr + token_id)
+            cos_base = pos * cos_sin_stride_pos
+
         cos_vals = tl.load(
             cos_cache_ptr + cos_base + d_cos_idx, mask=rot_mask, other=1.0
         ).to(tl.float32)
@@ -437,6 +468,19 @@ def fused_qkv_norm_rope_cache(
     block_size = k_cache.shape[3]  # k_cache: [B, H, D//X, block_size, X]
     x_size = k_cache.shape[4]
 
+    # Detect M-RoPE (2D positions: [3, num_tokens])
+    is_mrope = positions.ndim == 2
+    mrope_section = getattr(rotary_emb, "mrope_section", None)
+    if is_mrope:
+        assert mrope_section is not None, "M-RoPE requires rotary_emb.mrope_section"
+        s0 = mrope_section[0]
+        s1 = s0 + mrope_section[1]
+        pos_stride_row = positions.stride(0)
+    else:
+        s0 = 0
+        s1 = 0
+        pos_stride_row = 0
+
     # Allocate contiguous output tensors
     q_out = q.new_empty((T, num_heads * head_dim), dtype=q.dtype)
     k_out = k.new_empty((T, num_kv_heads * head_dim), dtype=k.dtype)
@@ -478,6 +522,7 @@ def fused_qkv_norm_rope_cache(
         v_scale.stride(0) if v_scale is not None and v_scale.dim() >= 1 else 0,
         v_scale.stride(1) if v_scale is not None and v_scale.dim() >= 2 else 0,
         slot_mapping,
+        pos_stride_row,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         eps=eps,
@@ -487,6 +532,9 @@ def fused_qkv_norm_rope_cache(
         ROTARY_DIM=rotary_dim,
         ROTARY_DIM_HALF=rotary_dim // 2,
         IS_FP8=is_fp8,
+        MROPE_S0=s0,
+        MROPE_S1=s1,
+        IS_MROPE=is_mrope,
     )
 
     return q_out, k_out
