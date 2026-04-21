@@ -10,6 +10,8 @@ The model registry lives in `atom/model_engine/model_runner.py` as `support_mode
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
+    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5ForConditionalGenerationTextOnly",
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
     "LlamaForCausalLM": "atom.models.llama.LlamaForCausalLM",
     "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
@@ -31,6 +33,8 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 |---|---|---|---|---|---|
 | `Qwen3ForCausalLM` | `atom.models.qwen3` | `Qwen3ForCausalLM` | No | No | GQA, QK norm, RoPE |
 | `Qwen3MoeForCausalLM` | `atom.models.qwen3_moe` | `Qwen3MoeForCausalLM` | Yes | No | GQA, QK norm, FusedMoE, sparse+dense layer mixing, QK norm+RoPE+cache+quant fusion |
+| `Qwen3_5ForConditionalGeneration` | `atom.models.qwen3_5` | `Qwen3_5ForConditionalGenerationTextOnly` | No | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, RoPE |
+| `Qwen3_5MoeForConditionalGeneration` | `atom.models.qwen3_5` | `Qwen3_5MoeForConditionalGenerationTextOnly` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet, GQA, QK norm, FusedMoE |
 | `LlamaForCausalLM` | `atom.models.llama` | `LlamaForCausalLM` | No | No | GQA, RoPE, fused RMSNorm+quant, fused SiLU+mul+quant |
 | `MixtralForCausalLM` | `atom.models.mixtral` | `MixtralForCausalLM` | Yes | No | GQA, RoPE, FusedMoE with TP sharding |
 | `DeepseekV3ForCausalLM` | `atom.models.deepseek_v2` | `DeepseekV2ForCausalLM` | Yes | Yes | MLA attention, LoRA-compressed QKV, FusedMoE with shared experts, FP4/FP8 fused kernels |
@@ -40,7 +44,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe` | `Glm4MoeForCausalLM` | Yes | No | GQA, partial RoPE (0.5 factor), QK norm, shared+routed experts, sigmoid scoring, grouped top-k |
 | `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
 
-**Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`) and `Qwen3NextMTP` (`atom.models.qwen3_next_mtp`) are not in the registry -- they are used exclusively as speculative draft models and are loaded separately.
+**Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`), `Qwen3NextMTP` (`atom.models.qwen3_next_mtp.Qwen3NextMTP`), and `Qwen3_5MTP` (`atom.models.qwen3_5_mtp.Qwen3_5MTP`) are not in the registry -- they are used exclusively as speculative draft models and are loaded separately via `EagleProposer`.
 
 ---
 
@@ -129,9 +133,30 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Architecture:** Hybrid MoE transformer with two attention types: full attention (`Qwen3NextAttention`) and Gated DeltaNet linear attention (`Qwen3NextGatedDeltaNet`). Layer type is determined by `config.layer_types`.
 - **Layer structure:** `Qwen3NextDecoderLayer` containing either full attention or linear attention, plus either `Qwen3NextSparseMoeBlock` (MoE layers) or `Qwen3NextMLP` (dense layers).
 - **Attention:** Full attention layers use `QKVParallelLinear` with QK norm, RoPE, GQA. Linear attention layers use `QKVZBAParallelLinear` for fused QKVZ+BA projections with Gated DeltaNet recurrence.
+- **GDN Recurrent State:** The Gated DeltaNet linear attention layers maintain per-request recurrent state. ATOM manages this state via a dedicated per-request slot pool (separate from KV cache blocks). Each sequence is assigned a `mamba_state_slot` index during allocation, and the state memory is accounted for dynamically as block equivalents within the unified KV pool.
 - **MoE:** `Qwen3NextSparseMoeBlock` with `FusedMoE`, shared expert fusion support.
 - **Normalization:** Uses `GemmaRMSNorm` (aliased as `Qwen3NextRMSNorm`).
 - **MTP:** Separate draft model in `atom/models/qwen3_next_mtp.py` (`Qwen3NextMTP`).
+
+### Qwen3.5 (`Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration`)
+
+- **Architecture:** Hybrid transformer with two attention types: full attention and Gated DeltaNet linear attention. Layer type is determined by `config.layer_types`. Dense or MoE variants.
+- **Layer structure:** `Qwen3_5DecoderLayer` containing either full attention or linear attention, plus either `Qwen3_5SparseMoeBlock` (MoE variants) or `Qwen3_5MLP` (dense variants).
+- **Attention:** Full attention layers use `QKVParallelLinear` with QK norm, RoPE, GQA. Linear attention layers use `QKVZBAParallelLinear` for fused QKVZ+BA projections with Gated DeltaNet.
+- **GDN Recurrent State:** Like Qwen3-Next, the Gated DeltaNet layers maintain per-request recurrent state managed via the slot pool. Qwen3.5 models (both dense and MoE variants) use the same unified memory management as Qwen3-Next.
+- **MoE:** `Qwen3_5SparseMoeBlock` with `FusedMoE`, shared expert fusion support.
+- **Normalization:** RMSNorm with optional fused allreduce for MoE models.
+- **MTP:** Separate draft model in `atom/models/qwen3_5_mtp.py` (`Qwen3_5MTP`). The MTP predictor uses only full attention layers (no Gated DeltaNet) for efficiency, supporting both MTP1 and MTP3 variants via `num_speculative_tokens`.
+
+### Qwen3.5 MTP (`Qwen3_5MTP`)
+
+- **Architecture:** Multi-Token Prediction draft model for speculative decoding with Qwen3.5.
+- **Layer structure:** `Qwen3_5MultiTokenPredictor` containing embedding, projection, and full-attention-only layers (no linear attention), followed by an LM head.
+- **Design:** Takes main model's hidden states and the next token's embedding as inputs. Concatenates normalized embeddings with normalized hidden states, applies a linear projection, then processes through one or more full-attention decoder layers.
+- **Weight loading:** Uses `weights_mapping = {"mtp.": "model."}` to map MTP weights from checkpoint. The `fc` layer uses a `prefix` parameter to enable weight quantization exclusion.
+- **Shared weights:** `embed_tokens` and `lm_head` are shared with the main model when loaded from the same checkpoint.
+- **Performance:** Typical acceptance rates of ~94% for MTP1 and ~83% for MTP3, with draft token generation overhead of ~1.94 and ~3.49 tokens per forward pass respectively.
+- **Attention metadata:** Since MTP only uses full attention (not MLA), the attention builder calls `prepare_mtp_decode()` with block table and context length updates (unlike MLA which uses kv_indptr).
 
 ---
 
@@ -311,12 +336,30 @@ When `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` is enabled, the `Qwen3MoeAtte
 
 Additionally, `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` fuses allreduce with RMSNorm for both attention output and MoE output, reducing communication overhead.
 
-### MTP: DeepSeek Multi-Token Prediction
+### MTP: Multi-Token Prediction (Speculative Decoding)
 
-The `DeepSeekMTP` model serves as a speculative draft model:
+Multi-Token Prediction (MTP) models serve as lightweight draft models for speculative decoding, proposing multiple tokens per forward pass to improve throughput while maintaining accuracy through rejection sampling. ATOM supports three MTP variants:
+
+**DeepSeekMTP** (`DeepSeekMTP`):
 - Each `DeepSeekMultiTokenPredictorLayer` takes the previous hidden state and the next token's embedding, normalizes both (`enorm`, `hnorm`), concatenates them, and passes through a linear projection (`eh_proj`) followed by a standard `DeepseekV2DecoderLayer`.
-- The `SharedHead` provides per-layer norm + LM head for logit computation.
+- The `SharedHead` provides per-layer norm + LM head for logit computation (one shared head per MTP layer).
 - For FP4 quantized main models, MTP blocks fall back to non-FP4 quantization config to maintain draft model accuracy.
+
+**Qwen3NextMTP** (`Qwen3NextMTP`):
+- Similar layer-by-layer structure to DeepSeek MTP with per-layer `SharedHead`.
+- Uses Qwen3-Next decoder layers with full attention only (no Gated DeltaNet linear attention).
+- Supports the hybrid architecture of the main Qwen3-Next model.
+
+**Qwen3_5MTP** (`Qwen3_5MTP`):
+- Simpler single-stage design: takes hidden states and token embeddings, projects them through a single full-attention block, then computes logits via a top-level `lm_head`.
+- All MTP layers are full-attention only (no Gated DeltaNet) for efficiency, even though the main Qwen3.5 model is hybrid.
+- Weight loading maps MTP weights via `weights_mapping = {"mtp.": "model."}`, allowing flexible quantization via the `fc` layer's prefix parameter.
+- Shares `embed_tokens` and `lm_head` with the main model when available.
+
+**General MTP Properties**:
+- Loaded separately via `EagleProposer` in `atom/spec_decode/eagle.py`, registered in `support_eagle_model_arch_dict`.
+- Each MTP variant uses `num_speculative_tokens` to control the number of draft tokens (e.g., MTP1 = 1 token, MTP3 = 3 tokens).
+- Attention metadata is updated incrementally: MLA models use `kv_indptr` tracking, while hybrid/GDN models (Qwen3.5 MTP) use block tables and context length updates.
 
 ---
 
@@ -333,8 +376,10 @@ The `DeepSeekMTP` model serves as a speculative draft model:
 | `atom/models/mixtral.py` | Mixtral model: `MixtralForCausalLM`, `MixtralModel`, `MixtralDecoderLayer`, `MixtralAttention`, `MixtralMoE` |
 | `atom/models/gpt_oss.py` | GPT-OSS model: `GptOssForCausalLM`, `GptOssModel`, `TransformerBlock`, `OAIAttention`, `MLPBlock` |
 | `atom/models/glm4_moe.py` | GLM4-MoE model: `Glm4MoeForCausalLM`, `Glm4MoeModel`, `Glm4MoeDecoderLayer`, `Glm4MoeAttention`, `Glm4MoE`, `Glm4MoeMLP` |
+| `atom/models/qwen3_5.py` | Qwen3.5 model: `Qwen3_5ForConditionalGenerationTextOnly`, `Qwen3_5MoeForConditionalGenerationTextOnly`, `Qwen3_5Model`, `Qwen3_5MoeModel`, `Qwen3_5DecoderLayer`, `Qwen3_5RMSNorm`, `Qwen3_5Attention`, `Qwen3_5GatedDeltaNet`, `Qwen3_5SparseMoeBlock`, `Qwen3_5MLP` |
 | `atom/models/qwen3_next.py` | Qwen3-Next model: `Qwen3NextForCausalLM`, `Qwen3NextModel`, `Qwen3NextDecoderLayer`, `Qwen3NextAttention`, `Qwen3NextGatedDeltaNet`, `Qwen3NextSparseMoeBlock`, `Qwen3NextMLP` |
 | `atom/models/qwen3_next_mtp.py` | Qwen3-Next MTP draft model |
+| `atom/models/qwen3_5_mtp.py` | Qwen3.5 MTP draft model: `Qwen3_5MTP`, `Qwen3_5MultiTokenPredictor` |
 | `atom/models/utils.py` | Model utilities: `IntermediateTensors`, `PPMissingLayer`, `make_layers`, `maybe_prefix`, `extract_layer_index` |
 | `atom/model_loader/loader.py` | Weight loading: `load_model`, `safetensors_weights_iterator`, `default_weight_loader` |
 | `atom/model_loader/weight_utils.py` | Weight utilities: `download_weights_from_hf`, `set_weight_attrs`, `filter_duplicate_safetensors_files` |

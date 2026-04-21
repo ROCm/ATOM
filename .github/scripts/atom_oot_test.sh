@@ -274,9 +274,12 @@ PY
     result_file="${flat_result_file}"
   fi
 
-  if [[ -n "${OOT_DOCKER_IMAGE}" ]]; then
+  if [[ -n "${OOT_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then
     RESULT_FILE="${result_file}" \
-    OOT_DOCKER_IMAGE="${OOT_DOCKER_IMAGE}" \
+    OOT_DOCKER_IMAGE="${OOT_DOCKER_IMAGE:-}" \
+    GPU_NAME="${GPU_NAME:-}" \
+    GPU_VRAM_GB="${GPU_VRAM_GB:-}" \
+    ROCM_VERSION="${ROCM_VERSION:-}" \
     python - <<'PY'
 import json
 import os
@@ -288,6 +291,15 @@ with open(result_file, "r", encoding="utf-8") as f:
 metadata = data.setdefault("atom_ci_metadata", {})
 if os.environ.get("OOT_DOCKER_IMAGE"):
     metadata["docker_image"] = os.environ["OOT_DOCKER_IMAGE"]
+if os.environ.get("GPU_NAME"):
+    metadata["gpu_name"] = os.environ["GPU_NAME"]
+if os.environ.get("GPU_VRAM_GB"):
+    try:
+        metadata["gpu_vram_gb"] = int(float(os.environ["GPU_VRAM_GB"]))
+    except ValueError:
+        pass
+if os.environ.get("ROCM_VERSION"):
+    metadata["rocm_version"] = os.environ["ROCM_VERSION"]
 
 with open(result_file, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)

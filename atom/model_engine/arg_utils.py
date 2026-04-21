@@ -242,7 +242,7 @@ class EngineArgs:
                 else None
             ),
         )
-        if self.method:
+        if self.method and self.num_speculative_tokens > 0:
             kwargs["speculative_config"] = SpeculativeConfig(
                 method=kwargs.pop("method"),
                 model=self.model,

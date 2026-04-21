@@ -1,35 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Tuple, Optional
-import torch
-from torch import Tensor
+from typing import Optional, Tuple
 
-from torch.overrides import (
-    has_torch_function_unary,
-    handle_torch_function,
+import aiter
+import torch
+from aiter import (
+    QuantType,
+    layernorm2d_fwd,
+    layernorm2d_fwd_with_add,
+    rmsnorm2d_fwd,
+    rmsnorm2d_fwd_with_add,
 )
+from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
+from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.decorators import mark_trace
-from torch import nn
-from aiter import (
-    rmsnorm2d_fwd,
-    rmsnorm2d_fwd_with_add,
-    layernorm2d_fwd,
-    layernorm2d_fwd_with_add,
-)
-import aiter
-from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
-from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
-from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
-
-from aiter import (
-    QuantType,
-)
+from torch import Tensor, nn
+from torch.overrides import handle_torch_function, has_torch_function_unary
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -163,9 +156,7 @@ def mxfp4_rms_quant_fuse(
     shuffle: bool = False,
     res1: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.fused_mxfp4_quant import (
-        fused_rms_mxfp4_quant,
-    )
+    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
 
     (x_quant, x_scale), _, _, residual_out = fused_rms_mxfp4_quant(
         x, weight, eps, shuffle=shuffle, res1=res1
@@ -237,10 +228,10 @@ class RMSNorm(nn.Module):
             return x, residual
         else:
             if x_scale is not None and self.use_fused_quant:
+                import aiter as rocm_aiter
                 from aiter.ops.triton.fused_fp8_quant import (
                     fused_rms_fp8_per_tensor_static_quant,
                 )
-                import aiter as rocm_aiter
 
                 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
@@ -561,6 +552,213 @@ class GemmaRMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.forward_cuda(x, residual)
+
+
+# ---------------------------------------------------------------------------
+# Fused Q/K RMSNorm Triton kernel
+# ---------------------------------------------------------------------------
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+
+
+@triton.jit
+def _fused_qk_norm_single_kernel(
+    q_ptr,
+    k_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    eps,
+    num_tokens,
+    head_dim,
+    q_in_stride0,
+    k_in_stride0,
+    q_out_stride0,
+    k_out_stride0,
+    num_q_heads,
+    num_k_heads,
+    ADD_UNIT_OFFSET: tl.constexpr,
+    RBLOCK: tl.constexpr,
+    XBLOCK: tl.constexpr,
+):
+    """Fused Q/K RMSNorm in a single kernel launch (out-of-place)."""
+    num_q_rows = num_tokens * num_q_heads
+    total_rows = num_tokens * (num_q_heads + num_k_heads)
+
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < total_rows
+    cols = tl.arange(0, RBLOCK)[None, :]
+    col_mask = cols < head_dim
+
+    is_q = xindex < num_q_rows
+    row_in_section = tl.where(is_q, xindex, xindex - num_q_rows)
+    cur_num_heads = tl.where(is_q, num_q_heads, num_k_heads)
+
+    tokens = row_in_section // cur_num_heads
+    heads = row_in_section % cur_num_heads
+
+    in_stride = tl.where(is_q, q_in_stride0, k_in_stride0)
+    in_bases = tokens * in_stride + heads * head_dim
+
+    # Output: contiguous, stride(1) = head_dim
+    out_stride0 = tl.where(is_q, q_out_stride0, k_out_stride0)
+    out_bases = tokens * out_stride0 + heads * head_dim
+
+    mask = xmask & col_mask
+
+    # Weight: load both, select via is_q
+    qw = tl.load(
+        q_weight_ptr + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
+    ).to(tl.float32)
+    kw = tl.load(
+        k_weight_ptr + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
+    ).to(tl.float32)
+    if ADD_UNIT_OFFSET:
+        qw = qw + 1.0
+        kw = kw + 1.0
+    w = tl.where(is_q, qw, kw)
+
+    # Use runtime branching for pointer selection (avoids tl.where on pointers)
+    # Since all threads in a program have the same is_q value (XBLOCK rows are
+    # consecutive and Q/K boundary is far apart), this branch is uniform.
+    # For the rare program straddling Q/K boundary, both branches execute.
+    x = tl.load(
+        q_ptr + in_bases + cols,
+        mask=mask & is_q,
+        other=0.0,
+        eviction_policy="evict_first",
+    ).to(tl.float32)
+    x = x + tl.load(
+        k_ptr + in_bases + cols,
+        mask=mask & ~is_q,
+        other=0.0,
+        eviction_policy="evict_first",
+    ).to(tl.float32)
+
+    var = tl.sum(x * x, 1)[:, None]
+    rstd = tl.rsqrt(var / head_dim + eps)
+
+    out = (x * rstd * w).to(q_out_ptr.dtype.element_ty)
+    tl.store(
+        q_out_ptr + out_bases + cols,
+        out,
+        mask=mask & is_q,
+        eviction_policy="evict_first",
+    )
+    tl.store(
+        k_out_ptr + out_bases + cols,
+        out,
+        mask=mask & ~is_q,
+        eviction_policy="evict_first",
+    )
+
+
+def fused_qk_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    add_unit_offset: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused Q/K RMSNorm in a single Triton kernel launch.
+
+    Args:
+        q: [num_tokens, num_heads, head_dim]
+        k: [num_tokens, num_kv_heads, head_dim]
+        q_weight, k_weight: [head_dim] norm weights
+        eps: epsilon for numerical stability
+        add_unit_offset: True for GemmaRMSNorm (w+1), False for standard
+    """
+    head_dim = q_weight.shape[0]
+    num_tokens = q.shape[0]
+    num_q_heads = q.shape[1]
+    num_k_heads = k.shape[1]
+    total_rows = num_tokens * (num_q_heads + num_k_heads)
+    RBLOCK = triton.next_power_of_2(head_dim)
+
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+
+    # Adaptive XBLOCK based on batch size.
+    # Small batch: XBLOCK=1 minimizes register pressure per program.
+    # Large batch: XBLOCK=2 amortizes overhead, but XBLOCK>2 hurts due to
+    # cross-token stride jumps in non-contiguous split views.
+    # num_warps=1 is universally optimal for head_dim=256 workloads on MI355X.
+    XBLOCK = 2 if total_rows > 8192 else 1
+    NUM_WARPS = 1
+    _fused_qk_norm_single_kernel[((total_rows + XBLOCK - 1) // XBLOCK,)](
+        q,
+        k,
+        q_out,
+        k_out,
+        q_weight,
+        k_weight,
+        eps,
+        num_tokens,
+        head_dim,
+        q.stride(0),
+        k.stride(0),
+        q_out.stride(0),
+        k_out.stride(0),
+        num_q_heads,
+        num_k_heads,
+        ADD_UNIT_OFFSET=add_unit_offset,
+        RBLOCK=RBLOCK,
+        XBLOCK=XBLOCK,
+        num_warps=NUM_WARPS,
+    )
+    return q_out, k_out
+
+
+class DualRMSNorm:
+    """Fused Q/K RMSNorm — single Triton kernel launch.
+
+    Not an nn.Module. References existing q_norm/k_norm for weights.
+    """
+
+    def __init__(
+        self,
+        q_norm: nn.Module,
+        k_norm: nn.Module,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        prefix: str,
+    ) -> None:
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.add_unit_offset = isinstance(q_norm, GemmaRMSNorm)
+        self.prefix = prefix
+
+    @mark_trace
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            q: [num_tokens, num_q_heads * head_dim]
+            k: [num_tokens, num_kv_heads * head_dim]
+        Returns:
+            (q_normed, k_normed) same shapes as input
+        """
+        q, k = fused_qk_norm(
+            q.view(-1, self.num_q_heads, self.head_dim),
+            k.view(-1, self.num_kv_heads, self.head_dim),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_norm.variance_epsilon,
+            add_unit_offset=self.add_unit_offset,
+        )
+        return (
+            q.view(-1, self.num_q_heads * self.head_dim),
+            k.view(-1, self.num_kv_heads * self.head_dim),
+        )
 
 
 @torch_compile_guard()

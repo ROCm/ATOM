@@ -61,12 +61,15 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `eos_token_id` | `int` | `-1` | End-of-sequence token ID (`-1` = use model default) |
 | `stop_token_ids` | `list[int]` | `[]` | Additional stop token IDs; populated from `GenerationConfig.eos_token_id` during init |
 
-**Auto-derived fields** (set in `__post_init__`, not user-supplied):
+**Auto-derived fields** (set in `__post_init__` or by `ModelRunner.get_num_blocks()`, not user-supplied):
 
 | Field | Type | Description |
 |---|---|---|
 | `hf_config` | `PretrainedConfig` | Loaded automatically via `get_hf_config(model)` |
 | `generation_config` | `GenerationConfig` | Loaded automatically via `get_generation_config(model)` |
+| `mamba_equiv_per_req` | `int` | Number of KV cache block equivalents reserved per request for GDN recurrent state (hybrid models only); computed by `ModelRunner.get_num_blocks()` |
+| `num_mamba_groups` | `int` | Number of per-request GDN state slot groups available (= `max_num_seqs` for hybrid models, 0 otherwise); computed by `ModelRunner.get_num_blocks()` |
+| `max_mamba_slots` | `int` | Maximum number of GDN state slots (including slots for speculative tokens); computed by `ModelRunner.get_num_blocks()` |
 
 ---
 
@@ -242,10 +245,55 @@ method with `num_speculative_tokens=1` is supported.
 | `num_speculative_tokens` | `Optional[int]` | `None` | Number of speculative tokens per iteration; **must be `1`** |
 | `draft_model_hf_config` | `Optional[PretrainedConfig]` | `None` | HuggingFace config for the draft model; auto-loaded from `model` when `None` |
 
-**Post-init behaviour:**
+### 5.1 Table-Driven MTP Config
+
+MTP configuration uses two class-level lookup tables to support multiple model
+families without per-model branching.
+
+**`_MTP_TYPE_MAP`** -- maps a base `model_type` to its MTP `model_type`:
+
+| Base `model_type` | MTP `model_type` |
+|---|---|
+| `deepseek_v3` | `deepseek_mtp` |
+| `glm_moe_dsa` | `deepseek_mtp` |
+| `qwen3_next` | `qwen3_next_mtp` |
+| `qwen3_5` | `qwen3_5_mtp` |
+| `qwen3_5_moe` | `qwen3_5_mtp` |
+| `qwen3_5_text` | `qwen3_5_mtp` |
+| `qwen3_5_moe_text` | `qwen3_5_mtp` |
+
+**`_MTP_CONFIG`** -- maps MTP `model_type` to a `(n_predict_attr, architecture)` tuple:
+
+| MTP `model_type` | `n_predict_attr` | Architecture |
+|---|---|---|
+| `deepseek_mtp` | `num_nextn_predict_layers` | `DeepSeekMTPModel` |
+| `qwen3_next_mtp` | `num_nextn_predict_layers` | `Qwen3NextMTPModel` |
+| `qwen3_5_mtp` | `mtp_num_hidden_layers` | `Qwen3_5MTPModel` |
+
+### 5.2 Post-init behaviour (`hf_config_override`)
+
+The static method `hf_config_override` applies a two-step transformation to the
+draft model's HuggingFace config:
+
+1. **Resolve model type** -- looks up `hf_config.model_type` in `_MTP_TYPE_MAP`.
+   If found, rewrites `model_type` to the MTP variant (e.g.
+   `deepseek_v3` -> `deepseek_mtp`).
+
+2. **Apply MTP overrides** -- looks up the (possibly rewritten) `model_type` in
+   `_MTP_CONFIG`. If found:
+   - Reads `n_predict` from the model-specific attribute (e.g.
+     `num_nextn_predict_layers` or `mtp_num_hidden_layers`), defaulting to 1.
+     Warns and forces it to 1 if the original value differs.
+   - Sets `n_predict=1`, `num_nextn_predict_layers=1` (universal across all MTP
+     families), and `architectures` to the corresponding MTP model class.
+   - **Qwen3.5 MTP only**: additionally injects `n_shared_experts=1` and
+     `n_routed_experts` (read from `hf_config.num_experts`, default 0) so the
+     MTP module can construct its MoE layer.
+
+Other post-init steps:
 
 - Loads `draft_model_hf_config` from `model` if not provided.
-- For DeepSeek V3 / MTP models: overrides `model_type` to `"deepseek_mtp"`, sets `n_predict=1` and `num_nextn_predict_layers=1`, and switches architectures to `["DeepSeekMTPModel"]`.
+- Extracts `text_config` from multimodal model configs when present.
 - `Config.__post_init__` raises `ValueError` if `num_speculative_tokens != 1`.
 
 ---
