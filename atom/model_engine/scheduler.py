@@ -290,6 +290,12 @@ class ScheduledBatch:
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
 
+        # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
+        # logger.info(f"{self.num_scheduled_tokens=}")
+        # logger.info(f"{self.context_lens=}")
+        # logger.info(f"{[len(blk)*16 for blk in self.block_tables]=}")
+        # logger.info(f"{self.block_tables=}")
+
 
 class ScheduledBatchOutput:
     """Token-level results from a single forward pass.
@@ -361,7 +367,9 @@ class Scheduler:
 
         # Scheduling delay for batching efficiency
         self.prev_time = 0.0
+        # Did we schedule a prompt at previous step?
         self.prev_prompt = False
+        # Latency of the last prompt step
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
 
@@ -480,6 +488,7 @@ class Scheduler:
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True
+            # lip: TODO for prefill/decode mixed batch
 
             connector_meta_output = None
             if self.kv_connector is not None:
@@ -581,6 +590,7 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
+            # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
                 continue
@@ -597,6 +607,9 @@ class Scheduler:
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
+                # logger.info(
+                #     f"{seq.id=}, {num_new_token=} {num_rejected=} {self.mtp_k} {token_ids=} {seq.token_ids[-8:]=}"
+                # )
             else:
                 num_rejected = 0
                 num_bonus = 0
@@ -627,6 +640,7 @@ class Scheduler:
                         leave_reason = "stop_sequence"
                         break
             else:
+                # Check the last token in the list for EOS
                 if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
                     leave_reason = "eos"
                 elif not seq.ignore_eos and any(
@@ -668,6 +682,9 @@ class Scheduler:
                 )
 
             if leave_reason is not None:
+                # logger.info(
+                #     f"Sequence {seq.id} finished with reason: {leave_reason}, {seq.token_ids[-8:]=}"
+                # )
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
@@ -677,12 +694,15 @@ class Scheduler:
             stream_output_queue.put_nowait(stream_outputs)
 
         if need_placeholder:
+            # placeholder for the each decode step
             for seq in seqs:
                 if seq.status == SequenceStatus.RUNNING:
                     num = num_placeholder - seq.num_rejected
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
-
+                    # logger.info(
+                    #     f"{seq.id=}, added {num}, total tokens now: {seq.num_tokens}"
+                    # )
         for seq in finished_seqs:
             logger.debug("Freeing blocks for finished seq %s", seq.id)
             if self.kv_connector is not None:

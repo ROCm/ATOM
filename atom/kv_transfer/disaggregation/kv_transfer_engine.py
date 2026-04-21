@@ -369,9 +369,7 @@ class MoRIIOWrapper:
             raise RuntimeError("input tensor must be contiguous")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
-        device_id = (
-            tensor.device.index if tensor.device.index is not None else -1
-        )
+        device_id = tensor.device.index if tensor.device.index is not None else -1
         return self.register_local_buffer(ptr, size, device_id)
 
     def get_unpack_memory_metadata(self, packed_memory_metadata):
@@ -665,8 +663,10 @@ class KVConnector(KVConnectorBase):
         logger.info(
             "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
             "poll_mode=%s, notification=%s",
-            qp_per_transfer, num_worker_threads,
-            poll_mode.name, enable_notification,
+            qp_per_transfer,
+            num_worker_threads,
+            poll_mode.name,
+            enable_notification,
         )
         self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
 
@@ -696,7 +696,6 @@ class KVConnector(KVConnectorBase):
             max_workers=1,
             thread_name_prefix="atom-moriio-handshake-initiator",
         )
-
 
         # In-flight receive transfers
         self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)
@@ -766,21 +765,20 @@ class KVConnector(KVConnectorBase):
 
             if not is_mla:
                 v_device_id = (
-                    v_cache.device.index
-                    if v_cache.device.index is not None
-                    else -1
+                    v_cache.device.index if v_cache.device.index is not None else -1
                 )
                 v_chunks, _ = _chunk_tensor_for_rdma(v_cache, 1)
                 for ptr, size in v_chunks:
                     meta_list.append(
-                        self.moriio_wrapper.register_local_buffer(ptr, size, v_device_id)
+                        self.moriio_wrapper.register_local_buffer(
+                            ptr, size, v_device_id
+                        )
                     )
 
             self.layer_name_to_local_kv_cache_metadata[layer_name] = meta_list
 
         logger.info(
-            "RDMA chunked registration: %d K chunks + %d V chunks, "
-            "%d blocks/chunk",
+            "RDMA chunked registration: %d K chunks + %d V chunks, " "%d blocks/chunk",
             self.num_k_chunks,
             len(meta_list) - self.num_k_chunks,
             self.blocks_per_chunk,
@@ -1032,8 +1030,8 @@ class KVConnector(KVConnectorBase):
                     for rci in range(nk):
                         local_md = _unpack(local_metas[lci])
                         remote_md = _unpack(remote_metas[rci])
-                        k_sessions[(lci, rci)] = (
-                            self.moriio_wrapper.build_session(local_md, remote_md)
+                        k_sessions[(lci, rci)] = self.moriio_wrapper.build_session(
+                            local_md, remote_md
                         )
 
                 # V sessions: NxN grid over entries [nk:]
@@ -1043,8 +1041,8 @@ class KVConnector(KVConnectorBase):
                     for rci in range(nv):
                         local_md = _unpack(local_metas[nk + lci])
                         remote_md = _unpack(remote_metas[nk + rci])
-                        v_sessions[(lci, rci)] = (
-                            self.moriio_wrapper.build_session(local_md, remote_md)
+                        v_sessions[(lci, rci)] = self.moriio_wrapper.build_session(
+                            local_md, remote_md
                         )
 
                 per_layer_sessions.append((k_sessions, v_sessions))
