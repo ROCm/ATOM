@@ -222,10 +222,20 @@ jobs:
           fi
           GPU_VRAM_GB=$(docker exec atom-benchmark rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
           ROCM_VERSION=$(docker exec atom-benchmark cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
+          DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
+          if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
+            RESOLVED_IMAGE=""
+            if RESOLUTION_JSON="$(python3 .github/scripts/resolve_atom_image.py --repository rocm/atom-dev --reference-tag latest --image-family native 2>/dev/null)"; then
+              RESOLVED_IMAGE="$(echo "$RESOLUTION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("resolved_image",""))')" || true
+            fi
+            DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
+          fi
           echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
           echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
           echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
-          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+          echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}, Docker: ${DOCKER_IMAGE}"
 
       - name: Download models
         run: |
@@ -269,7 +279,7 @@ jobs:
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
-            -e DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}" \
+            -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
             -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
             -e DISPLAY_NAME="${{ matrix.model.display }}" \
             atom-benchmark python3 -c "
