@@ -5,10 +5,10 @@ set -euo pipefail
 #
 # Optional env (with defaults):
 #   CONTAINER=atom_sglang_mesh
-#   DOCKER_IMAGE=sglang-atom-mesh-20260420-v0.1:latest
+#   DOCKER_IMAGE=rocm/atom-dev:mesh-sglang-latest
 
 CONTAINER="${CONTAINER:-atom_sglang_mesh}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-sglang-atom-mesh-20260420-v0.1:latest}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
 
 echo "[docker] starting container=${CONTAINER} image=${DOCKER_IMAGE}"
 
