@@ -1,5 +1,5 @@
 # Default base images
-ARG BASE_IMAGE="rocm/pytorch:latest"
+ARG BASE_IMAGE="rocm/pytorch:rocm7.2.2_ubuntu22.04_py3.10_pytorch_release_2.10.0"
 ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
@@ -18,7 +18,7 @@ LABEL com.rocm.atom.vllm_commit="${VLLM_COMMIT}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV MAX_JOBS=${MAX_JOBS}
-ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}"
 ENV VLLM_TARGET_DEVICE=rocm
 ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 
@@ -42,10 +42,10 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     echo "========== [OOT 2/7] Back up base image triton ==========" && \
     BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
     mkdir -p /tmp/triton-base-backup && \
-    cp -a /opt/venv/lib/python3.12/site-packages/triton /tmp/triton-base-backup/ && \
+    cp -a /opt/venv/lib/python3.10/site-packages/triton /tmp/triton-base-backup/ && \
     MATCHED_DIST_INFO="" && \
     MATCH_COUNT=0 && \
-    for f in /opt/venv/lib/python3.12/site-packages/triton-*.dist-info; do \
+    for f in /opt/venv/lib/python3.10/site-packages/triton-*.dist-info; do \
       [ -d "$f" ] || continue; \
       DIST_VERSION="$(awk -F': ' '$1 == "Version" { print $2; exit }' "$f/METADATA")"; \
       if [ "${DIST_VERSION}" = "${BASE_TRITON_VERSION}" ]; then \
@@ -56,7 +56,7 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     done && \
     if [ "${MATCH_COUNT}" -ne 1 ]; then \
       echo "ERROR: Expected exactly one triton dist-info matching imported version ${BASE_TRITON_VERSION}, found ${MATCH_COUNT}." && \
-      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true && \
+      ls -d /opt/venv/lib/python3.10/site-packages/triton-*.dist-info || true && \
       exit 1; \
     fi && \
     echo "Base image triton backed up: version=${BASE_TRITON_VERSION}, dist-info=${MATCHED_DIST_INFO}"
@@ -108,21 +108,21 @@ RUN echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
 # behavior and fail fast if `pip show triton` would disagree with `import triton`.
 RUN echo "========== [OOT] Restore base image triton ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
-    rm -rf /opt/venv/lib/python3.12/site-packages/triton \
-           /opt/venv/lib/python3.12/site-packages/triton-*.dist-info && \
-    cp -a /tmp/triton-base-backup/triton /opt/venv/lib/python3.12/site-packages/ && \
+    rm -rf /opt/venv/lib/python3.10/site-packages/triton \
+           /opt/venv/lib/python3.10/site-packages/triton-*.dist-info && \
+    cp -a /tmp/triton-base-backup/triton /opt/venv/lib/python3.10/site-packages/ && \
     RESTORED_DIST_INFO="" && \
     RESTORED_COUNT=0 && \
     for f in /tmp/triton-base-backup/triton-*.dist-info; do \
       [ -d "$f" ] || continue; \
-      cp -a "$f" /opt/venv/lib/python3.12/site-packages/; \
+      cp -a "$f" /opt/venv/lib/python3.10/site-packages/; \
       RESTORED_DIST_INFO="$(basename "$f")"; \
       RESTORED_COUNT=$((RESTORED_COUNT + 1)); \
     done && \
     rm -rf /tmp/triton-base-backup && \
     if [ "${RESTORED_COUNT}" -ne 1 ]; then \
       echo "ERROR: Expected exactly one restored triton dist-info, found ${RESTORED_COUNT}." && \
-      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true && \
+      ls -d /opt/venv/lib/python3.10/site-packages/triton-*.dist-info || true && \
       exit 1; \
     fi && \
     "${VENV_PYTHON}" -m pip show triton > /tmp/triton_pip_show.txt && \
@@ -131,7 +131,7 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     if [ -z "${PIP_TRITON_VERSION}" ] || [ "${PIP_TRITON_VERSION}" != "${IMPORT_TRITON_VERSION}" ]; then \
       echo "ERROR: pip show triton reports '${PIP_TRITON_VERSION}', but import triton reports '${IMPORT_TRITON_VERSION}'." && \
       cat /tmp/triton_pip_show.txt || true && \
-      ls -d /opt/venv/lib/python3.12/site-packages/triton-*.dist-info || true && \
+      ls -d /opt/venv/lib/python3.10/site-packages/triton-*.dist-info || true && \
       exit 1; \
     fi && \
     echo "Restored base image triton: version=${IMPORT_TRITON_VERSION}, dist-info=${RESTORED_DIST_INFO}" && \
@@ -187,7 +187,8 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     rm -f pyproject.toml && \
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
-    "${VENV_PYTHON}" -c "import tomllib; from pathlib import Path; deps = tomllib.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'transformers==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
+    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'transformers==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       -r /tmp/sglang-runtime-common.txt \
       airportsdata \
@@ -199,6 +200,7 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       nest_asyncio \
       outlines_core==0.1.26 \
       pycountry \
+      pybase64 \
       referencing \
       safetensors && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps \
@@ -338,16 +340,105 @@ COPY --from=build_mori /opt/venv /opt/venv
 COPY --from=build_mori /app/mori /app/mori
 RUN pip show mori || true
 
+# ========== Mooncake TransferEngine ==========
+# Mooncake and Rust apt operations MUST run before the RCCL dpkg -i --force-all
+# step below, because that step overwrites the Ubuntu-repo rccl with a custom
+# ROCm build whose version string doesn't match rocm-hip's declared dependency,
+# leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
+ARG INSTALL_MOONCAKE=1
+ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ARG MOONCAKE_COMMIT="v0.3.10.post1"
+ARG VENV_PYTHON="/opt/venv/bin/python"
+
+# [MC 1/4] Clone
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 1/4] Clone Mooncake =========="; \
+        git clone --depth 1 ${MOONCAKE_REPO} /app/mooncake && \
+        if [ -n "${MOONCAKE_COMMIT}" ]; then \
+            cd /app/mooncake && git fetch --depth 1 origin "${MOONCAKE_COMMIT}" && git checkout FETCH_HEAD; \
+        fi && \
+        cd /app/mooncake && echo "Mooncake commit: $(git rev-parse HEAD)"; \
+    else \
+        echo "========== Skipped Mooncake (INSTALL_MOONCAKE=0) =========="; \
+    fi
+
+# [MC 2/4] Install dependencies (system packages + yalantinglibs + Go + submodules)
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
+        apt-get update \
+        && cd /app/mooncake && bash dependencies.sh -y; \
+    fi
+
+# [MC 3/4] CMake build with HIP support
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 3/4] Build Mooncake (USE_HIP=ON) =========="; \
+        mkdir -p /app/mooncake/build && cd /app/mooncake/build \
+        && cmake .. \
+            -DUSE_HIP=ON \
+            -DUSE_TCP=ON \
+            -DUSE_HTTP=ON \
+            -DUSE_CUDA=OFF \
+            -DBUILD_UNIT_TESTS=ON \
+            -DBUILD_EXAMPLES=OFF \
+            -DWITH_STORE=OFF \
+            -DWITH_STORE_RUST=OFF \
+            -DWITH_P2P_STORE=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+        && make -j$(nproc); \
+    fi
+
+# [MC 4/4] Install Python wheel, copy artifacts, clean up
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 4/4] Install Mooncake Python package =========="; \
+        cd /app/mooncake \
+        && "${VENV_PYTHON}" -m pip install mooncake-wheel/ \
+        && MOONCAKE_PKG=$("${VENV_PYTHON}" -c "import mooncake, os; print(os.path.dirname(mooncake.__file__))") \
+        && cp build/mooncake-integration/engine.cpython-310-x86_64-linux-gnu.so \
+              "${MOONCAKE_PKG}/engine.so" \
+        && cp build/mooncake-asio/libasio.so \
+              "${MOONCAKE_PKG}/" \
+        && echo "Mooncake engine.so linkage:" \
+        && ldd "${MOONCAKE_PKG}/engine.so" | grep -E "hip|cuda" || true \
+        && echo "--- Save RDMA test binaries ---" \
+        && mkdir -p /usr/local/bin/mooncake-tests \
+        && cp build/mooncake-transfer-engine/tests/rdma_loopback_test \
+              build/mooncake-transfer-engine/tests/rdma_transport_test \
+              build/mooncake-transfer-engine/tests/rdma_transport_test2 \
+              /usr/local/bin/mooncake-tests/ 2>/dev/null || true \
+        && ls -lh /usr/local/bin/mooncake-tests/ \
+        && echo "--- Clean up build artifacts ---" \
+        && rm -rf /app/mooncake/build /app/mooncake/.git; \
+    fi
+
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.10/site-packages/mooncake:${LD_LIBRARY_PATH}"
+
+# ========== Install Rust toolchain ==========
+ARG RUST_VERSION="1.94.0"
+
+RUN echo "========== Install Rust toolchain ==========" \
+    && apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
+    && . "$HOME/.cargo/env" \
+    && rustc --version && cargo --version
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 # RCCL: install .deb from build stage
+# WARNING: dpkg -i --force-all overwrites Ubuntu-repo rccl with the ROCm custom
+# build, breaking rocm-hip's version dep in dpkg metadata. All apt-get install
+# operations (Mooncake, Rust, etc.) MUST be completed before this step.
 COPY --from=build_rccl /app/rccl/build/release/*.deb /tmp/rccl/
 RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
     rm -rf /tmp/rccl
 
 # Triton: copy package from build stage into current venv
 # Use RUN --mount to avoid COPY glob issues, and preserve mori already in venv
-RUN --mount=from=build_triton,source=/opt/venv/lib/python3.12/site-packages,target=/triton-pkgs \
-    cp -a /triton-pkgs/triton /opt/venv/lib/python3.12/site-packages/ && \
-    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.12/site-packages/ && \
+RUN --mount=from=build_triton,source=/opt/venv/lib/python3.10/site-packages,target=/triton-pkgs \
+    cp -a /triton-pkgs/triton /opt/venv/lib/python3.10/site-packages/ && \
+    cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.10/site-packages/ && \
     pip show triton
 
 # Aiter: copy compiled source tree + re-register editable install
