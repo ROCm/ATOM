@@ -5,7 +5,7 @@ from functools import cache
 from typing import Type
 
 from atom.model_ops.attentions.backends import AttentionBackend
-from atom.utils import resolve_obj_by_qualname
+from atom.utils import envs, resolve_obj_by_qualname
 from atom.plugin.prepare import is_vllm
 
 
@@ -40,13 +40,9 @@ def _cached_get_attn_backend(
 
 def get_attn_backend_cls(block_size, use_mla, use_gdn, use_vllm) -> str:
     if use_mla:
-        # if block_size == 1:
-        return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"  # noqa: E501
-        # else:
-        #     raise ValueError(
-        #         f" The selected backend"
-        #         f"does not support block size {block_size}."
-        #         "(currently only supports block size 1)")
+        if envs.ATOM_USE_TRITON_MLA:
+            return "atom.model_ops.attentions.triton_mla.TritonMLABackend"
+        return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"
     if use_gdn:
         if use_vllm:
             return "atom.plugin.vllm.attention_backend.gdn_attn.GDNAttentionBackend"
