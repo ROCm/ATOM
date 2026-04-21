@@ -215,7 +215,7 @@ def init_sgl_attrs(
 def mla_absorbed_bmm(
     attn: DeepseekV2MLAAttention,
     inp: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     weight_scale: Optional[torch.Tensor],
     weight_scale_k: Optional[torch.Tensor],
     out_dim: int,
@@ -226,6 +226,13 @@ def mla_absorbed_bmm(
     inp: (num_tokens, num_heads, in_dim) — token-major
     Returns: (num_tokens, num_heads, out_dim) — token-major
     """
+    # LOAD_DUMMY skips weight loading; return zeros for CUDAGraph capture.
+    if weight is None:
+        return torch.zeros(
+            inp.shape[0], attn.num_local_heads, out_dim,
+            dtype=inp.dtype, device=inp.device,
+        )
+
     effective_weight_scale = (
         weight_scale_k if weight_scale_k is not None else weight_scale
     )
@@ -316,6 +323,13 @@ def mla_v_up_proj(
     out_dim: int,
 ) -> torch.Tensor:
     """Project MLA decode output to a flat o_proj input."""
+    # LOAD_DUMMY skips weight loading; return zeros for CUDAGraph capture.
+    if weight is None:
+        return torch.zeros(
+            (inp.shape[0], attn.num_local_heads * out_dim),
+            dtype=inp.dtype, device=inp.device,
+        )
+
     effective_weight_scale = (
         weight_scale_k if weight_scale_k is not None else weight_scale
     )
