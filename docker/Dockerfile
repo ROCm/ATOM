@@ -26,6 +26,8 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     apt-get update && \
     apt --fix-broken install -y && \
     apt-get install -y --no-install-recommends ca-certificates jq ninja-build vim && \
+    "${VENV_PYTHON}" -m pip install --upgrade cmake && \
+    cmake --version && \
     mkdir -p /usr/local/bin && \
     ln -sf "$(command -v ninja)" /usr/local/bin/ninja && \
     /usr/local/bin/ninja --version && \
