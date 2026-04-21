@@ -729,6 +729,153 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         param.weight_loader_process(param_data, loaded_weight)
 
 
+class QKVGParallelLinear(ColumnParallelLinear):
+    """QKV + output-Gate parallel linear.
+
+    Rearranges interleaved Q+Gate weights from HF checkpoint into grouped
+    layout [Gate, Q, K, V] during loading, so inference uses a single split().
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int | None = None,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        source_quant_dtype: torch.dtype | None = None,
+        prefix: str = "",
+        **kwargs,
+    ):
+        self.head_size = head_size
+        self.total_num_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads or total_num_heads
+        tp_size = get_tp_group().world_size
+        self.num_heads = divide(self.total_num_heads, tp_size)
+        if self.total_num_kv_heads >= tp_size:
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+        else:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+
+        input_size = hidden_size
+        output_sizes = [
+            self.num_heads * self.head_size * tp_size,  # Gate
+            self.num_heads * self.head_size * tp_size,  # Q
+            self.num_kv_heads * self.head_size * tp_size,  # K
+            self.num_kv_heads * self.head_size * tp_size,  # V
+        ]
+
+        super().__init__(
+            input_size,
+            output_sizes,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+        )
+
+    def _deinterleave(
+        self, weight: torch.Tensor, head_stride: int | None = None
+    ) -> torch.Tensor:
+        """Rearrange Q+Gate from interleaved [q0,g0,q1,g1,...] to grouped [Q_all, Gate_all].
+
+        Args:
+            head_stride: number of elements per head along dim 0.
+                         Defaults to self.head_size (weights); use head_size//128
+                         for per-1x128 scales.
+        """
+        hs = head_stride if head_stride is not None else self.head_size
+        return (
+            weight.view(self.num_heads, 2, hs, -1)
+            .transpose(0, 1)
+            .reshape(self.num_heads * 2 * hs, -1)
+        )
+
+    def weight_loader(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
+    ):
+        param_data = param.data
+        assert loaded_shard_id in ["q", "k", "v"]
+        q_size = self.num_heads * self.head_size
+        kv_size = self.num_kv_heads * self.head_size
+        # Layout: [Gate, Q, K, V]
+        if loaded_shard_id == "q":
+            # HF q_proj contains interleaved Q+Gate; deinterleave then
+            # write Gate to offset 0 and Q to offset q_size
+            shard_size = q_size * 2
+            shard_offset = 0  # placeholder, handled below
+            shard_rank = self.tp_rank
+        elif loaded_shard_id == "k":
+            shard_size = kv_size
+            shard_offset = q_size * 2
+            shard_rank = self.tp_rank // self.num_kv_head_replicas
+        else:
+            shard_size = kv_size
+            shard_offset = q_size * 2 + kv_size
+            shard_rank = self.tp_rank // self.num_kv_head_replicas
+
+        is_scale = param is getattr(self, "weight_scale", None) or param is getattr(
+            self, "input_scale", None
+        )
+
+        if loaded_shard_id == "q":
+            # Q+Gate: deinterleave [q0,g0,...] -> [Q_all, Gate_all], then
+            # write Gate to offset 0 and Q to offset q_size → layout [Gate, Q, ...]
+            if is_scale and self.quant_type == QuantType.per_Tensor:
+                loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
+                # Gate scale -> slot 0, Q scale -> slot 1
+                q_scale = loaded_weight.narrow(self.tp_dim, shard_rank, 1)
+                param.weight_loader_process(
+                    param_data.narrow(self.tp_dim, 0, 1), q_scale.clone()
+                )
+                param.weight_loader_process(
+                    param_data.narrow(self.tp_dim, 1, 1), q_scale
+                )
+                return
+
+            scale_factor = (
+                128 if (is_scale and self.quant_type == QuantType.per_1x128) else 1
+            )
+            half = q_size // scale_factor
+            start_idx = shard_rank * shard_size // scale_factor
+            loaded_weight = loaded_weight.narrow(
+                self.tp_dim, start_idx, shard_size // scale_factor
+            )
+            stride = self.head_size // scale_factor
+            loaded_weight = self._deinterleave(
+                loaded_weight, head_stride=stride if scale_factor > 1 else None
+            )
+            q_part = loaded_weight.narrow(self.tp_dim, 0, half)
+            gate_part = loaded_weight.narrow(self.tp_dim, half, half)
+            q_offset = q_size // scale_factor
+            # Gate at offset 0, Q at offset q_size
+            param.weight_loader_process(
+                param_data.narrow(self.tp_dim, 0, half), gate_part
+            )
+            param.weight_loader_process(
+                param_data.narrow(self.tp_dim, q_offset, half), q_part
+            )
+        else:
+            # K or V: straightforward load
+            if is_scale:
+                if self.quant_type == QuantType.per_1x128:
+                    shard_offset //= 128
+                    shard_size //= 128
+                elif self.quant_type == QuantType.per_Tensor:
+                    loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
+                    # [Gate, Q, K, V] -> K=2, V=3
+                    shard_offset = {"k": 2, "v": 3}[loaded_shard_id]
+                    shard_size = 1
+
+            start_idx = shard_rank * shard_size
+            param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+            loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+            param.weight_loader_process(param_data, loaded_weight)
+
+
 class QKVParallelLinear(ColumnParallelLinear):
     def __init__(
         self,

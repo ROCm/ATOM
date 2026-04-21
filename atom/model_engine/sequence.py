@@ -56,7 +56,7 @@ class Sequence:
         self.num_rejected = 0
         self.num_cached_tokens = 0
         self.block_table = []
-        self.mamba_block_table = []
+        self.mamba_state_slot = -1  # per-request recurrent state slot index
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -96,11 +96,6 @@ class Sequence:
     def num_tokens(self, value):
         self._num_tokens = value
         self.num_blocks = (value + self.block_size - 1) // self.block_size
-        # for mamba-like arch, we need to make sure there are always 1 + spec number of blocks
-        if self.mamba_enabled:
-            self.num_mamba_blocks = 1 + self.num_draft_tokens
-        else:
-            self.num_mamba_blocks = 0
         self.last_block_num_tokens = (
             self._num_tokens - (self.num_blocks - 1) * self.block_size
         )

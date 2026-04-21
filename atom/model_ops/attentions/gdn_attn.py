@@ -11,7 +11,11 @@ from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, Context
 
-from .aiter_attention import AiterBackend, AiterAttentionMetadataBuilder
+from .aiter_attention import (
+    AiterBackend,
+    AiterAttentionMetadataBuilder,
+    kv_indices_generate_triton,
+)
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -134,16 +138,18 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
-        for idx, mamba_block_table in enumerate(batch.mamba_block_tables):
+        slots_per_group = 1 + self.num_spec
+        for idx, slot_group in enumerate(batch.mamba_state_slots):
             non_spec_state_indices[idx] = 0
             spec_state_indices[idx] = 0
+            base = slot_group * slots_per_group
 
             if not with_spec:
-                non_spec_state_indices[idx] = mamba_block_table[0]
+                non_spec_state_indices[idx] = base
             else:
-                spec_state_indices[idx, : 1 + self.num_spec] = mamba_block_table[
-                    : 1 + self.num_spec
-                ]
+                spec_state_indices[idx, : 1 + self.num_spec] = np.arange(
+                    base, base + 1 + self.num_spec
+                )
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
         self.num_accepted_tokens.fill_(1)
@@ -322,6 +328,37 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions
+
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        only_update: bool = False,
+        num_reject_tokens=None,
+    ):
+        var = self.model_runner.forward_vars
+
+        # GDN hybrid models use paged KV cache for full-attention layers.
+        # Regenerate kv_indices for the new max_seqlen_k after adding a
+        # draft token; kv_indptr stays unchanged (block count is stable).
+        # Note: only_update and num_reject_tokens are unused here — GDN's
+        # paged attention does not use persistent worker buffers that need
+        # incremental updates (unlike MLA). The full kv_indices regeneration
+        # is always correct regardless of the update mode.
+        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+        kv_indices_generate_triton(
+            var["block_tables"].gpu[:bs],
+            var["kv_indices"].gpu,
+            kv_indptr,
+            self.block_ratio,
+            max_seqlen_k,
+        )
+
+        result = {}
+        if self.block_size == 1024:
+            result = self.set_aiter_persistent_worker_buffers(bs)
+        return result
 
     def build_for_cudagraph_capture(self, bs: int):
         var = self.model_runner.forward_vars

@@ -1,6 +1,6 @@
 # Qwen3.5 with ATOM vLLM Plugin Backend
 
-This recipe shows how to run `Qwen3.5-35B-A3B-Instruct-FP8` and `Qwen3.5-397B-A5B-Instruct-FP8` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
+This recipe shows how to run `Qwen3.5-35B-A3B-Instruct-FP8`, `Qwen3.5-397B-A17B-FP8`, and `Qwen3.5-397B-A17B-MXFP4` with the ATOM vLLM plugin backend. For background on the plugin backend, see [ATOM vLLM Plugin Backend](../../docs/vllm_plugin_backend_guide.md).
 
 ## Step 1: Pull the OOT Docker
 
@@ -15,7 +15,9 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 ### Qwen3.5-35B-A3B (TP=2)
 
 ```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
 
 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
     --host localhost \
@@ -32,7 +34,9 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
 ### Qwen3.5-397B-A17B (TP=8)
 
 ```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
 
 vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
     --host localhost \
@@ -46,7 +50,30 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
     --no-enable-prefix-caching
 ```
 
-**Important**: `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` is required for Qwen3.5 because it uses a hybrid architecture with both linear attention (GatedDeltaNet) and full attention layers. This env var ensures full attention layers use vLLM's default implementation.
+### Qwen3.5-397B-A17B-MXFP4 (TP=4)
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export ATOM_USE_CUSTOM_ALL_GATHER=0
+
+vllm serve amd/Qwen3.5-397B-A17B-MXFP4 \
+    --host localhost \
+    --port 8000 \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype fp8 \
+    --gpu_memory_utilization 0.9 \
+    --async-scheduling \
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+    --max-model-len 16384 \
+    --no-enable-prefix-caching
+```
+
+**Important**: The following three environment variables are required for Qwen3.5:
+
+- `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: Disables ATOM attention plugin to use vLLM's implementation for full attention layers (required because Qwen3.5 uses a hybrid architecture with both linear attention (GatedDeltaNet) and full attention layers)
+- `ATOM_USE_CUSTOM_ALL_GATHER=0`: Disables custom all-gather for compatibility with Qwen3.5 model architecture
+- `AITER_QUICK_REDUCE_QUANTIZATION=INT4`: **Performance optimization** - enables INT4 quantization for quick reduce operations, which can significantly improve TTFT (Time To First Token) performance. **Note**: This optimization may introduce a risk of accuracy degradation. For accuracy-critical workloads, consider validating with your specific use case.
 
 ## Step 3: Performance Benchmark
 
@@ -85,10 +112,33 @@ lm_eval --model local-completions \
         --num_fewshot 3
 ```
 
+### Qwen3.5-397B-A17B-MXFP4 accuracy example
+
+```bash
+lm_eval --model local-completions \
+        --model_args model=amd/Qwen3.5-397B-A17B-MXFP4,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+        --tasks gsm8k \
+        --num_fewshot 5
+```
+
+Reference result (TP=4):
+
+```bash
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.8332|±  |0.0103|
+|     |       |strict-match    |     5|exact_match|↑  |0.8218|±  |0.0105|
+```
+
 
 ## Key Environment Variables
 
 - `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1`: **Required** - disables ATOM attention plugin to use vLLM's implementation for full attention layers
+- `ATOM_USE_CUSTOM_ALL_GATHER=0`: **Required** - disables custom all-gather for compatibility with Qwen3.5 model architecture
+- `AITER_QUICK_REDUCE_QUANTIZATION=INT4`: **Performance optimization** - enables INT4 quantization for quick reduce operations
+  - **Benefit**: Significantly improves TTFT (Time To First Token) performance by reducing communication overhead during tensor parallelism all-reduce operations
+  - **Risk**: May cause slight accuracy degradation due to lower quantization precision
+  - **Recommendation**: Use for latency-sensitive workloads where TTFT is critical. For accuracy-critical applications, validate with your specific dataset or consider removing this flag
 
 
 ## Performance baseline

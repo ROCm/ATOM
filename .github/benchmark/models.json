@@ -20,7 +20,7 @@
     "env_vars": ""
   },
   {
-    "display": "DeepSeek-R1-0528 MXFP4",
+    "display": "DeepSeek-R1-0528-MXFP4",
     "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "prefix": "deepseek-r1-0528-mxfp4",
     "args": "--kv_cache_dtype fp8 -tp 4",
@@ -30,7 +30,7 @@
     "env_vars": ""
   },
   {
-    "display": "DeepSeek-R1-0528 MXFP4-MTP3",
+    "display": "DeepSeek-R1-0528-MXFP4 MTP3",
     "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "prefix": "deepseek-r1-0528-mxfp4",
     "args": "--kv_cache_dtype fp8 -tp 4 --method mtp --num-speculative-tokens 3",
@@ -93,7 +93,37 @@
     "display": "MiniMax-M2.5-MXFP4",
     "path": "amd/MiniMax-M2.5-MXFP4",
     "prefix": "MiniMax-M2.5-MXFP4",
-    "args": "--kv_cache_dtype fp8 --trust-remote-code",
+    "args": "--kv_cache_dtype fp8 -tp 1 --trust-remote-code",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "Qwen3.5-397B-A17B-FP8",
+    "path": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "prefix": "qwen35-397b-fp8",
+    "args": "--kv_cache_dtype fp8 -tp 4",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "Qwen3.5-397B-A17B-FP8 MTP3",
+    "path": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "prefix": "qwen35-397b-fp8",
+    "args": "--kv_cache_dtype fp8 -tp 4 --method mtp --num-speculative-tokens 3",
+    "bench_args": "",
+    "suffix": "-mtp3",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "Qwen3.5-397B-A17B-MXFP4",
+    "path": "amd/Qwen3.5-397B-A17B-MXFP4",
+    "prefix": "qwen35-397b-mxfp4",
+    "args": "--kv_cache_dtype fp8 -tp 4",
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",

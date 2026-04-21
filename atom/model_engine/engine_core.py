@@ -77,7 +77,10 @@ class EngineCore:
                 "atom.model_engine.model_runner.ModelRunner",
                 config,
             )
-            num_blocks = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            num_blocks = block_info["num_kvcache_blocks"]
+            config.mamba_equiv_per_req = block_info.get("mamba_equiv_per_req", 0)
+            config.num_mamba_groups = block_info.get("num_mamba_groups", 0)
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
