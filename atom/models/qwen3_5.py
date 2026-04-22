@@ -244,6 +244,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
+        x_fp8=None,
+        x_scale=None,
     ):
         """
         Forward pass with three parts:
