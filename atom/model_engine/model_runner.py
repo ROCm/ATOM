@@ -552,6 +552,17 @@ class ModelRunner:
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
         )
+        use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
+        self.num_spec_tokens = (
+            self.config.speculative_config.num_speculative_tokens if use_spec else 0
+        )
+        self.tokenID_processor = tokenIDProcessor(
+            self,
+            self.config.max_num_batched_tokens,
+            use_spec,
+            self.num_spec_tokens,
+        )
+        self.sampler = Sampler()
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -595,14 +606,6 @@ class ModelRunner:
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
-        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
-        self.tokenID_processor = tokenIDProcessor(
-            self,
-            self.config.max_num_batched_tokens,
-            hasattr(self, "drafter"),
-            self.num_spec_tokens,
-        )
-        self.sampler = Sampler()
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
