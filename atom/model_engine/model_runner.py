@@ -450,6 +450,12 @@ class tokenIDProcessor:
                 if gathered_tokens is not None:
                     self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
         input_ids = self.input_ids.gpu[:total_tokens]
+        if self.use_spec and self.runner.rank == 0:
+            logger.info(
+                f"[MTP prepare_input_ids] {input_ids.tolist()} "
+                f"num_rejected={self.num_rejected[:batch.total_seqs_num].tolist()} "
+                f"num_bonus={self.num_bonus[:batch.total_seqs_num].tolist()}"
+            )
         return input_ids
 
     def prepare_draft_ids(
@@ -493,9 +499,10 @@ class ModelRunner:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
-        self.is_deepseek_v32 = (
-            hasattr(hf_config, "index_topk") if self.use_mla else False
-        )
+        # self.is_deepseek_v32 = (
+        #     hasattr(hf_config, "index_topk") if self.use_mla else False
+        # )
+        self.is_deepseek_v32 = False
         # Calculate local device rank considering both TP and DP
         # When data parallelism is enabled on the same node, different DP ranks
         # need to use different sets of GPUs

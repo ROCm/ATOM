@@ -1441,7 +1441,8 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        # self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = False
 
         if self.is_v32:
             self.indexer_rope_emb = get_rope(
@@ -1824,7 +1825,9 @@ class DeepseekV2Model(nn.Module):
         self.config = config
 
         self.vocab_size = config.vocab_size
-        self.is_v32 = hasattr(config, "index_topk")
+        # self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = False
+
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(

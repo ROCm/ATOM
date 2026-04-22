@@ -623,6 +623,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
+        if self.model_runner.rank == 0 and max_seqlen_q > 1 and not batch.is_dummy_run:
+            logger.info(
+                f"[MTP prepare_decode] positions={positions.tolist()} "
+                f"slot_mapping={slot_mapping[:sum_scheduled_tokens] if not isinstance(slot_mapping, list) else slot_mapping}"
+            )
 
         if any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
@@ -679,13 +684,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
                     sparse_per_token_lens, dtype=np.int32
                 )
-                logger.info(
-                    f"[sparse MTP prepare_decode] {scheduled_bs=} {max_seqlen_q=} "
-                    f"context_lens={context_lens[:scheduled_bs].tolist()} "
-                    f"per_token_kv_lens={per_token_kv_lens.tolist()} "
-                    f"sparse_per_token_lens={sparse_per_token_lens.tolist()} "
-                    f"sparse_kv_indptr={var['sparse_kv_indptr'].np[:sum_scheduled_tokens+1].tolist()}"
-                )
+                if self.model_runner.rank == 0:
+                    logger.info(
+                        f"[sparse MTP prepare_decode] {scheduled_bs=} {max_seqlen_q=} "
+                        f"context_lens={context_lens[:scheduled_bs].tolist()} "
+                        f"per_token_kv_lens={per_token_kv_lens.tolist()} "
+                        f"sparse_per_token_lens={sparse_per_token_lens.tolist()} "
+                        f"sparse_kv_indptr={var['sparse_kv_indptr'].np[:sum_scheduled_tokens+1].tolist()}"
+                    )
                 vars_used.append(("sparse_kv_indptr", sum_scheduled_tokens + 1))
                 vars_used.append(("sparse_cu_seqlens_q", sum_scheduled_tokens + 1))
                 metadata_deps.add("sparse_kv_indptr")
@@ -699,12 +705,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["sparse_kv_indptr"].np[scheduled_bs : bs + 1] = var[
                     "sparse_kv_indptr"
                 ].np[scheduled_bs]
-                logger.info(
-                    f"[sparse prepare_decode] {bs=} {scheduled_bs=} "
-                    f"context_lens={var['context_lens'].np[:bs].tolist()} "
-                    f"sparse_context_lens={sparse_context_lens.tolist()} "
-                    f"sparse_kv_indptr={var['sparse_kv_indptr'].np[:bs+1].tolist()}"
-                )
+                if self.model_runner.rank == 0:
+                    logger.info(
+                        f"[sparse prepare_decode] {bs=} {scheduled_bs=} "
+                        f"context_lens={var['context_lens'].np[:bs].tolist()} "
+                        f"sparse_context_lens={sparse_context_lens.tolist()} "
+                        f"sparse_kv_indptr={var['sparse_kv_indptr'].np[:bs+1].tolist()}"
+                    )
                 vars_used.append(("sparse_kv_indptr", bs + 1))
                 metadata_deps.add("sparse_kv_indptr")
 
