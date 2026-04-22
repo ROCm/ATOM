@@ -511,9 +511,11 @@ const _displayEntries = Object.entries(_displayMap).sort((a, b) => b[0].length -
 // TODO: Remove after old "MTP3" data ages out of dashboard history (~90 runs)
 const _accuracyRenames = {
   'Qwen3.5-397B-A17B-FP8 MTP3': 'Qwen3.5-397B-A17B-FP8 MTP',
+  'DeepSeek-R1-0528 MTP3': 'DeepSeek-R1-0528 MTP',
+  'DeepSeek-R1-0528-MXFP4 MTP3': 'DeepSeek-R1-0528-MXFP4 MTP',
 };
-function normalizeModelName(name) {
-  if (_accuracyRenames[name]) return _accuracyRenames[name];
+function normalizeModelName(name, accRename = false) {
+  if (accRename && _accuracyRenames[name]) return _accuracyRenames[name];
   const lc = name.toLowerCase();
   for (const [key, display] of _displayEntries) {
     if (lc === key) return display;
@@ -532,13 +534,13 @@ function parseBenchName(name) {
   if (backend === 'OOT') backend = 'ATOM-vLLM';
   // Accuracy entries: "ModelName accuracy (GSM8K)" — (.+?) for multi-word model names
   let m = rawName.match(/^(.+?)\s+accuracy\s+\((\w+)\)$/);
-  if (m) return { backend, model: normalizeModelName(m[1]), metric: 'accuracy', unit: m[2], isAccuracy: true };
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'accuracy', unit: m[2], isAccuracy: true };
   // MTP acceptance: "ModelName MTP acceptance (%)"
   m = rawName.match(/^(.+?)\s+MTP acceptance\s+\((%)\)$/);
-  if (m) return { backend, model: normalizeModelName(m[1]), metric: 'MTP acceptance', unit: m[2] };
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'MTP acceptance', unit: m[2] };
   // avg toks/fwd: "ModelName avg toks/fwd (tok/fwd)"
   m = rawName.match(/^(.+?)\s+avg toks\/fwd\s+\((.+)\)$/);
-  if (m) return { backend, model: normalizeModelName(m[1]), metric: 'avg toks/fwd', unit: m[2] };
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'avg toks/fwd', unit: m[2] };
   m = rawName.match(/^(.+?)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
   if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
   m = rawName.match(/^(.+?)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count|_tp)$/);
@@ -2610,7 +2612,7 @@ function renderAccuracyTab() {
     html += `<div style="flex:1;min-width:280px;display:flex;flex-direction:column;gap:var(--gap-md)">`;
     html += `<div><canvas id="${canvasId}" style="height:180px"></canvas></div>`;
     if (mtpHistory && mtpHistory.length > 0) {
-      html += `<div data-mtp-history="${escHTML(JSON.stringify(mtpHistory.slice(0, 30)))}"><canvas id="${mtpCanvasId}" style="height:180px"></canvas></div>`;
+      html += `<div><canvas id="${mtpCanvasId}" style="height:180px"></canvas></div>`;
     }
     html += `</div>`;
     // Right: info
@@ -2823,10 +2825,8 @@ function renderMtpAcceptanceMiniChart(key) {
   const mtpCanvasId = 'mtp-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
   const canvas = document.getElementById(mtpCanvasId);
   if (!canvas) return;
-  const wrapper = canvas.parentElement;
-  let history;
-  try { history = JSON.parse(wrapper.dataset.mtpHistory || '[]'); } catch { return; }
-  if (!history.length) return;
+  const history = mtpAcceptanceMap[key];
+  if (!history || !history.length) return;
   const sorted = [...history].sort((a, b) => a.date - b.date);
   const labels = sorted.map(h => { const dt = new Date(h.date); return `${dt.getMonth()+1}/${dt.getDate()}`; });
   const datasets = [{
@@ -2884,7 +2884,7 @@ function renderMtpAcceptanceMiniChart(key) {
             <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${escHTML(gpuLabel)}</span></div>
             <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(acc._rocm_version || '—')}</span></div>
             <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(acc.dockerImage || '—')}</span></div>
-            <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${commitHref ? '<a href="' + escHTML(commitHref) + '" target="_blank" rel="noopener noreferrer">' + (h.commit.id?.slice(0,7) || '—') + '</a>' : (h.commit?.id?.slice(0,7) || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${commitHref ? '<a href="' + escHTML(commitHref) + '" target="_blank" rel="noopener noreferrer">' + (h.commit?.id?.slice(0,7) || '—') + '</a>' : (h.commit?.id?.slice(0,7) || '—')}</span></div>
             <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(h.commit?.message?.split('\\n')[0] || '—')}</span></div>
             <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(h.commit?.author?.name || '—')}</span></div>
             <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${fmtDate(h.date)}</span></div>
