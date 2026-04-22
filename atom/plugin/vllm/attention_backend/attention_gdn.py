@@ -217,12 +217,8 @@ class GatedDeltaNet(nn.Module):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = (
-            attn_metadata.spec_state_indices_tensor
-        )  # noqa: E501
-        non_spec_state_indices_tensor = (
-            attn_metadata.non_spec_state_indices_tensor
-        )  # noqa: E501
+        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         compilation_config = forward_context.no_compile_layers
         self_kv_cache = compilation_config[layer_name].kv_cache
         conv_state = self_kv_cache[0].transpose(-1, -2)
@@ -401,7 +397,7 @@ class GatedDeltaNet(nn.Module):
 
                 last_recurrent_state = None
             else:
-                o = core_attn_out[:attn_metadata.num_decode_tokens]
+                o = core_attn_out[: attn_metadata.num_decode_tokens]
                 core_attn_out_non_spec, last_recurrent_state = (
                     fused_sigmoid_gating_delta_rule_update(
                         A_log=self.A_log,
@@ -418,7 +414,8 @@ class GatedDeltaNet(nn.Module):
                             : attn_metadata.num_decodes + 1
                         ],
                         ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm_in_kernel=True,)
+                        use_qk_l2norm_in_kernel=True,
+                    )
                 )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None

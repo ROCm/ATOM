@@ -135,9 +135,9 @@ def fused_sigmoid_mul_fp8_quant(
                      transpose_scale layout (column-major storage).
     """
     M, N = attn_output.shape
-    assert (
-        N % group_size == 0
-    ), f"N ({N}) must be divisible by group_size ({group_size})"
+    assert N % group_size == 0, (
+        f"N ({N}) must be divisible by group_size ({group_size})"
+    )
 
     BLOCK_SIZE_N = group_size
 

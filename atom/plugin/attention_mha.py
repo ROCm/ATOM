@@ -544,9 +544,9 @@ class PagedAttentionImplPluginModeMethods:
             not ATOM_RESHAPE_AND_CACHE_OUTSIDE
             and ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
         ):
-            assert (
-                position is None
-            ), "position should be None because it is passed through k"
+            assert position is None, (
+                "position should be None because it is passed through k"
+            )
 
             position = key
             qkv = value
@@ -670,7 +670,6 @@ class PagedAttentionImplPluginModeMethods:
 
         # calculate for extends
         if num_extends > 0:
-
             assert attn_metadata.plugin_metadata.extend_metadata is not None
             extend_tokens_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_extend_tokens

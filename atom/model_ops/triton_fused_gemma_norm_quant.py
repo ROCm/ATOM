@@ -143,9 +143,9 @@ def fused_gemma_norm_fp8_quant(
             residual_out: [M, N] = x + residual if residual given, else x
     """
     M, N = x.shape
-    assert (
-        N % group_size == 0
-    ), f"N ({N}) must be divisible by group_size ({group_size})"
+    assert N % group_size == 0, (
+        f"N ({N}) must be divisible by group_size ({group_size})"
+    )
 
     has_residual = residual is not None
 
