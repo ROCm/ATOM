@@ -26,6 +26,7 @@ from atom.utils.block_convert import (
     kv_indices_generate_triton,
 )
 from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils import envs
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
@@ -57,7 +58,10 @@ class AiterMLABackend(AttentionBackend):
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
-        self.block_size = 1
+        if envs.ATOM_ENABLE_TRITON_MLA_DECODE:
+            self.block_size = 64
+        else:
+            self.block_size = 1
         CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
@@ -482,7 +486,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
-        if not batch.is_dummy_run:
+        if not batch.is_dummy_run or envs.ATOM_ENABLE_TRITON_MLA_DECODE:
             if max_seqlen_q > 1:
                 # Get num_rejected (already mapped to current batch order in prepare_input_ids)
                 num_rejected = self.model_runner.tokenID_processor.num_rejected
@@ -581,15 +585,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
         ctx.update(ctx_mla_ps)
         current_stream.wait_stream(prep_stream)
-        # if self.block_ratio > 1:
-        #     if "block_tables" in ctx:
-        #         block_table_convert_triton(
-        #             var["block_tables"].gpu[:bs],
-        #             var["block_tables_converted"].gpu[:bs],
-        #             var["context_lens"].gpu[:bs],
-        #             self.block_ratio,
-        #         )
-        #         ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
+        if (
+            envs.ATOM_ENABLE_TRITON_MLA_DECODE
+            and self.block_ratio > 1
+            and "block_tables" in ctx
+        ):
+            if "block_tables" in ctx:
+                block_table_convert_triton(
+                    var["block_tables"].gpu[:bs],
+                    var["block_tables_converted"].gpu[:bs],
+                    var["context_lens"].gpu[:bs],
+                    self.block_ratio,
+                )
+                ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
