@@ -30,6 +30,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    "ATOM_USE_TRITON_GEMM_A16W16": lambda: os.getenv("ATOM_USE_TRITON_GEMM_A16W16", "0") == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0")
     == "1",
     # --- Kernel Fusion Toggles ---

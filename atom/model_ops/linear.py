@@ -16,6 +16,8 @@ from aiter import (
     get_hip_quant,
 )
 
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -39,6 +41,8 @@ logger = logging.getLogger("atom")
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
+def use_triton_gemm_a16w16() -> bool:
+    return envs.ATOM_USE_TRITON_GEMM_A16W16
 
 if use_triton_gemm():
     try:
@@ -58,11 +62,23 @@ if use_triton_gemm():
     except ImportError as e:
         logger.warning(f"Triton w8a8 GEMM not available: {e}")
         gemm_a8w8_blockscale_bpreshuffle_triton = None
+    
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
+# from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
+
+if use_triton_gemm_a16w16():
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+            gemm_a16w16,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton w16a16 GEMM not available: {e}")
+        gemm_a16w16 = None
+else:
+    gemm_a16w16 = None
 
 def divide(numerator, denominator):
     assert (
@@ -199,6 +215,29 @@ def gemm_a8w8_blockscale_preshuffle_impl(
         )
     else:
         y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+    return y
+
+
+def gemm_a16w16_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    dtype: torch.dtype = torch.bfloat16,
+    prefix: str = "",
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@mark_trace(torch_compile=False)
+@torch_compile_guard(gen_fake=gemm_a16w16_fake, mutates_args=[])
+def gemm_a16w16_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    dtype: torch.dtype = torch.bfloat16,
+    prefix: str = "",
+) -> torch.Tensor:
+    y = gemm_a16w16(x, weight, bias=bias, dtype=dtype)
     return y
 
 
@@ -390,12 +429,22 @@ class LinearBase(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
-                x,
-                self.weight,
-                self.bias,
-                otype=otype,
-            )
+            # if triton kernel available, call it
+            if (gemm_a16w16):
+                y = gemm_a16w16_impl(
+                    x,
+                    self.weight,
+                    bias=self.bias,
+                    dtype=otype,
+                )
+            else:
+                y = tgemm.mm(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                )
+            
         else:
             if x_scale is None:
                 quant_func = self.quant_func
