@@ -694,7 +694,7 @@ jobs:
           python3 .github/scripts/accuracy_to_dashboard.py \
             /tmp/accuracy-results \
             --output accuracy-benchmark-input.json \
-            --models .github/benchmark/oot_models_accuracy.json \
+            --models .github/benchmark/vllm_models_accuracy.json \
             --backend "ATOM-vLLM" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=== Generated entries ==="
