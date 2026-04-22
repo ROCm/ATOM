@@ -348,17 +348,22 @@ class vllmAttentionMetadataBuilderMethods:
         )
 
         if mixed:
-            prefill_max_query_len = (
-                query_lens_cpu[num_decodes + num_extends :].max().item()
-            )
-            prefill_max_seq_len = seq_lens[num_decodes + num_extends :].max().item()
-            prefill_query_start_loc = (
-                prefill_query_start_loc[num_decodes + num_extends :]
-                - prefill_query_start_loc[num_decodes + num_extends]
-            )
-            decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
-            decode_max_seq_len = seq_lens[:num_decodes].max().item()
-            decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
+            # Guard against empty slices: mixed=True guarantees at least two of
+            # {num_prefills, num_decodes, num_extends} are > 0, but any one of
+            # them can individually be 0 (e.g. only decodes+extends, no prefill).
+            if num_prefills > 0:
+                prefill_max_query_len = (
+                    query_lens_cpu[num_decodes + num_extends :].max().item()
+                )
+                prefill_max_seq_len = seq_lens[num_decodes + num_extends :].max().item()
+                prefill_query_start_loc = (
+                    prefill_query_start_loc[num_decodes + num_extends :]
+                    - prefill_query_start_loc[num_decodes + num_extends]
+                )
+            if num_decodes > 0:
+                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_seq_len = seq_lens[:num_decodes].max().item()
+                decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
         prefill_metadata = None
         decode_metadata = None
