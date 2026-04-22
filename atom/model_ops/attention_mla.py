@@ -603,9 +603,6 @@ class MLAAttention(nn.Module):
             reduce_partial_map=reduce_partial_map,
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
-            return_lse=bool(
-                getattr(get_current_atom_config(), "kv_transfer_config", None)
-            ),
         )
 
         if self.head_repeat_factor > 1:
