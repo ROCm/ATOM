@@ -556,19 +556,34 @@ class GemmaRMSNorm(nn.Module):
         return self.forward_native(x, residual)
 
     def _forward_fused_fp8(self, x, residual=None):
-        from atom.model_ops.triton_fused_gemma_norm_quant import (
-            fused_gemma_norm_fp8_quant,
-        )
+        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+        from aiter.utility.dtypes import fp8
 
-        out_bf16, out_fp8, out_scale, residual_out = fused_gemma_norm_fp8_quant(
+        group_size = 128
+        M = x.shape[0]
+        N = x.shape[1]
+        num_groups = N // group_size
+
+        out_fp8 = torch.empty((M, N), dtype=fp8, device=x.device)
+        out_scale = torch.empty((num_groups, M), dtype=torch.float32, device=x.device)
+        out_bf16 = torch.empty((M, N), dtype=x.dtype, device=x.device) if self.write_bf16 else None
+        res_out = torch.empty_like(x) if residual is not None else None
+
+        fused_qk_rmsnorm_group_quant(
+            out_fp8,
+            out_scale,
             x,
             self.weight,
             self.variance_epsilon,
-            residual=residual,
-            write_bf16=self.write_bf16,
+            q_out_unquantized=out_bf16,
+            q_res_out=res_out,
+            q_residual=residual,
+            group_size=group_size,
+            transpose_scale=True,
+            gemma_norm=True,
         )
         if residual is not None:
-            return out_fp8, out_scale, out_bf16, residual_out
+            return out_fp8, out_scale, out_bf16, res_out
         return out_fp8, out_scale, out_bf16
 
     def forward(
