@@ -83,7 +83,6 @@ class EngineCore:
         self.input_thread.start()
 
         self.profile_enbaled = config.torch_profiler_dir is not None
-        self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
         self._init_data_parallel(config)
 
@@ -111,20 +110,12 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if not config.enforce_eager:
-                # Start profiler before cudagraph capture only if mark-trace is enabled.
-                if self.profile_enbaled and self.mark_trace:
-                    self.runner_mgr.call_func(
-                        "start_profiler", "capture_graph", wait_out=True
-                    )
                 cap_cost, bs = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
                 logger.info(
                     f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} seconds"
                 )
-                if self.profile_enbaled and self.mark_trace:
-                    # Persist a dedicated capture-graph trace immediately.
-                    self.runner_mgr.call_func("stop_profiler", wait_out=True)
             good = True
         finally:
             logger.info(
@@ -176,7 +167,7 @@ class EngineCore:
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
         self.output_queue.put_nowait([get_exit_sequence()])
-        self.output_thread.join(timeout=0.5)
+        self.output_thread.join(timeout=5.0)
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
@@ -194,6 +185,17 @@ class EngineCore:
             if engine is not None:
                 engine.exit()
 
+    def _is_idle_sleeping(self) -> bool:
+        """Check if the engine is in sleep mode (weights offloaded).
+
+        When sleeping, busy-wait with a short delay to avoid CPU spin.
+        Returns True if the caller should skip model execution this tick.
+        """
+        if self._is_sleeping:
+            time.sleep(0.01)
+            return True
+        return False
+
     def busy_loop(self):
         shutdown = False
         try:
@@ -202,8 +204,7 @@ class EngineCore:
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_sleeping:
-                    time.sleep(0.01)
+                if self._is_idle_sleeping():
                     continue
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
@@ -407,19 +408,12 @@ class EngineCore:
                 valid_seqs = [
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
-                has_exit_seq = len(valid_seqs) != len(seqs)
-
-                # Only send ADD message if there are valid sequences to report
-                # (Don't send empty ADD when engine is shutting down during init)
-                if valid_seqs:
-                    serialized_obj = pickle.dumps(
-                        (EngineCoreRequestType.ADD, valid_seqs)
-                    )
-                    socket.send(serialized_obj)
-                    logger.info(f"{self.label}: output send {len(valid_seqs)} reqs")
-
-                # Send shutdown if there was an exit sequence
-                if has_exit_seq:
+                num_valid = len(valid_seqs)
+                if num_valid > 0:
+                    obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
+                    socket.send(obj)
+                    logger.info(f"{self.label}: output send {num_valid} reqs")
+                if len(valid_seqs) != len(seqs):
                     socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
                     logger.debug(
                         f"{self.label}: output send {EngineCoreRequestType.SHUTDOWN}"
@@ -428,7 +422,7 @@ class EngineCore:
 
     def start_profiler(self):
         if self.profile_enbaled:
-            self.runner_mgr.call_func("start_profiler", wait_out=True)
+            self.runner_mgr.call_func("start_profiler")
 
     def stop_profiler(self):
         if self.profile_enbaled:
@@ -490,6 +484,24 @@ class DPEngineCoreProc(EngineCore):
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
+    def _gather_local_dp_state(self) -> tuple[bool, int, int, bool, bool]:
+        """Gather local scheduling state, substituting dummy values when sleeping.
+
+        Sleeping cores must still participate in _sync_dp_state (NCCL
+        all_reduce) to prevent other DP ranks from blocking forever.
+        The sleep flag is included in the sync tensor so that ALL cores
+        agree to skip model execution together — MoE expert routing and
+        dummy_execution also contain DP-wide collectives that would hang
+        if only some cores participated.
+        """
+        sleeping = self._is_sleeping
+        if not sleeping:
+            is_prefill, num_tokens, num_reqs = self.scheduler.get_next_batch_info()
+            unfinished = not self.scheduler.is_finished()
+        else:
+            is_prefill, num_tokens, num_reqs, unfinished = False, 0, 0, False
+        return is_prefill, num_tokens, num_reqs, unfinished, sleeping
+
     def busy_loop(self):
         shutdown = False
         try:
@@ -497,20 +509,9 @@ class DPEngineCoreProc(EngineCore):
                 self.utility_handler.process_queue(self.utility_queue, self)
                 shutdown = shutdown or self.pull_and_process_input_queue()
 
-                # Sleeping cores must still participate in _sync_dp_state (NCCL
-                # all_reduce) to prevent other DP ranks from blocking forever.
-                # The sleep flag is included in the sync tensor so that ALL cores
-                # agree to skip model execution together — MoE expert routing and
-                # dummy_execution also contain DP-wide collectives that would hang
-                # if only some cores participated.
-                local_sleeping = self._is_sleeping
-                if not local_sleeping:
-                    local_is_prefill, local_num_tokens, local_num_reqs = (
-                        self.scheduler.get_next_batch_info()
-                    )
-                    local_unfinished = not self.scheduler.is_finished()
-                else:
-                    local_is_prefill, local_num_tokens, local_num_reqs, local_unfinished = False, 0, 0, False
+                local_is_prefill, local_num_tokens, local_num_reqs, local_unfinished, local_sleeping = (
+                    self._gather_local_dp_state()
+                )
 
                 (
                     global_has_prefill,
@@ -534,7 +535,6 @@ class DPEngineCoreProc(EngineCore):
                     )
                     break
 
-                # If any DP rank is sleeping, all must skip model execution.
                 if global_sleeping:
                     time.sleep(0.01)
                     continue
