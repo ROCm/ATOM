@@ -869,6 +869,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 True,
             )
             layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+            layer.w2_weight.is_shuffled = True
             shuffled_w2_scale = shuffle_scale_a16w4(
                 layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
                 self.num_experts,
@@ -883,16 +884,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
-            shuffle_weights(layer.w13_weight, layer.w2_weight)
+            # W1/W13 (gate+up): both stage1 (ck_moe_stage1) and stage2
+            # (ck_moe_stage2) use DeviceMoeGemmMXBPreShuffle with preShuffleBuffer
+            # layout (gate_up=False). The a4w4 kernel expects gate_up=False even
+            # though w1 has 2*N rows.
+            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, False)
+            layer.w13_weight.is_shuffled = True
             s0, s1, _ = layer.w13_weight_scale.shape
             w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-            w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
+            w13_weight_scale = shuffle_scale_a16w4(w13_weight_scale, s0, False)
             layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
-            s0, s1, _ = layer.w2_weight_scale.shape
-            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-            w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+            # W2 (down-proj): same preShuffleBuffer layout with gate_up=False.
+            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+            layer.w2_weight.is_shuffled = True
+            shuffled_w2_scale = shuffle_scale_a16w4(
+                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                self.num_experts,
+                False,
+            )
+            layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
             return
         else:
             shuffle_weights(layer.w13_weight, layer.w2_weight)
