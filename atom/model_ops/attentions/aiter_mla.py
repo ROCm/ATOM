@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import itertools
 import logging
 from typing import Type
 
@@ -518,34 +517,26 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
 
-        self.prepare_block_tables(batch)
-
-        num_blocks_per_seq = []
-        for i, (ctx, is_first) in enumerate(
-            zip(batch.context_lens, batch.is_first_decode_without_local_prefill)
-        ):
-            if is_first:
-                # First decode after remote prefill: use pre-allocated block count
-                blocks = len(batch.block_tables[i])
-            else:
-                # Normal case: ceil-divide context length by block size
-                blocks = (ctx + self.block_size - 1) // self.block_size
-            num_blocks_per_seq.append(blocks)
-        sum_blocks_before_converted = sum(
-            [(i + self.block_ratio - 1) // self.block_ratio for i in num_blocks_per_seq]
-        )
-
+        if any(batch.is_first_decode_without_local_prefill):
+            num_blocks_per_seq = [
+                (
+                    len(batch.block_tables[i])
+                    if is_first
+                    else cdiv(ctx_len, self.block_size)
+                )
+                for i, (ctx_len, is_first) in enumerate(
+                    zip(
+                        batch.context_lens,
+                        batch.is_first_decode_without_local_prefill,
+                    )
+                )
+            ]
+        else:
+            num_blocks_per_seq = cdiv(context_lens, self.block_size)
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1]
 
-        def prepare_kv_indices():
-            var["kv_indices"].np[:sum_blocks_before_converted] = np.fromiter(
-                itertools.chain.from_iterable(batch.block_tables),
-                dtype=np.int32,
-                count=sum_blocks_before_converted,
-            )
-
-        prepare_kv_indices()
+        self.prepare_block_tables(batch)
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
         var["kv_last_page_lens"].np[:scheduled_bs] = (
