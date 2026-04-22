@@ -544,9 +544,9 @@ class PagedAttentionImplPluginModeMethods:
             not ATOM_RESHAPE_AND_CACHE_OUTSIDE
             and ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
         ):
-            assert position is None, (
-                "position should be None because it is passed through k"
-            )
+            assert (
+                position is None
+            ), "position should be None because it is passed through k"
 
             position = key
             qkv = value

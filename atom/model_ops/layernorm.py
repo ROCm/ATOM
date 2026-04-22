@@ -203,9 +203,9 @@ class RMSNorm(nn.Module):
         x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.x_pad_to_multiple > 0:
-            assert not self.fused_allreduce, (
-                "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
-            )
+            assert (
+                not self.fused_allreduce
+            ), "fused_allreduce_rmsnorm is not supported with rms_norm padding!"
             if residual is None:
                 x = fused_rmsnorm_pad_(x, self.weight, self.eps, self.x_pad_to_multiple)
                 return x
@@ -215,9 +215,9 @@ class RMSNorm(nn.Module):
                 )
                 return x, residual
         if self.fused_allreduce and self.tp_size > 1:
-            assert residual is not None, (
-                "fused_allreduce_rmsnorm requires residual input!"
-            )
+            assert (
+                residual is not None
+            ), "fused_allreduce_rmsnorm requires residual input!"
             # tensor_model_parallel_fused_allreduce_rmsnorm does not support non-contiguous input
             x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x.contiguous(),
