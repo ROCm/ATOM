@@ -92,17 +92,21 @@ def _select_model_arch(vllm_config: VllmConfig) -> str:
     model_tag = None
     try:
         from vllm.compilation import backends as vllm_backends
+
         model_tag = getattr(vllm_backends, "model_tag", None)
     except Exception:
         pass
     if model_tag is None:
-        model_tag = getattr(getattr(vllm_config, "compilation_config", None), "model_tag", None)
+        model_tag = getattr(
+            getattr(vllm_config, "compilation_config", None), "model_tag", None
+        )
     if model_tag in {"eagle_head", "draft_model", "drafter"}:
         logger.info(
             f"Use draft model architecture {draft_arch} for speculative tag {model_tag}"
         )
         return draft_arch
     return model_arch
+
 
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
@@ -154,9 +158,11 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         exclude_mapping = getattr(model_cls, "quant_exclude_name_mapping", {})
         # add exclude mapping for mtp layer of GLM5.
         if model_arch != main_model_arch and main_model_arch == "GlmMoeDsaForCausalLM":
-            exclude_mapping.update({
-                "indexers_proj": "indexer.weights_proj",
-            })
+            exclude_mapping.update(
+                {
+                    "indexers_proj": "indexer.weights_proj",
+                }
+            )
         if exclude_mapping and self.atom_config.quant_config is not None:
             self.atom_config.quant_config.apply_exclude_name_mapping(exclude_mapping)
 
@@ -340,7 +346,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-
         return hidden_states
 
     def load_weights(
@@ -350,7 +355,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         # prevent circular import
         from atom.model_loader.loader import load_model_in_plugin_mode
 
-        is_mtp_draft_model = self.model_arch in {"DeepSeekMTPModel", "Qwen3NextMTPModel"}
+        is_mtp_draft_model = self.model_arch in {
+            "DeepSeekMTPModel",
+            "Qwen3NextMTPModel",
+        }
         draft_hf_config = None
         if is_mtp_draft_model:
             draft_model_config = getattr(
@@ -359,7 +367,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 None,
             )
             if draft_model_config is not None:
-                draft_hf_config = getattr(draft_model_config, "hf_config", draft_model_config)
+                draft_hf_config = getattr(
+                    draft_model_config, "hf_config", draft_model_config
+                )
 
         loaded_weights_record = load_model_in_plugin_mode(
             model=self.model,

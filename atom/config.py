@@ -992,6 +992,7 @@ def _get_current_atom_config_from_vllm_forward_context() -> Optional[Config]:
     except Exception:
         return None
 
+
 def get_current_atom_config() -> Config:
     forward_atom_config = _get_current_atom_config_from_vllm_forward_context()
     if forward_atom_config is not None:

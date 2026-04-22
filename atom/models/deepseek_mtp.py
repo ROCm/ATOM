@@ -92,8 +92,8 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         assert inputs_embeds is not None
         if is_vllm():
             masked_inputs_embeds = torch.where(
-                    positions.unsqueeze(-1) == 0, 0, inputs_embeds
-                )
+                positions.unsqueeze(-1) == 0, 0, inputs_embeds
+            )
         else:
             masked_inputs_embeds = inputs_embeds
         inputs_embeds = self.enorm(masked_inputs_embeds)

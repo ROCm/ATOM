@@ -199,7 +199,9 @@ def load_model_in_plugin_mode(
 
     _empty_cache()
     if hf_config_override is not None:
-        config_for_loading = getattr(hf_config_override, "hf_config", hf_config_override)
+        config_for_loading = getattr(
+            hf_config_override, "hf_config", hf_config_override
+        )
         if hasattr(config_for_loading, "text_config"):
             config_for_loading = config_for_loading.text_config
     else:

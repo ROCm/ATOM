@@ -2302,7 +2302,9 @@ def unified_attention_with_output_base_for_plugin_mode(
 
     if current_atom_config is None:
         current_atom_config = get_current_atom_config()
-    static_forward_context = current_atom_config.compilation_config.static_forward_context
+    static_forward_context = (
+        current_atom_config.compilation_config.static_forward_context
+    )
 
     if use_mla:
         # raise NotImplementedError("MLA is not supported for plugin mode for now")

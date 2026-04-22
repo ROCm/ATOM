@@ -7,7 +7,9 @@ logger = logging.getLogger("atom")
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     try:
-        from atom.utils.forward_context import AttentionMetaData as AtomAttentionMetaData
+        from atom.utils.forward_context import (
+            AttentionMetaData as AtomAttentionMetaData,
+        )
         from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
     except Exception as exc:
         logger.debug("ATOM spec-decode patch skipped: %s", exc)
