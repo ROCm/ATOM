@@ -1,72 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776883011541,
+  "lastUpdate": 1776897797818,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "carlushuang",
-            "username": "carlushuang",
-            "email": "carlus.huang@amd.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "108a70ed4e3c4f4ce3d8afcd5bc7e99c7cbc07ed",
-          "message": "[server] Refactor OpenAI server with tool calling, reasoning, and debug logging (#489)\n\n* [server] Improve OpenAI API compatibility for OpenClaw integration\n\n- Accept multimodal content format: ChatMessage.content now handles both\n  plain string and OpenAI array format ([{\"type\":\"text\",\"text\":\"...\"}])\n- Add model_config extra=\"ignore\" to ChatCompletionRequest and\n  CompletionRequest to silently drop unsupported fields (stream_options,\n  tools, tool_choice, etc.) instead of returning 422\n- Increase DEFAULT_MAX_TOKENS from 256 to 8192 for thinking models\n  (Kimi-K2) where 256 truncates inside <think> blocks\n- Strip <think>...</think> reasoning blocks from both streaming and\n  non-streaming responses so clients see only the final answer\n- Add thinking-block state machine in stream_chat_response() to filter\n  thinking content token-by-token during SSE streaming\n\n* style: fix Black formatting in openai_server.py\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [server] Refactor OpenAI server into modular architecture with reasoning support\n\nSplit the monolithic openai_server.py (1076 lines) into focused modules\nfollowing the mini-sglang/vLLM pattern:\n\n  atom/entrypoints/openai/\n  ├── __init__.py           - Package re-export\n  ├── protocol.py           - Pydantic request/response models\n  ├── reasoning.py          - Thinking content separation (reasoning_content)\n  ├── serving_chat.py       - Chat completion handler\n  ├── serving_completion.py - Text completion handler\n  └── api_server.py         - FastAPI app, routes, engine interface, main()\n\nKey improvements:\n- Reasoning content separation: <think>...</think> blocks are now returned\n  in a `reasoning_content` field alongside `content`, following the\n  SGLang/vLLM pattern (instead of stripping entirely)\n- Streaming reasoning: thinking tokens stream as reasoning_content deltas,\n  answer tokens as content deltas\n- Tool call token stripping: <|tool_calls_section_*|> tokens filtered\n- OpenAI-format error responses via exception handlers\n- Proper ModelCard/ModelList Pydantic models for /v1/models\n- Compatibility fields: presence_penalty, frequency_penalty, n accepted\n- Backward compatible: python -m atom.entrypoints.openai_server still works\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* style: fix Ruff lint errors (unused imports and variables)\n\n- api_server.py: remove unused ErrorResponse import\n- reasoning.py: remove unused `field` import from dataclasses\n- serving_chat.py: remove unused uuid, List, ChatCompletionRequest\n  imports; remove unused first_chunk and finish variables\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [test] Add unit tests for OpenAI server entrypoints\n\nAdd tests/entrypoints/ with 46 unit tests covering:\n\n- test_protocol.py (18 tests): ChatMessage multimodal content parsing,\n  ChatCompletionRequest extra field handling, CompletionRequest defaults,\n  response models, ModelCard/ModelList, ErrorResponse\n- test_reasoning.py (17 tests): separate_reasoning() for thinking block\n  extraction, unclosed blocks, tool call stripping; ReasoningFilter\n  streaming state machine with various token sequences\n- test_serving_chat.py (11 tests): SSE chunk creation format,\n  build_chat_response() with reasoning_content separation\n\nAll tests run without GPU (pure unit tests, no engine required).\nFix __init__.py to use lazy import avoiding uvicorn at import time.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [server] Add tool call parsing support\n\nParse model tool call special tokens into OpenAI-compatible tool_calls\nformat instead of stripping them.\n\nNew file: atom/entrypoints/openai/tool_parser.py\n- parse_tool_calls(text) -> (content, List[ToolCall]) for non-streaming\n- ToolCallStreamParser: stateful streaming parser for SSE chunks\n- Parses <|tool_call_begin|>functions.NAME:INDEX<|tool_call_argument_begin|>\n  ARGS<|tool_call_end|> format (Kimi-K2, etc.)\n\nChanges:\n- protocol.py: add tools/tool_choice fields to ChatCompletionRequest\n- serving_chat.py: integrate tool parser in both streaming and\n  non-streaming paths; set finish_reason=\"tool_calls\" when present\n- reasoning.py: remove tool call stripping (handled by tool_parser now)\n\nTests: 56 unit tests (11 new tool parser tests) + 16 integration tests\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Fix tool call round-trip for chat templates (Kimi-K2)\n\nMake ChatMessage.content optional (tool messages send content=None) and\nadd to_template_dict() to preserve tool_calls, tool_call_id, name, and\nreasoning_content when rendering the chat template.  Pass request.tools\nthrough to apply_chat_template so the template can inject tool\ndeclarations.\n\nAdds curl tool call tests for both parse_tool_calls and streaming parser.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Add --request-log flag for debugging API requests and responses\n\nAdds optional JSONL request logging behind --request-log <filepath>.\nWhen enabled, logs all incoming requests, non-streaming responses, and\nstreaming SSE chunks with timestamps and request IDs. Uses a dedicated\nlogger with FileHandler so it doesn't interfere with normal server\noutput. Zero overhead when the flag is not provided.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* style: fix Black formatting in test_tool_parser\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Update copyright year to 2024-2026 in all new files\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 4.6 <noreply@anthropic.com>",
-          "timestamp": "2026-04-10T15:31:14Z",
-          "url": "https://github.com/ROCm/ATOM/commit/108a70ed4e3c4f4ce3d8afcd5bc7e99c7cbc07ed"
-        },
-        "date": 1775850429466,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-vLLM::DeepSeek-R1-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.9424,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | strict-match: 0.9356 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4 TP8 accuracy (GSM8K)",
-            "value": 0.9363,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.9 | Baseline: 0.9 | BaselineModel: amd/Kimi-K2-Thinking-MXFP4 | strict-match: 0.9348 | fewshot: 3 | Model: /models/amd/Kimi-K2-Thinking-MXFP4"
-          },
-          {
-            "name": "ATOM-vLLM::Kimi-K2.5-MXFP4 TP8 accuracy (GSM8K)",
-            "value": 0.9287,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: amd/Kimi-K2.5-MXFP4 | BaselineNote: Reference value from recipes/atom_vllm/Kimi-K2.5.md | strict-match: 0.928 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
-          },
-          {
-            "name": "ATOM-vLLM::Llama-3.1-8B-Instruct TP1 accuracy (GSM8K)",
-            "value": 0.7703,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.73 | BaselineModel: meta-llama/Llama-3.1-8B-Instruct | BaselineNote: Threshold aligned with existing 8B Llama baseline used in CI (3-shot GSM8K). | strict-match: 0.674 | fewshot: 3 | Model: /models/meta-llama/Llama-3.1-8B-Instruct"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8 accuracy (GSM8K)",
-            "value": 0.8939,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.87 | Baseline: 0.87 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | strict-match: 0.8779 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3.5-397B-A17B TP8 accuracy (GSM8K)",
-            "value": 0.8575,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.83 | Baseline: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B | strict-match: 0.8385 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B"
-          },
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b TP2 accuracy (GSM8K)",
-            "value": 0.3988,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.38 | Baseline: 0.38 | BaselineModel: openai/gpt-oss-120b | strict-match: 0.2146 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -77537,6 +77473,88 @@ window.BENCHMARK_DATA = {
             "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=8 _tp",
             "value": 8,
             "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "f4478c5e8faa9590c1e58747408b176b9d85dadd",
+          "message": "fix(dashboard): deduplicate historyMap, fix prev comparison, unify metadata (#629)\n\nFive related data consistency bugs fixed:\n\n1. historyMap dedup: when multiple benchmark runs share the same commit,\n   keep only the newest run per (configKey, commit) using a Set. Uses\n   7-char commit prefix to handle abbreviated vs full hash IDs in data.js.\n\n2. Metadata unification: different configKeys (concurrency levels) from\n   the same commit+backend could show different Docker tags, dates, and\n   run URLs because they came from different benchmark runs. After\n   historyMap construction, find each (backend, commit)'s newest metadata\n   and apply it to all configKeys. Scoped by backend so ATOM/vLLM/sglang\n   legitimately keep their own Docker images.\n\n3. prev calculation in popover/detail: buildDetailHTML and showPopover\n   used hardcoded hist[1] as prev. When viewing a non-latest data point,\n   it compared against itself (0.0%). Fixed to use hist.indexOf(cfg).\n\n4. orderedRuns date: was built oldest-first, storing the oldest run's\n   date per commit. Changed to newest-first with _commitMeta fallback\n   so tooltip dates match popover dates.\n\n5. Commit ID normalization: data.js may store the same commit as\n   abbreviated (\"450f14b7\") or full hash — both are now matched via\n   7-char prefix throughout dedup and metadata unification.",
+          "timestamp": "2026-04-22T10:12:08Z",
+          "url": "https://github.com/ROCm/ATOM/commit/f4478c5e8faa9590c1e58747408b176b9d85dadd"
+        },
+        "date": 1776897795408,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.0546,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.88 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5.1 | BaselineNote: CI uses 3-shot, not comparable to HF 5-shot baseline | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.0409 | fewshot: 20 | Model: /models/zai-org/GLM-5.1-FP8"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4 TP8 accuracy (GSM8K)",
+            "value": 0.9303,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.9 | Baseline: 0.9 | BaselineModel: amd/Kimi-K2-Thinking-MXFP4 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.9303 | fewshot: 3 | Model: /models/amd/Kimi-K2-Thinking-MXFP4"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.5-MXFP4 TP8 accuracy (GSM8K)",
+            "value": 0.9416,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.92 | Baseline: 0.93 | BaselineModel: amd/Kimi-K2.5-MXFP4 | BaselineNote: Reference value from recipes/atom_vllm/Kimi-K2.5.md | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 252GB | ROCm: 7.2.2 | strict-match: 0.9409 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
+          },
+          {
+            "name": "ATOM-vLLM::Llama-3.1-8B-Instruct TP1 accuracy (GSM8K)",
+            "value": 0.7657,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Llama-3.1-8B-Instruct | BaselineNote: Threshold aligned with existing 8B Llama baseline used in CI (3-shot GSM8K). | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.677 | fewshot: 3 | Model: /models/meta-llama/Llama-3.1-8B-Instruct"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8 accuracy (GSM8K)",
+            "value": 0.8954,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.87 | Baseline: 0.87 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.8825 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.8196,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.76 | Baseline: 0.76 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.7961 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B TP8 accuracy (GSM8K)",
+            "value": 0.8643,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.83 | Baseline: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.8506 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.8719,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.83 | Baseline: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.8575 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4 TP4 accuracy (GSM8K)",
+            "value": 0.8385,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24795009480 | Threshold: 0.82 | Baseline: 0.82 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: Using Qwen3-235B baseline as proxy; needs CI measurement for Qwen3.5 specific baseline | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.8196 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
           }
         ]
       }
