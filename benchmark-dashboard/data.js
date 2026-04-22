@@ -1,74 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776877399197,
+  "lastUpdate": 1776883011541,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "email": "carlus.huang@amd.com",
-            "name": "carlushuang",
-            "username": "carlushuang"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "108a70ed4e3c4f4ce3d8afcd5bc7e99c7cbc07ed",
-          "message": "[server] Refactor OpenAI server with tool calling, reasoning, and debug logging (#489)\n\n* [server] Improve OpenAI API compatibility for OpenClaw integration\n\n- Accept multimodal content format: ChatMessage.content now handles both\n  plain string and OpenAI array format ([{\"type\":\"text\",\"text\":\"...\"}])\n- Add model_config extra=\"ignore\" to ChatCompletionRequest and\n  CompletionRequest to silently drop unsupported fields (stream_options,\n  tools, tool_choice, etc.) instead of returning 422\n- Increase DEFAULT_MAX_TOKENS from 256 to 8192 for thinking models\n  (Kimi-K2) where 256 truncates inside <think> blocks\n- Strip <think>...</think> reasoning blocks from both streaming and\n  non-streaming responses so clients see only the final answer\n- Add thinking-block state machine in stream_chat_response() to filter\n  thinking content token-by-token during SSE streaming\n\n* style: fix Black formatting in openai_server.py\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [server] Refactor OpenAI server into modular architecture with reasoning support\n\nSplit the monolithic openai_server.py (1076 lines) into focused modules\nfollowing the mini-sglang/vLLM pattern:\n\n  atom/entrypoints/openai/\n  ├── __init__.py           - Package re-export\n  ├── protocol.py           - Pydantic request/response models\n  ├── reasoning.py          - Thinking content separation (reasoning_content)\n  ├── serving_chat.py       - Chat completion handler\n  ├── serving_completion.py - Text completion handler\n  └── api_server.py         - FastAPI app, routes, engine interface, main()\n\nKey improvements:\n- Reasoning content separation: <think>...</think> blocks are now returned\n  in a `reasoning_content` field alongside `content`, following the\n  SGLang/vLLM pattern (instead of stripping entirely)\n- Streaming reasoning: thinking tokens stream as reasoning_content deltas,\n  answer tokens as content deltas\n- Tool call token stripping: <|tool_calls_section_*|> tokens filtered\n- OpenAI-format error responses via exception handlers\n- Proper ModelCard/ModelList Pydantic models for /v1/models\n- Compatibility fields: presence_penalty, frequency_penalty, n accepted\n- Backward compatible: python -m atom.entrypoints.openai_server still works\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* style: fix Ruff lint errors (unused imports and variables)\n\n- api_server.py: remove unused ErrorResponse import\n- reasoning.py: remove unused `field` import from dataclasses\n- serving_chat.py: remove unused uuid, List, ChatCompletionRequest\n  imports; remove unused first_chunk and finish variables\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [test] Add unit tests for OpenAI server entrypoints\n\nAdd tests/entrypoints/ with 46 unit tests covering:\n\n- test_protocol.py (18 tests): ChatMessage multimodal content parsing,\n  ChatCompletionRequest extra field handling, CompletionRequest defaults,\n  response models, ModelCard/ModelList, ErrorResponse\n- test_reasoning.py (17 tests): separate_reasoning() for thinking block\n  extraction, unclosed blocks, tool call stripping; ReasoningFilter\n  streaming state machine with various token sequences\n- test_serving_chat.py (11 tests): SSE chunk creation format,\n  build_chat_response() with reasoning_content separation\n\nAll tests run without GPU (pure unit tests, no engine required).\nFix __init__.py to use lazy import avoiding uvicorn at import time.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [server] Add tool call parsing support\n\nParse model tool call special tokens into OpenAI-compatible tool_calls\nformat instead of stripping them.\n\nNew file: atom/entrypoints/openai/tool_parser.py\n- parse_tool_calls(text) -> (content, List[ToolCall]) for non-streaming\n- ToolCallStreamParser: stateful streaming parser for SSE chunks\n- Parses <|tool_call_begin|>functions.NAME:INDEX<|tool_call_argument_begin|>\n  ARGS<|tool_call_end|> format (Kimi-K2, etc.)\n\nChanges:\n- protocol.py: add tools/tool_choice fields to ChatCompletionRequest\n- serving_chat.py: integrate tool parser in both streaming and\n  non-streaming paths; set finish_reason=\"tool_calls\" when present\n- reasoning.py: remove tool call stripping (handled by tool_parser now)\n\nTests: 56 unit tests (11 new tool parser tests) + 16 integration tests\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Fix tool call round-trip for chat templates (Kimi-K2)\n\nMake ChatMessage.content optional (tool messages send content=None) and\nadd to_template_dict() to preserve tool_calls, tool_call_id, name, and\nreasoning_content when rendering the chat template.  Pass request.tools\nthrough to apply_chat_template so the template can inject tool\ndeclarations.\n\nAdds curl tool call tests for both parse_tool_calls and streaming parser.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Add --request-log flag for debugging API requests and responses\n\nAdds optional JSONL request logging behind --request-log <filepath>.\nWhen enabled, logs all incoming requests, non-streaming responses, and\nstreaming SSE chunks with timestamps and request IDs. Uses a dedicated\nlogger with FileHandler so it doesn't interfere with normal server\noutput. Zero overhead when the flag is not provided.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* style: fix Black formatting in test_tool_parser\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Update copyright year to 2024-2026 in all new files\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 4.6 <noreply@anthropic.com>",
-          "timestamp": "2026-04-10T23:31:14+08:00",
-          "tree_id": "99ef03fd1d2dffba4fa3daf7e1e03792b49aa6ec",
-          "url": "https://github.com/ROCm/ATOM/commit/108a70ed4e3c4f4ce3d8afcd5bc7e99c7cbc07ed"
-        },
-        "date": 1775842153811,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
-            "value": 0.9333,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24250703467 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | strict-match: 0.931 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
-            "value": 0.9409,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24250703467 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | strict-match: 0.9386 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::Kimi-K2.5-MXFP4 accuracy (GSM8K)",
-            "value": 0.9401,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24250703467 | Threshold: 0.93 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.5 | BaselineNote: HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409 | strict-match: 0.9393 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
-          },
-          {
-            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
-            "value": 0.9174,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24250703467 | Threshold: 0.88 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | strict-match: 0.6293 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-          },
-          {
-            "name": "ATOM::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
-            "value": 0.7415,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24250703467 | Threshold: 0.73 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | strict-match: 0.7445 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
-            "value": 0.4367,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24250703467 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2328 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
-            "value": 0.4344,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24250703467 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2244 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -75507,6 +75441,2102 @@ window.BENCHMARK_DATA = {
             "value": 0.4139,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24790052052 | Threshold: 0.39 | Baseline: 0.41 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202604221609 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.229 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "f4478c5e8faa9590c1e58747408b176b9d85dadd",
+          "message": "fix(dashboard): deduplicate historyMap, fix prev comparison, unify metadata (#629)\n\nFive related data consistency bugs fixed:\n\n1. historyMap dedup: when multiple benchmark runs share the same commit,\n   keep only the newest run per (configKey, commit) using a Set. Uses\n   7-char commit prefix to handle abbreviated vs full hash IDs in data.js.\n\n2. Metadata unification: different configKeys (concurrency levels) from\n   the same commit+backend could show different Docker tags, dates, and\n   run URLs because they came from different benchmark runs. After\n   historyMap construction, find each (backend, commit)'s newest metadata\n   and apply it to all configKeys. Scoped by backend so ATOM/vLLM/sglang\n   legitimately keep their own Docker images.\n\n3. prev calculation in popover/detail: buildDetailHTML and showPopover\n   used hardcoded hist[1] as prev. When viewing a non-latest data point,\n   it compared against itself (0.0%). Fixed to use hist.indexOf(cfg).\n\n4. orderedRuns date: was built oldest-first, storing the oldest run's\n   date per commit. Changed to newest-first with _commitMeta fallback\n   so tooltip dates match popover dates.\n\n5. Commit ID normalization: data.js may store the same commit as\n   abbreviated (\"450f14b7\") or full hash — both are now matched via\n   7-char prefix throughout dedup and metadata unification.",
+          "timestamp": "2026-04-22T10:12:08Z",
+          "url": "https://github.com/ROCm/ATOM/commit/f4478c5e8faa9590c1e58747408b176b9d85dadd"
+        },
+        "date": 1776883007959,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=16 throughput (tok/s)",
+            "value": 1368.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2751.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=16 TTFT (ms)",
+            "value": 147.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=16 TPOT (ms)",
+            "value": 11.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=32 throughput (tok/s)",
+            "value": 2239.32,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 4471.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=32 TTFT (ms)",
+            "value": 356.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=32 TPOT (ms)",
+            "value": 13.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=4 throughput (tok/s)",
+            "value": 481,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 966.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=4 TTFT (ms)",
+            "value": 103.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=4 TPOT (ms)",
+            "value": 7.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=64 throughput (tok/s)",
+            "value": 3495.82,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 6993.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=64 TTFT (ms)",
+            "value": 249.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=64 TPOT (ms)",
+            "value": 17.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=8 throughput (tok/s)",
+            "value": 785.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1565.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=8 TTFT (ms)",
+            "value": 654.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=8 TPOT (ms)",
+            "value": 9.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=16 throughput (tok/s)",
+            "value": 1481.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=16 Total Tput (tok/s)",
+            "value": 1667.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=16 TTFT (ms)",
+            "value": 195.8,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=16 TPOT (ms)",
+            "value": 10.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=32 throughput (tok/s)",
+            "value": 2409.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=32 Total Tput (tok/s)",
+            "value": 2708.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=32 TTFT (ms)",
+            "value": 225.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=32 TPOT (ms)",
+            "value": 12.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=4 throughput (tok/s)",
+            "value": 482.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=4 Total Tput (tok/s)",
+            "value": 544.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=4 TTFT (ms)",
+            "value": 128.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=4 TPOT (ms)",
+            "value": 8.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=64 throughput (tok/s)",
+            "value": 3906.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=64 Total Tput (tok/s)",
+            "value": 4394.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=64 TTFT (ms)",
+            "value": 217.85,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=64 TPOT (ms)",
+            "value": 15.87,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=8 throughput (tok/s)",
+            "value": 838.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=8 Total Tput (tok/s)",
+            "value": 943.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=8 TTFT (ms)",
+            "value": 224.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=8 TPOT (ms)",
+            "value": 9.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 1024/8192 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 1198.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10820.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 390.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 12.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1750.35,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 15652.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 584.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 17.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 440.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3957.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 203.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 8.65,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 2454.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 22128.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 858.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 24.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 742.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 6606.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 303.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 10.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4-MTP-MoEFP4 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=16 throughput (tok/s)",
+            "value": 615.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1246.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=16 TTFT (ms)",
+            "value": 245.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=16 TPOT (ms)",
+            "value": 24.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=32 throughput (tok/s)",
+            "value": 1017.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2038.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=32 TTFT (ms)",
+            "value": 294.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=32 TPOT (ms)",
+            "value": 29.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=8 throughput (tok/s)",
+            "value": 361.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 719.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=8 TTFT (ms)",
+            "value": 235.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=8 TPOT (ms)",
+            "value": 21.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=16 throughput (tok/s)",
+            "value": 656.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=16 Total Tput (tok/s)",
+            "value": 739.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=16 TTFT (ms)",
+            "value": 246.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=16 TPOT (ms)",
+            "value": 23.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=4 throughput (tok/s)",
+            "value": 194,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=4 Total Tput (tok/s)",
+            "value": 220.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=4 TTFT (ms)",
+            "value": 214.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=4 TPOT (ms)",
+            "value": 19.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=64 throughput (tok/s)",
+            "value": 1812.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=64 Total Tput (tok/s)",
+            "value": 2039.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=64 TTFT (ms)",
+            "value": 375.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=64 TPOT (ms)",
+            "value": 34.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 1024/8192 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=32 throughput (tok/s)",
+            "value": 740.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 6621.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=32 TTFT (ms)",
+            "value": 1165.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=32 TPOT (ms)",
+            "value": 40.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=4 throughput (tok/s)",
+            "value": 169.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 1592.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=4 TTFT (ms)",
+            "value": 529.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=4 TPOT (ms)",
+            "value": 21.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.1-FP8 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=16 throughput (tok/s)",
+            "value": 2256.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 4536.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=16 TTFT (ms)",
+            "value": 98.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=16 TPOT (ms)",
+            "value": 6.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=32 throughput (tok/s)",
+            "value": 3389.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 6768.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=32 TTFT (ms)",
+            "value": 368.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=32 TPOT (ms)",
+            "value": 8.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=4 throughput (tok/s)",
+            "value": 832.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 1673.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=4 TTFT (ms)",
+            "value": 318.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=4 TPOT (ms)",
+            "value": 4.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=4 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=64 throughput (tok/s)",
+            "value": 5410.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 10823.19,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=64 TTFT (ms)",
+            "value": 313.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=64 TPOT (ms)",
+            "value": 11.2,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=8 throughput (tok/s)",
+            "value": 1415.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 2821.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=8 TTFT (ms)",
+            "value": 86.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=8 TPOT (ms)",
+            "value": 5.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/1024 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=16 throughput (tok/s)",
+            "value": 2576.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=16 Total Tput (tok/s)",
+            "value": 2899.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=16 TTFT (ms)",
+            "value": 79.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=16 TPOT (ms)",
+            "value": 6.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=32 throughput (tok/s)",
+            "value": 3870.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=32 Total Tput (tok/s)",
+            "value": 4351.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=32 TTFT (ms)",
+            "value": 106.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=32 TPOT (ms)",
+            "value": 8.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=4 throughput (tok/s)",
+            "value": 922.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=4 Total Tput (tok/s)",
+            "value": 1040.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=4 TTFT (ms)",
+            "value": 64.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=4 TPOT (ms)",
+            "value": 4.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=4 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=64 throughput (tok/s)",
+            "value": 6308.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=64 Total Tput (tok/s)",
+            "value": 7096.59,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=64 TTFT (ms)",
+            "value": 108.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=64 TPOT (ms)",
+            "value": 9.87,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=8 throughput (tok/s)",
+            "value": 1554.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=8 Total Tput (tok/s)",
+            "value": 1749.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=8 TTFT (ms)",
+            "value": 77.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=8 TPOT (ms)",
+            "value": 5.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 1024/8192 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=16 throughput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=16 TTFT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=16 TPOT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=32 throughput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 71029.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=32 TTFT (ms)",
+            "value": 1461.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=32 TPOT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=4 throughput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=4 TTFT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=4 TPOT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=4 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 throughput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 TTFT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 TPOT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=8 throughput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 0,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=8 TTFT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=8 TPOT (ms)",
+            "value": 0,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1922.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3837.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=32 TTFT (ms)",
+            "value": 203.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=32 TPOT (ms)",
+            "value": 16.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=4 throughput (tok/s)",
+            "value": 434.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 873.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=4 TTFT (ms)",
+            "value": 137.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=4 TPOT (ms)",
+            "value": 8.78,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=64 throughput (tok/s)",
+            "value": 2829.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 5660,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=64 TTFT (ms)",
+            "value": 511.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=64 TPOT (ms)",
+            "value": 21.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=8 throughput (tok/s)",
+            "value": 756.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1507.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=8 TTFT (ms)",
+            "value": 466.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=8 TPOT (ms)",
+            "value": 9.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=16 throughput (tok/s)",
+            "value": 1245.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=16 Total Tput (tok/s)",
+            "value": 1401.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=16 TTFT (ms)",
+            "value": 161.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=16 TPOT (ms)",
+            "value": 12.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=32 throughput (tok/s)",
+            "value": 2114.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=32 Total Tput (tok/s)",
+            "value": 2376.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=32 TTFT (ms)",
+            "value": 228.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=32 TPOT (ms)",
+            "value": 14.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=4 throughput (tok/s)",
+            "value": 439.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=4 Total Tput (tok/s)",
+            "value": 495.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=4 TTFT (ms)",
+            "value": 401.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=4 TPOT (ms)",
+            "value": 8.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=8 throughput (tok/s)",
+            "value": 804.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=8 Total Tput (tok/s)",
+            "value": 904.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=8 TTFT (ms)",
+            "value": 462.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=8 TPOT (ms)",
+            "value": 9.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 1024/8192 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=16 throughput (tok/s)",
+            "value": 1035.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 9348.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=16 TTFT (ms)",
+            "value": 515.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=16 TPOT (ms)",
+            "value": 14.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1527.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 13660.51,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=32 TTFT (ms)",
+            "value": 675.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=32 TPOT (ms)",
+            "value": 19.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=4 throughput (tok/s)",
+            "value": 397.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3576.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=4 TTFT (ms)",
+            "value": 280.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=4 TPOT (ms)",
+            "value": 9.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1999.72,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 18025.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=64 TTFT (ms)",
+            "value": 1002.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=64 TPOT (ms)",
+            "value": 30.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=16 throughput (tok/s)",
+            "value": 1349.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2712.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=16 TTFT (ms)",
+            "value": 347.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=16 TPOT (ms)",
+            "value": 11.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=32 throughput (tok/s)",
+            "value": 2276.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 4546.11,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=32 TTFT (ms)",
+            "value": 164.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=32 TPOT (ms)",
+            "value": 13.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=64 throughput (tok/s)",
+            "value": 3036.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 6074.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=64 TTFT (ms)",
+            "value": 246.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=64 TPOT (ms)",
+            "value": 20.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=8 throughput (tok/s)",
+            "value": 753.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1501.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=8 TTFT (ms)",
+            "value": 596.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=8 TPOT (ms)",
+            "value": 9.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=16 throughput (tok/s)",
+            "value": 1453.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=16 Total Tput (tok/s)",
+            "value": 1636.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=16 TTFT (ms)",
+            "value": 130.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=16 TPOT (ms)",
+            "value": 10.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=4 throughput (tok/s)",
+            "value": 459.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=4 Total Tput (tok/s)",
+            "value": 518.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=4 TTFT (ms)",
+            "value": 125.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=4 TPOT (ms)",
+            "value": 8.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=64 throughput (tok/s)",
+            "value": 3373.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=64 Total Tput (tok/s)",
+            "value": 3795.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=64 TTFT (ms)",
+            "value": 233.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=64 TPOT (ms)",
+            "value": 18.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=8 throughput (tok/s)",
+            "value": 812.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=8 Total Tput (tok/s)",
+            "value": 914.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=8 TTFT (ms)",
+            "value": 149.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=8 TPOT (ms)",
+            "value": 9.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 1024/8192 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=16 throughput (tok/s)",
+            "value": 1198.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10814.93,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=16 TTFT (ms)",
+            "value": 366.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=16 TPOT (ms)",
+            "value": 12.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=32 throughput (tok/s)",
+            "value": 1888.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 16883.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=32 TTFT (ms)",
+            "value": 521.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=32 TPOT (ms)",
+            "value": 15.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=8 throughput (tok/s)",
+            "value": 734.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 6532.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=8 TTFT (ms)",
+            "value": 275.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=8 TPOT (ms)",
+            "value": 10.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24775813466 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260422"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4-tp8 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
           }
         ]
       }
