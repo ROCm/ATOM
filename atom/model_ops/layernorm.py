@@ -494,10 +494,19 @@ class GemmaRMSNorm(nn.Module):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        quant_config: LayerQuantConfig | None = None,
+        write_bf16: bool = False,
     ) -> None:
         super().__init__()
         self.weight = atom_parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self.use_fused_quant = False
+        self.write_bf16 = write_bf16
+        if quant_config is not None:
+            from aiter import QuantType
+
+            if quant_config.quant_type == QuantType.per_1x128:
+                self.use_fused_quant = True
 
     @staticmethod
     def forward_static(
@@ -546,11 +555,29 @@ class GemmaRMSNorm(nn.Module):
             self._is_compiled = True
         return self.forward_native(x, residual)
 
+    def _forward_fused_fp8(self, x, residual=None):
+        from atom.model_ops.triton_fused_gemma_norm_quant import (
+            fused_gemma_norm_fp8_quant,
+        )
+
+        out_bf16, out_fp8, out_scale, residual_out = fused_gemma_norm_fp8_quant(
+            x,
+            self.weight,
+            self.variance_epsilon,
+            residual=residual,
+            write_bf16=self.write_bf16,
+        )
+        if residual is not None:
+            return out_fp8, out_scale, out_bf16, residual_out
+        return out_fp8, out_scale, out_bf16
+
     def forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.use_fused_quant:
+            return self._forward_fused_fp8(x, residual)
         return self.forward_cuda(x, residual)
 
 

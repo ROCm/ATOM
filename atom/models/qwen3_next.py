@@ -409,8 +409,9 @@ class Qwen3NextAttention(nn.Module):
         positions: torch.Tensor,
         output: torch.Tensor,
         hidden_states: torch.Tensor,
+        x_scale=None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
 
         if self.attn_output_gate:
             gate, q, k, v = torch.split(
@@ -711,6 +712,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
+        x_fp8=None,
+        x_scale=None,
     ):
         """
         Forward pass with three parts:
@@ -735,8 +738,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 self.head_v_dim,
             )
         else:
-            projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-            projected_states_ba = self.in_proj_ba(hidden_states)
+            if x_fp8 is not None:
+                projected_states_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
+            else:
+                projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+            projected_states_ba = self.in_proj_ba(hidden_states)  # always BF16
             # Use Triton kernel to process qkvz and ba
             num_k_heads_tp = self.num_k_heads // self.tp_size
             num_v_heads_tp = self.num_v_heads // self.tp_size
@@ -883,7 +889,28 @@ class Qwen3NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.layer_type == "full_attention":
+            input_norm_quant = (
+                quant_config.get_layer_quant_config(f"{prefix}.self_attn.qkv_proj")
+                if quant_config is not None
+                else None
+            )
+            input_norm_write_bf16 = False
+        elif self.layer_type == "linear_attention":
+            input_norm_quant = (
+                quant_config.get_layer_quant_config(
+                    f"{prefix}.linear_attn.in_proj_qkvz"
+                )
+                if quant_config is not None
+                else None
+            )
+            input_norm_write_bf16 = True  # in_proj_ba needs BF16
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            quant_config=input_norm_quant,
+            write_bf16=input_norm_write_bf16,
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -915,23 +942,42 @@ class Qwen3NextDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
 
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        if self.input_layernorm.use_fused_quant:
+            if residual is None:
+                residual = hidden_states
+                hidden_states, x_scale, hidden_bf16 = self.input_layernorm(
+                    hidden_states
+                )
+            else:
+                hidden_states, x_scale, hidden_bf16, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            x_scale = hidden_bf16 = None
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        self_attention_output = torch.empty_like(hidden_states)
+        self_attention_output = torch.empty(
+            hidden_states.shape, dtype=residual.dtype, device=hidden_states.device
+        )
         if self.layer_type == "linear_attention":
             self.linear_attn(
-                hidden_states=hidden_states,
+                hidden_states=(
+                    hidden_bf16 if hidden_bf16 is not None else hidden_states
+                ),
                 output=self_attention_output,
+                x_fp8=hidden_states if x_scale is not None else None,
+                x_scale=x_scale,
             )
         elif self.layer_type == "full_attention":
             self.self_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
                 positions=positions,
+                x_scale=x_scale,
             )
         else:
             raise ValueError("Invalid layer_type")
