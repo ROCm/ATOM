@@ -473,6 +473,7 @@ class ModelRunner:
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
+        self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -1409,8 +1410,9 @@ class ModelRunner:
                         v_cache = self.kv_cache[1, attn_idx].view(
                             self.num_physical_kvcache_blocks,
                             num_kv_heads,
+                            self.physical_block_size // x,
                             hf_config.head_dim,
-                            self.physical_block_size,
+                            x,
                         )
                         module.max_model_len = self.config.max_model_len
                         if config.kv_cache_dtype == "fp8":

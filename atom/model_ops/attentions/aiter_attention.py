@@ -23,6 +23,7 @@ from .backends import AttentionBackend, CommonAttentionBuilder
 from atom.plugin.prepare import is_plugin_mode
 from atom.plugin.attention import AiterAttentionMetadataBuilderDecoratorForPluginMode
 from atom.plugin.attention import AiterBackendDecoratorForPluginMode
+from atom.utils import envs
 
 
 def cdiv(a, b):
@@ -66,6 +67,12 @@ class AiterAttentionMetadataBuilder:
         model_runner=None,
     ):
         self.block_size = 1024 if model_runner.block_size == 1024 else 16
+        if envs.ATOM_ENABLE_TRITON_UNIFIED_ATTENTION_DECODE:
+            # activate block_convertor when UA_decode is enabled
+            self.block_size = 128 if model_runner.kv_cache_dtype == "fp8" else 64
+        assert (
+            model_runner.block_size % self.block_size == 0
+        ), f"model_runner.block_size must be divisible by block_size but got {model_runner.block_size=}, block_size={self.block_size}, please set --block-size (model_runner.block_size) to be divisible by {self.block_size}"
         # Note: Cannot use super() here because the class is dynamically created by decorator
         # Use explicit parent class call instead
         CommonAttentionBuilder.__init__(self, model_runner)

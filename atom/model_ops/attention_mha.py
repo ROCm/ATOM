@@ -21,6 +21,7 @@ from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
 from atom.utils.decorators import mark_trace
 from atom.model_ops.base_attention import cp_mha_gather_cache
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -344,56 +345,81 @@ class PagedAttentionImpl(nn.Module):
             max_context_partition_num = 1
             context_partition_size = 128
 
-        # Output buffers (same as Triton)
-        intermediate_shape = (
-            num_seqs,
-            num_kv_heads,
-            max_context_partition_num,
-            query_group_size,
-        )
-        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-        max_logits = torch.empty(
-            intermediate_shape, dtype=torch.float32, device=q.device
-        )
-        temporary_output = torch.empty(
-            *intermediate_shape,
-            head_size,
-            dtype=q.dtype,
-            device=q.device,
-        )
+        if envs.ATOM_ENABLE_TRITON_UNIFIED_ATTENTION_DECODE:
+            unified_attention(
+                q,
+                k_cache,
+                v_cache,
+                o,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                seqused_k=attn_metadata.context_lens,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=None,
+                window_size=(self.sliding_window, 0),
+                block_table=attn_metadata.block_tables,
+                softcap=0,
+                q_descale=None,
+                k_descale=self.kv_scale,
+                v_descale=self.kv_scale,
+                sinks=self.sinks,
+                shuffled_kv_cache=True,
+            )
+        else:
+            # Output buffers (same as Triton)
+            intermediate_shape = (
+                num_seqs,
+                num_kv_heads,
+                max_context_partition_num,
+                query_group_size,
+            )
+            exp_sums = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            max_logits = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            temporary_output = torch.empty(
+                *intermediate_shape,
+                head_size,
+                dtype=q.dtype,
+                device=q.device,
+            )
 
-        if k_scale is not None and k_scale.numel() > 1:
-            k_scale = k_scale.unsqueeze(-1)
-            v_scale = v_scale.unsqueeze(-1)
+            if k_scale is not None and k_scale.numel() > 1:
+                k_scale = k_scale.unsqueeze(-1)
+                v_scale = v_scale.unsqueeze(-1)
 
-        compute_type = (
-            torch.bfloat16
-            if self.kv_cache_dtype == "bf16"  # or per_tensor
-            else aiter.dtypes.fp8
-        )
-        torch.ops.aiter.pa_decode_gluon(
-            o,
-            q,
-            k_cache,
-            v_cache,
-            attn_metadata.context_lens,
-            attn_metadata.block_tables,
-            self.scale,
-            attn_metadata.max_seqlen_q,
-            max_context_partition_num,
-            context_partition_size,
-            compute_type,
-            None,  # q_scale
-            None if self.kv_cache_dtype == "bf16" else k_scale,
-            None if self.kv_cache_dtype == "bf16" else v_scale,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=temporary_output,
-            alibi_slopes=None,
-            sinks=self.sinks,
-            sliding_window=self.sliding_window,
-            ps=True,
-        )
+            compute_type = (
+                torch.bfloat16
+                if self.kv_cache_dtype == "bf16"  # or per_tensor
+                else aiter.dtypes.fp8
+            )
+            torch.ops.aiter.pa_decode_gluon(
+                o,
+                q,
+                k_cache,
+                v_cache,
+                attn_metadata.context_lens,
+                attn_metadata.block_tables,
+                self.scale,
+                attn_metadata.max_seqlen_q,
+                max_context_partition_num,
+                context_partition_size,
+                compute_type,
+                None,  # q_scale
+                None if self.kv_cache_dtype == "bf16" else k_scale,
+                None if self.kv_cache_dtype == "bf16" else v_scale,
+                exp_sums=exp_sums,
+                max_logits=max_logits,
+                temporary_output=temporary_output,
+                alibi_slopes=None,
+                sinks=self.sinks,
+                sliding_window=self.sliding_window,
+                ps=True,
+            )
 
         return o
 
