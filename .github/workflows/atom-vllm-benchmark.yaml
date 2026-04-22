@@ -358,7 +358,7 @@ jobs:
               or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp1" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1 == "true")
               or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp4" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4 == "true")
             ))
-          ' .github/benchmark/vllm_benchmark_models.json)"
+          ' .github/benchmark/oot_benchmark_models.json)"
           echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
           if [ "${MODELS_JSON}" = "[]" ]; then
             echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
