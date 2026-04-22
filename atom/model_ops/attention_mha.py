@@ -464,7 +464,7 @@ class PagedAttentionImpl(nn.Module):
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
 
-        # variable length attention use key value as input
+        # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
         sliding_window = (
             (self.sliding_window, 0, 0)

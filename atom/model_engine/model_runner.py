@@ -1420,7 +1420,7 @@ class ModelRunner:
             ) if self._per_layer_kv_cache is None else None
 
         # Build KVCacheConfig
-        # TODO(lirong): This is a simple solution to build KVCacheConfig,
+        # lirong TODO: This is a simple solution to build KVCacheConfig,
         # models with only one type of attention, but not support multi-type of attention models.
         # We need to support it by kv_cache_group in the future.
 

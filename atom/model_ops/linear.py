@@ -427,6 +427,8 @@ class LinearBase(nn.Module):
                         self._fp4_k_padded = k_pad
                         logger.info(f"[MXFP4] Padded weight K {k_packed} -> {k_pad} for {self.prefix}")
                 shuffle_weights(self.weight)
+                # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+        # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32:
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
