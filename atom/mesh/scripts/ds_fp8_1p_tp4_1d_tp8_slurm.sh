@@ -49,7 +49,7 @@ MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
 
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
-CONC_LIST="${CONC_LIST:-16,32,64}"
+CONC_LIST="${CONC_LIST:-1,2,4,8,16,32,64,128}"
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.8}"
 BACKEND="${BACKEND:-sglang}"
 
@@ -61,7 +61,7 @@ WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 # weights produce garbage output). Override with RUN_GSM8K=1 to force-enable
 # or RUN_GSM8K=0 to skip even with real weights.
 RUN_GSM8K="${RUN_GSM8K:-auto}"
-GSM8K_LIMIT="${GSM8K_LIMIT:-100}"
+GSM8K_LIMIT="${GSM8K_LIMIT:-}"
 GSM8K_NUM_FEWSHOT="${GSM8K_NUM_FEWSHOT:-3}"
 GSM8K_NUM_CONCURRENT="${GSM8K_NUM_CONCURRENT:-65}"
 
@@ -135,7 +135,7 @@ ROUTER  : ${PREFILL_IP}:${ROUTER_PORT}
 MODEL   : ${MODEL_PATH}
 IMAGE   : ${DOCKER_IMAGE}
 LOAD_DUMMY : ${LOAD_DUMMY:-<off>}
-RUN_GSM8K  : ${RUN_GSM8K} (limit=${GSM8K_LIMIT}, fewshot=${GSM8K_NUM_FEWSHOT})
+RUN_GSM8K  : ${RUN_GSM8K} (limit=${GSM8K_LIMIT:-all}, fewshot=${GSM8K_NUM_FEWSHOT})
 ISL/OSL/CONC : ${ISL_LIST} / ${OSL} / ${CONC_LIST}
 LOG_ROOT: ${LOG_ROOT}
 =====================
@@ -262,7 +262,7 @@ set -euo pipefail
 RESULT_DIR="/workspace/gsm8k_results"
 
 echo "[gsm8k] model=${MODEL_PATH} endpoint=http://127.0.0.1:${ROUTER_PORT}"
-echo "[gsm8k] limit=${GSM8K_LIMIT} fewshot=${GSM8K_NUM_FEWSHOT} concurrent=${GSM8K_NUM_CONCURRENT}"
+echo "[gsm8k] limit=${GSM8K_LIMIT:-all} fewshot=${GSM8K_NUM_FEWSHOT} concurrent=${GSM8K_NUM_CONCURRENT}"
 
 if ! command -v lm_eval >/dev/null 2>&1; then
     echo "[gsm8k] installing lm-eval..."
@@ -272,11 +272,16 @@ fi
 RUN_TAG="$(date +%Y%m%d%H%M%S)_gsm8k"
 mkdir -p "${RESULT_DIR}"
 
+LIMIT_ARG=""
+if [[ -n "${GSM8K_LIMIT}" ]]; then
+    LIMIT_ARG="--limit ${GSM8K_LIMIT}"
+fi
+
 lm_eval --model local-completions \
     --model_args "model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/completions,num_concurrent=${GSM8K_NUM_CONCURRENT},max_retries=1,tokenized_requests=False,trust_remote_code=True" \
     --tasks gsm8k \
     --num_fewshot "${GSM8K_NUM_FEWSHOT}" \
-    --limit "${GSM8K_LIMIT}" \
+    ${LIMIT_ARG} \
     --output_path "${RESULT_DIR}/${RUN_TAG}"
 
 python3 -c "
