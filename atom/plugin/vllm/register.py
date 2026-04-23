@@ -124,3 +124,17 @@ def register_model() -> None:
     from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
 
     apply_graph_capture_patch()
+
+    if not envs.ATOM_VLLM_SAMPLER:
+        logger.info("Disable ATOM vLLM sampler patch")
+        return
+
+    # The sampler patch follows the ATOM platform/plugin-mode lifecycle: if the
+    # ATOM vLLM platform is enabled, we also install the ATOM greedy sampler
+    # patch; if plugin mode is disabled, register_model() has already returned.
+    from atom.plugin.vllm.sampler_patch import apply_vllm_sampler_patch
+
+    # Install the ATOM-owned greedy sampler patch after the core vLLM model
+    # integration is in place. This keeps vLLM as the runtime while letting
+    # ATOM own the hot greedy argmax path.
+    apply_vllm_sampler_patch()
