@@ -961,9 +961,10 @@ jobs:
           VLLM_LOG="${RESULT_FILENAME}.vllm.log"
           BENCH_OUTCOME="${{ steps.run_benchmark_client.outcome }}"
           COMPLETED=""
+          NUM_PROMPTS=""
 
           if [ -f "${RESULT_PATH}" ]; then
-            COMPLETED=$(
+            mapfile -t RESULT_COUNTS < <(
               RESULT_PATH="${RESULT_PATH}" python3 - <<'PY'
           import json
           import os
@@ -974,18 +975,22 @@ jobs:
                   data = json.load(f)
           except (OSError, ValueError, json.JSONDecodeError):
               print("")
+              print("")
           else:
               print(data.get("completed", ""))
+              print(data.get("num_prompts", ""))
           PY
             )
+            COMPLETED="${RESULT_COUNTS[0]:-}"
+            NUM_PROMPTS="${RESULT_COUNTS[1]:-}"
           fi
 
-          if [[ "${BENCH_OUTCOME}" == "success" && -f "${RESULT_PATH}" && "${COMPLETED}" != "0" ]]; then
+          if [[ "${BENCH_OUTCOME}" == "success" && -f "${RESULT_PATH}" && -n "${NUM_PROMPTS}" && "${COMPLETED}" == "${NUM_PROMPTS}" ]]; then
             echo "Benchmark finished without triggering diagnostic dump."
             exit 0
           fi
 
-          echo "::warning::Dumping benchmark diagnostics for ${MODEL_NAME} (benchmark outcome=${BENCH_OUTCOME}, completed=${COMPLETED:-missing})."
+          echo "::warning::Dumping benchmark diagnostics for ${MODEL_NAME} (benchmark outcome=${BENCH_OUTCOME}, completed=${COMPLETED:-missing}, num_prompts=${NUM_PROMPTS:-missing})."
           echo "::group::Benchmark client log"
           if [ -f "${CLIENT_LOG}" ]; then
             cat "${CLIENT_LOG}"
@@ -1024,16 +1029,68 @@ jobs:
           "
           done
 
-      - name: Collect benchmark result
+      - name: Validate benchmark result completeness
+        id: validate_benchmark_result
         if: steps.check.outputs.enabled == 'true'
         run: |
-          if [ ! -f "${RESULT_FILENAME}.json" ]; then
-            echo "ERROR: Benchmark result file ${RESULT_FILENAME}.json was not generated for ${MODEL_NAME}."
-            exit 1
-          fi
+          set -euo pipefail
+          RESULT_PATH="${RESULT_FILENAME}.json"
+          RESULT_PATH="${RESULT_PATH}" MODEL_NAME="${MODEL_NAME}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          result_path = os.environ["RESULT_PATH"]
+          model_name = os.environ["MODEL_NAME"]
+
+          if not os.path.exists(result_path):
+              print(
+                  f"::error::Benchmark result file {result_path} was not generated for {model_name}.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          try:
+              with open(result_path, encoding="utf-8") as f:
+                  data = json.load(f)
+          except (OSError, ValueError, json.JSONDecodeError) as exc:
+              print(
+                  f"::error::Failed to read benchmark result file {result_path}: {exc}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          num_prompts = data.get("num_prompts")
+          completed = data.get("completed")
+
+          try:
+              num_prompts = int(num_prompts)
+              completed = int(completed)
+          except (TypeError, ValueError):
+              print(
+                  f"::error::Invalid benchmark result in {result_path}: "
+                  f"num_prompts={num_prompts!r}, completed={completed!r}.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if completed != num_prompts:
+              print(
+                  f"::error::Invalid benchmark result in {result_path}: "
+                  f"successful requests ({completed}) did not match num_prompts ({num_prompts}). "
+                  "Skipping artifact upload and dashboard publishing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(
+              f"Validated benchmark result for {model_name}: "
+              f"successful requests ({completed}) matched num_prompts ({num_prompts})."
+          )
+          PY
 
       - name: Upload benchmark artifacts
-        if: always() && steps.check.outputs.enabled == 'true'
+        if: always() && steps.check.outputs.enabled == 'true' && steps.validate_benchmark_result.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
           name: oot-benchmark-${{ env.RESULT_FILENAME }}
