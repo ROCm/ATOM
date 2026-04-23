@@ -88,6 +88,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # --- Disaggregated prefill/decode CU partitioning ---
+    # When 1 (default), prefill and decode dynamically select CU masks each
+    # iteration based on current batch sizes.  Set to 0 to disable CU masking
+    # entirely (both streams get all CUs, matching torch.cuda.Stream baseline).
+    "ATOM_DISAGG_DYNAMIC_CU": lambda: int(os.getenv("ATOM_DISAGG_DYNAMIC_CU", "1")),
 }
 
 

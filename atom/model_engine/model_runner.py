@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import ctypes
 import gzip
 import logging
 import math
@@ -1630,30 +1631,150 @@ class ModelRunner:
         logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
 
-    def create_prefill_stream(self) -> bool:
-        """Create a dedicated CUDA stream for disaggregated prefill KV writes.
+    @staticmethod
+    def _stream_with_cu_mask(mask_bits: list[int]) -> torch.cuda.ExternalStream:
+        """Create a HIP stream restricted to the CUs described by mask_bits.
+
+        mask_bits is a list of uint32 words; bit i of word w represents
+        CU (w*32 + i).  Uses hipExtStreamCreateWithCUMask (ROCm only).
+        """
+        hip = ctypes.CDLL("libamdhip64.so")
+        hip.hipExtStreamCreateWithCUMask.restype = ctypes.c_int
+        hip.hipExtStreamCreateWithCUMask.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        raw_stream = ctypes.c_void_p()
+        mask_arr = (ctypes.c_uint * len(mask_bits))(*mask_bits)
+        ret = hip.hipExtStreamCreateWithCUMask(
+            ctypes.byref(raw_stream), len(mask_bits), mask_arr
+        )
+        assert ret == 0, f"HIP err {ret} creating masked stream"
+        return torch.cuda.ExternalStream(raw_stream.value)
+
+    @staticmethod
+    def _cu_mask_for_fraction(fraction: float, upper: bool) -> list[int]:
+        """Return CU mask bits for the given fraction.
+
+        For upper=False (prefill): CUs [0, split).
+        For upper=True  (decode):  CUs [split, total).
+        split = round(total * fraction).
+        """
+        total = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        split = max(1, min(total - 1, round(total * fraction)))
+        start = split if upper else 0
+        end = total if upper else split
+        num_words = (total + 31) // 32
+        words = [0] * num_words
+        for cu in range(start, end):
+            words[cu // 32] |= 1 << (cu % 32)
+        side = "decode" if upper else "prefill"
+        logger.info(
+            f"CU mask ({side}): CUs [{start},{end}) "
+            f"(fraction={fraction}, total={total})"
+        )
+        return words
+
+    @staticmethod
+    def _optimal_cu_fraction(prefill_tokens: int, decode_batch: int):
+        """Return the prefill CU fraction for the given workload, or None for no mask.
+
+        Lookup table derived from empirical benchmarking across CU splits
+        (30/50/60/70/80% prefill) on DeepSeek-R1 tp=8.  Prefill latency
+        dominates in nearly all cases; decode tolerates CU reduction well
+        at typical batch sizes.
+
+        Returns None when CU masking provides no benefit (tiny prefill,
+        very large prefill that is memory-bandwidth-bound, or pure decode).
+        """
+        return None
+        # if prefill_tokens < 512:
+        #     return None
+        # if prefill_tokens >= 8192:
+        #     return None
+        # if prefill_tokens >= 4096:
+        #     return 0.7
+        # # 512 <= prefill_tokens < 4096
+        # if decode_batch > 96:
+        #     return 0.7
+        # return 0.8
+
+    def init_cu_shared_mem(self, shm_name: str) -> bool:
+        """Attach to the shared memory region for cross-process batch-size exchange.
+
+        Layout: [0:4] = prefill_tokens (uint32), [4:8] = decode_batch (uint32).
+        Called from both PrefillEngineCore._init_disagg() and
+        DecodeEngineCore._init_disagg().
+        """
+        import multiprocessing.shared_memory
+
+        self._cu_shm = multiprocessing.shared_memory.SharedMemory(
+            name=shm_name, create=False
+        )
+        return True
+
+    # CU fractions for which we pre-create masked streams.
+    _CU_POOL_FRACTIONS = [0.7, 0.8]
+
+    def create_prefill_stream_pool(self) -> bool:
+        """Create a pool of CU-masked CUDA streams for disaggregated prefill.
 
         Called once by PrefillEngineCore._init_disagg() after IPC import.
-        All subsequent prefill_forward() calls run on this stream so that
-        decode's default stream never observes partial KV writes.
+        Pre-creates one stream per fraction in _CU_POOL_FRACTIONS plus a
+        full-CU fallback (None key).  prefill_forward() selects the stream
+        dynamically each iteration via _optimal_cu_fraction().
         """
-        self._prefill_stream = torch.cuda.Stream()
-        return True  # sentinel so async_proc enqueues the result for wait_out=True
+        self._prefill_streams = {}
+        # for f in self._CU_POOL_FRACTIONS:
+        #     mask = self._cu_mask_for_fraction(f, upper=False)
+        #     self._prefill_streams[f] = self._stream_with_cu_mask(mask)
+        # Full-CU fallback (no mask)
+        self._prefill_streams[None] = torch.cuda.Stream()
+        logger.info(
+            f"Prefill stream pool created: fractions={list(self._prefill_streams.keys())}"
+        )
+        return True
 
-    def create_decode_stream(self) -> bool:
-        """Create a dedicated CUDA stream for disaggregated decode forward passes.
+    def create_decode_stream_pool(self) -> bool:
+        """Create a pool of CU-masked CUDA streams for disaggregated decode.
 
-        Called once by DecodeEngineCore._init_disagg(). run_model() runs on
-        this stream; postprocess() runs on the default stream after waiting on
-        _model_fwd_event.
+        Called once by DecodeEngineCore._init_disagg().  Complementary to the
+        prefill pool: for fraction F, decode gets CUs [F*total, total).
+        forward() selects the stream dynamically each iteration.
         """
-        self._decode_stream = torch.cuda.Stream()
+        self._decode_streams = {}
+        # for f in self._CU_POOL_FRACTIONS:
+        #     mask = self._cu_mask_for_fraction(f, upper=True)
+        #     self._decode_streams[f] = self._stream_with_cu_mask(mask)
+        #self._decode_streams[None] = torch.cuda.Stream()
+        torch.cuda.set_stream(torch.cuda.Stream())
         self._model_fwd_event = torch.cuda.Event()
-        return True  # sentinel so async_proc enqueues the result for wait_out=True
+        logger.info(
+            f"Decode stream pool created: fractions={list(self._decode_streams.keys())}"
+        )
+        return True
+
+    def _select_prefill_stream(self, batch: ScheduledBatch):
+        """Pick the best CU-masked prefill stream for the current workload."""
+        import struct
+
+        prefill_tokens = batch.total_tokens_num
+        # Read decode's last-known batch size from shared memory.
+        decode_batch = 0
+        shm = getattr(self, "_cu_shm", None)
+        if shm is not None:
+            decode_batch = struct.unpack_from("I", shm.buf, 4)[0]
+            # Write our prefill token count for decode to read.
+            struct.pack_into("I", shm.buf, 0, prefill_tokens)
+        fraction = self._optimal_cu_fraction(prefill_tokens, decode_batch)
+        return self._prefill_streams[fraction], fraction
 
     @torch.inference_mode()
     def prefill_forward(self, batch: ScheduledBatch) -> list[int]:
-        """Run a prefill forward pass on the dedicated prefill stream.
+        """Run a prefill forward pass on a dynamically selected CU-masked stream.
 
         Writes KV for all prompt tokens, samples the first generated token for
         each sequence, then synchronizes before returning so decode's default
@@ -1662,7 +1783,13 @@ class ModelRunner:
         the decode process can append them before the first decode step,
         matching the num_tokens state that non-disagg postprocess would produce.
         """
-        with torch.cuda.stream(self._prefill_stream):
+        # stream, fraction = self._select_prefill_stream(batch)
+        # logger.debug(
+        #     f"prefill_forward: tokens={batch.total_tokens_num} "
+        #     f"cu_fraction={fraction}"
+        # )
+        stream=self._prefill_streams[None]
+        with torch.cuda.stream(stream):
             input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(
                 batch
             )
@@ -1671,7 +1798,7 @@ class ModelRunner:
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
         # Synchronize so decode's default stream sees all KV writes.
-        self._prefill_stream.synchronize()
+        #stream.synchronize()
         reset_forward_context()
         return sampled_cpu
 
@@ -2004,23 +2131,49 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
         )
 
+    def _select_decode_stream(self, batch: ScheduledBatch):
+        """Pick the best CU-masked decode stream for the current workload."""
+        import struct
+
+        decode_batch = batch.total_seqs_num_decode
+        # Read prefill's last-known token count from shared memory.
+        prefill_tokens = 0
+        shm = getattr(self, "_cu_shm", None)
+        if shm is not None:
+            prefill_tokens = struct.unpack_from("I", shm.buf, 0)[0]
+            # Write our decode batch size for prefill to read.
+            struct.pack_into("I", shm.buf, 4, decode_batch)
+        fraction = self._optimal_cu_fraction(prefill_tokens, decode_batch)
+        return self._decode_streams[fraction], fraction
+
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        decode_stream = getattr(self, "_decode_stream", None)
-        if decode_stream is not None:
-            with torch.cuda.stream(decode_stream):
-                input_ids, temperatures, top_ks, top_ps, all_greedy = (
-                    self.prepare_model(batch)
-                )
-                logits, hidden_states = self.run_model(input_ids, batch)
-            # Signal default stream to wait until run_model is done on decode_stream.
-            self._model_fwd_event.record(decode_stream)
-            torch.cuda.current_stream().wait_event(self._model_fwd_event)
-        else:
-            input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(
-                batch
-            )
-            logits, hidden_states = self.run_model(input_ids, batch)
+        # decode_streams = getattr(self, "_decode_streams", None)
+        # if decode_streams is not None:
+        #     # stream, fraction = self._select_decode_stream(batch)
+        #     # logger.debug(
+        #     #     f"decode forward: batch={batch.total_seqs_num_decode} "
+        #     #     f"cu_fraction={fraction}"
+        #     # )
+        #     stream=self._decode_streams[None]
+        #     with torch.cuda.stream(stream):
+        #         input_ids, temperatures, top_ks, top_ps, all_greedy = (
+        #             self.prepare_model(batch)
+        #         )
+        #         logits, hidden_states = self.run_model(input_ids, batch)
+        #     # Signal default stream to wait until run_model is done on decode_stream.
+        #     self._model_fwd_event.record(stream)
+        #     torch.cuda.current_stream().wait_event(self._model_fwd_event)
+        # else:
+        #     input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(
+        #         batch
+        #     )
+        #     logits, hidden_states = self.run_model(input_ids, batch)
+        input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(
+            batch
+        )
+        logits, hidden_states = self.run_model(input_ids, batch)
+
         # postprocess (sampling + async CPU copy) always runs on default stream.
         fwd_output = self.postprocess(
             batch,

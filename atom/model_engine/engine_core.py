@@ -6,6 +6,7 @@ import logging
 import pickle
 import queue
 import threading
+import time
 from contextlib import ExitStack
 from typing import List
 
@@ -195,7 +196,18 @@ class EngineCore:
         scheduled_batch, seqs = self.scheduler.schedule()
         # if scheduled_batch is None:
         #     return False
+        t0 = time.perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        iter_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            f"iter {iter_ms:.2f}ms | "
+            f"reqs={scheduled_batch.total_seqs_num} "
+            f"(prefill={scheduled_batch.total_seqs_num_prefill} "
+            f"decode={scheduled_batch.total_seqs_num_decode}) | "
+            f"tokens={scheduled_batch.total_tokens_num} "
+            f"(prefill={scheduled_batch.total_tokens_num_prefill} "
+            f"decode={scheduled_batch.total_tokens_num_decode})"
+        )
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
@@ -585,10 +597,16 @@ class PrefillEngineCore(EngineCore):
         bootstrap was already sent inside _send_ready_signal(), so _init_disagg
         only needs to set up the per-request BlockAssignment/PrefillDone channel.
         """
-        # --- Create dedicated CUDA stream for prefill KV writes ---
-        logger.info("PrefillEngineCore: calling create_prefill_stream...")
-        self.runner_mgr.call_func("create_prefill_stream", wait_out=True)
-        logger.info("PrefillEngineCore: prefill CUDA stream created")
+        # --- Attach shared memory for dynamic CU partitioning ---
+        # if self._config.disagg_cu_shm_name:
+        #     self.runner_mgr.call_func(
+        #         "init_cu_shared_mem", self._config.disagg_cu_shm_name, wait_out=True
+        #     )
+
+        # --- Create pool of CU-masked CUDA streams for prefill ---
+        logger.info("PrefillEngineCore: creating prefill stream pool...")
+        self.runner_mgr.call_func("create_prefill_stream_pool", wait_out=True)
+        logger.info("PrefillEngineCore: prefill stream pool created")
 
         # --- Open the PUSH socket to send PrefillDone messages ---
         # Prefill connects (not binds) so decode's PULL bind is ready first,
@@ -659,8 +677,15 @@ class PrefillEngineCore(EngineCore):
             return False
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
+        t0 = time.perf_counter()
         sampled_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
+        )
+        iter_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            f"prefill iter {iter_ms:.2f}ms | "
+            f"reqs={scheduled_batch.total_seqs_num} | "
+            f"tokens={scheduled_batch.total_tokens_num}"
         )
 
         # Notify decode that prefill is done, including the first generated token
@@ -799,7 +824,6 @@ class DecodeEngineCore(EngineCore):
         # Give the GPU allocator a moment to reclaim the freed weight memory
         # before prefill measures free VRAM for KV cache sizing.  Without this,
         # the freed pages may not yet be visible and prefill can OOM on alloc.
-        import time
 
         time.sleep(2)
         logger.info(
@@ -823,6 +847,9 @@ class DecodeEngineCore(EngineCore):
         was already handled in __init__(), so _init_disagg only sets up the
         per-request BlockAssignment/PrefillDone channel.
         """
+        # Create pool of CU-masked CUDA streams for decode forward passes.
+        self.runner_mgr.call_func("create_decode_stream_pool", wait_out=True)
+
         # Decode PUSH connects to prefill's bound PULL (d2p channel).
         self._d2p_sock = self._disagg_ctx.socket(zmq.PUSH)
         self._d2p_sock.connect(self._disagg_d2p_addr)
@@ -831,8 +858,13 @@ class DecodeEngineCore(EngineCore):
         self._p2d_recv_sock = self._disagg_ctx.socket(zmq.PULL)
         self._p2d_recv_sock.bind(self._disagg_p2d_addr)
 
-        # Create a dedicated CUDA stream for decode forward passes.
-        self.runner_mgr.call_func("create_decode_stream", wait_out=True)
+        # --- Attach shared memory for dynamic CU partitioning ---
+        # if self._config.disagg_cu_shm_name:
+        #     self.runner_mgr.call_func(
+        #         "init_cu_shared_mem", self._config.disagg_cu_shm_name, wait_out=True
+        #     )
+
+        
 
         # Start thread to receive PrefillDone from prefill.
         self._prefill_done_thread = threading.Thread(
@@ -908,7 +940,18 @@ class DecodeEngineCore(EngineCore):
         scheduled_batch, seqs = result
         if scheduled_batch is None:
             return False
+        t0 = time.perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        iter_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            f"iter {iter_ms:.2f}ms | "
+            f"reqs={scheduled_batch.total_seqs_num} "
+            f"(prefill={scheduled_batch.total_seqs_num_prefill} "
+            f"decode={scheduled_batch.total_seqs_num_decode}) | "
+            f"tokens={scheduled_batch.total_tokens_num} "
+            f"(prefill={scheduled_batch.total_tokens_num_prefill} "
+            f"decode={scheduled_batch.total_tokens_num_decode})"
+        )
         finished_seqs = self.scheduler.postprocess(
             seqs.values(), fwd_out, stream_output_queue=self.stream_output_queue
         )

@@ -99,6 +99,7 @@ Access via `from atom.utils import envs; envs.ATOM_FOO`
 | `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION` | 0 | Disable plugin attention |
 | `ATOM_USE_CUSTOM_ALL_GATHER` | **1** | Custom all-gather (vs NCCL) |
 | `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD` | 1024 | Dual-stream MoE threshold (tokens) |
+| `ATOM_DISAGG_DYNAMIC_CU` | **1** | Dynamic CU partitioning between prefill/decode streams (disagg mode); 0 disables masking |
 
 ### Third-party vars (not managed in envs.py)
 - `AITER_LOG_LEVEL=WARNING` — **always set before starting server**

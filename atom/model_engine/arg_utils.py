@@ -47,6 +47,7 @@ class EngineArgs:
     num_speculative_tokens: int = 1
     mark_trace: bool = False
     enable_disagg: bool = False
+    disagg_prefill_max_num_seqs: Optional[int] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -181,6 +182,13 @@ class EngineArgs:
             "--enable-disagg",
             action="store_true",
             help="Enable intra-GPU prefill/decode disaggregation.",
+        )
+        parser.add_argument(
+            "--disagg-prefill-max-num-seqs",
+            type=int,
+            default=None,
+            help="Max sequences per prefill batch in disagg mode. "
+            "Defaults to --max-num-seqs when not set.",
         )
 
         return parser

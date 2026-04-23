@@ -755,6 +755,12 @@ class Config:
     disagg_kvcache_ipc_addr: str = ""
     # True for the decode process in disagg mode: skip GPU weight/kvcache allocation.
     disagg_is_decode: bool = False
+    # Name of the shared-memory region used for dynamic CU partitioning.
+    # Both prefill and decode processes open this to exchange batch sizes.
+    disagg_cu_shm_name: str = ""
+    # Override max_num_seqs for the prefill process in disagg mode.
+    # When None, prefill inherits the base max_num_seqs.
+    disagg_prefill_max_num_seqs: Optional[int] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:

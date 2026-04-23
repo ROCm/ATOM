@@ -4,6 +4,8 @@
 import asyncio
 import logging
 import multiprocessing
+import multiprocessing.shared_memory
+import os
 import pickle
 import queue
 import weakref
@@ -373,6 +375,14 @@ class CoreManager:
                 except (ValueError, OSError):
                     pass
 
+        # Clean up dynamic CU partitioning shared memory (if created).
+        if hasattr(self, "_cu_shm"):
+            try:
+                self._cu_shm.close()
+                self._cu_shm.unlink()
+            except Exception:
+                pass
+
         logger.info(f"{self.label}: All EngineCores shut down")
 
     def add_request(self, seqs: List[Sequence]):
@@ -553,16 +563,27 @@ class DisaggCoreManager(CoreManager):
         # Bootstrap round 2: kvcache handle + num_blocks (prefill → decode)
         kvcache_ipc_addr = get_open_zmq_ipc_path()
 
+        # Shared memory for dynamic CU partitioning: 8 bytes total.
+        # [0:4] = prefill_tokens (uint32), [4:8] = decode_batch (uint32).
+        cu_shm_name = f"atom_cu_split_{os.getpid()}"
+        self._cu_shm = multiprocessing.shared_memory.SharedMemory(
+            name=cu_shm_name, create=True, size=8
+        )
+        self._cu_shm.buf[:8] = b"\x00" * 8
+
         # Build per-process configs.
         from atom.utils import get_open_port as _get_open_port
 
         prefill_config = copy.deepcopy(config)
+        if config.disagg_prefill_max_num_seqs is not None:
+            prefill_config.max_num_seqs = config.disagg_prefill_max_num_seqs
         prefill_config.enforce_eager = True
         prefill_config.disagg_d2p_addr = d2p_addr
         prefill_config.disagg_p2d_addr = p2d_addr
         prefill_config.disagg_weight_ipc_addr = weight_ipc_addr
         prefill_config.disagg_weight_ack_addr = weight_ack_addr
         prefill_config.disagg_kvcache_ipc_addr = kvcache_ipc_addr
+        prefill_config.disagg_cu_shm_name = cu_shm_name
         # Give prefill a distinct distributed rendezvous port so it doesn't
         # collide with decode's data_parallel_base_port (both deep-copy the
         # same port from config).
@@ -574,6 +595,7 @@ class DisaggCoreManager(CoreManager):
         decode_config.disagg_weight_ipc_addr = weight_ipc_addr
         decode_config.disagg_weight_ack_addr = weight_ack_addr
         decode_config.disagg_kvcache_ipc_addr = kvcache_ipc_addr
+        decode_config.disagg_cu_shm_name = cu_shm_name
         # Decode allocates no GPU memory — kvcache and weights are imported from
         # prefill via CUDA IPC after prefill's READY signal.
         decode_config.disagg_is_decode = True
