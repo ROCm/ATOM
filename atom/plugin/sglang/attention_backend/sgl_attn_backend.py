@@ -219,8 +219,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
+        topk: int = 1,
     ):
-        super().__init__(model_runner, skip_prefill, kv_indptr_buf)
+        super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
