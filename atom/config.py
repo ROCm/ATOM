@@ -998,9 +998,5 @@ def get_current_atom_config() -> Config:
     forward_atom_config = _get_current_atom_config_from_vllm_forward_context()
     if forward_atom_config is not None:
         return forward_atom_config
-    if is_vllm():
-        logger.warning(
-            "atom config has not been set into vllm forward_context(vLLM plugin mode), using global singleton"
-        )
     assert _current_atom_config is not None, "Current atom config is not set"
     return _current_atom_config
