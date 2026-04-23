@@ -71,6 +71,12 @@ class Gemma4Attention(nn.Module):
 
     The two types differ in KV-head count, head dimension, RoPE config, and
     whether a sliding window is applied.
+
+    AITER's paged attention backend only supports full rotation
+    (rotary_dim == head_dim).  Gemma 4 full_attention layers use partial RoPE
+    (rotary_dim = 128 out of head_dim = 512), so we apply RoPE manually before
+    passing Q/K to the paged attention kernel.  Sliding_attention layers use
+    full rotation (rotary_dim = head_dim = 256) and can use in-kernel RoPE.
     """
 
     def __init__(
@@ -124,34 +130,83 @@ class Gemma4Attention(nn.Module):
 
         rope_theta = rope_params.get("rope_theta", 10000.0)
         partial_rotary_factor = rope_params.get("partial_rotary_factor", 1.0)
-        rotary_dim = int(self.head_dim * partial_rotary_factor)
+        self.rotary_dim = int(self.head_dim * partial_rotary_factor)
+        self.apply_partial_rope = self.rotary_dim < self.head_dim
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=rotary_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_theta,
-            # Pass a simple "default" scaling dict so the backend does not try
-            # to parse the nested Gemma4 rope_parameters structure.
-            rope_scaling={"rope_type": "default", "rope_theta": rope_theta},
-        )
-
-        self.attn = Attention(
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            scale=self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            kv_cache_dtype=atom_config.kv_cache_dtype,
-            layer_num=layer_num,
-            use_mla=False,
-            rotary_emb=self.rotary_emb,
-            config=atom_config,
-            prefix=f"{prefix}.attn",
-            per_layer_sliding_window=per_layer_sliding_window,
-        )
+        if self.apply_partial_rope:
+            # Partial RoPE: build a rotary emb that covers only rotary_dim dims.
+            # We apply it manually in forward() because AITER's paged-attention
+            # backend asserts rotary_dim == head_dim (full rotation only).
+            self.rotary_emb = get_rope(
+                self.rotary_dim,
+                rotary_dim=self.rotary_dim,
+                max_position=config.max_position_embeddings,
+                base=rope_theta,
+                rope_scaling={"rope_type": "default", "rope_theta": rope_theta},
+            )
+            # Paged attention with no in-kernel RoPE; Q/K arrive pre-rotated.
+            self.attn = Attention(
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                scale=self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                kv_cache_dtype=atom_config.kv_cache_dtype,
+                layer_num=layer_num,
+                use_mla=False,
+                rotary_emb=None,
+                config=atom_config,
+                prefix=f"{prefix}.attn",
+                per_layer_sliding_window=per_layer_sliding_window,
+            )
+        else:
+            # Full rotation: use AITER in-kernel RoPE (efficient path).
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=config.max_position_embeddings,
+                base=rope_theta,
+                rope_scaling={"rope_type": "default", "rope_theta": rope_theta},
+            )
+            self.attn = Attention(
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                scale=self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                kv_cache_dtype=atom_config.kv_cache_dtype,
+                layer_num=layer_num,
+                use_mla=False,
+                rotary_emb=self.rotary_emb,
+                config=atom_config,
+                prefix=f"{prefix}.attn",
+                per_layer_sliding_window=per_layer_sliding_window,
+            )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+    def _apply_partial_rope(
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply RoPE only to the first ``rotary_dim`` dims of Q and K."""
+        rotary_dim = self.rotary_dim
+        q_full = q.view(-1, self.num_heads, self.head_dim)
+        k_full = k.view(-1, self.num_kv_heads, self.head_dim)
+
+        # Extract the rotatable slice and flatten for get_rope's expectations.
+        q_rot = q_full[..., :rotary_dim].contiguous().view(
+            -1, self.num_heads * rotary_dim
+        )
+        k_rot = k_full[..., :rotary_dim].contiguous().view(
+            -1, self.num_kv_heads * rotary_dim
+        )
+        q_rot, k_rot = self.rotary_emb(positions, q_rot, k_rot)
+
+        # Write rotated dims back into the full head tensors.
+        q_full = q_full.clone()
+        k_full = k_full.clone()
+        q_full[..., :rotary_dim] = q_rot.view(-1, self.num_heads, rotary_dim)
+        k_full[..., :rotary_dim] = k_rot.view(-1, self.num_kv_heads, rotary_dim)
+        return q_full.view(-1, self.q_size), k_full.view(-1, self.kv_size)
 
     def forward(
         self,
@@ -169,6 +224,9 @@ class Gemma4Attention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
             -1, self.num_kv_heads * self.head_dim
         )
+
+        if self.apply_partial_rope:
+            q, k = self._apply_partial_rope(positions, q, k)
 
         o = self.attn(q, k, v, positions, **model_kwargs)
         output = self.o_proj(o)
