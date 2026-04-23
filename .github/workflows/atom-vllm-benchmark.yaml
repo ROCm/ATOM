@@ -720,7 +720,13 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > /tmp/oot_env_file.txt
+          {
+            printf '%s\n' "${{ matrix.model.env_vars }}"
+            printf '%s\n' \
+              "AITER_LOG_LEVEL=ERROR" \
+              "AITER_TRITON_LOG_LEVEL=CRITICAL" \
+              "AITER_LOG_MORE=0"
+          } | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
