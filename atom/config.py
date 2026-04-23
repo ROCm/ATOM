@@ -16,7 +16,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     get_quant_parser,
 )
-from atom.utils import envs, get_open_port
+from atom.utils import envs, get_open_port, resolve_obj_by_qualname
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
@@ -489,6 +489,7 @@ _CONFIG_REGISTRY: dict[str, str] = {
 
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
+    "gemma4": "text_config",
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
@@ -499,6 +500,12 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
     "qwen3_5",
     "qwen3_5_moe",
+}
+
+# Config classes for text sub-types not yet registered in upstream transformers.
+# Maps text model_type -> fully-qualified ATOM config class path.
+_CUSTOM_TEXT_CONFIG_REGISTRY: dict[str, str] = {
+    "gemma4_text": "atom.model_config.gemma4.Gemma4TextConfig",
 }
 
 
@@ -538,7 +545,11 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        config_class = AutoConfig.for_model(mapped_type)
+        conf_path = _CUSTOM_TEXT_CONFIG_REGISTRY.get(mapped_type)
+        if conf_path is not None:
+            config_class = resolve_obj_by_qualname(conf_path)
+        else:
+            config_class = AutoConfig.for_model(mapped_type)
         hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.

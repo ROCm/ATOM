@@ -52,6 +52,7 @@ from torch.profiler import record_function
 logger = logging.getLogger("atom")
 
 support_model_arch_dict = {
+    "Gemma4ForConditionalGeneration": "atom.models.gemma4.Gemma4ForConditionalGenerationTextOnly",
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
     "LlamaForCausalLM": "atom.models.llama.LlamaForCausalLM",
@@ -493,6 +494,7 @@ class ModelRunner:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
+        self.use_gemma4 = self.is_gemma4()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -678,6 +680,11 @@ class ModelRunner:
             return True
         return False
 
+    def is_gemma4(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        return self.hf_text_config.model_type == "gemma4_text"
+
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
     ) -> CpuGpuBuffer:
@@ -724,6 +731,8 @@ class ModelRunner:
         for attr in (
             "kv_cache",
             "kv_scale",
+            "kv_cache_full",
+            "kv_scale_full",
             "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
@@ -1052,6 +1061,7 @@ class ModelRunner:
         hf_config = config.hf_config
         num_kv_heads = self._get_num_kv_heads()
         total_num_layers = self._get_total_num_layers()
+        num_draft_layers = total_num_layers - hf_config.num_hidden_layers
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
 
         if self.use_mla:
@@ -1146,6 +1156,51 @@ class ModelRunner:
                 * swa_kv_heads
                 * self.physical_block_size
                 * 4  # float32
+            )
+        elif self.use_gemma4:
+            # Gemma 4 hybrid attention: sliding_attention layers and
+            # full_attention layers have different KV head / head-dim configs.
+            # Pre-compute layer-type index maps for KV cache allocation and
+            # binding.  These attributes are reused by allocate_kv_cache().
+            layer_types = hf_config.layer_types
+            self._gemma4_sliding_indices = [
+                i for i, lt in enumerate(layer_types) if lt == "sliding_attention"
+            ]
+            self._gemma4_full_indices = [
+                i for i, lt in enumerate(layer_types) if lt == "full_attention"
+            ]
+            self._gemma4_layer_to_sliding_idx = {
+                g: s for s, g in enumerate(self._gemma4_sliding_indices)
+            }
+            self._gemma4_layer_to_full_idx = {
+                g: f for f, g in enumerate(self._gemma4_full_indices)
+            }
+
+            num_sliding = len(self._gemma4_sliding_indices) + num_draft_layers
+            num_full = len(self._gemma4_full_indices)
+
+            # Per-GPU KV head counts (with GQA replication if tp > kv_heads)
+            s_kv_heads = max(1, hf_config.num_key_value_heads // self.world_size)
+            f_kv_heads = max(
+                1, hf_config.num_global_key_value_heads // self.world_size
+            )
+            self._gemma4_sliding_kv_heads = s_kv_heads
+            self._gemma4_full_kv_heads = f_kv_heads
+
+            s_head_dim = hf_config.head_dim
+            f_head_dim = hf_config.global_head_dim
+
+            block_bytes = (
+                # sliding kv_cache
+                2 * num_sliding * self.physical_block_size
+                * s_kv_heads * s_head_dim * kv_dtype_size
+                # sliding kv_scale (float32)
+                + 2 * num_sliding * s_kv_heads * self.physical_block_size * 4
+                # full kv_cache
+                + 2 * num_full * self.physical_block_size
+                * f_kv_heads * f_head_dim * kv_dtype_size
+                # full kv_scale (float32)
+                + 2 * num_full * f_kv_heads * self.physical_block_size * 4
             )
         else:
             # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
@@ -1412,6 +1467,57 @@ class ModelRunner:
             self.kv_cache = None
             self.kv_scale = None
             self._kv_layer_cache_store = []
+        elif self.use_gemma4:
+            # Two separate KV cache tensors: one per attention layer type.
+            num_sliding = len(self._gemma4_sliding_indices) + num_draft_layers
+            num_full = len(self._gemma4_full_indices)
+            kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+
+            kv_cache_sliding = torch.zeros(
+                2,
+                num_sliding,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
+                self._gemma4_sliding_kv_heads,
+                hf_config.head_dim,
+                dtype=kv_dtype,
+                device="cuda",
+            )
+            kv_scale_sliding = torch.zeros(
+                2,
+                num_sliding,
+                self.num_physical_kvcache_blocks,
+                self._gemma4_sliding_kv_heads,
+                self.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            )
+            kv_cache_full = torch.zeros(
+                2,
+                num_full,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
+                self._gemma4_full_kv_heads,
+                hf_config.global_head_dim,
+                dtype=kv_dtype,
+                device="cuda",
+            )
+            kv_scale_full = torch.zeros(
+                2,
+                num_full,
+                self.num_physical_kvcache_blocks,
+                self._gemma4_full_kv_heads,
+                self.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            )
+            # Alias self.kv_cache / kv_scale to the sliding tensors so that
+            # the x = 16 // self.kv_cache.element_size() line below works
+            # and exit() cleanup via delattr("kv_cache") is a no-op duplicate.
+            self.kv_cache = kv_cache_sliding
+            self.kv_scale = kv_scale_sliding
+            self.kv_cache_full = kv_cache_full
+            self.kv_scale_full = kv_scale_full
         else:
             self.kv_cache = torch.zeros(
                 2,
@@ -1468,7 +1574,51 @@ class ModelRunner:
                         # attention and linear attention, so attn_idx must
                         # skip linear-attention layers for target, and use
                         # consecutive slots after num_full_attn for draft.
-                        if self.is_qwen_next():
+                        if self.use_gemma4:
+                            # Gemma 4: route to sliding or full KV cache based
+                            # on the layer type at this absolute layer index.
+                            layer_type = hf_config.layer_types[layer_id]
+                            if layer_type == "sliding_attention":
+                                s_idx = self._gemma4_layer_to_sliding_idx[layer_id]
+                                s_kv_h = self._gemma4_sliding_kv_heads
+                                s_hdim = hf_config.head_dim
+                                k_cache = self.kv_cache[0, s_idx].view(
+                                    self.num_physical_kvcache_blocks,
+                                    s_kv_h,
+                                    s_hdim // x,
+                                    self.physical_block_size,
+                                    x,
+                                )
+                                v_cache = self.kv_cache[1, s_idx].view(
+                                    self.num_physical_kvcache_blocks,
+                                    s_kv_h,
+                                    s_hdim,
+                                    self.physical_block_size,
+                                )
+                                if config.kv_cache_dtype == "fp8":
+                                    module.k_scale = self.kv_scale[0, s_idx]
+                                    module.v_scale = self.kv_scale[1, s_idx]
+                            else:  # full_attention
+                                f_idx = self._gemma4_layer_to_full_idx[layer_id]
+                                f_kv_h = self._gemma4_full_kv_heads
+                                f_hdim = hf_config.global_head_dim
+                                k_cache = self.kv_cache_full[0, f_idx].view(
+                                    self.num_physical_kvcache_blocks,
+                                    f_kv_h,
+                                    f_hdim // x,
+                                    self.physical_block_size,
+                                    x,
+                                )
+                                v_cache = self.kv_cache_full[1, f_idx].view(
+                                    self.num_physical_kvcache_blocks,
+                                    f_kv_h,
+                                    f_hdim,
+                                    self.physical_block_size,
+                                )
+                                if config.kv_cache_dtype == "fp8":
+                                    module.k_scale = self.kv_scale_full[0, f_idx]
+                                    module.v_scale = self.kv_scale_full[1, f_idx]
+                        elif self.is_qwen_next():
                             if layer_id < mtp_start_layer_idx:
                                 attn_idx = layer_id // self.full_attention_interval
                             else:
