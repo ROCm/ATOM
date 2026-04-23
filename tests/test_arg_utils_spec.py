@@ -4,8 +4,6 @@
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 # conftest.py stubs atom.* and zmq before any atom imports are attempted,
 # but arg_utils.py imports LLMEngine from atom and CompilationConfig /
 # SpeculativeConfig from atom.config, which the minimal stub doesn't expose.

@@ -73,6 +73,10 @@ RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
 RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" && \
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip install --upgrade pip && \
+    # keeps the base image's ATOM-installed transformers
+    sed -i -e '/^transformers[[:space:]]/d' requirements/common.txt && \
+    echo "Removed transformers constraint from cloned vLLM requirements/common.txt to preserve base image transformers" && \
+    ! grep '^transformers' requirements/common.txt && \
     sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt && \
     "${VENV_PYTHON}" -m pip install --no-deps xgrammar==0.1.29 compressed-tensors==0.13.0 loguru && \
     sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' requirements/rocm.txt && \
@@ -138,6 +142,10 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     cat /tmp/triton_pip_show.txt && \
     rm -f /tmp/triton_pip_show.txt && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')"
+
+RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
+    "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
+    "${VENV_PYTHON}" -m pip show transformers || true
 
 CMD ["/bin/bash"]
 
@@ -313,7 +321,7 @@ ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
 
-RUN pip install --upgrade "setuptools_scm<9"
+RUN pip install --upgrade setuptools_scm
 RUN echo "========== [Parallel] Building Aiter ==========" && \
     git clone --depth 1 $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \

@@ -16,6 +16,7 @@ logger = logging.getLogger("atom")
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
+    "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
 }
 

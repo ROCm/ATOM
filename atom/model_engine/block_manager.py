@@ -116,6 +116,7 @@ class BlockManager:
         assert not seq.block_table
         h = -1
         cache_miss = False
+
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
             h = (
@@ -179,6 +180,9 @@ class BlockManager:
         return len(self.free_block_ids_set) >= new_blocks_needed
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
+        # Note: in disaggregated (P/D) mode the scheduler skips this call on
+        # the first decode step after remote prefill, because blocks were
+        # already allocated during the KV transfer phase.
         block_table = seq.block_table
         seq_len = len(seq)
         # Check if we need to allocate a new block

@@ -137,11 +137,16 @@ def _send_stream_chunk_direct(
         "finished_at": time.time(),
         "started_at": started_at,
     }
+    if getattr(request_output, "kv_transfer_params_output", None):
+        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
     loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
 
 
 async def generate_async(
-    prompt: str, sampling_params: SamplingParams, request_id: str
+    prompt: str,
+    sampling_params: SamplingParams,
+    request_id: str,
+    kv_transfer_params: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     global engine, tokenizer
@@ -155,8 +160,13 @@ async def generate_async(
     all_token_ids: List[int] = []
     finish_reason: Optional[str] = None
     seq = None
+    kv_transfer_output_meta_info = None
 
     def completion_callback(request_output: RequestOutput):
+        nonlocal kv_transfer_output_meta_info
+        kv_transfer_output_meta_info = getattr(
+            request_output, "kv_transfer_params_output", None
+        )
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -170,7 +180,10 @@ async def generate_async(
 
     def do_preprocess():
         return engine.io_processor.preprocess(
-            prompt, sampling_params, stream_callback=completion_callback
+            prompt,
+            sampling_params,
+            stream_callback=completion_callback,
+            kv_transfer_params=kv_transfer_params,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -204,7 +217,7 @@ async def generate_async(
         else 0.0
     )
 
-    yield {
+    response = {
         "text": text,
         "token_ids": all_token_ids,
         "finish_reason": finish_reason,
@@ -214,6 +227,9 @@ async def generate_async(
         "tpot": tpot,
         "latency": latency,
     }
+    if kv_transfer_output_meta_info is not None:
+        response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info
+    yield response
 
 
 def validate_model(requested_model: Optional[str]) -> None:
@@ -227,7 +243,10 @@ def validate_model(requested_model: Optional[str]) -> None:
 
 
 async def setup_streaming_request(
-    prompt: str, sampling_params: SamplingParams, request_id: str
+    prompt: str,
+    sampling_params: SamplingParams,
+    request_id: str,
+    kv_transfer_params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, asyncio.Queue]:
     """Set up a streaming request with the engine."""
     global engine, _stream_queues, _seq_id_to_request_id
@@ -246,7 +265,10 @@ async def setup_streaming_request(
 
     def do_preprocess():
         seq = engine.io_processor.preprocess(
-            prompt, sampling_params, stream_callback=stream_callback
+            prompt,
+            sampling_params,
+            stream_callback=stream_callback,
+            kv_transfer_params=kv_transfer_params,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -427,7 +449,10 @@ async def completions(request: CompletionRequest):
         # Streaming
         if request.stream:
             seq_id, stream_queue = await setup_streaming_request(
-                request.prompt, sampling_params, request_id
+                request.prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
             )
             gen = stream_completion_response(
                 request_id,
@@ -445,7 +470,12 @@ async def completions(request: CompletionRequest):
 
         # Non-streaming
         final_output = None
-        async for output in generate_async(request.prompt, sampling_params, request_id):
+        async for output in generate_async(
+            request.prompt,
+            sampling_params,
+            request_id,
+            kv_transfer_params=request.kv_transfer_params,
+        ):
             final_output = output
 
         if final_output is None:

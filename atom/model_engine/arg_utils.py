@@ -50,6 +50,7 @@ class EngineArgs:
     all2all_backend: Optional[str] = None
     method: Optional[str] = None
     num_speculative_tokens: int = 1
+    kv_transfer_config: str = "{}"
     mark_trace: bool = False
 
     @staticmethod
@@ -189,6 +190,14 @@ class EngineArgs:
             default=0.9,
             help="GPU memory utilization (0.0 to 1.0)",
         )
+
+        parser.add_argument(
+            "--kv-transfer-config",
+            type=str,
+            default="{}",
+            help="KV transfer config as JSON string.",
+        )
+
         parser.add_argument(
             "--scheduler-delay-factor",
             type=float,

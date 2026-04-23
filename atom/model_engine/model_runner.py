@@ -34,6 +34,9 @@ from atom.utils import (
     init_exit_handler,
     resolve_obj_by_qualname,
 )
+from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.utils.forward_context import get_kvconnector
+from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -63,6 +66,7 @@ support_model_arch_dict = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
+    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -79,8 +83,10 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        # self.is_deferred_out = False
-        self.is_deferred_out = True
+        # Deferred output is disabled when running in P/D disaggregation mode
+        # (kv_transfer_config is set), enabled otherwise.
+        # TODO: enable deferred output in P/D disaggregation mode
+        self.is_deferred_out = not bool(runner.config.kv_transfer_config)
 
         self.runner = runner
         device = runner.device
@@ -165,6 +171,7 @@ class tokenIDProcessor:
         self.token_ids_cpu: list[torch.Tensor] = []
 
         self.prev_batch: Optional[ScheduledBatch] = None
+        self.prev_token_ids: Optional[torch.Tensor] = None
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: Optional[torch.Tensor] = None
@@ -277,7 +284,8 @@ class tokenIDProcessor:
 
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
-        GPU need to be copied into the corresponding slots into input_ids."""
+        GPU need to be copied into the corresponding slots into input_ids.
+        """
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
         total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
@@ -545,6 +553,17 @@ class ModelRunner:
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
         )
+        use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
+        self.num_spec_tokens = (
+            self.config.speculative_config.num_speculative_tokens if use_spec else 0
+        )
+        self.tokenID_processor = tokenIDProcessor(
+            self,
+            self.config.max_num_batched_tokens,
+            use_spec,
+            self.num_spec_tokens,
+        )
+        self.sampler = Sampler()
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -588,14 +607,6 @@ class ModelRunner:
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
-        self.num_spec_tokens = self.drafter.mtp_k if hasattr(self, "drafter") else 0
-        self.tokenID_processor = tokenIDProcessor(
-            self,
-            self.config.max_num_batched_tokens,
-            hasattr(self, "drafter"),
-            self.num_spec_tokens,
-        )
-        self.sampler = Sampler()
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
@@ -657,6 +668,13 @@ class ModelRunner:
             "qwen3_5_text",
             "qwen3_5_moe_text",
         ):
+            return True
+        return False
+
+    def is_mimo_v2(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        elif self.hf_text_config.model_type in ("mimo_v2_flash"):
             return True
         return False
 
@@ -926,6 +944,7 @@ class ModelRunner:
         logger.info(
             f"{self.label}: dummy PREFILL batch executed with {num_tokens} tokens, {num_reqs} reqs"
         )
+        # TODO: initialize KV connector during warmup
         return True
 
     def warmup_model(self):
@@ -1079,6 +1098,55 @@ class ModelRunner:
             # GDN recurrent state is per-request (not per-block).
             # It is accounted for separately via _compute_mamba_per_slot_bytes().
             # Do NOT add it to block_bytes.
+        elif self.is_mimo_v2():
+            # MiMo-V2-Flash has mixed attention types (full + SWA) with
+            # different num_kv_heads per layer. Count each type separately
+            # for accurate memory estimation.
+            pattern = hf_config.hybrid_layer_pattern
+            num_swa_layers = sum(
+                1 for i in range(hf_config.num_hidden_layers) if pattern[i] == 1
+            )
+            num_full_layers = hf_config.num_hidden_layers - num_swa_layers
+            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
+            num_swa_layers += num_draft_layers
+
+            _swa_raw = getattr(hf_config, "swa_num_key_value_heads", 0)
+            swa_kv_heads = (
+                _swa_raw // self.world_size
+                if _swa_raw >= self.world_size
+                else (1 if _swa_raw else 0)
+            )
+
+            block_bytes = (
+                2
+                * num_full_layers
+                * self.block_size
+                * num_kv_heads
+                * hf_config.head_dim
+                * kv_dtype_size
+            )
+            block_bytes += (
+                2
+                * num_swa_layers
+                * self.block_size
+                * swa_kv_heads
+                * hf_config.head_dim
+                * kv_dtype_size
+            )
+            block_bytes += (
+                2
+                * num_full_layers
+                * num_kv_heads
+                * self.physical_block_size
+                * 4  # float32
+            )
+            block_bytes += (
+                2
+                * num_swa_layers
+                * swa_kv_heads
+                * self.physical_block_size
+                * 4  # float32
+            )
         else:
             # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
             # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
@@ -1338,6 +1406,12 @@ class ModelRunner:
                 dtype=mamba_dtypes[1],
                 device="cuda",
             )
+        elif self.is_mimo_v2():
+            # MiMo-V2-Flash: per-layer allocation deferred to the binding
+            # loop, so each layer gets the exact num_kv_heads it needs.
+            self.kv_cache = None
+            self.kv_scale = None
+            self._kv_layer_cache_store = []
         else:
             self.kv_cache = torch.zeros(
                 2,
@@ -1371,7 +1445,11 @@ class ModelRunner:
 
         kv_cache_tensors = []
         layer_id = 0
-        x = 16 // self.kv_cache.element_size()
+        if self.is_mimo_v2():
+            kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+            x = 16 // kv_dtype.itemsize
+        else:
+            x = 16 // self.kv_cache.element_size()
         mtp_start_layer_idx = (
             self.drafter.model.model.mtp_start_layer_idx
             if hasattr(self, "drafter")
@@ -1399,24 +1477,66 @@ class ModelRunner:
                                 )
                         else:
                             attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
 
+                        if self.is_mimo_v2():
+                            # Per-layer allocation: each module gets its own
+                            # correctly-sized tensor matching its num_kv_heads.
+                            module_kv_heads = module.num_kv_heads
+                            k_cache = torch.zeros(
+                                self.num_physical_kvcache_blocks,
+                                module_kv_heads,
+                                hf_config.head_dim // x,
+                                self.physical_block_size,
+                                x,
+                                dtype=kv_dtype,
+                                device="cuda",
+                            )
+                            v_cache = torch.zeros(
+                                self.num_physical_kvcache_blocks,
+                                module_kv_heads,
+                                self.physical_block_size // x,
+                                hf_config.head_dim,
+                                x,
+                                dtype=kv_dtype,
+                                device="cuda",
+                            )
+                            if config.kv_cache_dtype == "fp8":
+                                module.k_scale = torch.zeros(
+                                    self.num_physical_kvcache_blocks,
+                                    module_kv_heads,
+                                    self.physical_block_size,
+                                    dtype=dtypes.fp32,
+                                    device="cuda",
+                                )
+                                module.v_scale = torch.zeros(
+                                    self.num_physical_kvcache_blocks,
+                                    module_kv_heads,
+                                    self.physical_block_size,
+                                    dtype=dtypes.fp32,
+                                    device="cuda",
+                                )
+                            self._kv_layer_cache_store.append(
+                                (k_cache, v_cache, module.k_scale, module.v_scale)
+                            )
+                        else:
+                            k_cache = self.kv_cache[0, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                num_kv_heads,
+                                hf_config.head_dim // x,
+                                self.physical_block_size,
+                                x,
+                            )
+                            v_cache = self.kv_cache[1, attn_idx].view(
+                                self.num_physical_kvcache_blocks,
+                                num_kv_heads,
+                                hf_config.head_dim,
+                                self.physical_block_size,
+                            )
+                            if config.kv_cache_dtype == "fp8":
+                                module.k_scale = self.kv_scale[0, attn_idx]
+                                module.v_scale = self.kv_scale[1, attn_idx]
+
+                        module.max_model_len = self.config.max_model_len
                         k_scale = module.k_scale
                         v_scale = module.v_scale
 
@@ -1490,7 +1610,7 @@ class ModelRunner:
             for i, kv_cache_tensor in enumerate(kv_cache_tensors)
         }
         # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
-        set_kv_cache_data(kv_cache_data)
+        set_kv_cache_data(kv_cache_data, config)
 
         # Cross-validate: compare estimated vs actual KV cache allocation
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -1932,6 +2052,25 @@ class ModelRunner:
         )
         reset_forward_context()
         return fwd_output
+
+    @torch.inference_mode()
+    def process_kvconnector_output(self, connector_meta_output):
+        """Dispatch KV connector metadata to initiate async KV loading."""
+        if connector_meta_output is not None:
+            connector = get_kvconnector()
+            if connector is not None:
+                connector.start_load_kv(connector_meta_output)
+
+    @torch.inference_mode()
+    def async_proc_aggregation(self) -> KVConnectorOutput:
+        """Collect finished send/recv status from the KV connector."""
+        connector = get_kvconnector()
+        if connector is None:
+            return KVConnectorOutput(finished_sending=[], finished_recving=[])
+        done_sending, done_recving = connector.get_finished()
+        return KVConnectorOutput(
+            finished_sending=done_sending, finished_recving=done_recving
+        )
 
     def propose_draft_token_ids(
         self,

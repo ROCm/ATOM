@@ -517,7 +517,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
 
-        num_blocks_per_seq = cdiv(context_lens, self.block_size)
+        if any(batch.is_first_decode_without_local_prefill):
+            num_blocks_per_seq = [
+                (
+                    len(batch.block_tables[i])
+                    if is_first
+                    else cdiv(ctx_len, self.block_size)
+                )
+                for i, (ctx_len, is_first) in enumerate(
+                    zip(
+                        batch.context_lens,
+                        batch.is_first_decode_without_local_prefill,
+                    )
+                )
+            ]
+        else:
+            num_blocks_per_seq = cdiv(context_lens, self.block_size)
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1]
 

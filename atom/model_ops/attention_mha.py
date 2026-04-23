@@ -196,7 +196,7 @@ class PagedAttentionImpl(nn.Module):
         else:
             # for asm paged attention
             asm_layout = True
-            if use_triton_attn:
+            if use_triton_attn and v_cache.dim() != 5:
                 asm_layout = False
             if self.rotary_emb is not None:
                 assert position is not None

@@ -339,7 +339,7 @@ jobs:
 
       - name: Docker Login
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login docker.io -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Generate custom SGLang base Dockerfile
         run: |
@@ -480,7 +480,7 @@ jobs:
             $CONTAINER_ENGINE kill $containers || true
           fi
           $CONTAINER_ENGINE rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
+          $CONTAINER_ENGINE run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged docker.io/rocm/pytorch:latest bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
 
       - name: Checkout benchmark ATOM source
         if: steps.check.outputs.enabled == 'true'
@@ -566,21 +566,13 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/oot_env_file.txt << 'EOF'
-          ${{ matrix.model.env_vars }}
-          EOF
-
-          SHM_FLAG=(--shm-size=16G)
-          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
-            SHM_FLAG=()
-          fi
+          printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
             $MODEL_MOUNT \
             -w /workspace \
             --ipc=host --group-add video \
-            "${SHM_FLAG[@]}" \
             --privileged \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \

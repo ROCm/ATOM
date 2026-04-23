@@ -342,17 +342,19 @@ class TestPostprocess:
 
 class TestGetNextBatchInfo:
     def test_empty(self, scheduler):
-        assert scheduler.get_next_batch_info() == (False, 0)
+        assert scheduler.get_next_batch_info() == (False, 0, 0)
 
     def test_waiting(self, scheduler, seq_factory):
         scheduler.add(seq_factory([1, 2, 3, 4]))
-        is_prefill, n = scheduler.get_next_batch_info()
+        is_prefill, n, num_reqs = scheduler.get_next_batch_info()
         assert is_prefill is True
         assert n == 4
+        assert num_reqs == 1
 
     def test_running(self, scheduler, seq_factory):
         scheduler.add(seq_factory([1, 2, 3, 4]))
         scheduler.schedule()
-        is_prefill, n = scheduler.get_next_batch_info()
+        is_prefill, n, num_reqs = scheduler.get_next_batch_info()
         assert is_prefill is False
         assert n == 1
+        assert num_reqs == 1

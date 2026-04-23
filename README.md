@@ -11,6 +11,10 @@
 
 **ATOM** (AiTer Optimized Model) is a lightweight vLLM-like implementation, focusing on integration and optimization based on [AITER](https://github.com/ROCm/aiter).
 
+## 📢 News
+
+- **[2026/03]** ATOM now supports **Prefill/Decode (P/D) disaggregation** — run prefill and decode on separate GPU nodes with RDMA-based KV cache transfer via [MORI-IO](https://github.com/ROCm/mori). See [disaggregation docs](atom/kv_transfer/disaggregation/README.md).
+
 ## 🚀 Features
 
 - **ROCm Optimized**: Built on AMD's ROCm platform with [AITER](https://github.com/ROCm/aiter) kernels (ASM, CK, Triton)
@@ -36,6 +40,7 @@
 | [GLM-5](https://huggingface.co/zai-org/GLM-5-FP8) | `GlmMoeDsaForCausalLM` | MoE | MLA attention, similar to DeepSeek V3.2. See [recipe](recipes/GLM-5.md) |
 | [GPT-OSS](https://huggingface.co/openai) | `GptOssForCausalLM` | MoE | Sliding window + attention sinks |
 | [Kimi-K2](https://huggingface.co/moonshotai/Kimi-K2-Thinking) | via `--trust-remote-code` | MoE | See [recipe](recipes/Kimi-K2-Thinking.md) |
+| [MiMo-V2-Flash](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash) | `MiMoV2FlashForCausalLM` | MoE | Hybrid full + SWA attention, 3-layer MTP. See [recipe](recipes/MiMo-V2-Flash.md) |
 
 ## 📋 Requirements
 
