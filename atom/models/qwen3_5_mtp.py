@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3.5 MTP model."""
 
+import re
+
 import torch
 import torch.nn as nn
 from aiter.dist.parallel_state import get_tp_group
@@ -137,6 +139,28 @@ class Qwen3_5MTP(nn.Module):
         if atom_config.enable_prefix_caching:
             raise ValueError("Qwen3_5MTP currently does not support prefix caching")
         self.config = config
+
+        # Remap exclude entries: checkpoint uses 0-based MTP layer indices
+        # (e.g. "mtp.layers.0.*") but the model constructs layers with absolute
+        # indices starting at num_hidden_layers (e.g. "mtp.layers.60.*").
+        # Reindex so _is_excluded matches the construction prefix.
+        mtp_start = config.num_hidden_layers
+        num_mtp = getattr(config, "mtp_num_hidden_layers", 1)
+        if atom_config.quant_config is not None and mtp_start > 0:
+            pat = re.compile(r"^mtp\.layers\.(\d+)\.")
+            new_excludes = []
+            for entry in atom_config.quant_config.exclude_layers:
+                m = pat.match(entry)
+                if m:
+                    old_idx = int(m.group(1))
+                    entry = pat.sub(f"mtp.layers.{mtp_start + old_idx}.", entry)
+                new_excludes.append(entry)
+            # Add layer-level prefixes so that _is_excluded matches module
+            # prefixes like "mtp.layers.60.mlp.experts" (not just leaf names).
+            for i in range(num_mtp):
+                new_excludes.append(f"mtp.layers.{mtp_start + i}")
+            atom_config.quant_config.exclude_layers = list(dict.fromkeys(new_excludes))
+
         self.model = Qwen3_5MultiTokenPredictor(
             atom_config=atom_config, prefix=maybe_prefix(prefix, "mtp")
         )
