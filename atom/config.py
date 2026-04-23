@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
 import torch
 from aiter import QuantType
@@ -24,7 +24,6 @@ from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 # plugin-related utilities
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
-from atom.utils import resolve_obj_by_qualname
 
 logger = logging.getLogger("atom")
 
@@ -487,11 +486,6 @@ _CONFIG_REGISTRY: dict[str, str] = {
     "kimi_k2": "deepseek_v3",
 }
 
-_CUSTOM_TEXT_CONFIG_REGISTRY: dict[str, str] = {
-    "qwen3_5_text": "atom.model_config.qwen3_5.Qwen3_5TextConfig",
-    "qwen3_5_moe_text": "atom.model_config.qwen3_5_moe.Qwen3_5MoeTextConfig",
-}
-
 
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
@@ -544,11 +538,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
         mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        conf_path = _CUSTOM_TEXT_CONFIG_REGISTRY.get(mapped_type)
-        if conf_path is None:
-            config_class = AutoConfig.for_model(mapped_type)
-        else:
-            config_class = resolve_obj_by_qualname(conf_path)
+        config_class = AutoConfig.for_model(mapped_type)
         hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.
@@ -705,46 +695,63 @@ class SpeculativeConfig:
     num_speculative_tokens: Optional[int] = None
     draft_model_hf_config: Optional[PretrainedConfig] = None
 
+    # model_type → mtp_model_type mapping
+    _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
+        "deepseek_v3": "deepseek_mtp",
+        "glm_moe_dsa": "deepseek_mtp",
+        "qwen3_next": "qwen3_next_mtp",
+        "qwen3_5": "qwen3_5_mtp",
+        "qwen3_5_moe": "qwen3_5_mtp",
+        "qwen3_5_text": "qwen3_5_mtp",
+        "qwen3_5_moe_text": "qwen3_5_mtp",
+    }
+
+    # mtp_model_type → (n_predict_attr, architecture)
+    _MTP_CONFIG: ClassVar[dict[str, tuple[str, str]]] = {
+        "deepseek_mtp": ("num_nextn_predict_layers", "DeepSeekMTPModel"),
+        "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
+        "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
+    }
+
     def __post_init__(self):
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
+        # For multimodal models, extract text_config
+        if hasattr(self.draft_model_hf_config, "text_config"):
+            self.draft_model_hf_config = self.draft_model_hf_config.text_config
         self.hf_config_override(self.draft_model_hf_config)
 
     @staticmethod
-    def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type in ("deepseek_v3", "glm_moe_dsa"):
-            hf_config.model_type = "deepseek_mtp"
-        if hf_config.model_type == "qwen3_next":
-            hf_config.model_type = "qwen3_next_mtp"
+    def hf_config_override(hf_config: PretrainedConfig) -> None:
+        # Step 1: resolve model_type → mtp model_type
+        mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
+        if mtp_type is not None:
+            hf_config.model_type = mtp_type
 
-        if hf_config.model_type == "deepseek_mtp":
-            # DeepSeek MTP typically uses only 1 layer that gets reused
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
-            # Override to use only 1 layer if config says otherwise
+        # Step 2: apply MTP-specific config overrides
+        entry = SpeculativeConfig._MTP_CONFIG.get(hf_config.model_type)
+        if entry is not None:
+            n_predict_attr, arch = entry
+            n_predict = getattr(hf_config, n_predict_attr, 1)
             if n_predict != 1:
                 logger.warning(
-                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                    f"Overriding {n_predict_attr} from {n_predict} to 1 "
                     "(MTP typically uses 1 layer that gets reused)"
                 )
                 n_predict = 1
-            hf_config.update(
-                {
-                    "n_predict": n_predict,
-                    "num_nextn_predict_layers": n_predict,
-                    "architectures": ["DeepSeekMTPModel"],
-                }
-            )
-        if hf_config.model_type == "qwen3_next_mtp":
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
-            if n_predict != 1:
-                logger.warning(
-                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
-                    "(MTP typically uses 1 layer that gets reused)"
-                )
-                n_predict = 1
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["Qwen3NextMTPModel"]}
-            )
+
+            updates: dict[str, Any] = {
+                "n_predict": n_predict,
+                "num_nextn_predict_layers": n_predict,
+                "architectures": [arch],
+            }
+            # Qwen3.5 MTP needs expert counts for MoE layer construction
+            if hf_config.model_type == "qwen3_5_mtp":
+                updates["n_shared_experts"] = 1
+                updates["n_routed_experts"] = getattr(hf_config, "num_experts", 0)
+
+            hf_config.update(updates)
+
         logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
@@ -789,6 +796,11 @@ class Config:
     enable_dp_attention: bool = False
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
+    kv_transfer_config: dict = field(default_factory=dict)
+
+    enable_tbo: bool = False
+    enable_tbo_decode: bool = False
+    enable_low_latency: bool = False
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
@@ -883,10 +895,23 @@ class Config:
             else torch.bfloat16
         )
 
+        if hasattr(self, "kv_transfer_config") and isinstance(
+            self.kv_transfer_config, str
+        ):
+            import json
+
+            try:
+                self.kv_transfer_config = json.loads(self.kv_transfer_config)
+            except json.JSONDecodeError:
+                import ast
+
+                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+
         if self.speculative_config is not None:
-            if self.speculative_config.num_speculative_tokens > 4:
+            num_spec = self.speculative_config.num_speculative_tokens
+            if num_spec is None or num_spec < 1 or num_spec > 4:
                 raise ValueError(
-                    f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
+                    f"num_speculative_tokens must be between 1 and 4, got {num_spec}."
                 )
 
     def compute_hash(self) -> str:

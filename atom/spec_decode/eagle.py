@@ -16,6 +16,7 @@ logger = logging.getLogger("atom")
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
+    "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
 }
 
 
@@ -57,9 +58,26 @@ class EagleProposer:
         self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
         self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
 
-    def load_model(self, target_model: nn.Module) -> None:
+    @staticmethod
+    def _share_if_not_loaded(
+        owner: nn.Module,
+        attr: str,
+        source: nn.Module,
+        loaded: set[str],
+        param_key: str,
+        label: str,
+    ):
+        """Replace *owner.attr* with *source* if the weight was not loaded."""
+        if param_key not in loaded and getattr(owner, attr, None) is not None:
+            logger.info(
+                f"MTP {label} not loaded from checkpoint, "
+                "sharing from the target model."
+            )
+            delattr(owner, attr)
+            setattr(owner, attr, source)
 
-        load_model(
+    def load_model(self, target_model: nn.Module) -> None:
+        loaded = load_model(
             self.model,
             self.config.model,
             self.speculative_config.draft_model_hf_config,
@@ -67,41 +85,55 @@ class EagleProposer:
             True,
         )
 
-        # share embed_tokens with the target model if needed
+        # Resolve the base model (unwrap multimodal wrapper if present)
+        target_base = getattr(target_model, "language_model", target_model)
+
+        # Share embed_tokens with the target model
         if (
             get_pp_group().world_size == 1
             and self.model.model.embed_tokens.weight.shape
-            == target_model.model.embed_tokens.weight.shape
+            == target_base.model.embed_tokens.weight.shape
         ):
             logger.info(
                 "Assuming the EAGLE head shares the same vocab embedding"
                 " with the target model."
             )
             del self.model.model.embed_tokens
-            self.model.model.embed_tokens = target_model.model.embed_tokens
+            self.model.model.embed_tokens = target_base.model.embed_tokens
         else:
             logger.info(
                 "The EAGLE head's vocab embedding will be loaded separately"
                 " from the target model."
             )
 
-        # If MTP shared_head.head was not in checkpoint (weight is all zeros),
-        # share lm_head from the target model as fallback.
+        # Share lm_head from target if not loaded from checkpoint.
+        # Case 1: per-layer shared_head.head (DeepSeek MTP)
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             layers = self.model.model.layers
-            layer_iter = layers.values() if hasattr(layers, "values") else layers
-            for layer in layer_iter:
-                if (
-                    hasattr(layer, "shared_head")
-                    and hasattr(layer.shared_head, "head")
-                    and not layer.shared_head.head.weight.any()
-                ):
-                    logger.info(
-                        "MTP shared_head.head not found in checkpoint, "
-                        "sharing lm_head from the target model."
+            # ModuleDict uses string keys (actual layer indices like "61"),
+            # ModuleList uses integer indices.
+            layer_items = (
+                layers.items() if hasattr(layers, "items") else enumerate(layers)
+            )
+            for key, layer in layer_items:
+                if hasattr(layer, "shared_head"):
+                    self._share_if_not_loaded(
+                        layer.shared_head,
+                        "head",
+                        target_base.lm_head,
+                        loaded,
+                        f"model.layers.{key}.shared_head.head.weight",
+                        "shared_head.head",
                     )
-                    del layer.shared_head.head
-                    layer.shared_head.head = target_model.lm_head
+        # Case 2: top-level lm_head (Qwen3.5 / Qwen3-Next MTP)
+        self._share_if_not_loaded(
+            self.model,
+            "lm_head",
+            target_base.lm_head,
+            loaded,
+            "lm_head.weight",
+            "lm_head",
+        )
 
     def propose(
         self,
@@ -135,6 +167,7 @@ class EagleProposer:
         )
         # return draft_token_ids.fill_(1) # for debug
         var = self.runner.forward_vars
+        use_mla = self.runner.use_mla
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
                 ret_hidden_states = self.model(
@@ -165,20 +198,32 @@ class EagleProposer:
                         slot_mapping = var["slot_mapping"].gpu[
                             : bs * attn_metadata.max_seqlen_q
                         ]
-                        kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
                         cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
                         attn_metadata.kv_indptr = kv_indptr
                         attn_metadata.kv_indices = kv_indices
                         attn_metadata.cu_seqlens_q = cu_seqlens_q
                         attn_metadata.slot_mapping = slot_mapping
-                        attn_metadata.kv_last_page_lens = kv_last_page_lens
+                        if use_mla:
+                            kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+                            attn_metadata.kv_last_page_lens = kv_last_page_lens
+                        else:
+                            # MHA needs block_tables and context_lens
+                            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
+                            attn_metadata.context_lens = var["context_lens"].gpu[:bs]
                         cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
-                        kv_indptr[1 : bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
+                        if use_mla:
+                            # MLA: block_size=1, kv_indptr tracks tokens
+                            kv_indptr[1 : bs + 1] -= torch.cumsum(
+                                num_reject_tokens, dim=0
+                            )
                         positions = torch.gather(positions, 0, last_token_indices)
                         context.is_prefill = False
 
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
+                    if not use_mla:
+                        # MHA: update context_lens for this draft step
+                        attn_metadata.context_lens[:bs] += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (

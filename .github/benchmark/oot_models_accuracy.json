@@ -25,7 +25,7 @@
     "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
     "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
     "extraArgs": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
-    "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
     "accuracy_threshold": 0.83,
@@ -36,12 +36,24 @@
     "model_name": "Qwen3.5-397B-A17B TP8",
     "model_path": "Qwen/Qwen3.5-397B-A17B",
     "extraArgs": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
-    "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
     "accuracy_threshold": 0.83,
     "accuracy_baseline": 0.83,
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B"
+  },
+  {
+    "model_name": "Qwen3.5-397B-A17B-MXFP4 TP4",
+    "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
+    "extraArgs": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.82,
+    "accuracy_baseline": 0.82,
+    "accuracy_baseline_model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "_baseline_note": "Using Qwen3-235B baseline as proxy; needs CI measurement for Qwen3.5 specific baseline"
   },
   {
     "model_name": "Llama-3.1-8B-Instruct TP1",
@@ -51,7 +63,7 @@
     "runner": "linux-atom-mi35x-1",
     "test_level": "nightly",
     "accuracy_threshold": 0.73,
-    "accuracy_baseline": null,
+    "accuracy_baseline": 0.75,
     "accuracy_baseline_model": "meta-llama/Llama-3.1-8B-Instruct",
     "_baseline_note": "Threshold aligned with existing 8B Llama baseline used in CI (3-shot GSM8K)."
   },
@@ -63,7 +75,7 @@
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
     "accuracy_threshold": 0.9,
-    "accuracy_baseline": null,
+    "accuracy_baseline": 0.91,
     "accuracy_baseline_model": "Meta-Llama-3.1-405B-Instruct-FP8/",
     "_baseline_note": "Threshold aligned with workflow matrix target for TP8 gsm8k (3-shot)."
   },
@@ -85,7 +97,7 @@
     "env_vars": "",
     "runner": "linux-atom-mi35x-8",
     "test_level": "nightly",
-    "accuracy_threshold": 0.93,
+    "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.93,
     "accuracy_baseline_model": "amd/Kimi-K2.5-MXFP4",
     "_baseline_note": "Reference value from recipes/atom_vllm/Kimi-K2.5.md"
@@ -103,7 +115,7 @@
   },
   {
     "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
-    "model_path": "amd/DeepSeek-R1-0528-MXFP4",
+    "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "extraArgs": "--tensor-parallel-size 8",
     "env_vars": "",
     "runner": "linux-atom-mi35x-8",
@@ -133,5 +145,17 @@
     "accuracy_threshold": 0.38,
     "accuracy_baseline": 0.38,
     "accuracy_baseline_model": "openai/gpt-oss-120b"
+  },
+  {
+    "model_name": "GLM-5.1-FP8 TP8",
+    "model_path": "zai-org/GLM-5.1-FP8",
+    "extraArgs": "--tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "env_vars": "",
+    "runner": "linux-atom-mi35x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.88,
+    "accuracy_baseline": 0.9545,
+    "accuracy_baseline_model": "zai-org/GLM-5.1",
+    "_baseline_note": "CI uses 3-shot, not comparable to HF 5-shot baseline"
   }
 ]

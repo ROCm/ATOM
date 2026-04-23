@@ -11,12 +11,17 @@
 
 **ATOM** (AiTer Optimized Model) is a lightweight vLLM-like implementation, focusing on integration and optimization based on [AITER](https://github.com/ROCm/aiter).
 
+## 📢 News
+
+- **[2026/03]** ATOM now supports **Prefill/Decode (P/D) disaggregation** — run prefill and decode on separate GPU nodes with RDMA-based KV cache transfer via [MORI-IO](https://github.com/ROCm/mori). See [disaggregation docs](atom/kv_transfer/disaggregation/README.md).
+
 ## 🚀 Features
 
 - **ROCm Optimized**: Built on AMD's ROCm platform with [AITER](https://github.com/ROCm/aiter) kernels (ASM, CK, Triton)
 - **OpenAI-Compatible API**: Drop-in server with `/v1/chat/completions` and `/v1/completions` endpoints
 - **Piecewise torch.compile**: 4 compilation levels with CUDA graph capture for low-latency decode
 - **Multi-GPU Parallelism**: Tensor parallelism (TP), data parallelism (DP), and expert parallelism (EP) with MORI all-to-all
+- **Two-Batch Overlap (TBO)**: Following [DeepSeek's system design](https://arxiv.org/abs/2501.12948), TBO splits each batch into two micro-batches and pipelines them across compute and communication streams. Effectively hiding expert-parallel communication latency and reducing peak memory usage. See [recipe](recipes/TBO.md)
 - **Quantization**: FP8, MXFP4, INT8, INT4 with auto-detection from HuggingFace configs
 - **Speculative Decoding**: Multi-Token Prediction (MTP) with EAGLE proposer
 - **Prefix Caching**: xxhash64-based KV cache block sharing across sequences
@@ -246,6 +251,7 @@ lm_eval --model local-completions \
 - [Kimi-K2-Thinking](recipes/Kimi-K2-Thinking.md) — MXFP4 MoE on 4 GPUs
 - [GLM-5](recipes/GLM-5.md) — FP8 MoE with MLA on 8 GPUs
 - [GPT-OSS-120B](recipes/GPT-OSS.md) — Single GPU or DP+EP on 2 GPUs
+- [TBO (Two-Batch Overlap)](recipes/TBO.md) — Compute-communication overlap for MoE models with DP attention
 
 **Framework Integration:**
 

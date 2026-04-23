@@ -65,7 +65,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -836,7 +836,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
+            self.gate.e_score_correction_bias = atom_parameter(
                 torch.empty(config.n_routed_experts)
             )
         else:
@@ -868,7 +868,8 @@ class DeepseekV2MoE(nn.Module):
 
         if config.n_shared_experts is not None:
             if not is_rocm_aiter_fusion_shared_expert_enabled():
-                if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0:
+                tbo_active = get_current_atom_config().enable_tbo
+                if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
                     compilation_config = get_current_atom_config().compilation_config
                     compilation_config.static_forward_context[prefix] = self

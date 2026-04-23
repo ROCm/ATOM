@@ -17,6 +17,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.model_ops.topK import (
     is_rocm_aiter_fuse_routed_scaling_factor,
     is_rocm_aiter_fusion_shared_expert_enabled,
@@ -106,7 +107,7 @@ class Glm4MoE(nn.Module):
             bias=False,
             dtype=torch.float32,
         )
-        self.gate.e_score_correction_bias = nn.Parameter(
+        self.gate.e_score_correction_bias = atom_parameter(
             torch.empty(config.n_routed_experts, dtype=torch.float32)
         )
 

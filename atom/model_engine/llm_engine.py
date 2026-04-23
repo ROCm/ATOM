@@ -55,6 +55,17 @@ class LLMEngine:
         self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
+        import json
+
+        kv_config_str = kwargs.get("kv_transfer_config", "{}")
+        try:
+            config.kv_transfer_config = json.loads(kv_config_str)
+            logger.info(f"KV transfer config loaded: {config.kv_transfer_config}")
+        except json.JSONDecodeError:
+            config.kv_transfer_config = {}
+        logger.info(
+            f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
+        )
         logger.info(
             f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
         )
@@ -169,6 +180,7 @@ class InputOutputProcessor:
         prompt_or_tokens: str | list[int],
         sampling_params: SamplingParams,
         stream_callback=None,
+        kv_transfer_params=None,
     ):
         """responsible for:
         1) Tokenize
@@ -200,6 +212,7 @@ class InputOutputProcessor:
             stream_callback=stream_callback,
             num_draft_tokens=self.num_speculative_tokens,
             mamba_enabled=self.mamba_enabled,
+            kv_transfer_params=kv_transfer_params,
         )
         seq.arrive_time = time.time()
         self.requests[seq.id] = seq

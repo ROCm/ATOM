@@ -29,6 +29,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_qwen35_397b_fp4_tp4:
+        description: "Qwen3.5-397B-A17B-MXFP4 TP4"
+        required: false
+        type: boolean
+        default: false
       run_llama405_fp8_tp8:
         description: "Meta-Llama-3.1-405B-Instruct-FP8 TP8"
         required: false
@@ -66,6 +71,11 @@ on:
         default: false
       run_gpt_oss_120b_tp2:
         description: "gpt-oss-120b TP2"
+        required: false
+        type: boolean
+        default: false
+      run_glm5_1_fp8_tp8:
+        description: "GLM-5.1-FP8 TP8"
         required: false
         type: boolean
         default: false
@@ -113,6 +123,7 @@ jobs:
           RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
           RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
           RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
+          RUN_QWEN35_397B_FP4_TP4: ${{ inputs.run_qwen35_397b_fp4_tp4 }}
           RUN_LLAMA405_FP8_TP8: ${{ inputs.run_llama405_fp8_tp8 }}
           RUN_LLAMA8_TP1: ${{ inputs.run_llama8_tp1 }}
           RUN_KIMI_K2_TP8: ${{ inputs.run_kimi_k2_tp8 }}
@@ -121,6 +132,7 @@ jobs:
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
+          RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
         run: |
           set -euo pipefail
 
@@ -170,6 +182,15 @@ jobs:
                   "runner": "linux-atom-mi35x-8",
               },
               {
+                  "toggle_env": "RUN_QWEN35_397B_FP4_TP4",
+                  "model_name": "Qwen3.5-397B-A17B-MXFP4 TP4",
+                  "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
+                  "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "runner": "linux-atom-mi35x-4",
+              },
+              {
                   "toggle_env": "RUN_LLAMA405_FP8_TP8",
                   "model_name": "Meta-Llama-3.1-405B-Instruct-FP8/ TP8",
                   "model_path": "Meta-Llama-3.1-405B-Instruct-FP8/",
@@ -217,7 +238,7 @@ jobs:
               {
                   "toggle_env": "RUN_DSR1_FP4_TP8",
                   "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
-                  "model_path": "amd/DeepSeek-R1-0528-MXFP4",
+                  "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
@@ -241,6 +262,16 @@ jobs:
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-4",
               },
+              {
+                  "toggle_env": "RUN_GLM5_1_FP8_TP8",
+                  "model_name": "GLM-5.1-FP8 TP8",
+                  "model_path": "zai-org/GLM-5.1-FP8",
+                  "extra_args": "--tensor-parallel-size 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+                  "lm_eval_num_fewshot": 20,
+                  "accuracy_test_threshold": 0.88,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-8",
+              },
           ]
 
           selected = []
@@ -257,8 +288,26 @@ jobs:
           PY
 
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            echo "Scheduled run uses published OOT image: ${NIGHTLY_OOT_IMAGE_TAG}"
-            echo "oot_image_tag=${NIGHTLY_OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            if RESOLUTION_JSON="$(
+              python3 .github/scripts/resolve_atom_image.py \
+                --repository "${VALIDATION_IMAGE_REPO}" \
+                --reference-tag vllm-latest
+            )"; then
+              RESOLVED_OOT_IMAGE="$(
+                RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          PY
+              )"
+              echo "Scheduled run resolved published OOT image: ${RESOLVED_OOT_IMAGE}"
+            else
+              echo "::warning::Failed to resolve ${NIGHTLY_OOT_IMAGE_TAG} to an immutable reference; falling back to the floating tag."
+              RESOLVED_OOT_IMAGE="${NIGHTLY_OOT_IMAGE_TAG}"
+            fi
+            echo "oot_image_tag=${RESOLVED_OOT_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -266,7 +315,7 @@ jobs:
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           MANUAL_BASE_IMAGE_TAG="atom_oot_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
-          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:oot-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vllm-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
@@ -421,6 +470,17 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Collect GPU info (inside container)
+        id: gpu-info
+        run: |
+          GPU_NAME=$(docker exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          GPU_VRAM_GB=$(docker exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
+          ROCM_VERSION=$(docker exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          echo "gpu_name=${GPU_NAME}" >> "$GITHUB_OUTPUT"
+          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> "$GITHUB_OUTPUT"
+          echo "rocm_version=${ROCM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+
       - name: Download model if needed
         run: |
           set -euo pipefail
@@ -503,6 +563,7 @@ jobs:
           OOT_MODEL_PATH: ${{ matrix.model_path }}
           OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
           OOT_ENV_VARS: ${{ matrix.env_vars }}
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
@@ -511,6 +572,11 @@ jobs:
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
             -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
+            -e OOT_DOCKER_IMAGE="${OOT_IMAGE_TAG}" \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "

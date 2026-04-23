@@ -74,6 +74,28 @@ def build_entries(
         if baseline_note:
             extra_parts.append(f"BaselineNote: {baseline_note}")
 
+        ci_metadata = data.get("atom_ci_metadata", {})
+        docker_image = ci_metadata.get("docker_image")
+        if docker_image:
+            extra_parts.append(f"Docker: {docker_image}")
+        gpu_name = ci_metadata.get("gpu_name")
+        if gpu_name:
+            extra_parts.append(f"GPU: {gpu_name}")
+        gpu_vram_gb = ci_metadata.get("gpu_vram_gb")
+        if gpu_vram_gb not in (None, ""):
+            try:
+                gpu_vram_val = float(gpu_vram_gb)
+            except (TypeError, ValueError):
+                gpu_vram_val = None
+            if gpu_vram_val is not None:
+                if gpu_vram_val.is_integer():
+                    extra_parts.append(f"VRAM: {int(gpu_vram_val)}GB")
+                else:
+                    extra_parts.append(f"VRAM: {gpu_vram_val:g}GB")
+        rocm_version = ci_metadata.get("rocm_version")
+        if rocm_version:
+            extra_parts.append(f"ROCm: {rocm_version}")
+
         try:
             if strict_score is not None:
                 extra_parts.append(f"strict-match: {round(float(strict_score), 4)}")
@@ -113,6 +135,28 @@ def build_entries(
         if extra:
             entry["extra"] = extra
         entries.append(entry)
+
+        # MTP acceptance rate (extracted from server log during accuracy test)
+        mtp_rate = ci_metadata.get("mtp_acceptance_rate")
+        if mtp_rate is not None:
+            mtp_entry = {
+                "name": f"{backend}::{model_name} MTP acceptance (%)",
+                "unit": "%",
+                "value": round(float(mtp_rate), 2),
+            }
+            if extra:
+                mtp_entry["extra"] = extra
+            entries.append(mtp_entry)
+
+            avg_toks = ci_metadata.get("avg_tokens_per_forward")
+            if avg_toks is not None:
+                entries.append(
+                    {
+                        "name": f"{backend}::{model_name} avg toks/fwd (tok/fwd)",
+                        "unit": "tok/fwd",
+                        "value": round(float(avg_toks), 2),
+                    }
+                )
 
     return entries
 

@@ -87,6 +87,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_USE_CUSTOM_ALL_GATHER", "1"
     ).lower()
     == "1",
+    "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
@@ -95,6 +96,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower()
     == "1",
+    # --- Gradient Control ---
+    # Enable gradient tracking on model parameters.  Default "0" (disabled)
+    # is correct for inference; set to "1" only for training / fine-tuning.
+    "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
 }
 
 

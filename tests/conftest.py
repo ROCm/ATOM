@@ -40,7 +40,23 @@ class _StubConfig:
     pass
 
 
+class _StubKVCacheTensor:
+    """Placeholder for KVCacheTensor."""
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class _StubParallelConfig:
+    """Placeholder for ParallelConfig."""
+
+    pass
+
+
 _atom_config.Config = _StubConfig
+_atom_config.KVCacheTensor = _StubKVCacheTensor
+_atom_config.ParallelConfig = _StubParallelConfig
 sys.modules["atom.config"] = _atom_config
 
 # ── 4. Stub zmq / zmq.asyncio if not installed ────────────────────────────
