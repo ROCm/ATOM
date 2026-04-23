@@ -314,64 +314,33 @@ jobs:
           set -euo pipefail
           model_dir="/models/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
+            model_use_lock="true"
+            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+              model_use_lock="false"
+            fi
+            echo "Using shared model download script for ${model_dir} (MODEL_USE_LOCK=${model_use_lock})"
             if ! docker exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
-              -e MODEL_PATH="${{ matrix.model_path }}" \
-              -e MODEL_DIR="$model_dir" \
-              -e RUNNER_NAME="${{ matrix.runner }}" \
-              -e LOCK_SUFFIX="$lock_suffix" \
+              -e MODEL_ID="${{ matrix.model_path }}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_USE_LOCK="${model_use_lock}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
               "$CONTAINER_NAME" \
-              bash -lc '
-                set -euo pipefail
-                completion_flag="$MODEL_DIR/.download-complete"
-                use_model_lock="true"
-
-                if [ "$RUNNER_NAME" = "atom-mi355-8gpu.predownload" ]; then
-                  use_model_lock="false"
-                fi
-
-                download_model() {
-                  if [ -f "$MODEL_DIR/config.json" ]; then
-                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
-                  else
-                    echo "Model not found under ${MODEL_DIR}; downloading model"
-                  fi
-
-                  rm -f "$completion_flag"
-                  hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
-                  touch "$completion_flag"
-                }
-
-                if [ -f "$completion_flag" ]; then
-                  echo "Model already exists under ${MODEL_DIR}; skip download"
-                elif [ "$use_model_lock" != "true" ]; then
-                  echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
-                  download_model
-                else
-                  lock_dir="/models/.cache/atom-download-locks"
-                  mkdir -p "$lock_dir"
-                  lock_file="$lock_dir/${LOCK_SUFFIX}.lock"
-                  exec 9>"$lock_file"
-                  echo "Waiting for model download lock: $lock_file"
-                  if ! flock -w 7200 9; then
-                    echo "Timed out waiting for model download lock: $lock_file"
-                    exit 1
-                  fi
-
-                  if [ -f "$completion_flag" ]; then
-                    echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
-                  else
-                    download_model
-                  fi
-                fi
-              '; then
+              bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
           else
             echo "/models directory not mounted; skipping model download"
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "3h"
+          MODEL_LOCK_WAIT_SECONDS: "7200"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Resolve SGLANG model path
         if: success()

@@ -337,151 +337,33 @@ jobs:
           set -euo pipefail
           model_dir="/models/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            lock_suffix="$(printf '%s' "${{ matrix.model_path }}" | tr '/:@' '___')"
+            model_use_lock="true"
+            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+              model_use_lock="false"
+            fi
+            echo "Using shared model download script for ${model_dir} (MODEL_USE_LOCK=${model_use_lock})"
             if ! docker exec \
               -e HF_TOKEN="${HF_TOKEN:-}" \
-              -e MODEL_PATH="${{ matrix.model_path }}" \
-              -e MODEL_DIR="$model_dir" \
-              -e RUNNER_NAME="${{ matrix.runner }}" \
-              -e LOCK_SUFFIX="$lock_suffix" \
+              -e MODEL_ID="${{ matrix.model_path }}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_USE_LOCK="${model_use_lock}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
               "$CONTAINER_NAME" \
-              bash -lc '
-                set -euo pipefail
-                completion_flag="$MODEL_DIR/.download-complete"
-                revision_flag="$MODEL_DIR/.hf-revision"
-                use_model_lock="true"
-                remote_revision=""
-                remote_revision_lookup_failed="false"
-
-                if [ "$RUNNER_NAME" = "atom-mi355-8gpu.predownload" ]; then
-                  use_model_lock="false"
-                fi
-
-                fetch_remote_revision() {
-                  python3 - <<"PY"
-          import os
-          import sys
-
-          try:
-              from huggingface_hub import HfApi
-          except Exception as exc:
-              print(f"Failed to import huggingface_hub: {exc}", file=sys.stderr)
-              sys.exit(1)
-
-          repo_id = os.environ["MODEL_PATH"]
-          token = os.environ.get("HF_TOKEN")
-
-          try:
-              info = HfApi(token=token).model_info(repo_id)
-          except Exception as exc:
-              print(f"Failed to fetch remote revision for {repo_id}: {exc}", file=sys.stderr)
-              sys.exit(1)
-
-          sha = getattr(info, "sha", "") or ""
-          if not sha:
-              print(f"Remote revision is empty for {repo_id}", file=sys.stderr)
-              sys.exit(1)
-
-          print(sha)
-          PY
-                }
-
-                read_local_revision() {
-                  if [ -f "$revision_flag" ]; then
-                    tr -d "\n" < "$revision_flag"
-                  fi
-                }
-
-                cache_is_current() {
-                  if [ ! -f "$completion_flag" ]; then
-                    return 1
-                  fi
-
-                  if [ "$remote_revision_lookup_failed" = "true" ]; then
-                    echo "Remote revision lookup unavailable; keeping cached model under ${MODEL_DIR}"
-                    return 0
-                  fi
-
-                  local local_revision
-                  local_revision="$(read_local_revision)"
-
-                  if [ -z "$local_revision" ]; then
-                    echo "Cached model under ${MODEL_DIR} is missing revision metadata; refreshing cache"
-                    return 1
-                  fi
-
-                  if [ "$local_revision" = "$remote_revision" ]; then
-                    echo "Model already exists under ${MODEL_DIR} at remote revision ${remote_revision}; skip download"
-                    return 0
-                  fi
-
-                  echo "Remote model revision changed for ${MODEL_DIR}: local=${local_revision} remote=${remote_revision}"
-                  return 1
-                }
-
-                update_local_revision_file() {
-                  if [ -n "$remote_revision" ]; then
-                    mkdir -p "$MODEL_DIR"
-                    printf "%s\n" "$remote_revision" > "$revision_flag"
-                  else
-                    rm -f "$revision_flag"
-                  fi
-                }
-
-                download_model() {
-                  if [ -f "$MODEL_DIR/config.json" ]; then
-                    echo "Refreshing model cache under ${MODEL_DIR}"
-                  else
-                    echo "Model not found under ${MODEL_DIR}; downloading model"
-                  fi
-
-                  rm -f "$completion_flag"
-                  if [ -n "$remote_revision" ]; then
-                    hf download "$MODEL_PATH" --revision "$remote_revision" --local-dir "$MODEL_DIR"
-                  else
-                    hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
-                  fi
-                  update_local_revision_file
-                  touch "$completion_flag"
-                }
-
-                if remote_revision="$(fetch_remote_revision)"; then
-                  echo "Resolved remote revision for ${MODEL_PATH}: ${remote_revision}"
-                else
-                  remote_revision=""
-                  remote_revision_lookup_failed="true"
-                  echo "Warning: failed to resolve remote revision for ${MODEL_PATH}; falling back to completion marker logic"
-                fi
-
-                if cache_is_current; then
-                  exit 0
-                elif [ "$use_model_lock" != "true" ]; then
-                  echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
-                  download_model
-                else
-                  lock_dir="/models/.cache/atom-download-locks"
-                  mkdir -p "$lock_dir"
-                  lock_file="$lock_dir/${LOCK_SUFFIX}.lock"
-                  exec 9>"$lock_file"
-                  echo "Waiting for model download lock: $lock_file"
-                  if ! flock -w 7200 9; then
-                    echo "Timed out waiting for model download lock: $lock_file"
-                    exit 1
-                  fi
-
-                  if cache_is_current; then
-                    echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
-                  else
-                    download_model
-                  fi
-                fi
-              '; then
+              bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
           else
             echo "/models directory not mounted; skipping model download"
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "3h"
+          MODEL_LOCK_WAIT_SECONDS: "7200"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Resolve OOT model path
         if: success()
