@@ -62,7 +62,9 @@ class EngineCore:
         self._has_pending_utility = (
             False  # Flag to avoid checking empty queue every loop
         )
-        self._is_sleeping = False  # True when weights are offloaded (sleep mode)
+        self._is_rl_weights_offloaded = (
+            False  # True when weights are offloaded for RL training
+        )
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -95,6 +97,7 @@ class EngineCore:
                 config.runner_qualname,
                 config,
             )
+
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
             num_blocks = block_info["num_kvcache_blocks"]
             config.per_req_cache_equiv_blocks = block_info.get(
@@ -185,13 +188,13 @@ class EngineCore:
             if engine is not None:
                 engine.exit()
 
-    def _is_idle_sleeping(self) -> bool:
-        """Check if the engine is in sleep mode (weights offloaded).
+    def _is_idle_rl_weights_offloaded(self) -> bool:
+        """Check if weights are offloaded for RL training.
 
-        When sleeping, busy-wait with a short delay to avoid CPU spin.
+        When offloaded, busy-wait with a short delay to avoid CPU spin.
         Returns True if the caller should skip model execution this tick.
         """
-        if self._is_sleeping:
+        if self._is_rl_weights_offloaded:
             time.sleep(0.01)
             return True
         return False
@@ -204,7 +207,7 @@ class EngineCore:
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_sleeping():
+                if self._is_idle_rl_weights_offloaded():
                     continue
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
@@ -485,22 +488,23 @@ class DPEngineCoreProc(EngineCore):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
     def _gather_local_dp_state(self) -> tuple[bool, int, int, bool, bool]:
-        """Gather local scheduling state, substituting dummy values when sleeping.
+        """Gather local scheduling state, substituting dummy values when
+        weights are offloaded for RL training.
 
-        Sleeping cores must still participate in _sync_dp_state (NCCL
+        Offloaded cores must still participate in _sync_dp_state (NCCL
         all_reduce) to prevent other DP ranks from blocking forever.
-        The sleep flag is included in the sync tensor so that ALL cores
+        The offload flag is included in the sync tensor so that ALL cores
         agree to skip model execution together — MoE expert routing and
         dummy_execution also contain DP-wide collectives that would hang
         if only some cores participated.
         """
-        sleeping = self._is_sleeping
-        if not sleeping:
+        offloaded = self._is_rl_weights_offloaded
+        if not offloaded:
             is_prefill, num_tokens, num_reqs = self.scheduler.get_next_batch_info()
             unfinished = not self.scheduler.is_finished()
         else:
             is_prefill, num_tokens, num_reqs, unfinished = False, 0, 0, False
-        return is_prefill, num_tokens, num_reqs, unfinished, sleeping
+        return is_prefill, num_tokens, num_reqs, unfinished, offloaded
 
     def busy_loop(self):
         shutdown = False
@@ -509,9 +513,13 @@ class DPEngineCoreProc(EngineCore):
                 self.utility_handler.process_queue(self.utility_queue, self)
                 shutdown = shutdown or self.pull_and_process_input_queue()
 
-                local_is_prefill, local_num_tokens, local_num_reqs, local_unfinished, local_sleeping = (
-                    self._gather_local_dp_state()
-                )
+                (
+                    local_is_prefill,
+                    local_num_tokens,
+                    local_num_reqs,
+                    local_unfinished,
+                    local_offloaded,
+                ) = self._gather_local_dp_state()
 
                 (
                     global_has_prefill,
@@ -519,14 +527,14 @@ class DPEngineCoreProc(EngineCore):
                     global_max_reqs,
                     global_has_unfinished,
                     global_shutdown,
-                    global_sleeping,
+                    global_offloaded,
                 ) = self._sync_dp_state(
                     local_is_prefill,
                     local_num_tokens,
                     local_num_reqs,
                     local_unfinished,
                     shutdown,
-                    local_sleeping,
+                    local_offloaded,
                 )
 
                 if global_shutdown and not global_has_unfinished:
@@ -535,7 +543,7 @@ class DPEngineCoreProc(EngineCore):
                     )
                     break
 
-                if global_sleeping:
+                if global_offloaded:
                     time.sleep(0.01)
                     continue
 
@@ -567,7 +575,7 @@ class DPEngineCoreProc(EngineCore):
         local_num_reqs: int,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-        local_sleeping: bool = False,
+        local_offloaded: bool = False,
     ) -> tuple[bool, int, int, bool, bool, bool]:
         if self._shutting_down:
             return (
@@ -576,11 +584,11 @@ class DPEngineCoreProc(EngineCore):
                 local_num_reqs,
                 local_has_unfinished,
                 True,
-                local_sleeping,
+                local_offloaded,
             )
 
         try:
-            # Pack all state: [is_prefill, num_tokens, num_reqs, has_unfinished, shutdown, sleeping]
+            # Pack all state: [is_prefill, num_tokens, num_reqs, has_unfinished, shutdown, offloaded]
             state_tensor = torch.tensor(
                 [
                     1 if local_is_prefill else 0,
@@ -588,7 +596,7 @@ class DPEngineCoreProc(EngineCore):
                     local_num_reqs,
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
-                    1 if local_sleeping else 0,
+                    1 if local_offloaded else 0,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -601,14 +609,14 @@ class DPEngineCoreProc(EngineCore):
             global_max_reqs = state_tensor[2].item()
             global_has_unfinished = state_tensor[3].item() == 1
             global_shutdown = state_tensor[4].item() == 1
-            global_sleeping = state_tensor[5].item() == 1
+            global_offloaded = state_tensor[5].item() == 1
             return (
                 global_has_prefill,
                 global_max_tokens,
                 global_max_reqs,
                 global_has_unfinished,
                 global_shutdown,
-                global_sleeping,
+                global_offloaded,
             )
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
@@ -619,7 +627,7 @@ class DPEngineCoreProc(EngineCore):
                 local_num_reqs,
                 local_has_unfinished,
                 True,
-                local_sleeping,
+                local_offloaded,
             )
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:

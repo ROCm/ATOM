@@ -46,9 +46,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         device_indices = [int(x) for x in device_map.split(",")]
         local_device_rank = device_indices[rank]
-        dp_port = (
-            config.parallel_config.data_parallel_base_port + dp_rank_local * 100
-        )
+        dp_port = config.parallel_config.data_parallel_base_port + dp_rank_local * 100
         num_gpus = torch.cuda.device_count()
 
         if local_device_rank >= num_gpus:

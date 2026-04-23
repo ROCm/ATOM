@@ -227,7 +227,6 @@ class AsyncIOProcManager:
         self.runner_label = runner.split(".")[-1]
         self.label = f"AsyncIOProcManager({self.runner_label})"
 
-
         self.rpc_broadcast_mq = MessageQueue(
             proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024
         )

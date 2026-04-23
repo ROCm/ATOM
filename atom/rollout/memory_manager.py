@@ -173,7 +173,7 @@ class MemoryManagerMixin:
         self._kv_cache_num_blocks = None
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        available_blocks = self.get_num_blocks()
+        available_blocks = self.get_num_blocks()["num_kvcache_blocks"]
         num_blocks = min(saved_blocks, available_blocks)
         if num_blocks < saved_blocks:
             logger.warning(

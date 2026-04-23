@@ -42,7 +42,7 @@ class EngineUtilityHandler:
         When the queue is empty, ``engine._has_pending_utility`` is set to
         ``False`` so that the next busy-loop iteration can skip the check.
 
-        Sleep/wake state is tracked on *engine._is_sleeping* so that the
+        Sleep/wake state is tracked on *engine._is_rl_weights_offloaded* so that the
         busy-loop can skip model execution while the weights are offloaded.
         """
         if not engine._has_pending_utility:
@@ -56,7 +56,7 @@ class EngineUtilityHandler:
                 if cmd == "release_memory":
                     tags = args.get("tags", []) if isinstance(args, dict) else []
                     if "weights" in tags:
-                        engine._is_sleeping = True
+                        engine._is_rl_weights_offloaded = True
                         logger.info(f"{self.label}: engine entered sleep mode")
                 elif cmd in (
                     "resume_memory",
@@ -65,7 +65,7 @@ class EngineUtilityHandler:
                 ):
                     tags = args.get("tags", []) if isinstance(args, dict) else []
                     if cmd == "resume_memory" and "weights" in tags:
-                        engine._is_sleeping = False
+                        engine._is_rl_weights_offloaded = False
                         logger.info(f"{self.label}: engine exited sleep mode")
                     elif cmd in ("update_weights_shm", "update_weights_ipc"):
                         is_last = (
@@ -74,7 +74,7 @@ class EngineUtilityHandler:
                             else True
                         )
                         if is_last:
-                            engine._is_sleeping = False
+                            engine._is_rl_weights_offloaded = False
                             logger.info(
                                 f"{self.label}: engine exited sleep mode (weights updated)"
                             )
