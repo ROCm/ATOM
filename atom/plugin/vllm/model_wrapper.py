@@ -140,9 +140,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         main_model_arch = vllm_config.model_config.architectures[0]
         model_arch = _select_model_arch(vllm_config)
         self.model_arch = model_arch
-        # if self.forced_model_arch is not None:
-        #     model_arch = self.forced_model_arch
-        #     logger.info(f"Using forced model arch: {model_arch} for vLLM plugin mode")
         model_cls = _get_atom_model_cls(model_arch)
         module_remapping = getattr(model_cls, "packed_modules_mapping", {})
         weights_mapper = getattr(model_cls, "hf_to_atom_mapper", {})
@@ -303,12 +300,6 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     f"static_forward_context, skipping"
                 )
 
-    def _maybe_adjust_draft_positions(self, positions: torch.Tensor) -> torch.Tensor:
-        position_offset = getattr(self.model, "vllm_draft_position_offset", 0)
-        if position_offset == 0:
-            return positions
-        return positions + position_offset
-
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -322,12 +313,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
-        # positions = self._maybe_adjust_draft_positions(positions)
-
         # pass positions from vLLM to OOT execution path via vLLM's per-forward context
         if is_forward_context_available():
             forward_context = get_vllm_forward_context()
             forward_context.additional_kwargs["atom_positions"] = positions
+            # set atom_config into vLLM forward_context in order to
+            # make sure main model and draft model can get their specific
+            # static_forward_context from their own atom_config
             forward_context.additional_kwargs["atom_config"] = self.atom_config
         elif "positions" in self.atom_config.compilation_config.static_forward_context:
             buf = self.atom_config.compilation_config.static_forward_context[

@@ -976,8 +976,9 @@ def _get_current_atom_config_from_vllm_forward_context() -> Optional[Config]:
     # In vLLM plugin mode (especially speculative decode), main/draft models
     # can coexist in one process. Resolve per-forward config first to avoid
     # reading a stale global singleton.
-    if not is_vllm():
-        return None
+    assert (
+        is_vllm()
+    ), "get_current_atom_config_from_vllm_forward_context should only be called in vLLM plugin mode"
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
@@ -997,5 +998,9 @@ def get_current_atom_config() -> Config:
     forward_atom_config = _get_current_atom_config_from_vllm_forward_context()
     if forward_atom_config is not None:
         return forward_atom_config
+    if is_vllm():
+        logger.warning(
+            "atom config has not been set into vllm forward_context(vLLM plugin mode), using global singleton"
+        )
     assert _current_atom_config is not None, "Current atom config is not set"
     return _current_atom_config
