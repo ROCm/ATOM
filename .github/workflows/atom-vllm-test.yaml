@@ -331,7 +331,7 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Download model if needed
+      - name: Download or refresh model if needed
         if: success()
         run: |
           set -euo pipefail
@@ -348,26 +348,113 @@ jobs:
               bash -lc '
                 set -euo pipefail
                 completion_flag="$MODEL_DIR/.download-complete"
+                revision_flag="$MODEL_DIR/.hf-revision"
                 use_model_lock="true"
+                remote_revision=""
+                remote_revision_lookup_failed="false"
 
                 if [ "$RUNNER_NAME" = "atom-mi355-8gpu.predownload" ]; then
                   use_model_lock="false"
                 fi
 
+                fetch_remote_revision() {
+                  python3 - <<"PY"
+          import os
+          import sys
+
+          try:
+              from huggingface_hub import HfApi
+          except Exception as exc:
+              print(f"Failed to import huggingface_hub: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          repo_id = os.environ["MODEL_PATH"]
+          token = os.environ.get("HF_TOKEN")
+
+          try:
+              info = HfApi(token=token).model_info(repo_id)
+          except Exception as exc:
+              print(f"Failed to fetch remote revision for {repo_id}: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          sha = getattr(info, "sha", "") or ""
+          if not sha:
+              print(f"Remote revision is empty for {repo_id}", file=sys.stderr)
+              sys.exit(1)
+
+          print(sha)
+          PY
+                }
+
+                read_local_revision() {
+                  if [ -f "$revision_flag" ]; then
+                    tr -d "\n" < "$revision_flag"
+                  fi
+                }
+
+                cache_is_current() {
+                  if [ ! -f "$completion_flag" ]; then
+                    return 1
+                  fi
+
+                  if [ "$remote_revision_lookup_failed" = "true" ]; then
+                    echo "Remote revision lookup unavailable; keeping cached model under ${MODEL_DIR}"
+                    return 0
+                  fi
+
+                  local local_revision
+                  local_revision="$(read_local_revision)"
+
+                  if [ -z "$local_revision" ]; then
+                    echo "Cached model under ${MODEL_DIR} is missing revision metadata; refreshing cache"
+                    return 1
+                  fi
+
+                  if [ "$local_revision" = "$remote_revision" ]; then
+                    echo "Model already exists under ${MODEL_DIR} at remote revision ${remote_revision}; skip download"
+                    return 0
+                  fi
+
+                  echo "Remote model revision changed for ${MODEL_DIR}: local=${local_revision} remote=${remote_revision}"
+                  return 1
+                }
+
+                update_local_revision_file() {
+                  if [ -n "$remote_revision" ]; then
+                    mkdir -p "$MODEL_DIR"
+                    printf "%s\n" "$remote_revision" > "$revision_flag"
+                  else
+                    rm -f "$revision_flag"
+                  fi
+                }
+
                 download_model() {
                   if [ -f "$MODEL_DIR/config.json" ]; then
-                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
+                    echo "Refreshing model cache under ${MODEL_DIR}"
                   else
                     echo "Model not found under ${MODEL_DIR}; downloading model"
                   fi
 
                   rm -f "$completion_flag"
-                  hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  if [ -n "$remote_revision" ]; then
+                    hf download "$MODEL_PATH" --revision "$remote_revision" --local-dir "$MODEL_DIR"
+                  else
+                    hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  fi
+                  update_local_revision_file
                   touch "$completion_flag"
                 }
 
-                if [ -f "$completion_flag" ]; then
-                  echo "Model already exists under ${MODEL_DIR}; skip download"
+                if remote_revision="$(fetch_remote_revision)"; then
+                  echo "Resolved remote revision for ${MODEL_PATH}: ${remote_revision}"
+                else
+                  remote_revision=""
+                  remote_revision_lookup_failed="true"
+                  echo "Warning: failed to resolve remote revision for ${MODEL_PATH}; falling back to completion marker logic"
+                fi
+
+                if cache_is_current; then
+                  exit 0
                 elif [ "$use_model_lock" != "true" ]; then
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
                   download_model
@@ -382,7 +469,7 @@ jobs:
                     exit 1
                   fi
 
-                  if [ -f "$completion_flag" ]; then
+                  if cache_is_current; then
                     echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
                   else
                     download_model
