@@ -704,6 +704,7 @@ class SpeculativeConfig:
         "qwen3_5_moe": "qwen3_5_mtp",
         "qwen3_5_text": "qwen3_5_mtp",
         "qwen3_5_moe_text": "qwen3_5_mtp",
+        "mimo_v2_flash": "mimo_v2_flash_mtp",
     }
 
     # mtp_model_type → (n_predict_attr, architecture)
@@ -715,7 +716,9 @@ class SpeculativeConfig:
 
     def __post_init__(self):
         if self.draft_model_hf_config is None:
-            self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
+            self.draft_model_hf_config = AutoConfig.from_pretrained(
+                self.model, trust_remote_code=True
+            )
         # For multimodal models, extract text_config
         if hasattr(self.draft_model_hf_config, "text_config"):
             self.draft_model_hf_config = self.draft_model_hf_config.text_config
@@ -751,6 +754,18 @@ class SpeculativeConfig:
                 updates["n_routed_experts"] = getattr(hf_config, "num_experts", 0)
 
             hf_config.update(updates)
+
+        # MiMo-V2 has not MTP related information in HF config.json,
+        # override n_predict with the actual layer count (default 3).
+        if hf_config.model_type == "mimo_v2_flash_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 3)
+            hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "num_nextn_predict_layers": n_predict,
+                    "architectures": ["MiMoV2FlashMTPModel"],
+                }
+            )
 
         logger.info(f"hf config is: {hf_config}")
 

@@ -160,7 +160,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -169,7 +169,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
                   "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
@@ -178,7 +178,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B",
                   "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
@@ -187,7 +187,7 @@ jobs:
                   "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
                   "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -205,7 +205,7 @@ jobs:
                   "model_path": "meta-llama/Llama-3.1-8B-Instruct",
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.73,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-1",
               },
               {

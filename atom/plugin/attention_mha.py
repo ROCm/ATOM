@@ -29,6 +29,7 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
+_NO_PS_FIXED_SPLITS = 64  # covers up to 64 * 256 = 16384 context length
 
 
 class PagedAttentionImplPluginModeMethods:
@@ -99,34 +100,71 @@ class PagedAttentionImplPluginModeMethods:
             and self.q_norm is not None
             and self.k_norm is not None
         ):
-            fused_qk_norm_rope_cache_quant_shuffle(
-                qkv,
-                num_heads_q=self.num_heads,
-                num_heads_k=self.num_kv_heads,
-                num_heads_v=self.num_kv_heads,
-                head_dim=self.head_dim,
-                eps=self.q_norm.eps,
-                qw=self.q_norm.weight,
-                kw=self.k_norm.weight,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox_style=self.rotary_emb.is_neox_style,
-                pos_ids=position,
-                k_cache=new_key_cache,
-                v_cache=new_value_cache,
-                slot_mapping=attn_metadata.slot_mapping,
-                kv_cache_dtype=(
-                    "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
-                ),
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
+            from atom.model_ops.layernorm import GemmaRMSNorm
 
-            qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
-            q, k, v = qkv.split(
-                [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
-            )
+            if isinstance(self.q_norm, GemmaRMSNorm):
+                # GemmaRMSNorm (1+w) path — use the Triton fused kernel
+                from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
+                    triton_fused_norm_rope_cache,
+                )
+
+                # qkv is a packed [q, k, v] tensor — split
+                q_size = self.num_heads * self.head_dim
+                kv_size = self.num_kv_heads * self.head_dim
+                q_raw, k_raw, v_raw = torch.split(
+                    qkv, [q_size, kv_size, kv_size], dim=-1
+                )
+                q, k = triton_fused_norm_rope_cache(
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    position,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    rotary_emb=self.rotary_emb,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    k_cache=new_key_cache,
+                    v_cache=new_value_cache,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+                # Reshape q, k for attention: [T, num_heads, head_dim]
+                q = q.view(-1, self.num_heads, self.head_dim)
+                k = k.view(-1, self.num_kv_heads, self.head_dim)
+                v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+            else:
+                # Standard RMSNorm — use existing aiter kernel
+                fused_qk_norm_rope_cache_quant_shuffle(
+                    qkv,
+                    num_heads_q=self.num_heads,
+                    num_heads_k=self.num_kv_heads,
+                    num_heads_v=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    eps=self.q_norm.eps,
+                    qw=self.q_norm.weight,
+                    kw=self.k_norm.weight,
+                    cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                    is_neox_style=self.rotary_emb.is_neox_style,
+                    pos_ids=position,
+                    k_cache=new_key_cache,
+                    v_cache=new_value_cache,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    kv_cache_dtype=(
+                        "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+                    ),
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+                qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
+                q, k, v = qkv.split(
+                    [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
+                )
         elif use_triton_attn and self.rotary_emb is not None:
-
             k_scale = v_scale = self.per_tensor_scale
             self.per_token_quant = False
             qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
@@ -193,16 +231,23 @@ class PagedAttentionImplPluginModeMethods:
         v_scale: torch.Tensor,
         out: torch.Tensor,
         attn_metadata: "AttentionMetaData",
+        ps: bool = True,
     ):
         o = out
         num_seqs, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
         query_group_size = num_q_heads_total // num_kv_heads
         assert num_q_heads_total % num_kv_heads == 0
-
-        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
-
         context_partition_size = 256
+
+        use_ps = self.adopt_persistent_kernel(
+            head_size, num_kv_heads, num_q_heads_total
+        )
+        if use_ps:
+            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        else:
+            max_context_partition_num = _NO_PS_FIXED_SPLITS
+
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
@@ -213,6 +258,9 @@ class PagedAttentionImplPluginModeMethods:
             num_kv_heads,
             max_context_partition_num,
             query_group_size,
+        )
+        compute_type = (
+            torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
         )
         exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
         max_logits = torch.empty(
@@ -225,15 +273,9 @@ class PagedAttentionImplPluginModeMethods:
             device=q.device,
         )
 
-        per_tensor = False
         if k_scale is not None and k_scale.numel() > 1:
             k_scale = k_scale.unsqueeze(-1)
             v_scale = v_scale.unsqueeze(-1)
-        compute_type = (
-            torch.bfloat16
-            if self.kv_cache_dtype == "bf16" or per_tensor
-            else aiter.dtypes.fp8
-        )
 
         num_decode_seqs = q.shape[0]
         seq_lens_decode = attn_metadata.plugin_metadata.seq_lens[:num_decode_seqs]
@@ -262,7 +304,7 @@ class PagedAttentionImplPluginModeMethods:
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
-            ps=True,
+            ps=use_ps,
         )
 
         return o
@@ -495,6 +537,12 @@ class PagedAttentionImplPluginModeMethods:
             suffix_lse=lse,
         )
 
+    def adopt_persistent_kernel(self, head_size, num_kv_heads, num_q_heads):
+        non_ps_database = {(256, 4, 1)}
+        if (head_size, num_q_heads, num_kv_heads) in non_ps_database:
+            return False
+        return True
+
     def forward_impl_plugin_mode(
         self,
         layer: torch.nn.Module,
@@ -518,18 +566,15 @@ class PagedAttentionImplPluginModeMethods:
         if attn_metadata is None:
             return output.fill_(0)
 
-        # when using this optimization, the qkv tensor and
-        # position tensor are passed through q,k,v
-        # when not using this optimization, the position is not
-        # needed as the ROPE has been calculated outside of attention
+        # When using the fusion path (ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION),
+        # positions and qkv tuple are smuggled through k, v args.
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             assert (
                 position is None
             ), "position should be None because it is passed through k"
 
             position = key
-            qkv = value
-
+            qkv = value  # packed [q, k, v] tensor
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
             query, key, value = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
@@ -649,7 +694,6 @@ class PagedAttentionImplPluginModeMethods:
 
         # calculate for extends
         if num_extends > 0:
-
             assert attn_metadata.plugin_metadata.extend_metadata is not None
             extend_tokens_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_extend_tokens
@@ -735,6 +779,7 @@ def PagedAttentionImplDecoratorForPluginMode(cls):
         "extend_for_sliding_window",
         "extend_forward",
         "forward_impl_plugin_mode",
+        "adopt_persistent_kernel",
     ]
 
     logger.info(

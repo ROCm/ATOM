@@ -617,8 +617,8 @@ class MergedColumnParallelLinear(LinearBase):
             self, "input_scale", None
         ):
             if self.quant_type == QuantType.per_1x128:
-                shard_offset //= 128
-                shard_size //= 128
+                shard_offset = (shard_offset + 127) // 128
+                shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = loaded_shard_id
@@ -717,8 +717,8 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
             self, "input_scale", None
         ):
             if self.quant_type == QuantType.per_1x128:
-                shard_offset //= 128
-                shard_size //= 128
+                shard_offset = (shard_offset + 127) // 128
+                shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = ["qkvz", "ba"].index(loaded_shard_id)
@@ -887,9 +887,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        v_head_size: int | None = None,
         **kwargs,
     ):
         self.head_size = head_size
+        self.v_head_size = v_head_size if v_head_size is not None else head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
         tp_size = get_tp_group().world_size
@@ -909,7 +911,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         output_sizes = [
             self.num_heads * self.head_size * tp_size,
             self.num_kv_heads * self.head_size * tp_size,
-            self.num_kv_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.v_head_size * tp_size,
         ]
 
         super().__init__(
@@ -935,7 +937,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_offset = self.num_heads * self.head_size
             shard_rank = self.tp_rank // self.num_kv_head_replicas
         else:
-            shard_size = self.num_kv_heads * self.head_size
+            shard_size = self.num_kv_heads * self.v_head_size
             shard_offset = (
                 self.num_heads * self.head_size + self.num_kv_heads * self.head_size
             )
@@ -944,8 +946,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             self, "input_scale", None
         ):
             if self.quant_type == QuantType.per_1x128:
-                shard_offset //= 128
-                shard_size //= 128
+                shard_offset = (shard_offset + 127) // 128
+                shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = ["q", "k", "v"].index(loaded_shard_id)

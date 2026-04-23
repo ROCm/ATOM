@@ -41,6 +41,8 @@ def cp_mha_gather_cache_kernel(
     seq_start_ptr,  # [num_batches]
     k_scale_ptr,  # [1] / [num_blocks, num_kv_heads, page_size]
     v_scale_ptr,
+    k_cache_stride0,
+    v_cache_stride0,
     num_heads,
     head_size,
     x,
@@ -75,13 +77,13 @@ def cp_mha_gather_cache_kernel(
         # V: [num_blocks, page_size, num_head, head_dim]
         key_cache_ptr_offset = (
             key_cache_ptr
-            + block_id * num_heads * head_size * PAGE_SIZE
+            + block_id * k_cache_stride0
             + slot_id * num_heads * head_size
             + head_id * head_size
         )
         value_cache_ptr_offset = (
             value_cache_ptr
-            + block_id * num_heads * head_size * PAGE_SIZE
+            + block_id * v_cache_stride0
             + slot_id * num_heads * head_size
             + head_id * head_size
         )
@@ -111,13 +113,13 @@ def cp_mha_gather_cache_kernel(
         # V: [num_blocks, num_head, page_size // x, head_dim, x]
         key_cache_ptr_offset = (
             key_cache_ptr
-            + block_id * num_heads * head_size * PAGE_SIZE
+            + block_id * k_cache_stride0
             + head_id * head_size * PAGE_SIZE
             + slot_id * x
         )
         value_cache_ptr_offset = (
             value_cache_ptr
-            + block_id * num_heads * head_size * PAGE_SIZE
+            + block_id * v_cache_stride0
             + head_id * head_size * PAGE_SIZE
             + (slot_id // x) * head_size * x
             + slot_id % x
@@ -181,6 +183,8 @@ def cp_mha_gather_cache(
         page_size = key_cache.shape[3]
         num_heads = key_cache.shape[1]
 
+    k_cache_stride0 = key_cache.stride(0)
+    v_cache_stride0 = value_cache.stride(0)
     grid = lambda meta: (total_tokens, num_heads)  # noqa: E731
     cp_mha_gather_cache_kernel[grid](
         key_cache,
@@ -193,6 +197,8 @@ def cp_mha_gather_cache(
         seq_starts,
         k_scales,
         v_scales,
+        k_cache_stride0,
+        v_cache_stride0,
         num_heads,
         head_dim,
         x,

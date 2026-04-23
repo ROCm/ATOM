@@ -30,39 +30,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
-    "ATOM_USE_TRITON_MXFP4_BMM": lambda: os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0")
-    == "1",
+    "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
+        os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
+    ),
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
-    "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: os.getenv(
-        "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0"
-    )
-    == "1",
-    "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: os.getenv(
-        "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1"
-    )
-    == "1",
-    "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: os.getenv(
-        "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1"
-    )
-    == "1",
-    "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: os.getenv(
-        "ATOM_ENABLE_DS_QKNORM_FUSION", "1"
-    )
-    == "1",
-    "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: os.getenv(
-        "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1"
-    )
-    == "1",
-    "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: os.getenv(
-        "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1"
-    )
-    == "1",
-    "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: os.getenv(
-        "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1"
-    )
-    == "1",
+    "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
+        os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
+    ),
+    "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
+        os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
+    ),
+    "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION": lambda: (
+        os.getenv("ATOM_ENABLE_DS_QKNORM_QUANT_FUSION", "1") == "1"
+    ),
+    "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
+        os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
+    ),
+    "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
+        os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
+    ),
+    "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
+        os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
+    ),
+    "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: (
+        os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
+    ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
@@ -72,21 +66,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GPU timestamps for both prefill and decode phases.
     "ATOM_RTL_TRACE_DIR": lambda: os.getenv("ATOM_RTL_TRACE_DIR", None),
     # --- Model Loading ---
-    "ATOM_DISABLE_MMAP": lambda: os.getenv("ATOM_DISABLE_MMAP", "false").lower()
-    == "true",
+    "ATOM_DISABLE_MMAP": lambda: (
+        os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
+    ),
     # --- Plugin Mode ---
-    "ATOM_DISABLE_VLLM_PLUGIN": lambda: os.getenv(
-        "ATOM_DISABLE_VLLM_PLUGIN", "0"
-    ).lower()
-    == "1",
-    "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION": lambda: os.getenv(
-        "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0"
-    ).lower()
-    == "1",
-    "ATOM_USE_CUSTOM_ALL_GATHER": lambda: os.getenv(
-        "ATOM_USE_CUSTOM_ALL_GATHER", "1"
-    ).lower()
-    == "1",
+    "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
+        os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
+    ),
+    "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION": lambda: (
+        os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1"
+    ),
+    "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
+        os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
+    ),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
@@ -94,8 +86,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
     # --- MTP (relaxed mtp for quantized mtp) ---
-    "ATOM_ENABLE_RELAXED_MTP": lambda: os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower()
-    == "1",
+    "ATOM_ENABLE_RELAXED_MTP": lambda: (
+        os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
+    ),
     # --- Gradient Control ---
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.
