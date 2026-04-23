@@ -210,6 +210,7 @@ def create_attn_metadata_builder_init_method(base_class):
         self.block_size = kv_cache_spec.block_size
 
         self.aot_sliding_window: Optional[tuple[int, int]] = None
+        self.swa_head_dim: int = self.head_dim
         self.total_tokens: int = 0
 
         self.scheduler_config = config.scheduler_config
@@ -224,8 +225,10 @@ def create_attn_metadata_builder_init_method(base_class):
                 sliding_window_sizes.add(None)
             elif isinstance(sliding_window, tuple):
                 sliding_window_sizes.add(sliding_window)
+                self.swa_head_dim = layer.impl.head_dim
             else:
                 sliding_window_sizes.add((sliding_window - 1, 0))
+                self.swa_head_dim = layer.impl.head_dim
 
         while len(sliding_window_sizes) > 0:
             sliding_window_config = sliding_window_sizes.pop()
@@ -345,17 +348,22 @@ class vllmAttentionMetadataBuilderMethods:
         )
 
         if mixed:
-            prefill_max_query_len = (
-                query_lens_cpu[num_decodes + num_extends :].max().item()
-            )
-            prefill_max_seq_len = seq_lens[num_decodes + num_extends :].max().item()
-            prefill_query_start_loc = (
-                prefill_query_start_loc[num_decodes + num_extends :]
-                - prefill_query_start_loc[num_decodes + num_extends]
-            )
-            decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
-            decode_max_seq_len = seq_lens[:num_decodes].max().item()
-            decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
+            # Guard against empty slices: mixed=True guarantees at least two of
+            # {num_prefills, num_decodes, num_extends} are > 0, but any one of
+            # them can individually be 0 (e.g. only decodes+extends, no prefill).
+            if num_prefills > 0:
+                prefill_max_query_len = (
+                    query_lens_cpu[num_decodes + num_extends :].max().item()
+                )
+                prefill_max_seq_len = seq_lens[num_decodes + num_extends :].max().item()
+                prefill_query_start_loc = (
+                    prefill_query_start_loc[num_decodes + num_extends :]
+                    - prefill_query_start_loc[num_decodes + num_extends]
+                )
+            if num_decodes > 0:
+                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_seq_len = seq_lens[:num_decodes].max().item()
+                decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
         prefill_metadata = None
         decode_metadata = None
@@ -409,7 +417,7 @@ class vllmAttentionMetadataBuilderMethods:
                 )
                 fetched_shape = cu_seq_lens[-1].item()
                 swa_workspace = torch.empty(
-                    (2, fetched_shape, self.num_heads_kv, self.head_dim),
+                    (2, fetched_shape, self.num_heads_kv, self.swa_head_dim),
                     dtype=self.vllm_config.model_config.dtype,
                     device=self.device,
                 )

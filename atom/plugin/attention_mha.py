@@ -28,7 +28,167 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+_CK_MAX_HEAD_DIM = 256
+
+
+def _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                      softmax_scale, causal, return_lse=False, out=None):
+    """PyTorch SDPA fallback for varlen attention when CK is unsupported
+    (e.g. head_dim > 256).  Handles GQA head expansion automatically.
+
+    Returns (out, lse) when return_lse=True, else just out.
+    """
+    import torch.nn.functional as F
+
+    num_seqs = cu_seqlens_q.shape[0] - 1
+    if out is None:
+        out = torch.empty_like(q)
+    total_q = q.shape[0]
+    num_heads_q = q.shape[1]
+
+    if return_lse:
+        lse = torch.empty(num_heads_q, total_q, dtype=torch.float32,
+                          device=q.device)
+
+    # Expand KV heads once, then execute a single batched SDPA over padded
+    # tensors instead of launching one SDPA per sequence from Python.
+    num_kv_heads = k.shape[1]
+    if num_heads_q != num_kv_heads:
+        rep = num_heads_q // num_kv_heads
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+    q_starts = cu_seqlens_q[:-1].tolist()
+    q_ends = cu_seqlens_q[1:].tolist()
+    k_starts = cu_seqlens_k[:-1].tolist()
+    k_ends = cu_seqlens_k[1:].tolist()
+    q_lens = [q_e - q_s for q_s, q_e in zip(q_starts, q_ends)]
+    k_lens = [k_e - k_s for k_s, k_e in zip(k_starts, k_ends)]
+    max_q = max(q_lens) if q_lens else 0
+    max_k = max(k_lens) if k_lens else 0
+    if max_q == 0 or max_k == 0:
+        if return_lse:
+            lse.zero_()
+            return out, lse
+        return out
+    batch_q = q.new_zeros((num_seqs, num_heads_q, max_q, q.shape[-1]))
+    batch_k = k.new_zeros((num_seqs, num_heads_q, max_k, k.shape[-1]))
+    batch_v = v.new_zeros((num_seqs, num_heads_q, max_k, v.shape[-1]))
+    attn_mask = q.new_full((num_seqs, 1, max_q, max_k), float("-inf"))
+    for i, (sq_s, sq_e, sk_s, sk_e, q_len, k_len) in enumerate(
+        zip(q_starts, q_ends, k_starts, k_ends, q_lens, k_lens)
+    ):
+        if q_len == 0 or k_len == 0:
+            continue
+        batch_q[i, :, :q_len] = q[sq_s:sq_e].transpose(0, 1)
+        batch_k[i, :, :k_len] = k[sk_s:sk_e].transpose(0, 1)
+        batch_v[i, :, :k_len] = v[sk_s:sk_e].transpose(0, 1)
+        attn_mask[i, :, :q_len, :k_len] = 0
+        if causal:
+            causal_mask = torch.triu(
+                torch.full((q_len, k_len), float("-inf"),
+                           dtype=q.dtype, device=q.device),
+                diagonal=1,
+            )
+            attn_mask[i, :, :q_len, :k_len] = (
+                attn_mask[i, :, :q_len, :k_len] + causal_mask
+            )
+    batch_out = F.scaled_dot_product_attention(
+        batch_q,
+        batch_k,
+        batch_v,
+        attn_mask=attn_mask,
+        scale=softmax_scale,
+        is_causal=False,
+    )
+    for i, (sq_s, sq_e, q_len) in enumerate(zip(q_starts, q_ends, q_lens)):
+        if q_len == 0:
+            continue
+        out[sq_s:sq_e] = batch_out[i, :, :q_len].transpose(0, 1)
+    if return_lse:
+        scores = torch.matmul(
+            batch_q.to(torch.float32) * softmax_scale,
+            batch_k.transpose(-1, -2).to(torch.float32),
+        )
+        scores = scores + attn_mask.to(torch.float32)
+        batch_lse = torch.logsumexp(scores, dim=-1)
+        for i, (sq_s, sq_e, q_len) in enumerate(zip(q_starts, q_ends, q_lens)):
+            if q_len == 0:
+                continue
+            lse[:, sq_s:sq_e] = batch_lse[i, :, :q_len]
+    return (out, lse) if return_lse else out
+
+
+def _flash_attn_varlen_with_fallback(
+    q, k, v,
+    cu_seqlens_q, cu_seqlens_k,
+    max_seqlen_q, max_seqlen_k,
+    min_seqlen_q,
+    softmax_scale, causal,
+    head_dim,
+    sink_ptr=None,
+    alibi_slopes=None,
+):
+    """CK flash attention with automatic SDPA fallback for large head_dim."""
+    if head_dim <= _CK_MAX_HEAD_DIM:
+        return aiter.flash_attn_varlen_func(
+            q=q, k=k, v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=0.0,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            sink_ptr=sink_ptr,
+            alibi_slopes=alibi_slopes,
+            return_lse=True,
+        )
+    return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                             softmax_scale, causal, return_lse=True)
+
+
 _QWEN_GLUON_PA_DECODE_BS = 64
+
+
+def _triton_flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                               max_seqlen_q, max_seqlen_k, softmax_scale,
+                               causal=True, sliding_window=(-1, -1, 0),
+                               out=None, dropout_p=0.0):
+    """Fallback for prefill when head_dim > 256 (CK limitation).
+
+    Tries aiter Triton FA2 first, falls back to PyTorch SDPA with
+    GQA head expansion.
+    """
+    import torch
+
+    try:
+        from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.interface_v2 import (  # noqa: E501
+            varlen_fwd,
+        )
+        if out is None:
+            out = torch.empty_like(q)
+        wl = sliding_window[0] if isinstance(sliding_window, (tuple, list)) else sliding_window
+        wr = sliding_window[1] if isinstance(sliding_window, (tuple, list)) else 0
+        device = q.device
+        empty = torch.empty(0, device=device)
+        varlen_fwd(
+            q, k, v, out,
+            cu_seqlens_q, cu_seqlens_k,
+            None, None, empty, None,
+            max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale,
+            False, causal,
+            wl if wl > 0 else -1,
+            wr if wr > 0 else -1,
+            0.0, False,
+        )
+        return out
+    except Exception as e:
+        logger.warning("Triton FA2 varlen_fwd failed (head_dim=%s), "
+                       "falling back to PyTorch SDPA: %s", q.shape[-1], e)
+        return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                 softmax_scale, causal, out=out)
 
 
 class PagedAttentionImplPluginModeMethods:
@@ -95,7 +255,8 @@ class PagedAttentionImplPluginModeMethods:
         self.use_triton_attn = use_triton_attn
 
         if (
-            self.rotary_emb is not None
+            qkv is not None
+            and self.rotary_emb is not None
             and self.q_norm is not None
             and self.k_norm is not None
         ):
@@ -125,7 +286,7 @@ class PagedAttentionImplPluginModeMethods:
             q, k, v = qkv.split(
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
-        elif use_triton_attn and self.rotary_emb is not None:
+        elif use_triton_attn and self.rotary_emb is not None and qkv is not None:
 
             k_scale = v_scale = self.per_tensor_scale
             self.per_token_quant = False
@@ -404,7 +565,7 @@ class PagedAttentionImplPluginModeMethods:
                 v_scale,
             )
             return
-        out, lse = aiter.flash_attn_varlen_func(
+        out, lse = _flash_attn_varlen_with_fallback(
             q=query,
             k=key,
             v=value,
@@ -413,12 +574,11 @@ class PagedAttentionImplPluginModeMethods:
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_q,  # need to confirm
             min_seqlen_q=min_seqlen_q,
-            dropout_p=0.0,
             softmax_scale=self.scale,
             causal=True,
+            head_dim=self.head_dim,
             sink_ptr=self.sinks,
             alibi_slopes=self.alibi_slopes,
-            return_lse=True,
         )
         assert attn_metadata.plugin_metadata.extend_metadata is not None
         chunk_context_metadata = (
@@ -452,7 +612,7 @@ class PagedAttentionImplPluginModeMethods:
                 per_token_quant=self.per_token_quant,
             )
 
-            suf_out, suf_lse = aiter.flash_attn_varlen_func(
+            suf_out, suf_lse = _flash_attn_varlen_with_fallback(
                 q=query,
                 k=key_fetched,
                 v=value_fetched,
@@ -461,13 +621,11 @@ class PagedAttentionImplPluginModeMethods:
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlens[chunk_idx],
                 min_seqlen_q=min_seqlen_q,
-                dropout_p=0.0,
                 softmax_scale=self.scale,
                 causal=False,
-                window_size=(-1, -1, 0),
+                head_dim=self.head_dim,
                 sink_ptr=self.sinks,
                 alibi_slopes=self.alibi_slopes,
-                return_lse=True,
             )
 
             if chunked_output is None:
@@ -629,23 +787,30 @@ class PagedAttentionImplPluginModeMethods:
                 else (-1, -1, 0)
             )
 
-            aiter.flash_attn_varlen_func(
-                q=prefill_query,
-                k=prefill_key,
-                v=prefill_value,
-                cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.plugin_metadata.prefill_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.plugin_metadata.prefill_metadata.max_seq_len,
-                min_seqlen_q=1,
-                dropout_p=attn_metadata.dropout_p,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=sliding_window,
-                alibi_slopes=None,
-                sink_ptr=self.sinks,
-                out=output_actual_tokens[num_decode_tokens + num_extend_tokens :],
-            )
+            _pf_out = output_actual_tokens[num_decode_tokens + num_extend_tokens :]
+            if self.head_dim > 256:
+                _triton_flash_attn_varlen(
+                    q=prefill_query, k=prefill_key, v=prefill_value,
+                    cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.plugin_metadata.prefill_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.plugin_metadata.prefill_metadata.max_seq_len,
+                    softmax_scale=self.scale, causal=True,
+                    sliding_window=sliding_window, out=_pf_out,
+                    dropout_p=0.0,
+                )
+            else:
+                aiter.flash_attn_varlen_func(
+                    q=prefill_query, k=prefill_key, v=prefill_value,
+                    cu_seqlens_q=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.plugin_metadata.prefill_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.plugin_metadata.prefill_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.plugin_metadata.prefill_metadata.max_seq_len,
+                    min_seqlen_q=1, dropout_p=attn_metadata.dropout_p,
+                    softmax_scale=self.scale, causal=True,
+                    window_size=sliding_window, alibi_slopes=None,
+                    sink_ptr=self.sinks, out=_pf_out,
+                )
 
         # calculate for extends
         if num_extends > 0:

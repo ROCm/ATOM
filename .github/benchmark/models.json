@@ -138,5 +138,25 @@
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",
     "env_vars": ""
+  },
+  {
+    "display": "gemma-4-31b-it",
+    "path": "google/gemma-4-31b-it",
+    "prefix": "gemma-4-31b-it",
+    "args": "-tp 8 --trust-remote-code --max-model-len 4096",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
+  },
+  {
+    "display": "gemma-4-31b-it-MXFP4",
+    "path": "amd/gemma-4-31b-it-MXFP4",
+    "prefix": "gemma-4-31b-it-mxfp4",
+    "args": "-tp 8 --trust-remote-code --max-model-len 4096",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": ""
   }
 ]

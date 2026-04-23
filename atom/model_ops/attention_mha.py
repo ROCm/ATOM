@@ -71,6 +71,7 @@ class PagedAttentionImpl(nn.Module):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.per_tensor_scale = self.kv_scale
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -100,6 +101,7 @@ class PagedAttentionImpl(nn.Module):
             return o
 
         o: torch.Tensor
+
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
@@ -450,6 +452,13 @@ class PagedAttentionImpl(nn.Module):
 
         return output
 
+    @staticmethod
+    def _sdpa_varlen_fallback(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal):
+        """SDPA fallback for head_dim > 256 where CK is unsupported."""
+        from atom.plugin.attention_mha import _sdpa_varlen_attn
+        return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                 softmax_scale, causal)
+
     @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -462,21 +471,31 @@ class PagedAttentionImpl(nn.Module):
             if self.sliding_window is not None
             else (-1, -1, 0)
         )
-        o = aiter.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=attn_metadata.cu_seqlens_q,
-            cu_seqlens_k=attn_metadata.cu_seqlens_k,
-            max_seqlen_q=attn_metadata.max_seqlen_q,
-            max_seqlen_k=attn_metadata.max_seqlen_k,
-            min_seqlen_q=attn_metadata.min_seqlen_q,
-            dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
-            causal=True,
-            window_size=sliding_window,
-            sink_ptr=self.sinks,
-        )
+
+        if self.head_dim > 256:
+            o = self._sdpa_varlen_fallback(
+                q, k, v,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+        else:
+            o = aiter.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                min_seqlen_q=attn_metadata.min_seqlen_q,
+                dropout_p=attn_metadata.dropout_p,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=sliding_window,
+                sink_ptr=self.sinks,
+            )
 
         return o
 
