@@ -11,6 +11,7 @@ from atom.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
+    WAITING_FOR_REMOTE_KVS = auto()
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
@@ -40,6 +41,7 @@ class Sequence:
         stop_token_sequences: list[list[int]] = None,
         stream_callback: Optional[Callable[[Any], None]] = None,
         id=None,
+        kv_transfer_params: dict = None,
         num_draft_tokens: int = 0,
         mamba_enabled: bool = False,
     ):
@@ -56,7 +58,7 @@ class Sequence:
         self.num_rejected = 0
         self.num_cached_tokens = 0
         self.block_table = []
-        self.mamba_block_table = []
+        self.mamba_state_slot = -1  # per-request recurrent state slot index
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -64,7 +66,7 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
-
+        self.is_first_decode = False
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
@@ -77,6 +79,10 @@ class Sequence:
         self.first_token_time = 0.0
         self.leave_time = 0.0
         self.leave_reason = ""
+
+        # kv_transfer params
+        self.kv_transfer_params = kv_transfer_params
+        self.kv_transfer_params_output = None
 
         # accepted tokens for spec decode
         self.num_bonus_tokens = 0
@@ -96,11 +102,6 @@ class Sequence:
     def num_tokens(self, value):
         self._num_tokens = value
         self.num_blocks = (value + self.block_size - 1) // self.block_size
-        # for mamba-like arch, we need to make sure there are always 1 + spec number of blocks
-        if self.mamba_enabled:
-            self.num_mamba_blocks = 1 + self.num_draft_tokens
-        else:
-            self.num_mamba_blocks = 0
         self.last_block_num_tokens = (
             self._num_tokens - (self.num_blocks - 1) * self.block_size
         )

@@ -24,6 +24,7 @@ def create_completion_chunk(
     text: str,
     finish_reason: Optional[str] = None,
     usage: Optional[Dict] = None,
+    **extra_fields: Any,
 ) -> str:
     """Create a text completion chunk in SSE format."""
     chunk = {
@@ -40,6 +41,7 @@ def create_completion_chunk(
             }
         ],
     }
+    chunk.update(extra_fields)
     if usage is not None:
         chunk["usage"] = usage
     return f"data: {json.dumps(chunk)}\n\n"
@@ -63,11 +65,16 @@ async def stream_completion_response(
         new_text = chunk_data["text"]
         num_tokens_output += len(chunk_data.get("token_ids", []))
 
+        extra_fields: Dict[str, Any] = {}
+        if "kv_transfer_params" in chunk_data:
+            extra_fields["kv_transfer_params"] = chunk_data["kv_transfer_params"]
+
         yield create_completion_chunk(
             request_id,
             model,
             new_text,
             finish_reason=chunk_data.get("finish_reason"),
+            **extra_fields,
         )
 
         if chunk_data.get("finished", False):
@@ -99,7 +106,7 @@ def build_completion_response(
     final_output: Dict[str, Any],
 ) -> CompletionResponse:
     """Build a non-streaming text completion response."""
-    return CompletionResponse(
+    response = CompletionResponse(
         id=request_id,
         created=int(time.time()),
         model=model,
@@ -120,3 +127,10 @@ def build_completion_response(
             "latency_s": round(final_output.get("latency", 0.0), 4),
         },
     )
+    if "kv_transfer_output_meta_info" in final_output:
+        response = response.model_copy(
+            update={
+                "kv_transfer_params": final_output["kv_transfer_output_meta_info"],
+            }
+        )
+    return response

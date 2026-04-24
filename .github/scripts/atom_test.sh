@@ -41,8 +41,8 @@ if [ "$TYPE" == "launch" ]; then
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
-  # Phase 1: Wait for HTTP server to be up via /health endpoint
-  max_retries=30
+  # Phase 1: Wait for HTTP server to be up via /health endpoint (45 min max)
+  max_retries=45
   retry_interval=60
   server_up=false
   for ((i=1; i<=max_retries; i++)); do
@@ -159,9 +159,12 @@ PY
     RESULT_FILENAME="${FLAT_RESULT_FILE}"
   fi
 
-  if [ -n "${ATOM_DOCKER_IMAGE}" ]; then
+  if [ -n "${ATOM_DOCKER_IMAGE:-}" ] || [ -n "${GPU_NAME:-}" ] || [ -n "${GPU_VRAM_GB:-}" ] || [ -n "${ROCM_VERSION:-}" ]; then
     RESULT_FILE="${RESULT_FILENAME}" \
-    ATOM_DOCKER_IMAGE="${ATOM_DOCKER_IMAGE}" \
+    ATOM_DOCKER_IMAGE="${ATOM_DOCKER_IMAGE:-}" \
+    GPU_NAME="${GPU_NAME:-}" \
+    GPU_VRAM_GB="${GPU_VRAM_GB:-}" \
+    ROCM_VERSION="${ROCM_VERSION:-}" \
     python3 - <<'PY'
 import json
 import os
@@ -171,7 +174,49 @@ with open(result_file, "r", encoding="utf-8") as f:
     data = json.load(f)
 
 metadata = data.setdefault("atom_ci_metadata", {})
-metadata["docker_image"] = os.environ["ATOM_DOCKER_IMAGE"]
+if os.environ.get("ATOM_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["ATOM_DOCKER_IMAGE"]
+if os.environ.get("GPU_NAME"):
+    metadata["gpu_name"] = os.environ["GPU_NAME"]
+if os.environ.get("GPU_VRAM_GB"):
+    try:
+        metadata["gpu_vram_gb"] = int(float(os.environ["GPU_VRAM_GB"]))
+    except ValueError:
+        pass
+if os.environ.get("ROCM_VERSION"):
+    metadata["rocm_version"] = os.environ["ROCM_VERSION"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
+  # Extract MTP acceptance rate from server log (if present)
+  ATOM_SERVER_LOG="${ATOM_SERVER_LOG:-/tmp/atom_server.log}"
+  if [ -f "$ATOM_SERVER_LOG" ]; then
+    RESULT_FILE="${RESULT_FILENAME}" \
+    ATOM_SERVER_LOG="$ATOM_SERVER_LOG" \
+    python3 - <<'PY'
+import json, os, re
+
+result_file = os.environ["RESULT_FILE"]
+server_log = os.environ["ATOM_SERVER_LOG"]
+
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+with open(server_log, encoding="utf-8", errors="replace") as f:
+    for line in reversed(f.readlines()):
+        if "[MTP Stats " in line and "Interval" not in line:
+            m = re.search(
+                r"Average toks/fwd: ([\d.]+).*Acceptance rate: ([\d.]+)%",
+                line,
+            )
+            if m:
+                meta = data.setdefault("atom_ci_metadata", {})
+                meta["mtp_acceptance_rate"] = float(m.group(2))
+                meta["avg_tokens_per_forward"] = float(m.group(1))
+                break
 
 with open(result_file, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
@@ -275,9 +320,12 @@ d["random_input_len"] = int(os.environ["ISL"])
 d["random_output_len"] = int(os.environ["OSL"])
 d["benchmark_backend"] = "ATOM"
 
-tp_match = re.search(r"-tp\s+(\d+)", os.environ.get("SERVER_ARGS", ""))
-if tp_match:
-    d["tensor_parallel_size"] = int(tp_match.group(1))
+server_args = os.environ.get("SERVER_ARGS", "")
+tp_match = re.search(r"(?:^|\s)-tp\s+(\d+)", server_args)
+d["tensor_parallel_size"] = int(tp_match.group(1)) if tp_match else 1
+dp_match = re.search(r"(?:--data-parallel-size|(?:^|\s)-dp)\s+(\d+)", server_args)
+d["data_parallel_size"] = int(dp_match.group(1)) if dp_match else 1
+d["enable_dp_attention"] = "--enable-dp-attention" in server_args
 
 with open(result_path, "w", encoding="utf-8") as f:
     json.dump(d, f, indent=2)

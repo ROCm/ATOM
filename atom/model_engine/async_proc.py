@@ -1,6 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+"""
+Asynchronous I/O process management for model runner workers.
+
+This module provides:
+
+- :class:`AsyncIOProc`: A single worker process that runs a model runner
+  and communicates via ZMQ sockets and shared-memory broadcast queues.
+- :class:`AsyncIOProcManager`: Manages multiple ``AsyncIOProc`` workers,
+  routes function calls via broadcast, and aggregates KV transfer outputs
+  from all workers.
+"""
+
 import logging
 import multiprocessing
 import pickle
@@ -13,6 +25,7 @@ from threading import Thread
 import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
+from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.utils import (
     get_mp_context,
     get_open_zmq_ipc_path,
@@ -26,29 +39,52 @@ logger = logging.getLogger("atom")
 
 
 class AsyncIOProc:
+    """A single worker process that runs a model runner with ZMQ I/O.
+
+    Each worker receives function calls via shared-memory broadcast,
+    executes them on the runner, and sends results back via ZMQ.
+    KV aggregation outputs are sent on a dedicated channel to avoid
+    mixing with regular forward outputs.
+
+    Args:
+        label: Human-readable label for logging.
+        io_addrs: ``(input_addr, output_addr)`` ZMQ endpoints.
+        input_shm_handle: Shared memory handle for the broadcast queue.
+        runner_qualname: Fully qualified class name of the runner to instantiate.
+        rank: TP rank of this worker.
+        kv_output_addr: Optional ZMQ endpoint for KV aggregation output.
+    """
+
+    # Function names whose output goes to the KV channel instead of primary
+    _KV_FUNC_NAMES = frozenset(["async_proc_aggregation"])
 
     def __init__(
         self,
         label: str,
         io_addrs: tuple[str, str],
         input_shm_handle: int,
-        # runner class and its args
-        runner_qualname: str,  # atom.model_engine.model_runner.ModelRunner
+        runner_qualname: str,
         rank: int,
+        kv_output_addr: str | None = None,
         *args,
         **kwargs,
     ):
         self.label = f"AsyncIOProc({label})"
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
-        self.io_threads = []
+        self.io_threads: list[threading.Thread] = []
+
+        # KV aggregation output channel
+        self.kv_output_addr = kv_output_addr
+        self.kv_queue: queue.Queue | None = None
+
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
-        # Register atexit to close shared memory even if exit() doesn't complete
         import atexit
 
         atexit.register(self._cleanup_shared_memory)
-        # make sure exit handler is set before runner is created
         init_exit_handler(self)
+
+        # Start I/O threads for primary input/output
         for addr, q, func in zip(
             self.io_addrs,
             self.io_queues,
@@ -60,13 +96,23 @@ class AsyncIOProc:
             t.start()
             self.io_threads.append(t)
 
-        runner_class = resolve_obj_by_qualname(runner_qualname)  # type: ignore
-        self.runners = []
-        self.runners.append(runner_class(rank, *args, **kwargs))
+        # Dedicated KV aggregation output thread
+        if self.kv_output_addr is not None:
+            self.kv_queue = queue.Queue()
+            t = threading.Thread(
+                target=self.send_output_to_socket,
+                args=(self.kv_output_addr, self.kv_queue),
+                daemon=True,
+            )
+            t.start()
+            self.io_threads.append(t)
+
+        runner_class = resolve_obj_by_qualname(runner_qualname)
+        self.runners: list[object] = [runner_class(rank, *args, **kwargs)]
         self.busy_loop()
 
     def exit(self):
-        if not self.still_running:
+        if not getattr(self, "still_running", True):
             return
         self.still_running = False
         logger.debug(f"{self.label}: Shutting down runner...")
@@ -93,18 +139,15 @@ class AsyncIOProc:
                 make_zmq_socket(ctx, addr, zmq.DEALER, bind=False)
             )
             poller = zmq.Poller()
-            # Send initial message to input socket - this is required
-            # before the front-end ROUTER socket can send input messages
-            # back to us.
             socket.send(b"")
             poller.register(socket, zmq.POLLIN)
             logger.debug(f"{self.label}: input socket connected")
 
-            while self.still_running:
+            while getattr(self, "still_running", True):
                 for socket, _ in poller.poll(timeout=1000):
                     serialized_obj = socket.recv(copy=False)
-                    input = pickle.loads(serialized_obj)
-                    input_queue.put_nowait(input)
+                    input_obj = pickle.loads(serialized_obj)
+                    input_queue.put_nowait(input_obj)
 
     def send_output_to_socket(self, addr: str, output_queue: queue.Queue):
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -119,6 +162,7 @@ class AsyncIOProc:
                 socket.send(serialized_obj)
 
     def busy_loop(self):
+        """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
             func_name, args = self.get_func()
             for runner in self.runners:
@@ -126,8 +170,15 @@ class AsyncIOProc:
                 if func is None:
                     continue
                 out = func(*args)
-                if self.io_addrs[1] is not None and out is not None:
-                    self.io_queues[1].put_nowait(out)
+                if out is not None:
+                    if (
+                        self.io_addrs[1] is not None
+                        and func_name not in self._KV_FUNC_NAMES
+                    ):
+                        self.io_queues[1].put_nowait(out)
+                    if self.kv_queue is not None and func_name in self._KV_FUNC_NAMES:
+                        self.kv_queue.put_nowait(out)
+
             if func_name == "exit":
                 break
         logger.debug(f"{self.label}: exit busy_loop...")
@@ -138,15 +189,34 @@ class AsyncIOProc:
 
 
 class AsyncIOProcManager:
+    """Manages a pool of :class:`AsyncIOProc` workers.
+
+    Handles process lifecycle, function dispatch via shared-memory broadcast,
+    and KV output aggregation across all workers.
+
+    The manager maintains two output channels:
+    - **Primary channel** (rank 0 only): Regular forward outputs.
+    - **KV channels** (all ranks): Per-worker KV transfer status, aggregated
+      by :class:`KVOutputAggregator` before returning to the caller.
+
+    Args:
+        finalizer: Callback invoked when the manager shuts down.
+        proc_num: Number of worker processes (= TP world size).
+        runner: Fully qualified class name of the model runner.
+        *args: Additional arguments forwarded to the runner constructor.
+    """
 
     def __init__(self, finalizer, proc_num: int, runner: str, *args):
         self.parent_finalizer = finalizer
+        self.proc_num = proc_num
+
         io_addrs = [get_open_zmq_ipc_path(), get_open_zmq_ipc_path()]
-        self.procs = []
+        self.procs: list[multiprocessing.Process] = []
         ctx = get_mp_context()
         self.mp_ctx = ctx
         self.runner_label = runner.split(".")[-1]
         self.label = f"AsyncIOProcManager({self.runner_label})"
+
         self.rpc_broadcast_mq = MessageQueue(
             proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024
         )
@@ -157,11 +227,20 @@ class AsyncIOProcManager:
 
         atexit.register(self._cleanup_shared_memory)
         init_exit_handler(self)
+
+        # KV output aggregation infrastructure
+        self.kv_output_aggregator: KVOutputAggregator | None = None
+        self.kv_output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]
+        self.kv_outputs_queues: list[queue.Queue] = [
+            queue.Queue() for _ in range(proc_num)
+        ]
+        self.kv_output_threads: list[threading.Thread] = []
+
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
-            addrs = (
-                [None, io_addrs[1]] if i == 0 else [None, None]
-            )  # only get output from rank 0
+            # Only rank 0 gets the primary output address
+            addrs = [None, io_addrs[1]] if i == 0 else [None, None]
+
             process = ctx.Process(
                 target=AsyncIOProc,
                 name=label,
@@ -171,6 +250,7 @@ class AsyncIOProcManager:
                     scheduler_output_handle,
                     runner,
                     i,
+                    self.kv_output_addrs[i],
                     *args,
                 ),
             )
@@ -178,7 +258,9 @@ class AsyncIOProcManager:
             self.procs.append(process)
 
         self.zmq_ctx = zmq.Context(io_threads=2)
-        self.outputs_queue = queue.Queue()
+
+        # Primary output queue (rank 0 only)
+        self.outputs_queue: queue.Queue = queue.Queue()
         self.output_thread = threading.Thread(
             target=self.process_output_sockets,
             name=f"{self.label}_output_thread",
@@ -186,19 +268,25 @@ class AsyncIOProcManager:
             daemon=True,
         )
         self.output_thread.start()
+
+        # Per-worker KV output channels
+        for i, output_addr in enumerate(self.kv_output_addrs):
+            t = threading.Thread(
+                target=self.process_kv_output_sockets,
+                name=f"{self.label}_kv_output_thread_{i}",
+                args=(output_addr, i),
+                daemon=True,
+            )
+            t.start()
+            self.kv_output_threads.append(t)
+
         self.monitor_procs()
 
     def exit(self):
         if not self.still_running:
             return
         self.still_running = False
-        # 1. Clean up shared memory BEFORE killing runners —
-        #    unlink only needs the creator, readers don't need to be alive.
-        #    Must happen before CoreManager terminates us (timeout).
         self._cleanup_shared_memory()
-        # 2. Wait for runners to exit cleanly (they received "exit" RPC
-        #    from EngineCore and need time to call destroy_dist_env so
-        #    all NCCL ranks shut down without TCPStore errors).
         logger.info(f"{self.label}: shutdown all runners...")
         for proc in self.procs:
             if proc.is_alive():
@@ -206,10 +294,11 @@ class AsyncIOProcManager:
         shutdown_all_processes(self.procs, allowed_seconds=1)
         self.procs = []
         self.output_thread.join(timeout=1)
+        for thread in self.kv_output_threads:
+            thread.join(timeout=0.5)
         logger.info(f"{self.label}: All runners are shutdown.")
-        # 3. put a None to unblock call_func
         self.outputs_queue.put_nowait(SystemExit())
-        # 4. call parent finalizer
+
         self.parent_finalizer()
 
     def _cleanup_shared_memory(self):
@@ -227,6 +316,7 @@ class AsyncIOProcManager:
                     pass
 
     def process_output_sockets(self, output_address: str):
+        """Receive results from rank 0's primary output channel."""
         output_socket = make_zmq_socket(self.zmq_ctx, output_address, zmq.PULL)
         try:
             poller = zmq.Poller()
@@ -235,16 +325,32 @@ class AsyncIOProcManager:
                 socks = poller.poll(timeout=1000)
                 if not socks:
                     continue
-
                 obj = output_socket.recv(copy=False)
-                obj = pickle.loads(obj)  # type: ignore
+                obj = pickle.loads(obj)
                 self.outputs_queue.put_nowait(obj)
         finally:
-            # Close sockets.
             output_socket.close(linger=0)
             logger.debug(f"{self.label}: output thread exit")
 
+    def process_kv_output_sockets(self, output_address: str, worker_id: int):
+        """Receive KV output from each worker's dedicated channel."""
+        output_socket = make_zmq_socket(self.zmq_ctx, output_address, zmq.PULL)
+        try:
+            poller = zmq.Poller()
+            poller.register(output_socket, zmq.POLLIN)
+            while self.still_running:
+                socks = poller.poll(timeout=1000)
+                if not socks:
+                    continue
+                obj = output_socket.recv(copy=False)
+                obj = pickle.loads(obj)
+                self.kv_outputs_queues[worker_id].put_nowait(obj)
+        finally:
+            output_socket.close(linger=0)
+            logger.debug(f"{self.label}: kv output thread {worker_id} exit")
+
     def call_func(self, func_name: str, *args, wait_out: bool = False):
+        """Standard RPC call for non-KV operations."""
         logger.debug(f"{self.label}: call_func {func_name} {args}")
         msg = (func_name, *args)
         self.rpc_broadcast_mq.enqueue(msg)
@@ -253,6 +359,45 @@ class AsyncIOProcManager:
             if isinstance(ret, SystemExit):
                 raise ret
             return ret
+
+    def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
+        """RPC call with KV output aggregation across all workers.
+
+        Broadcasts the function call to all workers, collects their
+        KV outputs, and returns the aggregated result.
+
+        Args:
+            func_name: Method name to invoke on each worker's runner.
+            timeout: Maximum seconds to wait for each worker's output.
+
+        Returns:
+            Aggregated :class:`KVConnectorOutput`, or ``None`` on timeout.
+        """
+        if self.kv_output_aggregator is None:
+            self.kv_output_aggregator = KVOutputAggregator(world_size=self.proc_num)
+
+        logger.debug(f"{self.label}: call_func_with_aggregation {func_name} {args}")
+        msg = (func_name, *args)
+        self.rpc_broadcast_mq.enqueue(msg)
+
+        # Collect KV outputs from all workers
+        worker_outputs = []
+        for i, output_queue in enumerate(self.kv_outputs_queues):
+            try:
+                output = output_queue.get(timeout=timeout)
+                worker_outputs.append(output)
+            except queue.Empty:
+                logger.error(
+                    f"{self.label}: Timeout waiting for KV output from worker {i}"
+                )
+                return None
+
+        if not worker_outputs:
+            return None
+
+        kv_output = self.kv_output_aggregator.aggregate(worker_outputs=worker_outputs)
+        logger.debug(f"Aggregated KV output: {kv_output}")
+        return kv_output
 
     def monitor_procs(self):
         self_ref = weakref.ref(self)

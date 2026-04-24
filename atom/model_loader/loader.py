@@ -24,17 +24,12 @@ from atom.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
 )
-from atom.models.deepseek_mtp import (
-    get_spec_layer_idx_from_weight_name,
-    rewrite_spec_layer_name,
-)
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.moe import (
     FusedMoEMethodBase,
     is_rocm_aiter_fusion_shared_expert_enabled,
 )
 from aiter.dist.parallel_state import get_tp_group
-from atom.models.qwen3_next_mtp import remap_mtp_weight_name
 
 from atom.plugin.prepare import is_sglang
 
@@ -264,6 +259,7 @@ def load_model(
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     weights_mapping = getattr(model, "weights_mapping", {})
     skip_weight_prefixes = getattr(model, "skip_weight_prefixes", [])
+    mtp_remap = getattr(model, "remap_mtp_weight_name", None)
     params_dict = dict(model.named_parameters())
 
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
@@ -313,17 +309,11 @@ def load_model(
                 name.startswith(p) for p in skip_weight_prefixes
             ):
                 continue
-            if spec_decode:
-                if hf_config.model_type == "deepseek_mtp":
-                    spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
-                    if spec_layer is None:
-                        continue
-                    name = rewrite_spec_layer_name(spec_layer, name)
-                elif hf_config.model_type == "qwen3_next_mtp":
-                    remapped_name = remap_mtp_weight_name(name)
-                    if remapped_name is None:
-                        continue
-                    name = remapped_name
+            if spec_decode and mtp_remap is not None:
+                remapped = mtp_remap(name)
+                if remapped is None:
+                    continue
+                name = remapped
             for mapping_part in weights_mapping.keys():
                 if mapping_part in name:
                     name = name.replace(mapping_part, weights_mapping[mapping_part])
@@ -534,5 +524,4 @@ def load_model(
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
 
-    if is_plugin_mode:
-        return loaded_weights_record
+    return loaded_weights_record

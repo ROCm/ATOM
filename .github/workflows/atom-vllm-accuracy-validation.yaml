@@ -160,7 +160,7 @@ jobs:
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
                   "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -169,7 +169,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
                   "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
@@ -178,7 +178,7 @@ jobs:
                   "model_path": "Qwen/Qwen3.5-397B-A17B",
                   "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
               },
               {
@@ -187,7 +187,7 @@ jobs:
                   "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
                   "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
                   "accuracy_test_threshold": 0.83,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-4",
               },
               {
@@ -205,7 +205,7 @@ jobs:
                   "model_path": "meta-llama/Llama-3.1-8B-Instruct",
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.73,
-                  "env_vars": "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
                   "runner": "linux-atom-mi35x-1",
               },
               {
@@ -470,6 +470,17 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Collect GPU info (inside container)
+        id: gpu-info
+        run: |
+          GPU_NAME=$(docker exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          GPU_VRAM_GB=$(docker exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
+          ROCM_VERSION=$(docker exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          echo "gpu_name=${GPU_NAME}" >> "$GITHUB_OUTPUT"
+          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> "$GITHUB_OUTPUT"
+          echo "rocm_version=${ROCM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+
       - name: Download model if needed
         run: |
           set -euo pipefail
@@ -562,6 +573,9 @@ jobs:
             -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
             -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
             -e OOT_DOCKER_IMAGE="${OOT_IMAGE_TAG}" \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
             -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \

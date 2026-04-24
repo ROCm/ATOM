@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
@@ -394,6 +395,81 @@ def reset_forward_context() -> None:
     _forward_context = ForwardContext()
 
 
-def set_kv_cache_data(kv_cache_data: dict[int, KVCacheTensor]) -> None:
+# ---------------------------------------------------------------------------
+# KV Connector global instances (lazy initialization)
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger("atom")
+
+_global_kvconnector: Optional[Any] = None
+_global_kvconnector_scheduler: Optional[Any] = None
+
+
+def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> Any:
+    """Get or lazily initialize the global KV connector instance.
+
+    The connector is role-dependent:
+      - ``"worker"``: Returns a :class:`KVConnectorBase` (worker-side, per TP rank).
+      - ``"scheduler"``: Returns a :class:`KVConnectorSchedulerBase` (scheduler-side).
+
+    The concrete backend is selected by :class:`KVConnectorFactory` based on
+    ``config.kv_transfer_config["kv_connector"]`` (default: ``"moriio"``).
+
+    Args:
+        role: Either ``"worker"`` or ``"scheduler"``.
+        config: Engine config; required on first call to trigger initialization.
+
+    Returns:
+        The KV connector instance, or ``None`` if KV transfer is not configured.
+    """
+    global _global_kvconnector, _global_kvconnector_scheduler
+
+    if not (hasattr(config, "kv_transfer_config") and config.kv_transfer_config):
+        return _global_kvconnector
+
+    if role == "worker":
+        from aiter.dist.parallel_state import get_tp_group
+
+        try:
+            tp_rank = get_tp_group().rank_in_group
+        except Exception:
+            _logger.warning(
+                "get_tp_group() failed (dist not initialized?), returning None"
+            )
+            return None
+
+        if _global_kvconnector is None:
+            from atom.kv_transfer.disaggregation import KVConnectorFactory
+
+            _global_kvconnector = KVConnectorFactory.create_connector(
+                config, role="worker"
+            )
+            _logger.debug("Initialized global KVConnector at tp_rank %d", tp_rank)
+
+    elif role == "scheduler":
+        from atom.kv_transfer.disaggregation import KVConnectorFactory
+
+        _global_kvconnector_scheduler = KVConnectorFactory.create_connector(
+            config, role="scheduler"
+        )
+        _logger.debug("Initialized global KVConnectorScheduler")
+        return _global_kvconnector_scheduler
+
+    else:
+        raise ValueError(f"Unknown KV connector role: {role!r}")
+
+    return _global_kvconnector
+
+
+def set_kv_cache_data(
+    kv_cache_data: dict[int, KVCacheTensor], config: Optional[Config] = None
+) -> None:
+    """Register KV cache data globally and with the KV connector if enabled."""
     global _forward_kv_cache_context
+
+    if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
+        connector = get_kvconnector(config=config)
+        if connector is not None:
+            connector.register_kv_caches(kv_cache_data)
+
     _forward_kv_cache_context.kv_cache_data = kv_cache_data

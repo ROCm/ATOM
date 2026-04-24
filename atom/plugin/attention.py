@@ -123,17 +123,34 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        from vllm.v1.attention.backend import (
-            MultipleOf,
-        )  # pyright: ignore[reportMissingImports]
 
-        return [MultipleOf(16)]
+        return [16]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
         if block_size is None:
             return True
         return block_size % 16 == 0
+
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        """Discover which tensor dim is the block index, since different
+        backends lay out dims differently."""
+        _S = 1234567
+        shape = cls.get_kv_cache_shape(
+            _S,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(_S)
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -345,17 +362,18 @@ class vllmAttentionMetadataBuilderMethods:
         )
 
         if mixed:
-            prefill_max_query_len = (
-                query_lens_cpu[num_decodes + num_extends :].max().item()
-            )
-            prefill_max_seq_len = seq_lens[num_decodes + num_extends :].max().item()
-            prefill_query_start_loc = (
-                prefill_query_start_loc[num_decodes + num_extends :]
-                - prefill_query_start_loc[num_decodes + num_extends]
-            )
-            decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
-            decode_max_seq_len = seq_lens[:num_decodes].max().item()
-            decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
+            prefill_start = num_decodes + num_extends
+            if num_prefills > 0:
+                prefill_max_query_len = query_lens_cpu[prefill_start:].max().item()
+                prefill_max_seq_len = seq_lens[prefill_start:].max().item()
+                prefill_query_start_loc = (
+                    prefill_query_start_loc[prefill_start:]
+                    - prefill_query_start_loc[prefill_start]
+                )
+            if num_decodes > 0:
+                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_seq_len = seq_lens[:num_decodes].max().item()
+                decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
         prefill_metadata = None
         decode_metadata = None

@@ -192,6 +192,7 @@ The `Sequence` class (in `atom/model_engine/sequence.py`) is the central data st
 | `num_prompt_tokens` | `int` | Length of the original prompt |
 | `num_tokens` | `int` (property) | Total length including generated tokens |
 | `block_table` | `list[int]` | KV cache block IDs allocated to this sequence |
+| `mamba_state_slot` | `int` | Per-request GDN recurrent state slot index for hybrid models (Qwen3-Next, Qwen3.5); `-1` if unallocated or not a hybrid model |
 | `status` | `SequenceStatus` | Current lifecycle state |
 | `type` | `SequenceType` | Current execution type |
 | `temperature` | `float` | Sampling temperature |
@@ -220,6 +221,49 @@ WAITING ──(scheduled for prefill)──► RUNNING ──(stop condition met
 - `SequenceType.DUMMY` -- initial state before scheduling.
 - `SequenceType.PREFILL` -- prompt processing phase (all prompt tokens in one batch).
 - `SequenceType.DECODE` -- autoregressive token generation (one or more tokens per step with MTP).
+
+---
+
+## 7. Speculative Decoding (MTP / EAGLE)
+
+ATOM supports speculative decoding via `EagleProposer` (in `atom/spec_decode/eagle.py`), which uses Multi-Token Prediction (MTP) draft models to propose candidate tokens that are verified by the target model through rejection sampling.
+
+### Supported MTP architectures
+
+The `support_eagle_model_arch_dict` maps HuggingFace architecture keys to draft model implementations:
+
+| Architecture key | Implementation | Used by |
+|---|---|---|
+| `DeepSeekMTPModel` | `atom.models.deepseek_mtp.DeepSeekMTP` | DeepSeek-R1, DeepSeek-V3 |
+| `Qwen3NextMTPModel` | `atom.models.qwen3_next_mtp.Qwen3NextMTP` | Qwen3-Next |
+| `Qwen3_5MTPModel` | `atom.models.qwen3_5_mtp.Qwen3_5MTP` | Qwen3.5 |
+
+### Weight sharing
+
+`EagleProposer.load_model()` shares weights between the draft and target models to save memory. It uses `_share_if_not_loaded()`, which checks whether a parameter key exists in the `loaded_weights_record` set returned by the model loader. If the key is absent (meaning the checkpoint did not contain that weight), the draft module's attribute is replaced with a reference to the target model's corresponding parameter. This avoids comparing tensor values and instead relies on the loader's bookkeeping of which weights were actually present in the checkpoint.
+
+Two sharing patterns are handled:
+
+- **Per-layer `shared_head.head`** (DeepSeek MTP) -- each MTP layer has a `shared_head` whose `head` weight is shared with `target_base.lm_head` if not loaded from the checkpoint.
+- **Top-level `lm_head`** (Qwen3.5 / Qwen3-Next MTP) -- the draft model's `lm_head` is shared with the target if not loaded.
+
+The `embed_tokens` layer is always shared when shapes match and pipeline parallelism is not used.
+
+### Propose loop: MHA vs MLA branching
+
+The `propose()` method iterates `mtp_k` draft steps. On the first iteration (`i == 0`), it sets up attention metadata for single-token decode. The metadata setup branches based on `runner.use_mla`:
+
+- **MLA models** (DeepSeek, Qwen3 MoE) -- use `kv_indptr` and `kv_last_page_lens` with block_size=1 paged KV cache. `kv_indptr` is adjusted by subtracting the cumulative `num_reject_tokens` to account for rejected speculative tokens from the previous step.
+- **MHA models** (GDN/hybrid architectures) -- use `block_tables` and `context_lens`. `context_lens` is incremented by 1 at each draft step to reflect the additional KV entries.
+
+On subsequent iterations (`i > 0`), `max_seqlen_k` is incremented and `prepare_mtp_decode()` is called to update backend-specific attention metadata.
+
+### `prepare_mtp_decode()`
+
+Each attention backend provides its own `prepare_mtp_decode()` implementation:
+
+- **`AiterMLAAttnMetadataBuilder`** (`atom/model_ops/attentions/aiter_mla.py`) -- for MLA attention, increments `kv_indptr` by the cumulative query sequence lengths and regenerates `kv_indices` via `kv_indices_generate_triton`. Supports incremental updates (`only_update=True`) for persistent worker buffers used by AITER's paged attention.
+- **`GDNAttnMetadataBuilder`** (`atom/model_ops/attentions/gdn_attn.py`) -- for GDN hybrid models with paged KV cache, regenerates `kv_indices` for the new `max_seqlen_k` after each draft token. The `kv_indptr` (block count) stays unchanged since the page table is stable within a draft step. The `only_update` and `num_reject_tokens` parameters are unused -- GDN always does a full `kv_indices` regeneration.
 
 ---
 
