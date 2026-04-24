@@ -174,6 +174,7 @@ export LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --host 0.0.0.0 --port "${PREFILL_PORT}" \
+    --grpc-mode \
     --trust-remote-code \
     --tp-size "${PREFILL_TP}" \
     --kv-cache-dtype "${KV_CACHE_DTYPE}" \
@@ -215,6 +216,7 @@ export LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm
 TORCHINDUCTOR_COMPILE_THREADS=128 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --host 0.0.0.0 --port "${DECODE_PORT}" \
+    --grpc-mode \
     --trust-remote-code \
     --tp-size "${DECODE_TP}" \
     --kv-cache-dtype "${KV_CACHE_DTYPE}" \
@@ -244,8 +246,8 @@ mkdir -p /workspace/logs
 ${MESH_BIN} launch \
     --host 0.0.0.0 --port "${ROUTER_PORT}" \
     --pd-disaggregation \
-    --prefill "http://${PREFILL_IP}:${PREFILL_PORT}" "${BOOTSTRAP_PORT}" \
-    --decode  "http://${DECODE_IP}:${DECODE_PORT}" \
+    --prefill "grpc://${PREFILL_IP}:${PREFILL_PORT}" "${BOOTSTRAP_PORT}" \
+    --decode  "grpc://${DECODE_IP}:${DECODE_PORT}" \
     --policy random \
     --backend sglang \
     --log-dir /workspace/logs \
