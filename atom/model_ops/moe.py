@@ -485,6 +485,38 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = atom_parameter(self._maybe_pad_weight(layer.w13_weight.data))
         layer.w2_weight = atom_parameter(self._maybe_pad_weight(layer.w2_weight.data))
+
+        # gfx950 CK a16w16 stage2 requires inter_dim % 64 == 0.
+        # For tp=4 (inter=320) and tp=8 (inter=160), pad inter_dim up to the
+        # next multiple of 64. Zero padding is safe because fused_moe clips
+        # routed-weight contributions and zero-padded rows contribute nothing.
+        # Verified 2026-04-24: cos_sim >= 0.9999 for inter=160->192 and
+        # inter=320->384 vs torch reference.
+        w13 = layer.w13_weight.data  # [E, 2*inter, hidden]
+        w2 = layer.w2_weight.data    # [E, hidden, inter]
+        inter_dim = w2.shape[2]
+        # Stage1 dispatch: inter<=192 uses NPerBlock=64, inter>192 uses NPerBlock=128.
+        # Stage2 dispatch: inter>192 uses KPerBlock=64.
+        # So required alignment: 64 when inter<=192, 128 when inter>192.
+        # (inter=160->192 satisfies 192%64=0; inter=320->384 satisfies 384%128=0 and 384%64=0)
+        align = 64 if inter_dim <= 192 else 128
+        inter_pad = (inter_dim + align - 1) // align * align
+        if inter_pad != inter_dim:
+            E, _, hidden = w13.shape
+            # pad w13: gate half [E, inter, hidden] and up half [E, inter, hidden]
+            w13_new = torch.zeros(
+                E, 2 * inter_pad, hidden, dtype=w13.dtype, device=w13.device
+            )
+            w13_new[:, :inter_dim, :] = w13[:, :inter_dim, :]       # gate
+            w13_new[:, inter_pad : inter_pad + inter_dim, :] = w13[:, inter_dim:, :]  # up
+            # pad w2: [E, hidden, inter_pad]
+            w2_new = torch.zeros(
+                E, hidden, inter_pad, dtype=w2.dtype, device=w2.device
+            )
+            w2_new[:, :, :inter_dim] = w2
+            layer.w13_weight = atom_parameter(w13_new)
+            layer.w2_weight = atom_parameter(w2_new)
+
         # Shuffle weights for CK/ASM kernels.
         # Previously skipped for gfx950 bf16 g1u1 on the assumption that the CK
         # 2-stage preshuffle_off (NSwizzle=0) kernel expected un-shuffled weights.
