@@ -400,6 +400,43 @@ class TestExcludeMatching:
         qcfg = self._make(["lm_head"])
         assert not qcfg._is_excluded("self_attn.q_proj")
 
+    def test_check_children_matches_child_entries(self):
+        """check_children=True: parent excluded when child entries exist."""
+        qcfg = self._make(
+            [
+                "mtp.layers.60.mlp.experts.0.gate_up_proj",
+                "mtp.layers.60.mlp.experts.0.down_proj",
+            ]
+        )
+        # Without check_children: module-level prefix does NOT match
+        assert not qcfg._is_excluded("mtp.layers.60.mlp.experts")
+        # With check_children: child entries trigger a match
+        assert qcfg._is_excluded("mtp.layers.60.mlp.experts", check_children=True)
+
+    def test_check_children_no_false_positive_on_siblings(self):
+        """check_children must not match sibling modules."""
+        qcfg = self._make(["mtp.layers.60.mlp.gate"])
+        # "mlp.gate" is a sibling of "mlp.experts", not a child
+        assert not qcfg._is_excluded("mtp.layers.60.mlp.experts", check_children=True)
+
+    def test_check_children_propagates_through_get_layer_quant_config(self):
+        qcfg = QuantizationConfig(config=None)
+        qcfg.torch_dtype = BF16
+        qcfg.global_spec = LayerQuantConfig(
+            quant_type=QuantType.per_Token, quant_dtype=FP8
+        )
+        qcfg.exclude_layers = ["mtp.layers.60.mlp.experts.0.gate_up_proj"]
+
+        # Without check_children: returns global FP8
+        result = qcfg.get_layer_quant_config("mtp.layers.60.mlp.experts")
+        assert result.quant_dtype == FP8
+
+        # With check_children: returns BF16 (excluded)
+        result = qcfg.get_layer_quant_config(
+            "mtp.layers.60.mlp.experts", check_children=True
+        )
+        assert result.quant_dtype == BF16
+
 
 class TestMatchesExclude:
     def test_exact(self):
