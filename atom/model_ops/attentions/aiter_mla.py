@@ -388,14 +388,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         reduce_indptr = var["reduce_indptr"]
         reduce_final_map = var["reduce_final_map"]
         reduce_partial_map = var["reduce_partial_map"]
+        # Dense layers use kv_indptr (full KV lengths per seq).
+        # sparse_kv_indptr is per-token in MTP mode and must NOT be
+        # indexed with [:bs+1] here — that misinterprets the per-token
+        # cumsum as per-seq, producing wrong KV lengths and OOB metadata.
+        kv_indptr_for_metadata = var["kv_indptr"].gpu[: bs + 1]
         if only_update:
             decode_update_mla_metadata_v1(
                 var["cu_seqlens_q"].gpu[: bs + 1],
-                (
-                    var["sparse_kv_indptr"].gpu[: bs + 1]
-                    if self.is_sparse
-                    else var["kv_indptr"].gpu[: bs + 1]
-                ),
+                kv_indptr_for_metadata,
                 var["kv_last_page_lens"].gpu[:bs],
                 self.padded_num_attention_heads,
                 1,  # nhead_kv,
@@ -416,11 +417,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         else:
             get_mla_metadata_v1(
                 var["cu_seqlens_q"].gpu[: bs + 1],
-                (
-                    var["sparse_kv_indptr"].gpu[: bs + 1]
-                    if self.is_sparse
-                    else var["kv_indptr"].gpu[: bs + 1]
-                ),
+                kv_indptr_for_metadata,
                 var["kv_last_page_lens"].gpu[:bs],
                 self.padded_num_attention_heads,
                 1,  # nhead_kv,
@@ -623,6 +620,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
+        var["context_lens"].np[scheduled_bs:bs] = 0
 
         if any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
