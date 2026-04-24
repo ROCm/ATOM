@@ -4,7 +4,14 @@ use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
 use tracing::debug;
 
-use super::{context::SharedComponents, pipeline::RequestPipeline};
+use super::{
+    completion_adapter::{
+        completion_to_generate, wrap_generate_response_as_completion,
+        wrap_streaming_generate_as_completion,
+    },
+    context::SharedComponents,
+    pipeline::RequestPipeline,
+};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
@@ -13,8 +20,10 @@ use crate::{
         UNKNOWN_MODEL_ID,
     },
     observability::metrics::{metrics_labels, Metrics},
-    protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
-    routers::RouterTrait,
+    protocols::{
+        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    },
+    routers::{error, RouterTrait},
 };
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
@@ -236,6 +245,35 @@ impl RouterTrait for GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
+    }
+
+    async fn route_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let synthetic = match completion_to_generate(body) {
+            Ok(g) => g,
+            Err(msg) => return error::bad_request("completion_unsupported_field", msg),
+        };
+
+        let is_stream = body.stream;
+        debug!(
+            "Routing /v1/completions via synthetic generate (stream={}) for model: {}",
+            is_stream,
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
+
+        let upstream = self
+            .route_generate_impl(headers, &synthetic, model_id)
+            .await;
+
+        if is_stream {
+            wrap_streaming_generate_as_completion(upstream, body.model.clone()).await
+        } else {
+            wrap_generate_response_as_completion(upstream, body.model.clone()).await
+        }
     }
 
     fn router_type(&self) -> &'static str {
