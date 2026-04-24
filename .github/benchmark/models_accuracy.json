@@ -146,7 +146,7 @@
   {
     "model_name": "GLM-5-FP8",
     "model_path": "zai-org/GLM-5-FP8",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --method mtp",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
@@ -158,7 +158,7 @@
   {
     "model_name": "GLM-5.1-FP8",
     "model_path": "zai-org/GLM-5.1-FP8",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}' --method mtp",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
@@ -170,7 +170,7 @@
   {
     "model_name": "GLM-5.1-MXFP4",
     "model_path": "amd/GLM-5.1-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --default-chat-template-kwargs '{\"enable_thinking\":false}' --method mtp",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",

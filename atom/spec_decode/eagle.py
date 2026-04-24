@@ -243,7 +243,7 @@ class EagleProposer:
                     positions += 1
                     hidden_states = sample_hidden_states
 
-        self.runner.debug(f"final {draft_token_ids=}")
+        # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]
         return draft_token_ids
 

@@ -450,12 +450,6 @@ class tokenIDProcessor:
                 if gathered_tokens is not None:
                     self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
         input_ids = self.input_ids.gpu[:total_tokens]
-        if self.use_spec and self.runner.rank == 0:
-            logger.info(
-                f"[MTP prepare_input_ids] {input_ids.tolist()} "
-                f"num_rejected={self.num_rejected[:batch.total_seqs_num].tolist()} "
-                f"num_bonus={self.num_bonus[:batch.total_seqs_num].tolist()}"
-            )
         return input_ids
 
     def prepare_draft_ids(
@@ -499,10 +493,10 @@ class ModelRunner:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
-        # self.is_deepseek_v32 = (
-        #     hasattr(hf_config, "index_topk") if self.use_mla else False
-        # )
-        self.is_deepseek_v32 = False
+        self.is_deepseek_v32 = (
+            hasattr(hf_config, "index_topk") if self.use_mla else False
+        )
+        # self.is_deepseek_v32 = False
         # Calculate local device rank considering both TP and DP
         # When data parallelism is enabled on the same node, different DP ranks
         # need to use different sets of GPUs
@@ -1878,7 +1872,6 @@ class ModelRunner:
 
         temperatures, top_ks, top_ps, all_greedy = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        self.debug(f"{input_ids=}")
         self.prepare_inputs(batch, input_ids)
         return (
             input_ids,
@@ -1993,7 +1986,6 @@ class ModelRunner:
         if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
-        self.debug(f"{sampled_tokens=}")
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
