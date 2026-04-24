@@ -563,13 +563,14 @@ class DisaggCoreManager(CoreManager):
         # Bootstrap round 2: kvcache handle + num_blocks (prefill → decode)
         kvcache_ipc_addr = get_open_zmq_ipc_path()
 
-        # Shared memory for dynamic CU partitioning: 8 bytes total.
-        # [0:4] = prefill_tokens (uint32), [4:8] = decode_batch (uint32).
+        # Shared memory for dynamic CU partitioning: 4 bytes (float32).
+        # DecodeScheduler writes the chosen CU fraction; PrefillScheduler reads it.
+        # 0.0 means no mask (None).
         cu_shm_name = f"atom_cu_split_{os.getpid()}"
         self._cu_shm = multiprocessing.shared_memory.SharedMemory(
-            name=cu_shm_name, create=True, size=8
+            name=cu_shm_name, create=True, size=4
         )
-        self._cu_shm.buf[:8] = b"\x00" * 8
+        self._cu_shm.buf[:4] = b"\x00" * 4
 
         # Build per-process configs.
         from atom.utils import get_open_port as _get_open_port

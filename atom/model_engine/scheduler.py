@@ -177,6 +177,44 @@ class CacheStats:
         )
 
 
+def _optimal_cu_fraction(
+    decode_batch: int, prefill_waiting_tokens: int
+) -> Optional[float]:
+    """Return the prefill CU fraction for the current workload, or None for no mask.
+
+    Called by the DecodeScheduler, which has visibility into both the decode
+    batch size and the total tokens queued in prefill_waiting.  The chosen
+    fraction is written to shared memory so the PrefillScheduler can read it.
+
+    Lookup table derived from empirical benchmarking across CU splits
+    (30/50/60/70/80% prefill) on DeepSeek-R1 tp=8.  Prefill latency
+    dominates in nearly all cases; decode tolerates CU reduction well
+    at typical batch sizes.
+
+    Returns None when CU masking provides no benefit (no pending prefill,
+    tiny prefill).
+    """
+    return None
+    # if prefill_waiting_tokens==0 or decode_batch<64:
+    #     logger.info("returning none")
+    #     return None
+    # else:
+    #     logger.info("returning 0.5")
+    #     return 0.5
+    # if prefill_waiting_tokens == 0:
+    #     return None
+    # if prefill_waiting_tokens < 512:
+    #     return None
+    # if prefill_waiting_tokens >= 8192:
+    #     return None
+    # if prefill_waiting_tokens >= 4096:
+    #     return 0.7
+    # # 512 <= prefill_waiting_tokens < 4096
+    # if decode_batch > 96:
+    #     return 0.7
+    # return 0.8
+
+
 class ScheduledBatch:
     def __init__(
         self,
@@ -191,6 +229,7 @@ class ScheduledBatch:
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {},
+        cu_stream_fraction: Optional[float] = None,
     ):
         # len(seqs) == total_seqs_num == total_seqs_num_prefill + total_seqs_num_decode
         # self.seqs = seqs
@@ -255,6 +294,10 @@ class ScheduledBatch:
         self.is_dummy_run = is_dummy_run
 
         self.num_spec_step = num_spec_step
+
+        # Key into ModelRunner's stream pool for CU-masked disagg streams.
+        # None means full-CU fallback (no mask).
+        self.cu_stream_fraction = cu_stream_fraction
 
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
@@ -630,7 +673,7 @@ class PrefillScheduler:
     - Decode scheduling is never performed.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.block_manager = None  # blocks managed by decode process
@@ -641,6 +684,16 @@ class PrefillScheduler:
         self.mtp_k = 0
         self.spec_stats = None
         self.cache_stats = None
+
+        # Shared memory for dynamic CU partitioning.
+        # Layout: [0:4] = prefill_tokens (uint32), [4:8] = decode_batch (uint32).
+        self._cu_shm = None
+        if disagg_cu_shm_name:
+            import multiprocessing.shared_memory
+
+            self._cu_shm = multiprocessing.shared_memory.SharedMemory(
+                name=disagg_cu_shm_name, create=False
+            )
 
     def is_finished(self) -> bool:
         return not self.waiting and not self.running
@@ -690,10 +743,20 @@ class PrefillScheduler:
         if not scheduled_seqs:
             return None, {}
 
-        logger.info(
-            f"[PrefillScheduler] scheduled {num_seqs} seqs, "
-            f"{num_batched_tokens} tokens, req_ids: {tuple(scheduled_seqs.keys())}"
-        )
+        # Read the CU fraction chosen by the DecodeScheduler via shared memory.
+        # 0.0 in shm means "no mask" → map to None (the stream pool key).
+        import struct
+
+        cu_fraction = None
+        # if self._cu_shm is not None:
+        #     raw = struct.unpack_from("f", self._cu_shm.buf, 0)[0]
+        #     if raw > 0.0:
+        #         cu_fraction = raw
+
+        # logger.info(
+        #     f"[PrefillScheduler] scheduled {num_seqs} seqs, "
+        #     f"{num_batched_tokens} tokens, req_ids: {tuple(scheduled_seqs.keys())}"
+        # )
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -702,6 +765,7 @@ class PrefillScheduler:
                 total_tokens_num_prefill=num_batched_tokens,
                 total_seqs_num=num_seqs,
                 total_seqs_num_prefill=num_seqs,
+                cu_stream_fraction=cu_fraction,
             ),
             scheduled_seqs,
         )
@@ -737,12 +801,22 @@ class DecodeScheduler(Scheduler):
     promoting prefill_done sequences into running.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         super().__init__(config)
         # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
         self.prefill_waiting: dict[int, Sequence] = {}
         # Sequences that have received PrefillDone and are ready to start decode.
         self.prefill_done: deque[Sequence] = deque()
+
+        # Shared memory for dynamic CU partitioning.
+        self._cu_shm = None
+        # if disagg_cu_shm_name:
+        #     import multiprocessing.shared_memory
+
+        #     self._cu_shm = multiprocessing.shared_memory.SharedMemory(
+        #         name=disagg_cu_shm_name, create=False
+        #     )
+
         # Protects prefill_waiting and prefill_done: on_prefill_done is called
         # from the _recv_prefill_done background thread.
         self._prefill_lock = threading.Lock()
@@ -858,6 +932,23 @@ class DecodeScheduler(Scheduler):
             return None
 
         total_tokens_num_decode = sum(num_scheduled_tokens)
+
+        # Dynamic CU partitioning: decode decides the fraction based on its
+        # batch size and the total tokens queued for prefill, then writes the
+        # fraction to shared memory for PrefillScheduler to read.
+        import struct
+
+        cu_fraction = None
+        # if self._cu_shm is not None:
+        #     prefill_waiting_tokens = sum(
+        #         seq.num_tokens for seq in self.prefill_waiting.values()
+        #     )
+        #     raw = _optimal_cu_fraction(len(scheduled_seqs), prefill_waiting_tokens)
+        #     # Write to shm for prefill to read. 0.0 means "no mask".
+        #     struct.pack_into("f", self._cu_shm.buf, 0, raw or 0.0)
+        #     # Stream pool is keyed by None (no mask) or a positive float.
+        #     cu_fraction = raw if raw and raw > 0.0 else None
+
         self.running.extendleft(reversed(scheduled_seqs.values()))
         return (
             ScheduledBatch(
@@ -869,6 +960,7 @@ class DecodeScheduler(Scheduler):
                 total_seqs_num_decode=len(scheduled_seqs),
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+                cu_stream_fraction=cu_fraction,
             ),
             scheduled_seqs,
         )

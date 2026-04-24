@@ -196,18 +196,7 @@ class EngineCore:
         scheduled_batch, seqs = self.scheduler.schedule()
         # if scheduled_batch is None:
         #     return False
-        t0 = time.perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-        iter_ms = (time.perf_counter() - t0) * 1000
-        logger.info(
-            f"iter {iter_ms:.2f}ms | "
-            f"reqs={scheduled_batch.total_seqs_num} "
-            f"(prefill={scheduled_batch.total_seqs_num_prefill} "
-            f"decode={scheduled_batch.total_seqs_num_decode}) | "
-            f"tokens={scheduled_batch.total_tokens_num} "
-            f"(prefill={scheduled_batch.total_tokens_num_prefill} "
-            f"decode={scheduled_batch.total_tokens_num_decode})"
-        )
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
@@ -540,7 +529,9 @@ class PrefillEngineCore(EngineCore):
         # Replace the base Scheduler created by EngineCore.__init__ with
         # PrefillScheduler, which has no BlockManager and only schedules
         # sequences that already have a block_table from decode.
-        self.scheduler = PrefillScheduler(config)
+        self.scheduler = PrefillScheduler(
+            config, disagg_cu_shm_name=config.disagg_cu_shm_name
+        )
 
     def _post_model_load_hook(self):
         """Round 1 bootstrap: export weights → send to decode → wait for ACK.
@@ -597,12 +588,6 @@ class PrefillEngineCore(EngineCore):
         bootstrap was already sent inside _send_ready_signal(), so _init_disagg
         only needs to set up the per-request BlockAssignment/PrefillDone channel.
         """
-        # --- Attach shared memory for dynamic CU partitioning ---
-        # if self._config.disagg_cu_shm_name:
-        #     self.runner_mgr.call_func(
-        #         "init_cu_shared_mem", self._config.disagg_cu_shm_name, wait_out=True
-        #     )
-
         # --- Create pool of CU-masked CUDA streams for prefill ---
         logger.info("PrefillEngineCore: creating prefill stream pool...")
         self.runner_mgr.call_func("create_prefill_stream_pool", wait_out=True)
@@ -799,7 +784,9 @@ class DecodeEngineCore(EngineCore):
             )
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
-        self.scheduler = DecodeScheduler(config)
+        self.scheduler = DecodeScheduler(
+            config, disagg_cu_shm_name=config.disagg_cu_shm_name
+        )
 
         # --- Now truly ready ---
         super()._send_ready_signal()
@@ -857,14 +844,6 @@ class DecodeEngineCore(EngineCore):
         # Decode PULL binds so prefill's connecting PUSH finds a ready socket (p2d channel).
         self._p2d_recv_sock = self._disagg_ctx.socket(zmq.PULL)
         self._p2d_recv_sock.bind(self._disagg_p2d_addr)
-
-        # --- Attach shared memory for dynamic CU partitioning ---
-        # if self._config.disagg_cu_shm_name:
-        #     self.runner_mgr.call_func(
-        #         "init_cu_shared_mem", self._config.disagg_cu_shm_name, wait_out=True
-        #     )
-
-        
 
         # Start thread to receive PrefillDone from prefill.
         self._prefill_done_thread = threading.Thread(
