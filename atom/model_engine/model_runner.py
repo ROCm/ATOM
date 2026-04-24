@@ -1825,11 +1825,17 @@ class ModelRunner:
 
     def prepare_sample(
         self, batch: ScheduledBatch
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, bool]:
         bs = batch.total_seqs_num
 
         # Check on CPU whether all requests are greedy (temperature=0)
         all_greedy = (batch.temperatures == 0).all()
+
+        # Check on CPU whether any fan-out sibling needs per-row random noise.
+        # Missing attribute (e.g. dummy runs, older callers) -> False.
+        needs_independent_noise = bool(
+            getattr(batch, "needs_independent_noise", np.zeros(0, dtype=bool)).any()
+        )
 
         temp_buffer = self.forward_vars["temperatures"]
         # Clamp temperatures on CPU to avoid division by zero in sampler
@@ -1863,13 +1869,15 @@ class ModelRunner:
         else:
             top_ps = None
 
-        return temperatures, top_ks, top_ps, all_greedy
+        return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
     def prepare_model(self, batch: ScheduledBatch):
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
-        temperatures, top_ks, top_ps, all_greedy = self.prepare_sample(batch)
+        temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
+            self.prepare_sample(batch)
+        )
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         self.prepare_inputs(batch, input_ids)
         return (
@@ -1878,6 +1886,7 @@ class ModelRunner:
             top_ks,
             top_ps,
             all_greedy,
+            needs_independent_noise,
         )
 
     def run_model(
@@ -1942,12 +1951,18 @@ class ModelRunner:
         all_greedy: bool,
         # following for draft
         hidden_states: torch.Tensor,
+        needs_independent_noise: bool = False,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(
-                logits, temperatures, top_ks, top_ps, all_greedy
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise=needs_independent_noise,
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
@@ -1964,6 +1979,7 @@ class ModelRunner:
                 top_ks=top_ks,
                 top_ps=top_ps,
                 all_greedy=all_greedy,
+                needs_independent_noise=needs_independent_noise,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -2039,7 +2055,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
+        (
+            input_ids,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            needs_independent_noise,
+        ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
         fwd_output = self.postprocess(
             batch,
@@ -2049,6 +2072,7 @@ class ModelRunner:
             top_ps,
             all_greedy,
             hidden_states,
+            needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
         return fwd_output

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/sampling_params.py
 
+import pytest
 from atom.sampling_params import SamplingParams
 
 
@@ -21,6 +22,10 @@ class TestSamplingParamsDefaults:
         sp = SamplingParams()
         assert sp.stop_strings is None
 
+    def test_default_n(self):
+        sp = SamplingParams()
+        assert sp.n == 1
+
 
 class TestSamplingParamsCustom:
     def test_custom_values(self):
@@ -35,3 +40,15 @@ class TestSamplingParamsCustom:
     def test_zero_temperature(self):
         sp = SamplingParams(temperature=0.0)
         assert sp.temperature == 0.0
+
+    def test_n_greater_than_one(self):
+        sp = SamplingParams(n=4, temperature=0.8)
+        assert sp.n == 4
+
+    def test_n_zero_rejected(self):
+        with pytest.raises(ValueError, match="n must be >= 1"):
+            SamplingParams(n=0)
+
+    def test_n_negative_rejected(self):
+        with pytest.raises(ValueError, match="n must be >= 1"):
+            SamplingParams(n=-3)

@@ -478,3 +478,105 @@ class TestErrorHandling:
         )
         # Should fail with 400 or 500 (ValueError from get_messages())
         assert r.status_code in (400, 422, 500)
+
+
+# ---------------------------------------------------------------------------
+# Multi-sample (n > 1) Tests — issue #618
+# ---------------------------------------------------------------------------
+
+
+class TestMultiSampleChat:
+    """Verify that ``n > 1`` returns multiple sampled completions."""
+
+    def test_n_greater_than_one_returns_multiple_choices(self, base_url):
+        r = requests.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Give me any single word.",
+                    }
+                ],
+                "max_tokens": 64,
+                "temperature": 0.9,
+                "top_p": 0.95,
+                "stream": False,
+                "n": 3,
+            },
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["choices"]) == 3
+        assert {c["index"] for c in data["choices"]} == {0, 1, 2}
+
+    def test_n_greedy_collapses_to_one(self, base_url):
+        """temperature=0 with n>1 should collapse to a single choice."""
+        r = requests.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 32,
+                "temperature": 0.0,
+                "stream": False,
+                "n": 4,
+            },
+        )
+        assert r.status_code == 200
+        assert len(r.json()["choices"]) == 1
+
+    def test_n_streaming_multiplexes_by_index(self, base_url):
+        """Streaming with n>1 should tag every chunk by choices[0].index."""
+        r = requests.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Say a word."}],
+                "max_tokens": 64,
+                "temperature": 0.9,
+                "stream": True,
+                "n": 2,
+            },
+            stream=True,
+        )
+        assert r.status_code == 200
+        indices_seen = set()
+        finish_reasons_by_index = {}
+        for line in r.iter_lines():
+            line = line.decode("utf-8").strip()
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            chunk = json.loads(line[6:])
+            if "choices" not in chunk:
+                continue
+            idx = chunk["choices"][0]["index"]
+            indices_seen.add(idx)
+            fr = chunk["choices"][0].get("finish_reason")
+            if fr is not None:
+                finish_reasons_by_index[idx] = fr
+        assert indices_seen == {0, 1}
+        # Both siblings should have emitted a terminal finish_reason.
+        assert set(finish_reasons_by_index.keys()) == {0, 1}
+
+
+class TestMultiSampleCompletion:
+    """n>1 on /v1/completions."""
+
+    def test_completion_n_returns_multiple_choices(self, base_url):
+        r = requests.post(
+            f"{base_url}/v1/completions",
+            json={
+                "model": MODEL,
+                "prompt": "The quick brown",
+                "max_tokens": 16,
+                "temperature": 0.9,
+                "stream": False,
+                "n": 2,
+            },
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data["choices"]) == 2
+        assert {c["index"] for c in data["choices"]} == {0, 1}

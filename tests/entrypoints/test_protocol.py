@@ -174,6 +174,16 @@ class TestChatCompletionRequest:
         assert req.stream is False
         assert req.top_p == 1.0
         assert req.top_k == -1
+        assert req.n == 1
+
+    def test_n_greater_than_one(self):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "n": 4,
+            }
+        )
+        assert req.n == 4
 
     def test_multimodal_messages(self):
         """Request with multimodal content should parse correctly."""
@@ -203,12 +213,17 @@ class TestCompletionRequest:
         req = CompletionRequest(prompt="Hello world")
         assert req.prompt == "Hello world"
         assert req.max_tokens == 8192
+        assert req.n == 1
 
     def test_extra_fields_ignored(self):
         req = CompletionRequest.model_validate(
             {"prompt": "Hello", "unknown": "ignored"}
         )
         assert req.prompt == "Hello"
+
+    def test_n_parameter_accepted(self):
+        req = CompletionRequest.model_validate({"prompt": "Hi", "n": 3})
+        assert req.n == 3
 
 
 # ============================================================================

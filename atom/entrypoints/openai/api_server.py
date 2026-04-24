@@ -37,8 +37,18 @@ from .protocol import (
     ModelCard,
     ModelList,
 )
-from .serving_chat import build_chat_response, stream_chat_response
-from .serving_completion import build_completion_response, stream_completion_response
+from .serving_chat import (
+    build_chat_response,
+    build_chat_response_multi,
+    stream_chat_response,
+    stream_chat_response_fanout,
+)
+from .serving_completion import (
+    build_completion_response,
+    build_completion_response_multi,
+    stream_completion_response,
+    stream_completion_response_fanout,
+)
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -107,6 +117,7 @@ def _build_sampling_params(
     ignore_eos: bool,
     top_k: int = -1,
     top_p: float = 1.0,
+    n: int = 1,
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
@@ -115,7 +126,35 @@ def _build_sampling_params(
         max_tokens=max_tokens,
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
+        n=n,
     )
+
+
+def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
+    """Return an effective ``n`` for a request.
+
+    * ``None``/``<1`` coerce to ``1`` (matches OpenAI default).
+    * ``n > 1`` combined with greedy sampling (``temperature <= 0``) is
+      collapsed to ``1`` because all siblings would produce identical
+      outputs — other runtimes (vLLM, TGI) silently do the same, and it
+      avoids wasting KV cache on duplicate decodes.
+    """
+    n = requested_n if requested_n is not None else 1
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 1
+    if n < 1:
+        n = 1
+    if n > 1 and (temperature is None or temperature <= 0.0):
+        logger.info(
+            "n=%s requested with temperature=%s; collapsing to n=1 because "
+            "greedy sampling would produce identical siblings.",
+            n,
+            temperature,
+        )
+        n = 1
+    return n
 
 
 def _send_stream_chunk_direct(
@@ -140,6 +179,32 @@ def _send_stream_chunk_direct(
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
     loop.call_soon_threadsafe(stream_queue.put_nowait, chunk_data)
+
+
+def _send_stream_chunk_tagged(
+    request_output: RequestOutput,
+    sibling_index: int,
+    stream_queue: asyncio.Queue,
+    loop: AbstractEventLoop,
+) -> None:
+    """Variant of :func:`_send_stream_chunk_direct` for fan-out siblings.
+
+    Pushes ``(sibling_index, chunk_data)`` tuples onto a single shared
+    queue so the merge-stream consumer in :mod:`serving_chat` /
+    :mod:`serving_completion` can demultiplex by index.
+    """
+    global tokenizer
+
+    new_text = tokenizer.decode(request_output.output_tokens, skip_special_tokens=True)
+    chunk_data = {
+        "text": new_text,
+        "token_ids": request_output.output_tokens,
+        "finished": request_output.finished,
+        "finish_reason": request_output.finish_reason,
+    }
+    if getattr(request_output, "kv_transfer_params_output", None):
+        chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
+    loop.call_soon_threadsafe(stream_queue.put_nowait, (sibling_index, chunk_data))
 
 
 async def generate_async(
@@ -232,6 +297,111 @@ async def generate_async(
     yield response
 
 
+async def generate_async_fanout(
+    prompt: str,
+    sampling_params: SamplingParams,
+    request_id: str,
+    kv_transfer_params: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Non-streaming n>1 path: fan out N siblings and await all of them.
+
+    Returns a list of per-sibling output dicts in the same shape as
+    :func:`generate_async` yields for n==1, so response builders can treat
+    each entry the same way.
+    """
+    global engine, tokenizer
+
+    n = int(sampling_params.n)
+    assert n >= 1
+
+    shared_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    started_at = time.time()
+    per_tokens: List[List[int]] = [[] for _ in range(n)]
+    per_first_token_at: List[Optional[float]] = [None] * n
+    per_last_token_at: List[Optional[float]] = [None] * n
+    per_finish_reason: List[Optional[str]] = [None] * n
+    finished = [False] * n
+
+    def make_callback(idx: int):
+        def _cb(request_output: RequestOutput) -> None:
+            now = time.time()
+            loop.call_soon_threadsafe(
+                shared_queue.put_nowait,
+                (
+                    idx,
+                    {
+                        "token_ids": request_output.output_tokens,
+                        "finished": request_output.finished,
+                        "finish_reason": request_output.finish_reason,
+                        "ts": now,
+                    },
+                ),
+            )
+
+        return _cb
+
+    stream_callbacks = [make_callback(i) for i in range(n)]
+
+    def do_preprocess():
+        return engine.io_processor.preprocess_fanout(
+            prompt,
+            sampling_params,
+            stream_callbacks=stream_callbacks,
+            kv_transfer_params=kv_transfer_params,
+            parent_request_id=request_id,
+        )
+
+    seqs = await loop.run_in_executor(None, do_preprocess)
+    engine.core_mgr.add_request(seqs)
+    num_tokens_input = seqs[0].num_prompt_tokens
+
+    while not all(finished):
+        idx, item = await shared_queue.get()
+        if finished[idx]:
+            continue
+        tokens = item.get("token_ids") or []
+        if tokens:
+            if per_first_token_at[idx] is None:
+                per_first_token_at[idx] = item.get("ts", time.time())
+            per_last_token_at[idx] = item.get("ts", time.time())
+            per_tokens[idx].extend(tokens)
+        if item.get("finished", False):
+            per_finish_reason[idx] = item.get("finish_reason")
+            finished[idx] = True
+
+    finished_at = time.time()
+    outputs: List[Dict[str, Any]] = []
+    for i in range(n):
+        num_tokens_output = len(per_tokens[i])
+        ttft = (
+            per_first_token_at[i] - started_at
+            if per_first_token_at[i] is not None
+            else 0.0
+        )
+        tpot = (
+            (per_last_token_at[i] - per_first_token_at[i]) / (num_tokens_output - 1)
+            if per_first_token_at[i] is not None
+            and per_last_token_at[i] is not None
+            and num_tokens_output > 1
+            else 0.0
+        )
+        outputs.append(
+            {
+                "text": tokenizer.decode(per_tokens[i], skip_special_tokens=True),
+                "token_ids": per_tokens[i],
+                "finish_reason": per_finish_reason[i],
+                "num_tokens_input": num_tokens_input,
+                "num_tokens_output": num_tokens_output,
+                "ttft": ttft,
+                "tpot": tpot,
+                "latency": finished_at - started_at,
+            }
+        )
+    return outputs
+
+
 def validate_model(requested_model: Optional[str]) -> None:
     """Validate that the requested model matches the server's model."""
     if requested_model is not None and requested_model != model_name:
@@ -283,7 +453,12 @@ async def setup_streaming_request(
 
 
 def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
-    """Clean up resources for a streaming request."""
+    """Clean up resources for a streaming request.
+
+    Safe to call multiple times for the same ``request_id`` with different
+    ``seq_id`` values (as happens in fan-out cleanup): the per-request
+    dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
+    """
     global engine, _stream_queues, _seq_id_to_request_id
     global _stream_loops, _request_start_times
 
@@ -292,6 +467,61 @@ def cleanup_streaming_request(request_id: str, seq_id: int) -> None:
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
     engine.io_processor.requests.pop(seq_id, None)
+
+
+async def setup_streaming_request_fanout(
+    prompt: str,
+    sampling_params: SamplingParams,
+    request_id: str,
+    kv_transfer_params: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[int], asyncio.Queue]:
+    """Fan-out variant of :func:`setup_streaming_request`.
+
+    Creates ``sampling_params.n`` sibling sequences sharing one output
+    queue. Every callback pushes ``(sibling_index, chunk_data)`` tuples so
+    the merge-stream consumer can rewrite ``choices[0].index`` correctly.
+    """
+    global engine, _stream_queues, _seq_id_to_request_id
+    global _stream_loops, _request_start_times
+
+    n = int(sampling_params.n)
+    assert n >= 1
+
+    shared_queue: asyncio.Queue = asyncio.Queue()
+    stream_loop = asyncio.get_running_loop()
+    _stream_queues[request_id] = shared_queue
+    _stream_loops[request_id] = stream_loop
+    _request_start_times[request_id] = time.time()
+
+    def make_callback(idx: int):
+        def _cb(request_output: RequestOutput) -> None:
+            _send_stream_chunk_tagged(request_output, idx, shared_queue, stream_loop)
+
+        return _cb
+
+    stream_callbacks = [make_callback(i) for i in range(n)]
+
+    executor_loop = asyncio.get_event_loop()
+
+    def do_preprocess():
+        seqs = engine.io_processor.preprocess_fanout(
+            prompt,
+            sampling_params,
+            stream_callbacks=stream_callbacks,
+            kv_transfer_params=kv_transfer_params,
+            parent_request_id=request_id,
+        )
+        for seq in seqs:
+            _seq_id_to_request_id[seq.id] = request_id
+        return seqs
+
+    seqs = await executor_loop.run_in_executor(None, do_preprocess)
+    seq_ids = [seq.id for seq in seqs]
+    logger.info(
+        f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
+    )
+    engine.core_mgr.add_request(seqs)
+    return seq_ids, shared_queue
 
 
 # ============================================================================
@@ -371,6 +601,7 @@ async def chat_completions(request: ChatCompletionRequest):
             **merged_kwargs,
         )
 
+        effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.max_tokens,
@@ -378,6 +609,7 @@ async def chat_completions(request: ChatCompletionRequest):
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
             top_p=request.top_p,
+            n=effective_n,
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -386,34 +618,52 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Streaming
         if request.stream:
-            seq_id, stream_queue = await setup_streaming_request(
-                prompt, sampling_params, request_id
-            )
-            gen = stream_chat_response(
-                request_id,
-                model_name,
-                prompt,
-                stream_queue,
-                seq_id,
-                tokenizer,
-                cleanup_streaming_request,
-            )
+            if effective_n > 1:
+                seq_ids, stream_queue = await setup_streaming_request_fanout(
+                    prompt, sampling_params, request_id
+                )
+                gen = stream_chat_response_fanout(
+                    request_id,
+                    model_name,
+                    prompt,
+                    stream_queue,
+                    seq_ids,
+                    tokenizer,
+                    cleanup_streaming_request,
+                )
+            else:
+                seq_id, stream_queue = await setup_streaming_request(
+                    prompt, sampling_params, request_id
+                )
+                gen = stream_chat_response(
+                    request_id,
+                    model_name,
+                    prompt,
+                    stream_queue,
+                    seq_id,
+                    tokenizer,
+                    cleanup_streaming_request,
+                )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
         # Non-streaming
-        final_output = None
-        async for output in generate_async(prompt, sampling_params, request_id):
-            final_output = output
-
-        if final_output is None:
-            raise RuntimeError("No output generated")
-
-        resp = build_chat_response(
-            request_id, model_name, final_output["text"], final_output
-        )
+        if effective_n > 1:
+            outputs = await generate_async_fanout(prompt, sampling_params, request_id)
+            if not outputs:
+                raise RuntimeError("No output generated")
+            resp = build_chat_response_multi(request_id, model_name, outputs)
+        else:
+            final_output = None
+            async for output in generate_async(prompt, sampling_params, request_id):
+                final_output = output
+            if final_output is None:
+                raise RuntimeError("No output generated")
+            resp = build_chat_response(
+                request_id, model_name, final_output["text"], final_output
+            )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
 
@@ -433,6 +683,7 @@ async def completions(request: CompletionRequest):
     validate_model(request.model)
 
     try:
+        effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.max_tokens,
@@ -440,6 +691,7 @@ async def completions(request: CompletionRequest):
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
             top_p=request.top_p,
+            n=effective_n,
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -448,40 +700,68 @@ async def completions(request: CompletionRequest):
 
         # Streaming
         if request.stream:
-            seq_id, stream_queue = await setup_streaming_request(
-                request.prompt,
-                sampling_params,
-                request_id,
-                kv_transfer_params=request.kv_transfer_params,
-            )
-            gen = stream_completion_response(
-                request_id,
-                model_name,
-                request.prompt,
-                stream_queue,
-                seq_id,
-                tokenizer,
-                cleanup_streaming_request,
-            )
+            if effective_n > 1:
+                seq_ids, stream_queue = await setup_streaming_request_fanout(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                )
+                gen = stream_completion_response_fanout(
+                    request_id,
+                    model_name,
+                    request.prompt,
+                    stream_queue,
+                    seq_ids,
+                    tokenizer,
+                    cleanup_streaming_request,
+                )
+            else:
+                seq_id, stream_queue = await setup_streaming_request(
+                    request.prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=request.kv_transfer_params,
+                )
+                gen = stream_completion_response(
+                    request_id,
+                    model_name,
+                    request.prompt,
+                    stream_queue,
+                    seq_id,
+                    tokenizer,
+                    cleanup_streaming_request,
+                )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
         # Non-streaming
-        final_output = None
-        async for output in generate_async(
-            request.prompt,
-            sampling_params,
-            request_id,
-            kv_transfer_params=request.kv_transfer_params,
-        ):
-            final_output = output
+        if effective_n > 1:
+            outputs = await generate_async_fanout(
+                request.prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
+            )
+            if not outputs:
+                raise RuntimeError("No output generated")
+            resp = build_completion_response_multi(request_id, model_name, outputs)
+        else:
+            final_output = None
+            async for output in generate_async(
+                request.prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=request.kv_transfer_params,
+            ):
+                final_output = output
 
-        if final_output is None:
-            raise RuntimeError("No output generated")
+            if final_output is None:
+                raise RuntimeError("No output generated")
 
-        resp = build_completion_response(request_id, model_name, final_output)
+            resp = build_completion_response(request_id, model_name, final_output)
         _log_request_event("response", request_id, resp.model_dump())
         return resp
 
