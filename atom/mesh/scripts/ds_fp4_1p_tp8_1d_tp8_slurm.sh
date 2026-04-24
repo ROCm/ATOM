@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=ds-fp8-1p-tp4-1d-tp8
+#SBATCH --job-name=ds-fp4-1p-tp8-1d-tp8
 #SBATCH --account=amd-frameworks
 #SBATCH --partition=amd-frameworks
 #SBATCH --nodes=2
@@ -10,28 +10,28 @@
 #SBATCH --exclusive
 #SBATCH --time=04:00:00
 #SBATCH --nodelist=mia1-p02-g42,mia1-p02-g44
-#SBATCH --output=/it-share/yajizhan/slurm_logs/ds_fp8_1p_tp4_1d_tp8-%j.out
-#SBATCH --error=/it-share/yajizhan/slurm_logs/ds_fp8_1p_tp4_1d_tp8-%j.err
+#SBATCH --output=/it-share/yajizhan/slurm_logs/ds_fp4_1p_tp8_1d_tp8-%j.out
+#SBATCH --error=/it-share/yajizhan/slurm_logs/ds_fp4_1p_tp8_1d_tp8-%j.err
 #
-# Self-contained 1P+1D PD-disaggregated benchmark for DeepSeek-R1 FP8.
-#   prefill: TP=4, decode: TP=8, mooncake RDMA KV transfer.
+# Self-contained 1P+1D PD-disaggregated benchmark for DeepSeek-R1 MXFP4.
+#   prefill: TP=8, decode: TP=8, mooncake RDMA KV transfer.
 # All server/router/benchmark logic is inline — no external script dependencies.
 #
 # Usage:
 #   mkdir -p /it-share/yajizhan/slurm_logs
-#   sbatch ds_fp8_1p_tp4_1d_tp8_slurm.sh
+#   sbatch ds_fp4_1p_tp8_1d_tp8_slurm.sh
 #
 # Override defaults via env:
-#   sbatch --export=ALL,LOAD_DUMMY=,ISL_LIST="1024,8192" ds_fp8_1p_tp4_1d_tp8_slurm.sh
+#   sbatch --export=ALL,LOAD_DUMMY=,ISL_LIST="1024,8192" ds_fp4_1p_tp8_1d_tp8_slurm.sh
 
 set -euo pipefail
 
 # ======================== configuration ========================
-MODEL_PATH="${MODEL_PATH:-/mnt/models/deepseek-ai/DeepSeek-R1}"
+MODEL_PATH="${MODEL_PATH:-/it-share/models/deepseek-ai/DeepSeek-R1-0528-MXFP4}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
 CONTAINER="${CONTAINER:-atom_sglang_mesh_${SLURM_JOB_ID}}"
 
-PREFILL_TP="${PREFILL_TP:-4}"
+PREFILL_TP="${PREFILL_TP:-8}"
 DECODE_TP="${DECODE_TP:-8}"
 PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
@@ -43,13 +43,13 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
 CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
-CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-64}"
+CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-256}"
 IB_DEVICE="${IB_DEVICE:-rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7}"
 MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
 
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
-CONC_LIST="${CONC_LIST:-1,2,4,8,16,32,64,128}"
+CONC_LIST="${CONC_LIST:-1,2,4,8,16}"
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.8}"
 BACKEND="${BACKEND:-sglang}"
 
@@ -65,7 +65,7 @@ GSM8K_LIMIT="${GSM8K_LIMIT:-}"
 GSM8K_NUM_FEWSHOT="${GSM8K_NUM_FEWSHOT:-3}"
 GSM8K_NUM_CONCURRENT="${GSM8K_NUM_CONCURRENT:-65}"
 
-LOG_ROOT="${LOG_ROOT:-/it-share/yajizhan/slurm_logs/$(date +%m%d)_ds_fp8_1p_tp4_1d_tp8_${SLURM_JOB_ID}}"
+LOG_ROOT="${LOG_ROOT:-/it-share/yajizhan/slurm_logs/$(date +%m%d)_ds_fp4_1p_tp8_1d_tp8_${SLURM_JOB_ID}}"
 
 # ======================== pre-flight ========================
 echo "=== Job ${SLURM_JOB_ID} starting on $(hostname) at $(date -Is) ==="
