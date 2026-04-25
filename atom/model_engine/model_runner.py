@@ -46,7 +46,6 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.selector import get_attn_backend
-from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -2126,6 +2125,8 @@ class ModelRunner:
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
         self.forward_vars["kv_indptr"].gpu.zero_()
+        if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
+            self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
