@@ -745,7 +745,6 @@ class PrefillScheduler:
 
         # Read the CU fraction chosen by the DecodeScheduler via shared memory.
         # 0.0 in shm means "no mask" → map to None (the stream pool key).
-        import struct
 
         cu_fraction = None
         # if self._cu_shm is not None:
@@ -787,26 +786,23 @@ class PrefillScheduler:
 class DecodeScheduler(Scheduler):
     """Scheduler for the disaggregated decode process.
 
-    Manages 4 queues:
+    Manages 3 queues:
     - waiting:         new requests pending block allocation
     - prefill_waiting: blocks allocated, BlockAssignment sent, awaiting PrefillDone
-    - prefill_done:    received PrefillDone, ready to be promoted to running
     - running:         ongoing decode sequences
 
     Block allocation is separated from scheduling: allocate_waiting() is called
     by DecodeEngineCore after draining the input queue, and returns newly
     allocated sequences so the engine can send BlockAssignment to prefill.
 
-    schedule() never returns a prefill batch — only decode batches, after
-    promoting prefill_done sequences into running.
+    on_prefill_done() promotes sequences directly from prefill_waiting to
+    running.  schedule() only schedules the running queue as decode batches.
     """
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         super().__init__(config)
         # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
         self.prefill_waiting: dict[int, Sequence] = {}
-        # Sequences that have received PrefillDone and are ready to start decode.
-        self.prefill_done: deque[Sequence] = deque()
 
         # Shared memory for dynamic CU partitioning.
         self._cu_shm = None
@@ -817,30 +813,18 @@ class DecodeScheduler(Scheduler):
         #         name=disagg_cu_shm_name, create=False
         #     )
 
-        # Protects prefill_waiting and prefill_done: on_prefill_done is called
+        # Protects prefill_waiting and running: on_prefill_done is called
         # from the _recv_prefill_done background thread.
         self._prefill_lock = threading.Lock()
 
     def is_finished(self) -> bool:
-        return (
-            not self.waiting
-            and not self.prefill_waiting
-            and not self.prefill_done
-            and not self.running
-        )
+        return not self.waiting and not self.prefill_waiting and not self.running
 
     def has_requests(self) -> bool:
-        return bool(
-            self.waiting or self.prefill_waiting or self.prefill_done or self.running
-        )
+        return bool(self.waiting or self.prefill_waiting or self.running)
 
     def get_num_unfinished_requests(self) -> int:
-        return (
-            len(self.waiting)
-            + len(self.prefill_waiting)
-            + len(self.prefill_done)
-            + len(self.running)
-        )
+        return len(self.waiting) + len(self.prefill_waiting) + len(self.running)
 
     def allocate_waiting(self) -> list[Sequence]:
         """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.
@@ -864,46 +848,28 @@ class DecodeScheduler(Scheduler):
     def on_prefill_done(
         self, seq_id: int, num_tokens_computed: int, sampled_token_id: int
     ) -> None:
-        """Move a sequence from prefill_waiting to prefill_done.
+        """Promote a sequence from prefill_waiting directly to running.
 
         Called from the _recv_prefill_done background thread.
         sampled_token_id is the first generated token sampled by the prefill
-        process; it is appended to seq.token_ids when the sequence is promoted
-        to running so that context_lens and slot_mapping match the non-disagg
-        postprocess state before the first decode step.
+        process; it is appended here so that context_lens and slot_mapping
+        match the non-disagg postprocess state before the first decode step.
         """
         with self._prefill_lock:
             seq = self.prefill_waiting.pop(seq_id, None)
             if seq is not None:
                 seq.num_cached_tokens = num_tokens_computed
-                seq._disagg_sampled_token_id = sampled_token_id
-                self.prefill_done.append(seq)
+                seq.status = SequenceStatus.RUNNING
+                seq.type = SequenceType.DECODE
+                seq.append_token(sampled_token_id)
+                self.running.append(seq)
 
     def schedule(self):
         """Schedule decode-only batches.
 
-        Promotes sequences from prefill_done → running, then schedules the
-        running queue as decode.  Never returns a prefill batch.
+        Sequences are promoted directly from prefill_waiting to running by
+        on_prefill_done(); this method only schedules the running queue.
         """
-        # Promote prefill_done → running under lock.
-        with self._prefill_lock:
-            while self.prefill_done:
-                seq = self.prefill_done.popleft()
-                seq.status = SequenceStatus.RUNNING
-                seq.type = SequenceType.DECODE
-                # Append the first generated token sampled by the prefill process.
-                # In non-disagg mode, Scheduler.postprocess() does this after the
-                # prefill forward (is_deferred_out=True always appends one placeholder
-                # that is later overwritten with the real token from the async queue).
-                # In disagg mode the prefill process ran sampling and sent us the real
-                # token; appending it here puts num_tokens, context_lens, and
-                # slot_mapping in the same state as non-disagg before the first decode
-                # step.
-                token_id = seq._disagg_sampled_token_id
-                del seq._disagg_sampled_token_id
-                seq.append_token(token_id)
-                self.running.append(seq)
-
         if not self.running:
             return None
 
@@ -936,7 +902,6 @@ class DecodeScheduler(Scheduler):
         # Dynamic CU partitioning: decode decides the fraction based on its
         # batch size and the total tokens queued for prefill, then writes the
         # fraction to shared memory for PrefillScheduler to read.
-        import struct
 
         cu_fraction = None
         # if self._cu_shm is not None:

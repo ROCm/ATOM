@@ -872,7 +872,7 @@ class DecodeEngineCore(EngineCore):
             )
             logger.info(
                 f"DecodeEngineCore: seq {done.seq_id} prefill done "
-                f"({done.num_tokens_computed} tokens cached), moved to prefill_done queue"
+                f"({done.num_tokens_computed} tokens cached), moved to running queue"
             )
 
     def _send_block_assignment(self, seq: Sequence):

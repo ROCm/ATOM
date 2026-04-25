@@ -1694,9 +1694,9 @@ class ModelRunner:
         dynamically each iteration via _optimal_cu_fraction().
         """
         self._prefill_streams = {}
-        # for f in self._CU_POOL_FRACTIONS:
-        #     mask = self._cu_mask_for_fraction(f, upper=False)
-        #     self._prefill_streams[f] = self._stream_with_cu_mask(mask)
+        for f in self._CU_POOL_FRACTIONS:
+            mask = self._cu_mask_for_fraction(f, upper=False)
+            self._prefill_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask)
         self._prefill_streams[None] = torch.cuda.Stream()
         logger.info(
@@ -1712,9 +1712,9 @@ class ModelRunner:
         forward() selects the stream dynamically each iteration.
         """
         self._decode_streams = {}
-        # for f in self._CU_POOL_FRACTIONS:
-        #     mask = self._cu_mask_for_fraction(f, upper=True)
-        #     self._decode_streams[f] = self._stream_with_cu_mask(mask)
+        for f in self._CU_POOL_FRACTIONS:
+            mask = self._cu_mask_for_fraction(f, upper=True)
+            self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask)
         self._decode_streams[None] = torch.cuda.Stream()
         self._model_fwd_event = torch.cuda.Event()
@@ -2092,33 +2092,23 @@ class ModelRunner:
                     self.prepare_model(batch)
                 )
                 logits, hidden_states = self.run_model(input_ids, batch)
-                # Signal default stream to wait until run_model is done on decode_stream.
-                fwd_output = self.postprocess(
-                    batch,
-                    logits,
-                    temperatures,
-                    top_ks,
-                    top_ps,
-                    all_greedy,
-                    hidden_states,
-                )
-            # self._model_fwd_event.record(stream)
-            # torch.cuda.current_stream().wait_event(self._model_fwd_event)
+            self._model_fwd_event.record(stream)
+            torch.cuda.current_stream().wait_event(self._model_fwd_event)
             #stream.synchronize()
         else:
             input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
             logits, hidden_states = self.run_model(input_ids, batch)
 
-            # postprocess (sampling + async CPU copy) always runs on default stream.
-            fwd_output = self.postprocess(
-                batch,
-                logits,
-                temperatures,
-                top_ks,
-                top_ps,
-                all_greedy,
-                hidden_states,
-            )
+        # postprocess (sampling + async CPU copy) always runs on default stream.
+        fwd_output = self.postprocess(
+            batch,
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            hidden_states,
+        )
         reset_forward_context()
         return fwd_output
 
