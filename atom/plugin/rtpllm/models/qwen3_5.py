@@ -60,6 +60,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             device_resource_config=device_resource_config,
         )
         self.model = atom_model
+        self._warned_once_keys: set[str] = set()
 
     def load_weights(self):
         # ATOM weights should be loaded exactly once from ATOMQwen35Moe._create_python_model.
@@ -76,6 +77,12 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         if first_param is None:
             return torch.bfloat16
         return first_param.dtype
+
+    def _warn_once(self, key: str, msg: str, *args: Any) -> None:
+        if key in self._warned_once_keys:
+            return
+        self._warned_once_keys.add(key)
+        logger.warning(msg, *args)
 
     def _build_positions_fallback(
         self, inputs: PyModelInputs, model_device: torch.device
@@ -162,7 +169,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             positions = torch.arange(
                 input_ids.numel(), dtype=torch.int32, device=model_device
             )
-            logger.warning(
+            self._warn_once(
+                "positions_missing_local_arange",
                 "RTP plugin did not provide position ids; using local arange fallback."
             )
         # Rotary embedding requires `positions.numel() == token_num`.
@@ -181,21 +189,24 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 )
                 if sequence_lengths is not None and int(sequence_lengths.numel()) == token_num:
                     positions = sequence_lengths.to(device=model_device, dtype=torch.int32, non_blocking=True)
-                    logger.warning(
+                    self._warn_once(
+                        "position_token_mismatch_sequence_lengths",
                         "Position/token mismatch fixed via sequence_lengths: pos=%d token=%d",
                         pos_num,
                         token_num,
                     )
                 elif pos_num > token_num:
                     positions = positions[..., -token_num:].contiguous()
-                    logger.warning(
+                    self._warn_once(
+                        "position_token_mismatch_tail_slice",
                         "Position/token mismatch fixed via tail slice: pos=%d token=%d",
                         pos_num,
                         token_num,
                     )
                 else:
                     positions = torch.arange(token_num, dtype=torch.int32, device=model_device)
-                    logger.warning(
+                    self._warn_once(
+                        "position_token_mismatch_local_arange",
                         "Position/token mismatch fixed via local arange: pos=%d token=%d",
                         pos_num,
                         token_num,
