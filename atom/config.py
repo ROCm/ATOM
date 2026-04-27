@@ -302,7 +302,9 @@ class QuantizationConfig:
         """Alias for ``global_spec``."""
         return self.global_spec
 
-    def get_layer_quant_config(self, layer_name: str) -> LayerQuantConfig:
+    def get_layer_quant_config(
+        self, layer_name: str, *, check_children: bool = False
+    ) -> LayerQuantConfig:
         """Return the :class:`LayerQuantConfig` for *layer_name*.
 
         Resolution order:
@@ -311,7 +313,7 @@ class QuantizationConfig:
         3. Fall back to ``global_spec``.
         """
         # 1. Exclude list
-        if self._is_excluded(layer_name):
+        if self._is_excluded(layer_name, check_children=check_children):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
@@ -366,13 +368,21 @@ class QuantizationConfig:
 
     # -- internal helpers ---------------------------------------------------
 
-    def _is_excluded(self, layer_name: str) -> bool:
+    def _is_excluded(self, layer_name: str, *, check_children: bool = False) -> bool:
         if layer_name is None or not self.exclude_layers:
             return False
-        return any(
-            self._matches_exclude(layer_name, ignore_str)
-            for ignore_str in self.exclude_layers
-        )
+        prefix = layer_name + "."
+        for ignore_str in self.exclude_layers:
+            if self._matches_exclude(layer_name, ignore_str):
+                return True
+            # When check_children is True, also match if any exclude entry
+            # is a child of layer_name.  This is needed by container modules
+            # like FusedMoE whose prefix (e.g. "mtp.layers.60.mlp.experts")
+            # is a parent of the leaf-level exclude entries (e.g.
+            # "mtp.layers.60.mlp.experts.0.gate_up_proj").
+            if check_children and ignore_str.startswith(prefix):
+                return True
+        return False
 
     @staticmethod
     def _matches_exclude(
