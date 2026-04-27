@@ -10,7 +10,6 @@ from aiter import (
     QuantType,
     dtypes,
     gemm_a4w4,
-    gemm_a8w8,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
     get_hip_quant,
@@ -39,8 +38,11 @@ logger = logging.getLogger("atom")
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
+def use_gluon_gemm() -> bool:
+    return envs.ATOM_USE_TRITON_GEMM
 
-if use_triton_gemm():
+
+if use_triton_gemm() and not use_gluon_gemm():
     try:
         # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
         from aiter.ops.triton.gemm_afp4wfp4 import (
@@ -58,9 +60,36 @@ if use_triton_gemm():
     except ImportError as e:
         logger.warning(f"Triton w8a8 GEMM not available: {e}")
         gemm_a8w8_blockscale_bpreshuffle_triton = None
+elif use_gluon_gemm():
+    try:
+        # matching the above variable names for uniformity and code reuse
+        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_afp4wfp4 import (
+            gemm_afp4wfp4_preshuffle,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Gluon FP4 GEMM not available: {e}")
+        gemm_afp4wfp4_preshuffle = None
+
+    # For Triton FP8 Blockscale GEMM is mostly slower then AITER GEMM, we turn off Triton FP8 GEMM
+    try:
+        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale as gemm_a8w8_blockscale_bpreshuffle_triton,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Gluon a8w8 blockscale GEMM not available: {e}")
+        gemm_a8w8_blockscale_bpreshuffle_triton = None
+
+    try:
+        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a8w8 import (
+            gemm_a8w8,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Gluon a8w8 GEMM not available: {e}")
+        from aiter import gemm_a8w8
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
+    from aiter import gemm_a8w8
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
@@ -410,14 +439,24 @@ class LinearBase(nn.Module):
                         scale=getattr(self, "input_scale", None),
                     )
             if self.quant_type.value == QuantType.per_Tensor.value:
-                y = tgemm.mm(
-                    x,
-                    self.weight,
-                    self.bias,
-                    otype=otype,
-                    scale_a=x_scale,
-                    scale_b=self.weight_scale,
-                )
+                if self.params_dtype == dtypes.i8 and use_gluon_gemm(): # check for now in case incompatible on gfx12
+                    y = gemm_a8w8(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        self.bias,
+                        dtype=otype,
+                    )
+                else:
+                    y = tgemm.mm(
+                        x,
+                        self.weight,
+                        self.bias,
+                        otype=otype,
+                        scale_a=x_scale,
+                        scale_b=self.weight_scale,
+                    )
             elif self.quant_type.value == QuantType.per_Token.value:
                 if self.params_dtype == dtypes.i8:
                     y = gemm_a8w8(
