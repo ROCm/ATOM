@@ -1429,7 +1429,6 @@ def extract_stage_kernels(
     it_ts = iteration["ts"]
     it_end = it_ts + iteration.get("dur", 0)
     it_tid = iteration.get("tid")
-    it_pid = iteration.get("pid")
     target = STAGE_PREFIX + stage_name
 
     stage_ev = None
