@@ -31,7 +31,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook
 
-
 SPECIAL_KERNEL_LAUNCH_NAMES = {"hipmemcpyasync", "cudamemcpyasync"}
 
 # vLLM iteration annotation pattern:
