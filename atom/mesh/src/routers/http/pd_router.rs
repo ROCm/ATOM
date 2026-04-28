@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -13,11 +13,12 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use super::pd_types::api_path;
 use crate::{
-    config::types::RetryConfig,
+    config::types::{BackendType, RetryConfig},
     core::{
         is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
         UNKNOWN_MODEL_ID,
@@ -40,6 +41,23 @@ use crate::{
     },
 };
 
+/// vLLM Mooncake mode: cached prefill node metadata fetched once at startup
+/// from each prefill worker's bootstrap `/query` endpoint.
+pub struct VllmPrefillInfo {
+    /// prefill worker URL → bootstrap HTTP address (e.g. "http://10.0.0.1:8998")
+    pub bootstrap_addrs: HashMap<String, String>,
+    /// prefill worker URL → { dp_rank → engine_id }
+    pub engine_ids: HashMap<String, HashMap<usize, String>>,
+}
+
+impl std::fmt::Debug for VllmPrefillInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VllmPrefillInfo")
+            .field("prefill_count", &self.bootstrap_addrs.len())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
@@ -47,6 +65,9 @@ pub struct PDRouter {
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    pub backend: BackendType,
+    /// Some(_) iff backend == Vllm; populated at startup from prefill bootstrap /query
+    pub vllm_prefill_info: Option<Arc<VllmPrefillInfo>>,
 }
 
 #[derive(Clone)]
@@ -153,12 +174,128 @@ impl PDRouter {
     }
 
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+        let backend = ctx.router_config.backend;
+        let worker_registry = Arc::clone(&ctx.worker_registry);
+        let client = ctx.client.clone();
+
+        let vllm_prefill_info = if backend == BackendType::Vllm {
+            Some(Arc::new(
+                Self::fetch_vllm_prefill_info(&worker_registry, &client).await?,
+            ))
+        } else {
+            None
+        };
+
         Ok(PDRouter {
-            worker_registry: Arc::clone(&ctx.worker_registry),
+            worker_registry,
             policy_registry: Arc::clone(&ctx.policy_registry),
-            client: ctx.client.clone(),
+            client,
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            backend,
+            vllm_prefill_info,
+        })
+    }
+
+    /// vLLM Mooncake mode: query each prefill node's bootstrap `/query` endpoint to cache
+    /// `dp_rank -> engine_id` mapping. Called once at startup; not refreshed dynamically.
+    async fn fetch_vllm_prefill_info(
+        worker_registry: &WorkerRegistry,
+        client: &Client,
+    ) -> Result<VllmPrefillInfo, String> {
+        let prefill_workers = worker_registry.get_prefill_workers();
+        if prefill_workers.is_empty() {
+            return Err(
+                "vLLM PD mode requires at least one prefill worker, but none were registered"
+                    .to_string(),
+            );
+        }
+
+        let mut bootstrap_addrs = HashMap::new();
+        let mut engine_ids = HashMap::new();
+
+        for worker in &prefill_workers {
+            let worker_url = worker.url().to_string();
+            let parsed = url::Url::parse(&worker_url)
+                .map_err(|e| format!("Invalid prefill URL {}: {}", worker_url, e))?;
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| format!("No host in prefill URL {}", worker_url))?
+                .to_string();
+            let port = worker.bootstrap_port().unwrap_or(8998);
+            let bootstrap_addr = format!("http://{}:{}", host, port);
+
+            info!(
+                "Querying vLLM prefill bootstrap: {}/query",
+                bootstrap_addr
+            );
+
+            let resp = client
+                .get(format!("{}/query", bootstrap_addr))
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to query vLLM bootstrap at {}/query: {}",
+                        bootstrap_addr, e
+                    )
+                })?;
+
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "vLLM bootstrap {}/query returned status {}",
+                    bootstrap_addr,
+                    resp.status()
+                ));
+            }
+
+            let data: HashMap<String, Value> = resp.json().await.map_err(|e| {
+                format!(
+                    "Failed to parse vLLM bootstrap response from {}: {}",
+                    bootstrap_addr, e
+                )
+            })?;
+
+            let mut rank_map = HashMap::new();
+            for (rank_str, entry) in &data {
+                let rank: usize = rank_str.parse().map_err(|e| {
+                    format!(
+                        "Invalid dp_rank '{}' from {}: {}",
+                        rank_str, bootstrap_addr, e
+                    )
+                })?;
+                let eid = entry
+                    .get("engine_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "Missing engine_id for rank {} from {}",
+                            rank, bootstrap_addr
+                        )
+                    })?
+                    .to_string();
+                rank_map.insert(rank, eid);
+            }
+
+            if rank_map.is_empty() {
+                return Err(format!(
+                    "vLLM bootstrap {}/query returned empty engine_id map",
+                    bootstrap_addr
+                ));
+            }
+
+            info!(
+                "vLLM prefill {} bootstrap_addr={} engine_ids={:?}",
+                worker_url, bootstrap_addr, rank_map
+            );
+
+            bootstrap_addrs.insert(worker_url.clone(), bootstrap_addr);
+            engine_ids.insert(worker_url, rank_map);
+        }
+
+        Ok(VllmPrefillInfo {
+            bootstrap_addrs,
+            engine_ids,
         })
     }
 
@@ -266,6 +403,368 @@ impl PDRouter {
             );
         }
         Ok(original)
+    }
+
+    /// Dispatch a request based on backend type. SGLang uses dual-dispatch+bootstrap;
+    /// vLLM uses Mooncake fire-and-forget P + streamed D with kv_transfer_params.
+    async fn dispatch_pd<T: Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        original_request: &T,
+        context: PDRequestContext<'_>,
+    ) -> Response {
+        match self.backend {
+            BackendType::Sglang => {
+                self.execute_dual_dispatch(headers, original_request, context)
+                    .await
+            }
+            BackendType::Vllm => {
+                self.execute_vllm_mooncake(headers, original_request, context)
+                    .await
+            }
+        }
+    }
+
+    /// Inject `kv_transfer_params` into a request JSON.
+    /// When `force_prefill` is true, also forces single-token, non-streaming behavior
+    /// for the prefill phase (vLLM Mooncake protocol).
+    fn inject_kv_transfer_params(
+        mut request: Value,
+        kv_transfer_params: Value,
+        force_prefill: bool,
+    ) -> Result<Value, String> {
+        let obj = request
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        obj.insert("kv_transfer_params".to_string(), kv_transfer_params);
+        if force_prefill {
+            obj.insert("stream".to_string(), Value::Bool(false));
+            obj.insert("max_tokens".to_string(), json!(1));
+            if obj.contains_key("max_completion_tokens") {
+                obj.insert("max_completion_tokens".to_string(), json!(1));
+            }
+            obj.remove("stream_options");
+        }
+        Ok(request)
+    }
+
+    /// vLLM Mooncake mode: fire prefill request as background task, stream decode response.
+    /// Replaces the dual-dispatch+bootstrap protocol used for SGLang.
+    async fn execute_vllm_mooncake<T: Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        original_request: &T,
+        context: PDRequestContext<'_>,
+    ) -> Response {
+        let start_time = Instant::now();
+
+        let route = context.route;
+        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        let endpoint = route_to_endpoint(route);
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_PD,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            bool_to_static_str(context.is_stream),
+        );
+
+        let shared_request = Arc::new(original_request.clone());
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            {
+                move |attempt: u32| {
+                    let shared_request = Arc::clone(&shared_request);
+                    let context = context.clone();
+                    async move {
+                        let (prefill, decode) = match self
+                            .select_pd_pair(
+                                context.request_text.as_deref(),
+                                context.model_id,
+                                context.headers.as_ref(),
+                            )
+                            .await
+                        {
+                            Ok(pair) => pair,
+                            Err(e) => return Self::handle_server_selection_error(e),
+                        };
+
+                        debug!(
+                            "vLLM PD retry attempt {} prefill={} decode={}",
+                            attempt,
+                            prefill.url(),
+                            decode.url()
+                        );
+
+                        let json_request = match serde_json::to_value(shared_request.as_ref()) {
+                            Ok(v) => v,
+                            Err(e) => return Self::handle_serialization_error(e),
+                        };
+
+                        self.dispatch_vllm_mooncake_internal(
+                            headers,
+                            json_request,
+                            context,
+                            Arc::clone(&prefill),
+                            Arc::clone(&decode),
+                            start_time,
+                        )
+                        .await
+                    }
+                }
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
+            },
+        )
+        .await;
+
+        let duration = start_time.elapsed();
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_PD,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
+        } else if !is_retryable_status(response.status()) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_PD,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
+    }
+
+    /// Core vLLM Mooncake dispatch: build P/D requests with kv_transfer_params,
+    /// fire P as background task, stream D response back to client.
+    async fn dispatch_vllm_mooncake_internal(
+        &self,
+        headers: Option<&HeaderMap>,
+        json_request: Value,
+        context: PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        _start_time: Instant,
+    ) -> Response {
+        let info = match self.vllm_prefill_info.as_ref() {
+            Some(info) => info,
+            None => {
+                error!("vLLM mode but vllm_prefill_info is None (router not initialized)");
+                return error::internal_error(
+                    "vllm_prefill_info_missing",
+                    "vLLM PD router not initialized with prefill bootstrap info",
+                );
+            }
+        };
+
+        let prefill_url = prefill.url().to_string();
+        let bootstrap_addr = match info.bootstrap_addrs.get(&prefill_url) {
+            Some(addr) => addr.clone(),
+            None => {
+                error!("No bootstrap_addr cached for prefill {}", prefill_url);
+                return error::internal_error(
+                    "bootstrap_addr_missing",
+                    format!("No bootstrap_addr cached for prefill {}", prefill_url),
+                );
+            }
+        };
+        // Mooncake DP rank: use worker's dp_rank if set, otherwise default to 0.
+        let dp_rank = prefill.dp_rank().unwrap_or(0);
+        let engine_id = match info
+            .engine_ids
+            .get(&prefill_url)
+            .and_then(|m| m.get(&dp_rank))
+        {
+            Some(eid) => eid.clone(),
+            None => {
+                error!(
+                    "No engine_id for prefill {} dp_rank {}",
+                    prefill_url, dp_rank
+                );
+                return error::internal_error(
+                    "engine_id_missing",
+                    format!(
+                        "No engine_id for prefill {} dp_rank {}",
+                        prefill_url, dp_rank
+                    ),
+                );
+            }
+        };
+
+        let request_id = Uuid::new_v4();
+        let transfer_id = format!("xfer-{}", request_id);
+
+        let prefill_kv = json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "transfer_id": transfer_id,
+        });
+        let decode_kv = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "remote_bootstrap_addr": bootstrap_addr,
+            "remote_engine_id": engine_id,
+            "transfer_id": transfer_id,
+        });
+
+        let prefill_request_json =
+            match Self::inject_kv_transfer_params(json_request.clone(), prefill_kv, true) {
+                Ok(v) => v,
+                Err(e) => return Self::handle_serialization_error(e),
+            };
+        let decode_request_json =
+            match Self::inject_kv_transfer_params(json_request, decode_kv, false) {
+                Ok(v) => v,
+                Err(e) => return Self::handle_serialization_error(e),
+            };
+
+        // Load tracking: streaming uses guards inside create_streaming_response.
+        let _prefill_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        let _decode_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+
+        // P request: fire-and-forget background task. Mooncake coordinates KV transfer
+        // via its own out-of-band channel; we only need to ensure P starts processing.
+        let prefill_post = self.build_post_with_headers(
+            &self.client,
+            prefill.url(),
+            context.route,
+            &prefill_request_json,
+            headers,
+            false,
+        );
+        let prefill_url_for_log = prefill.url().to_string();
+        let prefill_for_outcome = prefill.clone();
+        let prefill_request_id = request_id.to_string();
+        tokio::spawn(async move {
+            match prefill_post.send().await {
+                Ok(res) => {
+                    let status = res.status();
+                    if status.is_success() {
+                        debug!(
+                            "vLLM prefill {} request_id={} status={}",
+                            prefill_url_for_log, prefill_request_id, status
+                        );
+                    } else {
+                        warn!(
+                            "vLLM prefill {} request_id={} returned non-success status={}",
+                            prefill_url_for_log, prefill_request_id, status
+                        );
+                    }
+                    // Drain body so the connection can be reused.
+                    let _ = res.bytes().await;
+                    prefill_for_outcome.record_outcome(status.is_success());
+                }
+                Err(e) => {
+                    error!(
+                        "vLLM prefill {} request_id={} failed: {}",
+                        prefill_url_for_log, prefill_request_id, e
+                    );
+                    prefill_for_outcome.record_outcome(false);
+                }
+            }
+        });
+
+        // D request: client sees the streamed (or buffered) response from D.
+        let decode_post = self.build_post_with_headers(
+            &self.client,
+            decode.url(),
+            context.route,
+            &decode_request_json,
+            headers,
+            false,
+        );
+        let decode_result = decode_post.send().await;
+        events::RequestReceivedEvent {}.emit();
+
+        let res = match decode_result {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    decode_url = %decode.url(),
+                    error = %e,
+                    "vLLM decode request failed"
+                );
+                decode.record_outcome(false);
+                return error::bad_gateway(
+                    "decode_server_error",
+                    format!("Decode server error: {}", e),
+                );
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let not_error = status.is_success() || status.is_client_error();
+        decode.record_outcome(not_error);
+
+        if !status.is_success() {
+            error!(
+                "vLLM decode {} returned error status={}",
+                decode.url(),
+                status
+            );
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_DECODE,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
+            return self
+                .handle_decode_error_response(res, &context, prefill, decode)
+                .await;
+        }
+
+        if context.is_stream {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            self.create_streaming_response(
+                res.bytes_stream(),
+                status,
+                None,
+                false,
+                None,
+                Some(response_headers),
+                prefill,
+                decode,
+            )
+        } else {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            match res.bytes().await {
+                Ok(decode_body) => {
+                    let mut response = Response::new(Body::from(decode_body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => {
+                    error!("Failed to read vLLM decode response: {}", e);
+                    error::internal_error("read_response_failed", "Failed to read response")
+                }
+            }
+        }
     }
 
     async fn execute_dual_dispatch<T: Serialize + Clone>(
@@ -1237,7 +1736,7 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.dispatch_pd(headers, body, context).await
     }
 
     async fn route_chat(
@@ -1279,7 +1778,7 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.dispatch_pd(headers, body, context).await
     }
 
     async fn route_completion(
@@ -1312,7 +1811,7 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.dispatch_pd(headers, body, context).await
     }
 
     fn router_type(&self) -> &'static str {
@@ -1336,6 +1835,8 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            backend: BackendType::Sglang,
+            vllm_prefill_info: None,
         }
     }
 
