@@ -328,12 +328,16 @@ def _precompute_freqs_cis(
 def _apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
-    """Apply rotary positional embeddings IN-PLACE.
+    """Apply rotary positional embeddings IN-PLACE (manual complex multiply).
 
     Port of inference/model.py:232-244. The input tensor `x` is overwritten with
     the rotated values; the same tensor is also returned for chaining.
     `inverse=True` uses the conjugate (un-rotation) — used on the attention
     output to remove absolute-position embedding from the value contribution.
+
+    NOTE: forward RoPE on Q/KV now goes through `_V4RoPE` (aiter kernel). This
+    function is kept ONLY for the output inverse step, which aiter does not
+    expose.
     """
     y = x
     x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
@@ -346,6 +350,154 @@ def _apply_rotary_emb(
     x = torch.view_as_real(x * freqs_cis).flatten(-2)
     y.copy_(x)
     return y
+
+
+@lru_cache(8)
+def _build_cos_sin_cache(
+    rotary_dim: int,
+    max_seq_len: int,
+    base: float,
+    factor: float,
+    original_seq_len: int,
+    beta_fast: int,
+    beta_slow: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Shared cos/sin cache for `_V4RoPE`, keyed by (rope params, dtype, device).
+
+    V4 has only 3 distinct rope param sets (HCA / CSA / Dense) — without
+    deduping we'd materialize 62 copies per rank (~16GB at fp32 complex,
+    ~8GB at bf16). Per-device caching means each rank holds exactly one
+    cos+sin pair per param set. Cache size 8 covers (HCA, CSA, Dense) ×
+    (cuda:0..N) headroom.
+    """
+    freqs = _precompute_freqs_cis(
+        rotary_dim,
+        max_seq_len,
+        original_seq_len,
+        base,
+        factor,
+        beta_fast,
+        beta_slow,
+    )
+    cos = (
+        freqs.real.to(device=device, dtype=dtype)
+        .contiguous()
+        .unsqueeze(-2)
+        .unsqueeze(-2)
+    )
+    sin = (
+        freqs.imag.to(device=device, dtype=dtype)
+        .contiguous()
+        .unsqueeze(-2)
+        .unsqueeze(-2)
+    )
+    return cos, sin
+
+
+class _V4RoPE(nn.Module):
+    """Per-token-positions RoPE wrapper around aiter's `rope_cached_*_fwd_inplace`.
+
+    Builds the cos/sin cache via V4's exact YaRN math (`_precompute_freqs_cis`),
+    then dispatches to the aiter HIP kernel. Works on a pre-sliced rope tensor
+    (`head_size == rotary_dim`) so callers stay symmetric with the existing
+    `_apply_rotary_emb(x[..., -rd:], ...)` pattern.
+
+    `freqs_for_positions(positions)` rebuilds a complex tensor from the cos/sin
+    slices for the attention output's inverse RoPE step (which aiter does not
+    expose). We deliberately do NOT keep a complex `freqs_cis` buffer: cos/sin
+    in bf16 is half the memory of complex64, and 62 layers × 1M positions ×
+    32 freqs adds up fast.
+    """
+
+    def __init__(
+        self,
+        rotary_dim: int,
+        max_seq_len: int,
+        base: float,
+        factor: float,
+        original_seq_len: int,
+        beta_fast: int,
+        beta_slow: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.rotary_dim = rotary_dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        self.factor = factor
+        self.original_seq_len = original_seq_len
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.dtype = dtype
+        # Cos/sin caches are fetched lazily on first forward via the
+        # device-keyed `_build_cos_sin_cache`; this lets all 62 layers share
+        # one cache per (rope params, device) instead of registering 62
+        # buffers that .to() would each clone onto GPU.
+
+    def _caches(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        return _build_cos_sin_cache(
+            self.rotary_dim,
+            self.max_seq_len,
+            self.base,
+            self.factor,
+            self.original_seq_len,
+            self.beta_fast,
+            self.beta_slow,
+            self.dtype,
+            device,
+        )
+
+    def freqs_for_positions(self, positions: torch.Tensor) -> torch.Tensor:
+        """Rebuild the complex `freqs_cis` slice for the given positions.
+
+        Used by the attention output's inverse RoPE step.
+        Returns: complex64 [num_tokens, rotary_dim // 2].
+        """
+        cos_cache, sin_cache = self._caches(positions.device)
+        cos = cos_cache.index_select(0, positions).squeeze(-2).squeeze(-2).float()
+        sin = sin_cache.index_select(0, positions).squeeze(-2).squeeze(-2).float()
+        return torch.complex(cos, sin)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+    ) -> None:
+        """In-place RoPE on `query` (and `key` if given). All inputs are the
+        rope-slice only (`head_size == rotary_dim`)."""
+        import aiter as ops
+
+        cos, sin = self._caches(query.device)
+        num_tokens = positions.numel()
+        # rotate_style=1 → GPT-J / interleaved (matches V4's view_as_complex).
+        rotate_style = 1
+        q_view = query.view(1, num_tokens, -1, self.rotary_dim)
+        positions_view = positions.view(1, num_tokens)
+        if key is not None:
+            k_view = key.view(1, num_tokens, -1, self.rotary_dim)
+            ops.rope_cached_positions_2c_fwd_inplace(
+                q_view,
+                k_view,
+                cos,
+                sin,
+                positions_view,
+                rotate_style,
+                reuse_freqs_front_part=True,
+                nope_first=False,
+            )
+        else:
+            ops.rope_cached_positions_fwd_inplace(
+                q_view,
+                cos,
+                sin,
+                positions_view,
+                rotate_style,
+                reuse_freqs_front_part=True,
+                nope_first=False,
+            )
 
 
 @lru_cache(1)
@@ -462,7 +614,7 @@ class Compressor(nn.Module):
 
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: Optional[torch.Tensor] = None
-        self.freqs_cis: Optional[torch.Tensor] = None
+        self.rotary_emb: Optional[_V4RoPE] = None
 
         # Decode-phase state buffers. With overlap: state[:, :ratio] holds the
         # overlapping window from the previous compression block; state[:, ratio:]
@@ -506,21 +658,27 @@ class Compressor(nn.Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
-    def forward(self, x: torch.Tensor, start_pos: int) -> Optional[torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, positions: torch.Tensor
+    ) -> Optional[torch.Tensor]:
         """Compress KV for the input tokens. Writes into self.kv_cache when a
         compression block boundary is hit; otherwise just buffers state and returns None.
 
         Args:
             x: [num_tokens, dim] (2D, ATOM convention) or [B, S, dim] (3D, legacy).
                 2D input is treated as a single sequence (B=1 implicit).
-            start_pos: starting position in the absolute sequence (0 = prefill).
+            positions: [num_tokens] absolute token positions. PR1 single-sequence
+                assumes positions are contiguous; `start_pos = positions[0]` drives
+                the ring-buffer index. PR3 multi-sequence will need per-token slot
+                indexing instead.
         Returns:
             Compressed KV slice that was just written ([1, S/ratio, head_dim] in
             prefill, or [1, 1, head_dim] in decode), or None if no compression
             boundary was hit on this call.
         """
         assert self.kv_cache is not None, "compressor.kv_cache must be set by owner"
-        assert self.freqs_cis is not None, "compressor.freqs_cis must be set by owner"
+        assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
+        start_pos = int(positions[0].item())
         if x.dim() == 2:
             x = x.unsqueeze(0)  # [num_tokens, dim] → [1, num_tokens, dim]
         bsz, seqlen, _ = x.size()
@@ -608,10 +766,14 @@ class Compressor(nn.Module):
 
         # Apply RoPE to the rope-head-dim tail of compressed entries.
         if start_pos == 0:
-            freqs_cis = self.freqs_cis[:cutoff:ratio]
+            comp_pos = torch.arange(0, cutoff, ratio, device=x.device, dtype=torch.long)
         else:
-            freqs_cis = self.freqs_cis[start_pos + 1 - self.compress_ratio].unsqueeze(0)
-        _apply_rotary_emb(kv[..., -rd:], freqs_cis)
+            comp_pos = torch.tensor(
+                [start_pos + 1 - self.compress_ratio],
+                device=x.device,
+                dtype=torch.long,
+            )
+        self.rotary_emb(comp_pos, kv[..., -rd:])
 
         # QAT round-trip: rotated branch (Indexer) uses Hadamard + FP4 sim;
         # plain branch uses FP8 sim on non-rope dims only.
@@ -688,13 +850,13 @@ class Indexer(nn.Module):
             ),
             persistent=False,
         )
-        self.freqs_cis: Optional[torch.Tensor] = None
+        self.rotary_emb: Optional[_V4RoPE] = None
 
     def forward(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
-        start_pos: int,
+        positions: torch.Tensor,
         offset: int,
     ) -> torch.Tensor:
         """Compute sparse top-k indices over the indexer's compressed KV cache.
@@ -702,34 +864,35 @@ class Indexer(nn.Module):
         Args:
             x: [num_tokens, dim] input hidden states (for compressor + weights_proj).
             qr: [num_tokens, q_lora_rank] latent query shared with main Attention's q_a.
-            start_pos: absolute sequence start position.
+            positions: [num_tokens] absolute token positions (per-token indices
+                used by aiter RoPE; `start_pos = positions[0]` drives index masks).
             offset: offset added to returned indices to land them in the
                 concatenated (window || compressed) KV layout consumed by sparse_attn.
         Returns:
             topk_idxs: [1, num_tokens, K] int (B=1 implicit). -1 = future-masked.
         """
-        assert self.freqs_cis is not None
+        assert self.rotary_emb is not None
         assert x.dim() == 2 and qr.dim() == 2
         seqlen = x.size(0)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        start_pos = int(positions[0].item())
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         end_pos = start_pos + seqlen
 
-        # Lazy plumb the indexer's kv_cache + freqs_cis into its compressor.
+        # Lazy plumb the indexer's kv_cache + rotary_emb into its compressor.
         if self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache
-            self.compressor.freqs_cis = self.freqs_cis
+            self.compressor.rotary_emb = self.rotary_emb
 
         # ----- Indexer Q (2D Linear, then add B=1 dim for RoPE / einsum) -----
         q = self.wq_b(qr).view(seqlen, self.n_local_heads, self.head_dim)
         q = q.unsqueeze(0)  # [1, S, H, D]
-        _apply_rotary_emb(q[..., -rd:], freqs_cis)
+        self.rotary_emb(positions, q[..., -rd:])
         q = rotate_activation(q)
         fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
 
         # ----- Indexer KV (Compressor takes 2D, mutates kv_cache) -----
-        self.compressor(x, start_pos)
+        self.compressor(x, positions)
         # weights_proj is ATOM Linear → 2D input; restore B=1 dim for einsum.
         weights = (
             self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
@@ -887,8 +1050,11 @@ class DeepseekV4Attention(nn.Module):
             persistent=False,
         )
 
-        # ----- RoPE freqs (own freqs, not shared): YaRN for compressed
-        # attention layers (long context), plain rope for dense (window-only) -----
+        # ----- RoPE (own per-layer instance, not shared): YaRN for compressed
+        # attention layers (long context), plain RoPE for dense (window-only).
+        # Wraps aiter's `rope_cached_*_fwd_inplace` kernel so RoPE is driven by
+        # per-token `positions` (groundwork for PR3 multi-sequence), while the
+        # cos/sin cache uses V4's exact YaRN math via `_precompute_freqs_cis`.
         if self.compress_ratio:
             original_seq_len, rope_theta = (
                 args.original_seq_len,
@@ -896,16 +1062,16 @@ class DeepseekV4Attention(nn.Module):
             )
         else:
             original_seq_len, rope_theta = 0, args.rope_theta
-        freqs_cis = _precompute_freqs_cis(
-            self.rope_head_dim,
-            args.max_seq_len,
-            original_seq_len,
-            rope_theta,
-            args.rope_factor,
-            args.beta_fast,
-            args.beta_slow,
+        self.rotary_emb = _V4RoPE(
+            rotary_dim=self.rope_head_dim,
+            max_seq_len=args.max_seq_len,
+            base=rope_theta,
+            factor=args.rope_factor,
+            original_seq_len=original_seq_len,
+            beta_fast=args.beta_fast,
+            beta_slow=args.beta_slow,
+            dtype=torch.bfloat16,
         )
-        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
     def process_weights_after_loading(self) -> None:
         """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
@@ -959,14 +1125,17 @@ class DeepseekV4Attention(nn.Module):
 
         self.wo_a.quant_type = _QT.No
 
-    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
-        """Compute attention for `x` at absolute position `start_pos`.
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Compute attention for `x` at absolute token `positions`.
 
         Args:
             x: [num_tokens, dim] flat ATOM convention. Single-sequence
                 (B=1 implicit; multi-sequence batching needs attn_metadata,
                 deferred until ATOM's scheduler integration).
-            start_pos: absolute position of the first token in this batch.
+            positions: [num_tokens] absolute token positions. PR1 single-seq
+                assumes contiguous positions starting at `positions[0]`; that
+                start_pos drives the KV ring-buffer index. PR3 will replace the
+                ring-buffer with per-request slot management.
         Returns:
             [num_tokens, dim] attention output (BF16).
         """
@@ -974,18 +1143,18 @@ class DeepseekV4Attention(nn.Module):
             x.dim() == 2
         ), f"DeepseekV4Attention expects 2D [num_tokens, dim], got {x.shape}"
         seqlen = x.size(0)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        start_pos = int(positions[0].item())
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        # First-call plumbing: hand the (compressed-half) KV cache + freqs_cis
+        # First-call plumbing: hand the (compressed-half) KV cache + rotary_emb
         # to the compressor / indexer.
         if self.compress_ratio and self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache[:, win:]
-            self.compressor.freqs_cis = self.freqs_cis
+            self.compressor.rotary_emb = self.rotary_emb
             if self.indexer is not None:
-                self.indexer.freqs_cis = self.freqs_cis
+                self.indexer.rotary_emb = self.rotary_emb
 
         # Reset all KV buffers on new prefill (start_pos==0). The ATOM warmup
         # forward (seqlen=MAX_BATCHED_TOKENS with zeros) fills these buffers
@@ -1010,12 +1179,13 @@ class DeepseekV4Attention(nn.Module):
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
         # Insert B=1 dim for RoPE / sparse_attn convention.
         q = q.unsqueeze(0)  # [1, S, H, D]
-        _apply_rotary_emb(q[..., -rd:], freqs_cis)
 
         # ----- Window KV: project, RMSNorm, RoPE on rope dims, FP8-sim on nope -----
         kv = self.wkv(x)  # [S, head_dim]
         kv = self.kv_norm(kv).unsqueeze(0)  # [1, S, head_dim]
-        _apply_rotary_emb(kv[..., -rd:], freqs_cis)
+
+        # Forward RoPE on Q + KV's rope tail in one fused aiter call.
+        self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
         # ----- Build topk_idxs (B=1 implicit) -----
@@ -1023,7 +1193,7 @@ class DeepseekV4Attention(nn.Module):
         if self.compress_ratio:
             offset = kv.size(1) if start_pos == 0 else win
             if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+                compress_topk_idxs = self.indexer(x, qr, positions, offset)
             else:
                 compress_topk_idxs = _get_compress_topk_idxs(
                     ratio, 1, seqlen, start_pos, offset, device=x.device
@@ -1047,13 +1217,13 @@ class DeepseekV4Attention(nn.Module):
                     :, -win:
                 ].split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio:
-                if (kv_compress := self.compressor(x, start_pos)) is not None:
+                if (kv_compress := self.compressor(x, positions)) is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
             self.kv_cache[:1, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
-                self.compressor(x, start_pos)
+                self.compressor(x, positions)
             o = sparse_attn(
                 q,
                 self.kv_cache[:1],
@@ -1062,9 +1232,12 @@ class DeepseekV4Attention(nn.Module):
                 self.softmax_scale,
             )
 
-        # Inverse RoPE on output's rope dims to remove absolute-position contribution
-        # carried in by the value-side RoPE of the KV entries.
-        _apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
+        # Inverse RoPE on output's rope dims to remove absolute-position
+        # contribution carried in by the value-side RoPE of the KV entries.
+        # aiter has no inverse-RoPE kernel; rebuild per-token complex freqs
+        # from the rotary_emb's cos/sin cache and reuse the manual multiply.
+        freqs_slice = self.rotary_emb.freqs_for_positions(positions)
+        _apply_rotary_emb(o[..., -rd:], freqs_slice, inverse=True)
 
         # ----- Grouped output LoRA -----
         # o: [1, S, H, D] → drop B; reshape into groups for the einsum.
@@ -1597,7 +1770,7 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        positions: torch.Tensor,
         input_ids: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # ----- Attention sub-layer with mHC mixing -----
@@ -1606,7 +1779,7 @@ class Block(nn.Module):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
-        x = self.attn(x, start_pos)
+        x = self.attn(x, positions)
         x = self.hc_post(x, residual, post, comb)
 
         # ----- FFN sub-layer with mHC mixing -----
@@ -1741,14 +1914,14 @@ class MTPBlock(Block):
         self.head: Optional[ParallelHead] = None
 
     def forward(
-        self, x: torch.Tensor, start_pos: int, input_ids: torch.Tensor
+        self, x: torch.Tensor, positions: torch.Tensor, input_ids: torch.Tensor
     ) -> torch.Tensor:
         """Forward.
 
         Args:
             x: residual stream from main model. Either [num_tokens, hc, D]
                 (ATOM 2D-flat convention) or [B, S, hc, D] (legacy 4D).
-            start_pos: absolute position offset.
+            positions: [num_tokens] absolute token positions.
             input_ids: matching token ids.
         Returns:
             Logits of the last token (vocab projected by self.head).
@@ -1763,7 +1936,7 @@ class MTPBlock(Block):
         # adds the hc dim before the trailing D so [num_tokens, D] → [num_tokens, 1, D]
         # broadcasts correctly against x [num_tokens, hc, D]. Same for 4D path.
         x = self.e_proj(e).unsqueeze(-2) + self.h_proj(x)
-        x = super().forward(x, start_pos, input_ids)
+        x = super().forward(x, positions, input_ids)
         logits = self.head(
             x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
         )
@@ -1825,7 +1998,7 @@ class DeepseekV4Model(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        start_pos: int = 0,
+        positions: Optional[torch.Tensor] = None,
         **model_kwargs: dict,
     ) -> torch.Tensor:
         """Forward.
@@ -1834,7 +2007,8 @@ class DeepseekV4Model(nn.Module):
             input_ids: 1D `[num_tokens]` (ATOM 2D-flat convention) OR 2D
                 `[B, S]` (legacy reference convention; treated as a single
                 sequence of B*S tokens — only correct for B=1).
-            start_pos: absolute position of the first token.
+            positions: [num_tokens] absolute token positions. If None, defaults
+                to `arange(num_tokens)` (i.e. start_pos=0 prefill).
         Returns:
             Logits of the last token: `[vocab]` (1D path) or `[B, vocab]` (2D path).
         """
@@ -1848,8 +2022,13 @@ class DeepseekV4Model(nn.Module):
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
+        if positions is None:
+            positions = torch.arange(
+                input_ids.numel(), device=input_ids.device, dtype=torch.long
+            )
+
         for layer in self.layers:
-            h = layer(h, start_pos, input_ids)
+            h = layer(h, positions, input_ids)
 
         logits = self.head(
             h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
@@ -1928,8 +2107,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **model_kwargs: dict,
     ) -> torch.Tensor:
-        start_pos = int(positions[0].item()) if positions is not None else 0
-        return self.model(input_ids=input_ids, start_pos=start_pos, **model_kwargs)
+        return self.model(input_ids=input_ids, positions=positions, **model_kwargs)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # In V4, the LM head is fused into DeepseekV4Model.forward (it consumes
