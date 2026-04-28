@@ -358,7 +358,10 @@ class GatedDeltaNet(nn.Module):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            from aiter.ops.triton.gated_delta_net.gated_delta_rule import chunk_gated_delta_rule_opt_vk
+            from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
+                chunk_gated_delta_rule_opt_vk,
+            )
+
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
