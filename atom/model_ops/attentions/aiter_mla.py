@@ -681,9 +681,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     sparse_per_token_lens, dtype=np.int32
                 )
                 sum_tokens = bs * max_seqlen_q
-                var["sparse_kv_indptr"].np[sum_scheduled_tokens + 1 : sum_tokens + 1] = (
-                    var["sparse_kv_indptr"].np[sum_scheduled_tokens]
-                )
+                var["sparse_kv_indptr"].np[
+                    sum_scheduled_tokens + 1 : sum_tokens + 1
+                ] = var["sparse_kv_indptr"].np[sum_scheduled_tokens]
                 vars_used.append(("sparse_kv_indptr", sum_tokens + 1))
                 vars_used.append(("sparse_cu_seqlens_q", sum_tokens + 1))
                 metadata_deps.add("sparse_kv_indptr")
@@ -762,9 +762,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 scheduled_bs, dtype=torch.int32, device=self.device
             ).repeat_interleave(max_seqlen_q)
             self._token_to_seq_idxs_gpu[sum_scheduled_tokens:sum_tokens] = 0
-            attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[
-                :sum_tokens
-            ]
+            attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:sum_tokens]
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
