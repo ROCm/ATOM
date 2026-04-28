@@ -1278,7 +1278,7 @@ class MoE(nn.Module):
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
-                swiglu_limit=0.0,
+                swiglu_limit=args.swiglu_limit,
                 quant_config=qc,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
@@ -1299,7 +1299,9 @@ class MoE(nn.Module):
                 ]
             )
             assert args.n_shared_experts == 1
-            self.shared_experts = Expert(args.dim, args.moe_inter_dim, swiglu_limit=0.0)
+            self.shared_experts = Expert(
+                args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit
+            )
 
     def _hash_topk(
         self,
