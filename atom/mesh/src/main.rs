@@ -1,8 +1,8 @@
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use mesh::{
     config::{
-        CircuitBreakerConfig, ConfigResult, HealthCheckConfig, MetricsConfig, PolicyConfig,
-        RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+        BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig, MetricsConfig,
+        PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
@@ -44,12 +44,24 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
 pub enum Backend {
     #[value(name = "sglang")]
     Sglang,
+    #[value(name = "vllm")]
+    Vllm,
 }
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Backend::Sglang => write!(f, "sglang"),
+            Backend::Vllm => write!(f, "vllm"),
+        }
+    }
+}
+
+impl From<Backend> for BackendType {
+    fn from(b: Backend) -> Self {
+        match b {
+            Backend::Sglang => BackendType::Sglang,
+            Backend::Vllm => BackendType::Vllm,
         }
     }
 }
@@ -438,6 +450,7 @@ impl CliArgs {
 
         let builder = RouterConfig::builder()
             .mode(mode)
+            .backend(self.backend.into())
             .policy(policy)
             .connection_mode(connection_mode)
             .host(&self.host)

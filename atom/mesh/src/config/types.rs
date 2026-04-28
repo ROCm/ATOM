@@ -3,10 +3,23 @@ use serde::{Deserialize, Serialize};
 use super::ConfigResult;
 use crate::core::ConnectionMode;
 
+/// Backend runtime type for inference workers.
+/// Determines PD-disaggregation protocol (SGLang dual-dispatch+bootstrap vs vLLM Mooncake kv_transfer_params).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BackendType {
+    #[default]
+    #[serde(rename = "sglang")]
+    Sglang,
+    #[serde(rename = "vllm")]
+    Vllm,
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
     pub mode: RoutingMode,
+    #[serde(default)]
+    pub backend: BackendType,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
     pub policy: PolicyConfig,
@@ -314,6 +327,7 @@ impl Default for RouterConfig {
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
+            backend: BackendType::Sglang,
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 3001,
