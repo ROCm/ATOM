@@ -1,6 +1,6 @@
 use super::{
-    CircuitBreakerConfig, ConfigResult, HealthCheckConfig, MetricsConfig, PolicyConfig,
-    RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+    BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig, MetricsConfig,
+    PolicyConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -23,6 +23,13 @@ impl RouterConfigBuilder {
 
     pub fn from_config_ref(config: &RouterConfig) -> Self {
         Self::from_config(config.clone())
+    }
+
+    // ==================== Backend ====================
+
+    pub fn backend(mut self, backend: BackendType) -> Self {
+        self.config.backend = backend;
+        self
     }
 
     // ==================== Routing Mode ====================
