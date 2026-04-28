@@ -472,9 +472,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             max_seqlen_k,
         )
-        return self.set_mla_persistent_worker_buffers(
+        result = self.set_mla_persistent_worker_buffers(
             bs, max_seqlen_q, only_update, num_reject_tokens
         )
+        if self.is_sparse:
+            result["sparse_kv_indptr"] = sparse_kv_indptr
+        return result
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
@@ -677,8 +680,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
                     sparse_per_token_lens, dtype=np.int32
                 )
-                vars_used.append(("sparse_kv_indptr", sum_scheduled_tokens + 1))
-                vars_used.append(("sparse_cu_seqlens_q", sum_scheduled_tokens + 1))
+                sum_tokens = bs * max_seqlen_q
+                var["sparse_kv_indptr"].np[sum_scheduled_tokens + 1 : sum_tokens + 1] = (
+                    var["sparse_kv_indptr"].np[sum_scheduled_tokens]
+                )
+                vars_used.append(("sparse_kv_indptr", sum_tokens + 1))
+                vars_used.append(("sparse_cu_seqlens_q", sum_tokens + 1))
                 metadata_deps.add("sparse_kv_indptr")
             else:
                 sparse_context_lens = np.clip(
@@ -721,9 +728,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
 
         if is_sparse_mtp:
+            sum_tokens = bs * max_seqlen_q
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
             ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
-                sum_scheduled_tokens
+                sum_tokens
             )
         else:
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
@@ -743,17 +751,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 setattr(attn_metadata, k, v)
 
         if is_sparse_mtp:
+            sum_tokens = bs * max_seqlen_q
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
-                : sum_scheduled_tokens + 1
+                : sum_tokens + 1
             ]
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
-            ].gpu[:sum_scheduled_tokens]
+            ].gpu[:sum_tokens]
             self._token_to_seq_idxs_gpu[:sum_scheduled_tokens] = torch.arange(
                 scheduled_bs, dtype=torch.int32, device=self.device
             ).repeat_interleave(max_seqlen_q)
+            self._token_to_seq_idxs_gpu[sum_scheduled_tokens:sum_tokens] = 0
             attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[
-                :sum_scheduled_tokens
+                :sum_tokens
             ]
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
