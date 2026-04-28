@@ -5,7 +5,7 @@ import itertools
 import logging
 import time
 from dataclasses import fields
-from typing import List, Union
+from typing import List, Optional, Union
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager
@@ -184,7 +184,52 @@ class InputOutputProcessor:
     ):
         """responsible for:
         1) Tokenize
-        2) Create Sequence object"""
+        2) Create Sequence object
+
+        Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
+        callers which expect exactly one ``Sequence`` back cannot silently
+        drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
+        """
+        if getattr(sampling_params, "n", 1) > 1:
+            raise ValueError(
+                "preprocess() returns a single Sequence; for SamplingParams.n > 1 "
+                "call preprocess_fanout() and manage the returned list."
+            )
+        seqs = self.preprocess_fanout(
+            prompt_or_tokens,
+            sampling_params,
+            stream_callback=stream_callback,
+            kv_transfer_params=kv_transfer_params,
+        )
+        return seqs[0]
+
+    def preprocess_fanout(
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        stream_callback=None,
+        stream_callbacks: Optional[List] = None,
+        kv_transfer_params=None,
+        parent_request_id: Optional[str] = None,
+    ) -> List[Sequence]:
+        """Tokenize once and materialize ``sampling_params.n`` Sequences.
+
+        Returns a list of length ``n``. For ``n == 1`` this is functionally
+        equivalent to the legacy single-sequence path. For ``n > 1``:
+
+        * The prompt is tokenized a single time and the token list is copied
+          into each sibling (``Sequence`` copies internally, so mutations stay
+          isolated).
+        * Every sibling is marked ``needs_independent_noise=True`` so the
+          sampler generates fresh per-row noise instead of reusing the cached
+          shared exponential tensor. Without this, siblings with identical
+          logits would emit identical tokens.
+        * Per-sibling ``stream_callbacks`` can be supplied to route streaming
+          deltas to independent queues (one per choice index). Falls back to
+          the scalar ``stream_callback`` for every sibling.
+        """
+        n = max(1, int(getattr(sampling_params, "n", 1)))
+
         tokens = (
             self.tokenizer.encode(prompt_or_tokens)
             if isinstance(prompt_or_tokens, str)
@@ -199,28 +244,50 @@ class InputOutputProcessor:
                 else sampling_params.stop_strings
             )
             for stop_str in stops:
-                # Encode the full stop string as a sequence of tokens
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
 
-        seq = Sequence(
-            tokens,
-            self.block_size,
-            sampling_params,
-            stop_token_sequences,
-            stream_callback=stream_callback,
-            num_draft_tokens=self.num_speculative_tokens,
-            mamba_enabled=self.mamba_enabled,
-            kv_transfer_params=kv_transfer_params,
-        )
-        seq.arrive_time = time.time()
-        self.requests[seq.id] = seq
-        logger.info(
-            f"Request {seq.id} arrived, input tokens: {len(tokens)}, pending requests: {len(self.requests)} "
-            # f"<{prompt_or_tokens=}>"
-        )
-        return seq
+        if stream_callbacks is not None and len(stream_callbacks) != n:
+            raise ValueError(
+                f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
+            )
+
+        seqs: List[Sequence] = []
+        for i in range(n):
+            cb = (
+                stream_callbacks[i] if stream_callbacks is not None else stream_callback
+            )
+            seq = Sequence(
+                tokens,
+                self.block_size,
+                sampling_params,
+                stop_token_sequences,
+                stream_callback=cb,
+                num_draft_tokens=self.num_speculative_tokens,
+                mamba_enabled=self.mamba_enabled,
+                kv_transfer_params=kv_transfer_params,
+                needs_independent_noise=(n > 1),
+                parent_request_id=parent_request_id,
+                sibling_index=i,
+            )
+            seq.arrive_time = time.time()
+            self.requests[seq.id] = seq
+            seqs.append(seq)
+
+        if n == 1:
+            logger.info(
+                f"Request {seqs[0].id} arrived, input tokens: {len(tokens)}, "
+                f"pending requests: {len(self.requests)}"
+            )
+        else:
+            logger.info(
+                f"Request {parent_request_id or seqs[0].id} fanned out into "
+                f"{n} siblings ({seqs[0].id}..{seqs[-1].id}), "
+                f"input tokens: {len(tokens)}, "
+                f"pending requests: {len(self.requests)}"
+            )
+        return seqs
 
     def postprocess(self, reqs: List[Sequence]):
         """responsible for:

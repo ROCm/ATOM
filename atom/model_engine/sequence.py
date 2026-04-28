@@ -44,6 +44,9 @@ class Sequence:
         kv_transfer_params: dict = None,
         num_draft_tokens: int = 0,
         mamba_enabled: bool = False,
+        needs_independent_noise: bool = False,
+        parent_request_id: Optional[str] = None,
+        sibling_index: int = 0,
     ):
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
@@ -86,6 +89,17 @@ class Sequence:
 
         # accepted tokens for spec decode
         self.num_bonus_tokens = 0
+
+        # Fan-out bookkeeping for SamplingParams.n > 1. When True, the sampler
+        # must produce fresh, per-row random noise for this sequence instead
+        # of reusing the cached shared exponential tensor, otherwise sibling
+        # sequences with identical logits would emit identical tokens.
+        self.needs_independent_noise = needs_independent_noise
+        # Parent request id (user-facing id from the API layer) and this
+        # sequence's index within the fan-out group [0, n). Both default
+        # to safe values for single-sample requests.
+        self.parent_request_id = parent_request_id
+        self.sibling_index = sibling_index
 
     def __len__(self):
         return self._num_tokens

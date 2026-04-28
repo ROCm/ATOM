@@ -256,6 +256,13 @@ class ScheduledBatch:
         ]
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
+        # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
+        # and therefore requires fresh per-row random noise at the sampler
+        # rather than the cached shared exponential tensor.
+        self.needs_independent_noise = np.asarray(
+            [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
+            dtype=bool,
+        )
 
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
