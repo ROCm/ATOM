@@ -249,10 +249,10 @@ class ScheduledBatch:
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
-        self.mamba_state_slots = [
-            seq.mamba_state_slot
+        self.per_req_cache_groups = [
+            seq.per_req_cache_group
             for seq in seqs.values()
-            if seq.mamba_enabled and seq.mamba_state_slot >= 0
+            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)

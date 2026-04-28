@@ -67,9 +67,8 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 |---|---|---|
 | `hf_config` | `PretrainedConfig` | Loaded automatically via `get_hf_config(model)` |
 | `generation_config` | `GenerationConfig` | Loaded automatically via `get_generation_config(model)` |
-| `mamba_equiv_per_req` | `int` | Number of KV cache block equivalents reserved per request for GDN recurrent state (hybrid models only); computed by `ModelRunner.get_num_blocks()` |
-| `num_mamba_groups` | `int` | Number of per-request GDN state slot groups available (= `max_num_seqs` for hybrid models, 0 otherwise); computed by `ModelRunner.get_num_blocks()` |
-| `max_mamba_slots` | `int` | Maximum number of GDN state slots (including slots for speculative tokens); computed by `ModelRunner.get_num_blocks()` |
+| `per_req_cache_equiv_blocks` | `int` | Number of KV cache block equivalents reserved per request for the per-request stateful-attention cache (currently GDN recurrent state; future stateful attentions plug in via `AttentionMetadataBuilder.compute_per_req_cache_bytes()`); computed by `ModelRunner.get_num_blocks()` |
+| `num_per_req_cache_groups` | `int` | Number of per-request slot groups available (= `max_num_seqs` for stateful-attention models, 0 otherwise); computed by `ModelRunner.get_num_blocks()` |
 
 ---
 
