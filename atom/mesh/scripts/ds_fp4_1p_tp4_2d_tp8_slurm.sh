@@ -522,6 +522,38 @@ wait_endpoint() {
     "
 }
 
+wait_grpc() {
+    local node="$1" host="$2" port="$3" timeout="$4" name="$5"
+    echo "[wait] ${name} -> grpc://${host}:${port} (timeout ${timeout}s)"
+    srun --nodelist="$node" --nodes=1 --ntasks=1 bash -lc "
+        deadline=\$(( \$(date +%s) + ${timeout} ))
+        while true; do
+            if docker exec '${CONTAINER}' python3 -c '
+import grpc, sys
+ch = grpc.insecure_channel(\"${host}:${port}\")
+try:
+    from grpc_health.v1 import health_pb2, health_pb2_grpc
+    stub = health_pb2_grpc.HealthStub(ch)
+    r = stub.Check(health_pb2.HealthCheckRequest(), timeout=5)
+    sys.exit(0 if r.status == health_pb2.HealthCheckResponse.SERVING else 1)
+except ImportError:
+    grpc.channel_ready_future(ch).result(timeout=5)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+' 2>/dev/null; then
+                echo '[wait][OK] ${name} ready (gRPC SERVING)'
+                break
+            fi
+            if [[ \$(date +%s) -ge \$deadline ]]; then
+                echo '[wait][FAIL] ${name} not ready after ${timeout}s'
+                exit 1
+            fi
+            sleep 10
+        done
+    "
+}
+
 # Send a real /v1/completions request and require a non-empty response.
 # This is the only reliable way to confirm the PD pipeline (prefill -> mooncake
 # KV transfer -> decode) is fully operational. The /v1/models endpoint returns
@@ -580,12 +612,12 @@ srun --nodelist="$DECODE_NODE_2" --nodes=1 --ntasks=1 bash -lc "
     docker exec -d '${CONTAINER}' bash '${LOG_ROOT}/scripts/decode_2.sh'
 "
 
-# ======================== 4. wait for servers ========================
-wait_endpoint "$PREFILL_NODE"   "http://${PREFILL_IP}:${PREFILL_PORT}/v1/models" \
+# ======================== 4. wait for servers (gRPC health check) ========================
+wait_grpc "$PREFILL_NODE"   "${PREFILL_IP}"  "${PREFILL_PORT}" \
     "$WAIT_SERVER_TIMEOUT" "prefill"
-wait_endpoint "$DECODE_NODE_1"  "http://${DECODE_IP_1}:${DECODE_PORT}/v1/models" \
+wait_grpc "$DECODE_NODE_1"  "${DECODE_IP_1}" "${DECODE_PORT}" \
     "$WAIT_SERVER_TIMEOUT" "decode-1"
-wait_endpoint "$DECODE_NODE_2"  "http://${DECODE_IP_2}:${DECODE_PORT}/v1/models" \
+wait_grpc "$DECODE_NODE_2"  "${DECODE_IP_2}" "${DECODE_PORT}" \
     "$WAIT_SERVER_TIMEOUT" "decode-2"
 
 # ======================== 5. start router (detached) ========================
