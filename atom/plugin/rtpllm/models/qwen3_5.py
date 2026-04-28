@@ -146,11 +146,58 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             return None
         return torch.cat(parts, dim=0)
 
+    def _build_positions_from_attention_inputs(
+        self, attn_inputs: Any, model_device: torch.device
+    ) -> torch.Tensor | None:
+        if attn_inputs is None:
+            return None
+        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
+        input_lengths = getattr(attn_inputs, "input_lengths", None)
+        prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
+        sequence_lengths = getattr(attn_inputs, "sequence_lengths", None)
+
+        if is_prefill and input_lengths is not None and input_lengths.numel() > 0:
+            parts: list[torch.Tensor] = []
+            input_lengths_cpu = input_lengths.detach().to(device="cpu")
+            prefix_lengths_cpu = (
+                prefix_lengths.detach().to(device="cpu")
+                if prefix_lengths is not None and prefix_lengths.numel() > 0
+                else None
+            )
+            for i, token_num in enumerate(input_lengths_cpu.tolist()):
+                token_num = int(token_num)
+                if token_num <= 0:
+                    continue
+                prefix = (
+                    int(prefix_lengths_cpu[i].item())
+                    if prefix_lengths_cpu is not None and i < int(prefix_lengths_cpu.numel())
+                    else 0
+                )
+                parts.append(
+                    torch.arange(
+                        prefix,
+                        prefix + token_num,
+                        dtype=torch.int32,
+                        device=model_device,
+                    )
+                )
+            if parts:
+                return torch.cat(parts, dim=0)
+
+        if sequence_lengths is not None and sequence_lengths.numel() > 0:
+            return sequence_lengths.to(
+                device=model_device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+        return None
+
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         model_device = self._get_model_device()
         model_dtype = self._get_model_dtype()
         input_ids = inputs.input_ids
-        positions = inputs.attention_inputs.position_ids
+        attn_inputs = getattr(inputs, "attention_inputs", None)
+        positions = getattr(attn_inputs, "position_ids", None)
+        if positions is None:
+            positions = self._build_positions_from_attention_inputs(attn_inputs, model_device)
         if positions is None:
             # In some RTP plugin paths, position ids are populated in
             # bert_embedding_inputs instead of attention_inputs.
