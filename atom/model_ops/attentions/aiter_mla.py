@@ -381,14 +381,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
                 attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
-                if self.block_ratio > 1:
-                    block_table_convert_triton(
-                        var["block_tables"].gpu[:bs],
-                        var["block_tables_converted"].gpu[:bs],
-                        var["context_lens"].gpu[:bs],
-                        self.block_ratio,
-                    )
-                    attn_metadata.block_tables = var["block_tables_converted"].gpu[:bs]
+                # if self.block_ratio > 1:
+                #     block_table_convert_triton(
+                #         var["block_tables"].gpu[:bs],
+                #         var["block_tables_converted"].gpu[:bs],
+                #         var["context_lens"].gpu[:bs],
+                #         self.block_ratio,
+                #     )
+                #     attn_metadata.block_tables = var["block_tables_converted"].gpu[:bs]
             counts = var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
             if attn_metadata.has_cached:
                 # Full context (cached + new): use cu_seqlens_k for indexer
@@ -787,11 +787,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_indices=var["kv_indices"].gpu,
             kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],
             sparse_kv_indptr=sparse_kv_indptr,
-            block_tables_converted=(
-                var["block_tables_converted"].gpu[:bs]
-                if "block_tables_converted" in var
-                else None
-            ),
+            # block_tables_converted=(
+            #     var["block_tables_converted"].gpu[:bs]
+            #     if "block_tables_converted" in var
+            #     else None
+            # ),
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q

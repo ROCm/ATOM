@@ -484,6 +484,7 @@ class MLAAttention(nn.Module):
                 attn_metadata.block_tables,
                 attn_metadata.cu_seqlens_k,
                 NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                PAGE_SIZE=get_current_atom_config().kv_cache_block_size,
             )
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
@@ -916,7 +917,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
@@ -941,14 +942,19 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     )  # int32
     pre_seqlens_q = tl.load(cu_seqlens_q + req_id)
 
+    seq_token_idx = indice - pre_seqlens_q
+    block_id = seq_token_idx // PAGE_SIZE
+    inblock_offset = seq_token_idx % PAGE_SIZE
+
     # Guard block_table access
     store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
     valid_mask = store_mask & (indice >= 0)
-    out_val = tl.load(
-        block_table + req_id * bt_stride0 + (indice - pre_seqlens_q) * bt_stride1,
+    physical_block = tl.load(
+        block_table + req_id * bt_stride0 + block_id * bt_stride1,
         mask=valid_mask,
         other=-1,
     )
+    out_val = tl.where(valid_mask, physical_block * PAGE_SIZE + inblock_offset, -1)
 
     # Store results
     out_ptr_ij = out_kv_indices + kv_start + col_id
@@ -967,7 +973,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
     # dsa_kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]           -->>>     output for this kernel
-    PAGE_SIZE: int = 1,  # page_block_size = 1 for now
+    PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
 ):
