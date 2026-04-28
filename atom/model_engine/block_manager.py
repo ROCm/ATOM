@@ -52,7 +52,9 @@ class BlockManager:
             config, "per_req_cache_equiv_blocks", 0
         )
         num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
-        self.free_per_req_cache_groups: list[int] = list(range(num_per_req_cache_groups))
+        self.free_per_req_cache_groups: list[int] = list(
+            range(num_per_req_cache_groups)
+        )
         # seq_id → list of accounting block_ids (memory bookkeeping only)
         self.per_req_cache_accounting: dict[int, list[int]] = {}
 
