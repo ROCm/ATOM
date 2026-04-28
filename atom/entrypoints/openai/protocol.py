@@ -116,6 +116,7 @@ class CompletionRequest(BaseModel):
     stream: Optional[bool] = False
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: Optional[Dict[str, Any]] = None
+    n: Optional[int] = 1
 
 
 # ============================================================================

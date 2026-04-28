@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 from dataclasses import dataclass
 from typing import Type
 
 import numpy as np
 import torch
+from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
@@ -74,6 +76,22 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         model_runner,
     ):
         super().__init__(model_runner=model_runner)
+        # Hybrid model layer-counting state (formerly set as a side effect
+        # inside ModelRunner._compute_block_bytes' qwen_next branch).
+        # Promoted to runner attributes here so all consumers
+        # (build_kv_cache_tensor, allocate_kv_cache_tensors, the per-req
+        # cache hooks) can read them as `self.model_runner.<name>` without
+        # a hidden ordering dependency on _compute_block_bytes being
+        # called first.
+        hf = model_runner.config.hf_config
+        model_runner.full_attention_interval = hf.full_attention_interval
+        model_runner.num_full_attn = (
+            hf.num_hidden_layers // model_runner.full_attention_interval
+        )
+        model_runner.num_gdn_attn_state = (
+            hf.num_hidden_layers - model_runner.num_full_attn
+        )
+
         self.num_spec = 0
         if hasattr(model_runner, "drafter"):
             self.num_spec = model_runner.drafter.mtp_k
@@ -135,11 +153,185 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         }
         self.model_runner.forward_vars.update(gdn_metadata)
 
+    # ------------------------------------------------------------------ #
+    # Per-request cache hooks (called from ModelRunner via base class).  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _state_shape(
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_kernel_size: int,
+        num_spec: int = 0,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """GDN per-layer state shape (conv_state, temporal_state).
+
+        Moved from ModelRunner.gated_delta_net_state_shape() so that the
+        GDN-specific tensor layout lives next to the GDN-specific code that
+        consumes it. Identical math.
+        """
+        conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
+        conv_state_shape = (
+            conv_kernel_size - 1 + num_spec,
+            conv_dim // tp_world_size,
+        )
+        temporal_state_shape = (
+            num_v_heads // tp_world_size,
+            head_v_dim,
+            head_k_dim,
+        )
+        return conv_state_shape, temporal_state_shape
+
+    def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
+        return (
+            self.model_runner.config.torch_dtype,
+            self.model_runner.config.torch_dtype,
+        )
+
+    def _state_shape_for_runner(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        hf = self.model_runner.config.hf_config
+        return self._state_shape(
+            get_tp_group().world_size,
+            hf.linear_num_key_heads,
+            hf.linear_num_value_heads,
+            hf.linear_key_head_dim,
+            hf.linear_value_head_dim,
+            hf.linear_conv_kernel_dim,
+            self.model_runner.num_spec_tokens,
+        )
+
+    def compute_per_req_cache_bytes(self) -> int:
+        """GDN: conv_state + temporal_state, summed over all GDN layers."""
+        shape_k, shape_v = self._state_shape_for_runner()
+        dt_k, dt_v = self._state_dtypes()
+        per_layer = (
+            math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
+        )
+        return self.model_runner.num_gdn_attn_state * per_layer
+
+    def slots_per_req(self) -> int:
+        """GDN reserves one extra slot per speculative token for rollback."""
+        return 1 + self.num_spec
+
+    def allocate_per_req_cache(self, num_slots: int) -> dict[str, torch.Tensor]:
+        """Allocate mamba_k_cache / mamba_v_cache.
+
+        Names preserved for backward compat with `attention_gdn.py` which
+        accesses them as `model_runner.mamba_{k,v}_cache`.
+        """
+        shape_k, shape_v = self._state_shape_for_runner()
+        dt_k, dt_v = self._state_dtypes()
+        n = self.model_runner.num_gdn_attn_state
+        return {
+            "mamba_k_cache": torch.zeros(
+                (n, num_slots) + shape_k, dtype=dt_k, device="cuda"
+            ),
+            "mamba_v_cache": torch.zeros(
+                (n, num_slots) + shape_v, dtype=dt_v, device="cuda"
+            ),
+        }
+
+    def compute_block_bytes(self) -> int:
+        """GDN hybrid: only full-attention layer slots contribute paged KV
+        bytes (linear-attention layers' state lives in the per-request
+        cache pool, accounted separately via compute_per_req_cache_bytes).
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        num_kv_heads = runner._get_num_kv_heads()
+        total = runner._get_total_num_layers()
+        num_draft = total - hf_config.num_hidden_layers
+        n_full = runner.num_full_attn + num_draft
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
+        # kv_cache: [2, n_full, blocks, block_size, num_kv_heads, head_dim]
+        block_bytes = (
+            2
+            * n_full
+            * runner.physical_block_size
+            * num_kv_heads
+            * hf_config.head_dim
+            * kv_dtype_size
+        )
+        # kv_scale: [2, n_full, blocks, num_kv_heads, block_size] fp32
+        block_bytes += 2 * n_full * num_kv_heads * runner.physical_block_size * 4
+        return block_bytes
+
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads: int, num_draft_layers: int
+    ) -> dict:
+        """GDN hybrid: KV cache only covers full-attention layer slots
+        (linear-attention layers don't store paged KV; they use the
+        per-request mamba_k/v_cache pool allocated separately).
+
+        Layout: `[2, num_full_attn + num_draft_layers, ...]` — note this
+        differs from AiterAttentionMetadataBuilder's `num_hidden_layers`
+        first dim. The slot index math is in build_kv_cache_tensor's
+        attn_idx computation (skips linear-attn slots).
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        n_full = runner.num_full_attn + num_draft_layers
+        return {
+            "kv_cache": torch.zeros(
+                2,
+                n_full,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                num_kv_heads,
+                hf_config.head_dim,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            ),
+            "kv_scale": torch.zeros(
+                2,
+                n_full,
+                runner.num_physical_kvcache_blocks,
+                num_kv_heads,
+                runner.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            ),
+        }
+
+    def build_kv_cache_tensor(self, layer_id: int, module):
+        """Dispatch by module type:
+
+        - `base_linear_attention` (GDN linear attention) → wrap the slot
+          slice of mamba_k_cache / mamba_v_cache
+        - everything else (full-attention MHA layers in the hybrid model,
+          plus modules of types this builder doesn't recognize) → defer
+          to AiterAttentionMetadataBuilder.build_kv_cache_tensor
+        """
+        if hasattr(module, "base_linear_attention"):
+            from atom.config import KVCacheTensor
+
+            runner = self.model_runner
+            interval = runner.full_attention_interval
+            gdn_idx = (layer_id // interval) * (interval - 1) + (layer_id % interval)
+            return KVCacheTensor(
+                layer_num=layer_id,
+                k_cache=runner.mamba_k_cache[gdn_idx],
+                v_cache=runner.mamba_v_cache[gdn_idx],
+                k_scale=None,
+                v_scale=None,
+            )
+        return super().build_kv_cache_tensor(layer_id, module)
+
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
         slots_per_group = 1 + self.num_spec
-        for idx, slot_group in enumerate(batch.mamba_state_slots):
+        for idx, slot_group in enumerate(batch.per_req_cache_groups):
             non_spec_state_indices[idx] = 0
             spec_state_indices[idx] = 0
             base = slot_group * slots_per_group
