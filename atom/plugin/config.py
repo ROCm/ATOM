@@ -282,6 +282,10 @@ def _generate_atom_config_from_rtpllm_config(config: Any):
         elif "int8" in raw_kv_dtype:
             kv_cache_dtype = "int8"
 
+    # Keep RTP behavior aligned with SGLang plugin semantics:
+    # only enable EP when ep_size > 1; pure TP (ep_size == 1) must not use EP.
+    rtpllm_ep_size = getattr(rtpllm_parallelism_config, "ep_size", 1)
+
     return Config(
         model=rtpllm_model_config.ckpt_path,
         max_num_batched_tokens=max(16384, max_generate_batch_size),
@@ -298,7 +302,7 @@ def _generate_atom_config_from_rtpllm_config(config: Any):
         compilation_config=rtpllm_compilation_config,
         asyncio_mode=False,
         load_dummy=False,
-        enable_expert_parallel=bool(getattr(rtpllm_model_config, "expert_num", 0) > 1),
+        enable_expert_parallel=bool(rtpllm_ep_size > 1),
         master_addr=None,
         enable_dp_attention=False,
         plugin_config=plugin_config,
