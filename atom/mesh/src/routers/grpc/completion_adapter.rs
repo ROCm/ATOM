@@ -371,14 +371,15 @@ pub(crate) async fn wrap_streaming_generate_as_completion(
                 };
                 prev_text[index] = cumulative;
 
-                let finish_reason = parsed
-                    .get("meta_info")
+                let meta_info = parsed.get("meta_info");
+
+                let finish_reason = meta_info
                     .and_then(|m| m.get("finish_reason"))
                     .map(map_finish_reason)
                     .and_then(|x| x);
+                let is_final = finish_reason.is_some();
 
-                let matched_stop = parsed
-                    .get("meta_info")
+                let matched_stop = meta_info
                     .and_then(|m| m.get("matched_stop"))
                     .cloned();
 
@@ -412,6 +413,38 @@ pub(crate) async fn wrap_streaming_generate_as_completion(
 
                 if !send(&tx, format!("data: {}\n\n", serialized)) {
                     break 'outer;
+                }
+
+                // Emit a usage chunk after the final token so streaming
+                // clients (e.g. bench_serving) can compute TPOT.
+                if is_final {
+                    let prompt_tokens = meta_info
+                        .and_then(|m| m.get("prompt_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let completion_tokens = meta_info
+                        .and_then(|m| m.get("completion_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+
+                    let usage_chunk = json!({
+                        "id": cmpl_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens,
+                        },
+                    });
+
+                    if let Ok(s) = serde_json::to_string(&usage_chunk) {
+                        if !send(&tx, format!("data: {}\n\n", s)) {
+                            break 'outer;
+                        }
+                    }
                 }
             }
         }
