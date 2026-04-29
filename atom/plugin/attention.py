@@ -1753,9 +1753,6 @@ class AiterMLASparseMetadataForPluginMode:
     block_size: int = 1
     topk_tokens: int = 2048
 
-    # Flag to run ragged layout conversion only once per forward (shared across MLA layers)
-    ragged_layout_built: bool = False
-
 
 class vllmMLASparseAttentionMetadataBuilderMethods:
     def __init__(self):
