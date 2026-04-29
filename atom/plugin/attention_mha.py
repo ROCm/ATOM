@@ -248,6 +248,8 @@ class PagedAttentionImplPluginModeMethods:
         else:
             max_context_partition_num = _NO_PS_FIXED_SPLITS
 
+        if attn_metadata.plugin_metadata.max_seq_len < 2048 and use_ps:
+            max_context_partition_num = 1
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
