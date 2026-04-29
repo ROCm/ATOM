@@ -264,11 +264,6 @@ class LinearBase(nn.Module):
             self.register_parameter("bias", None)
         self.quant_type = quant_type
         self.params_dtype = params_dtype
-        if self.tp_rank == 0:
-            print(
-                f"input_size: {self.input_size}, output_size: {self.output_size}, tp_dim: {tp_dim}, bias: {bias}, quant_config: {quant_config}, reduce_results: {reduce_results}, source_quant_dtype: {source_quant_dtype}, prefix: {prefix}, quant_type: {quant_type}, params_dtype: {params_dtype}\n",
-                flush=True,
-            )
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
             if quant_type == QuantType.per_Tensor:
@@ -394,11 +389,7 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
-        # if self.tp_rank == 0:
-        #     print(f"x.shape: {x.shape}, self.weight.shape: {self.weight.shape}, x_scale.shape: {x_scale.shape if x_scale is not None else None}, weight_scale.shape: {self.weight_scale.shape if self.weight_scale is not None else None}\n", flush=True)
         if self.quant_type.value == QuantType.No.value:
-            # if self.tp_rank == 0:
-            #     print(f"tgemm.mm(x, self.weight, self.bias, otype=otype)\n", flush=True)
             y = tgemm.mm(
                 x,
                 self.weight,
@@ -407,8 +398,6 @@ class LinearBase(nn.Module):
             )
         else:
             if x_scale is None:
-                # if self.tp_rank == 0:
-                #     print(f"x_scale is None\n", flush=True)
                 quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:
                     quant_func = functools_partial(
@@ -421,8 +410,6 @@ class LinearBase(nn.Module):
                         scale=getattr(self, "input_scale", None),
                     )
             if self.quant_type.value == QuantType.per_Tensor.value:
-                # if self.tp_rank == 0:
-                #     print(f"tgemm.mm(x, self.weight, self.bias, otype=otype, scale_a=x_scale, scale_b=self.weight_scale)\n", flush=True)
                 y = tgemm.mm(
                     x,
                     self.weight,
@@ -433,8 +420,6 @@ class LinearBase(nn.Module):
                 )
             elif self.quant_type.value == QuantType.per_Token.value:
                 if self.params_dtype == dtypes.i8:
-                    # if self.tp_rank == 0:
-                    #     print(f"gemm_a8w8(x, self.weight, x_scale, self.weight_scale, self.bias, dtype=otype)\n", flush=True)
                     y = gemm_a8w8(
                         x,
                         self.weight,
@@ -444,8 +429,6 @@ class LinearBase(nn.Module):
                         dtype=otype,
                     )
                 else:
-                    # if self.tp_rank == 0:
-                    #     print(f"gemm_a8w8_bpreshuffle(x, self.weight, x_scale, self.weight_scale, dtype=otype)\n", flush=True)
                     y = gemm_a8w8_bpreshuffle(
                         x,
                         self.weight,
@@ -456,8 +439,6 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
-                # if self.tp_rank == 0:
-                #     print(f"gemm_a8w8_blockscale_preshuffle_impl(x, self.weight, x_scale, self.weight_scale, dtype=otype, prefix=self.prefix)\n", flush=True)
                 y = gemm_a8w8_blockscale_preshuffle_impl(
                     x,
                     self.weight,
@@ -469,8 +450,6 @@ class LinearBase(nn.Module):
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
-                # if self.tp_rank == 0:
-                #     print(f"gemm_a4w4_quant(x, x_scale, self.weight, otype, self.weight_scale.data, self.params_dtype, getattr(self, 'input_scale', None), self.output_size)\n", flush=True)
                 y = gemm_a4w4_quant(
                     x,
                     x_scale,
