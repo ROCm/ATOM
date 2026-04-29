@@ -399,7 +399,7 @@ class GatedDeltaNet(nn.Module):
                     stream=torch.cuda.current_stream(),
                 )
                 core_attn_out_non_spec = o
-                last_recurrent_state = o
+                last_recurrent_state = ssm_state
             else:
                 core_attn_out_non_spec, last_recurrent_state = (
                     fused_sigmoid_gating_delta_rule_update(
