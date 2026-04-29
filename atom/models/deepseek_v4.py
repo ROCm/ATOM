@@ -39,6 +39,97 @@ from atom.model_ops.quant_v4 import (
     rotate_activation,
 )
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn, sparse_attn  # noqa: F401
+from atom.utils.forward_context import get_forward_context
+
+# ---------------------------------------------------------------------------
+# Classical KV cache scatter / gather helpers (PR3-pre2c-B).
+#
+# Each V4 block (block_size=lcm(m, m')=128 original tokens) holds k_per_block
+# compressed entries per layer (k1=32 for CSA, k2=1 for HCA). Compressor.forward
+# scatters newly-compressed entries into block-table-indexed slots; sparse_attn
+# input gathers all committed entries up to the current position.
+#
+# In PR3-pre2c-B these helpers run on a single sequence (block_table fetched
+# from `forward_context.attn_metadata.block_tables[0]`). PR3-main extends to
+# per-seq dispatch.
+# ---------------------------------------------------------------------------
+
+# V4 paper §3.6.1: classical-KV block_size = lcm(m, m'). For V4-Pro / V4-Flash
+# this is lcm(4, 128) = 128 original tokens. Kept as a constant so Compressor
+# code does not need to import the builder.
+_V4_BLOCK_SIZE: int = 128
+
+
+def _v4_get_block_table() -> Optional[torch.Tensor]:
+    """Fetch the current single-seq block_table from the forward context.
+
+    Returns the seq's `[max_blocks]` tensor of physical block IDs, or `None`
+    when no attn_metadata is set (warmup / dummy run / non-V4 forward path).
+    """
+    ctx = get_forward_context()
+    if ctx is None or ctx.attn_metadata is None:
+        return None
+    block_tables = ctx.attn_metadata.block_tables
+    if block_tables is None or block_tables.numel() == 0:
+        return None
+    return block_tables[0]  # PR3-pre2c-B: single sequence
+
+
+def _v4_is_dummy_run() -> bool:
+    """True during the warmup forward (kv_cache bindings may not be in place)."""
+    ctx = get_forward_context()
+    return ctx is not None and ctx.context is not None and ctx.context.is_dummy_run
+
+
+def _v4_scatter_compressed(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    kv: torch.Tensor,
+    ci_start: int,
+    n_compressed: int,
+    k_per_block: int,
+) -> None:
+    """Scatter `n_compressed` compressed entries into the classical KV pool.
+
+    Args:
+        kv_cache: [num_blocks, k_per_block, head_dim] per-layer pool view.
+        block_table: [max_blocks] physical block IDs for the current seq.
+        kv: [n_compressed, head_dim] entries to write.
+        ci_start: absolute compressed index of the first entry to write.
+        n_compressed: number of entries to write.
+        k_per_block: entries per block (lcm/m for CSA, lcm/m' for HCA).
+    """
+    if n_compressed == 0:
+        return
+    device = kv.device
+    ci = torch.arange(
+        ci_start, ci_start + n_compressed, device=device, dtype=torch.long
+    )
+    block_in_seq = ci // k_per_block
+    slot_in_block = ci % k_per_block
+    physical_blocks = block_table[block_in_seq].long()
+    kv_cache[physical_blocks, slot_in_block] = kv
+
+
+def _v4_gather_compressed(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    n_compressed: int,
+    k_per_block: int,
+) -> torch.Tensor:
+    """Gather the first `n_compressed` committed compressed entries.
+
+    Returns: `[n_compressed, head_dim]`. Empty if `n_compressed == 0`.
+    """
+    head_dim = kv_cache.size(-1)
+    if n_compressed == 0:
+        return torch.empty(0, head_dim, dtype=kv_cache.dtype, device=kv_cache.device)
+    ci = torch.arange(n_compressed, device=kv_cache.device, dtype=torch.long)
+    block_in_seq = ci // k_per_block
+    slot_in_block = ci % k_per_block
+    physical_blocks = block_table[block_in_seq].long()
+    return kv_cache[physical_blocks, slot_in_block]
+
 
 # ---------------------------------------------------------------------------
 # Config wrapper
@@ -681,7 +772,9 @@ class Compressor(nn.Module):
             prefill, or [1, 1, head_dim] in decode), or None if no compression
             boundary was hit on this call.
         """
-        assert self.kv_cache is not None, "compressor.kv_cache must be set by owner"
+        # PR3-pre2c-B: kv_cache is bound by the V4 attention builder; during
+        # warmup the binding hasn't run yet but writes are guarded below by
+        # `_v4_is_dummy_run()`, so a None kv_cache is OK in that path.
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
         start_pos = int(positions[0].item())
         if x.dim() == 2:
@@ -788,10 +881,43 @@ class Compressor(nn.Module):
         else:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
-        if start_pos == 0:
-            self.kv_cache[:bsz, : seqlen // ratio] = kv
-        else:
-            self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
+        # PR3-pre2c-B: scatter compressed entries into the block-table-indexed
+        # classical KV pool. self.kv_cache here is the per-layer pool view of
+        # shape `[num_blocks, k_per_block, head_dim]` (bound by
+        # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor). During
+        # warmup the builder binding has not yet run, so we skip writes —
+        # warmup forward never reads kv_cache (decode path is not exercised).
+        block_table = _v4_get_block_table()
+        if block_table is not None and not _v4_is_dummy_run():
+            assert self.kv_cache is not None and self.kv_cache.dim() == 3, (
+                f"compressor.kv_cache must be a [num_blocks, k, head_dim] "
+                f"per-layer view post-binding; got "
+                f"{None if self.kv_cache is None else self.kv_cache.shape}"
+            )
+            k_per_block = _V4_BLOCK_SIZE // ratio
+            if start_pos == 0:
+                # Prefill: write all `seqlen // ratio` compressed entries
+                # at compressed indices [0, seqlen // ratio).
+                _v4_scatter_compressed(
+                    self.kv_cache,
+                    block_table,
+                    kv.squeeze(0),  # [n_compressed, head_dim]
+                    ci_start=0,
+                    n_compressed=seqlen // ratio,
+                    k_per_block=k_per_block,
+                )
+            else:
+                # Decode: write the single just-compressed entry at
+                # compressed index `start_pos // ratio`.
+                ci = start_pos // ratio
+                _v4_scatter_compressed(
+                    self.kv_cache,
+                    block_table,
+                    kv.squeeze(0),  # [1, head_dim]
+                    ci_start=ci,
+                    n_compressed=1,
+                    k_per_block=k_per_block,
+                )
         return kv
 
 
@@ -805,6 +931,7 @@ class Indexer(nn.Module):
 
     def __init__(self, args: DeepseekV4Args, compress_ratio: int = 4, prefix: str = ""):
         super().__init__()
+        self.prefix = prefix  # Used by V4 attention builder for layer-id parsing.
         self.dim = args.dim
         self.n_heads = args.index_n_heads
         # TP shards Q heads (wq_b is ColumnParallelLinear); per-rank head count.
@@ -846,10 +973,16 @@ class Indexer(nn.Module):
             rotate=True,
             prefix=f"{prefix}.compressor",
         )
+        # PR3-pre2c-B: Indexer.kv_cache is bound by the V4 attention builder
+        # to a `[num_blocks, k1, head_dim]` per-CSA-layer view of the global
+        # `csa_idx_kv` classical KV pool. The 1-slot register_buffer below is
+        # a warmup fallback (warmup runs before allocate_kv_cache); it is
+        # setattr-replaced post-binding and GC'd. Same pattern as Compressor's
+        # kv_state in pre2a / Attention.swa_kv in pre2c-A.
         self.register_buffer(
             "kv_cache",
             torch.zeros(
-                args.max_batch_size,
+                1,
                 args.max_seq_len // compress_ratio,
                 self.head_dim,
             ),
@@ -884,9 +1017,10 @@ class Indexer(nn.Module):
         rd = self.rope_head_dim
         end_pos = start_pos + seqlen
 
-        # Lazy plumb the indexer's kv_cache + rotary_emb into its compressor.
-        if self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache
+        # Lazy plumb rotary_emb into compressor (kv_cache is now bound by
+        # the V4 attention builder; pre-PR3-pre2c-B the kv_cache plumbing
+        # also happened here).
+        if self.compressor.rotary_emb is None:
             self.compressor.rotary_emb = self.rotary_emb
 
         # ----- Indexer Q (2D Linear, then add B=1 dim for RoPE / einsum) -----
@@ -904,9 +1038,25 @@ class Indexer(nn.Module):
         ).unsqueeze(0)
 
         # ----- Index score -----
-        index_score = torch.einsum(
-            "bshd,btd->bsht", q, self.kv_cache[:1, : end_pos // ratio]
-        )
+        # PR3-pre2c-B: gather committed compressed Indexer entries from the
+        # block-table-indexed `csa_idx_kv` pool (per-CSA-layer view bound by
+        # the V4 attention builder). During warmup the binding has not yet
+        # run, so we return a zeros placeholder — the resulting topk_idxs are
+        # discarded by the warmup forward path anyway.
+        n_committed = end_pos // ratio
+        block_table = _v4_get_block_table()
+        if block_table is not None and not _v4_is_dummy_run() and n_committed > 0:
+            k_per_block = _V4_BLOCK_SIZE // ratio
+            gathered = _v4_gather_compressed(
+                self.kv_cache, block_table, n_committed, k_per_block
+            ).unsqueeze(
+                0
+            )  # [1, n_committed, head_dim]
+        else:
+            gathered = torch.zeros(
+                1, n_committed, self.head_dim, dtype=q.dtype, device=q.device
+            )
+        index_score = torch.einsum("bshd,btd->bsht", q, gathered)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
 
         # ----- Top-k selection over compressed positions -----
@@ -1058,24 +1208,12 @@ class DeepseekV4Attention(nn.Module):
             torch.zeros(1, args.window_size, self.head_dim),
             persistent=False,
         )
-        # Classical KV cache (compressed entries only — no window):
-        #   `kv_cache`: [B, max_seq_len/ratio, head_dim].
-        # PR3-pre2c-A keeps this as register_buffer (slot-major, single slot).
-        # PR3-pre2c-B will move it under the block_table (per-V4-block
-        # storage of k1=lcm/m CSA or k2=lcm/m' HCA entries per layer).
-        if self.compress_ratio:
-            self.register_buffer(
-                "kv_cache",
-                torch.zeros(
-                    args.max_batch_size,
-                    args.max_seq_len // self.compress_ratio,
-                    self.head_dim,
-                ),
-                persistent=False,
-            )
-        else:
-            # Dense layer: SWA-only. No compressed entries -> no kv_cache.
-            self.kv_cache = None
+        # Classical KV cache (paper §3.6.1) lives entirely in the global
+        # `csa_main_kv` / `hca_main_kv` pool (allocated by the V4 attention
+        # builder as `[num_blocks, n_layers, k_per_block, head_dim]`).
+        # `Compressor.kv_cache` is bound to a per-layer view of that pool by
+        # `DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor`. The
+        # Attention module no longer owns a `kv_cache` attribute (PR3-pre2c-B).
 
         # ----- RoPE (own per-layer instance, not shared): YaRN for compressed
         # attention layers (long context), plain RoPE for dense (window-only).
@@ -1175,28 +1313,27 @@ class DeepseekV4Attention(nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        # First-call plumbing: hand the (now compressed-only) kv_cache + rotary_emb
-        # to the compressor / indexer. After the SWA migration (PR3-pre2c-A),
-        # `self.kv_cache` IS the compressed-entry buffer (no embedded window),
-        # so the slice `[:, win:]` is gone.
-        if self.compress_ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache
+        # First-call plumbing: hand rotary_emb to the compressor / indexer.
+        # PR3-pre2c-B: Compressor.kv_cache and Indexer.kv_cache are now bound
+        # by the V4 attention builder to per-layer views of the global
+        # classical KV pool — no need to plumb them here anymore.
+        if self.compress_ratio and self.compressor.rotary_emb is None:
             self.compressor.rotary_emb = self.rotary_emb
             if self.indexer is not None:
                 self.indexer.rotary_emb = self.rotary_emb
 
-        # Reset all KV buffers on new prefill (start_pos==0). The ATOM warmup
-        # forward (seqlen=MAX_BATCHED_TOKENS with zeros) fills these buffers
-        # with garbage. Real prefill only overwrites a few slots, leaving
-        # stale warmup data that poisons decode attention.
+        # Reset state-cache buffers on new prefill (start_pos==0). The ATOM
+        # warmup forward fills these buffers with garbage; real prefill only
+        # overwrites a few slots, leaving stale warmup data that poisons decode.
+        # The classical KV pool (Compressor.kv_cache / Indexer.kv_cache) is
+        # NOT reset here — BlockManager assigns fresh blocks per seq, so
+        # block-table-indexed reads only ever see freshly-written entries.
         if start_pos == 0:
             self.swa_kv.zero_()
             if self.compress_ratio:
-                self.kv_cache.zero_()
                 self.compressor.kv_state.zero_()
                 self.compressor.score_state.fill_(float("-inf"))
                 if self.indexer is not None:
-                    self.indexer.kv_cache.zero_()
                     self.indexer.compressor.kv_state.zero_()
                     self.indexer.compressor.score_state.fill_(float("-inf"))
 
@@ -1255,11 +1392,35 @@ class DeepseekV4Attention(nn.Module):
             self.swa_kv[:1, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, positions)
-                # sparse_attn input layout is [SWA window || compressed entries].
-                # PR3-pre2c-A reconstructs this concat at call time (cheap:
-                # n_win + max_seq/ratio entries per layer). PR3-pre2c-B with
-                # block_table classical KV will gather from blocks here.
-                kv_full = torch.cat([self.swa_kv[:1], self.kv_cache[:1]], dim=1)
+                # PR3-pre2c-B sparse_attn input layout: [SWA window ||
+                # compressed entries gathered from the block-table-indexed
+                # classical KV pool]. The number of committed compressed
+                # entries after this decode step is `(start_pos + 1) // ratio`.
+                # Indexer.forward / `_get_compress_topk_idxs` produce indices
+                # in the range `[win, win + n_committed)` so the cat layout
+                # matches the topk_idxs space exactly.
+                n_committed = (start_pos + 1) // ratio
+                block_table = _v4_get_block_table()
+                if (
+                    block_table is not None
+                    and not _v4_is_dummy_run()
+                    and n_committed > 0
+                ):
+                    k_per_block = _V4_BLOCK_SIZE // ratio
+                    gathered = _v4_gather_compressed(
+                        self.compressor.kv_cache,
+                        block_table,
+                        n_committed,
+                        k_per_block,
+                    ).unsqueeze(
+                        0
+                    )  # [1, n_committed, head_dim]
+                    kv_full = torch.cat([self.swa_kv[:1], gathered], dim=1)
+                else:
+                    # Warmup path: no block_table available, no real classical
+                    # KV to read. Pass swa_kv only — sparse_attn output isn't
+                    # consumed during warmup beyond shape propagation.
+                    kv_full = self.swa_kv[:1]
             else:
                 kv_full = self.swa_kv[:1]
             o = sparse_attn(

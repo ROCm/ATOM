@@ -18,11 +18,13 @@ Per paper §3.6.1, V4 splits cache into two parts:
 
 PR3-pre2a  (done): Compressor state buffers (kv_state + score_state ×3 owners)
                    migrated to per_req_cache pool.
-PR3-pre2c-A (this revision): adds SWA buffer migration. Classical KV cache
-                   for compressed entries (Compressor.kv_cache /
-                   Indexer.kv_cache) is still register_buffer-backed on the
-                   model and slot-major (1 slot at index 0). PR3-pre2c-B will
-                   move it to the block_table.
+PR3-pre2c-A (done): SWA buffer migration to per_req_cache pool.
+PR3-pre2c-B (this revision): classical KV cache (compressed entries) moved
+                   under the block_table per paper §3.6.1. Three pools allocated
+                   (csa_main_kv / csa_idx_kv / hca_main_kv), shape
+                   `[num_blocks, n_layers_of_type, k, head_dim]`. block_size =
+                   lcm(m, m') = 128 original tokens. Compressor + Indexer
+                   .kv_cache attributes bound to per-layer pool slices.
 PR3-main:   multi-sequence dispatch (slot=0 -> per-seq slot).
 
 Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
@@ -67,13 +69,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     """Per-request cache owner for V4's state-cache buffers.
 
     Inherits CommonAttentionBuilder for the standard prefill/decode prep
-    (slot_mapping, block_tables, cu_seqlens). PR3-pre2c-A keeps `block_size = 1`
-    (token-level placeholder) because the classical KV pool (Compressor/Indexer
-    .kv_cache) is still register_buffer on the model. Block_size will be raised
-    to 128 (lcm(m, m')) in PR3-pre2c-B alongside the block_table migration.
+    (slot_mapping, block_tables, cu_seqlens). PR3-pre2c-B sets `block_size`
+    to lcm(m, m') = 128 (V4-Pro: m=4 CSA, m'=128 HCA), matching paper §3.6.1's
+    requirement that each classical KV cache block hold an integral number of
+    compressed entries per layer (k1=lcm/m=32 CSA, k2=lcm/m'=1 HCA).
     """
 
-    block_size = 1
+    block_size = 128
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
@@ -102,8 +104,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.csa_idx_state_shape = (2 * 4, 2 * self.index_head_dim)
         self.hca_main_state_shape = (128, self.head_dim)
 
+        # Classical KV pool geometry. block_size=128 original tokens means
+        # each V4 block holds k1=128/4=32 CSA entries and k2=128/128=1 HCA
+        # entry per layer (paper §3.6.1).
+        self.k1_csa = self.block_size // 4  # = 32
+        self.k2_hca = self.block_size // 128  # = 1
+
         self._state_dtype = torch.float32  # fp32 required for softmax-pool
         self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
+        self._classical_dtype = torch.bfloat16  # compressed KV is BF16
 
     # ------------------------------------------------------------------ #
     # AttentionMetadataBuilder hooks (per-request cache abstraction).    #
@@ -136,26 +145,56 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return 1
 
     def compute_block_bytes(self) -> int:
-        """Phantom per-token bytes for V4's planned classical KV cache.
+        """Per-V4-block bytes for the three classical KV pools (BF16).
 
-        PR3-pre2c-A still register_buffer's the compressed KV pools on the
-        model (Compressor/Indexer.kv_cache). PR3-pre2c-B will migrate them
-        into block-table-backed pools, at which point this returns the
-        true per-V4-block cost. For now we report the planned per-token
-        cost so ModelRunner's pool-sizing math (per_req_cache_equiv_blocks
-        and num_kvcache_blocks) stays consistent.
+        Each V4 block (block_size=128 original tokens) stores per layer:
+          - CSA layer: k1=32 entries × head_dim (Main) + k1×idx_head_dim (Indexer)
+          - HCA layer: k2=1 entry × head_dim
         """
-        bf16 = 2
-        # k1=lcm/m=32 CSA entries per layer per V4 block of 128 original tokens.
-        # k2=lcm/m'=1 HCA entry per layer per V4 block.
-        csa_main_per_block = 32 * self.head_dim * bf16
-        csa_idx_per_block = 32 * self.index_head_dim * bf16
-        hca_main_per_block = 1 * self.head_dim * bf16
-        bytes_per_v4_block = (
+        elem = self._classical_dtype.itemsize
+        csa_main_per_block = self.k1_csa * self.head_dim * elem
+        csa_idx_per_block = self.k1_csa * self.index_head_dim * elem
+        hca_main_per_block = self.k2_hca * self.head_dim * elem
+        return (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
             + len(self.hca_layers) * hca_main_per_block
         )
-        return bytes_per_v4_block // 128  # per-token (block_size=1 in pre2c-A)
+
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads: int, num_draft_layers: int
+    ) -> dict[str, torch.Tensor]:
+        """Allocate the three classical KV pools.
+
+        Pool layout: `[num_blocks, n_layers_of_type, k_per_block, head_dim]`.
+        Per-layer view (`pool[:, layer_pos]` shape `[num_blocks, k, head_dim]`)
+        is what `Compressor.kv_cache` / `Indexer.kv_cache` get bound to in
+        `build_kv_cache_tensor`. Compressor.forward then writes individual
+        compressed entries via `pool[block_id, slot_in_block, :] = entry`.
+
+        Returns a dict; ModelRunner setattr's each as `runner.<name>`.
+        """
+        runner = self.model_runner
+        device = runner.device
+        num_blocks = runner.num_physical_kvcache_blocks
+        n_csa = len(self.csa_layers)
+        n_hca = len(self.hca_layers)
+        return {
+            "v4_csa_main_kv": torch.zeros(
+                (num_blocks, n_csa, self.k1_csa, self.head_dim),
+                dtype=self._classical_dtype,
+                device=device,
+            ),
+            "v4_csa_idx_kv": torch.zeros(
+                (num_blocks, n_csa, self.k1_csa, self.index_head_dim),
+                dtype=self._classical_dtype,
+                device=device,
+            ),
+            "v4_hca_main_kv": torch.zeros(
+                (num_blocks, n_hca, self.k2_hca, self.head_dim),
+                dtype=self._classical_dtype,
+                device=device,
+            ),
+        }
 
     def allocate_per_req_cache(self, num_slots: int) -> dict[str, torch.Tensor]:
         """Allocate the state-cache pool.
@@ -199,27 +238,38 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         }
 
     def build_kv_cache_tensor(self, layer_id: int, module):
-        """Bind V4 modules' state-cache views (no KVCacheTensor returned).
+        """Bind V4 modules' state-cache + classical-cache views.
 
         Called by ModelRunner.allocate_kv_cache() for every nn.Module:
-          - V4 Compressor: bind kv_state + score_state (per_req_cache pool).
           - V4 Attention: bind swa_kv (per_req_cache pool).
+          - V4 Compressor: bind kv_state, score_state (per_req_cache pool)
+            AND kv_cache (classical pool slice — per CSA/HCA layer).
+          - V4 Indexer:    bind kv_cache (csa_idx_kv slice — per CSA layer).
 
-        Returns None always — V4's classical KV cache (compressed entries) is
-        still register_buffer on the model in PR3-pre2c-A, so there are no
-        KVCacheTensor entries to register from this builder.
+        Returns None always — V4 forward consumes module attributes directly,
+        not the global `forward_context.kv_cache_data` registry that ATOM's
+        standard MHA path uses.
         """
         # Local imports to avoid circular dependency at module load time.
         from atom.models.deepseek_v4 import (
             Compressor as _V4Compressor,
             DeepseekV4Attention as _V4Attention,
+            Indexer as _V4Indexer,
         )
 
         runner = self.model_runner
 
         if isinstance(module, _V4Attention):
-            # Attention.swa_kv — every layer (one slice of v4_swa_kv per layer).
+            # Attention.swa_kv — every layer.
             module.swa_kv = runner.v4_swa_kv[module.layer_id]
+            return None
+
+        if isinstance(module, _V4Indexer):
+            # Indexer.kv_cache — CSA Indexer compressed pool, per CSA layer.
+            # prefix: "layers.<L>.attn.indexer"
+            layer_id_from_prefix = int(module.prefix.split(".")[1])
+            pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
+            module.kv_cache = runner.v4_csa_idx_kv[:, pos]
             return None
 
         if isinstance(module, _V4Compressor):
@@ -236,14 +286,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_idx_kv_state[pos]
                 module.score_state = runner.v4_csa_idx_score_state[pos]
+                # Inner compressor writes target the SAME storage as the
+                # outer Indexer.kv_cache (csa_idx_kv).
+                module.kv_cache = runner.v4_csa_idx_kv[:, pos]
             elif ratio == 4:
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_main_kv_state[pos]
                 module.score_state = runner.v4_csa_main_score_state[pos]
+                module.kv_cache = runner.v4_csa_main_kv[:, pos]
             elif ratio == 128:
                 pos = self.layer_id_to_hca_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_hca_main_kv_state[pos]
                 module.score_state = runner.v4_hca_main_score_state[pos]
+                module.kv_cache = runner.v4_hca_main_kv[:, pos]
             else:
                 raise ValueError(
                     f"Unknown V4 compress_ratio={ratio} on Compressor at "
@@ -260,11 +315,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # ------------------------------------------------------------------ #
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
-        """V4-style decode prep: populates positions like AiterBackend.
+        """V4-style decode prep: populates positions + block_tables.
 
-        V4 forward currently consumes only `positions[0]` to drive its
-        KV ring-buffer index; once PR3-main lands, block_tables / slot_mapping
-        will also be consumed.
+        block_tables is required so V4 forward can scatter compressed entries
+        into the classical KV pool by block_id, and gather them for sparse_attn.
         """
         import numpy as np
 
@@ -278,6 +332,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         sum_scheduled_tokens = batch.total_tokens_num_decode
         var["positions"].np[:sum_scheduled_tokens] = positions
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+
+        block_tables_gpu = self._populate_block_tables(batch, scheduled_bs)
         attn_metadata = AttentionMetaData(
             cu_seqlens_k=None,
             max_seqlen_q=max_seqlen_q,
@@ -287,8 +343,40 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             has_cached=False,
             total_kv=int(context_lens.sum()),
             num_cached_tokens=None,
+            block_tables=block_tables_gpu,
         )
         return attn_metadata, positions
+
+    def prepare_prefill(self, batch: ScheduledBatch):
+        """V4 prefill prep: extends parent to always populate block_tables.
+
+        The parent only emits block_tables when has_cached (prefix cache hit);
+        V4 always needs block_tables because Compressor scatters compressed
+        entries into the classical KV pool from token 0 onwards.
+        """
+        attn_metadata, positions = super().prepare_prefill(batch)
+        if attn_metadata.block_tables is None:
+            scheduled_bs = batch.total_seqs_num_prefill
+            attn_metadata.block_tables = self._populate_block_tables(
+                batch, scheduled_bs
+            )
+        return attn_metadata, positions
+
+    def _populate_block_tables(
+        self, batch: ScheduledBatch, scheduled_bs: int
+    ) -> torch.Tensor:
+        """Populate `forward_vars["block_tables"]` from the batch and return
+        the GPU view sliced to `scheduled_bs` rows.
+
+        Mirrors `CommonAttentionBuilder.prepare_block_tables` but is invoked
+        unconditionally (parent only calls it when has_cached).
+        """
+        var = self.model_runner.forward_vars
+        block_tables_np = var["block_tables"].np
+        for i, block_table in enumerate(batch.block_tables[:scheduled_bs]):
+            block_tables_np[i] = 0
+            block_tables_np[i, : len(block_table)] = block_table
+        return var["block_tables"].copy_to_gpu(scheduled_bs)
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         # CUDA Graph capture is disabled for V4 (PR4 scope). Return a stub.

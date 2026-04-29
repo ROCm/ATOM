@@ -951,6 +951,16 @@ class Config:
                     f"num_speculative_tokens must be between 1 and 4, got {num_spec}."
                 )
 
+        # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
+        # lcm(m, m'). For V4-Pro / V4-Flash this is lcm(4, 128) = 128 original
+        # tokens. ATOM's BlockManager + slot_mapping math assume one global
+        # block_size, so we override `kv_cache_block_size` here when V4 is
+        # detected; the V4 attention builder enforces the same value.
+        if getattr(self.hf_config, "model_type", None) == "deepseek_v4":
+            v4_block_size = 128
+            if self.kv_cache_block_size != v4_block_size:
+                self.kv_cache_block_size = v4_block_size
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
