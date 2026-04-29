@@ -493,6 +493,7 @@ class ModelRunner:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
+        self.use_v4 = self.is_deepseek_v4()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -552,6 +553,7 @@ class ModelRunner:
             self.block_size,
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
+            use_v4=self.use_v4,
         )
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
@@ -691,6 +693,11 @@ class ModelRunner:
         ):
             return True
         return False
+
+    def is_deepseek_v4(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        return self.hf_text_config.model_type == "deepseek_v4"
 
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):

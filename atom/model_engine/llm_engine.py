@@ -189,7 +189,14 @@ class InputOutputProcessor:
         registered here. Adding a new stateful-attention model means
         adding its model_type to this set.
         """
-        return frozenset({"qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"})
+        return frozenset(
+            {
+                "qwen3_next",
+                "qwen3_5_text",
+                "qwen3_5_moe_text",
+                "deepseek_v4",
+            }
+        )
 
     def preprocess(
         self,

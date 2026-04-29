@@ -616,13 +616,22 @@ class Compressor(nn.Module):
         self.kv_cache: Optional[torch.Tensor] = None
         self.rotary_emb: Optional[_V4RoPE] = None
 
-        # Decode-phase state buffers. With overlap: state[:, :ratio] holds the
-        # overlapping window from the previous compression block; state[:, ratio:]
-        # holds the current in-progress window.
+        # Decode-phase state buffers (per paper §3.6.1 "uncompressed tail
+        # tokens" of the state cache). With overlap: state[:, :ratio] holds
+        # the overlapping window from the previous compression block;
+        # state[:, ratio:] holds the current in-progress window.
+        #
+        # PR3-pre2a: a 1-slot register_buffer is kept here so warmup (which
+        # runs before allocate_kv_cache → build_kv_cache_tensor) sees a
+        # valid tensor; afterwards `DeepseekV4AttentionMetadataBuilder.
+        # build_kv_cache_tensor` setattr-replaces these attributes with
+        # views of the per-request cache pool (shape
+        # `[max_num_seqs, coff*ratio, coff*head_dim]`). The 1-slot init
+        # buffers (≈9 MB total across all layers) are GC'd once replaced.
         self.register_buffer(
             "kv_state",
             torch.zeros(
-                args.max_batch_size,
+                1,
                 coff * compress_ratio,
                 coff * self.head_dim,
                 dtype=torch.float32,
@@ -632,11 +641,7 @@ class Compressor(nn.Module):
         self.register_buffer(
             "score_state",
             torch.full(
-                (
-                    args.max_batch_size,
-                    coff * compress_ratio,
-                    coff * self.head_dim,
-                ),
+                (1, coff * compress_ratio, coff * self.head_dim),
                 float("-inf"),
                 dtype=torch.float32,
             ),
@@ -1040,15 +1045,37 @@ class DeepseekV4Attention(nn.Module):
             self.compressor = None
             self.indexer = None
 
-        # ----- KV cache: [B, window_size + max_seq_len/ratio, head_dim] -----
-        kv_cache_size = args.window_size + (
-            args.max_seq_len // self.compress_ratio if self.compress_ratio else 0
-        )
+        # ----- KV cache splitting (paper §3.6.1) -----
+        # State cache (per-request slot, in per_req_cache pool):
+        #   `swa_kv`: [num_slots, n_win, head_dim] — most recent n_win window.
+        #   Bound by DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor()
+        #   after allocate_kv_cache. The 1-slot register_buffer below is a
+        #   warmup fallback (warmup runs before allocate_kv_cache); after
+        #   binding it is setattr-replaced with the per_req_cache pool slice
+        #   `[max_num_seqs, n_win, head_dim]` and the original buffer is GC'd.
         self.register_buffer(
-            "kv_cache",
-            torch.zeros(args.max_batch_size, kv_cache_size, self.head_dim),
+            "swa_kv",
+            torch.zeros(1, args.window_size, self.head_dim),
             persistent=False,
         )
+        # Classical KV cache (compressed entries only — no window):
+        #   `kv_cache`: [B, max_seq_len/ratio, head_dim].
+        # PR3-pre2c-A keeps this as register_buffer (slot-major, single slot).
+        # PR3-pre2c-B will move it under the block_table (per-V4-block
+        # storage of k1=lcm/m CSA or k2=lcm/m' HCA entries per layer).
+        if self.compress_ratio:
+            self.register_buffer(
+                "kv_cache",
+                torch.zeros(
+                    args.max_batch_size,
+                    args.max_seq_len // self.compress_ratio,
+                    self.head_dim,
+                ),
+                persistent=False,
+            )
+        else:
+            # Dense layer: SWA-only. No compressed entries -> no kv_cache.
+            self.kv_cache = None
 
         # ----- RoPE (own per-layer instance, not shared): YaRN for compressed
         # attention layers (long context), plain RoPE for dense (window-only).
@@ -1148,10 +1175,12 @@ class DeepseekV4Attention(nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        # First-call plumbing: hand the (compressed-half) KV cache + rotary_emb
-        # to the compressor / indexer.
+        # First-call plumbing: hand the (now compressed-only) kv_cache + rotary_emb
+        # to the compressor / indexer. After the SWA migration (PR3-pre2c-A),
+        # `self.kv_cache` IS the compressed-entry buffer (no embedded window),
+        # so the slice `[:, win:]` is gone.
         if self.compress_ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.kv_cache = self.kv_cache
             self.compressor.rotary_emb = self.rotary_emb
             if self.indexer is not None:
                 self.indexer.rotary_emb = self.rotary_emb
@@ -1161,8 +1190,9 @@ class DeepseekV4Attention(nn.Module):
         # with garbage. Real prefill only overwrites a few slots, leaving
         # stale warmup data that poisons decode attention.
         if start_pos == 0:
-            self.kv_cache.zero_()
+            self.swa_kv.zero_()
             if self.compress_ratio:
+                self.kv_cache.zero_()
                 self.compressor.kv_state.zero_()
                 self.compressor.score_state.fill_(float("-inf"))
                 if self.indexer is not None:
@@ -1201,18 +1231,19 @@ class DeepseekV4Attention(nn.Module):
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()
 
-        # ----- Attention: prefill writes window KV linearly + concats fresh
-        # compressed entries; decode writes one slot in window ring buffer
-        # then reads from the persistent kv_cache. (kv_cache slot 0 = our
-        # implicit B=1.) -----
+        # ----- Attention: prefill writes window KV linearly into swa_kv +
+        # concats fresh compressed entries from compressor; decode writes one
+        # slot in swa_kv ring buffer then reads [swa_kv || kv_cache] for sparse
+        # attention. (slot 0 = single-seq implicit B=1; PR3-main will plumb
+        # per-seq slot indices.) -----
         if start_pos == 0:
             if seqlen <= win:
-                self.kv_cache[:1, :seqlen] = kv
+                self.swa_kv[:1, :seqlen] = kv
             else:
                 cutoff = seqlen % win
                 (
-                    self.kv_cache[:1, cutoff:win],
-                    self.kv_cache[:1, :cutoff],
+                    self.swa_kv[:1, cutoff:win],
+                    self.swa_kv[:1, :cutoff],
                 ) = kv[
                     :, -win:
                 ].split([win - cutoff, cutoff], dim=1)
@@ -1221,12 +1252,19 @@ class DeepseekV4Attention(nn.Module):
                     kv = torch.cat([kv, kv_compress], dim=1)
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
-            self.kv_cache[:1, start_pos % win] = kv.squeeze(1)
+            self.swa_kv[:1, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, positions)
+                # sparse_attn input layout is [SWA window || compressed entries].
+                # PR3-pre2c-A reconstructs this concat at call time (cheap:
+                # n_win + max_seq/ratio entries per layer). PR3-pre2c-B with
+                # block_table classical KV will gather from blocks here.
+                kv_full = torch.cat([self.swa_kv[:1], self.kv_cache[:1]], dim=1)
+            else:
+                kv_full = self.swa_kv[:1]
             o = sparse_attn(
                 q,
-                self.kv_cache[:1],
+                kv_full,
                 self.attn_sink,
                 topk_idxs,
                 self.softmax_scale,
