@@ -251,7 +251,6 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         1. Input projection
         2. Core attention (custom op)
         """
-        num_tokens = hidden_states.size(0)
 
         # ============================================================
         # Part 1: Input Projection
