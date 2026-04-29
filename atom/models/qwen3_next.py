@@ -962,9 +962,6 @@ class Qwen3NextDecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # self_attention_output = torch.empty(
-        #     hidden_states.shape, dtype=residual.dtype, device=hidden_states.device
-        # )
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(
                 hidden_states=(
@@ -981,7 +978,6 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         else:
             raise ValueError("Invalid layer_type")
-        # hidden_states = self_attention_output
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:

@@ -547,10 +547,11 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from atom.model_ops.triton_gemma_rmsnorm import (
-            gemma_rmsnorm_triton
+        from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
+
+        return gemma_rmsnorm_triton(
+            x, self.weight.data, self.variance_epsilon, residual
         )
-        return gemma_rmsnorm_triton(x, self.weight.data, self.variance_epsilon, residual)
 
     def _forward_fused_fp8(self, x, residual=None):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
