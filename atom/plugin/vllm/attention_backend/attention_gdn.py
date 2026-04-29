@@ -382,7 +382,6 @@ class GatedDeltaNet(nn.Module):
         elif attn_metadata.num_decodes > 0:
             o = core_attn_out[: attn_metadata.num_decode_tokens]
             if USE_FLYDSL_GDR:
-                core_attn_out_non_spec = query_non_spec.new_empty(*value_non_spec.shape)
                 query_non_spec = query_non_spec.permute(1, 0, 2, 3)
                 flydsl_gdr_decode(
                     query=query_non_spec,
@@ -399,8 +398,8 @@ class GatedDeltaNet(nn.Module):
                     need_shuffle_state=False,
                     stream=torch.cuda.current_stream(),
                 )
-
-                last_recurrent_state = None
+                core_attn_out_non_spec = o
+                last_recurrent_state = o
             else:
                 core_attn_out_non_spec, last_recurrent_state = (
                     fused_sigmoid_gating_delta_rule_update(
