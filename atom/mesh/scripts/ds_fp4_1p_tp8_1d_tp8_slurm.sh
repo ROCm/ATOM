@@ -27,7 +27,7 @@
 set -euo pipefail
 
 # ======================== configuration ========================
-MODEL_PATH="${MODEL_PATH:-/it-share/models/deepseek-ai/DeepSeek-R1-0528-MXFP4}"
+MODEL_PATH="${MODEL_PATH:-amd/DeepSeek-R1-0528-MXFP4}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-sglang-latest}"
 CONTAINER="${CONTAINER:-atom_sglang_mesh_${SLURM_JOB_ID}}"
 
@@ -160,6 +160,7 @@ cat > /workspace/mooncake_prefill.json <<MC
 MC
 
 export HIP_VISIBLE_DEVICES=${PREFILL_GPU_IDS}
+export HF_HUB_CACHE=/mnt/hf_hub_cache
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 export SGLANG_USE_AITER=1
 export SGLANG_AITER_FP8_PREFILL_ATTN=0
@@ -203,6 +204,7 @@ echo "[decode] IP=${DECODE_IP} TP=${DECODE_TP} port=${DECODE_PORT}"
 mkdir -p /workspace/logs
 
 export HIP_VISIBLE_DEVICES=${DECODE_GPU_IDS}
+export HF_HUB_CACHE=/mnt/hf_hub_cache
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 export SGLANG_USE_AITER=1
 export SGLANG_AITER_FP8_PREFILL_ATTN=0
