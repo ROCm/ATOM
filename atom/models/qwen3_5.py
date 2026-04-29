@@ -267,7 +267,10 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                 self.head_v_dim,
             )
         else:
-            mixed_qkvz = self.in_proj_qkvz(hidden_states)
+            if x_fp8 is not None:
+                mixed_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
+            else:
+                mixed_qkvz = self.in_proj_qkvz(hidden_states)
             ba = self.in_proj_ba(hidden_states)
 
             qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
