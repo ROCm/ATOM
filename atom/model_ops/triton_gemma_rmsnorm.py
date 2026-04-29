@@ -81,7 +81,7 @@ def _gemma_rmsnorm_kernel(
 
 
 def gemma_rmsnorm_triton(x, weight, eps, residual):
-    """Launch the Triton kernel. Returns (out, residual_out | None)."""
+    """Launch the Triton kernel. Returns out or (out, residual_out)."""
     ori_shape = x.shape
     x = x.view(-1, ori_shape[-1])
     n_rows, n_cols = x.shape
@@ -117,4 +117,4 @@ def gemma_rmsnorm_triton(x, weight, eps, residual):
     out = out.view(ori_shape)
     if has_residual:
         return out, residual_out.view(ori_shape)
-    return out, None
+    return out
