@@ -777,17 +777,13 @@ controls ATOM’s runtime behaviour.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">GenerationConfig</span></code></p></td>
 <td><p>Loaded automatically via <code class="docutils literal notranslate"><span class="pre">get_generation_config(model)</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mamba_equiv_per_req</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">per_req_cache_equiv_blocks</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
-<td><p>Number of KV cache block equivalents reserved per request for GDN recurrent state (hybrid models only); computed by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code></p></td>
+<td><p>Number of KV cache block equivalents reserved per request for the per-request stateful-attention cache (currently GDN recurrent state; future stateful attentions plug in via <code class="docutils literal notranslate"><span class="pre">AttentionMetadataBuilder.compute_per_req_cache_bytes()</span></code>); computed by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_mamba_groups</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_per_req_cache_groups</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
-<td><p>Number of per-request GDN state slot groups available (= <code class="docutils literal notranslate"><span class="pre">max_num_seqs</span></code> for hybrid models, 0 otherwise); computed by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code></p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_mamba_slots</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
-<td><p>Maximum number of GDN state slots (including slots for speculative tokens); computed by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code></p></td>
+<td><p>Number of per-request slot groups available (= <code class="docutils literal notranslate"><span class="pre">max_num_seqs</span></code> for stateful-attention models, 0 otherwise); computed by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code></p></td>
 </tr>
 </tbody>
 </table>

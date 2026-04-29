@@ -896,22 +896,28 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">used_block_ids</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">enable_prefix_caching</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_prefix_caching</span>
         
-        <span class="c1"># Mamba/GDN recurrent state: per-request slot groups + equiv-block accounting</span>
+        <span class="c1"># Per-request cache: per-request slot pool + equiv-block accounting.</span>
+        <span class="c1"># Used by attention types whose state lives outside the paged KV pool</span>
+        <span class="c1"># (currently GDN recurrent state; future stateful attentions plug in</span>
+        <span class="c1"># via AttentionMetadataBuilder.compute_per_req_cache_bytes()).</span>
         <span class="c1"># Each slot group contains (1+num_spec) contiguous tensor indices.</span>
-        <span class="c1"># free_mamba_slots tracks group indices (0..num_groups-1).</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">mamba_equiv_per_req</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;mamba_equiv_per_req&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">num_mamba_groups</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;num_mamba_groups&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">free_mamba_slots</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">num_mamba_groups</span><span class="p">))</span>
-        <span class="c1"># seq_id → list of accounting block_ids</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">mamba_accounting</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">per_req_cache_equiv_blocks</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
+            <span class="n">config</span><span class="p">,</span> <span class="s2">&quot;per_req_cache_equiv_blocks&quot;</span><span class="p">,</span> <span class="mi">0</span>
+        <span class="p">)</span>
+        <span class="n">num_per_req_cache_groups</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;num_per_req_cache_groups&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_per_req_cache_groups</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span>
+            <span class="nb">range</span><span class="p">(</span><span class="n">num_per_req_cache_groups</span><span class="p">)</span>
+        <span class="p">)</span>
+        <span class="c1"># seq_id → list of accounting block_ids (memory bookkeeping only)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">per_req_cache_accounting</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
 </pre></div>
 </div>
 <p>The block pool is pre-allocated at startup. <code class="docutils literal notranslate"><span class="pre">free_block_ids</span></code> is a deque for O(1) pop/push, <code class="docutils literal notranslate"><span class="pre">used_block_ids</span></code> tracks active blocks, and <code class="docutils literal notranslate"><span class="pre">hash_to_block_id</span></code> maps content hashes to block IDs for prefix caching.</p>
-<p><strong>Mamba/GDN State Pools (Hybrid Models):</strong> For models with Gated DeltaNet (GDN) recurrent attention (Qwen3-Next, Qwen3.5):</p>
+<p><strong>Per-Request Cache Pools (Stateful-Attention Models):</strong> For models whose attention type maintains per-request state outside the paged KV pool (currently GDN: Qwen3-Next, Qwen3.5; future: DeepseekV4 ring buffer + compressor state, etc.):</p>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">free_mamba_slots</span></code> – list of available per-request state slot indices (0 to <code class="docutils literal notranslate"><span class="pre">num_mamba_groups</span> <span class="pre">-</span> <span class="pre">1</span></code>). Each slot holds one request’s (or one speculative token’s) recurrent state.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">mamba_accounting</span></code> – maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and GDN state through dynamic competition; GDN memory is accounted for as block equivalents.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">mamba_equiv_per_req</span></code> – number of KV cache block equivalents reserved per request for its GDN state.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">free_per_req_cache_groups</span></code> – list of available per-request slot group indices (0 to <code class="docutils literal notranslate"><span class="pre">num_per_req_cache_groups</span> <span class="pre">-</span> <span class="pre">1</span></code>). Each group corresponds to one request and contains <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">+</span> <span class="pre">num_speculative_tokens</span></code> contiguous tensor slot indices.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">per_req_cache_accounting</span></code> – maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">per_req_cache_equiv_blocks</span></code> – number of KV cache block equivalents reserved per request for its per-request cache (computed from <code class="docutils literal notranslate"><span class="pre">AttentionMetadataBuilder.compute_per_req_cache_bytes()</span> <span class="pre">/</span> <span class="pre">block_bytes</span></code>).</p></li>
 </ul>
 </section>
 <section id="allocation-allocate">
@@ -932,11 +938,11 @@
 </li>
 <li><p>Full blocks are registered in <code class="docutils literal notranslate"><span class="pre">hash_to_block_id</span></code>.</p></li>
 </ol>
-<p><strong>Mamba/GDN state allocation (if <code class="docutils literal notranslate"><span class="pre">seq.mamba_enabled</span></code>):</strong></p>
+<p><strong>Per-request cache allocation (if <code class="docutils literal notranslate"><span class="pre">seq.has_per_req_cache</span></code>):</strong></p>
 <ol class="arabic simple">
-<li><p>Allocates <code class="docutils literal notranslate"><span class="pre">mamba_equiv_per_req</span></code> accounting blocks from the free pool (for memory accounting).</p></li>
-<li><p>Stores these block IDs in <code class="docutils literal notranslate"><span class="pre">mamba_accounting[seq.id]</span></code> to track GDN memory usage.</p></li>
-<li><p>Pops one slot index from <code class="docutils literal notranslate"><span class="pre">free_mamba_slots</span></code> and assigns it to <code class="docutils literal notranslate"><span class="pre">seq.mamba_state_slot</span></code> (per-request state indexing).</p></li>
+<li><p>Allocates <code class="docutils literal notranslate"><span class="pre">per_req_cache_equiv_blocks</span></code> accounting blocks from the free pool (for memory accounting only).</p></li>
+<li><p>Stores these block IDs in <code class="docutils literal notranslate"><span class="pre">per_req_cache_accounting[seq.id]</span></code> to track per-request memory usage.</p></li>
+<li><p>Pops one slot group index from <code class="docutils literal notranslate"><span class="pre">free_per_req_cache_groups</span></code> and assigns it to <code class="docutils literal notranslate"><span class="pre">seq.per_req_cache_group</span></code> (per-request state indexing into the builder-allocated tensors).</p></li>
 </ol>
 </section>
 <section id="deallocation-deallocate">
@@ -950,34 +956,38 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">_deallocate_block</span><span class="p">(</span><span class="n">block_id</span><span class="p">)</span>
     <span class="n">seq</span><span class="o">.</span><span class="n">num_cached_tokens</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">seq</span><span class="o">.</span><span class="n">block_table</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">seq</span><span class="o">.</span><span class="n">mamba_enabled</span> <span class="ow">and</span> <span class="n">seq</span><span class="o">.</span><span class="n">mamba_state_slot</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">:</span>
-        <span class="k">for</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">mamba_accounting</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">seq</span><span class="o">.</span><span class="n">id</span><span class="p">,</span> <span class="p">[]):</span>
+    <span class="k">if</span> <span class="n">seq</span><span class="o">.</span><span class="n">has_per_req_cache</span> <span class="ow">and</span> <span class="n">seq</span><span class="o">.</span><span class="n">per_req_cache_group</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_req_cache_accounting</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">seq</span><span class="o">.</span><span class="n">id</span><span class="p">,</span> <span class="p">[]):</span>
             <span class="n">block</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span>
             <span class="n">block</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># accounting blocks bypass ref-counting</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_deallocate_block</span><span class="p">(</span><span class="n">block_id</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">free_mamba_slots</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">seq</span><span class="o">.</span><span class="n">mamba_state_slot</span><span class="p">)</span>
-        <span class="n">seq</span><span class="o">.</span><span class="n">mamba_state_slot</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_per_req_cache_groups</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">seq</span><span class="o">.</span><span class="n">per_req_cache_group</span><span class="p">)</span>
+        <span class="n">seq</span><span class="o">.</span><span class="n">per_req_cache_group</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
 </pre></div>
 </div>
 <p><strong>KV Cache deallocation:</strong> Blocks are released in reverse order. Shared blocks (with <code class="docutils literal notranslate"><span class="pre">ref_count</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> from prefix caching) are not freed until all referencing sequences release them.</p>
-<p><strong>Mamba/GDN state deallocation (if <code class="docutils literal notranslate"><span class="pre">seq.mamba_enabled</span></code>):</strong></p>
+<p><strong>Per-request cache deallocation (if <code class="docutils literal notranslate"><span class="pre">seq.has_per_req_cache</span></code>):</strong></p>
 <ol class="arabic simple">
-<li><p>Releases all accounting blocks for this sequence from <code class="docutils literal notranslate"><span class="pre">mamba_accounting[seq.id]</span></code> directly (bypassing ref-counting, as they are internal to the accounting system).</p></li>
-<li><p>Returns the slot index <code class="docutils literal notranslate"><span class="pre">seq.mamba_state_slot</span></code> to <code class="docutils literal notranslate"><span class="pre">free_mamba_slots</span></code> for reuse.</p></li>
-<li><p>Clears <code class="docutils literal notranslate"><span class="pre">seq.mamba_state_slot</span></code> to <code class="docutils literal notranslate"><span class="pre">-1</span></code> to mark it as released.</p></li>
+<li><p>Releases all accounting blocks for this sequence from <code class="docutils literal notranslate"><span class="pre">per_req_cache_accounting[seq.id]</span></code> directly (bypassing ref-counting, as they are internal to the accounting system).</p></li>
+<li><p>Returns the slot group index <code class="docutils literal notranslate"><span class="pre">seq.per_req_cache_group</span></code> to <code class="docutils literal notranslate"><span class="pre">free_per_req_cache_groups</span></code> for reuse.</p></li>
+<li><p>Clears <code class="docutils literal notranslate"><span class="pre">seq.per_req_cache_group</span></code> to <code class="docutils literal notranslate"><span class="pre">-1</span></code> to mark it as released.</p></li>
 </ol>
 </section>
 <section id="can-allocate-and-can-append-checks">
 <h3>3.5 Can-Allocate and Can-Append Checks<a class="headerlink" href="#can-allocate-and-can-append-checks" title="Link to this heading"></a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">can_allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-    <span class="n">mamba_cost</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mamba_equiv_per_req</span> <span class="k">if</span> <span class="n">seq</span><span class="o">.</span><span class="n">mamba_enabled</span> <span class="k">else</span> <span class="mi">0</span>
-    <span class="n">mamba_slot_ok</span> <span class="o">=</span> <span class="p">(</span><span class="ow">not</span> <span class="n">seq</span><span class="o">.</span><span class="n">mamba_enabled</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free_mamba_slots</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span>
+    <span class="n">per_req_cache_cost</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">per_req_cache_equiv_blocks</span> <span class="k">if</span> <span class="n">seq</span><span class="o">.</span><span class="n">has_per_req_cache</span> <span class="k">else</span> <span class="mi">0</span>
+    <span class="p">)</span>
+    <span class="n">per_req_cache_slot_ok</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="p">(</span><span class="ow">not</span> <span class="n">seq</span><span class="o">.</span><span class="n">has_per_req_cache</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free_per_req_cache_groups</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span>
+    <span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prefix_caching</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">(</span>
-            <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free_block_ids_set</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">seq</span><span class="o">.</span><span class="n">num_blocks</span> <span class="o">+</span> <span class="n">mamba_cost</span>
-            <span class="ow">and</span> <span class="n">mamba_slot_ok</span>
+            <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free_block_ids_set</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">seq</span><span class="o">.</span><span class="n">num_blocks</span> <span class="o">+</span> <span class="n">per_req_cache_cost</span>
+            <span class="ow">and</span> <span class="n">per_req_cache_slot_ok</span>
         <span class="p">)</span>
-    <span class="c1"># ... (prefix caching dry-run logic with mamba_cost included)</span>
+    <span class="c1"># ... (prefix caching dry-run logic with per_req_cache_cost included)</span>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">can_append</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">num_new_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
     <span class="n">seq_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span>
@@ -990,8 +1000,8 @@
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">can_allocate</span></code> checks that:</p>
 <ul>
-<li><p>Enough free KV blocks exist for the full sequence (<code class="docutils literal notranslate"><span class="pre">seq.num_blocks</span> <span class="pre">+</span> <span class="pre">mamba_cost</span></code> accounting blocks for GDN state if hybrid).</p></li>
-<li><p>At least one mamba slot is available if the sequence has <code class="docutils literal notranslate"><span class="pre">mamba_enabled=True</span></code>.</p></li>
+<li><p>Enough free KV blocks exist for the full sequence (<code class="docutils literal notranslate"><span class="pre">seq.num_blocks</span> <span class="pre">+</span> <span class="pre">per_req_cache_cost</span></code> accounting blocks for per-request state if applicable).</p></li>
+<li><p>At least one per-request cache slot group is available if the sequence has <code class="docutils literal notranslate"><span class="pre">has_per_req_cache=True</span></code>.</p></li>
 </ul>
 </li>
 <li><p><code class="docutils literal notranslate"><span class="pre">can_append</span></code> checks whether a decode step needs a new block. Calculates the required block count given <code class="docutils literal notranslate"><span class="pre">num_new_tokens</span></code> (typically <code class="docutils literal notranslate"><span class="pre">mtp_k</span> <span class="pre">+</span> <span class="pre">1</span></code> for speculative decode) and returns whether enough free blocks remain.</p></li>
@@ -1287,13 +1297,13 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">list[int]</span></code></p></td>
 <td><p>Ordered list of block IDs assigned to this sequence</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mamba_enabled</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">has_per_req_cache</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
-<td><p>Whether the model uses Gated DeltaNet recurrent attention (set at sequence init)</p></td>
+<td><p>Whether the model’s attention type maintains per-request state outside the paged KV pool (set at sequence init; True for GDN-based models, future stateful attentions)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mamba_state_slot</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">per_req_cache_group</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
-<td><p>Per-request GDN recurrent state slot index (assigned by BlockManager during allocation, <code class="docutils literal notranslate"><span class="pre">-1</span></code> if unallocated)</p></td>
+<td><p>Per-request stateful-attention slot group index (assigned by BlockManager during allocation, <code class="docutils literal notranslate"><span class="pre">-1</span></code> if unallocated)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">last_token</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
