@@ -315,10 +315,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # ------------------------------------------------------------------ #
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
-        """V4-style decode prep: populates positions + block_tables.
+        """V4-style decode prep: populates positions, cu_seqlens_q,
+        block_tables, and v4_slot_indices.
 
-        block_tables is required so V4 forward can scatter compressed entries
-        into the classical KV pool by block_id, and gather them for sparse_attn.
+        For PR3-main multi-seq:
+          - cu_seqlens_q gives V4 forward per-seq token-range slicing.
+          - block_tables[i] is the per-seq block list for compressor scatter
+            and sparse_attn gather.
+          - v4_slot_indices[i] is the per-seq state-cache slot (swa_kv +
+            Compressor.kv_state position).
         """
         import numpy as np
 
@@ -333,8 +338,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var["positions"].np[:sum_scheduled_tokens] = positions
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
+        # cu_seqlens_q for decode: each seq has max_seqlen_q tokens.
+        cu_seqlens_q_np = np.arange(
+            0, (scheduled_bs + 1) * max_seqlen_q, max_seqlen_q, dtype=np.int32
+        )
+        var["cu_seqlens_q"].np[: scheduled_bs + 1] = cu_seqlens_q_np
+        cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(scheduled_bs + 1)
+
         block_tables_gpu = self._populate_block_tables(batch, scheduled_bs)
+        slot_indices_gpu = self._populate_slot_indices(batch, scheduled_bs)
         attn_metadata = AttentionMetaData(
+            cu_seqlens_q=cu_seqlens_q_gpu,
             cu_seqlens_k=None,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=int(context_lens.max()) if len(context_lens) else 1,
@@ -345,21 +359,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             num_cached_tokens=None,
             block_tables=block_tables_gpu,
         )
+        # Attach V4-specific per-seq metadata via dynamic attribute.
+        # AttentionMetaData is a regular class (not slotted), so this works
+        # without modifying its schema.
+        attn_metadata.v4_slot_indices = slot_indices_gpu
         return attn_metadata, positions
 
     def prepare_prefill(self, batch: ScheduledBatch):
-        """V4 prefill prep: extends parent to always populate block_tables.
+        """V4 prefill prep: extends parent to always populate block_tables
+        and v4_slot_indices.
 
         The parent only emits block_tables when has_cached (prefix cache hit);
         V4 always needs block_tables because Compressor scatters compressed
         entries into the classical KV pool from token 0 onwards.
         """
         attn_metadata, positions = super().prepare_prefill(batch)
+        scheduled_bs = batch.total_seqs_num_prefill
         if attn_metadata.block_tables is None:
-            scheduled_bs = batch.total_seqs_num_prefill
             attn_metadata.block_tables = self._populate_block_tables(
                 batch, scheduled_bs
             )
+        attn_metadata.v4_slot_indices = self._populate_slot_indices(batch, scheduled_bs)
         return attn_metadata, positions
 
     def _populate_block_tables(
@@ -377,6 +397,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             block_tables_np[i] = 0
             block_tables_np[i, : len(block_table)] = block_table
         return var["block_tables"].copy_to_gpu(scheduled_bs)
+
+    def _populate_slot_indices(
+        self, batch: ScheduledBatch, scheduled_bs: int
+    ) -> torch.Tensor:
+        """Build `[scheduled_bs]` int32 tensor of per-seq state-cache slots.
+
+        With slots_per_req() == 1, slot index == per_req_cache_group. This
+        is what V4 forward uses to index swa_kv / Compressor.kv_state.
+        """
+        import numpy as np
+
+        groups_np = np.asarray(
+            batch.per_req_cache_groups[:scheduled_bs], dtype=np.int32
+        )
+        return torch.from_numpy(groups_np).to(self.model_runner.device)
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         # CUDA Graph capture is disabled for V4 (PR4 scope). Return a stub.
