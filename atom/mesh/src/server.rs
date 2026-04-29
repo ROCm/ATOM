@@ -692,6 +692,35 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!("Worker initialization job submitted (will complete in background)");
 
+    // Wait for workers to be registered before creating the router.
+    // The InitializeWorkersFromConfig job spawns AddWorker sub-jobs asynchronously,
+    // so we poll until all expected workers appear in the registry.
+    let expected_workers = config.router_config.mode.worker_count();
+    if expected_workers > 0 {
+        let max_wait = Duration::from_secs(config.router_config.worker_startup_timeout_secs + 60);
+        let poll_interval = Duration::from_millis(500);
+        let start = std::time::Instant::now();
+        loop {
+            let current = app_context.worker_registry.len();
+            if current >= expected_workers {
+                info!(
+                    "All {} expected workers registered (took {:?})",
+                    expected_workers,
+                    start.elapsed()
+                );
+                break;
+            }
+            if start.elapsed() > max_wait {
+                warn!(
+                    "Timed out waiting for workers: {} of {} registered after {:?}",
+                    current, expected_workers, max_wait
+                );
+                break;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     let worker_stats = app_context.worker_registry.stats();
     info!(
         "Workers initialized: {} total, {} healthy",

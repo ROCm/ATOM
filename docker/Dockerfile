@@ -388,6 +388,23 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         rm go1.22.2.linux-amd64.tar.gz; \
     fi
 
+# [MC 2.5/4] Install AMD Pensando ionic RDMA provider for Mooncake RDMA transport.
+# The container's apt rdma-core (v39) predates the ionic provider. The upstream
+# rdma-core v61 ionic source only supports kernel ABI 1, but Pensando's ionic NIC
+# driver uses kernel ABI 4. Pensando's custom libionic1 deb (based on rdma-core v54
+# fork) supports ABI 1-4 and is required for correct RDMA operation.
+ARG IONIC_DEB_URL="https://repo.radeon.com/amdainic/pensando/ubuntu/1.117.1-a-63/pool/main/r/rdma-core/libionic1_54.0-149.g3304be71_amd64.deb"
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        echo "========== [MC 2.5/4] Install ionic RDMA provider =========="; \
+        curl -fSL "${IONIC_DEB_URL}" -o /tmp/libionic1.deb && \
+        dpkg -i /tmp/libionic1.deb && \
+        echo "driver ionic" > /etc/libibverbs.d/ionic.driver && \
+        ldconfig && \
+        echo "Installed ionic provider:" && \
+        ls -la /usr/lib/x86_64-linux-gnu/libibverbs/libionic* && \
+        rm -f /tmp/libionic1.deb; \
+    fi
+
 # [MC 3/4] CMake build with HIP support + system install
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON) =========="; \
