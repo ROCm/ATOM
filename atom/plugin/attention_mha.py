@@ -29,6 +29,7 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
+_NO_PS_FIXED_SPLITS = 64  # covers up to 64 * 256 = 16384 context length
 
 
 class PagedAttentionImplPluginModeMethods:
@@ -239,9 +240,14 @@ class PagedAttentionImplPluginModeMethods:
         assert num_q_heads_total % num_kv_heads == 0
         context_partition_size = 256
 
-        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        use_ps = self.adopt_persistent_kernel(
+            head_size, num_kv_heads, num_q_heads_total
+        )
+        if use_ps:
+            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        else:
+            max_context_partition_num = _NO_PS_FIXED_SPLITS
 
-        context_partition_size = 256
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
@@ -298,7 +304,7 @@ class PagedAttentionImplPluginModeMethods:
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
-            ps=True,
+            ps=use_ps,
         )
 
         return o
