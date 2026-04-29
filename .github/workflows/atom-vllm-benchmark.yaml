@@ -720,7 +720,13 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          printf '%s\n' "${{ matrix.model.env_vars }}" | sed 's/^[[:space:]]*//' > /tmp/oot_env_file.txt
+          {
+            printf '%s\n' "${{ matrix.model.env_vars }}"
+            printf '%s\n' \
+              "AITER_LOG_LEVEL=ERROR" \
+              "AITER_TRITON_LOG_LEVEL=CRITICAL" \
+              "AITER_LOG_MORE=0"
+          } | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' > /tmp/oot_env_file.txt
 
           $CONTAINER_ENGINE run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
@@ -809,9 +815,8 @@ jobs:
             test -f \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\"
           "
 
-      - name: Run OOT benchmark
+      - name: Launch OOT benchmark server
         if: steps.check.outputs.enabled == 'true'
-        timeout-minutes: 240
         env:
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
@@ -829,60 +834,86 @@ jobs:
               bash .github/scripts/atom_oot_test.sh launch full
             "
 
+      - name: Run OOT benchmark client
+        id: run_benchmark_client
+        if: steps.check.outputs.enabled == 'true'
+        timeout-minutes: 240
+        continue-on-error: true
+        run: |
+          set -euo pipefail
           TRUST_REMOTE_CODE_ARG=""
           if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
             TRUST_REMOTE_CODE_ARG="--trust-remote-code"
           fi
 
-          echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+          {
+            echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+            $CONTAINER_ENGINE exec \
+              -e ISL="${ISL}" \
+              -e OSL="${OSL}" \
+              -e CONC="${CONC}" \
+              -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+              -e RESULT_FILENAME="${RESULT_FILENAME}" \
+              -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+              "$CONTAINER_NAME" bash -lc "
+                set -euo pipefail
+                rm -rf \"${CONTAINER_RESULT_DIR}\"
+                mkdir -p \"${CONTAINER_RESULT_DIR}\"
+                PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
+                  --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                  --backend=vllm \
+                  --base-url=http://127.0.0.1:8000 \
+                  --dataset-name=random \
+                  --random-input-len=\"${ISL}\" \
+                  --random-output-len=\"${OSL}\" \
+                  --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                  --num-prompts=\"$(( CONC * 10 ))\" \
+                  --max-concurrency=\"${CONC}\" \
+                  ${TRUST_REMOTE_CODE_ARG} \
+                  --num-warmups=\"$(( 2 * CONC ))\" \
+                  --request-rate=inf \
+                  --ignore-eos \
+                  --save-result \
+                  --percentile-metrics=\"ttft,tpot,itl,e2el\" \
+                  --result-dir=\"${CONTAINER_RESULT_DIR}\" \
+                  --result-filename=\"${RESULT_FILENAME}.json\" \
+                  ${BENCH_EXTRA_ARGS:-}
+              "
+          } > "./${RESULT_FILENAME}.client.log" 2>&1
 
-          $CONTAINER_ENGINE exec \
-            -e ISL="${ISL}" \
-            -e OSL="${OSL}" \
-            -e CONC="${CONC}" \
-            -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-            -e RESULT_FILENAME="${RESULT_FILENAME}" \
-            -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-            "$CONTAINER_NAME" bash -lc "
-              set -euo pipefail
-              rm -rf \"${CONTAINER_RESULT_DIR}\"
-              mkdir -p \"${CONTAINER_RESULT_DIR}\"
-              PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
-                --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                --backend=vllm \
-                --base-url=http://127.0.0.1:8000 \
-                --dataset-name=random \
-                --random-input-len=\"${ISL}\" \
-                --random-output-len=\"${OSL}\" \
-                --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                --num-prompts=\"$(( CONC * 10 ))\" \
-                --max-concurrency=\"${CONC}\" \
-                ${TRUST_REMOTE_CODE_ARG} \
-                --num-warmups=\"$(( 2 * CONC ))\" \
-                --request-rate=inf \
-                --ignore-eos \
-                --save-result \
-                --percentile-metrics=\"ttft,tpot,itl,e2el\" \
-                --result-dir=\"${CONTAINER_RESULT_DIR}\" \
-                --result-filename=\"${RESULT_FILENAME}.json\" \
-                ${BENCH_EXTRA_ARGS:-}
-            "
+      - name: Copy OOT benchmark outputs
+        if: always() && steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "test -f \"${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json\"" >/dev/null 2>&1; then
+            $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json" || true
+          fi
+          if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "test -f /tmp/vllm_oot.log" >/dev/null 2>&1; then
+            $CONTAINER_ENGINE cp "${CONTAINER_NAME}:/tmp/vllm_oot.log" "./${RESULT_FILENAME}.vllm.log" || true
+          fi
 
-          $CONTAINER_ENGINE exec -i \
-            -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
-            -e ISL="${ISL}" \
-            -e OSL="${OSL}" \
-            -e EXTRA_ARGS_TEXT="${OOT_EXTRA_ARGS}" \
-            -e DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
-            -e ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
-            -e ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
-            -e ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
-            -e VLLM_COMMIT_USED="${VLLM_COMMIT_USED}" \
-            -e VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
-            -e OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
-            -e OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
-            -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
-            "$CONTAINER_NAME" python3 - <<'PY'
+      - name: Enrich copied benchmark result
+        if: always() && steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -f "${RESULT_FILENAME}.json" ]; then
+            echo "No benchmark result JSON found to enrich."
+            exit 0
+          fi
+          RESULT_PATH="${RESULT_FILENAME}.json" \
+          ISL="${ISL}" \
+          OSL="${OSL}" \
+          EXTRA_ARGS_TEXT="${OOT_EXTRA_ARGS}" \
+          DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
+          ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
+          ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
+          ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
+          VLLM_COMMIT_USED="${VLLM_COMMIT_USED}" \
+          VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
+          OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
+          OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
+          PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
+          python3 - <<'PY'
           import json
           import os
           import re
@@ -921,7 +952,60 @@ jobs:
               json.dump(data, f, indent=2)
           PY
 
-          $CONTAINER_ENGINE cp "${CONTAINER_NAME}:${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" "./${RESULT_FILENAME}.json"
+      - name: Dump OOT benchmark diagnostics
+        if: always() && steps.check.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          RESULT_PATH="${RESULT_FILENAME}.json"
+          CLIENT_LOG="${RESULT_FILENAME}.client.log"
+          VLLM_LOG="${RESULT_FILENAME}.vllm.log"
+          BENCH_OUTCOME="${{ steps.run_benchmark_client.outcome }}"
+          COMPLETED=""
+          NUM_PROMPTS=""
+
+          if [ -f "${RESULT_PATH}" ]; then
+            mapfile -t RESULT_COUNTS < <(
+              RESULT_PATH="${RESULT_PATH}" python3 - <<'PY'
+          import json
+          import os
+
+          result_path = os.environ["RESULT_PATH"]
+          try:
+              with open(result_path, encoding="utf-8") as f:
+                  data = json.load(f)
+          except (OSError, ValueError, json.JSONDecodeError):
+              print("")
+              print("")
+          else:
+              print(data.get("completed", ""))
+              print(data.get("num_prompts", ""))
+          PY
+            )
+            COMPLETED="${RESULT_COUNTS[0]:-}"
+            NUM_PROMPTS="${RESULT_COUNTS[1]:-}"
+          fi
+
+          if [[ "${BENCH_OUTCOME}" == "success" && -f "${RESULT_PATH}" && -n "${NUM_PROMPTS}" && "${COMPLETED}" == "${NUM_PROMPTS}" ]]; then
+            echo "Benchmark finished without triggering diagnostic dump."
+            exit 0
+          fi
+
+          echo "::warning::Dumping benchmark diagnostics for ${MODEL_NAME} (benchmark outcome=${BENCH_OUTCOME}, completed=${COMPLETED:-missing}, num_prompts=${NUM_PROMPTS:-missing})."
+          echo "::group::Benchmark client log"
+          if [ -f "${CLIENT_LOG}" ]; then
+            cat "${CLIENT_LOG}"
+          else
+            echo "Benchmark client log not found: ${CLIENT_LOG}"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::vLLM log tail"
+          if [ -f "${VLLM_LOG}" ]; then
+            tail -n 400 "${VLLM_LOG}"
+          else
+            echo "vLLM log not found: ${VLLM_LOG}"
+          fi
+          echo "::endgroup::"
 
       - name: Inject GPU metadata into benchmark results
         if: steps.check.outputs.enabled == 'true'
@@ -945,20 +1029,76 @@ jobs:
           "
           done
 
-      - name: Collect benchmark result
+      - name: Validate benchmark result completeness
+        id: validate_benchmark_result
         if: steps.check.outputs.enabled == 'true'
         run: |
-          if [ ! -f "${RESULT_FILENAME}.json" ]; then
-            echo "ERROR: Benchmark result file ${RESULT_FILENAME}.json was not generated for ${MODEL_NAME}."
-            exit 1
-          fi
+          set -euo pipefail
+          RESULT_PATH="${RESULT_FILENAME}.json"
+          RESULT_PATH="${RESULT_PATH}" MODEL_NAME="${MODEL_NAME}" python3 - <<'PY'
+          import json
+          import os
+          import sys
 
-      - name: Upload benchmark result
-        if: steps.check.outputs.enabled == 'true'
+          result_path = os.environ["RESULT_PATH"]
+          model_name = os.environ["MODEL_NAME"]
+
+          if not os.path.exists(result_path):
+              print(
+                  f"::error::Benchmark result file {result_path} was not generated for {model_name}.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          try:
+              with open(result_path, encoding="utf-8") as f:
+                  data = json.load(f)
+          except (OSError, ValueError, json.JSONDecodeError) as exc:
+              print(
+                  f"::error::Failed to read benchmark result file {result_path}: {exc}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          num_prompts = data.get("num_prompts")
+          completed = data.get("completed")
+
+          try:
+              num_prompts = int(num_prompts)
+              completed = int(completed)
+          except (TypeError, ValueError):
+              print(
+                  f"::error::Invalid benchmark result in {result_path}: "
+                  f"num_prompts={num_prompts!r}, completed={completed!r}.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if completed != num_prompts:
+              print(
+                  f"::error::Invalid benchmark result in {result_path}: "
+                  f"successful requests ({completed}) did not match num_prompts ({num_prompts}). "
+                  "Skipping artifact upload and dashboard publishing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(
+              f"Validated benchmark result for {model_name}: "
+              f"successful requests ({completed}) matched num_prompts ({num_prompts})."
+          )
+          PY
+
+      - name: Upload benchmark artifacts
+        if: always() && steps.check.outputs.enabled == 'true' && steps.validate_benchmark_result.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
           name: oot-benchmark-${{ env.RESULT_FILENAME }}
-          path: ${{ env.RESULT_FILENAME }}.json
+          if-no-files-found: warn
+          path: |
+            ${{ env.RESULT_FILENAME }}.json
+            ${{ env.RESULT_FILENAME }}.client.log
+            ${{ env.RESULT_FILENAME }}.vllm.log
 
       - name: Clean up OOT benchmark container
         if: always() && steps.check.outputs.enabled == 'true'

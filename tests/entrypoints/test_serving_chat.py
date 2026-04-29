@@ -8,6 +8,7 @@ import json
 
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
+    build_chat_response_multi,
     create_chat_chunk,
 )
 
@@ -125,3 +126,91 @@ class TestBuildChatResponse:
         assert resp.usage["ttft_s"] == 0.15
         assert resp.usage["tpot_s"] == 0.03
         assert resp.usage["latency_s"] == 0.8
+
+
+# ============================================================================
+# build_chat_response_multi Tests (SamplingParams.n > 1 fan-out)
+# ============================================================================
+
+
+class TestBuildChatResponseMulti:
+    """Tests for multi-choice (n>1) non-streaming chat response."""
+
+    def _make_output(self, **overrides):
+        defaults = {
+            "text": "Hello!",
+            "finish_reason": "stop",
+            "num_tokens_input": 10,
+            "num_tokens_output": 5,
+            "ttft": 0.1,
+            "tpot": 0.02,
+            "latency": 0.5,
+        }
+        defaults.update(overrides)
+        return defaults
+
+    def test_choice_count_matches_fanout(self):
+        outputs = [self._make_output(text=f"answer-{i}") for i in range(4)]
+        resp = build_chat_response_multi("req-2", "model", outputs)
+        assert len(resp.choices) == 4
+
+    def test_choice_indices_are_zero_to_n_minus_one(self):
+        outputs = [self._make_output(text=f"answer-{i}") for i in range(3)]
+        resp = build_chat_response_multi("req-2", "model", outputs)
+        assert [c["index"] for c in resp.choices] == [0, 1, 2]
+
+    def test_per_choice_content_preserved(self):
+        outputs = [
+            self._make_output(text="first answer"),
+            self._make_output(text="second answer"),
+        ]
+        resp = build_chat_response_multi("req-2", "model", outputs)
+        assert resp.choices[0]["message"]["content"] == "first answer"
+        assert resp.choices[1]["message"]["content"] == "second answer"
+
+    def test_completion_tokens_summed_across_siblings(self):
+        outputs = [
+            self._make_output(num_tokens_output=5),
+            self._make_output(num_tokens_output=7),
+            self._make_output(num_tokens_output=3),
+        ]
+        resp = build_chat_response_multi("req-2", "model", outputs)
+        assert resp.usage["completion_tokens"] == 15
+        # prompt tokens come from the shared prompt and should not be multiplied
+        assert resp.usage["prompt_tokens"] == 10
+        assert resp.usage["total_tokens"] == 25
+        assert resp.usage["num_choices"] == 3
+
+    def test_latency_is_max_across_siblings(self):
+        outputs = [
+            self._make_output(latency=0.3),
+            self._make_output(latency=0.9),
+            self._make_output(latency=0.5),
+        ]
+        resp = build_chat_response_multi("req-2", "model", outputs)
+        assert resp.usage["latency_s"] == 0.9
+
+    def test_reasoning_separated_per_choice(self):
+        outputs = [
+            self._make_output(text="<think>reasoning A</think>answer A"),
+            self._make_output(text="plain answer B"),
+        ]
+        resp = build_chat_response_multi("req-2", "model", outputs)
+        assert resp.choices[0]["message"]["content"] == "answer A"
+        assert resp.choices[0]["message"]["reasoning_content"] == "reasoning A"
+        assert resp.choices[1]["message"]["content"] == "plain answer B"
+        assert "reasoning_content" not in resp.choices[1]["message"]
+
+
+class TestCreateChatChunkWithIndex:
+    """Tests for the ``index`` parameter added for fan-out streaming."""
+
+    def test_default_index_is_zero(self):
+        chunk_str = create_chat_chunk("req", "model", delta={"content": "hi"})
+        data = json.loads(chunk_str[6:])
+        assert data["choices"][0]["index"] == 0
+
+    def test_explicit_index_propagated(self):
+        chunk_str = create_chat_chunk("req", "model", delta={"content": "hi"}, index=3)
+        data = json.loads(chunk_str[6:])
+        assert data["choices"][0]["index"] == 3

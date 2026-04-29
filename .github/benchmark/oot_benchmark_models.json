@@ -93,8 +93,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-    "excluded_input_output_pairs": ["1024x8192"]
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
   },
   {
     "display": "Qwen3.5-397B-A17B-MXFP4 TP4",
@@ -105,8 +104,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-    "excluded_input_output_pairs": ["1024x8192"]
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
   },
   {
     "display": "Qwen3.5-397B-A17B-FP8 TP2",
@@ -117,8 +115,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 2 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-    "excluded_input_output_pairs": ["1024x8192"]
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
   },
   {
     "display": "Qwen3.5-397B-A17B-FP8 TP4",
@@ -129,8 +126,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-    "excluded_input_output_pairs": ["1024x8192"]
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
   },
   {
     "display": "Qwen3.5-397B-A17B TP8",
@@ -141,8 +137,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 8 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-    "excluded_input_output_pairs": ["1024x8192"]
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
   },
   {
     "display": "Qwen3.5-397B-A17B TP2",
@@ -153,8 +148,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 2 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-    "excluded_input_output_pairs": ["1024x8192"]
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
   },
   {
     "display": "Qwen3.5-397B-A17B TP4",
@@ -165,8 +159,7 @@
     "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
-    "excluded_input_output_pairs": ["1024x8192"]
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
   },
   {
     "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
@@ -174,10 +167,10 @@
     "source_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
     "path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
     "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp1",
-    "extra_args": "--trust-remote-code --tensor-parallel-size 1 --attention-backend ROCM_AITER_FA --max-num-batched-tokens 32768 --max-model-len 16384",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1"
   },
   {
     "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
@@ -185,9 +178,9 @@
     "source_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
     "path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
     "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp4",
-    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --attention-backend ROCM_AITER_FA --max-num-batched-tokens 32768 --max-model-len 16384",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384",
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1"
   }
 ]

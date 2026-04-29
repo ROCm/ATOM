@@ -120,6 +120,12 @@ class RadixAttention(BaseAttention):
         if is_sglang():
             # for sglang, forward_batch is required
             forward_batch = kwargs.get("forward_batch", None)
+            if forward_batch is None:
+                from atom.plugin.sglang.models.base_model_wrapper import (
+                    get_current_forward_batch,
+                )
+
+                forward_batch = get_current_forward_batch()
             # save_kv_cache is explicitly set by the caller:
             # - True (default): the attention backend writes KV to cache
             # - False: when fused rope+qknorm kernel already wrote KV to cache,

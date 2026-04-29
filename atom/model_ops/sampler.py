@@ -55,6 +55,7 @@ class Sampler(nn.Module):
         top_ks: torch.Tensor | None = None,  # (num_tokens,) int32, -1 means disabled
         top_ps: torch.Tensor | None = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
+        needs_independent_noise: bool = False,
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -65,16 +66,30 @@ class Sampler(nn.Module):
             top_ks: Top-k value per token, -1 means disabled (num_tokens,)
             top_ps: Top-p value per token, 1.0 means disabled (num_tokens,)
             all_greedy: True if all requests use greedy sampling (checked on CPU)
+            needs_independent_noise: True when the batch contains fan-out
+                siblings (SamplingParams.n>1). Forces fresh per-row random
+                exponential noise so sibling sequences with identical logits
+                do not produce identical tokens. Adds an O(bs * vocab_size)
+                allocation, so only enabled when actually needed.
 
         Returns:
             Sampled token IDs (num_tokens,)
         """
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
-            return self._temperature_sample(logits, temperatures)
+            return self._temperature_sample(
+                logits, temperatures, needs_independent_noise=needs_independent_noise
+            )
 
         # Apply top-k/top-p filtering
-        return self._topk_topp_sample(logits, temperatures, top_ks, top_ps, all_greedy)
+        return self._topk_topp_sample(
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            needs_independent_noise=needs_independent_noise,
+        )
 
     def _needs_filtering(
         self,
@@ -92,13 +107,27 @@ class Sampler(nn.Module):
         self,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
+        needs_independent_noise: bool = False,
     ) -> torch.Tensor:
-        """Temperature-based Gumbel-max sampling."""
+        """Temperature-based Gumbel-max sampling.
+
+        When ``needs_independent_noise`` is True the per-row exponential noise
+        tensor is freshly drawn with shape ``(num_tokens, vocab_size)`` so that
+        fan-out siblings produced by ``SamplingParams.n > 1`` diverge instead
+        of collapsing onto the same token when they share logits. Otherwise we
+        keep the cached ``(1, vocab_size)`` row broadcasted across the batch,
+        which preserves the existing run-to-run determinism optimization.
+        """
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
-        exponential = get_per_token_exponential(vocab_size, logits.device).expand(
-            num_tokens, vocab_size
-        )
+        if needs_independent_noise:
+            exponential = torch.empty(
+                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
+            ).exponential_(1)
+        else:
+            exponential = get_per_token_exponential(vocab_size, logits.device).expand(
+                num_tokens, vocab_size
+            )
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
@@ -111,8 +140,17 @@ class Sampler(nn.Module):
         top_ks: torch.Tensor | None,
         top_ps: torch.Tensor | None,
         all_greedy: bool,
+        needs_independent_noise: bool = False,
     ) -> torch.Tensor:
-        """Top-K/Top-P sampling with temperature scaling."""
+        """Top-K/Top-P sampling with temperature scaling.
+
+        The top-k/top-p paths below use ``torch.multinomial`` (native fallback)
+        or aiter's sampling ops that draw from torch's default RNG stream per
+        batch row, so fan-out siblings already diverge naturally and the
+        ``needs_independent_noise`` flag is accepted purely for API symmetry.
+        """
+        # Accepted but unused here; see docstring.
+        del needs_independent_noise
         # Fast path: if ALL requests are greedy (temperature=0), just do argmax
         # This avoids the overhead of softmax and top-k/top-p filtering
         if all_greedy:
