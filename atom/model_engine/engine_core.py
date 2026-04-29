@@ -21,6 +21,8 @@ from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
 
+from atom.kv_transfer.disaggregation import KVOutputAggregator
+
 logger = logging.getLogger("atom")
 
 
@@ -58,6 +60,14 @@ class EngineCore:
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
         )
         self.output_thread.start()
+
+        # Start input thread BEFORE _init_data_parallel so that CoreManager
+        # can receive the input socket connection and proceed to start the
+        # remaining DP ranks.  Without this, _init_data_parallel blocks on
+        # rendezvous waiting for all DP ranks, but they haven't been spawned
+        # yet because CoreManager is still waiting for *this* rank's socket.
+        # The READY signal (sent at the end of __init__) gates actual request
+        # processing, so starting the input thread early is safe.
         self.input_thread = threading.Thread(
             target=self.process_input_sockets, args=(self.input_address,), daemon=True
         )
@@ -77,7 +87,14 @@ class EngineCore:
                 "atom.model_engine.model_runner.ModelRunner",
                 config,
             )
-            num_blocks = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
+            num_blocks = block_info["num_kvcache_blocks"]
+            config.per_req_cache_equiv_blocks = block_info.get(
+                "per_req_cache_equiv_blocks", 0
+            )
+            config.num_per_req_cache_groups = block_info.get(
+                "num_per_req_cache_groups", 0
+            )
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -109,16 +126,11 @@ class EngineCore:
 
         self.scheduler = Scheduler(config)
 
-        # Start input thread AFTER model is loaded so the "ready" signal
-        # is sent only when the engine is truly ready to accept requests
-        # self.input_thread = threading.Thread(
-        #     target=self.process_input_sockets, args=(self.input_address,), daemon=True
-        # )
-        # self.input_thread.start()
-
-        # We can not start input thread here since dp need to sync with other ranks,
-        # Otherwise, DP will hang always.
-        # Thus we add new signal READY to notify CoreManager
+        self.kv_transfer_enabled = bool(config.kv_transfer_config)
+        if self.kv_transfer_enabled:
+            self.kv_aggregator = KVOutputAggregator(
+                world_size=config.tensor_parallel_size
+            )
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
@@ -179,12 +191,42 @@ class EngineCore:
                 self._process_engine_step()
 
     def _process_engine_step(self):
-        if not self.scheduler.has_requests():
+        result = self.scheduler.schedule()
+        if result is None:
             return False
-        scheduled_batch, seqs = self.scheduler.schedule()
-        # if scheduled_batch is None:
-        #     return False
-        fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        scheduled_batch, seqs = result
+
+        if scheduled_batch is None:
+            logger.debug("%s: No sequences to schedule, skipping forward", self.label)
+            return False
+
+        # Dispatch KV connector metadata to workers (triggers async KV load)
+        if (
+            self.kv_transfer_enabled
+            and scheduled_batch.connector_meta_output is not None
+        ):
+            self.runner_mgr.call_func(
+                "process_kvconnector_output", scheduled_batch.connector_meta_output
+            )
+
+        # Run the model forward pass if there are actual sequences
+        has_seqs = len(scheduled_batch.req_ids) > 0
+        if has_seqs:
+            fwd_out = self.runner_mgr.call_func(
+                "forward", scheduled_batch, wait_out=True
+            )
+
+        # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
+        if self.kv_transfer_enabled:
+            kvoutput = self.runner_mgr.call_func_with_aggregation(
+                "async_proc_aggregation"
+            )
+            self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+        if not has_seqs:
+            logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
+            return False
+
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
@@ -214,7 +256,7 @@ class EngineCore:
                     return True
                 recv_reqs.append(seq)
         if len(recv_reqs) > 0:
-            logger.info(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
+            logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
         return False
 
@@ -397,7 +439,19 @@ class DPEngineCoreProc(EngineCore):
             else:
                 executed = self._process_engine_step()
                 if not executed:
-                    self._execute_dummy_batch()
+                    if global_has_prefill:
+                        # get_next_batch_info predicted prefill but schedule()
+                        # skipped it (e.g. WAITING_FOR_REMOTE_KVS).  Other DP
+                        # ranks already committed to dummy_prefill, so we must
+                        # match to keep the all-reduce in sync.
+                        logger.info(
+                            f"{self.label}: Predicted prefill was not scheduled, "
+                            f"falling back to dummy prefill ({global_max_tokens} "
+                            f"tokens) to stay in sync with other DP ranks"
+                        )
+                        self._execute_dummy_prefill(global_max_tokens)
+                    else:
+                        self._execute_dummy_batch()
 
             self.engines_running = global_has_unfinished
 

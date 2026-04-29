@@ -114,6 +114,9 @@ class CompletionRequest(BaseModel):
     stop: Optional[List[str]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
+    # Optional KV-transfer metadata for P/D disaggregation.
+    kv_transfer_params: Optional[Dict[str, Any]] = None
+    n: Optional[int] = 1
 
 
 # ============================================================================
@@ -143,6 +146,8 @@ class CompletionResponse(BaseModel):
     model: str
     choices: List[Dict[str, Any]]
     usage: Dict[str, Any]
+    # Optional KV-transfer metadata returned for P/D disaggregation.
+    kv_transfer_params: Optional[Dict[str, Any]] = None
 
 
 class ModelCard(BaseModel):

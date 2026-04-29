@@ -1932,7 +1932,9 @@ class FusedMoE(torch.nn.Module):
         super().__init__()
         self.prefix = prefix
         layer_quant_config = (
-            quant_config.get_layer_quant_config(prefix) if quant_config else None
+            quant_config.get_layer_quant_config(prefix, check_children=True)
+            if quant_config
+            else None
         )
         self.params_dtype = (
             layer_quant_config.quant_dtype

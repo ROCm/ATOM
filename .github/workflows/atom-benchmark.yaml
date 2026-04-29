@@ -34,6 +34,14 @@ on:
         description: "Benchmark MiniMax-M2.5"
         type: boolean
         default: true
+      qwen35-397b-fp8:
+        description: "Benchmark Qwen3.5-397B-A17B-FP8"
+        type: boolean
+        default: true
+      qwen35-397b-mxfp4:
+        description: "Benchmark Qwen3.5-397B-A17B-MXFP4"
+        type: boolean
+        default: true
       llama-3-3-70b-instruct-mxfp4:
         description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
         type: boolean
@@ -45,6 +53,10 @@ on:
         description: "Image to use for the benchmark"
         type: string
         default: "rocm/atom-dev:latest"
+      runner:
+        description: "Optional runner label override for manual runs; leave empty to use model defaults"
+        type: string
+        default: ""
       enable_profiler:
         description: "Enable torch profiler to collect trace for performance debugging"
         type: boolean
@@ -140,7 +152,7 @@ jobs:
           - model: { suffix: "-mtp3" }
             config: { concurrency: 2 }
 
-    runs-on: ${{ matrix.model.runner }}
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}
 
     env:
       MODEL_PATH: ${{ matrix.model.path }}
@@ -205,12 +217,25 @@ jobs:
         run: |
           # Run rocm-smi inside the container for consistent output across runners
           GPU_NAME=$(docker exec atom-benchmark rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          if [ -z "$GPU_NAME" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; then
+            GPU_NAME=$(docker exec atom-benchmark rocminfo 2>/dev/null | grep -A1 "Uuid:.*GPU-" | grep "Marketing Name" | head -1 | sed 's/.*:\s*//' | xargs || echo "")
+          fi
           GPU_VRAM_GB=$(docker exec atom-benchmark rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
           ROCM_VERSION=$(docker exec atom-benchmark cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
+          DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
+          if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
+            RESOLVED_IMAGE=""
+            if RESOLUTION_JSON="$(python3 .github/scripts/resolve_atom_image.py --repository rocm/atom-dev --reference-tag latest --image-family native 2>/dev/null)"; then
+              RESOLVED_IMAGE="$(echo "$RESOLUTION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("resolved_image",""))')" || true
+            fi
+            DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
+          fi
           echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
           echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
           echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
-          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+          echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}, Docker: ${DOCKER_IMAGE}"
 
       - name: Download models
         run: |
@@ -254,8 +279,9 @@ jobs:
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
-            -e DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}" \
+            -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
             -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
+            -e DISPLAY_NAME="${{ matrix.model.display }}" \
             atom-benchmark python3 -c "
           import json, os
           p = os.environ['RESULT_PATH']
@@ -268,6 +294,9 @@ jobs:
               d['gpu_vram_gb'] = int(os.environ.get('GPU_VRAM_GB') or 0)
               d['rocm_version'] = os.environ.get('ROCM_VERSION', '')
               d['docker_image'] = os.environ.get('DOCKER_IMAGE', '')
+              display_name = os.environ.get('DISPLAY_NAME', '')
+              if display_name:
+                  d['benchmark_model_name'] = display_name
               with open(p, 'w') as f:
                   json.dump(d, f, indent=2)
           "
@@ -300,7 +329,7 @@ jobs:
       - name: Upload benchmark result
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.RESULT_FILENAME }}
+          name: benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
       - name: Clean Up
@@ -325,7 +354,7 @@ jobs:
       - name: Download all benchmark results
         uses: actions/download-artifact@v8
         with:
-          pattern: '*'
+          pattern: 'benchmark-*'
           merge-multiple: true
           path: .
 
@@ -346,7 +375,9 @@ jobs:
           if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "${{ github.run_id }}" ]; then
             echo "Downloading baseline from run #$PREV_RUN_ID"
             mkdir -p /tmp/baseline
-            gh run download "$PREV_RUN_ID" --dir /tmp/baseline || echo "::warning::Failed to download baseline artifacts"
+            # Only download benchmark result artifacts (prefix: benchmark-),
+            # not profiler/regression traces which can be multi-GB.
+            gh run download "$PREV_RUN_ID" --dir /tmp/baseline --pattern 'benchmark-*' || echo "::warning::Failed to download baseline artifacts"
             BASELINE_COUNT=$(find /tmp/baseline -name '*.json' | wc -l)
             echo "Downloaded $BASELINE_COUNT baseline files"
             echo "baseline_dir=/tmp/baseline" >> $GITHUB_OUTPUT
@@ -398,51 +429,11 @@ jobs:
 
       - name: Transform results for benchmark dashboard
         run: |
-          python3 -c "
-          import json, glob, re
-          run_url = f'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          entries = []
-          for f in sorted(glob.glob('*.json')):
-              if f == 'regression_report.json':
-                  continue
-              try:
-                  d = json.load(open(f))
-              except (json.JSONDecodeError, OSError):
-                  continue
-              if 'output_throughput' not in d:
-                  continue
-              model = d.get('model_id', '').split('/')[-1]
-              m = re.search(r'-(mtp\d*)-', f)
-              if m:
-                  model = f'{model}-{m.group(1)}'
-              isl = d.get('random_input_len', 0)
-              osl = d.get('random_output_len', 0)
-              conc = d.get('max_concurrency', 0)
-              label = f'{model} {isl}/{osl} c={conc}'
-              gpu_name = d.get('gpu_name', '')
-              gpu_vram = d.get('gpu_vram_gb', 0)
-              rocm_ver = d.get('rocm_version', '')
-              extra = f'Run: {run_url}'
-              if gpu_name:
-                  extra += f' | GPU: {gpu_name}'
-              if gpu_vram:
-                  extra += f' | VRAM: {gpu_vram}GB'
-              if rocm_ver:
-                  extra += f' | ROCm: {rocm_ver}'
-              entries.append({'name': f'{label} throughput (tok/s)', 'unit': 'tok/s',
-                              'value': round(d['output_throughput'], 2), 'extra': extra})
-              entries.append({'name': f'{label} Total Tput (tok/s)', 'unit': 'tok/s',
-                              'value': round(d.get('total_token_throughput', 0), 2), 'extra': extra})
-              entries.append({'name': f'{label} TTFT (ms)', 'unit': 'ms',
-                              'value': round(d.get('mean_ttft_ms', 0), 2), 'extra': extra})
-              entries.append({'name': f'{label} TPOT (ms)', 'unit': 'ms',
-                              'value': round(d.get('mean_tpot_ms', 0), 2), 'extra': extra})
-              tp = d.get('tensor_parallel_size', 1)
-              entries.append({'name': f'{label} _gpu_count', 'unit': '',
-                              'value': int(tp)})
-          json.dump(entries, open('benchmark-action-input.json', 'w'), indent=2)
-          print(f'Generated {len(entries)} entries for benchmark dashboard')
-          "
+          python3 .github/scripts/plugin_benchmark_to_dashboard.py \
+            . \
+            --output benchmark-action-input.json \
+            --default-backend ATOM \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Store benchmark result to dashboard
         uses: benchmark-action/github-action-benchmark@v1
@@ -463,6 +454,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           CURRENT_SHA=$(git rev-parse HEAD)
+          # Generate prefix→display name mapping from models.json
+          python3 -c "
+          import json
+          models = json.loads(open('.github/benchmark/models.json').read())
+          mapping = {}
+          for m in models:
+              display = m.get('display','')
+              path = m.get('path','')
+              suffix = m.get('suffix','')
+              if not display or not path: continue
+              hf_name = path.split('/')[-1].lower()
+              # HF path-derived key (old data used model_id last segment + optional suffix)
+              hf_key = hf_name + suffix.lower() if suffix else hf_name
+              mapping[hf_key] = display
+          with open('/tmp/dashboard_models_map.js','w') as f:
+              f.write('window.MODELS_DISPLAY_MAP = ' + json.dumps(mapping) + ';')
+          "
           # Save dashboard assets before switching branches
           cp .github/dashboard/index.html /tmp/dashboard_index.html
           cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
@@ -471,6 +479,7 @@ jobs:
           git checkout gh-pages
           # Replace auto-generated index.html with custom dashboard + logo
           cp /tmp/dashboard_index.html benchmark-dashboard/index.html
+          cp /tmp/dashboard_models_map.js benchmark-dashboard/models_map.js
           cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
           cp /tmp/dashboard_logo_mini.png benchmark-dashboard/atom_logo_mini.png
           git add benchmark-dashboard/
@@ -530,7 +539,7 @@ jobs:
       fail-fast: false
       matrix:
         cell: ${{ fromJson(needs.generate-regression-matrix.outputs.matrix_json) }}
-    runs-on: ${{ matrix.cell.runner }}
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}
     timeout-minutes: 60
     steps:
       - name: Kill all Docker containers

@@ -224,6 +224,12 @@ run_accuracy() {
     --tasks "${LM_EVAL_TASK}" \
     --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
     --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+  # Capture lm_eval exit code explicitly; tee always exits 0 so PIPESTATUS is needed.
+  lm_eval_exit="${PIPESTATUS[0]}"
+  if [[ "${lm_eval_exit}" -ne 0 ]]; then
+    echo "ERROR: lm_eval exited with code ${lm_eval_exit}"
+    return "${lm_eval_exit}"
+  fi
 
   local result_file=""
   result_file=$(python3 - <<PY
@@ -257,9 +263,12 @@ PY
     result_file="${flat_result_file}"
   fi
 
-  if [[ -n "${SGLANG_DOCKER_IMAGE}" ]]; then
+  if [[ -n "${SGLANG_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then
     RESULT_FILE="${result_file}" \
-    SGLANG_DOCKER_IMAGE="${SGLANG_DOCKER_IMAGE}" \
+    SGLANG_DOCKER_IMAGE="${SGLANG_DOCKER_IMAGE:-}" \
+    GPU_NAME="${GPU_NAME:-}" \
+    GPU_VRAM_GB="${GPU_VRAM_GB:-}" \
+    ROCM_VERSION="${ROCM_VERSION:-}" \
     python3 - <<'PY'
 import json
 import os
@@ -271,6 +280,15 @@ with open(result_file, "r", encoding="utf-8") as f:
 metadata = data.setdefault("atom_ci_metadata", {})
 if os.environ.get("SGLANG_DOCKER_IMAGE"):
     metadata["docker_image"] = os.environ["SGLANG_DOCKER_IMAGE"]
+if os.environ.get("GPU_NAME"):
+    metadata["gpu_name"] = os.environ["GPU_NAME"]
+if os.environ.get("GPU_VRAM_GB"):
+    try:
+        metadata["gpu_vram_gb"] = int(float(os.environ["GPU_VRAM_GB"]))
+    except ValueError:
+        pass
+if os.environ.get("ROCM_VERSION"):
+    metadata["rocm_version"] = os.environ["ROCM_VERSION"]
 
 with open(result_file, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)

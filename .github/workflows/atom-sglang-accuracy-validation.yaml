@@ -279,6 +279,17 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Collect GPU info (inside container)
+        id: gpu-info
+        run: |
+          GPU_NAME=$(docker exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          GPU_VRAM_GB=$(docker exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
+          ROCM_VERSION=$(docker exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          echo "gpu_name=${GPU_NAME}" >> "$GITHUB_OUTPUT"
+          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> "$GITHUB_OUTPUT"
+          echo "rocm_version=${ROCM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+
       - name: Download model if needed
         run: |
           set -euo pipefail
@@ -371,6 +382,9 @@ jobs:
             -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
             -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
             -e SGLANG_DOCKER_IMAGE="${SGLANG_IMAGE_TAG}" \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
             -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
@@ -481,6 +495,7 @@ jobs:
           find /tmp/accuracy-results -type f -name '*.json' | head -20 || echo "No JSON files found"
 
       - name: Transform SGLANG accuracy results for dashboard
+        id: transform
         if: steps.downloaded.outputs.json_count != '0'
         run: |
           python3 .github/scripts/accuracy_to_dashboard.py \
@@ -491,9 +506,14 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
+          entries_count=$(python3 -c "import json; data=json.load(open('accuracy-benchmark-input.json')); print(len(data))")
+          echo "entries_count=${entries_count}" >> "$GITHUB_OUTPUT"
+          if [ "${entries_count}" = "0" ]; then
+            echo "::warning::No valid SGLANG accuracy entries were produced. Check that the result JSON files contain 'results.gsm8k[\"exact_match,flexible-extract\"]'."
+          fi
 
       - name: Store SGLANG accuracy result to dashboard
-        if: steps.downloaded.outputs.json_count != '0'
+        if: steps.transform.outputs.entries_count != '0' && steps.transform.outputs.entries_count != ''
         uses: benchmark-action/github-action-benchmark@v1
         with:
           tool: customBiggerIsBetter

@@ -26,7 +26,6 @@ disable_vllm_plugin_attention = envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
 @dataclass
 class AiterFlashAttentionPhaseMetadata:
     max_query_len: int
-    min_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
 
@@ -63,7 +62,6 @@ class AiterChunkContextMetadata:
 @dataclass
 class AiterFlashAttentionChunkPrefillMetadata:
     max_query_len: int
-    min_query_len: int
     max_seq_len: int
     query_start_loc: torch.Tensor
     chunk_context_metadata: AiterChunkContextMetadata
@@ -125,17 +123,34 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        from vllm.v1.attention.backend import (
-            MultipleOf,
-        )  # pyright: ignore[reportMissingImports]
 
-        return [MultipleOf(16)]
+        return [16]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
         if block_size is None:
             return True
         return block_size % 16 == 0
+
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        """Discover which tensor dim is the block index, since different
+        backends lay out dims differently."""
+        _S = 1234567
+        shape = cls.get_kv_cache_shape(
+            _S,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(_S)
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -324,35 +339,76 @@ class vllmAttentionMetadataBuilderMethods:
             num_prefill_tokens,
         ) = split_ret
 
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        prefill_only = num_decodes == 0 and num_extends == 0 and num_prefills > 0
+        decode_only = num_decodes > 0 and num_extends == 0 and num_prefills == 0
+        mixed = not (prefill_only or decode_only)
+
+        # common_attn_metadata._seq_lens_cpu is equal to common_attn_metadata.seq_lens.cpu(),
+        # but using seq_lens.cpu() can get the better performance in low concurrency.
+        # seq_lens = common_attn_metadata._seq_lens_cpu
         seq_lens = common_attn_metadata.seq_lens.cpu()
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
+        num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+
+        prefill_max_query_len = decode_max_query_len = (
+            common_attn_metadata.max_query_len
+        )
+        prefill_max_seq_len = decode_max_seq_len = common_attn_metadata.max_seq_len
+        prefill_query_start_loc = decode_query_start_loc = (
+            common_attn_metadata.query_start_loc
+        )
+
+        if mixed:
+            prefill_start = num_decodes + num_extends
+            if num_prefills > 0:
+                prefill_max_query_len = query_lens_cpu[prefill_start:].max().item()
+                prefill_max_seq_len = seq_lens[prefill_start:].max().item()
+                prefill_query_start_loc = (
+                    prefill_query_start_loc[prefill_start:]
+                    - prefill_query_start_loc[prefill_start]
+                )
+            if num_decodes > 0:
+                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_seq_len = seq_lens[:num_decodes].max().item()
+                decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
+
+        prefill_metadata = None
         decode_metadata = None
-        if num_decodes > 0:
-            decode_metadata = AiterFlashAttentionDecodeMetadata(
-                max_query_len=query_lens_cpu[:num_decodes].max().item(),
-                min_query_len=query_lens_cpu[:num_decodes].min().item(),
-                max_seq_len=seq_lens[:num_decodes].max().item(),
-                query_start_loc=common_attn_metadata.query_start_loc[: num_decodes + 1],
+        extend_metadata = None
+
+        if num_prefills > 0:
+            prefill_metadata = AiterFlashAttentionPrefillMetadata(
+                max_query_len=prefill_max_query_len,
+                max_seq_len=prefill_max_seq_len,
+                query_start_loc=prefill_query_start_loc,
             )
 
-        extend_metadata = None
+        if num_decodes > 0:
+            decode_metadata = AiterFlashAttentionDecodeMetadata(
+                max_query_len=decode_max_query_len,
+                max_seq_len=decode_max_seq_len,
+                query_start_loc=decode_query_start_loc,
+            )
+
         if num_extends > 0:
             num_extends_slice = slice(num_decodes, num_decodes + num_extends)
-            query_lens_for_extend = query_lens_cpu[num_extends_slice]
-            seq_lens_for_extend = seq_lens[num_extends_slice]
-            computed_kv_lens = seq_lens_for_extend - query_lens_for_extend
+            query_lens_extend = query_lens_cpu[num_extends_slice]
+            seq_lens_extend = seq_lens[num_extends_slice]
+            computed_kv_lens = num_computed_tokens_cpu[num_extends_slice]
+
             swa_metadata = None
             if self.aot_sliding_window is not None:
                 swa_seqlen_for_extend = torch.minimum(
-                    seq_lens_for_extend,
-                    query_lens_for_extend + self.aot_sliding_window[0] + 1,
+                    seq_lens_extend,
+                    query_lens_extend + self.aot_sliding_window[0] + 1,
                 )
                 cu_seq_lens = torch.zeros(
                     num_extends + 1,
                     dtype=torch.int32,
-                    device=seq_lens_for_extend.device,
+                    device=seq_lens_extend.device,
                 )
                 torch.cumsum(
                     swa_seqlen_for_extend,
@@ -364,7 +420,7 @@ class vllmAttentionMetadataBuilderMethods:
                     0,
                     num_extends,
                     dtype=torch.int32,
-                    device=seq_lens_for_extend.device,
+                    device=seq_lens_extend.device,
                 )
                 token_to_seq = torch.repeat_interleave(
                     token_to_seq, swa_seqlen_for_extend
@@ -376,7 +432,7 @@ class vllmAttentionMetadataBuilderMethods:
                     device=self.device,
                 )
 
-                seq_starts = seq_lens_for_extend - swa_seqlen_for_extend
+                seq_starts = seq_lens_extend - swa_seqlen_for_extend
                 max_seqlen_k = swa_seqlen_for_extend.max().item()
                 total_tokens = cu_seq_lens[-1].item()
 
@@ -457,27 +513,13 @@ class vllmAttentionMetadataBuilderMethods:
                 seq_lens_device, dim=0, dtype=cu_seq_lens.dtype, out=cu_seq_lens[1:]
             )
             extend_metadata = AiterFlashAttentionChunkPrefillMetadata(
-                max_query_len=query_lens_for_extend.max().item(),
-                min_query_len=query_lens_for_extend.min().item(),
+                max_query_len=query_lens_extend.max().item(),
                 max_seq_len=seq_lens[num_extends_slice].max().item(),
                 query_start_loc=query_start_loc_device - query_start_loc_device[0],
                 chunk_context_metadata=chunk_context_metadata,
             )
-
-        prefill_metadata = None
-        if num_prefills > 0:
-            query_lens_for_prefill = query_lens_cpu[num_decodes + num_extends :]
-            query_start_loc_device = common_attn_metadata.query_start_loc[
-                num_decodes + num_extends :
-            ]
-            prefill_metadata = AiterFlashAttentionPrefillMetadata(
-                max_query_len=query_lens_for_prefill.max().item(),
-                min_query_len=query_lens_for_prefill.min().item(),
-                max_seq_len=seq_lens[num_decodes + num_extends :].max().item(),
-                query_start_loc=query_start_loc_device - query_start_loc_device[0],
-            )
-
-        num_actual_kv_tokens = torch.sum(seq_lens).item()
+        # num_actual_kv_tokens = torch.sum(seq_lens).item()
+        num_actual_kv_tokens = 0
 
         use_cascade = False
 
@@ -587,8 +629,15 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
                     if callable(method):
                         class_dict[method_name] = method
         elif is_sglang_mode:
-            raise NotImplementedError(
-                "AttentionMetadataBuilder for sglang is not implemented yet"
+            # SGLang uses ATOM's ScheduledBatch + CommonAttentionBuilder pipeline (same as
+            # native ATOM server). Do not swap in vLLM's AttentionMetadataBuilder or
+            # vllmAttentionMetadataBuilderMethods(build(common_attn_metadata=...)).
+            base_class = default_base_class
+            generic_base = default_base_class
+            needs_generic = True
+            logger.info(
+                "AiterAttentionMetadataBuilder: SGLang plugin mode keeps %s + original methods",
+                getattr(default_base_class, "__name__", default_base_class),
             )
 
         # create the new class
@@ -602,8 +651,10 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
         )
         if needs_generic and is_generic_builder_base:
             new_class.__orig_bases__ = (generic_base[AttentionMetaData],)
-        else:
+        elif generic_base is not None:
             new_class.__orig_bases__ = (generic_base,)
+        else:
+            new_class.__orig_bases__ = (base_class,)
 
         return new_class
 
@@ -1315,8 +1366,12 @@ def AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
                     if callable(method):
                         class_dict[method_name] = method
         elif is_sglang_mode:
-            raise NotImplementedError(
-                "AttentionMetadataBuilder for sglang is not implemented yet"
+            base_class = default_base_class
+            generic_base = default_base_class
+            needs_generic = True
+            logger.info(
+                "AiterMLAMetadataBuilder: SGLang plugin mode keeps %s + original methods",
+                getattr(default_base_class, "__name__", default_base_class),
             )
 
         # create the new class

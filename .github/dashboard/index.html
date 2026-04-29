@@ -236,6 +236,15 @@
     .popover .pop-section { margin-top: var(--gap-md); padding-top: var(--gap-sm); border-top: 1px solid var(--border); }
     /* pop-actions uses shared action-row + action-btn */
     .pop-close { position: absolute; top: 12px; right: 12px; background: none; border: none; color: var(--text-tertiary); font-size: 18px; cursor: pointer; }
+    .hover-tooltip { display: none; position: fixed; z-index: 210; min-width: 220px; max-width: 320px; padding: 10px 12px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 12px 32px rgba(0,0,0,0.35); pointer-events: none; }
+    .hover-tooltip.open { display: block; }
+    .hover-tooltip .hover-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; font-size: 12px; }
+    .hover-tooltip .hover-key { color: var(--text-tertiary); white-space: nowrap; }
+    .hover-tooltip .hover-val { color: var(--text-primary); text-align: right; overflow-wrap: anywhere; }
+    .hover-tooltip .hover-val.num { font-family: "SF Mono", monospace; }
+    .accuracy-score-cell { padding-top: 4px; padding-bottom: 4px; }
+    .accuracy-score-trigger { background: none; border: none; padding: 0; font: inherit; font-weight: 700; color: var(--text-primary); cursor: pointer; text-decoration: underline dotted transparent; text-underline-offset: 3px; }
+    .accuracy-score-trigger:hover, .accuracy-score-trigger:focus-visible { text-decoration-color: var(--text-tertiary); }
 
     /* ============================================================
        FOOTER
@@ -331,10 +340,12 @@
 
 <!-- Popover -->
 <div class="popover-overlay" id="popover-overlay"><div class="popover" id="popover"></div></div>
+<div class="hover-tooltip" id="accuracy-hover-tooltip" aria-hidden="true"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js" integrity="sha384-y49Zu59jZHJL/PLKgZPv3k2WI9c0Yp3pWB76V8OBVCb0QBKS8l4Ff3YslzHVX76Y" crossorigin="anonymous"></script>
 <script src="data.js"></script>
+<script src="models_map.js"></script>
 <script>
 'use strict';
 (function() {
@@ -493,6 +504,25 @@ const REGRESSION_CRITICAL = 0.10;  // 10% → critical
    ================================================================ */
 const rawData = window.BENCHMARK_DATA;
 
+// Normalize legacy model names using HF-path->display mapping from models_map.js
+const _displayMap = window.MODELS_DISPLAY_MAP || {};
+const _displayEntries = Object.entries(_displayMap).sort((a, b) => b[0].length - a[0].length);
+// Accuracy model name renames: unify legacy "MTP3" suffix to "MTP"
+// TODO: Remove after old "MTP3" data ages out of dashboard history (~90 runs)
+const _accuracyRenames = {
+  'Qwen3.5-397B-A17B-FP8 MTP3': 'Qwen3.5-397B-A17B-FP8 MTP',
+  'DeepSeek-R1-0528 MTP3': 'DeepSeek-R1-0528 MTP',
+  'DeepSeek-R1-0528-MXFP4 MTP3': 'DeepSeek-R1-0528-MXFP4 MTP',
+};
+function normalizeModelName(name, accRename = false) {
+  if (accRename && _accuracyRenames[name]) return _accuracyRenames[name];
+  const lc = name.toLowerCase();
+  for (const [key, display] of _displayEntries) {
+    if (lc === key) return display;
+  }
+  return name;
+}
+
 function parseBenchName(name) {
   let backend = 'ATOM';
   let rawName = name;
@@ -504,11 +534,17 @@ function parseBenchName(name) {
   if (backend === 'OOT') backend = 'ATOM-vLLM';
   // Accuracy entries: "ModelName accuracy (GSM8K)" — (.+?) for multi-word model names
   let m = rawName.match(/^(.+?)\s+accuracy\s+\((\w+)\)$/);
-  if (m) return { backend, model: m[1], metric: 'accuracy', unit: m[2], isAccuracy: true };
-  m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
-  if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
-  m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count)$/);
-  if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: '_gpu_count', unit: '' };
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'accuracy', unit: m[2], isAccuracy: true };
+  // MTP acceptance: "ModelName MTP acceptance (%)"
+  m = rawName.match(/^(.+?)\s+MTP acceptance\s+\((%)\)$/);
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'MTP acceptance', unit: m[2] };
+  // avg toks/fwd: "ModelName avg toks/fwd (tok/fwd)"
+  m = rawName.match(/^(.+?)\s+avg toks\/fwd\s+\((.+)\)$/);
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'avg toks/fwd', unit: m[2] };
+  m = rawName.match(/^(.+?)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
+  if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
+  m = rawName.match(/^(.+?)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count|_tp)$/);
+  if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: m[4], unit: '' };
   return null;
 }
 
@@ -520,7 +556,7 @@ function parseRunConfigs(run) {
   const configs = {}; // key: "backend|model|isl/osl|conc"
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
-    if (!p || p.isAccuracy || p.islOsl === '0/0') continue;
+    if (!p || p.isAccuracy || !p.islOsl || p.islOsl === '0/0') continue;
     const key = `${p.backend}|${p.model}|${p.islOsl}|${p.conc}`;
     if (!configs[key]) configs[key] = { backend: p.backend, model: p.model, islOsl: p.islOsl, conc: p.conc, commit: run.commit, date: run.date, runUrl: '' };
     configs[key][p.metric] = b.value;
@@ -541,13 +577,66 @@ function parseRunConfigs(run) {
   return configs;
 }
 
-// All parsed configs from all runs, keyed by configKey, each holding array of values over time
+// All parsed configs from all runs, keyed by configKey, each holding array of values over time.
+// When multiple runs share the same commit, keep only the newest run per (configKey, commit)
+// so that all consumers (table, trend chart, tooltip, detail panel) see consistent data.
+function localDay(ts) { const d = new Date(ts); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+
 const historyMap = {}; // key -> [{date, commit, throughput, ...}, ...]
+const _seenDayCommit = {}; // key -> { "day|cid7": { cfg, benchCount } }
+const _benchCounts = new WeakMap(); // cfg -> run.benches.length (avoids polluting cfg objects)
+// Use 7-char prefix for dedup: data.js may store the same commit as abbreviated
+// (e.g. "450f14b7") or full hash — both must be treated as the same commit.
 for (const run of allRuns) {
   const configs = parseRunConfigs(run);
   for (const [key, cfg] of Object.entries(configs)) {
-    if (!historyMap[key]) historyMap[key] = [];
+    if (!historyMap[key]) { historyMap[key] = []; _seenDayCommit[key] = {}; }
+    const cid7 = cfg.commit.id.slice(0, 7);
+    // Dedup by day+commit — keep the entry from the run with most benches
+    const day = localDay(cfg.date);
+    const dedupKey = day + '|' + cid7;
+    const prev = _seenDayCommit[key][dedupKey];
+    if (prev) {
+      // Replace if this run is from a larger batch (more complete nightly)
+      const prevIdx = historyMap[key].indexOf(prev.cfg);
+      if (prevIdx >= 0 && run.benches.length > prev.benchCount) {
+        _benchCounts.set(cfg, run.benches.length);
+        historyMap[key][prevIdx] = cfg;
+        _seenDayCommit[key][dedupKey] = { cfg, benchCount: run.benches.length };
+      }
+      continue;
+    }
+    _benchCounts.set(cfg, run.benches.length);
+    _seenDayCommit[key][dedupKey] = { cfg, benchCount: run.benches.length };
     historyMap[key].push(cfg);
+  }
+}
+
+// Unify metadata across configKeys that share the same commit.
+// Different benchmark runs for the same commit may have different Docker tags,
+// dates, and run URLs; pick the newest run's metadata so all configKeys are consistent.
+// Note: _gpu_count/_tp are NOT unified — they are real per-config values tied to throughput data.
+// Key by (backend, cid7): different backends (ATOM, ATOM-vLLM, ATOM-sglang)
+// legitimately use different Docker images on the same commit.
+const _commitMeta = {}; // "backend|cid7" -> metadata from newest run
+for (const history of Object.values(historyMap)) {
+  for (const cfg of history) {
+    const mk = cfg.backend + '|' + cfg.commit.id.slice(0, 7);
+    if (!_commitMeta[mk] || cfg.date > _commitMeta[mk].date) {
+      _commitMeta[mk] = { date: cfg.date, runUrl: cfg.runUrl, _oot_image_tag: cfg._oot_image_tag, _gpu_name: cfg._gpu_name, _gpu_vram_gb: cfg._gpu_vram_gb, _rocm_version: cfg._rocm_version };
+    }
+  }
+}
+for (const history of Object.values(historyMap)) {
+  for (const cfg of history) {
+    const meta = _commitMeta[cfg.backend + '|' + cfg.commit.id.slice(0, 7)];
+    if (!meta) continue;
+    // Don't overwrite cfg.date — each nightly run's date must stay distinct for trends
+    if (meta.runUrl) cfg.runUrl = meta.runUrl;
+    if (meta._oot_image_tag) cfg._oot_image_tag = meta._oot_image_tag;
+    if (meta._gpu_name) cfg._gpu_name = meta._gpu_name;
+    if (meta._gpu_vram_gb) cfg._gpu_vram_gb = meta._gpu_vram_gb;
+    if (meta._rocm_version) cfg._rocm_version = meta._rocm_version;
   }
 }
 
@@ -569,6 +658,9 @@ function detectRegressions() {
     if (!prev || !prev['Total Tput'] || !cfg['Total Tput']) continue;
     const tputChange = (cfg['Total Tput'] - prev['Total Tput']) / prev['Total Tput'];
     const tpotChange = (prev.TPOT && cfg.TPOT) ? (cfg.TPOT - prev.TPOT) / prev.TPOT : 0;
+    // Skip regression check when throughput improved significantly —
+    // TPOT increase alongside throughput gain is a normal batching tradeoff, not a regression.
+    if (tputChange >= REGRESSION_WARNING) continue;
     const worstDelta = Math.max(-tputChange, tpotChange);
     if (worstDelta >= REGRESSION_WARNING) {
       const severity = worstDelta >= REGRESSION_CRITICAL ? 'critical' : 'warning';
@@ -581,28 +673,44 @@ const regressions = detectRegressions();
 
 /* ---- Accuracy data ---- */
 const accuracyMap = {}; // "backend|model" -> [{date, commit, score, runUrl, threshold}, ...]
+const mtpAcceptanceMap = {}; // "backend|model" -> [{date, commit, rate, avgToks, runUrl}, ...]
 for (const run of allRuns) {
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
-    if (!p || !p.isAccuracy) continue;
+    if (!p) continue;
+    // MTP acceptance entries from perf benchmark
+    if (p.metric === 'MTP acceptance') {
+      const mkey = `${p.backend}|${p.model}`;
+      if (!mtpAcceptanceMap[mkey]) mtpAcceptanceMap[mkey] = [];
+      const mEntry = { date: run.date, commit: run.commit, rate: b.value, runUrl: '' };
+      if (b.extra) { const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/); if (rm) mEntry.runUrl = rm[1]; }
+      mtpAcceptanceMap[mkey].push(mEntry);
+      continue;
+    }
+    if (p.metric === 'avg toks/fwd') {
+      const mkey = `${p.backend}|${p.model}`;
+      const arr = mtpAcceptanceMap[mkey];
+      if (arr && arr.length > 0) { const last = arr[arr.length - 1]; if (last.date === run.date) last.avgToks = b.value; }
+      continue;
+    }
+    if (!p.isAccuracy) continue;
     const key = `${p.backend}|${p.model}`;
     if (!accuracyMap[key]) accuracyMap[key] = [];
     const entry = { date: run.date, commit: run.commit, score: b.value, runUrl: '' };
     if (b.extra) {
-      const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/);
-      if (rm) entry.runUrl = rm[1];
-      const tm = b.extra.match(/Threshold:\s*([\d.]+)/);
-      if (tm) entry.threshold = +tm[1];
-      const sm = b.extra.match(/strict-match:\s*([\d.]+)/);
-      if (sm) entry.strictMatch = +sm[1];
-      const fm = b.extra.match(/fewshot:\s*(\d+)/);
-      if (fm) entry.fewshot = +fm[1];
-      const bl = b.extra.match(/Baseline:\s*([\d.]+)/);
-      if (bl) entry.baseline = +bl[1];
-      const bm = b.extra.match(/BaselineModel:\s*(\S+)/);
-      if (bm) entry.baselineModel = bm[1];
-      const bn = b.extra.match(/BaselineNote:\s*([^|]+)/);
-      if (bn) entry.baselineNote = bn[1].trim();
+      const meta = parseAccuracyExtra(b.extra);
+      if (meta.runUrl) entry.runUrl = meta.runUrl;
+      if (meta.dockerImage) entry.dockerImage = meta.dockerImage;
+      if (meta.gpuName) entry._gpu_name = meta.gpuName;
+      if (meta.gpuVramGb != null) entry._gpu_vram_gb = meta.gpuVramGb;
+      if (meta.rocmVersion) entry._rocm_version = meta.rocmVersion;
+      if (meta.threshold != null) entry.threshold = meta.threshold;
+      if (meta.strictMatch != null) entry.strictMatch = meta.strictMatch;
+      if (meta.fewshot != null) entry.fewshot = meta.fewshot;
+      if (meta.baseline != null) entry.baseline = meta.baseline;
+      if (meta.baselineModel) entry.baselineModel = meta.baselineModel;
+      if (meta.baselineNote) entry.baselineNote = meta.baselineNote;
+      if (meta.modelId) entry.modelId = meta.modelId;
     }
     accuracyMap[key].push(entry);
   }
@@ -611,6 +719,7 @@ for (const run of allRuns) {
 for (const history of Object.values(accuracyMap)) {
   history.sort((a, b) => b.date - a.date);
 }
+for (const h of Object.values(mtpAcceptanceMap)) h.sort((a, b) => b.date - a.date);
 const latestAccuracy = {};
 for (const [key, history] of Object.entries(accuracyMap)) {
   if (!history.length) continue;
@@ -639,6 +748,38 @@ const hasAccuracyData = Object.keys(accuracyMap).length > 0;
 // HTML escape & safe URL helpers
 function escHTML(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function safeHref(url) { return typeof url === 'string' && url.startsWith('https://') ? url : null; }
+function parseMaybeNumber(value) {
+  if (value == null || value === '') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+function parseAccuracyExtra(extra) {
+  const parsed = {};
+  if (typeof extra !== 'string' || !extra) return parsed;
+  for (const part of extra.split(' | ')) {
+    if (part.startsWith('Run: ')) parsed.runUrl = part.slice(5).trim();
+    else if (part.startsWith('Threshold: ')) parsed.threshold = parseMaybeNumber(part.slice(11).trim());
+    else if (part.startsWith('Baseline: ')) parsed.baseline = parseMaybeNumber(part.slice(10).trim());
+    else if (part.startsWith('BaselineModel: ')) parsed.baselineModel = part.slice(15).trim();
+    else if (part.startsWith('BaselineNote: ')) parsed.baselineNote = part.slice(14).trim();
+    else if (part.startsWith('Docker: ')) parsed.dockerImage = part.slice(8).trim();
+    else if (part.startsWith('GPU: ')) parsed.gpuName = part.slice(5).trim();
+    else if (part.startsWith('VRAM: ')) parsed.gpuVramGb = parseMaybeNumber(part.slice(6).trim().replace(/GB$/i, ''));
+    else if (part.startsWith('ROCm: ')) parsed.rocmVersion = part.slice(6).trim();
+    else if (part.startsWith('strict-match: ')) parsed.strictMatch = parseMaybeNumber(part.slice(14).trim());
+    else if (part.startsWith('fewshot: ')) parsed.fewshot = parseMaybeNumber(part.slice(9).trim());
+    else if (part.startsWith('Model: ')) parsed.modelId = part.slice(7).trim();
+  }
+  return parsed;
+}
+function buildAccuracyPreviewRows(preview) {
+  const scoreText = Number.isFinite(preview?.score) ? preview.score.toFixed(4) : '—';
+  return [
+    { label: 'Model', value: preview?.model || '—' },
+    { label: 'Date', value: preview?.dateText || '—' },
+    { label: 'Accuracy', value: scoreText },
+  ];
+}
 
 // Extract unique filter values from ALL runs (not just latest) so historical models are always visible
 const _lc = (a, b) => { const la = a.toLowerCase(), lb = b.toLowerCase(); return la < lb ? -1 : la > lb ? 1 : 0; };
@@ -686,12 +827,14 @@ function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+
 
 // Model family grouping: "DeepSeek-R1-0528-mtp3" → family "DeepSeek-R1-0528", variant "mtp3"
 function modelFamily(name) {
-  const m = name.match(/^([A-Za-z][\w.]*(?:-[A-Za-z0-9.]+){1,3}?)(?:[-_](?:mtp|MTP|moe|MoE|MXFP|mxfp).*)?$/);
-  return m ? m[1] : name;
+  // Strip space-separated quant/MTP suffixes (e.g. "DeepSeek-R1-0528 MXFP4 MTP3" -> "DeepSeek-R1-0528")
+  const base = name.replace(/(\s+(?:MTP|MXFP|FP)\d*)+$/i, '');
+  const m = base.match(/^([A-Za-z][\w.]*(?:-[A-Za-z0-9.]+){1,6}?)(?:[-_](?:mtp|MTP|moe|MoE|MXFP|mxfp|FP|fp)\d*.*)?$/);
+  return m ? m[1] : base;
 }
 function modelVariant(name) {
   const fam = modelFamily(name);
-  return name === fam ? 'base' : name.slice(fam.length).replace(/^[-_]+/, '');
+  return name === fam ? 'base' : name.slice(fam.length).replace(/^[-_\s]+/, '');
 }
 const MERGED_KIMI_TRADEOFF_FAMILY = 'Kimi-K2&K2.5-MXFP4';
 function tradeoffFamilyInfo(name) {
@@ -880,6 +1023,45 @@ function avgLinePlugin(avgValue, label, color) {
 function chartTooltipOpts() {
   return { backgroundColor: C_TOOLTIP_BG, borderColor: C_TOOLTIP_BD, borderWidth: 1, titleColor: C_TOOLTIP_TITLE, bodyColor: C_TOOLTIP_BODY, cornerRadius: 6, padding: 12 };
 }
+const _accuracyHoverTooltip = document.getElementById('accuracy-hover-tooltip');
+function renderAccuracyHover(preview) {
+  if (!_accuracyHoverTooltip) return;
+  const rows = buildAccuracyPreviewRows(preview);
+  _accuracyHoverTooltip.innerHTML = rows.map(r => `<div class="hover-row"><span class="hover-key">${escHTML(r.label)}</span><span class="hover-val ${r.label === 'Accuracy' ? 'num' : ''}">${escHTML(String(r.value))}</span></div>`).join('');
+}
+function positionAccuracyHoverTooltip(anchor) {
+  if (!_accuracyHoverTooltip) return;
+  const pad = 12;
+  const rect = _accuracyHoverTooltip.getBoundingClientRect();
+  let x = pad;
+  let y = pad;
+  if (anchor && typeof anchor.clientX === 'number' && typeof anchor.clientY === 'number') {
+    x = anchor.clientX;
+    y = anchor.clientY;
+  } else if (anchor && anchor.getBoundingClientRect) {
+    const targetRect = anchor.getBoundingClientRect();
+    x = targetRect.left + targetRect.width / 2;
+    y = targetRect.bottom;
+  }
+  let left = x + 14;
+  let top = y + 14;
+  if (left + rect.width + pad > window.innerWidth) left = x - rect.width - 14;
+  if (top + rect.height + pad > window.innerHeight) top = y - rect.height - 14;
+  _accuracyHoverTooltip.style.left = Math.max(pad, left) + 'px';
+  _accuracyHoverTooltip.style.top = Math.max(pad, top) + 'px';
+}
+function showAccuracyHover(anchor, preview) {
+  if (!_accuracyHoverTooltip) return;
+  renderAccuracyHover(preview);
+  _accuracyHoverTooltip.classList.add('open');
+  _accuracyHoverTooltip.setAttribute('aria-hidden', 'false');
+  positionAccuracyHoverTooltip(anchor);
+}
+function hideAccuracyHover() {
+  if (!_accuracyHoverTooltip) return;
+  _accuracyHoverTooltip.classList.remove('open');
+  _accuracyHoverTooltip.setAttribute('aria-hidden', 'true');
+}
 
 /* ================================================================
    5. HEADER & META
@@ -1060,7 +1242,7 @@ function renderKPICards() {
 
   const models = new Set(entries.map(([, c]) => c.model));
   const backends = new Set(entries.map(([, c]) => c.backend));
-  const gpuCounts = [...new Set(entries.map(([, c]) => c._gpu_count).filter(Boolean))].sort((a, b) => a - b);
+  const gpuCounts = [...new Set(entries.map(([, c]) => c._gpu_count || c._tp).filter(Boolean))].sort((a, b) => a - b);
   const gpuLabel = gpuCounts.length === 1 ? gpuCounts[0] + '× GPU' : gpuCounts.length > 1 ? gpuCounts[0] + '-' + gpuCounts[gpuCounts.length - 1] + '× GPU' : '';
 
   // GPU platform info from latest configs
@@ -1108,8 +1290,7 @@ function renderKPICards() {
   const atRiskCount = accEntries.filter(([, a]) => a.threshold && a.score >= 0.1 && a.score >= a.threshold && (a.score - a.threshold) < 0.005).length;
   const healthyCount = accEntries.filter(([, a]) => a.threshold && a.score >= 0.1 && a.score >= a.threshold && (a.score - a.threshold) >= 0.005).length;
   const accCardClass = failCount > 0 ? 'alert clickable' : atRiskCount > 0 ? 'alert-warning clickable' : (accEntries.length > 0 ? 'ok clickable' : 'clickable');
-  const accSub = accEntries.length === 0
-    ? (Object.keys(latestAccuracy).length === 0 ? 'No accuracy data' : 'No rows match Backend/Model filters')
+  const accSub = accEntries.length === 0 ? 'No accuracy data'
     : failCount > 0 ? `${failCount} failed` + (atRiskCount > 0 ? ` · ${atRiskCount} at risk` : '')
     : atRiskCount > 0 ? `${healthyCount} healthy · ${atRiskCount} at risk`
     : 'All healthy';
@@ -1345,7 +1526,7 @@ function renderPerformanceTab() {
       <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
-      <td class="num">${cfg._gpu_count || '—'}</td>
+      <td class="num">${cfg._tp || cfg._gpu_count || 1}</td>
       <td style="white-space:nowrap;font-size:11px">${cfg._gpu_name ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_name : '—'}</td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${totalTputPct}%;background:rgba(109,191,128,0.12)"></div><span class="data-bar-text">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</span></td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${outTputPct}%;background:rgba(126,143,174,0.10)"></div><span class="data-bar-text">${fmtNum(cfg.throughput, 1)}</span></td>
@@ -1487,7 +1668,7 @@ function renderTradeoffTab() {
     if (!seriesMap[sKey]) seriesMap[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, points: [], concLabels: [], configKeys: [] };
     const tpot = cfg.TPOT;
     const totalTput = cfg['Total Tput'];
-    const gpuCount = cfg._gpu_count || 8;
+    const gpuCount = cfg._gpu_count || cfg._tp || 1;
     if (tpot && tpot > 0 && totalTput) {
       seriesMap[sKey].points.push({ x: 1000 / tpot, y: totalTput / gpuCount });
       seriesMap[sKey].concLabels.push(cfg.conc);
@@ -1700,7 +1881,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
   for (const [key, cfg] of Object.entries(configs)) {
     const sKey = `${cfg.backend}|${cfg.model}|${cfg.islOsl}`;
     if (!byKey[sKey]) byKey[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, tputPoints: [], tpotPoints: [], tputKeys: [], tpotKeys: [] };
-    const gpuCount = cfg._gpu_count || 8;
+    const gpuCount = cfg._gpu_count || cfg._tp || 1;
     if (cfg['Total Tput'] != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg['Total Tput'] / gpuCount }); byKey[sKey].tputKeys.push(key); }
     if (cfg.TPOT != null) { byKey[sKey].tpotPoints.push({ x: cfg.conc, y: cfg.TPOT }); byKey[sKey].tpotKeys.push(key); }
   }
@@ -1836,19 +2017,23 @@ function renderTrendsTab() {
   if (!state.trendModelKey) return;
   const [trendBackend, trendModel] = state.trendModelKey.split('|');
 
-  // Build ordered x-axis: use date as primary key (not commit ID)
-  // Each run gets a unique index; x-axis shows short date labels
-  const runsAsc = [...allRuns].reverse();
-  const seen = new Set();
-  const orderedRuns = []; // [{cid, date, label}]
-  for (const r of runsAsc) {
+  // Build ordered x-axis: group by day+commit, keep the run with most benches
+  // (nightly > individual reruns). Same commit can appear on multiple days.
+  const dayRunMap = {}; // "YYYY-MM-DD|cid" -> best run
+  for (const r of allRuns) {
     const cid = r.commit.id.slice(0, 7);
-    if (!seen.has(cid)) {
-      seen.add(cid);
-      const d = new Date(r.date);
-      orderedRuns.push({ cid, date: r.date, label: (d.getMonth()+1) + '/' + d.getDate() + ' ' + cid });
+    const dayKey = localDay(r.date) + '|' + cid;
+    if (!dayRunMap[dayKey] || r.benches.length > dayRunMap[dayKey].benches.length) {
+      dayRunMap[dayKey] = r;
     }
   }
+  const orderedRuns = Object.values(dayRunMap)
+    .sort((a, b) => a.date - b.date)
+    .map(r => {
+      const cid = r.commit.id.slice(0, 7);
+      const d = new Date(r.date);
+      return { cid, date: r.date, day: localDay(r.date), label: (d.getMonth()+1) + '/' + d.getDate() + ' ' + cid };
+    });
   const orderedLabels = orderedRuns.map(r => r.label);
   const commitDateMap = {}; const labelToCid = {};
   orderedRuns.forEach(r => { commitDateMap[r.label] = r.date; labelToCid[r.label] = r.cid; });
@@ -1887,14 +2072,15 @@ function renderTrendsTab() {
       const pointMap = {};
       for (const pt of history) {
         const cid = pt.commit.id.slice(0, 7);
-        // Map to the label that contains this commit ID
-        const matchLabel = orderedRuns.find(r => r.cid === cid)?.label;
+        const day = localDay(pt.date);
+        // Match by day+commit (same granularity as orderedRuns dedup)
+        const matchLabel = orderedRuns.find(r => r.cid === cid && r.day === day)?.label;
         if (matchLabel && pt[met.key] != null) {
           let val = pt[met.key];
           // Normalize Total Tput to per-GPU for cross-config comparability
           if (met.key === 'Total Tput') {
-            const gpuCount = pt._gpu_count;
-            if (!Number.isFinite(gpuCount) || gpuCount <= 0) continue;
+            const gpuCount = pt._gpu_count || pt._tp;
+            if (!gpuCount) continue;
             val = val / gpuCount;
           }
           pointMap[matchLabel] = val;
@@ -1993,8 +2179,9 @@ function renderTrendsTab() {
           if (!key) return;
           const lbl = orderedLabels[elems[0].index];
           const cid = labelToCid[lbl];
+          const clickedDay = commitDateMap[lbl] ? localDay(commitDateMap[lbl]) : null;
           const hist = historyMap[key];
-          const histCfg = cid && hist ? hist.find(h => h.commit.id.slice(0, 7) === cid) : null;
+          const histCfg = cid && hist ? hist.find(h => h.commit.id.slice(0, 7) === cid && (!clickedDay || localDay(h.date) === clickedDay)) : null;
           showPopover(key, histCfg || latestConfigs[key]);
         }
       }
@@ -2044,7 +2231,7 @@ function renderDataTab() {
           if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
           if (!state.filters.conc.includes(cfg.conc)) continue;
           rows.push([fmtDate(cfg.date), cfg.commit.id?.slice(0,7), cfg.backend, cfg.model, cfg.islOsl, cfg.conc,
-            cfg._gpu_count ?? '', cfg['Total Tput'] ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
+            cfg._tp ?? cfg._gpu_count ?? '', cfg['Total Tput'] ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
         }
       }
       navigator.clipboard.writeText(header + '\n' + rows.join('\n'));
@@ -2112,7 +2299,7 @@ function renderDataTable() {
       case 'model': return dir * a.cfg.model.localeCompare(b.cfg.model);
       case 'islOsl': return dir * a.cfg.islOsl.localeCompare(b.cfg.islOsl);
       case 'conc': return dir * (a.cfg.conc - b.cfg.conc);
-      case 'tp': return dir * ((a.cfg._gpu_count || 0) - (b.cfg._gpu_count || 0));
+      case 'tp': return dir * ((a.cfg._tp || a.cfg._gpu_count || 0) - (b.cfg._tp || b.cfg._gpu_count || 0));
       case 'gpu': return dir * (a.cfg._gpu_name || '').localeCompare(b.cfg._gpu_name || '');
       case 'totalTput': return dir * ((a.cfg['Total Tput'] || 0) - (b.cfg['Total Tput'] || 0));
       case 'tpot': return dir * ((a.cfg.TPOT || 0) - (b.cfg.TPOT || 0));
@@ -2146,7 +2333,7 @@ function renderDataTable() {
       <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
-      <td class="num">${cfg._gpu_count || '—'}</td>
+      <td class="num">${cfg._tp || cfg._gpu_count || 1}</td>
       <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
       <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
       <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
@@ -2196,7 +2383,7 @@ function renderTimeline() {
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
+        <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._tp || cfg._gpu_count || 1}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
         <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
@@ -2213,7 +2400,8 @@ function renderTimeline() {
    ================================================================ */
 function buildDetailHTML(key, cfg) {
   const hist = historyMap[key];
-  const prev = (hist && hist.length > 1) ? hist[1] : null;
+  const idx = hist ? hist.indexOf(cfg) : -1;
+  const prev = hist && idx >= 0 && idx + 1 < hist.length ? hist[idx + 1] : (hist && hist.length > 1 ? hist[1] : null);
   const reg = regressions[key];
 
   const interactive = cfg.TPOT && cfg.TPOT > 0 ? 1000 / cfg.TPOT : null;
@@ -2224,6 +2412,7 @@ function buildDetailHTML(key, cfg) {
     ['Interactive', interactive, 'tok/s/user', prevInteractive, false],
     ['TPOT', cfg.TPOT, 'ms', prev?.TPOT, true],
     ['TTFT', cfg.TTFT, 'ms', prev?.TTFT, true],
+    ['TP', cfg._tp || cfg._gpu_count, '', null, false],
     ['GPU Count', cfg._gpu_count, '', null, false],
   ].map(([label, val, unit, prevVal, inv]) =>
     `<div class="detail-item"><span class="detail-key">${label}</span><span class="detail-val">${val != null ? fmtNum(val, 2) + ' ' + unit : '—'} ${prevVal != null ? trendHTML(val, prevVal, inv) : ''}</span></div>`
@@ -2258,7 +2447,8 @@ function buildDetailHTML(key, cfg) {
    ================================================================ */
 function showPopover(key, cfg) {
   const hist = historyMap[key];
-  const prev = (hist && hist.length > 1) ? hist[1] : null;
+  const idx = hist ? hist.indexOf(cfg) : -1;
+  const prev = hist && idx >= 0 && idx + 1 < hist.length ? hist[idx + 1] : (hist && hist.length > 1 ? hist[1] : null);
   const reg = regressions[key];
 
   const pop = document.getElementById('popover');
@@ -2294,6 +2484,51 @@ function showPopover(key, cfg) {
     switchToTrace(key, cfg.date);
   });
 }
+function showAccuracyPopover(key, acc, prevOverride) {
+  const history = accuracyMap[key] || [];
+  const prev = prevOverride !== undefined ? prevOverride : (history.length > 1 ? history[1] : null);
+  const [backend, model] = key.split('|');
+  const hasThreshold = acc.threshold != null;
+  const margin = hasThreshold ? acc.score - acc.threshold : null;
+  const recoveryPct = acc.baseline > 0 ? acc.score / acc.baseline * 100 : null;
+  const gpuParts = [];
+  if (acc._gpu_name) gpuParts.push(acc._gpu_name);
+  if (acc._gpu_vram_gb) gpuParts.push(acc._gpu_vram_gb + 'GB');
+  const gpuLabel = gpuParts.length ? gpuParts.join(' · ') : '—';
+  const commitHref = safeHref(acc.commit?.url);
+  const runHref = safeHref(acc.runUrl);
+
+  const pop = document.getElementById('popover');
+  pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
+    <h3>${escHTML(model)} Accuracy</h3>
+    <div class="pop-row"><span class="pop-key">Accuracy</span><span class="pop-val">${fmtNum(acc.score, 4)} ${trendHTML(acc.score, prev?.score, false)}</span></div>
+    <div class="pop-row"><span class="pop-key">Strict Match</span><span class="pop-val">${acc.strictMatch != null ? fmtNum(acc.strictMatch, 4) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Threshold</span><span class="pop-val">${hasThreshold ? fmtNum(acc.threshold, 4) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Margin</span><span class="pop-val">${hasThreshold ? (margin >= 0 ? '+' : '') + fmtNum(margin, 4) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Fewshot</span><span class="pop-val">${acc.fewshot != null ? acc.fewshot : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Baseline</span><span class="pop-val">${acc.baseline > 0 ? fmtNum(acc.baseline, 4) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Recovery</span><span class="pop-val">${recoveryPct != null ? recoveryPct.toFixed(1) + '%' : '—'}</span></div>
+    <div class="pop-section">
+      <div class="pop-row"><span class="pop-key">Model</span><span class="pop-val" style="font-family:inherit">${escHTML(model)}</span></div>
+      <div class="pop-row"><span class="pop-key">Backend</span><span class="pop-val" style="font-family:inherit">${escHTML(backend)}</span></div>
+      <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${escHTML(gpuLabel)}</span></div>
+      <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(acc._rocm_version || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(acc.dockerImage || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${commitHref ? `<a href="${escHTML(commitHref)}" target="_blank" rel="noopener noreferrer">${acc.commit?.id?.slice(0, 7) || '—'}</a>` : (acc.commit?.id?.slice(0, 7) || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(acc.commit?.message?.split('\n')[0] || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(acc.commit?.author?.name || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${fmtDate(acc.date)}</span></div>
+    </div>
+    <div class="action-row">
+      ${runHref ? `<a class="action-btn" href="${escHTML(runHref)}" target="_blank" rel="noopener noreferrer">Open Run ↗</a>` : ''}
+      ${commitHref ? `<a class="action-btn" href="${escHTML(commitHref)}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
+    </div>`;
+  document.getElementById('popover-overlay').classList.add('open');
+  document.getElementById('pop-close-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    hidePopover();
+  });
+}
 function hidePopover() { document.getElementById('popover-overlay').classList.remove('open'); }
 document.getElementById('popover-overlay').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) hidePopover();
@@ -2302,6 +2537,7 @@ document.getElementById('popover-overlay').addEventListener('click', (e) => {
 // Escape key: close popover or dropdowns
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
+    hideAccuracyHover();
     const overlay = document.getElementById('popover-overlay');
     if (overlay.classList.contains('open')) { hidePopover(); return; }
     closeAllDropdowns();
@@ -2347,8 +2583,8 @@ function readFromHash() {
 /** Accuracy keys are "backend|model"; ISL/conc do not apply to GSM8K rows. */
 function filteredAccuracyEntries() {
   return Object.entries(latestAccuracy).filter(([key]) => {
-    const [backend, model] = key.split('|');
-    return state.filters.backends.includes(backend) && state.filters.models.includes(model);
+    const [backend] = key.split('|');
+    return state.filters.backends.includes(backend);
   });
 }
 
@@ -2375,7 +2611,7 @@ function renderAccuracyTab() {
           <th class="num">flexible-extract</th><th class="num">strict-match</th>
           <th class="num">Baseline</th><th class="num">Recovery</th>
           <th class="num">Threshold</th><th class="num">Margin</th>
-          <th>Trend</th><th>Fewshot</th><th>Last Tested</th><th>Run</th>
+          <th>Trend</th><th>Fewshot</th><th class="num">MTP Accept%</th><th class="num">toks/fwd</th><th>Last Tested</th><th>Run</th>
         </tr></thead>
         <tbody>`;
 
@@ -2406,11 +2642,16 @@ function renderAccuracyTab() {
     const dateStr = fmtDate(acc.date);
     const href = safeHref(acc.runUrl);
 
+    // MTP acceptance lookup — exact key match
+    let mtpRate = null, mtpToks = null, mtpHistory = null;
+    const mh = mtpAcceptanceMap[key];
+    if (mh && mh.length > 0) { mtpRate = mh[0].rate; mtpToks = mh[0].avgToks; mtpHistory = mh; }
+
     html += `
       <tr class="${rowClass}" data-acc-key="${escHTML(key)}">
         <td style="white-space:nowrap;font-weight:600">${escHTML(backend)}</td>
         <td style="font-weight:600;color:var(--text-primary)">${escHTML(model)}</td>
-        <td class="num" style="font-weight:700;color:var(--text-primary)">${fmtNum(acc.score, 4)}</td>
+        <td class="num accuracy-score-cell"><button type="button" class="accuracy-score-trigger" data-acc-open="${escHTML(key)}">${fmtNum(acc.score, 4)}</button></td>
         <td class="num">${acc.strictMatch != null ? fmtNum(acc.strictMatch, 4) : '—'}</td>
         <td class="num">${acc.baseline > 0 ? fmtNum(acc.baseline, 4) : '—'}</td>
         <td class="num">${acc.baseline > 0 ? '<span class="' + (acc.score / acc.baseline >= 0.98 ? 'trend-up' : acc.score / acc.baseline >= 0.95 ? 'trend-neutral' : 'trend-down') + '">' + (acc.score / acc.baseline * 100).toFixed(1) + '%</span>' : '—'}</td>
@@ -2418,15 +2659,23 @@ function renderAccuracyTab() {
         <td class="num"><span class="${marginClass}">${hasThreshold ? (margin >= 0 ? '+' : '') + fmtNum(margin, 4) : '—'}</span></td>
         <td>${trendHTML(acc.score, prev?.score, false)}</td>
         <td class="num">${acc.fewshot != null ? acc.fewshot : '—'}</td>
+        <td class="num">${mtpRate != null ? '<span style="color:var(--accent-green)">' + fmtNum(mtpRate, 1) + '%</span>' : '—'}</td>
+        <td class="num">${mtpToks != null ? fmtNum(mtpToks, 2) : '—'}</td>
         <td>${dateStr}</td>
         <td>${href ? `<a href="${escHTML(href)}" target="_blank" rel="noopener noreferrer">→</a>` : '—'}</td>
       </tr>`;
 
     // Detail row with inline trend chart
     const canvasId = 'acc-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
-    html += `<tr class="detail-row" data-detail-acc="${escHTML(key)}"><td colspan="12"><div class="detail-inner" style="display:flex;gap:var(--gap-lg);flex-wrap:wrap;align-items:flex-start">`;
-    // Left: trend chart
-    html += `<div style="flex:1;min-width:280px"><canvas id="${canvasId}" style="height:180px"></canvas></div>`;
+    html += `<tr class="detail-row" data-detail-acc="${escHTML(key)}"><td colspan="14"><div class="detail-inner" style="display:flex;gap:var(--gap-lg);flex-wrap:wrap;align-items:flex-start">`;
+    // Left: charts stacked vertically (accuracy trend + MTP acceptance)
+    const mtpCanvasId = 'mtp-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+    html += `<div style="flex:1;min-width:280px;display:flex;flex-direction:column;gap:var(--gap-md)">`;
+    html += `<div><canvas id="${canvasId}" style="height:180px"></canvas></div>`;
+    if (mtpHistory && mtpHistory.length > 0) {
+      html += `<div><canvas id="${mtpCanvasId}" style="height:180px"></canvas></div>`;
+    }
+    html += `</div>`;
     // Right: info
     html += `<div style="flex:0 0 auto;min-width:200px">`;
     if (acc.baselineModel || acc.baselineNote) {
@@ -2434,6 +2683,9 @@ function renderAccuracyTab() {
       if (acc.baselineModel) html += `<p style="color:var(--text-secondary)">${escHTML(acc.baselineModel)}<br>score: ${acc.baseline > 0 ? fmtNum(acc.baseline, 4) : '—'}</p>`;
       if (acc.baselineNote) html += `<p style="color:var(--text-tertiary);font-size:11px;margin-top:4px;font-style:italic">${escHTML(acc.baselineNote)}</p>`;
       html += `</div>`;
+    }
+    if (acc.dockerImage) {
+      html += `<div class="detail-section"><h4>Docker</h4><p style="color:var(--text-secondary);font-size:11px;overflow-wrap:anywhere">${escHTML(acc.dockerImage)}</p></div>`;
     }
     if (healthLevel !== 'healthy' && healthLevel !== 'unknown') {
       html += `<div class="detail-section"><h4>Status: ${healthLabel.replace('● ','')}</h4><p style="color:${healthColor}">${healthLevel === 'anomaly' ? 'Score suspiciously low — possible test failure' : healthLevel === 'fail' ? 'Below threshold by ' + fmtNum(Math.abs(margin), 4) : 'Margin to threshold only ' + fmtNum(margin, 4)}</p></div>`;
@@ -2455,7 +2707,8 @@ function renderAccuracyTab() {
   // Row expand/collapse — render chart on first expand
   container.querySelectorAll('tr[data-acc-key]').forEach(row => {
     row.style.cursor = 'pointer';
-    row.addEventListener('click', () => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.accuracy-score-trigger')) return;
       const key = row.dataset.accKey;
       const detail = container.querySelector(`tr[data-detail-acc="${key}"]`);
       if (!detail) return;
@@ -2463,9 +2716,51 @@ function renderAccuracyTab() {
       detail.classList.toggle('expanded');
       row.classList.toggle('row-open');
       if (expanding && !accCharts[key]) {
-        requestAnimationFrame(() => renderAccuracyMiniChart(key, accCharts));
+        requestAnimationFrame(() => {
+          renderAccuracyMiniChart(key, accCharts);
+          renderMtpAcceptanceMiniChart(key);
+        });
       }
     });
+  });
+  function getAccuracyTriggerContext(target) {
+    const btn = target?.closest ? target.closest('.accuracy-score-trigger') : null;
+    if (!btn || !container.contains(btn)) return null;
+    const key = btn.dataset.accOpen;
+    const acc = latestAccuracy[key];
+    if (!acc) return null;
+    return { btn, key, acc, preview: { model: key.split('|')[1], dateText: fmtDate(acc.date), score: acc.score } };
+  }
+  container.addEventListener('click', (e) => {
+    const hit = getAccuracyTriggerContext(e.target);
+    if (!hit) return;
+    e.preventDefault();
+    hideAccuracyHover();
+    showAccuracyPopover(hit.key, hit.acc);
+  });
+  container.addEventListener('mouseover', (e) => {
+    const hit = getAccuracyTriggerContext(e.target);
+    if (!hit) return;
+    showAccuracyHover(e, hit.preview);
+  });
+  container.addEventListener('mousemove', (e) => {
+    if (!getAccuracyTriggerContext(e.target)) return;
+    positionAccuracyHoverTooltip(e);
+  });
+  container.addEventListener('mouseout', (e) => {
+    const hit = getAccuracyTriggerContext(e.target);
+    if (!hit) return;
+    const related = e.relatedTarget;
+    if (related && related.closest && related.closest('.accuracy-score-trigger') === hit.btn) return;
+    hideAccuracyHover();
+  });
+  container.addEventListener('focusin', (e) => {
+    const hit = getAccuracyTriggerContext(e.target);
+    if (!hit) return;
+    showAccuracyHover(hit.btn, hit.preview);
+  });
+  container.addEventListener('focusout', (e) => {
+    if (getAccuracyTriggerContext(e.target)) hideAccuracyHover();
   });
 }
 
@@ -2559,6 +2854,10 @@ function renderAccuracyMiniChart(key, chartCache) {
         tooltip: { ...chartTooltipOpts(), callbacks: {
           title: (items) => model + ' · ' + labels[items[0].dataIndex],
           label: (item) => ` ${item.dataset.label}: ${fmtNum(item.raw, 4)}  (${(item.raw * 100).toFixed(1)}%)`,
+          afterBody: (items) => {
+            const dockerImage = sorted[items[0].dataIndex]?.dockerImage;
+            return dockerImage ? ['', `Docker: ${dockerImage}`] : [];
+          },
         }},
         datalabels: { display: false },
       },
@@ -2569,6 +2868,94 @@ function renderAccuracyMiniChart(key, chartCache) {
           grid: chartGridOpts(),
           ticks: { color: C_TICK, callback: v => (v * 100).toFixed(0) + '%' },
         },
+      },
+      onClick: (_e, elems) => {
+        if (!elems.length) return;
+        const pointIdx = elems[0].index;
+        const accEntry = sorted[pointIdx];
+        if (!accEntry) return;
+        const prevEntry = pointIdx > 0 ? sorted[pointIdx - 1] : null;
+        hideAccuracyHover();
+        showAccuracyPopover(key, accEntry, prevEntry);
+      },
+    },
+  });
+}
+
+function renderMtpAcceptanceMiniChart(key) {
+  const mtpCanvasId = 'mtp-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+  const canvas = document.getElementById(mtpCanvasId);
+  if (!canvas) return;
+  const history = mtpAcceptanceMap[key];
+  if (!history || !history.length) return;
+  const sorted = [...history].sort((a, b) => a.date - b.date);
+  const labels = sorted.map(h => { const dt = new Date(h.date); return `${dt.getMonth()+1}/${dt.getDate()}`; });
+  const datasets = [{
+    label: 'Acceptance %', data: sorted.map(h => h.rate),
+    borderColor: 'hsl(145,63%,49%)', backgroundColor: 'hsla(145,63%,49%,0.15)',
+    borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, tension: 0.3, fill: true, yAxisID: 'y',
+  }];
+  const hasAvgToks = sorted.some(h => h.avgToks != null);
+  if (hasAvgToks) {
+    datasets.push({
+      label: 'avg toks/fwd', data: sorted.map(h => h.avgToks ?? null),
+      borderColor: 'hsl(210,80%,60%)', backgroundColor: 'hsla(210,80%,60%,0.1)',
+      borderWidth: 1.5, borderDash: [4,3], pointRadius: 3, tension: 0.3, fill: false, yAxisID: 'y2',
+    });
+  }
+  new Chart(canvas, {
+    type: 'line', data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
+        title: { display: true, text: 'MTP Acceptance Rate', color: C_LEGEND, font: { size: 12 } },
+        tooltip: { ...chartTooltipOpts() },
+        datalabels: { display: false },
+      },
+      scales: {
+        x: { grid: chartGridOpts(), ticks: { color: C_TICK, font: { size: 10 } } },
+        y: { position: 'left', grid: chartGridOpts(),
+          title: { display: true, text: 'Acceptance %', color: C_TICK, font: { size: 10 } },
+          ticks: { color: C_TICK } },
+        ...(hasAvgToks ? { y2: { position: 'right', grid: { display: false },
+          title: { display: true, text: 'toks/fwd', color: C_TICK, font: { size: 10 } },
+          ticks: { color: C_TICK } } } : {}),
+      },
+      onClick: (_e, elems) => {
+        if (!elems.length) return;
+        const h = sorted[elems[0].index];
+        if (!h) return;
+        const [backend, model] = key.split('|');
+        const acc = latestAccuracy[key] || {};
+        const gpuParts = [];
+        if (acc._gpu_name) gpuParts.push(acc._gpu_name);
+        if (acc._gpu_vram_gb) gpuParts.push(acc._gpu_vram_gb + 'GB');
+        const gpuLabel = gpuParts.length ? gpuParts.join(' · ') : '—';
+        const commitHref = safeHref(h.commit?.url);
+        const runHref = safeHref(h.runUrl);
+        const pop = document.getElementById('popover');
+        pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
+          <h3>${escHTML(model)} MTP Acceptance</h3>
+          <div class="pop-row"><span class="pop-key">Acceptance Rate</span><span class="pop-val" style="color:var(--accent-green)">${fmtNum(h.rate, 2)}%</span></div>
+          ${h.avgToks != null ? `<div class="pop-row"><span class="pop-key">Avg toks/fwd</span><span class="pop-val">${fmtNum(h.avgToks, 2)}</span></div>` : ''}
+          <div class="pop-section">
+            <div class="pop-row"><span class="pop-key">Model</span><span class="pop-val" style="font-family:inherit">${escHTML(model)}</span></div>
+            <div class="pop-row"><span class="pop-key">Backend</span><span class="pop-val" style="font-family:inherit">${escHTML(backend)}</span></div>
+            <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${escHTML(gpuLabel)}</span></div>
+            <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(acc._rocm_version || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(acc.dockerImage || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${commitHref ? '<a href="' + escHTML(commitHref) + '" target="_blank" rel="noopener noreferrer">' + (h.commit?.id?.slice(0,7) || '—') + '</a>' : (h.commit?.id?.slice(0,7) || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(h.commit?.message?.split('\\n')[0] || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(h.commit?.author?.name || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${fmtDate(h.date)}</span></div>
+          </div>
+          <div class="action-row">
+            ${runHref ? '<a class="action-btn" href="' + escHTML(runHref) + '" target="_blank" rel="noopener noreferrer">Open Run ↗</a>' : ''}
+            ${commitHref ? '<a class="action-btn" href="' + escHTML(commitHref) + '" target="_blank" rel="noopener noreferrer">View Commit ↗</a>' : ''}
+          </div>`;
+        document.getElementById('popover-overlay').classList.add('open');
+        document.getElementById('pop-close-btn').addEventListener('click', (e) => { e.stopPropagation(); hidePopover(); });
       },
     },
   });
