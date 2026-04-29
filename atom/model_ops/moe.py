@@ -2311,6 +2311,26 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.shape[shard_dim] + self.tp_size - 1
         ) // self.tp_size
         start = load_shard_size * tp_rank
+        # When D < tp_size (e.g. per_1x128 scale block count smaller than
+        # tp_size, observed at tp=8 with inter=1280 → D=10), the ceil split
+        # gives some trailing ranks start >= D so they hold no slice of the
+        # loaded tensor. Skip narrow + copy_ for those ranks; the rank's
+        # slice of expert_data stays at its initialised value (0 for weight,
+        # 1.0 for scale) and the rank contributes a no-op to the column
+        # gather / row reduction.
+        if start >= loaded_weight.shape[shard_dim]:
+            # FP8 scale tensors are torch.ones() initialised. If we leave the
+            # trailing rank's slice at 1.0, the downstream FP8 dequant multiplies
+            # the (uninitialised) fp8 weight by 1.0 instead of the correct
+            # quantization scale, contaminating the column gather / row reduction.
+            # Zero the slot so dequant produces 0 and the rank contributes a
+            # true no-op (matches MXFP4 scale init at moe.py:776,813).
+            if expert_data.dtype == torch.float32:
+                if shard_id == "w1":
+                    expert_data.narrow(shard_dim, 0, expert_shard_size).zero_()
+                else:
+                    expert_data.narrow(shard_dim, expert_shard_size, expert_shard_size).zero_()
+            return
         size = min(load_shard_size, loaded_weight.shape[shard_dim] - start)
         loaded_weight = loaded_weight.narrow(shard_dim, start, size)
         # Narrow parameter and load.
@@ -2353,6 +2373,17 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight.shape[shard_dim] + self.tp_size - 1
             ) // self.tp_size
             start = load_shard_size * tp_rank
+            # See _load_w13 comment above: when D < tp_size the ceil split
+            # leaves trailing ranks with no slice; skip narrow + copy_.
+            if start >= loaded_weight.shape[shard_dim]:
+                # Zero the scale slice so dequant=0 instead of multiplying by
+                # stale init=1.0; see _load_w13 comment for full rationale.
+                if expert_data.dtype == torch.float32:
+                    if load_shard_size != shard_size:
+                        expert_data.narrow(shard_dim, 0, load_shard_size).zero_()
+                    else:
+                        expert_data.zero_()
+                return
             size = min(load_shard_size, loaded_weight.shape[shard_dim] - start)
             loaded_weight = loaded_weight.narrow(shard_dim, start, size)
             if load_shard_size != shard_size:
