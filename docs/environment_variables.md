@@ -82,6 +82,36 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
 
+### Debug Dump (`atom.utils.debug_helper`)
+
+Env-gated dump / compare / monkey-patch primitives for forward bisect &
+batch invariance investigation. All entries are **no-op when their
+controlling `*_DIR` is unset**, so they are safe to leave wired into
+production paths. See `.claude/skills/dump-bisect-debug.md` for the
+methodology and `atom/utils/debug_helper/` for the implementation.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_FWD_DUMP_DIR** | str | — | Enables `install_block_forward_hooks`. Per-Block hidden state is saved to `{DIR}/layer{LL}_{Cls}_rank{R}[_call{NNN}].pt`. |
+| **ATOM_FWD_DUMP_LAYERS** | csv int | "" (= all) | Comma-separated layer ids to dump (e.g. `0,5,15,30`). Empty string means dump every layer. |
+| **ATOM_FWD_DUMP_BLOCK_CLASS** | csv str | `Block` | Module class names to hook. Multiple values supported (e.g. `Block,DeepseekV4Attention,MoE,Compressor,Indexer`) for sub-stage bisect. Override per model. |
+| **ATOM_FWD_DUMP_LAYER_ATTR** | str | `layer_id` | Attribute name on the block carrying its index. Some non-DeepSeek models use `layer_idx`. |
+| **ATOM_FWD_DUMP_ONE_SHOT** | bool | 1 (true) | When `1`, only the first call per layer is dumped (typical: warmup). Set to `0` to enumerate every call (`_call000.pt`, `_call001.pt`, …) — required when bisecting per-seq dispatch loops. |
+| **ATOM_WEIGHT_DUMP_DIR** | str | — | Enables `maybe_dump_weights_and_exit`. Per-rank params + buffers for selected layers dumped to `{DIR}/weight_rank{R}_layer{L}.pt`. Skips `.experts.*` (FP4 packed). |
+| **ATOM_WEIGHT_DUMP_LAYERS** | csv int | `0` | Comma-separated layer ids to dump weights for. |
+| **ATOM_WEIGHT_DUMP_EXIT** | bool | 1 (true) | When `1` (default), call `sys.exit(0)` after dumping. Set to `0` to continue inference after dump. |
+| **ATOM_DEBUG_TOPK** | int | 0 | Set to `K > 0` to log top-K logits per row from `Sampler.forward` via `maybe_log_topk()`. Only rank 0 writes. |
+| **ATOM_DEBUG_TOPK_PATH** | str | — | Optional output file for top-K logs. Writes to stderr if unset. |
+
+CLI for comparing dumps:
+
+```bash
+python -m atom.utils.debug_helper.compare slot-invariance --dir DIR --n-slots 4
+python -m atom.utils.debug_helper.compare ref-vs-target  --dir DIR
+python -m atom.utils.debug_helper.compare layer-bisect   --dir DIR --threshold 0.99
+python -m atom.utils.debug_helper.compare schema --a A.pt --b B.pt
+```
+
 ---
 
 ## Benchmarks (Optional)

@@ -40,6 +40,7 @@ from atom.model_ops.quant_v4 import (
     rotate_activation,
 )
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn, sparse_attn  # noqa: F401
+from atom.model_ops.utils import atom_parameter
 from atom.utils.forward_context import get_forward_context
 
 # ---------------------------------------------------------------------------
@@ -683,7 +684,7 @@ class Compressor(nn.Module):
         self.prefix = prefix
         coff = 1 + self.overlap
 
-        self.ape = nn.Parameter(
+        self.ape = atom_parameter(
             torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
         )
         # wkv/wgate stored as fp32 (matches reference's Linear(dtype=fp32) BF16 path).
@@ -1155,7 +1156,7 @@ class DeepseekV4Attention(nn.Module):
         p = prefix  # e.g. "layers.7.attn"
 
         # ----- Parameters (names mirror reference for state_dict load) -----
-        self.attn_sink = nn.Parameter(
+        self.attn_sink = atom_parameter(
             torch.empty(self.n_local_heads, dtype=torch.float32)
         )
         self.wq_a = ReplicatedLinear(
@@ -1283,7 +1284,7 @@ class DeepseekV4Attention(nn.Module):
         )
         # Replace the weight tensor with BF16, drop the scale param so future
         # loads / introspection don't try to use a stale FP8 scale.
-        self.wo_a.weight = torch.nn.Parameter(bf16, requires_grad=False)
+        self.wo_a.weight = atom_parameter(bf16)
         try:
             delattr(self.wo_a, "weight_scale")
         except AttributeError:
@@ -1514,17 +1515,16 @@ class Gate(nn.Module):
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.hash = layer_id < args.n_hash_layers
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        self.weight = atom_parameter(torch.empty(args.n_routed_experts, args.dim))
         if self.hash:
-            self.tid2eid = nn.Parameter(
+            self.tid2eid = atom_parameter(
                 torch.empty(
                     args.vocab_size, args.n_activated_experts, dtype=torch.int32
                 ),
-                requires_grad=False,
             )
             self.bias = None
         else:
-            self.bias = nn.Parameter(
+            self.bias = atom_parameter(
                 torch.empty(args.n_routed_experts, dtype=torch.float32)
             )
 
@@ -1658,17 +1658,16 @@ class MoE(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.gate",
             )
-            self.gate.e_score_correction_bias = nn.Parameter(
+            self.gate.e_score_correction_bias = atom_parameter(
                 torch.empty(self.n_routed_experts, dtype=torch.float32)
             )
             if self.is_hash_layer:
                 # tid2eid: per-token-id top-k expert lookup table (V4 first 3
                 # layers use this in lieu of gate-logit routing).
-                self.gate.tid2eid = nn.Parameter(
+                self.gate.tid2eid = atom_parameter(
                     torch.empty(
                         args.vocab_size, args.n_activated_experts, dtype=torch.int32
                     ),
-                    requires_grad=False,
                 )
                 # Cache for input_ids — set by forward() right before the FusedMoE
                 # call so the custom routing closure can index tid2eid.
@@ -1906,12 +1905,16 @@ class Block(nn.Module):
         mix_hc = (2 + hc_mult) * hc_mult
         hc_dim = hc_mult * args.dim
         # All HC params stored in fp32 (matches reference's `set_dtype(torch.float32)`).
-        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-        self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.hc_attn_fn = atom_parameter(
+            torch.empty(mix_hc, hc_dim, dtype=torch.float32)
+        )
+        self.hc_ffn_fn = atom_parameter(
+            torch.empty(mix_hc, hc_dim, dtype=torch.float32)
+        )
+        self.hc_attn_base = atom_parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.hc_ffn_base = atom_parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.hc_attn_scale = atom_parameter(torch.empty(3, dtype=torch.float32))
+        self.hc_ffn_scale = atom_parameter(torch.empty(3, dtype=torch.float32))
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -2089,7 +2092,7 @@ class ParallelHead(nn.Module):
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
         # PR1 single-rank: full vocab on this rank.
-        self.weight = nn.Parameter(
+        self.weight = atom_parameter(
             torch.empty(self.vocab_size, self.dim, dtype=torch.float32)
         )
 
@@ -2195,11 +2198,11 @@ class MTPBlock(Block):
         # Per-MTP hc_head params (distinct from Block's hc_attn/hc_ffn params).
         hc_mult = args.hc_mult
         hc_dim = hc_mult * args.dim
-        self.hc_head_fn = nn.Parameter(
+        self.hc_head_fn = atom_parameter(
             torch.empty(hc_mult, hc_dim, dtype=torch.float32)
         )
-        self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
+        self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
         # Externally-assigned by DeepseekV4Model (shared with main model).
         self.embed: Optional[nn.Module] = None
         self.head: Optional[ParallelHead] = None
@@ -2279,11 +2282,11 @@ class DeepseekV4Model(nn.Module):
         # before the LM head linear projection.
         hc_mult = args.hc_mult
         hc_dim = hc_mult * args.dim
-        self.hc_head_fn = nn.Parameter(
+        self.hc_head_fn = atom_parameter(
             torch.empty(hc_mult, hc_dim, dtype=torch.float32)
         )
-        self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
+        self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
     @torch.inference_mode()
     def forward(

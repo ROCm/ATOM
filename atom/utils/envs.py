@@ -93,6 +93,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.
     "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
+    # --- Debug Dump (atom/utils/debug_helper/) ---
+    # All disabled (empty / no-op) by default. Set to enable instrumentation
+    # for forward / weight / sampler bisecting; safe to leave wired in
+    # production paths.
+    #
+    # Forward hidden_state dump per Block.
+    "ATOM_FWD_DUMP_DIR": lambda: os.getenv("ATOM_FWD_DUMP_DIR", ""),
+    "ATOM_FWD_DUMP_LAYERS": lambda: os.getenv("ATOM_FWD_DUMP_LAYERS", ""),
+    # Override for non-DeepSeek models (e.g. "DecoderLayer" for Llama).
+    "ATOM_FWD_DUMP_BLOCK_CLASS": lambda: os.getenv(
+        "ATOM_FWD_DUMP_BLOCK_CLASS", "Block"
+    ),
+    "ATOM_FWD_DUMP_LAYER_ATTR": lambda: os.getenv(
+        "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
+    ),
+    "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
+    # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
+    "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
+    "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),
+    "ATOM_WEIGHT_DUMP_EXIT": lambda: os.getenv("ATOM_WEIGHT_DUMP_EXIT", "1") == "1",
+    # Sampler top-K logits log — int K, 0/empty disables.
+    "ATOM_DEBUG_TOPK": lambda: int(os.getenv("ATOM_DEBUG_TOPK", "0") or "0"),
+    "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
 }
 
 

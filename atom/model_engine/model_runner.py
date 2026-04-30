@@ -599,6 +599,18 @@ class ModelRunner:
         )
         logger.info(f"Model load done: {config.model}")
 
+        # Optional debug instrumentation; no-op when env vars unset.
+        # See atom/utils/debug_helper/.
+        from atom.utils.debug_helper import (
+            install_block_forward_hooks,
+            maybe_dump_weights_and_exit,
+        )
+
+        _n_fwd_hooks = install_block_forward_hooks(self.model)
+        if _n_fwd_hooks > 0:
+            logger.info(f"[ATOM_FWD_DUMP] {_n_fwd_hooks} Block forward hooks installed")
+        maybe_dump_weights_and_exit(self.model)
+
         if self.config.speculative_config and get_pp_group().is_last_rank:
             from atom.utils.backends import set_model_tag
 
