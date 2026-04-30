@@ -629,8 +629,15 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
                     if callable(method):
                         class_dict[method_name] = method
         elif is_sglang_mode:
-            raise NotImplementedError(
-                "AttentionMetadataBuilder for sglang is not implemented yet"
+            # SGLang uses ATOM's ScheduledBatch + CommonAttentionBuilder pipeline (same as
+            # native ATOM server). Do not swap in vLLM's AttentionMetadataBuilder or
+            # vllmAttentionMetadataBuilderMethods(build(common_attn_metadata=...)).
+            base_class = default_base_class
+            generic_base = default_base_class
+            needs_generic = True
+            logger.info(
+                "AiterAttentionMetadataBuilder: SGLang plugin mode keeps %s + original methods",
+                getattr(default_base_class, "__name__", default_base_class),
             )
 
         # create the new class
@@ -644,8 +651,10 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
         )
         if needs_generic and is_generic_builder_base:
             new_class.__orig_bases__ = (generic_base[AttentionMetaData],)
-        else:
+        elif generic_base is not None:
             new_class.__orig_bases__ = (generic_base,)
+        else:
+            new_class.__orig_bases__ = (base_class,)
 
         return new_class
 
@@ -1357,8 +1366,12 @@ def AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
                     if callable(method):
                         class_dict[method_name] = method
         elif is_sglang_mode:
-            raise NotImplementedError(
-                "AttentionMetadataBuilder for sglang is not implemented yet"
+            base_class = default_base_class
+            generic_base = default_base_class
+            needs_generic = True
+            logger.info(
+                "AiterMLAMetadataBuilder: SGLang plugin mode keeps %s + original methods",
+                getattr(default_base_class, "__name__", default_base_class),
             )
 
         # create the new class

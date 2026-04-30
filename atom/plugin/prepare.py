@@ -74,9 +74,23 @@ def prepare_model(config: Any, engine: str):
     model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
     logger.info(f"ATOM model class for {model_arch} is {model_cls}")
 
-    if is_sglang():
-        register_ops_to_sglang(atom_config=atom_config)
+    if model_arch in {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        from atom.plugin.sglang.models.qwen3_5 import (
+            apply_prepare_model_adaptations,
+        )
 
+        apply_prepare_model_adaptations(atom_config, model_arch)
+
+    # Qwen3-Next and Qwen3.5 series models keep the upstream attention backend path.
+    if model_arch not in {
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        register_ops_to_sglang(atom_config=atom_config)
     set_attn_cls()
 
     # init aiter dist for using aiter custom collective ops
@@ -85,9 +99,19 @@ def prepare_model(config: Any, engine: str):
     # Patch SGLang graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in aiter collectives when model uses aiter's
     # custom all_reduce (same fix as atom/plugin/vllm/graph_capture_patch.py)
-    if is_sglang():
-        from atom.plugin.sglang.graph_capture_patch import apply_graph_capture_patch
+    from atom.plugin.sglang.graph_capture_patch import apply_graph_capture_patch
 
-        apply_graph_capture_patch()
+    apply_graph_capture_patch()
 
-    return model_cls(atom_config=atom_config)
+    try:
+        model = model_cls(atom_config=atom_config)
+    except TypeError as exc:
+        # Some SGLang plugin models keep SGLang's native wrapper constructor
+        # and only swap their internal language_model with an ATOM model.
+        # Those classes accept `config=...` instead of `atom_config=...`.
+        if "atom_config" not in str(exc):
+            raise
+        model = model_cls(config=config)
+    if not hasattr(model, "atom_config"):
+        model.atom_config = atom_config
+    return model

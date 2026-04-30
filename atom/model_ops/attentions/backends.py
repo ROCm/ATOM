@@ -89,6 +89,111 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         raise NotImplementedError
 
+    # ------------------------------------------------------------------ #
+    # Per-request cache (model-managed state outside the paged KV pool). #
+    # ------------------------------------------------------------------ #
+    # Used by attention types that maintain per-request stateful buffers
+    # which do not fit the paged KV cache model — e.g. GDN recurrent state,
+    # DeepseekV4 ring buffer + compressor state. ModelRunner queries these
+    # methods at startup to size the per-request slot pool, deduct its
+    # bytes from the KV pool budget, and allocate the underlying tensors.
+    #
+    # Stateless attentions (standard MHA / MLA) leave the defaults:
+    # `compute_per_req_cache_bytes()` returns 0, `allocate_per_req_cache()`
+    # returns an empty dict, so no per-req pool is allocated.
+
+    def compute_per_req_cache_bytes(self) -> int:
+        """Total bytes (across all attention layers) for ONE request's
+        per-request cache.
+
+        ModelRunner multiplies this by `max_num_seqs * slots_per_req()` to
+        size the per-req cache tensors and deduct that memory from the KV
+        pool budget.
+        """
+        return 0
+
+    def slots_per_req(self) -> int:
+        """Number of contiguous slot indices one request occupies.
+
+        Default = 1 (single committed state, no speculative lookahead).
+        GDN-style attentions override with `1 + model_runner.num_spec_tokens`
+        because their state-update kernel reserves one extra slot per
+        speculated token for rollback on rejection. Override only if the
+        attention has a different lookahead layout.
+        """
+        return 1
+
+    def allocate_per_req_cache(self, num_slots: int) -> dict[str, "torch.Tensor"]:
+        """Allocate per-request cache tensors.
+
+        Called by ModelRunner.allocate_kv_cache() once `num_slots` is known.
+        Builder returns a dict mapping attribute name → tensor; ModelRunner
+        does `setattr(self, name, tensor)` so model layers can access them
+        as `model_runner.<name>` (preserving existing names like
+        `mamba_k_cache` / `mamba_v_cache`).
+        """
+        return {}
+
+    def compute_block_bytes(self) -> int:
+        """Per-block bytes contributed by this attention type's primary KV
+        tensors (kv_cache + kv_scale + any side caches like the V3.2
+        indexer cache).
+
+        Mirror of `allocate_kv_cache_tensors`: used by ModelRunner
+        get_num_blocks() to size the unified pool BEFORE any tensor is
+        allocated, so the budget math sees the same per-block cost the
+        builder will actually allocate. Per-request cache bytes are NOT
+        included here — they're accounted for via
+        `compute_per_req_cache_bytes()`.
+
+        Default returns 0 (no primary KV pool).
+        """
+        return 0
+
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads: int, num_draft_layers: int
+    ) -> dict[str, Any]:
+        """Allocate the model's primary paged KV cache tensors.
+
+        Called by ModelRunner.allocate_kv_cache() after num_physical_kvcache_blocks
+        is known. Builders own the per-attention-type tensor layout (single
+        576-dim MLA tensor vs split-K/V MHA tensor; full-rank vs hybrid-only-
+        full-attn-rows for Qwen3-Next; per-module deferred for MiMo-V2). The
+        runner only setattr's the returned dict onto itself, so model layers
+        can access tensors as `model_runner.<name>` (preserving existing
+        names: kv_cache, kv_scale, index_cache, etc.).
+
+        Values may be Tensors, None (deferred allocation), or scalar metadata
+        (e.g. aligned_index_dim) needed downstream by build_kv_cache_tensor.
+        Returns empty dict for builders that do not own the main KV pool.
+        """
+        return {}
+
+    def build_kv_cache_tensor(self, layer_id: int, module):
+        """Build the vLLM-style `KVCacheTensor` registration entry for one
+        attention module, OR return None if this builder does not recognize
+        the module type.
+
+        Called from ModelRunner.allocate_kv_cache()'s binding loop for every
+        module of the model. The builder owns:
+          - module-type detection (e.g. `hasattr(module, "use_mla")`)
+          - per-attention-type slot index math (attn_idx, gdn_idx, ...)
+          - per-module tensor slicing from runner-owned tensors
+            (self.model_runner.kv_cache, .mamba_k_cache, ...)
+          - any `setattr(module, "k_cache", ...)` side effects per the
+            existing module convention
+          - returning a `KVCacheTensor` ModelRunner appends to its registry
+
+        Builders override this for the module types they handle; subclasses
+        chain via `super().build_kv_cache_tensor(...)` to inherit shared
+        paths (e.g. `GDNAttentionMetadataBuilder` handles
+        `base_linear_attention` and delegates `base_attention` MHA modules
+        to its `AiterAttentionMetadataBuilder` parent).
+
+        Default returns None for unknown module types.
+        """
+        return None
+
 
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     def __init__(self, model_runner):

@@ -372,14 +372,19 @@ class LinearBase(nn.Module):
             )
             self.weight.data = w_q
             self.weight_scale = atom_parameter(w_s)
-            shuffle_weights(self.weight)
+            # Only quantized 2D GEMM weights use aiter's preshuffle layout.
+            # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
+            # quantized models must keep that tensor unshuffled here.
+            if self.weight.dim() == 2:
+                shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
             if (
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
             ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
-                shuffle_weights(self.weight)
+                if self.weight.dim() == 2:
+                    shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32:
