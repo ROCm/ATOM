@@ -215,13 +215,9 @@ class LLMEngine:
         logger.info(f"LLMEngine sleep: level={level}")
 
         if level >= 1:
-            self.core_mgr.broadcast_utility_command(
-                "release_memory", tags=["kv_cache"]
-            )
+            self.core_mgr.broadcast_utility_command("release_memory", tags=["kv_cache"])
         if level >= 2:
-            self.core_mgr.broadcast_utility_command(
-                "release_memory", tags=["weights"]
-            )
+            self.core_mgr.broadcast_utility_command("release_memory", tags=["weights"])
 
     def load_weights(self, weights, bucket_size_mb: int = 2048):
         load_weights_via_shm(self.core_mgr, weights, bucket_size_mb)
