@@ -74,6 +74,22 @@ This document describes the environment variables used in the ATOM project.
 
 ---
 
+## V4 Attention Backend (Migration)
+
+Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4.py`
+and the new batched `V4AttentionBackend` (`atom/model_ops/v4_attention_backend.py`).
+The new backend removes ~256 GPU→CPU `.item()` syncs per forward and is required
+to enable CUDAGraph capture for V4. Legacy stays available during PR-A migration
+for byte-equal A/B verification via dump-bisect; it is removed once all phases
+land. See `atom/model_ops/v4_backend_gate.py` for the selector.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_V4_BACKEND** | str | `legacy` | `legacy` keeps the per-seq dispatch loop. `new` routes through `V4AttentionBackend`. Layer-restricted by `ATOM_V4_BACKEND_LAYERS` if set. |
+| **ATOM_V4_BACKEND_LAYERS** | csv int | "" (= all) | Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply `ATOM_V4_BACKEND` uniformly. Used for layer-by-layer bisect during migration (e.g. `0,3,15,30`). |
+
+---
+
 ## Profiling & Debugging
 
 | Variable | Type | Default | Description |

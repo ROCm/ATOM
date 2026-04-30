@@ -41,6 +41,8 @@ from atom.model_ops.quant_v4 import (
 )
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn, sparse_attn  # noqa: F401
 from atom.model_ops.utils import atom_parameter
+from atom.model_ops.v4_backend_gate import use_new_v4_backend  # noqa: F401
+from atom.model_ops.v4_kernels import update_compressor_states, swa_write  # noqa: F401
 from atom.utils.forward_context import get_forward_context
 
 # ---------------------------------------------------------------------------
@@ -65,29 +67,59 @@ _V4_BLOCK_SIZE: int = 128
 def _v4_get_seq_metadata():
     """Fetch per-seq batch metadata from the forward context.
 
-    Returns a tuple `(block_tables, slot_indices, cu_seqlens_q, num_seqs)`,
-    or `(None, None, None, 0)` if no metadata is set (warmup / dummy run /
-    non-V4 path). PR3-main per-seq dispatch uses these to slice the flat
+    Returns a tuple `(block_tables, state_slot_mapping, cu_seqlens_q,
+    context_lens, num_seqs, cpu_meta)`, or `(None, None, None, None, 0,
+    None)` if no metadata is set (warmup / dummy run / non-V4 path).
+    PR3-main per-seq dispatch uses these to slice the flat
     `[total_tokens, ...]` Q/KV tensors per sequence and pick each seq's
-    state-cache slot + block_table for compressor scatter / sparse_attn gather.
+    state-cache slot + block_table for compressor scatter / sparse_attn
+    gather.
 
-      - block_tables: `[bs, max_blocks]` int — per-seq physical block IDs.
-      - slot_indices: `[bs]` int — per-seq state-cache slot
-        (== `per_req_cache_group` since `slots_per_req()==1` in pre-PR3-spec).
-      - cu_seqlens_q: `[bs+1]` int — per-seq cumulative token offsets in the
-        flat batch tensors.
+      - block_tables: `[bs, max_blocks]` int GPU — per-seq physical block IDs
+        (paged-KV block table; same concept as in V2/Llama backends).
+      - state_slot_mapping: `[bs]` int GPU — per-request slot in V4's
+        stateful per-request pool (`swa_kv`, `Compressor.kv_state`). Distinct
+        from the per-token paged-KV `slot_mapping` carried elsewhere on
+        AttentionMetaData. Sourced from `batch.per_req_cache_groups`.
+      - cu_seqlens_q: `[bs+1]` int GPU — per-seq cumulative token offsets.
+      - context_lens: `[bs]` int GPU — per-seq end-of-context absolute
+        position. Drives `update_compressor_states` fresh-prefill vs
+        decode/prefix-cache discrimination.
       - num_seqs: int — number of sequences in this forward call.
+      - cpu_meta: dict[str, np.ndarray] | None — CPU mirrors published by
+        `DeepseekV4AttentionMetadataBuilder` (PR-A Phase 2). When non-None,
+        per-seq dispatch reads positions / slots / cu_seqlens here instead
+        of `.tolist()` / `.item()` on GPU tensors:
+          - "cu_seqlens_q":      `[bs+1]` int — token offsets
+          - "state_slot_mapping": `[bs]`  int — per-request state slots
+          - "start_pos_per_seq": `[bs]`  int — `positions[seq_start]` per seq
     """
     ctx = get_forward_context()
     if ctx is None or ctx.attn_metadata is None:
-        return None, None, None, 0
+        return None, None, None, None, 0, None
     md = ctx.attn_metadata
     if md.block_tables is None or md.block_tables.numel() == 0:
-        return None, None, None, 0
-    slot_indices = getattr(md, "v4_slot_indices", None)
+        return None, None, None, None, 0, None
+    state_slot_mapping = getattr(md, "state_slot_mapping", None)
     cu_seqlens_q = md.cu_seqlens_q
+    context_lens = getattr(md, "context_lens", None)
     num_seqs = md.block_tables.size(0)
-    return md.block_tables, slot_indices, cu_seqlens_q, num_seqs
+    cpu_meta = None
+    cu_cpu = getattr(md, "cu_seqlens_q_cpu", None)
+    if cu_cpu is not None:
+        cpu_meta = {
+            "cu_seqlens_q": cu_cpu,
+            "state_slot_mapping": getattr(md, "state_slot_mapping_cpu", None),
+            "start_pos_per_seq": getattr(md, "start_pos_per_seq_cpu", None),
+        }
+    return (
+        md.block_tables,
+        state_slot_mapping,
+        cu_seqlens_q,
+        context_lens,
+        num_seqs,
+        cpu_meta,
+    )
 
 
 def _v4_is_dummy_run() -> bool:
@@ -703,10 +735,12 @@ class Compressor(nn.Module):
         self.kv_cache: Optional[torch.Tensor] = None
         self.rotary_emb: Optional[_V4RoPE] = None
 
-        # Decode-phase state buffers (per paper §3.6.1 "uncompressed tail
-        # tokens" of the state cache). With overlap: state[:, :ratio] holds
-        # the overlapping window from the previous compression block;
-        # state[:, ratio:] holds the current in-progress window.
+        # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
+        # window" portion). Indexed as a single ring buffer of size
+        # `coff * compress_ratio` by `pos % STATE_SIZE` per token — no
+        # segment switching, no roll. The `forward` softmax-pool consumer
+        # resolves A-side (current block) vs B-side (previous block) by
+        # block-id parity (`comp_id % 2`).
         #
         # PR3-pre2a: a 1-slot register_buffer is kept here so warmup (which
         # runs before allocate_kv_cache → build_kv_cache_tensor) sees a
@@ -756,6 +790,7 @@ class Compressor(nn.Module):
         positions: torch.Tensor,
         slot: int = 0,
         block_table: Optional[torch.Tensor] = None,
+        context_lens: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Compress KV for the input tokens. Writes into self.kv_cache when a
         compression block boundary is hit; otherwise just buffers state and returns None.
@@ -765,8 +800,8 @@ class Compressor(nn.Module):
                 Treated as a SINGLE sequence (caller pre-slices the per-seq chunk
                 in PR3-main multi-seq dispatch).
             positions: [num_tokens] absolute token positions for this sequence.
-                `start_pos = positions[0]` drives the compressor's overlap-window
-                bookkeeping and the block-table scatter index.
+                `positions[0]` drives the compressor's overlap-window bookkeeping
+                and the block-table scatter index.
             slot: per-request state-cache slot — selects which row of
                 `kv_state` / `score_state` this seq writes/reads. Defaults to 0
                 for legacy single-seq callers.
@@ -782,6 +817,10 @@ class Compressor(nn.Module):
         # warmup the binding hasn't run yet but writes are guarded below by
         # `_v4_is_dummy_run()`, so a None kv_cache is OK in that path.
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
+        # Single GPU→CPU sync per call: needed for the prefill/decode branch,
+        # `should_compress` check, and the scatter `ci` index. Tensor-side ops
+        # below use `positions[0]` directly (0-d tensor index) where the value
+        # only feeds slot/RoPE arithmetic — no extra syncs.
         start_pos = int(positions[0].item())
         if x.dim() == 2:
             x = x.unsqueeze(0)  # [num_tokens, dim] → [1, num_tokens, dim]
@@ -797,28 +836,46 @@ class Compressor(nn.Module):
         kv = self.wkv(x)
         score = self.wgate(x)
 
+        # Unified in-place update of `kv_state` + `score_state` ring buffer
+        # (per paper §3.6.1 per-request state cache). Each token at absolute
+        # `pos` lands at `kv_state[slot, pos % STATE_SIZE]` where
+        # STATE_SIZE = 2*ratio (CSA overlap) or ratio (HCA). No segment
+        # switching, no roll. Phase (fresh prefill vs decode/prefix-cache)
+        # is derived inside the kernel from `context_lens` vs `cu_seqlens_q`
+        # — no `IS_PREFILL` flag. ape is added inside the kernel; caller
+        # MUST NOT pre-add it.
+        # context_lens MUST be supplied by caller (Attention.forward /
+        # Indexer.forward per-seq slice from `attn_metadata.context_lens`).
+        # No positions-derived fallback inside the kernel/wrapper.
+        assert context_lens is not None, (
+            "Compressor.forward: context_lens kwarg is required (caller must "
+            "pass per-seq slice from attn_metadata.context_lens)"
+        )
+        update_compressor_states(
+            kv.squeeze(0),
+            score.squeeze(0),
+            self.ape,
+            self.kv_state,
+            self.score_state,
+            positions=positions,
+            context_lens=context_lens,
+            ratio=ratio,
+            overlap=overlap,
+            slot=slot,
+        )
+
         if start_pos == 0:
-            # ===== Prefill path =====
+            # ===== Prefill softmax-pool path =====
             should_compress = seqlen >= ratio
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
-            offset = ratio if overlap else 0
 
-            # Save the last `ratio` overlap-slice tokens into kv_state for use
-            # by the next decode call's overlap window.
-            if overlap and cutoff >= ratio:
-                self.kv_state[slot : slot + 1, :ratio] = kv[:, cutoff - ratio : cutoff]
-                self.score_state[slot : slot + 1, :ratio] = (
-                    score[:, cutoff - ratio : cutoff] + self.ape
-                )
-            # Save the trailing partial block (remainder tokens) into kv_state.
+            # Truncate kv/score to the part the downstream softmax-pool
+            # consumes (the `[:cutoff]` rows). Legacy did this implicitly via
+            # `kv, kv_state[...] = kv.split(...)` tuple unpack at the same
+            # time as the partial-state save.
             if remainder > 0:
-                kv, self.kv_state[slot : slot + 1, offset : offset + remainder] = (
-                    kv.split([cutoff, remainder], dim=1)
-                )
-                self.score_state[slot : slot + 1, offset : offset + remainder] = (
-                    score[:, cutoff:] + self.ape[:remainder]
-                )
+                kv = kv[:, :cutoff]
                 score = score[:, :cutoff]
             # Reshape to [B, num_blocks, ratio, coff*d] and softmax-pool.
             kv = kv.unflatten(1, (-1, ratio))
@@ -828,44 +885,43 @@ class Compressor(nn.Module):
                 score = self.overlap_transform(score, float("-inf"))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
         else:
-            # ===== Decode path (start_pos > 0, seqlen == 1) =====
+            # ===== Decode boundary-compression path =====
+            # (state write itself is done by update_compressor_states above)
             should_compress = (start_pos + 1) % self.compress_ratio == 0
-            score = score + self.ape[start_pos % ratio]
             if overlap:
-                self.kv_state[slot : slot + 1, ratio + start_pos % ratio] = kv.squeeze(
-                    1
-                )
-                self.score_state[slot : slot + 1, ratio + start_pos % ratio] = (
-                    score.squeeze(1)
-                )
                 if should_compress:
+                    # State cache is a pos-%-(2*ratio) ring buffer (no roll).
+                    # The just-completed block id `comp_id = start_pos //
+                    # ratio` determines which half is A-side (current) vs
+                    # B-side (previous):
+                    #   comp_id even: A at slot[0:ratio], B at slot[ratio:2*ratio]
+                    #   comp_id odd:  A at slot[ratio:2*ratio], B at slot[0:ratio]
+                    # Concat order matches old layout: [B-side; A-side].
+                    comp_id = start_pos // ratio
+                    if comp_id % 2 == 0:
+                        b_lo, b_hi = ratio, 2 * ratio
+                        a_lo, a_hi = 0, ratio
+                    else:
+                        b_lo, b_hi = 0, ratio
+                        a_lo, a_hi = ratio, 2 * ratio
                     kv_state = torch.cat(
                         [
-                            self.kv_state[slot : slot + 1, :ratio, :d],
-                            self.kv_state[slot : slot + 1, ratio:, d:],
+                            self.kv_state[slot : slot + 1, b_lo:b_hi, :d],
+                            self.kv_state[slot : slot + 1, a_lo:a_hi, d:],
                         ],
                         dim=1,
                     )
                     score_state = torch.cat(
                         [
-                            self.score_state[slot : slot + 1, :ratio, :d],
-                            self.score_state[slot : slot + 1, ratio:, d:],
+                            self.score_state[slot : slot + 1, b_lo:b_hi, :d],
+                            self.score_state[slot : slot + 1, a_lo:a_hi, d:],
                         ],
                         dim=1,
                     )
                     kv = (kv_state * score_state.softmax(dim=1)).sum(
                         dim=1, keepdim=True
                     )
-                    # Roll: the just-completed window becomes the next overlap window.
-                    self.kv_state[slot : slot + 1, :ratio] = self.kv_state[
-                        slot : slot + 1, ratio:
-                    ]
-                    self.score_state[slot : slot + 1, :ratio] = self.score_state[
-                        slot : slot + 1, ratio:
-                    ]
             else:
-                self.kv_state[slot : slot + 1, start_pos % ratio] = kv.squeeze(1)
-                self.score_state[slot : slot + 1, start_pos % ratio] = score.squeeze(1)
                 if should_compress:
                     kv = (
                         self.kv_state[slot : slot + 1]
@@ -957,11 +1013,11 @@ class Indexer(nn.Module):
         self.compress_ratio = compress_ratio
 
         qc = args.quant_config
-        # Indexer Q is replicated across TP ranks (matches sglang/upstream):
-        # the index scoring path needs all 64 heads at every rank to compute
-        # the per-token compressed-position topk locally without cross-rank
-        # all_reduce. Sharding wq_b would force an extra all_reduce on
-        # `index_score` after the per-head sum.
+        # Indexer Q is replicated across TP ranks: the index scoring path
+        # needs all 64 heads at every rank to compute the per-token
+        # compressed-position topk locally without cross-rank all_reduce.
+        # Sharding wq_b would force an extra all_reduce on `index_score`
+        # after the per-head sum.
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -969,9 +1025,9 @@ class Indexer(nn.Module):
             quant_config=qc,
             prefix=f"{prefix}.wq_b",
         )
-        # weights_proj: BF16 in reference. Replicated to match sglang/upstream:
-        # the layer is tiny (dim × n_heads = 7168 × 64 ≈ 896KB BF16) and column-
-        # parallel sharding produces a degenerate N=8 GEMM with no aiter tuned
+        # weights_proj: BF16 in reference. Replicated because the layer is
+        # tiny (dim × n_heads = 7168 × 64 ≈ 896KB BF16) and column-parallel
+        # sharding produces a degenerate N=8 GEMM with no aiter tuned
         # config; full replication keeps N=64.
         self.weights_proj = ReplicatedLinear(
             self.dim,
@@ -1014,6 +1070,7 @@ class Indexer(nn.Module):
         offset: int,
         slot: int = 0,
         block_table: Optional[torch.Tensor] = None,
+        context_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute sparse top-k indices over the indexer's compressed KV cache.
 
@@ -1022,7 +1079,7 @@ class Indexer(nn.Module):
                 (caller pre-slices in PR3-main multi-seq dispatch).
             qr: [num_tokens, q_lora_rank] latent query shared with main Attention's q_a.
             positions: [num_tokens] absolute token positions for this sequence.
-                `start_pos = positions[0]` drives index masks + scatter indices.
+                `positions[0]` drives index masks + scatter indices.
             offset: offset added to returned indices to land them in the
                 concatenated (window || compressed) KV layout consumed by sparse_attn.
             slot: per-request state-cache slot — routed to the inner Compressor.
@@ -1035,6 +1092,9 @@ class Indexer(nn.Module):
         assert self.rotary_emb is not None
         assert x.dim() == 2 and qr.dim() == 2
         seqlen = x.size(0)
+        # Single GPU→CPU sync per call for n_committed Python int + the inner
+        # Compressor (which extracts its own from positions). Tensor-side index
+        # math uses `positions` directly.
         start_pos = int(positions[0].item())
         ratio = self.compress_ratio
         rd = self.rope_head_dim
@@ -1054,7 +1114,13 @@ class Indexer(nn.Module):
         fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
 
         # ----- Indexer KV (Compressor takes 2D, mutates kv_cache) -----
-        self.compressor(x, positions, slot=slot, block_table=block_table)
+        self.compressor(
+            x,
+            positions,
+            slot=slot,
+            block_table=block_table,
+            context_lens=context_lens,
+        )
         # weights_proj is ATOM Linear → 2D input; restore B=1 dim for einsum.
         weights = (
             self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
@@ -1363,16 +1429,40 @@ class DeepseekV4Attention(nn.Module):
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
         # ----- Per-seq dispatch -----
-        block_tables, slot_indices, cu_seqlens_q, num_seqs = _v4_get_seq_metadata()
+        # PR-A Phase 2: prefer CPU-mirror metadata published by the V4
+        # attention builder over `.tolist()` on GPU tensors. When available,
+        # `start_pos_per_seq_cpu` also lets the loop body skip the per-seq
+        # `int(seq_positions[0].item())` sync. Falls back to legacy `.tolist()`
+        # path when CPU mirror is absent (warmup / non-V4 dispatch).
+        (
+            block_tables,
+            state_slot_mapping,
+            cu_seqlens_q,
+            context_lens,
+            num_seqs,
+            cpu_meta,
+        ) = _v4_get_seq_metadata()
+        start_pos_per_seq: Optional[list[int]] = None
         if num_seqs == 0 or block_tables is None or _v4_is_dummy_run():
             # Warmup / fallback: treat the whole batch as a single dummy seq.
             seq_offsets = [0, seqlen_total]
             slots = [0]
             per_seq_bts: list[Optional[torch.Tensor]] = [None]
             num_seqs = 1
+            # Dummy context_lens: 1-element tensor sized to seqlen_total
+            # (treats warmup as fresh prefill). Compressor.forward requires
+            # context_lens; this satisfies the contract during dummy run.
+            context_lens = torch.tensor(
+                [seqlen_total], device=positions.device, dtype=torch.int32
+            )
+        elif cpu_meta is not None and cpu_meta["start_pos_per_seq"] is not None:
+            seq_offsets = cpu_meta["cu_seqlens_q"][: num_seqs + 1].tolist()
+            slots = cpu_meta["state_slot_mapping"][:num_seqs].tolist()
+            start_pos_per_seq = cpu_meta["start_pos_per_seq"][:num_seqs].tolist()
+            per_seq_bts = [block_tables[i] for i in range(num_seqs)]
         else:
             seq_offsets = cu_seqlens_q[: num_seqs + 1].tolist()
-            slots = slot_indices[:num_seqs].tolist()
+            slots = state_slot_mapping[:num_seqs].tolist()
             per_seq_bts = [block_tables[i] for i in range(num_seqs)]
 
         output_chunks = []
@@ -1388,7 +1478,12 @@ class DeepseekV4Attention(nn.Module):
             seq_x = x[seq_start:seq_end]
             seq_q = q[:, seq_start:seq_end]
             seq_kv = kv[:, seq_start:seq_end]
-            start_pos = int(seq_positions[0].item())
+            # PR-A Phase 2: prefer CPU mirror to avoid per-seq GPU→CPU sync
+            # (~64 layers × num_seqs syncs eliminated when present).
+            if start_pos_per_seq is not None:
+                start_pos = start_pos_per_seq[seq_idx]
+            else:
+                start_pos = int(seq_positions[0].item())
 
             # Per-seq state-cache reset on prefill from scratch.
             # Only this seq's slot is touched — other concurrent seqs are
@@ -1406,6 +1501,7 @@ class DeepseekV4Attention(nn.Module):
             topk_idxs = _get_window_topk_idxs(
                 win, 1, seqlen, start_pos, device=x.device
             )
+            seq_context_lens = context_lens[seq_idx : seq_idx + 1]
             if self.compress_ratio:
                 offset = seq_kv.size(1) if start_pos == 0 else win
                 if self.indexer is not None:
@@ -1417,6 +1513,7 @@ class DeepseekV4Attention(nn.Module):
                         offset,
                         slot=slot,
                         block_table=block_table,
+                        context_lens=seq_context_lens,
                     )
                 else:
                     compress_topk_idxs = _get_compress_topk_idxs(
@@ -1425,8 +1522,24 @@ class DeepseekV4Attention(nn.Module):
                 topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
             topk_idxs = topk_idxs.int()
 
-            # SWA write + sparse_attn input gather (per-seq layout).
-            if start_pos == 0:
+            # SWA write — gated swap-out point for v4_kernels.swa_write
+            # (PR-A Phase 1a). The new path writes via Triton kernel using
+            # `positions % win` per token; equivalent to legacy ring-rotation.
+            if use_new_v4_backend(self.layer_id):
+                if seqlen <= win:
+                    seq_kv_flat = seq_kv.squeeze(0).contiguous()
+                    seq_pos_flat = seq_positions
+                else:
+                    seq_kv_flat = seq_kv.squeeze(0)[-win:].contiguous()
+                    seq_pos_flat = seq_positions[-win:]
+                slot_per_token = torch.full(
+                    (seq_kv_flat.size(0),),
+                    slot,
+                    device=seq_kv_flat.device,
+                    dtype=torch.int32,
+                )
+                swa_write(seq_kv_flat, seq_pos_flat, slot_per_token, self.swa_kv, win)
+            elif start_pos == 0:
                 if seqlen <= win:
                     self.swa_kv[slot : slot + 1, :seqlen] = seq_kv
                 else:
@@ -1435,18 +1548,32 @@ class DeepseekV4Attention(nn.Module):
                         self.swa_kv[slot : slot + 1, cutoff:win],
                         self.swa_kv[slot : slot + 1, :cutoff],
                     ) = seq_kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+            else:
+                self.swa_kv[slot : slot + 1, start_pos % win] = seq_kv.squeeze(1)
+
+            # Compressor + kv_sa construction. Branches on prefill
+            # (start_pos == 0) vs decode. Compressor extracts its own start_pos
+            # from `seq_positions[0]` internally.
+            if start_pos == 0:
                 kv_sa = seq_kv
                 if self.compress_ratio:
                     kv_compress = self.compressor(
-                        seq_x, seq_positions, slot=slot, block_table=block_table
+                        seq_x,
+                        seq_positions,
+                        slot=slot,
+                        block_table=block_table,
+                        context_lens=seq_context_lens,
                     )
                     if kv_compress is not None:
                         kv_sa = torch.cat([kv_sa, kv_compress], dim=1)
             else:
-                self.swa_kv[slot : slot + 1, start_pos % win] = seq_kv.squeeze(1)
                 if self.compress_ratio:
                     self.compressor(
-                        seq_x, seq_positions, slot=slot, block_table=block_table
+                        seq_x,
+                        seq_positions,
+                        slot=slot,
+                        block_table=block_table,
+                        context_lens=seq_context_lens,
                     )
                     # sparse_attn input layout: [SWA window || compressed
                     # entries gathered from block-table]. n_committed accounts

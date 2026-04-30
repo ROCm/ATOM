@@ -316,14 +316,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         """V4-style decode prep: populates positions, cu_seqlens_q,
-        block_tables, and v4_slot_indices.
+        block_tables, and state_slot_mapping.
 
         For PR3-main multi-seq:
           - cu_seqlens_q gives V4 forward per-seq token-range slicing.
           - block_tables[i] is the per-seq block list for compressor scatter
             and sparse_attn gather.
-          - v4_slot_indices[i] is the per-seq state-cache slot (swa_kv +
-            Compressor.kv_state position).
+          - state_slot_mapping[i] is the per-seq state-cache slot (swa_kv +
+            Compressor.kv_state row index). Distinct from `slot_mapping`
+            which is per-token paged-KV-pool index.
+
+        Also publishes CPU mirrors (`v4_*_cpu` attrs) so the V4 forward path
+        can read per-seq metadata without GPU→CPU `.tolist()`/.item() syncs
+        (PR-A Phase 2: required to unlock CUDAGraph).
         """
         import numpy as np
 
@@ -331,11 +336,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs = batch.total_seqs_num_decode
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         max_seqlen_q = batch.num_spec_step + 1
-        positions = np.tile(
+        positions_np = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
         ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
         sum_scheduled_tokens = batch.total_tokens_num_decode
-        var["positions"].np[:sum_scheduled_tokens] = positions
+        var["positions"].np[:sum_scheduled_tokens] = positions_np
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
 
         # cu_seqlens_q for decode: each seq has max_seqlen_q tokens.
@@ -345,8 +350,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var["cu_seqlens_q"].np[: scheduled_bs + 1] = cu_seqlens_q_np
         cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(scheduled_bs + 1)
 
+        # PR-A: V4 Compressor state-cache update reads context_lens to
+        # discriminate fresh prefill vs decode/prefix-cache. Parent's
+        # prepare_prefill pushes this; decode path must do the same.
+        var["context_lens"].np[:scheduled_bs] = context_lens
+        context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
+
         block_tables_gpu = self._populate_block_tables(batch, scheduled_bs)
-        slot_indices_gpu = self._populate_slot_indices(batch, scheduled_bs)
+        state_slot_gpu, state_slot_np = self._populate_state_slot_mapping(
+            batch, scheduled_bs, return_cpu=True
+        )
         attn_metadata = AttentionMetaData(
             cu_seqlens_q=cu_seqlens_q_gpu,
             cu_seqlens_k=None,
@@ -358,28 +371,57 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             total_kv=int(context_lens.sum()),
             num_cached_tokens=None,
             block_tables=block_tables_gpu,
+            context_lens=context_lens_gpu,
         )
         # Attach V4-specific per-seq metadata via dynamic attribute.
         # AttentionMetaData is a regular class (not slotted), so this works
         # without modifying its schema.
-        attn_metadata.v4_slot_indices = slot_indices_gpu
+        attn_metadata.state_slot_mapping = state_slot_gpu
+        # PR-A Phase 2: CPU mirrors so the V4 forward path can read per-seq
+        # metadata without `.tolist()` / `.item()` GPU→CPU syncs. Generic
+        # naming (no `v4_` prefix) — these are not V4-specific concepts and
+        # other backends with stateful per-request buffers can adopt them.
+        attn_metadata.cu_seqlens_q_cpu = cu_seqlens_q_np
+        attn_metadata.state_slot_mapping_cpu = state_slot_np
+        attn_metadata.start_pos_per_seq_cpu = positions_np[
+            cu_seqlens_q_np[:scheduled_bs]
+        ]
         return attn_metadata, positions
 
     def prepare_prefill(self, batch: ScheduledBatch):
         """V4 prefill prep: extends parent to always populate block_tables
-        and v4_slot_indices.
+        and state_slot_mapping.
 
         The parent only emits block_tables when has_cached (prefix cache hit);
         V4 always needs block_tables because Compressor scatters compressed
         entries into the classical KV pool from token 0 onwards.
+
+        Also publishes CPU mirrors (`v4_*_cpu`) consumed by the V4 forward
+        path to avoid `.item()` / `.tolist()` syncs (PR-A Phase 2).
         """
+        import numpy as np
+
         attn_metadata, positions = super().prepare_prefill(batch)
         scheduled_bs = batch.total_seqs_num_prefill
         if attn_metadata.block_tables is None:
             attn_metadata.block_tables = self._populate_block_tables(
                 batch, scheduled_bs
             )
-        attn_metadata.v4_slot_indices = self._populate_slot_indices(batch, scheduled_bs)
+        state_slot_gpu, state_slot_np = self._populate_state_slot_mapping(
+            batch, scheduled_bs, return_cpu=True
+        )
+        attn_metadata.state_slot_mapping = state_slot_gpu
+        # PR-A Phase 2 CPU mirrors (generic, not V4-specific). The parent
+        # populated forward_vars CPU buffers; read them back as numpy slices.
+        var = self.model_runner.forward_vars
+        sum_scheduled_tokens = batch.total_tokens_num_prefill
+        positions_np = np.asarray(var["positions"].np[:sum_scheduled_tokens])
+        cu_seqlens_q_np = np.asarray(var["cu_seqlens_q"].np[: scheduled_bs + 1])
+        attn_metadata.cu_seqlens_q_cpu = cu_seqlens_q_np
+        attn_metadata.state_slot_mapping_cpu = state_slot_np
+        attn_metadata.start_pos_per_seq_cpu = positions_np[
+            cu_seqlens_q_np[:scheduled_bs]
+        ]
         return attn_metadata, positions
 
     def _populate_block_tables(
@@ -398,20 +440,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             block_tables_np[i, : len(block_table)] = block_table
         return var["block_tables"].copy_to_gpu(scheduled_bs)
 
-    def _populate_slot_indices(
-        self, batch: ScheduledBatch, scheduled_bs: int
-    ) -> torch.Tensor:
-        """Build `[scheduled_bs]` int32 tensor of per-seq state-cache slots.
+    def _populate_state_slot_mapping(
+        self, batch: ScheduledBatch, scheduled_bs: int, return_cpu: bool = False
+    ):
+        """Build `[scheduled_bs]` int32 tensor of per-request state-cache slots.
 
         With slots_per_req() == 1, slot index == per_req_cache_group. This
-        is what V4 forward uses to index swa_kv / Compressor.kv_state.
+        is what V4 forward uses to index `swa_kv` and `Compressor.kv_state`
+        (the per-request state pool, distinct from the per-token paged-KV
+        `slot_mapping`).
+
+        When `return_cpu=True`, returns `(gpu_tensor, cpu_numpy)`. The CPU
+        copy is consumed by the V4 forward path to avoid `.tolist()` syncs
+        (PR-A Phase 2).
         """
         import numpy as np
 
         groups_np = np.asarray(
             batch.per_req_cache_groups[:scheduled_bs], dtype=np.int32
         )
-        return torch.from_numpy(groups_np).to(self.model_runner.device)
+        gpu = torch.from_numpy(groups_np).to(self.model_runner.device)
+        if return_cpu:
+            return gpu, groups_np
+        return gpu
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         # CUDA Graph capture is disabled for V4 (PR4 scope). Return a stub.

@@ -40,9 +40,9 @@ def generate_cuda_graph_sizes(max_size):
 
 def main():
     prompts = [
-        # "introduce yourself",
-        # "list all prime numbers within 100",
-        # "1+2+3=?",
+        "introduce yourself",
+        "list all prime numbers within 100",
+        "1+2+3=?",
         "如何在一个月内增肌10公斤",
     ]
     args = parser.parse_args()

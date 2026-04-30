@@ -93,6 +93,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.
     "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
+    # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
+    # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
+    # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with
+    # batched Triton kernels (no GPU→CPU sync, CUDAGraph-capturable).
+    # During Phase 1/2 migration, individual sites can be flipped to `new`
+    # for byte-equal A/B verification via dump-bisect.
+    "ATOM_V4_BACKEND": lambda: os.getenv("ATOM_V4_BACKEND", "legacy"),
+    # Comma-separated layer ids to route through the new backend (others stay
+    # legacy). Empty means: respect ATOM_V4_BACKEND for all layers. Used for
+    # layer-by-layer bisect during migration. Example: "0,3,15,30".
+    "ATOM_V4_BACKEND_LAYERS": lambda: os.getenv("ATOM_V4_BACKEND_LAYERS", ""),
     # --- Debug Dump (atom/utils/debug_helper/) ---
     # All disabled (empty / no-op) by default. Set to enable instrumentation
     # for forward / weight / sampler bisecting; safe to leave wired in
