@@ -11,6 +11,7 @@
 
 """Inference-only Cohere model compatible with HuggingFace weights."""
 
+from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 import torch
@@ -259,6 +260,7 @@ class CohereModel(nn.Module):
         layer_type: type[nn.Module] = CohereDecoderLayer,
     ):
         super().__init__()
+        self.atom_config = atom_config
         config = atom_config.hf_config
         self.config = config
         cache_config = atom_config.kv_cache_dtype
@@ -394,3 +396,17 @@ class CohereForCausalLM(nn.Module):
     ) -> Optional[torch.Tensor]:
         logits = self.lm_head(hidden_states)
         return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from atom.model_loader.loader import load_model_in_plugin_mode
+
+        loaded = load_model_in_plugin_mode(
+            model=self, config=self.model.atom_config, prefix="model."
+        )
+        # Cohere2 checkpoints omit input_layernorm.bias and norm.bias — they are
+        # zero-initialized by LayerNorm.__init__ and correct as-is.  Mark them
+        # as loaded so vLLM's completeness check does not raise.
+        for name, _ in self.named_parameters():
+            if name.endswith(".bias") and ("layernorm" in name or name == "model.norm.bias"):
+                loaded.add("model." + name)
+        return loaded
