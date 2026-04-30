@@ -356,8 +356,8 @@ RUN pip show mori || true
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
-ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="v0.3.10.post1"
+ARG MOONCAKE_REPO="https://github.com/Jasen2201/Mooncake.git"
+ARG MOONCAKE_COMMIT="fix/ionic-mr-and-qp-resource-fixes"
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
 # [MC 1/4] Clone
