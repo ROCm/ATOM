@@ -87,6 +87,7 @@ def parse_vllm_iteration(name: str) -> Optional[IterationInfo]:
 
 
 _SLIM_ARGS_KEYS = frozenset({"kernel", "correlation"})
+_CPU_OP_EXTRA_ARGS_KEYS = frozenset({"Input Dims", "Input type", "Concrete Inputs"})
 
 
 def _slim_one(e: Dict) -> Optional[Dict]:
@@ -104,10 +105,64 @@ def _slim_one(e: Dict) -> Optional[Dict]:
     }
     raw_args = e.get("args")
     if raw_args:
-        slim_args = {k: raw_args[k] for k in _SLIM_ARGS_KEYS if k in raw_args}
+        keep_keys = _SLIM_ARGS_KEYS
+        if slimmed["cat"] == "cpu_op":
+            keep_keys = _SLIM_ARGS_KEYS | _CPU_OP_EXTRA_ARGS_KEYS
+        slim_args = {k: raw_args[k] for k in keep_keys if k in raw_args}
         if slim_args:
             slimmed["args"] = slim_args
     return slimmed
+
+
+def format_input_shapes(cpu_op_event: Dict) -> str:
+    """Format cpu_op Input Dims / Input type / Concrete Inputs into a readable string.
+
+    Example: "[bfloat16(256, 2048), bfloat16(2560, 2048), scalar(True)]"
+    Empty argument slots are kept as "_" to preserve positional info.
+    Returns "" if no shape information is available.
+    """
+    args = cpu_op_event.get("args") or {}
+    dims_list = args.get("Input Dims")
+    type_list = args.get("Input type")
+    concrete_list = args.get("Concrete Inputs")
+
+    if not dims_list and not type_list and not concrete_list:
+        return ""
+
+    n = max(
+        len(dims_list) if dims_list else 0,
+        len(type_list) if type_list else 0,
+        len(concrete_list) if concrete_list else 0,
+    )
+    if n == 0:
+        return ""
+
+    parts: List[str] = []
+    for i in range(n):
+        dims = dims_list[i] if dims_list and i < len(dims_list) else []
+        dtype_raw = type_list[i] if type_list and i < len(type_list) else ""
+        concrete = concrete_list[i] if concrete_list and i < len(concrete_list) else ""
+
+        if not dims or dims == []:
+            if dtype_raw == "Scalar" and concrete:
+                parts.append(f"scalar({concrete})")
+            elif dtype_raw == "ScalarList" and concrete:
+                parts.append(f"scalars({concrete})")
+            elif dtype_raw and concrete:
+                parts.append(f"{dtype_raw}({concrete})")
+            elif concrete:
+                parts.append(f"scalar({concrete})")
+            else:
+                parts.append("_")
+            continue
+
+        dtype_label = dtype_raw if dtype_raw else "?"
+        dims_str = ", ".join(str(d) for d in dims)
+        parts.append(f"{dtype_label}({dims_str})")
+
+    if all(p == "_" for p in parts):
+        return ""
+    return "[" + ", ".join(parts) + "]"
 
 
 def load_trace_events(filepath: str) -> Tuple[List[Dict], float]:
@@ -474,10 +529,12 @@ def write_kernel_rows_to_sheet(
     section_label: str = "",
 ) -> None:
     if section_label:
-        ws.append([section_label, "", "", ""])
+        ws.append([section_label, "", "", "", ""])
 
     total_duration = sum(float(r[2]) for r in rows) if rows else 0.0
-    for cpu_mod, kernel, dur in rows:
+    for row in rows:
+        cpu_mod, kernel, dur = row[0], row[1], row[2]
+        shapes = row[3] if len(row) > 3 else ""
         dur_f = float(dur)
         pct = (dur_f / total_duration * 100) if total_duration > 0 else 0
         ws.append(
@@ -486,10 +543,11 @@ def write_kernel_rows_to_sheet(
                 demangle_kernel_name(kernel),
                 round(dur_f, 3),
                 round(pct, 1),
+                shapes,
             ]
         )
 
-    ws.append(["TOTAL", "", round(total_duration, 3), 100.0])
+    ws.append(["TOTAL", "", round(total_duration, 3), 100.0, ""])
     ws.append([])
 
 
@@ -514,13 +572,13 @@ def write_consolidated_xlsx(
         else:
             ws = wb.create_sheet(sheet_name)
 
-        ws.append(["cpu_module", "gpu_kernel", "duration_us", "pct%"])
+        ws.append(["cpu_module", "gpu_kernel", "duration_us", "pct%", "input_shapes"])
 
         for label, rows in groups:
             write_kernel_rows_to_sheet(ws, rows, section_label=label)
-            for _, kernel, dur in rows:
-                short_name = demangle_kernel_name(kernel)
-                dur_f = float(dur)
+            for row in rows:
+                short_name = demangle_kernel_name(row[1])
+                dur_f = float(row[2])
                 prev = kernel_stats.get(short_name, (0, 0.0))
                 kernel_stats[short_name] = (prev[0] + 1, prev[1] + dur_f)
                 grand_total += dur_f
@@ -796,8 +854,8 @@ def build_module_map(
     events: List[Dict],
     cpu_fwd: Dict,
     gpu_kernels: List[Dict],
-) -> Dict[int, str]:
-    """Map GPU kernel index to cpu_module name."""
+) -> Tuple[Dict[int, str], Dict[int, str]]:
+    """Map GPU kernel index to (cpu_module name, formatted input shapes)."""
     fwd_ts = cpu_fwd["ts"]
     fwd_end = fwd_ts + cpu_fwd.get("dur", 0)
     fwd_tid = cpu_fwd.get("tid")
@@ -833,7 +891,7 @@ def build_module_map(
         if corr is not None:
             corr_to_rt[corr] = rt
 
-    def _narrowest_cpu_op(rt_event: Dict) -> str:
+    def _narrowest_cpu_op(rt_event: Dict) -> Tuple[str, str]:
         rt_ts = rt_event["ts"]
         rt_end = rt_ts + rt_event.get("dur", 0)
         containing = [
@@ -843,14 +901,19 @@ def build_module_map(
         ]
         containing.sort(key=lambda op: op.get("dur", 0))
         if not containing:
-            return ""
+            return "", ""
+        chosen = None
         for op in containing:
             name = op.get("name", "")
             if not name.startswith("aiter::"):
-                return name
-        return containing[0].get("name", "")
+                chosen = op
+                break
+        if chosen is None:
+            chosen = containing[0]
+        return chosen.get("name", ""), format_input_shapes(chosen)
 
     index_to_mod: Dict[int, str] = {}
+    index_to_shapes: Dict[int, str] = {}
     for i, gk in enumerate(gpu_kernels):
         corr = (gk.get("args") or {}).get("correlation")
         if corr is None:
@@ -858,11 +921,85 @@ def build_module_map(
         rt = corr_to_rt.get(corr)
         if rt is None:
             continue
-        name = _narrowest_cpu_op(rt)
+        name, shapes = _narrowest_cpu_op(rt)
         if name:
             index_to_mod[i] = name
+        if shapes:
+            index_to_shapes[i] = shapes
 
-    return index_to_mod
+    return index_to_mod, index_to_shapes
+
+
+def build_module_map_for_graph(
+    events: List[Dict],
+    gpu_kernels: List[Dict],
+) -> Tuple[Dict[int, str], Dict[int, str]]:
+    """Map CUDAGraph GPU kernel index to (cpu_module, input_shapes) via capture-phase correlations.
+
+    Unlike build_module_map(), this does not require a cpu_fwd scope — it searches
+    the entire trace for cuda_runtime launch events matching each kernel's correlation ID,
+    then finds the narrowest containing cpu_op.
+    """
+    corr_to_rt: Dict[int, Dict] = {}
+    for e in events:
+        if e.get("ph") != "X" or e.get("cat") != "cuda_runtime":
+            continue
+        if not is_kernel_launch(e.get("name", "")):
+            continue
+        corr = (e.get("args") or {}).get("correlation")
+        if corr is not None:
+            corr_to_rt[corr] = e
+
+    rt_pids_tids: set = set()
+    for rt in corr_to_rt.values():
+        rt_pids_tids.add((rt.get("pid"), rt.get("tid")))
+
+    cpu_ops = [
+        e
+        for e in events
+        if e.get("ph") == "X"
+        and e.get("cat") == "cpu_op"
+        and (e.get("pid"), e.get("tid")) in rt_pids_tids
+    ]
+    cpu_ops.sort(key=lambda e: (e["ts"], e.get("dur", 0)))
+
+    def _narrowest_cpu_op(rt_event: Dict) -> Tuple[str, str]:
+        rt_ts = rt_event["ts"]
+        rt_end = rt_ts + rt_event.get("dur", 0)
+        containing = [
+            op
+            for op in cpu_ops
+            if op["ts"] <= rt_ts and rt_end <= op["ts"] + op.get("dur", 0)
+        ]
+        containing.sort(key=lambda op: op.get("dur", 0))
+        if not containing:
+            return "", ""
+        chosen = None
+        for op in containing:
+            name = op.get("name", "")
+            if not name.startswith("aiter::"):
+                chosen = op
+                break
+        if chosen is None:
+            chosen = containing[0]
+        return chosen.get("name", ""), format_input_shapes(chosen)
+
+    index_to_mod: Dict[int, str] = {}
+    index_to_shapes: Dict[int, str] = {}
+    for i, gk in enumerate(gpu_kernels):
+        corr = (gk.get("args") or {}).get("correlation")
+        if corr is None:
+            continue
+        rt = corr_to_rt.get(corr)
+        if rt is None:
+            continue
+        name, shapes = _narrowest_cpu_op(rt)
+        if name:
+            index_to_mod[i] = name
+        if shapes:
+            index_to_shapes[i] = shapes
+
+    return index_to_mod, index_to_shapes
 
 
 def _collect_norm_cpu_ops(events: List[Dict], cpu_fwd: Dict) -> List[Dict]:
@@ -952,8 +1089,6 @@ def _scan_for_norm_boundaries(
     expected_layers: int,
 ) -> Optional["NormData"]:
     """Scan GPU kernels for norm-type kernels and identify layer boundaries."""
-    slack = max(2, expected_layers // 8)
-
     sig_positions: Dict[str, List[int]] = {}
     for i, k in enumerate(gpu_kernels):
         name = k.get("name", "").lower()
@@ -965,10 +1100,8 @@ def _scan_for_norm_boundaries(
     if not sig_positions:
         return None
 
-    candidates: List[Tuple[List[int], Optional[List[int]], float]] = []
-    for sig, positions in sig_positions.items():
-        cnt = len(positions)
-        first_offset = min(
+    def _first_offset(positions: List[int]) -> float:
+        return min(
             (
                 p - loop_start
                 for p in positions
@@ -976,13 +1109,49 @@ def _scan_for_norm_boundaries(
             ),
             default=float("inf"),
         )
+
+    def _is_evenly_spaced(positions: List[int], tolerance: float = 0.15) -> bool:
+        if len(positions) < 4:
+            return False
+        diffs = [positions[i + 1] - positions[i] for i in range(len(positions) - 1)]
+        median = sorted(diffs)[len(diffs) // 2]
+        if median == 0:
+            return False
+        return (
+            sum(1 for d in diffs if abs(d - median) <= max(2, median * tolerance))
+            >= len(diffs) * 0.85
+        )
+
+    slack = max(2, expected_layers // 8)
+
+    candidates: List[Tuple[List[int], Optional[List[int]], float]] = []
+    for sig, positions in sig_positions.items():
+        cnt = len(positions)
+        fo = _first_offset(positions)
         if abs(cnt - expected_layers) <= slack:
-            candidates.append((positions, None, first_offset))
+            candidates.append((positions, None, fo))
         elif abs(cnt - 2 * expected_layers) <= 2 * slack:
             primary = positions[::2]
             alt = positions[1::2]
             if abs(len(primary) - expected_layers) <= slack:
-                candidates.append((primary, alt, first_offset))
+                candidates.append((primary, alt, fo))
+
+    if not candidates:
+        for sig, positions in sig_positions.items():
+            cnt = len(positions)
+            if cnt < 4 or not _is_evenly_spaced(positions):
+                continue
+            fo = _first_offset(positions)
+            norms_per_period = sum(
+                1 for p in positions if loop_start <= p < loop_start + detected_period
+            )
+            if norms_per_period >= 1 and cnt >= expected_layers:
+                candidates.append((positions, None, fo))
+                if cnt >= 2 * expected_layers:
+                    primary = positions[::2]
+                    alt = positions[1::2]
+                    if _is_evenly_spaced(primary):
+                        candidates.append((primary, alt, fo))
 
     if not candidates:
         return None
@@ -991,7 +1160,7 @@ def _scan_for_norm_boundaries(
     best_positions, best_alt, best_offset = candidates[0]
 
     if not _detect_phase(gpu_kernels, best_positions, loop_start):
-        if best_alt is not None and abs(len(best_alt) - expected_layers) <= slack:
+        if best_alt is not None:
             print("  Phase corrected: switched to odd-indexed norms (input_layernorm)")
             best_positions = best_alt
         else:
@@ -1224,7 +1393,7 @@ def _run_eager_forward_analysis(
         print(f"  No eager forward kernels found for {batch_type}.")
         return None
 
-    mod_map = build_module_map(eager_events, cpu_fwd, kernels)
+    mod_map, _ = build_module_map(eager_events, cpu_fwd, kernels)
     print(f"  Eager module-mapped: {len(mod_map)}/{len(kernels)} kernels")
 
     norm_data = find_layer_boundaries_v2(
@@ -1238,90 +1407,67 @@ def align_eager_to_graph(
     graph_kernels: List[Dict],
     eager_result: EagerForwardResult,
     label: str,
-) -> Tuple[Dict[int, str], Optional[List[int]], int, int, bool]:
-    """Anchor-map eager kernel metadata onto graph-mode kernel list."""
+) -> Dict[int, str]:
+    """Transfer eager module names onto graph kernel list via signature matching.
+
+    Returns graph_mod_map only. Layer boundaries are handled separately
+    via graph-native norm detection.
+    """
     eager_kernels = eager_result.gpu_kernels
-    eager_names = [k.get("name", "") for k in eager_kernels]
-    graph_names = [k.get("name", "") for k in graph_kernels]
+    eager_mod_map = eager_result.module_map
 
-    eager_anchor_idx: Optional[int] = None
-    anchor_name: Optional[str] = None
-    for ei, name in enumerate(eager_names):
-        if is_stable_anchor_kernel(name):
-            eager_anchor_idx = ei
-            anchor_name = name
-            break
+    eager_sig_to_mods: Dict[str, List[str]] = {}
+    for ei, k in enumerate(eager_kernels):
+        mod = eager_mod_map.get(ei)
+        if not mod:
+            continue
+        sig = kernel_signature(k.get("name", ""))
+        eager_sig_to_mods.setdefault(sig, []).append(mod)
 
-    if eager_anchor_idx is None or anchor_name is None:
-        print(
-            f"  {label}: no stable anchor kernel found in eager trace — name-scan alignment"
-        )
-        eager_anchor_idx = 0
-        anchor_name = eager_names[0] if eager_names else ""
-
-    graph_anchor_idx: Optional[int] = None
-    for gi, name in enumerate(graph_names):
-        if name == anchor_name:
-            graph_anchor_idx = gi
-            break
-
-    if graph_anchor_idx is None:
-        print(f"  {label}: anchor '{anchor_name}' not found in graph — offset=0")
-        offset = 0
-    else:
-        offset = graph_anchor_idx - eager_anchor_idx
+    eager_name_to_mods: Dict[str, List[str]] = {}
+    for ei, k in enumerate(eager_kernels):
+        mod = eager_mod_map.get(ei)
+        if not mod:
+            continue
+        name = k.get("name", "")
+        eager_name_to_mods.setdefault(name, []).append(mod)
 
     graph_mod_map: Dict[int, str] = {}
-    for ei, mod in eager_result.module_map.items():
-        gi = ei + offset
-        if 0 <= gi < len(graph_kernels):
-            graph_mod_map[gi] = mod
+    sig_counters: Dict[str, int] = {}
+
+    for gi, gk in enumerate(graph_kernels):
+        gname = gk.get("name", "")
+        gsig = kernel_signature(gname)
+
+        if gname in eager_name_to_mods:
+            mods = eager_name_to_mods[gname]
+            idx = sig_counters.get(gname, 0)
+            graph_mod_map[gi] = mods[idx % len(mods)]
+            sig_counters[gname] = idx + 1
+        elif gsig in eager_sig_to_mods:
+            mods = eager_sig_to_mods[gsig]
+            idx = sig_counters.get(gsig, 0)
+            graph_mod_map[gi] = mods[idx % len(mods)]
+            sig_counters[gsig] = idx + 1
+
     print(
         f"  {label}: transferred {len(graph_mod_map)}/{len(graph_kernels)} module mappings"
     )
-
-    nd = eager_result.norm_data
-    if nd.norm_gpu_indices is None:
-        return graph_mod_map, None, 0, nd.norm_period, nd.use_end_as_boundary
-
-    graph_norm_indices = [
-        idx + offset
-        for idx in nd.norm_gpu_indices
-        if 0 <= idx + offset < len(graph_kernels)
-    ]
-    if len(graph_norm_indices) < 4:
-        print(
-            f"  {label}: only {len(graph_norm_indices)} norm indices translated (need ≥4)"
-        )
-        return graph_mod_map, None, 0, nd.norm_period, nd.use_end_as_boundary
-
-    pre_loop_eager = set(nd.norm_gpu_indices[: nd.norm_loop_start])
-    graph_norm_loop_start = sum(
-        1 for ei in pre_loop_eager if 0 <= ei + offset < len(graph_kernels)
-    )
-    print(
-        f"  {label}: {len(graph_norm_indices)} graph norm indices, "
-        f"loop_start={graph_norm_loop_start}"
-    )
-
-    return (
-        graph_mod_map,
-        graph_norm_indices,
-        graph_norm_loop_start,
-        nd.norm_period,
-        nd.use_end_as_boundary,
-    )
+    return graph_mod_map
 
 
 def _kernels_to_rows(
     gpu_kernels: List[Dict],
     mod_map: Dict[int, str],
     start_idx: int = 0,
+    shape_map: Optional[Dict[int, str]] = None,
 ) -> List[List[Any]]:
     rows = []
     for i, k in enumerate(gpu_kernels):
-        cpu_mod = mod_map.get(i + start_idx, "")
-        rows.append([cpu_mod, k.get("name", ""), k.get("dur", 0)])
+        idx = i + start_idx
+        cpu_mod = mod_map.get(idx, "")
+        shapes = shape_map.get(idx, "") if shape_map else ""
+        rows.append([cpu_mod, k.get("name", ""), k.get("dur", 0), shapes])
     return rows
 
 
@@ -1331,6 +1477,7 @@ def slice_target_layer(
     target_layer: int,
     trace_start_ts: float,
     mod_map: Optional[Dict[int, str]] = None,
+    shape_map: Optional[Dict[int, str]] = None,
 ) -> List[Tuple[str, List[List[Any]]]]:
     """Slice gpu_kernels into pre-loop, target layer, and post-loop groups."""
     if mod_map is None:
@@ -1344,7 +1491,7 @@ def slice_target_layer(
         or len(nd.norm_gpu_indices) < 2
     ):
         print("  No layer boundaries found. Returning all kernels as a single group")
-        return [("[all]", _kernels_to_rows(gpu_kernels, mod_map, 0))]
+        return [("[all]", _kernels_to_rows(gpu_kernels, mod_map, 0, shape_map))]
 
     P = nd.norm_period
     L = nd.norm_loop_start
@@ -1396,13 +1543,18 @@ def slice_target_layer(
 
     if pre_end > 0:
         groups.append(
-            ("[pre-loop]", _kernels_to_rows(gpu_kernels[:pre_end], mod_map, 0))
+            (
+                "[pre-loop]",
+                _kernels_to_rows(gpu_kernels[:pre_end], mod_map, 0, shape_map),
+            )
         )
 
     groups.append(
         (
             f"[layer {N}]",
-            _kernels_to_rows(gpu_kernels[layer_start:layer_end], mod_map, layer_start),
+            _kernels_to_rows(
+                gpu_kernels[layer_start:layer_end], mod_map, layer_start, shape_map
+            ),
         )
     )
 
@@ -1410,7 +1562,9 @@ def slice_target_layer(
         groups.append(
             (
                 "[post-loop]",
-                _kernels_to_rows(gpu_kernels[post_start:], mod_map, post_start),
+                _kernels_to_rows(
+                    gpu_kernels[post_start:], mod_map, post_start, shape_map
+                ),
             )
         )
 
@@ -1471,8 +1625,8 @@ def extract_stage_kernels(
             if gk is not None:
                 matched_kernels.append(gk)
 
-    mod_map = build_module_map(events, stage_ev, matched_kernels)
-    return _kernels_to_rows(matched_kernels, mod_map, 0)
+    mod_map, shape_map = build_module_map(events, stage_ev, matched_kernels)
+    return _kernels_to_rows(matched_kernels, mod_map, 0, shape_map)
 
 
 def analyze_trace(
@@ -1527,25 +1681,43 @@ def analyze_trace(
                 events, prefill_iter, cpu_pid, gpu_pid, corr_to_gpu=corr_to_gpu
             )
             if kernels:
-                if is_cg and eager_events is not None:
-                    eager_res = _run_eager_forward_analysis(
-                        eager_events,
-                        "prefill",
-                        eager_cpu_pid,
-                        None,
-                        corr_to_gpu,
-                        trace_start_ts,
+                shape_map: Dict[int, str] = {}
+                if is_cg:
+                    mod_map, shape_map = build_module_map_for_graph(events, kernels)
+                    print(
+                        f"  Graph-native module-mapped: {len(mod_map)}/{len(kernels)} kernels, "
+                        f"{len(shape_map)} with shapes"
                     )
-                    if eager_res is not None:
-                        mod_map, ngi, nls, np_, use_end = align_eager_to_graph(
-                            kernels, eager_res, "prefill"
+                    kernel_names = [k.get("name", "") for k in kernels]
+                    loop_start, period, num_repeats = find_layer_boundaries(
+                        kernel_names, min_num_repeats=4
+                    )
+                    expected_layers = num_repeats if num_repeats > 1 else 48
+                    nd_scan = _scan_for_norm_boundaries(
+                        kernels, loop_start, period, expected_layers
+                    )
+                    if nd_scan is not None:
+                        nd = nd_scan
+                        print(
+                            f"  Graph-native norm boundaries: {len(nd.norm_gpu_indices)} norms"
                         )
-                        nd = NormData(ngi, np_, nls, use_end)
                     else:
-                        mod_map = {}
                         nd = _gpu_signature_fallback(kernels)
-                elif not is_cg and cpu_fwd is not None:
-                    mod_map = build_module_map(events, cpu_fwd, kernels)
+                    if not mod_map and eager_events is not None:
+                        eager_res = _run_eager_forward_analysis(
+                            eager_events,
+                            "prefill",
+                            eager_cpu_pid,
+                            None,
+                            corr_to_gpu,
+                            trace_start_ts,
+                        )
+                        if eager_res is not None:
+                            mod_map = align_eager_to_graph(
+                                kernels, eager_res, "prefill"
+                            )
+                elif cpu_fwd is not None:
+                    mod_map, shape_map = build_module_map(events, cpu_fwd, kernels)
                     print(f"  Module-mapped: {len(mod_map)}/{len(kernels)} kernels")
                     nd = find_layer_boundaries_v2(
                         events, cpu_fwd, kernels, gpu_pid, corr_to_gpu
@@ -1555,7 +1727,7 @@ def analyze_trace(
                     nd = _gpu_signature_fallback(kernels)
 
                 groups = slice_target_layer(
-                    kernels, nd, target_layer, trace_start_ts, mod_map
+                    kernels, nd, target_layer, trace_start_ts, mod_map, shape_map
                 )
                 sections["prefill"] = groups
 
@@ -1578,25 +1750,41 @@ def analyze_trace(
                 events, decode_iter, cpu_pid, gpu_pid, corr_to_gpu=corr_to_gpu
             )
             if kernels:
-                if is_cg and eager_events is not None:
-                    eager_res = _run_eager_forward_analysis(
-                        eager_events,
-                        "decode",
-                        eager_cpu_pid,
-                        None,
-                        corr_to_gpu,
-                        trace_start_ts,
+                shape_map: Dict[int, str] = {}
+                if is_cg:
+                    mod_map, shape_map = build_module_map_for_graph(events, kernels)
+                    print(
+                        f"  Graph-native module-mapped: {len(mod_map)}/{len(kernels)} kernels, "
+                        f"{len(shape_map)} with shapes"
                     )
-                    if eager_res is not None:
-                        mod_map, ngi, nls, np_, use_end = align_eager_to_graph(
-                            kernels, eager_res, "decode"
+                    kernel_names = [k.get("name", "") for k in kernels]
+                    loop_start, period, num_repeats = find_layer_boundaries(
+                        kernel_names, min_num_repeats=4
+                    )
+                    expected_layers = num_repeats if num_repeats > 1 else 48
+                    nd_scan = _scan_for_norm_boundaries(
+                        kernels, loop_start, period, expected_layers
+                    )
+                    if nd_scan is not None:
+                        nd = nd_scan
+                        print(
+                            f"  Graph-native norm boundaries: {len(nd.norm_gpu_indices)} norms"
                         )
-                        nd = NormData(ngi, np_, nls, use_end)
                     else:
-                        mod_map = {}
                         nd = _gpu_signature_fallback(kernels)
-                elif not is_cg and cpu_fwd is not None:
-                    mod_map = build_module_map(events, cpu_fwd, kernels)
+                    if not mod_map and eager_events is not None:
+                        eager_res = _run_eager_forward_analysis(
+                            eager_events,
+                            "decode",
+                            eager_cpu_pid,
+                            None,
+                            corr_to_gpu,
+                            trace_start_ts,
+                        )
+                        if eager_res is not None:
+                            mod_map = align_eager_to_graph(kernels, eager_res, "decode")
+                elif cpu_fwd is not None:
+                    mod_map, shape_map = build_module_map(events, cpu_fwd, kernels)
                     print(f"  Module-mapped: {len(mod_map)}/{len(kernels)} kernels")
                     nd = find_layer_boundaries_v2(
                         events, cpu_fwd, kernels, gpu_pid, corr_to_gpu
@@ -1606,7 +1794,7 @@ def analyze_trace(
                     nd = _gpu_signature_fallback(kernels)
 
                 groups = slice_target_layer(
-                    kernels, nd, target_layer, trace_start_ts, mod_map
+                    kernels, nd, target_layer, trace_start_ts, mod_map, shape_map
                 )
                 sections["decode"] = groups
 
@@ -1639,9 +1827,21 @@ def analyze_trace(
         print("No data to write.")
 
 
+_CACHE_VERSION = "v3"
+
+
 def _load_with_cache(filepath: str) -> Tuple[List[Dict], float]:
     """Load trace with pickle cache for fast repeated loads."""
-    cache_path = Path(filepath).with_suffix("").with_suffix(".cache.pkl")
+    p = Path(filepath)
+    stem = p.with_suffix("") if p.suffix == ".gz" else p
+    cache_path = stem.with_suffix(f".cache.{_CACHE_VERSION}.pkl")
+
+    for old_suffix in [".cache.pkl", ".cache.v2.pkl"]:
+        old_cache = stem.with_suffix(old_suffix)
+        if old_cache.exists():
+            old_cache.unlink()
+            print(f"  [cache] Removed stale cache: {old_cache}")
+
     if cache_path.exists():
         print(f"  [cache] Loading from {cache_path}")
         with cache_path.open("rb") as f:
