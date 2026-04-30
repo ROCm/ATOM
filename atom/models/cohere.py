@@ -11,7 +11,6 @@
 
 """Inference-only Cohere model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 import torch
@@ -23,6 +22,7 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
+from atom.model_ops.layernorm import layernorm2d_fwd_, layernorm2d_fwd_with_add_
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -39,6 +39,33 @@ from atom.models.utils import (
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import CohereConfig
+
+
+class CohereLayerNorm(nn.Module):
+    """LayerNorm using AITER kernels with a zero bias that is not a parameter.
+
+    Cohere2 checkpoints do not store input_layernorm.bias (it is always zero).
+    Using a non-parameter buffer avoids the vLLM weight-completeness check
+    while still letting the AITER fused kernel accept a bias argument.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.register_buffer("bias", torch.zeros(dim))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return layernorm2d_fwd_(x, self.weight, self.bias, self.eps, self.dim)
+        return layernorm2d_fwd_with_add_(
+            x, self.weight, residual, self.bias, self.eps, self.dim
+        )
 
 
 class CohereMLP(nn.Module):
@@ -223,7 +250,7 @@ class CohereDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
         # Cohere uses a single LayerNorm (with bias) shared by both attn and MLP
-        self.input_layernorm = LayerNorm(
+        self.input_layernorm = CohereLayerNorm(
             config.hidden_size,
             eps=config.layer_norm_eps,
         )
@@ -292,7 +319,7 @@ class CohereModel(nn.Module):
 
         if get_pp_group().is_last_rank:
             # Cohere uses LayerNorm for the final norm as well
-            self.norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            self.norm = CohereLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -397,16 +424,3 @@ class CohereForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from atom.model_loader.loader import load_model_in_plugin_mode
-
-        loaded = load_model_in_plugin_mode(
-            model=self, config=self.model.atom_config, prefix="model."
-        )
-        # Cohere2 checkpoints omit input_layernorm.bias and norm.bias — they are
-        # zero-initialized by LayerNorm.__init__ and correct as-is.  Mark them
-        # as loaded so vLLM's completeness check does not raise.
-        for name, _ in self.named_parameters():
-            if name.endswith(".bias") and ("layernorm" in name or name == "model.norm.bias"):
-                loaded.add("model." + name)
-        return loaded
