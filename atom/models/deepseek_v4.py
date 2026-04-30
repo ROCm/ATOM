@@ -1658,9 +1658,14 @@ class MoE(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.gate",
             )
-            self.gate.e_score_correction_bias = atom_parameter(
-                torch.empty(self.n_routed_experts, dtype=torch.float32)
-            )
+            # V4 hash-routed layers (layer_id < n_hash_layers) use tid2eid lookup,
+            # not bias-corrected gate-logit routing — checkpoint has no
+            # `gate.bias` for those layers. Only allocate the bias for
+            # sqrtsoftplus layers to avoid 3 spurious unloaded-param warnings.
+            if not self.is_hash_layer:
+                self.gate.e_score_correction_bias = atom_parameter(
+                    torch.empty(self.n_routed_experts, dtype=torch.float32)
+                )
             if self.is_hash_layer:
                 # tid2eid: per-token-id top-k expert lookup table (V4 first 3
                 # layers use this in lieu of gate-logit routing).
@@ -1690,7 +1695,9 @@ class MoE(nn.Module):
                 use_grouped_topk=False,
                 prefix=f"{prefix}.experts",
                 scoring_func=args.score_func,  # "sqrtsoftplus"
-                e_score_correction_bias=self.gate.e_score_correction_bias,
+                e_score_correction_bias=getattr(
+                    self.gate, "e_score_correction_bias", None
+                ),
                 config=moe_cfg,
             )
             self.experts.swiglu_limit = args.swiglu_limit
@@ -1845,7 +1852,9 @@ class MoE(nn.Module):
                     self._hash_topk if self.is_hash_layer else None
                 ),
                 scoring_func=self.experts.scoring_func,
-                e_score_correction_bias=self.gate.e_score_correction_bias,
+                e_score_correction_bias=getattr(
+                    self.gate, "e_score_correction_bias", None
+                ),
                 routed_scaling_factor=self.routed_scaling_factor,
             )
             if self.is_hash_layer:

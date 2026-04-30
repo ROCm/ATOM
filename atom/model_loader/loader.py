@@ -301,12 +301,18 @@ def load_model(
     detect_fused_expert_fn = getattr(model, "detect_fused_expert_format", None)
     get_fused_expert_mapping_fn = getattr(model, "get_fused_expert_mapping", None)
 
+    # Track ckpt names that were silently dropped at `get_parameter`
+    # AttributeError sites — these indicate weights_mapping bugs where the
+    # rewritten name doesn't correspond to any model param. (orig, mapped) pairs.
+    dropped_ckpt_keys: list[tuple[str, str]] = []
+
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         disable_mmap = envs.ATOM_DISABLE_MMAP
         for name, weight_tensor in safetensors_weights_iterator(
             model_name_or_path, disable_mmap=disable_mmap
         ):
+            _orig_ckpt_name = name  # preserve for ckpt-side coverage report
             if weights_mapper is not None:
                 mapped_name = weights_mapper._map_name(name)
                 if mapped_name is None:
@@ -368,6 +374,9 @@ def load_model(
                                 try:
                                     param = model.get_parameter(param_name)
                                 except AttributeError:
+                                    dropped_ckpt_keys.append(
+                                        (_orig_ckpt_name, param_name)
+                                    )
                                     continue
                                 weight_loader = getattr(param, "weight_loader")
                                 futures.append(
@@ -385,6 +394,7 @@ def load_model(
                             try:
                                 param = model.get_parameter(param_name)
                             except AttributeError:
+                                dropped_ckpt_keys.append((_orig_ckpt_name, param_name))
                                 break
                             weight_loader = getattr(param, "weight_loader")
                             # weight_loader(param, weight_tensor, shard_id)
@@ -483,6 +493,7 @@ def load_model(
                             try:
                                 param = model.get_parameter(fused_name)
                             except AttributeError:
+                                dropped_ckpt_keys.append((_orig_ckpt_name, fused_name))
                                 continue
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
@@ -501,6 +512,7 @@ def load_model(
                         try:
                             param = model.get_parameter(name)
                         except AttributeError:
+                            dropped_ckpt_keys.append((_orig_ckpt_name, name))
                             continue
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
@@ -514,6 +526,7 @@ def load_model(
                     try:
                         param = model.get_parameter(name)
                     except AttributeError:
+                        dropped_ckpt_keys.append((_orig_ckpt_name, name))
                         continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -562,6 +575,40 @@ def load_model(
                 "translation. First %d unloaded names: %s",
                 len(truly_unloaded),
                 len(expected_param_names),
+                len(sample),
+                sample,
+            )
+
+    # Reverse direction: ckpt names that were silently dropped by
+    # `get_parameter` AttributeError. These are the actionable bug class —
+    # the mapping rewrote the ckpt name to something the model has no slot for,
+    # so legitimate ckpt data was thrown away. Filter known-benign families
+    # (output_scale, kv_scale, etc.) so the warning is signal, not noise.
+    if dropped_ckpt_keys:
+        benign_substrings = (
+            "output_scale",
+            "kv_scale",
+            "inv_freq",
+            "weight_scale_2",
+        )
+        actionable_drops = [
+            (orig, mapped)
+            for orig, mapped in dropped_ckpt_keys
+            if not any(s in orig or s in mapped for s in benign_substrings)
+        ]
+        try:
+            _is_rank0 = get_tp_group().rank == 0
+        except Exception:
+            _is_rank0 = True
+        if actionable_drops and _is_rank0:
+            sample = actionable_drops[:20]
+            logger.warning(
+                "load_model: %d checkpoint tensors were silently dropped "
+                "because the rewritten name has no matching model parameter. "
+                "This is a `weights_mapping` / `WeightsMapper` bug — real "
+                "ckpt data is being thrown away. Fix the rewrite rule. "
+                "First %d (orig_ckpt_name → rewritten_name): %s",
+                len(actionable_drops),
                 len(sample),
                 sample,
             )
