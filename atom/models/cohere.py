@@ -176,8 +176,12 @@ class CohereAttention(nn.Module):
             is_neox_style=False,  # Cohere uses interleaved RoPE (repeat_interleave), not neox
         )
 
-        # Sliding window support (some Cohere variants)
-        sliding_window = None
+        # Sliding window support (some Cohere variants).
+        # Use -1 (ATOM's "no sliding window" sentinel) as the explicit default
+        # so that vLLM's Attention layer does not inherit the global
+        # cache_config.sliding_window (from config.sliding_window = 4096)
+        # for layers that are NOT sliding_attention layers.
+        sliding_window = -1
         if layer_types := getattr(config, "layer_types", None):
             if layer_types[layer_idx] == "sliding_attention":
                 sliding_window = config.sliding_window
