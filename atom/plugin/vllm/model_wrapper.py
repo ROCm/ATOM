@@ -118,6 +118,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if exclude_mapping and self.atom_config.quant_config is not None:
             self.atom_config.quant_config.apply_exclude_name_mapping(exclude_mapping)
 
+        default_excludes = getattr(model_cls, "quant_default_exclude_layers", [])
+        if default_excludes and self.atom_config.quant_config is not None:
+            self.atom_config.quant_config.apply_default_exclude_layers(default_excludes)
+
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)
 
