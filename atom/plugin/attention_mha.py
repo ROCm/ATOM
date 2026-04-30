@@ -100,7 +100,6 @@ class PagedAttentionImplPluginModeMethods:
         attn_metadata = attention_metadata
 
         use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
-        self.use_triton_attn = use_triton_attn
 
         if (
             self.rotary_emb is not None
@@ -133,7 +132,7 @@ class PagedAttentionImplPluginModeMethods:
             q, k, v = qkv.split(
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
-        elif use_triton_attn and self.rotary_emb is not None:
+        elif use_triton_attn and self.rotary_emb is not None and qkv is not None:
 
             k_scale = v_scale = self.per_tensor_scale
             self.per_token_quant = False
