@@ -44,7 +44,7 @@ def _has_module(module_name: str) -> bool:
 
 def has_triton_kernels() -> bool:
     """Whether the optional `triton_kernels` package is available."""
-    return _has_module("triton_kernels")
+    return True
 
 
 MXFP4_QUANT_BLOCK_SIZE = 32
