@@ -27,6 +27,7 @@ from vllm.forward_context import (
 
 import atom  # noqa: F401
 from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.plugin.prepare import _set_framework_backbone
 
 import logging
 
@@ -76,6 +77,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        _set_framework_backbone("vllm")
 
         self.config = vllm_config.model_config.hf_config
         self.text_config = self.config.get_text_config()

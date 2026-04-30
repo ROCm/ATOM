@@ -372,6 +372,114 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             bs, max_seqlen_q, only_update, num_reject_tokens
         )
 
+    def compute_block_bytes(self) -> int:
+        """MLA per-block bytes: single 576-dim packed tensor per layer
+        (k_c + k_pe; V is absorbed into latent compression — no separate
+        V cache or kv_scale).
+
+        DeepSeek-V3.2 sparse variant adds an indexer cache contribution
+        (`hf_config.num_hidden_layers` rows, aligned-to-16 fp8).
+        """
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        total_num_layers = runner._get_total_num_layers()
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
+        block_bytes = total_num_layers * runner.block_size * 576 * kv_dtype_size
+        if runner.is_deepseek_v32:
+            index_dim = hf_config.index_head_dim + 4
+            aligned_index_dim = ((index_dim + 15) // 16) * 16
+            block_bytes += (
+                hf_config.num_hidden_layers
+                * runner.block_size
+                * aligned_index_dim
+                * dtypes.fp8.itemsize
+            )
+        return block_bytes
+
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads: int, num_draft_layers: int
+    ) -> dict:
+        """MLA: single 576-dim paged tensor per layer (k_c + k_pe packed,
+        no separate V cache — MLA absorbs V into the latent compression).
+
+        DeepSeek-V3.2 sparse variant additionally allocates an `index_cache`
+        for the indexer module; the aligned dimension is also returned so
+        build_kv_cache_tensor can reslice without recomputing it.
+        """
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        total_num_layers = hf_config.num_hidden_layers + num_draft_layers
+        out: dict = {
+            "kv_cache": torch.zeros(
+                total_num_layers,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                576,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            ),
+        }
+        if runner.is_deepseek_v32:
+            # Align last dimension to 16 bytes for fp8 (1 byte per element)
+            # to avoid unaligned memory access in torch inductor.
+            index_dim = hf_config.index_head_dim + 4
+            aligned = ((index_dim + 15) // 16) * 16
+            out["aligned_index_dim"] = aligned
+            out["index_cache"] = torch.zeros(
+                hf_config.num_hidden_layers,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                aligned,
+                dtype=dtypes.fp8,
+                device="cuda",
+            )
+        return out
+
+    def build_kv_cache_tensor(self, layer_id: int, module):
+        """Bind one MLA attention module to its KV slice.
+
+        Handles standard MLA (single 576-dim KV cache per layer) and the
+        DeepSeek-V3.2 sparse variant (additional indexer cache hooked via
+        `module.indexer.k_cache.kv_cache[0]`). Returns the KVCacheTensor or
+        None if the module is not an MLA attention this builder owns.
+        Side effects: sets module `kv_cache`, `max_model_len`, and (V3.2)
+        the indexer's k_cache slot.
+        """
+        from atom.config import KVCacheTensor
+
+        if not (
+            hasattr(module, "base_attention")
+            and hasattr(module, "use_mla")
+            and module.use_mla
+        ):
+            return None
+
+        runner = self.model_runner
+        kv_cache = runner.kv_cache[layer_id].view(
+            runner.num_physical_kvcache_blocks * runner.physical_block_size,
+            1,
+            576,
+        )
+        module.max_model_len = runner.config.max_model_len
+        if runner.is_deepseek_v32 and module.indexer is not None:
+            # Use aligned dimension to avoid memory copy in torch inductor
+            module.indexer.k_cache.kv_cache[0] = runner.index_cache[layer_id].view(
+                runner.num_physical_kvcache_blocks * runner.physical_block_size,
+                1,
+                runner.aligned_index_dim,
+            )
+        module.kv_cache = kv_cache
+        return KVCacheTensor(
+            layer_num=layer_id,
+            k_cache=kv_cache,
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+        )
+
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         bs = batch.total_seqs_num_prefill
