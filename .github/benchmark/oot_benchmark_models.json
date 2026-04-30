@@ -43,8 +43,8 @@
   {
     "display": "Kimi-K2-Thinking-MXFP4 TP4",
     "dashboard_model": "Kimi-K2-Thinking-MXFP4-tp4",
-    "source_path": "amd/Kimi-K2-Thinking-MXFP4",
-    "path": "amd/Kimi-K2-Thinking-MXFP4",
+    "source_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
+    "path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
     "prefix": "kimi-k2-thinking-mxfp4-tp4",
     "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
@@ -54,8 +54,8 @@
   {
     "display": "Kimi-K2-Thinking-MXFP4 TP8",
     "dashboard_model": "Kimi-K2-Thinking-MXFP4-tp8",
-    "source_path": "amd/Kimi-K2-Thinking-MXFP4",
-    "path": "amd/Kimi-K2-Thinking-MXFP4",
+    "source_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
+    "path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
     "prefix": "kimi-k2-thinking-mxfp4-tp8",
     "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
     "bench_args": "",
