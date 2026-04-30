@@ -124,9 +124,9 @@ fi
 CUDAGRAPH_SIZES=$(seq -s, "${CUDA_GRAPH_BS_START}" "${CUDA_GRAPH_BS_END}")
 
 if [[ -n "${ENFORCE_EAGER}" ]]; then
-    COMPILE_ARGS="--enforce-eager"
+    COMPILE_ARGS="--no-async-scheduling --enforce-eager"
 else
-    COMPILE_ARGS="--async-scheduling --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": [${CUDAGRAPH_SIZES}]}'"
+    COMPILE_ARGS="--no-async-scheduling --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": [${CUDAGRAPH_SIZES}]}'"
 fi
 
 cat <<INFO
@@ -157,9 +157,6 @@ set -euo pipefail
 echo "[prefill] IP=${PREFILL_IP} TP=${PREFILL_TP} port=${PREFILL_PORT} bootstrap=${BOOTSTRAP_PORT}"
 
 mkdir -p /workspace/logs
-cat > /workspace/mooncake_prefill.json <<MC
-{"prefill_url": "${PREFILL_IP}:${PREFILL_PORT}", "protocol": "rdma"}
-MC
 
 export HIP_VISIBLE_DEVICES=${PREFILL_GPU_IDS}
 export HF_HUB_CACHE=/mnt/hf_hub_cache
@@ -168,8 +165,7 @@ export VLLM_RPC_TIMEOUT=1800000
 export VLLM_CACHE_ROOT=/root/.cache/vllm
 export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
 export VLLM_MOONCAKE_BOOTSTRAP_PORT=${BOOTSTRAP_PORT}
-export MOONCAKE_CONFIG_PATH=/workspace/mooncake_prefill.json
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 rm -rf /root/.cache
 
@@ -203,7 +199,7 @@ export SAFETENSORS_FAST_GPU=1
 export VLLM_RPC_TIMEOUT=1800000
 export VLLM_CACHE_ROOT=/root/.cache/vllm
 export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
-export LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 rm -rf /root/.cache
 
@@ -228,6 +224,8 @@ set -euo pipefail
 echo "[router] prefill=http://${PREFILL_IP}:${PREFILL_PORT} decode=http://${DECODE_IP}:${DECODE_PORT} router=0.0.0.0:${ROUTER_PORT}"
 
 mkdir -p /workspace/logs
+
+export HF_HUB_CACHE=/mnt/hf_hub_cache
 
 ${MESH_BIN} launch \
     --host 0.0.0.0 --port "${ROUTER_PORT}" \
