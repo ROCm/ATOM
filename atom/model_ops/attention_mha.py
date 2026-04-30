@@ -80,12 +80,16 @@ class PagedAttentionImpl(nn.Module):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+<<<<<<< HEAD
         # Pre-allocated fp8 dequant scale for the pa_decode_bf16_asm path. Built
         # here (outside CUDAGraph capture) and reused so the kernel wrapper never
         # allocates a tensor mid-capture.
         self._pa_decode_bf16_asm_scale = torch.full(
             (1,), self.kv_scale_float, dtype=torch.float32, device=self.device
         )
+=======
+        self.per_tensor_scale = self.kv_scale  # set here; fp8 path overrides later
+>>>>>>> 50af2bba (Fix: initialize per_tensor_scale in MHAAttention.__init__ for non-fp8 models)
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = sliding_window if sliding_window is not None else -1
