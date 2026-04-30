@@ -323,7 +323,7 @@ ARG MAX_JOBS
 
 RUN pip install --upgrade setuptools_scm
 RUN echo "========== [Parallel] Building Aiter ==========" && \
-    git clone --depth 1 $AITER_REPO /app/aiter-test && \
+    git clone $AITER_REPO /app/aiter-test && \
     cd /app/aiter-test && \
     pip install -r requirements.txt && \
     git checkout $AITER_COMMIT && \

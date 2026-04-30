@@ -65,8 +65,8 @@
   {
     "display": "Kimi-K2.5-MXFP4 TP4",
     "dashboard_model": "Kimi-K2.5-MXFP4-tp4",
-    "source_path": "amd/Kimi-K2.5-MXFP4",
-    "path": "amd/Kimi-K2.5-MXFP4",
+    "source_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
+    "path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
     "prefix": "kimi-k25-mxfp4-tp4",
     "extra_args": "--trust-remote-code --tensor-parallel-size 4",
     "bench_args": "",
@@ -76,8 +76,8 @@
   {
     "display": "Kimi-K2.5-MXFP4 TP8",
     "dashboard_model": "Kimi-K2.5-MXFP4",
-    "source_path": "amd/Kimi-K2.5-MXFP4",
-    "path": "amd/Kimi-K2.5-MXFP4",
+    "source_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
+    "path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
     "prefix": "kimi-k25-mxfp4-tp8",
     "extra_args": "--trust-remote-code --tensor-parallel-size 8",
     "bench_args": "",
