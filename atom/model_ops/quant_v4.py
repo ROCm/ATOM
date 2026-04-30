@@ -138,8 +138,14 @@ def act_quant_inplace(
     amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
     scale = amax * fp8_max_inv
     if scale_fmt == "ue8m0":
-        # Match reference's `fast_round_scale`: ceil(log2(amax * fp8_max_inv))
-        scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
+        # Match reference (ref_full_generate / aiter): round-to-even via
+        # f32_to_e8m0 + e8m0_to_f32. Earlier `ceil(log2(scale))` matched the
+        # TileLang reference but differed from the aiter-backed ref_full_generate
+        # path by up to 1 binade — see notes/17_root_cause_input_quant.md.
+        from aiter.utility import fp4_utils as _fp4u
+
+        e8m0 = _fp4u.f32_to_e8m0(scale.contiguous())
+        scale = _fp4u.e8m0_to_f32(e8m0)
 
     # Quantize -> FP8 -> dequantize
     quant_fp8 = (

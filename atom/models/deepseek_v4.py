@@ -27,6 +27,7 @@ from torch import nn
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from atom.config import Config
 from atom.model_ops.embed_head import VocabParallelEmbedding
+from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -260,6 +261,9 @@ class DeepseekV4Args:
             original_seq_len=rope_scaling.get("original_max_position_embeddings", 0),
             beta_fast=rope_scaling.get("beta_fast", 32),
             beta_slow=rope_scaling.get("beta_slow", 1),
+            # Default to "ue8m0" matching reference ModelArgs (inference/model.py:40);
+            # HF config.json does not carry this field, only inference/config.json does.
+            scale_fmt=g("scale_fmt", "ue8m0"),
         )
 
 
@@ -357,28 +361,6 @@ def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
 # ---------------------------------------------------------------------------
 # Small utilities — port of inference/model.py:183-276
 # ---------------------------------------------------------------------------
-
-
-class _RMSNorm(nn.Module):
-    """Reference RMSNorm: weight stored in fp32, computation in fp32, output in input dtype.
-
-    Port of inference/model.py:183-196. Distinct from atom.model_ops.layernorm.RMSNorm
-    which is wired for TP/quantization; PR1 keeps a self-contained class so dummy
-    state_dicts load directly. PR3 may swap to ATOM's RMSNorm with dtype shim.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        var = x.square().mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return (self.weight * x).to(dtype)
 
 
 @lru_cache(2)
@@ -714,7 +696,7 @@ class Compressor(nn.Module):
         self.wgate = nn.Linear(
             self.dim, coff * self.head_dim, bias=False, dtype=torch.float32
         )
-        self.norm = _RMSNorm(self.head_dim, args.norm_eps)
+        self.norm = RMSNorm(self.head_dim, args.norm_eps)
 
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: Optional[torch.Tensor] = None
@@ -967,12 +949,6 @@ class Indexer(nn.Module):
         self.prefix = prefix  # Used by V4 attention builder for layer-id parsing.
         self.dim = args.dim
         self.n_heads = args.index_n_heads
-        # TP shards Q heads (wq_b is ColumnParallelLinear); per-rank head count.
-        tp_size = get_tensor_model_parallel_world_size()
-        assert (
-            args.index_n_heads % tp_size == 0
-        ), f"index_n_heads={args.index_n_heads} not divisible by tp={tp_size}"
-        self.n_local_heads = args.index_n_heads // tp_size
         self.head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
@@ -980,17 +956,23 @@ class Indexer(nn.Module):
         self.compress_ratio = compress_ratio
 
         qc = args.quant_config
-        # Indexer Q heads sharded across TP ranks.
-        self.wq_b = ColumnParallelLinear(
+        # Indexer Q is replicated across TP ranks (matches sglang/upstream):
+        # the index scoring path needs all 64 heads at every rank to compute
+        # the per-token compressed-position topk locally without cross-rank
+        # all_reduce. Sharding wq_b would force an extra all_reduce on
+        # `index_score` after the per-head sum.
+        self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
             bias=False,
             quant_config=qc,
             prefix=f"{prefix}.wq_b",
         )
-        # weights_proj: BF16 in reference (dtype=bf16); V4QuantConfig already
-        # forces no_spec for ".indexer.weights_proj" so quant_config is fine.
-        self.weights_proj = ColumnParallelLinear(
+        # weights_proj: BF16 in reference. Replicated to match sglang/upstream:
+        # the layer is tiny (dim × n_heads = 7168 × 64 ≈ 896KB BF16) and column-
+        # parallel sharding produces a degenerate N=8 GEMM with no aiter tuned
+        # config; full replication keeps N=64.
+        self.weights_proj = ReplicatedLinear(
             self.dim,
             self.n_heads,
             bias=False,
@@ -1064,7 +1046,7 @@ class Indexer(nn.Module):
             self.compressor.rotary_emb = self.rotary_emb
 
         # ----- Indexer Q (2D Linear, then add B=1 dim for RoPE / einsum) -----
-        q = self.wq_b(qr).view(seqlen, self.n_local_heads, self.head_dim)
+        q = self.wq_b(qr).view(seqlen, self.n_heads, self.head_dim)
         q = q.unsqueeze(0)  # [1, S, H, D]
         self.rotary_emb(positions, q[..., -rd:])
         q = rotate_activation(q)
@@ -1183,7 +1165,7 @@ class DeepseekV4Attention(nn.Module):
             quant_config=qc,
             prefix=f"{p}.wq_a",
         )
-        self.q_norm = _RMSNorm(self.q_lora_rank, self.eps)
+        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1198,7 +1180,7 @@ class DeepseekV4Attention(nn.Module):
             quant_config=qc,
             prefix=f"{p}.wkv",
         )
-        self.kv_norm = _RMSNorm(self.head_dim, self.eps)
+        self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a: grouped LoRA — V4QuantConfig forces this BF16 even though disk is FP8.
         # The grouped einsum (`bsgd,grd->bsgr`) needs BF16 weights; aiter has no FP8 einsum.
         self.wo_a = ColumnParallelLinear(
@@ -1358,17 +1340,27 @@ class DeepseekV4Attention(nn.Module):
                 self.indexer.rotary_emb = self.rotary_emb
 
         # ----- Batched ops on full flat tensors -----
+        # EXPERIMENT: round-trip x and qr to ue8m0-aligned FP8 to mimic ref's
+        # act_quant(scale_fmt="ue8m0") behavior in Linear input quantization.
+        if os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1":
+            from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
+
+            x = x.clone()
+            _v4_aqi(x, 128, "ue8m0")
         qr = self.q_norm(self.wq_a(x))  # [S_total, q_lora_rank], shared with Indexer
+        if os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1":
+            from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
+
+            qr = qr.clone()
+            _v4_aqi(qr, 128, "ue8m0")
         q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
         q = q.unsqueeze(0)  # [1, S_total, H, D]
 
         kv = self.wkv(x)  # [S_total, head_dim]
         kv = self.kv_norm(kv).unsqueeze(0)  # [1, S_total, head_dim]
-
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
-
         # ----- Per-seq dispatch -----
         block_tables, slot_indices, cu_seqlens_q, num_seqs = _v4_get_seq_metadata()
         if num_seqs == 0 or block_tables is None or _v4_is_dummy_run():
@@ -1496,7 +1488,6 @@ class DeepseekV4Attention(nn.Module):
         # from the rotary_emb's cos/sin cache and reuse the manual multiply.
         freqs_slice = self.rotary_emb.freqs_for_positions(positions)
         _apply_rotary_emb(o[..., -rd:], freqs_slice, inverse=True)
-
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
         o = o.squeeze(0).view(seqlen_total, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -1789,6 +1780,15 @@ class MoE(nn.Module):
             top_idx = idx[:, 1]
             sub_x = x[tok_idx].float()
             sub_w = topk_weights[tok_idx, top_idx].unsqueeze(-1)
+            # V4_USE_REF_QUANT: round-trip sub_x through FP8 ue8m0 to mirror
+            # ref Expert.forward (which quantizes input to FP8 with ue8m0
+            # scale via act_quant before fp4_gemm). See notes/17.
+            if os.environ.get("V4_USE_REF_QUANT", "0") == "1":
+                from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
+
+                sub_x = sub_x.to(torch.bfloat16)
+                _v4_aqi(sub_x, 128, "ue8m0")
+                sub_x = sub_x.float()
 
             # Dequant w1/w3 (gate/up) from FP4
             w13_e = mxfp4_to_f32(w13[e_id])  # [2*inter_tp, H]
@@ -1817,7 +1817,12 @@ class MoE(nn.Module):
             )
             w2_f = w2_f.reshape(w2_e.shape[0], -1)
 
-            out = act.to(torch.bfloat16).float() @ w2_f.T  # [N, H]
+            act_bf = act.to(torch.bfloat16)
+            if os.environ.get("V4_USE_REF_QUANT", "0") == "1":
+                from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
+
+                _v4_aqi(act_bf, 128, "ue8m0")
+            out = act_bf.float() @ w2_f.T  # [N, H]
             y[tok_idx] += out
 
         return y
@@ -1865,7 +1870,8 @@ class MoE(nn.Module):
                     continue
                 idx, top = torch.where(indices == i)
                 y[idx] = y[idx] + self.experts[i](x[idx], weights[idx, top, None])
-        y = y + self.shared_experts(x)
+        shared_out = self.shared_experts(x)
+        y = y + shared_out
         if self.use_fused and self.tp_size > 1:
             from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 
@@ -1892,8 +1898,8 @@ class Block(nn.Module):
         self.norm_eps = args.norm_eps
         self.attn = DeepseekV4Attention(layer_id, args, prefix=f"{prefix}.attn")
         self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn")
-        self.attn_norm = _RMSNorm(args.dim, self.norm_eps)
-        self.ffn_norm = _RMSNorm(args.dim, self.norm_eps)
+        self.attn_norm = RMSNorm(args.dim, self.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
         self.hc_sinkhorn_iters = args.hc_sinkhorn_iters
         self.hc_eps = args.hc_eps
@@ -1992,19 +1998,31 @@ class Block(nn.Module):
     ) -> torch.Tensor:
         """Expand [..., D] sub-layer output back to [..., hc, D] residual.
 
-        Prefers fused aiter `mhc_post`; falls back to torch.
+        Defaults to the torch reference; aiter `mhc_post` is opt-in via
+        `V4_AITER_HC_POST=1`. The aiter kernel produces small numerical drift
+        per call that compounds over 30+ autoregressive decode steps and
+        collapses long generations into degenerate same-word repetition; the
+        torch path is bit-stable across the full decode trajectory. See
+        `/app/logs_claude/deepseek_v4/notes/12_aiter_mhc_post_root_cause.md`
+        for the diagnosis. Re-enable aiter once the kernel is fixed upstream.
         """
-        try:
-            import aiter as _aiter
+        import os as _os
 
-            mhc_post = getattr(_aiter, "mhc_post", None)
-        except ImportError:
-            mhc_post = None
-        # Same divisibility constraint as mhc_pre.
-        dim = residual.shape[-1]
-        aiter_ok = (
-            mhc_post is not None and x.is_cuda and (dim % 512 == 0 or dim % 256 == 0)
-        )
+        if _os.environ.get("V4_AITER_HC_POST", "") == "1":
+            try:
+                import aiter as _aiter
+
+                mhc_post = getattr(_aiter, "mhc_post", None)
+            except ImportError:
+                mhc_post = None
+            dim = residual.shape[-1]
+            aiter_ok = (
+                mhc_post is not None
+                and x.is_cuda
+                and (dim % 512 == 0 or dim % 256 == 0)
+            )
+        else:
+            aiter_ok = False
         if aiter_ok:
             lead = residual.shape[:-2]
             x_ = x.reshape(-1, x.shape[-1])
@@ -2030,6 +2048,7 @@ class Block(nn.Module):
         positions: torch.Tensor,
         input_ids: Optional[torch.Tensor],
     ) -> torch.Tensor:
+
         # ----- Attention sub-layer with mHC mixing -----
         residual = x
         x, post, comb = self.hc_pre(
@@ -2038,7 +2057,6 @@ class Block(nn.Module):
         x = self.attn_norm(x)
         x = self.attn(x, positions)
         x = self.hc_post(x, residual, post, comb)
-
         # ----- FFN sub-layer with mHC mixing -----
         residual = x
         x, post, comb = self.hc_pre(
@@ -2171,9 +2189,9 @@ class MTPBlock(Block):
                 quant_config=qc,
                 prefix=f"{prefix}.h_proj",
             )
-        self.enorm = _RMSNorm(args.dim, args.norm_eps)
-        self.hnorm = _RMSNorm(args.dim, args.norm_eps)
-        self.norm = _RMSNorm(args.dim, args.norm_eps)
+        self.enorm = RMSNorm(args.dim, args.norm_eps)
+        self.hnorm = RMSNorm(args.dim, args.norm_eps)
+        self.norm = RMSNorm(args.dim, args.norm_eps)
         # Per-MTP hc_head params (distinct from Block's hc_attn/hc_ffn params).
         hc_mult = args.hc_mult
         hc_dim = hc_mult * args.dim
@@ -2246,7 +2264,7 @@ class DeepseekV4Model(nn.Module):
                 for layer_id in range(args.n_layers)
             ]
         )
-        self.norm = _RMSNorm(args.dim, self.norm_eps)
+        self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = ParallelHead(args.vocab_size, args.dim, self.norm_eps, self.hc_eps)
 
         # MTP blocks: constructed and linked, but only invoked externally (PR5).
@@ -2294,7 +2312,6 @@ class DeepseekV4Model(nn.Module):
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-
         if positions is None:
             positions = torch.arange(
                 input_ids.numel(), device=input_ids.device, dtype=torch.long

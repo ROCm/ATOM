@@ -2655,6 +2655,12 @@ class FusedMoE(torch.nn.Module):
                     topk_weights = topk_weights / topk_weights.sum(
                         dim=-1, keepdim=True
                     ).clamp_min(1e-20)
+                # Match reference Gate.forward (deepseek_v4 inference/model.py:583):
+                # `weights *= route_scale` is applied for every non-softmax routing
+                # path. The hash routing path (`_hash_topk`) already does this
+                # internally; do it here for the sqrtsoftplus topk path so callers
+                # don't need to re-scale.
+                topk_weights = topk_weights * routed_scaling_factor
 
                 topk_ids = topk_ids.to(torch.int32)
             else:
