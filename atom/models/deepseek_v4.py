@@ -27,7 +27,8 @@ from torch import nn
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from atom.config import Config
 from atom.model_ops.embed_head import VocabParallelEmbedding
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
+from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -66,6 +67,18 @@ from atom.utils.forward_context import get_forward_context
 # this is lcm(4, 128) = 128 original tokens. Kept as a constant so Compressor
 # code does not need to import the builder.
 _V4_BLOCK_SIZE: int = 128
+
+_V4_RMSNORM_BACKEND = os.environ.get("ATOM_V4_RMSNORM_BACKEND", "triton")
+
+
+_V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
+
+
+def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
+    if _V4_USE_TRITON_RMSNORM:
+        return rmsnorm_nw(x, eps)
+    ones = torch.ones(dim, dtype=x.dtype, device=x.device)
+    return rmsnorm2d_fwd_(x, ones, eps, dim)
 
 
 def _v4_get_seq_metadata():
@@ -1297,7 +1310,7 @@ class DeepseekV4Attention(nn.Module):
             qr = qr.clone()
             _v4_aqi(qr, 128, "ue8m0")
         q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        q = _rmsnorm_nw(q, self.eps, self.head_dim)
         q = q.unsqueeze(0)  # [1, S_total, H, D]
 
         kv = self.wkv(x)  # [S_total, head_dim]
@@ -1995,9 +2008,10 @@ class Block(nn.Module):
 
         # Torch fallback (PR1 toy mode / no-aiter): mirrors the reference math.
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(-2).float()  # [..., hc*D]
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt  # [..., mix_hc]
+        x = x.flatten(-2)  # [..., hc*D]
+        hc_dim = x.shape[-1]
+        x_normed = _rmsnorm_nw(x, self.norm_eps, hc_dim)
+        mixes = F.linear(x_normed.float(), hc_fn)  # [..., mix_hc]
         pre, post, comb = hc_split_sinkhorn(
             mixes,
             hc_scale,
@@ -2152,9 +2166,10 @@ class ParallelHead(nn.Module):
         Shape-agnostic in leading dims (mirrors Block.hc_pre / hc_post).
         """
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(-2).float()  # [..., hc*D]
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
+        x = x.flatten(-2)  # [..., hc*D]
+        hc_dim = x.shape[-1]
+        x_normed = _rmsnorm_nw(x, self.norm_eps, hc_dim)
+        mixes = F.linear(x_normed.float(), hc_fn)
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
         return y.to(dtype)
