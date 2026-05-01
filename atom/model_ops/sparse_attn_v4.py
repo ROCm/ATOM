@@ -13,16 +13,368 @@ tensors and use FP32 internally for numerical stability — matching the referen
 kernel's accumulation precision. They are correct but not performant.
 """
 
+import os
 from typing import Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 # ---------------------------------------------------------------------------
 # sparse_attn — FlashAttention-style sparse MQA with attention sink
 # ---------------------------------------------------------------------------
 
 
-def sparse_attn(
+@triton.jit
+def _sparse_attn_triton_kernel(
+    q_ptr,
+    kv_ptr,
+    attn_sink_ptr,
+    topk_idxs_ptr,
+    out_ptr,
+    q_stride_b: tl.constexpr,
+    q_stride_m: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    kv_stride_b: tl.constexpr,
+    kv_stride_n: tl.constexpr,
+    kv_stride_d: tl.constexpr,
+    topk_stride_b: tl.constexpr,
+    topk_stride_m: tl.constexpr,
+    topk_stride_k: tl.constexpr,
+    out_stride_b: tl.constexpr,
+    out_stride_m: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    M: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_bm = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    m = pid_bm % M
+    b = pid_bm // M
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    q_base = b * q_stride_b + m * q_stride_m
+    q = tl.load(
+        q_ptr + q_base + h_offs[:, None] * q_stride_h + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    k_offs = tl.arange(0, BLOCK_K)
+    for k_start in tl.range(0, K, BLOCK_K):
+        k_pos = k_start + k_offs
+        in_range = k_pos < K
+        idx = tl.load(
+            topk_idxs_ptr
+            + b * topk_stride_b
+            + m * topk_stride_m
+            + k_pos * topk_stride_k,
+            mask=in_range,
+            other=-1,
+        )
+        valid = in_range & (idx >= 0)
+
+        kv = tl.load(
+            kv_ptr
+            + b * kv_stride_b
+            + idx[:, None] * kv_stride_n
+            + d_offs[None, :] * kv_stride_d,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+
+        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+        l_i = l_new
+
+    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+    m_final = tl.maximum(m_i, sink)
+    l_final = l_i * tl.exp(m_i - m_final) + tl.exp(sink - m_final)
+
+    denom = tl.maximum(l_final, 1.0e-30)
+    out = tl.where(l_final[:, None] > 0.0, acc / denom[:, None], 0.0)
+    out_base = b * out_stride_b + m * out_stride_m
+    tl.store(
+        out_ptr
+        + out_base
+        + h_offs[:, None] * out_stride_h
+        + d_offs[None, :] * out_stride_d,
+        out,
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
+
+
+def _sparse_attn_triton(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    if not q.is_cuda:
+        raise RuntimeError("Triton sparse_attn requires CUDA/HIP tensors")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError(f"Triton sparse_attn expects fp16/bf16 q, got {q.dtype}")
+    if kv.dtype != q.dtype:
+        raise RuntimeError(
+            f"Triton sparse_attn expects kv dtype {q.dtype}, got {kv.dtype}"
+        )
+
+    B, M, H, D = q.shape
+    K = topk_idxs.shape[-1]
+    out = torch.empty_like(q)
+    topk_idxs = topk_idxs.to(torch.int32)
+
+    # Process a small head tile per program, matching the TileLang kernel's
+    # q[h, d] / acc[h, d] structure while keeping V4's D=512 register
+    # pressure bounded.
+    block_h = 2 if D >= 256 else 4
+    block_d = triton.next_power_of_2(D)
+    block_k = 16 if D >= 256 else 32
+    _sparse_attn_triton_kernel[(B * M, triton.cdiv(H, block_h))](
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        kv.stride(0),
+        kv.stride(1),
+        kv.stride(2),
+        topk_idxs.stride(0),
+        topk_idxs.stride(1),
+        topk_idxs.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        M,
+        H,
+        D,
+        K,
+        float(softmax_scale),
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
+    return out
+
+
+@triton.jit
+def _sparse_attn_ragged_triton_kernel(
+    q_ptr,
+    kv_ptr,
+    attn_sink_ptr,
+    topk_idxs_ptr,
+    out_ptr,
+    q_stride_t: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    kv_stride_n: tl.constexpr,
+    kv_stride_d: tl.constexpr,
+    topk_stride_t: tl.constexpr,
+    topk_stride_k: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    k_offs = tl.arange(0, BLOCK_K)
+    for k_start in tl.range(0, K, BLOCK_K):
+        k_pos = k_start + k_offs
+        in_range = k_pos < K
+        idx = tl.load(
+            topk_idxs_ptr + t * topk_stride_t + k_pos * topk_stride_k,
+            mask=in_range,
+            other=-1,
+        )
+        valid = in_range & (idx >= 0)
+
+        kv = tl.load(
+            kv_ptr + idx[:, None] * kv_stride_n + d_offs[None, :] * kv_stride_d,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+
+        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+        l_i = l_new
+
+    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+    m_final = tl.maximum(m_i, sink)
+    l_final = l_i * tl.exp(m_i - m_final) + tl.exp(sink - m_final)
+
+    denom = tl.maximum(l_final, 1.0e-30)
+    out = tl.where(l_final[:, None] > 0.0, acc / denom[:, None], 0.0)
+    tl.store(
+        out_ptr
+        + t * out_stride_t
+        + h_offs[:, None] * out_stride_h
+        + d_offs[None, :] * out_stride_d,
+        out,
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
+
+
+def _sparse_attn_ragged_triton(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    if not q.is_cuda:
+        raise RuntimeError("Triton sparse_attn_ragged requires CUDA/HIP tensors")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError(
+            f"Triton sparse_attn_ragged expects fp16/bf16 q, got {q.dtype}"
+        )
+    if kv.dtype != q.dtype:
+        raise RuntimeError(
+            f"Triton sparse_attn_ragged expects kv dtype {q.dtype}, got {kv.dtype}"
+        )
+
+    T, H, D = q.shape
+    K = topk_idxs.shape[-1]
+    out = torch.empty_like(q)
+    topk_idxs = topk_idxs.to(torch.int32)
+
+    block_h = 2 if D >= 256 else 4
+    block_d = triton.next_power_of_2(D)
+    block_k = 16 if D >= 256 else 32
+    _sparse_attn_ragged_triton_kernel[(T, triton.cdiv(H, block_h))](
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv.stride(0),
+        kv.stride(1),
+        topk_idxs.stride(0),
+        topk_idxs.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H,
+        D,
+        K,
+        float(softmax_scale),
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
+    return out
+
+
+def _sparse_attn_ragged_torch(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    return _sparse_attn_torch(
+        q.unsqueeze(0),
+        kv.unsqueeze(0),
+        attn_sink,
+        topk_idxs.unsqueeze(0),
+        softmax_scale,
+    ).squeeze(0)
+
+
+def sparse_attn_ragged(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Sparse attention over flat ragged sequences.
+
+    Args:
+        q: [num_tokens, H, D]
+        kv: [total_kv, D]
+        topk_idxs: [num_tokens, K] global indices into `kv`; -1 entries are skipped.
+    """
+    if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
+        return _sparse_attn_ragged_triton(q, kv, attn_sink, topk_idxs, softmax_scale)
+    return _sparse_attn_ragged_torch(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+
+def _sparse_attn_torch(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -119,6 +471,23 @@ def sparse_attn(
     # weights_kv: [B, M, H, K]  ;  kv_f32: [B, M, K, D]  ->  out: [B, M, H, D]
     out = torch.einsum("bmhk,bmkd->bmhd", weights_kv, kv_f32)
     return out.to(out_dtype)
+
+
+def sparse_attn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Sparse multi-head attention with optional Triton backend.
+
+    Set `ATOM_USE_TRITON_ATTN=1` to use the Triton kernel. The torch
+    implementation remains the default when the env var is unset.
+    """
+    if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
+        return _sparse_attn_triton(q, kv, attn_sink, topk_idxs, softmax_scale)
+    return _sparse_attn_torch(q, kv, attn_sink, topk_idxs, softmax_scale)
 
 
 # ---------------------------------------------------------------------------
