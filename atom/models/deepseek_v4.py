@@ -47,7 +47,9 @@ from atom.model_ops.sparse_attn_v4 import (  # noqa: F401
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_backend_gate import use_new_v4_backend  # noqa: F401
 from atom.model_ops.v4_kernels import (  # noqa: F401
+    CompressPlan,
     fused_compress_attn,
+    make_single_seq_plan,
     swa_write,
     update_compressor_states,
 )
@@ -777,62 +779,60 @@ class Compressor(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor,
-        slot: int = 0,
-        block_table: Optional[torch.Tensor] = None,
-        context_lens: Optional[torch.Tensor] = None,
+        plan: "CompressPlan",
+        state_slot_mapping: torch.Tensor,
+        block_tables: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = None,
     ) -> Optional[torch.Tensor]:
-        """Compress KV for the input tokens.
+        """Batched plan-style compress: one fused kernel call for the whole
+        fwd's batch (across all seqs).
 
         Single fused Triton kernel does pool + RMSNorm + RoPE + bf16 kv_cache
-        scatter in one launch. Generic across fresh prefill / chunked prefill /
-        decode / MTP-N via per-source-position dispatch in the kernel — no
-        .item() sync, no caller-supplied start_pos. Kernel loads
-        `start_pos = positions[0]` and `end_pos = context_lens[0]` itself.
+        scatter in one launch. Each compression boundary across the batch is
+        one row in `plan.compress_plan_gpu`. State cache update fires after
+        (write order critical — fused kernel reads state-cache-as-of-previous-
+        fwd; update_compressor_states overwrites for next fwd).
 
         TODO: quant (FP8 ue8m0 for CSA, FP4 + Hadamard for Indexer) is NOT
         applied; see class docstring.
 
         Args:
-            x:           [num_tokens, dim] or [B, S, dim] (single sequence).
-            positions:   [num_tokens] absolute token positions.
-            slot:        per-request state-cache slot.
-            block_table: [max_blocks] physical block IDs; None during warmup
-                         to skip kv_cache scatter.
-            context_lens: [1] absolute end-of-context for this seq. Required.
-                         Used by both fused kernel (end_pos load) and
-                         `update_compressor_states` (write-window mask).
+            x:           [num_q_tokens, dim] flat ragged batch.
+            plan:        CompressPlan from attn_metadata.compress_plans[ratio]
+                         (or `make_single_seq_plan` for Indexer's bs=1 path).
+            state_slot_mapping: [bs] int32 — per-seq state cache slot
+                         (attn_metadata.state_slot_mapping).
+            block_tables: [bs, max_blocks_per_seq] int32 — physical block IDs
+                         per seq; None during warmup (skips kv_cache scatter).
+            out_dtype:   override kernel output dtype. Defaults to bf16.
 
         Returns:
-            Compressed KV `[1, n_max, head_dim]` post-norm post-rope BF16
-            PADDED tensor (rows past `n_actual` are uninitialized — sparse_attn
-            is gather-based and never reads them). Returns None if
-            `token_num == 0`.
+            Compressed KV `[num_compress, head_dim]` post-norm post-rope BF16,
+            in plan order (= per-seq grouped by `plan.cu_compress_cpu`).
+            Returns None if `plan.num_compress == 0`.
         """
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
-        assert context_lens is not None, (
-            "Compressor.forward: context_lens kwarg is required (caller must "
-            "pass per-seq slice from attn_metadata.context_lens)"
-        )
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
-        bsz, token_num, _ = x.size()
+        if x.dim() == 3:
+            assert x.size(0) == 1, f"3D x must have B=1, got {x.size(0)}"
+            x = x.squeeze(0)
+        assert x.dim() == 2, f"x must be [num_q_tokens, dim], got {x.shape}"
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
         rd = self.rope_head_dim
-        dtype = x.dtype
+        if out_dtype is None:
+            out_dtype = torch.bfloat16 if x.dtype == torch.float32 else x.dtype
 
         # Projection (always fp32 for stability).
         x = x.float()
-        kv = self.wkv(x)
+        kv = self.wkv(x)  # [num_q_tokens, coff*head_dim]
         score = self.wgate(x)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
         # Order is critical: fused kernel reads state cache as-of-end-of-
-        # PREVIOUS-fwd (so historic positions still in their ring slots).
-        # `update_compressor_states` overwrites them with this fwd's data
-        # for the NEXT fwd's overlap — must run AFTER the fused kernel.
+        # PREVIOUS-fwd. `update_compressor_states` overwrites them with this
+        # fwd's data for the NEXT fwd's overlap — must run AFTER the fused
+        # kernel.
         #
         # The kernel does pool + RMSNorm + RoPE + BF16 store to kv_cache.
         # No quant is applied (FP8 ue8m0 for CSA, FP4 + Hadamard for Indexer
@@ -840,45 +840,44 @@ class Compressor(nn.Module):
         # was trained with → output quality drops measurably from baseline.
         # TODO: port the quant variants into the kernel for full byte-equal.
         cos_cache, sin_cache = self.rotary_emb._caches(x.device)
-        scatter_block_table = (
-            block_table
-            if (block_table is not None and not _v4_is_dummy_run())
+        scatter_block_tables = (
+            block_tables
+            if (block_tables is not None and not _v4_is_dummy_run())
             else None
         )
-        scatter_kv_cache = self.kv_cache if scatter_block_table is not None else None
+        scatter_kv_cache = self.kv_cache if scatter_block_tables is not None else None
         out = fused_compress_attn(
-            kv_in=kv.squeeze(0).contiguous(),
-            score_in=score.squeeze(0).contiguous(),
+            kv_in=kv.contiguous(),
+            score_in=score.contiguous(),
             kv_state=self.kv_state,
             score_state=self.score_state,
-            slot=slot,
-            positions=positions,
-            context_lens=context_lens,
+            plan=plan,
+            state_slot_mapping=state_slot_mapping,
             ape=self.ape,
             rms_weight=self.norm.weight,
             rms_eps=self.norm.eps,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             kv_cache=scatter_kv_cache,
-            block_table=scatter_block_table,
+            block_tables=scatter_block_tables,
             k_per_block=_V4_BLOCK_SIZE // ratio,
             overlap=overlap,
             ratio=ratio,
             head_dim=d,
             rope_head_dim=rd,
-            out_dtype=dtype,
+            out_dtype=out_dtype,
         )
         update_compressor_states(
-            kv.squeeze(0),
-            score.squeeze(0),
+            kv,
+            score,
             self.ape,
             self.kv_state,
             self.score_state,
-            positions=positions,
-            context_lens=context_lens,
+            write_plan=plan.write_plan_gpu,
+            num_write=plan.num_write,
+            state_slot_mapping=state_slot_mapping,
             ratio=ratio,
             overlap=overlap,
-            slot=slot,
         )
         return out
 
@@ -984,8 +983,8 @@ class Indexer(nn.Module):
         assert x.dim() == 2 and qr.dim() == 2
         token_num = x.size(0)
         # start_pos: prefer caller-supplied (from cpu_meta) to avoid .item().
-        # Used locally for the topk masks below; inner Compressor no longer
-        # needs it (kernel loads positions[0] / context_lens[0] itself).
+        # Used locally for the topk masks below AND for building the bs=1
+        # CompressPlan that the inner Compressor consumes.
         if start_pos is None:
             start_pos = int(positions[0].item())
         ratio = self.compress_ratio
@@ -1006,12 +1005,25 @@ class Indexer(nn.Module):
         fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
 
         # ----- Indexer KV (Compressor takes 2D, mutates kv_cache) -----
+        # Wrap as a bs=1 plan for the batched Compressor interface. The
+        # block_table arg is per-seq [max_blocks]; convert to [1, max_blocks]
+        # for the batched API. State slot also wrapped as [1].
+        single_plan = make_single_seq_plan(
+            token_num=token_num,
+            start_pos=start_pos,
+            ratio=ratio,
+            is_overlap=self.compressor.overlap,
+            device=x.device,
+        )
+        single_state_slot = torch.tensor([slot], device=x.device, dtype=torch.int32)
+        single_block_tables = (
+            block_table.unsqueeze(0) if block_table is not None else None
+        )
         self.compressor(
             x,
-            positions,
-            slot=slot,
-            block_table=block_table,
-            context_lens=context_lens,
+            plan=single_plan,
+            state_slot_mapping=single_state_slot,
+            block_tables=single_block_tables,
         )
         # weights_proj is ATOM Linear → 2D input; restore B=1 dim for einsum.
         weights = (
@@ -1336,6 +1348,17 @@ class DeepseekV4Attention(nn.Module):
             cpu_meta,
         ) = _v4_get_seq_metadata()
         start_pos_per_seq: Optional[list[int]] = None
+        # Compress plan for this fwd's batch (per ratio). Built by
+        # DeepseekV4AttentionMetadataBuilder.prepare_decode/prefill. Absent
+        # during warmup / dummy run — caller builds a fallback single-seq plan.
+        attn_md = (
+            get_forward_context().attn_metadata
+            if get_forward_context() is not None
+            else None
+        )
+        compress_plans = (
+            getattr(attn_md, "compress_plans", None) if attn_md is not None else None
+        )
         if num_seqs == 0 or block_tables is None or _v4_is_dummy_run():
             # Warmup / fallback: treat the whole batch as a single dummy seq.
             seq_offsets = [0, seqlen_total]
@@ -1343,20 +1366,83 @@ class DeepseekV4Attention(nn.Module):
             per_seq_bts: list[Optional[torch.Tensor]] = [None]
             num_seqs = 1
             # Dummy context_lens: 1-element tensor sized to seqlen_total
-            # (treats warmup as fresh prefill). Compressor.forward requires
-            # context_lens; this satisfies the contract during dummy run.
+            # (treats warmup as fresh prefill).
             context_lens = torch.tensor(
                 [seqlen_total], device=positions.device, dtype=torch.int32
             )
+            state_slot_mapping = torch.tensor(
+                [0], device=positions.device, dtype=torch.int32
+            )
+            compress_plans = None  # batched call below builds fallback
+            block_tables_gpu = None
         elif cpu_meta is not None and cpu_meta["start_pos_per_seq"] is not None:
             seq_offsets = cpu_meta["cu_seqlens_q"][: num_seqs + 1].tolist()
             slots = cpu_meta["state_slot_mapping"][:num_seqs].tolist()
             start_pos_per_seq = cpu_meta["start_pos_per_seq"][:num_seqs].tolist()
             per_seq_bts = [block_tables[i] for i in range(num_seqs)]
+            block_tables_gpu = block_tables
         else:
             seq_offsets = cu_seqlens_q[: num_seqs + 1].tolist()
             slots = state_slot_mapping[:num_seqs].tolist()
             per_seq_bts = [block_tables[i] for i in range(num_seqs)]
+            block_tables_gpu = block_tables
+
+        # ----- Per-seq state-cache reset on prefill from scratch -----
+        # Done BEFORE batched compressor so the state cache contains correct
+        # initial -inf scores when the kernel reads it.
+        for seq_idx in range(num_seqs):
+            seq_token_num = seq_offsets[seq_idx + 1] - seq_offsets[seq_idx]
+            if seq_token_num == 0:
+                continue
+            sp = (
+                start_pos_per_seq[seq_idx]
+                if start_pos_per_seq is not None
+                else int(positions[seq_offsets[seq_idx]].item())
+            )
+            if sp == 0:
+                slot = slots[seq_idx]
+                self.swa_kv[slot].zero_()
+                if self.compress_ratio:
+                    self.compressor.kv_state[slot].zero_()
+                    self.compressor.score_state[slot].fill_(float("-inf"))
+                    if self.indexer is not None:
+                        self.indexer.compressor.kv_state[slot].zero_()
+                        self.indexer.compressor.score_state[slot].fill_(float("-inf"))
+
+        # ----- Batched compressor call (ONCE for the whole batch) -----
+        # Replaces per-seq self.compressor() inside the loop. Indexer's
+        # internal Compressor is still called per-seq (bs=1 plan) inside the
+        # per-seq loop below, since Indexer needs per-seq topk masks anyway.
+        kv_compress_batched: Optional[torch.Tensor] = None
+        plan_for_layer: Optional[CompressPlan] = None
+        if self.compress_ratio:
+            if compress_plans is not None and ratio in compress_plans:
+                plan_for_layer = compress_plans[ratio]
+            else:
+                # Fallback: build a single-seq plan from positions / token count.
+                # Only path for warmup / non-V4 dispatch.
+                sp_dummy = start_pos_per_seq[0] if start_pos_per_seq is not None else 0
+                plan_for_layer = make_single_seq_plan(
+                    token_num=seqlen_total,
+                    start_pos=sp_dummy,
+                    ratio=ratio,
+                    is_overlap=self.compressor.overlap,
+                    device=x.device,
+                )
+            assert (
+                state_slot_mapping is not None
+                and state_slot_mapping.dtype == torch.int32
+                and state_slot_mapping.is_cuda
+            ), (
+                "batched compressor needs state_slot_mapping as int32 GPU "
+                f"tensor, got {state_slot_mapping}"
+            )
+            kv_compress_batched = self.compressor(
+                x,
+                plan=plan_for_layer,
+                state_slot_mapping=state_slot_mapping,
+                block_tables=block_tables_gpu,
+            )
 
         sparse_kvs = []
         sparse_topks = []
@@ -1379,17 +1465,9 @@ class DeepseekV4Attention(nn.Module):
                 start_pos = int(seq_positions[0].item())
             end_pos = start_pos + token_num
 
-            # Per-seq state-cache reset on prefill from scratch.
-            # Only this seq's slot is touched — other concurrent seqs are
-            # unaffected (paper §3.6.1: state cache is per-request).
-            if start_pos == 0:
-                self.swa_kv[slot].zero_()
-                if self.compress_ratio:
-                    self.compressor.kv_state[slot].zero_()
-                    self.compressor.score_state[slot].fill_(float("-inf"))
-                    if self.indexer is not None:
-                        self.indexer.compressor.kv_state[slot].zero_()
-                        self.indexer.compressor.score_state[slot].fill_(float("-inf"))
+            # NOTE: state-cache reset moved BEFORE the batched compressor
+            # call (above), so the kernel's first read sees zeroed state +
+            # -inf scores for fresh-prefill seqs.
 
             # topk_idxs (per-seq, since token_num + start_pos differ).
             topk_idxs = _get_window_topk_idxs(
@@ -1446,31 +1524,21 @@ class DeepseekV4Attention(nn.Module):
             else:
                 self.swa_kv[slot : slot + 1, start_pos % win] = seq_kv.squeeze(1)
 
-            # Compressor + kv_sa construction. Prefill (start_pos == 0) directly
-            # consumes the kernel-returned padded compress tensor (sparse_attn is
-            # gather-based via topk_idxs — padded rows past n_actual are never
-            # accessed). Decode reads accumulated history from kv_cache.
+            # Compressor was called ONCE batched above (kv_compress_batched
+            # holds all seqs' boundaries packed in plan order). Per-seq
+            # prefill cat its slice; decode reads accumulated history from
+            # kv_cache via _v4_gather_compressed.
             if start_pos == 0:
                 kv_sa = seq_kv
-                if self.compress_ratio:
-                    kv_compress = self.compressor(
-                        seq_x,
-                        seq_positions,
-                        slot=slot,
-                        block_table=block_table,
-                        context_lens=seq_context_lens,
-                    )
-                    if kv_compress is not None:
-                        kv_sa = torch.cat([kv_sa, kv_compress], dim=1)
+                if self.compress_ratio and kv_compress_batched is not None:
+                    cu_c = plan_for_layer.cu_compress_cpu
+                    seq_compress = kv_compress_batched[
+                        int(cu_c[seq_idx]) : int(cu_c[seq_idx + 1])
+                    ]
+                    if seq_compress.shape[0] > 0:
+                        kv_sa = torch.cat([kv_sa, seq_compress.unsqueeze(0)], dim=1)
             else:
                 if self.compress_ratio:
-                    self.compressor(
-                        seq_x,
-                        seq_positions,
-                        slot=slot,
-                        block_table=block_table,
-                        context_lens=seq_context_lens,
-                    )
                     # sparse_attn input layout: [SWA window || compressed
                     # entries gathered from block-table]. n_committed counts
                     # all boundaries up to and including this fwd's window

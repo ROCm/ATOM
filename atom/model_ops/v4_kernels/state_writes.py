@@ -136,22 +136,23 @@ def swa_write_reference(
     swa_kv[slot_per_token, ring_idx] = kv
 
 
-# === Unified Compressor state save (all phases) =========================
+# === Unified Compressor state save (plan path) ==========================
 # Paper §3.6.1: per-request fixed-size state cache for "uncompressed tail
 # tokens + previous block as overlap context (B-side, eq 11)". ATOM keeps
 # this as a single ring of size `STATE_SIZE = 2*ratio` (CSA overlap) or
 # `ratio` (HCA). Each token at absolute `pos` writes to slot
 # `pos % STATE_SIZE`; the consumer (`fused_compress.*` kernel) reads its K
 # source rows per-source-position, dispatching INPUT vs state cache by the
-# `s >= start_pos` test.
+# `k_static >= window_len` plan field (where `window_len` is the count of
+# leading K-loop iterations that go to state cache, encoded per-boundary in
+# `compress_plan`).
 #
-# Write mask (uniform — no prefill/decode discrimination):
-#   Always preserve the last STATE_SIZE absolute positions of this forward:
-#     write_start_pos = max(0, context_n - STATE_SIZE)
-#     do_write        = pos >= write_start_pos
-#   This is the smallest invariant that keeps the next forward's first
-#   compress-boundary read fully populated regardless of how this forward
-#   was scheduled (fresh prefill, chunked prefill, single decode, MTP-N).
+# Write window selection (HOST side, in compress_plan.make_compress_plans):
+#   write_plan rows = tokens whose absolute `pos >= max(0, seq_len - STATE_SIZE)`.
+#   This preserves the last STATE_SIZE absolute positions of this forward
+#   regardless of how it was scheduled (fresh prefill, chunked prefill,
+#   single decode, MTP-N). The kernel below writes those rows
+#   unconditionally — no in-kernel mask.
 
 
 @triton.jit
@@ -159,11 +160,8 @@ def _update_compressor_states_kernel(
     kv_ptr,  # [N, dim]
     score_ptr,  # [N, dim]
     ape_ptr,  # [RATIO, dim]
-    positions_ptr,  # [N]            absolute token positions
-    seq_idx_per_token_ptr,  # [N]            which seq each token belongs to
-    cu_seqlens_q_ptr,  # [num_seqs+1]   per-seq token offsets
-    context_lens_ptr,  # [num_seqs]     per-seq total context length
-    state_slot_mapping_ptr,  # [num_seqs]     per-seq state slot
+    write_plan_ptr,  # [num_write, 4] int32 (ragged_id, batch_id, position, _)
+    state_slot_mapping_ptr,  # [bs] int32 — per-seq state cache slot
     kv_state_ptr,
     kv_state_slot_stride,
     kv_state_pos_stride,
@@ -176,55 +174,34 @@ def _update_compressor_states_kernel(
     RATIO: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """One program per token. Uniform `dst = pos % STATE_SIZE`; per-seq mask
-    derived from `cu_seqlens_q` + `context_lens`.
+    """SGLang plan-style write: one program per row in `write_plan_ptr`.
 
-    Per-seq derivations:
-      seqlen_q   = cu_seqlens_q[seq+1] - cu_seqlens_q[seq]
-      context_n  = context_lens[seq]                   (incl. tokens in this fwd)
-      start_pos  = context_n - seqlen_q
+    Each plan row = (ragged_id, batch_id, position, _). The plan was
+    pre-filtered on the host to include only tokens whose `position` falls in
+    the per-seq "last STATE_SIZE absolute positions" window — so the kernel
+    writes unconditionally (no in-kernel mask), keeping it minimal.
 
-    Per-token write mask (unified across fresh prefill / chunked prefill /
-    single-token decode / MTP-N):
-      Always preserve the last STATE_SIZE positions of THIS forward in state
-      cache (so the next forward has a full B-side overlap window for its
-      first compress-boundary read):
+    Destination (uniform):
+      dst = position % STATE_SIZE
+      slot = state_slot_mapping[batch_id]
 
-        write_start_pos = max(0, context_n - STATE_SIZE)
-        do_write        = pos >= write_start_pos
-
-      For fresh prefill with seqlen_q >= STATE_SIZE this writes positions
-      [seqlen-STATE_SIZE, seqlen). For shorter forwards it writes everything.
-      No is_prefill / is_fresh_prefill discrimination — pure function of
-      context length.
-
-    Per-token destination:
-      dst = pos % STATE_SIZE                           (uniform; consumer
-                                                       resolves A/B by parity
-                                                       or per-source position)
+    Score write fuses ape lookup: `score + ape[position % RATIO]`.
     """
-    tok = tl.program_id(0)
-    pos = tl.load(positions_ptr + tok)
-    seq_idx = tl.load(seq_idx_per_token_ptr + tok)
-    ring_idx_ape = pos % RATIO  # ape lookup is always per-block-position
+    pid = tl.program_id(0)
+    plan_base = write_plan_ptr + pid * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    position = tl.load(plan_base + 2)
 
-    seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
-    seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
-    seqlen_q = seq_end - seq_start
-    context_n = tl.load(context_lens_ptr + seq_idx)
-
-    # Unified write window: last STATE_SIZE absolute positions of this fwd.
-    write_start_pos = tl.maximum(context_n - STATE_SIZE, 0)
-    do_write = pos >= write_start_pos
-
-    dst = pos % STATE_SIZE
-    slot = tl.load(state_slot_mapping_ptr + seq_idx)
+    slot = tl.load(state_slot_mapping_ptr + batch_id)
+    dst = position % STATE_SIZE
+    ring_idx_ape = position % RATIO
 
     d = tl.arange(0, BLOCK_D)
-    m = (d < dim) & do_write
+    m = d < dim
 
-    kv_v = tl.load(kv_ptr + tok * dim + d, mask=m).to(tl.float32)
-    sc_v = tl.load(score_ptr + tok * dim + d, mask=m).to(tl.float32)
+    kv_v = tl.load(kv_ptr + ragged_id * dim + d, mask=m).to(tl.float32)
+    sc_v = tl.load(score_ptr + ragged_id * dim + d, mask=m).to(tl.float32)
     ape_v = tl.load(ape_ptr + ring_idx_ape * dim + d, mask=m).to(tl.float32)
 
     tl.store(
@@ -249,91 +226,55 @@ def update_compressor_states(
     kv_state: torch.Tensor,
     score_state: torch.Tensor,
     *,
-    positions: torch.Tensor,
-    context_lens: torch.Tensor,
+    write_plan: torch.Tensor,  # [num_write, 4] int32
+    num_write: int,
+    state_slot_mapping: torch.Tensor,  # [bs] int32 — per-seq state slot
     ratio: int,
     overlap: bool,
-    # Batched-mode inputs (caller has full attn_metadata):
-    cu_seqlens_q: torch.Tensor | None = None,
-    state_slot_mapping: torch.Tensor | None = None,
-    seq_idx_per_token: torch.Tensor | None = None,
-    # Single-seq fallback (constructs trivial 1-seq metadata):
-    slot: int | None = None,
 ) -> None:
     """In-place update of Compressor's per-request `kv_state`/`score_state`
-    ring buffer (size `2*ratio` for overlap CSA, `ratio` for HCA). Each
-    token at absolute `pos` writes to slot `pos % STATE_SIZE` — uniform
-    across prefill (only tail + B-side overlap window are written) and
-    decode (every token in this fwd writes).
+    ring buffer (size `2*ratio` for overlap CSA, `ratio` for HCA), driven by
+    a SGLang-style packed `write_plan`.
 
-    `context_lens` is required in both call modes — the kernel uses it to
-    discriminate fresh prefill (`context_n == seqlen_q`) vs decode /
-    prefix-cache (`context_n > seqlen_q`). Caller pulls it from
-    `attn_metadata.context_lens` (e.g. `var["context_lens"].gpu[:bs]` for
-    batched, or a per-seq slice `[seq_idx:seq_idx+1]` for single-seq).
+    The plan is pre-filtered on the host to include only tokens whose
+    `position` falls in the per-seq "last STATE_SIZE absolute positions"
+    window — the kernel writes unconditionally, no in-kernel mask.
 
-    Two call modes:
-
-    1. **Batched** (preferred — caller has full attn_metadata):
-        `cu_seqlens_q`, `state_slot_mapping`, `seq_idx_per_token` from
-        `forward_context.attn_metadata`. One launch handles all seqs.
-
-    2. **Single-seq fallback**: pass `slot=` + `context_lens=` (1-element
-        tensor). Wrapper builds trivial 1-seq cu_seqlens_q /
-        state_slot_mapping / seq_idx_per_token.
-
-    All per-token write decisions (mask, dst) happen inside the kernel.
-
-    Args (common):
-      kv:          [N, dim]                — flat batched KV.
-      score:       [N, dim]                — flat batched score (NOT
-                                             pre-added with ape; kernel adds it).
-      ape:         [ratio, dim]            — absolute position embedding.
-      positions:   [N]                     — absolute token positions.
-      context_lens: [num_seqs] int         — per-seq end-of-context
-                                             absolute position. Required.
-      kv_state:    [num_slots, S, dim] in-place ring buffer.
-                                           S = 2*ratio if overlap else ratio.
-      score_state: same shape as kv_state.
+    Args:
+      kv:           [N, dim] flat batched KV (typically fp32 or bf16, cast inside).
+      score:        [N, dim] flat batched score (NOT pre-added with ape;
+                    kernel fuses ape addition).
+      ape:          [ratio, dim] absolute position embedding.
+      kv_state:     [num_slots, S, dim] in-place ring buffer.
+                    S = 2*ratio if overlap else ratio.
+      score_state:  same shape as kv_state.
+      write_plan:   [num_write, 4] int32 — packed (ragged_id, batch_id,
+                    position, _); each row = one token to write.
+      num_write:    grid size (CPU scalar, == write_plan.shape[0] but kept
+                    explicit to avoid GPU sync).
+      state_slot_mapping: [bs] int32 — per-seq state cache slot.
+      ratio, overlap: compress geometry.
     """
     assert kv.dim() == 2 and score.dim() == 2
     assert kv.shape == score.shape, f"{kv.shape} vs {score.shape}"
     assert ape.dim() == 2 and ape.shape[0] == ratio
-    assert (
-        context_lens is not None
-    ), "context_lens is required (no positions-derived fallback)"
     state_size = (2 if overlap else 1) * ratio
     assert (
         kv_state.shape[1] == state_size
     ), f"kv_state.shape[1]={kv_state.shape[1]}, expected {state_size}"
-    n = kv.shape[0]
-    if n == 0:
+    if num_write == 0:
         return
     dim = kv.shape[1]
-    device = kv.device
-
-    # Single-seq fallback: build trivial 1-seq cu_seqlens_q /
-    # state_slot_mapping / seq_idx_per_token. context_lens MUST be
-    # supplied by caller (no positions-derived shortcut).
-    if cu_seqlens_q is None:
-        assert slot is not None, "single-seq mode requires slot="
-        cu_seqlens_q = torch.tensor([0, n], device=device, dtype=torch.int32)
-        state_slot_mapping = torch.tensor([slot], device=device, dtype=torch.int32)
-        seq_idx_per_token = torch.zeros(n, device=device, dtype=torch.int32)
-    else:
-        assert (
-            state_slot_mapping is not None and seq_idx_per_token is not None
-        ), "batched mode requires state_slot_mapping, seq_idx_per_token"
+    assert write_plan.dim() == 2 and write_plan.shape[1] == 4
+    assert write_plan.dtype == torch.int32
+    assert state_slot_mapping.dim() == 1 and state_slot_mapping.dtype == torch.int32
 
     BLOCK_D = triton.next_power_of_2(dim)
-    _update_compressor_states_kernel[(n,)](
+    _update_compressor_states_kernel[(num_write,)](
         kv if kv.is_contiguous() else kv.contiguous(),
         score if score.is_contiguous() else score.contiguous(),
         ape,
-        positions,
-        seq_idx_per_token,
-        cu_seqlens_q,
-        context_lens,
+        write_plan,
         state_slot_mapping,
         kv_state,
         kv_state.stride(0),
@@ -356,25 +297,22 @@ def update_compressor_states_reference(
     kv_state: torch.Tensor,
     score_state: torch.Tensor,
     *,
-    positions: torch.Tensor,
-    context_n: int,
+    write_plan: torch.Tensor,
+    state_slot_mapping: torch.Tensor,
     ratio: int,
     overlap: bool,
-    slot: int,
 ) -> None:
-    """Pure-PyTorch reference equivalent of `update_compressor_states`.
+    """Pure-PyTorch reference equivalent of `update_compressor_states` (plan path).
 
-    Unified write mask (no prefill/decode discrimination): preserve the last
-    STATE_SIZE positions of THIS forward, where STATE_SIZE = 2*ratio (overlap)
-    or ratio (HCA). `context_n` is the absolute end-of-context position +1
-    (i.e., `start_pos + seqlen` for this fwd).
+    `write_plan[i] = (ragged_id, batch_id, position, _)` — each row is one
+    token to write.  No mask (host filtered).
     """
     state_size = (2 if overlap else 1) * ratio
-    write_start = max(0, context_n - state_size)
-    for i in range(kv.size(0)):
-        p = int(positions[i].item())
-        if p < write_start:
-            continue
-        dst = p % state_size
-        kv_state[slot, dst] = kv[i]
-        score_state[slot, dst] = score[i] + ape[p % ratio]
+    plan_cpu = write_plan.detach().cpu()
+    slot_map_cpu = state_slot_mapping.detach().cpu()
+    for i in range(plan_cpu.shape[0]):
+        ragged_id, batch_id, position, _ = plan_cpu[i].tolist()
+        slot = int(slot_map_cpu[batch_id].item())
+        dst = position % state_size
+        kv_state[slot, dst] = kv[ragged_id]
+        score_state[slot, dst] = score[ragged_id] + ape[position % ratio]

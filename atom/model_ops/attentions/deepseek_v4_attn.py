@@ -37,6 +37,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
 
 from typing import Type
 
+import numpy as np
 import torch
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attentions.backends import (
@@ -92,6 +93,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.dense_layers = [i for i, r in enumerate(ratios) if r == 0]
         self.layer_id_to_csa_pos = {l: p for p, l in enumerate(self.csa_layers)}
         self.layer_id_to_hca_pos = {l: p for p, l in enumerate(self.hca_layers)}
+        # Unique (ratio, is_overlap) pairs needed for compress-plan generation.
+        # CSA ratio=4 has overlap=True; HCA ratio=128 has overlap=False.
+        unique = []
+        if self.csa_layers:
+            unique.append((4, True))
+        if self.hca_layers:
+            unique.append((128, False))
+        self._unique_compress_ratios_overlap = unique
 
         # Geometry from HF config.
         self.head_dim = getattr(hf, "kv_head_dim", 512)
@@ -347,6 +356,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         The actual topk index values are layer-specific (CSA Indexer depends on
         weights), but the per-token topk span and global-KV offset layout only
         depends on the request geometry and compress_ratio.
+
+        For prefill (start_pos == 0), `kv_len` consumes the actual per-seq
+        compressed-boundary count from `attn_metadata.compress_plans[ratio]`
+        (computed by the SGLang-style plan generator). The plan returns the
+        EXACT count `cu_compress_cpu[i+1] - cu_compress_cpu[i]` (= floor
+        formula), not the loose `(token_num + ratio - 1) // ratio` ceil
+        upper bound — keeping the sparse-attn `kv_offsets` aligned with the
+        batched compressor's tightly-packed output.
         """
         import numpy as np
 
@@ -357,6 +374,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             4: ("csa", 4),
             128: ("hca", 128),
         }
+        compress_plans = getattr(attn_metadata, "compress_plans", None) or {}
         for ratio_key, (kind, ratio) in ratio_specs.items():
             starts = var[f"v4_{kind}_sparse_topk_starts"].np
             lens = var[f"v4_{kind}_sparse_topk_lens"].np
@@ -365,6 +383,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             kv_base = 0
             token_base = 0
             max_topk = 0
+            cu_compress_cpu = None
+            if ratio in compress_plans:
+                cu_compress_cpu = compress_plans[ratio].cu_compress_cpu
             for seq_idx in range(scheduled_bs):
                 seq_start = int(cu_seqlens_q_np[seq_idx])
                 seq_end = int(cu_seqlens_q_np[seq_idx + 1])
@@ -373,15 +394,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     continue
                 start_pos = int(start_pos_per_seq[seq_idx])
                 end_pos = start_pos + token_num
-                window_topk = self.window_size if start_pos > 0 else min(
-                    token_num, self.window_size
+                window_topk = (
+                    self.window_size
+                    if start_pos > 0
+                    else min(token_num, self.window_size)
                 )
                 compress_topk = 0
                 kv_len = token_num if start_pos == 0 else self.window_size
+                # n_compress: this-fwd's compressed boundary count for this
+                # seq. Floor formula matches batched compressor's tightly-
+                # packed output length. Falls back to numpy formula when
+                # compress_plans is absent (warmup / non-V4 dispatch).
+                if cu_compress_cpu is not None:
+                    n_compress = int(
+                        cu_compress_cpu[seq_idx + 1] - cu_compress_cpu[seq_idx]
+                    )
+                else:
+                    n_compress = end_pos // ratio - start_pos // ratio if ratio else 0
                 if ratio == 4:
                     compress_topk = min(self.index_topk, end_pos // ratio)
                     if start_pos == 0:
-                        kv_len = token_num + (token_num + ratio - 1) // ratio
+                        kv_len = token_num + n_compress
                     else:
                         kv_len = self.window_size + end_pos // ratio
                 elif ratio == 128:
@@ -390,7 +423,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     else:
                         compress_topk = token_num // ratio
                     if start_pos == 0:
-                        kv_len = token_num + (token_num + ratio - 1) // ratio
+                        kv_len = token_num + n_compress
                     else:
                         kv_len = self.window_size + end_pos // ratio
                 topk_len = window_topk + compress_topk
@@ -407,9 +440,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 kv_base += kv_len
                 max_topk = max(max_topk, topk_len)
 
-            topk_starts = var[f"v4_{kind}_sparse_topk_starts"].copy_to_gpu(
-                total_tokens
-            )
+            topk_starts = var[f"v4_{kind}_sparse_topk_starts"].copy_to_gpu(total_tokens)
             topk_lens = var[f"v4_{kind}_sparse_topk_lens"].copy_to_gpu(total_tokens)
             kv_offsets = var[f"v4_{kind}_sparse_kv_offsets"].copy_to_gpu(total_tokens)
             layouts[ratio_key] = {
@@ -440,11 +471,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         scheduled_bs = batch.total_seqs_num_decode
-        context_lens = np.asarray(batch.context_lens, dtype=np.int32)
+        # Naming: `_np` suffix marks numpy arrays, `_gpu` marks GPU tensors.
+        # Both representations of context_lens coexist (CPU mirror feeds the
+        # plan builder; GPU copy goes into attn_metadata for kernels).
+        context_lens_np = np.asarray(batch.context_lens, dtype=np.int32)
         max_seqlen_q = batch.num_spec_step + 1
         positions_np = np.tile(
             np.arange(max_seqlen_q, dtype=np.int32), scheduled_bs
-        ) + np.repeat(context_lens - max_seqlen_q, max_seqlen_q)
+        ) + np.repeat(context_lens_np - max_seqlen_q, max_seqlen_q)
         sum_scheduled_tokens = batch.total_tokens_num_decode
         var["positions"].np[:sum_scheduled_tokens] = positions_np
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
@@ -459,7 +493,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # PR-A: V4 Compressor state-cache update reads context_lens to
         # discriminate fresh prefill vs decode/prefix-cache. Parent's
         # prepare_prefill pushes this; decode path must do the same.
-        var["context_lens"].np[:scheduled_bs] = context_lens
+        var["context_lens"].np[:scheduled_bs] = context_lens_np
         context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
 
         block_tables_gpu = self._populate_block_tables(batch, scheduled_bs)
@@ -470,11 +504,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_q=cu_seqlens_q_gpu,
             cu_seqlens_k=None,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=int(context_lens.max()) if len(context_lens) else 1,
+            max_seqlen_k=int(context_lens_np.max()) if len(context_lens_np) else 1,
             min_seqlen_q=0,
             dropout_p=0.0,
             has_cached=False,
-            total_kv=int(context_lens.sum()),
+            total_kv=int(context_lens_np.sum()),
             num_cached_tokens=None,
             block_tables=block_tables_gpu,
             context_lens=context_lens_gpu,
@@ -492,6 +526,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.start_pos_per_seq_cpu = positions_np[
             cu_seqlens_q_np[:scheduled_bs]
         ]
+        # Compress plans (per ratio) for batched fused_compress + update_states.
+        # Decode batch: extend_lens = max_seqlen_q for all seqs (uniform).
+        # `context_lens_np` is post-extend (from batch.context_lens, set by
+        # scheduler after appending this fwd's tokens) — this is what plan
+        # generation needs as `seq_lens`. Must run BEFORE
+        # `_attach_sparse_layout_metadata` since it consumes plan.cu_compress_cpu
+        # to compute the per-token kv_len for sparse-attn ragged layout.
+        extend_lens_np = np.full(scheduled_bs, max_seqlen_q, dtype=np.int32)
+        attn_metadata.compress_plans = self._build_compress_plans(
+            extend_lens_np, context_lens_np, positions.device
+        )
         self._attach_sparse_layout_metadata(
             attn_metadata,
             cu_seqlens_q_np,
@@ -535,6 +580,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.start_pos_per_seq_cpu = positions_np[
             cu_seqlens_q_np[:scheduled_bs]
         ]
+        # Compress plans (per ratio) for batched fused_compress + update_states.
+        # Prefill batch: extend_lens read from cu_seqlens_q_np.
+        # Must run BEFORE `_attach_sparse_layout_metadata` (sparse layout
+        # consumes plan.cu_compress_cpu for the per-token kv_len computation).
+        extend_lens_np = (
+            cu_seqlens_q_np[1 : scheduled_bs + 1] - cu_seqlens_q_np[:scheduled_bs]
+        ).astype(np.int32)
+        # context_lens for prefill = positions[seq_start_in] + extend_lens
+        # (= absolute seq_len incl. this fwd's tokens).
+        context_lens_np = (attn_metadata.start_pos_per_seq_cpu + extend_lens_np).astype(
+            np.int32
+        )
+        attn_metadata.compress_plans = self._build_compress_plans(
+            extend_lens_np, context_lens_np, positions.device
+        )
         self._attach_sparse_layout_metadata(
             attn_metadata,
             cu_seqlens_q_np,
@@ -543,6 +603,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             sum_scheduled_tokens,
         )
         return attn_metadata, positions
+
+    def _build_compress_plans(self, extend_lens_np, seq_lens_np, device):
+        """Build per-ratio CompressPlan dict consumed by batched compressor.
+
+        Reuse this from both prepare_decode and prepare_prefill — caller
+        supplies extend_lens / seq_lens (np int32) and target device.
+        """
+        from atom.model_ops.v4_kernels import make_compress_plans
+
+        if not self._unique_compress_ratios_overlap:
+            return {}
+        # Ensure inputs are np int32 (callers may pass torch tensors / lists).
+        if isinstance(extend_lens_np, torch.Tensor):
+            extend_lens_np = extend_lens_np.cpu().numpy().astype(np.int32)
+        if isinstance(seq_lens_np, torch.Tensor):
+            seq_lens_np = seq_lens_np.cpu().numpy().astype(np.int32)
+        return make_compress_plans(
+            np.ascontiguousarray(extend_lens_np, dtype=np.int32),
+            np.ascontiguousarray(seq_lens_np, dtype=np.int32),
+            self._unique_compress_ratios_overlap,
+            device,
+        )
 
     def _populate_block_tables(
         self, batch: ScheduledBatch, scheduled_bs: int

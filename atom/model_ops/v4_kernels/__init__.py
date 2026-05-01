@@ -9,6 +9,11 @@ take batched tensors (positions, slot_per_token, cu_seqlens_q) — nothing is
 derived from device data via `.item()`.
 """
 
+from atom.model_ops.v4_kernels.compress_plan import (
+    CompressPlan,
+    make_compress_plans,
+    make_single_seq_plan,
+)
 from atom.model_ops.v4_kernels.fused_compress import (
     fused_compress_attn,
     fused_compress_attn_reference,
@@ -20,4 +25,7 @@ __all__ = [
     "swa_write",
     "fused_compress_attn",
     "fused_compress_attn_reference",
+    "CompressPlan",
+    "make_compress_plans",
+    "make_single_seq_plan",
 ]
