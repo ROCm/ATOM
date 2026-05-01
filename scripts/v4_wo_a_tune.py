@@ -39,15 +39,16 @@ M_LIST = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 # kernel's _get_config bucketing breakpoints (mirror existing JSON keys)
 M_BUCKETS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
 
-# Configs to sweep — keep BLOCK_SIZE_K = group_size = 128 (kernel constraint)
+# Configs to sweep — keep BLOCK_SIZE_K = group_size = 128 (kernel constraint).
+# Wider sweep tuned for "small M + medium N + large K" regime (V4 wo_a).
 SWEEP = list(
     product(
-        [16, 32, 64, 128, 256],     # BLOCK_SIZE_M
-        [16, 32, 64, 128, 256],     # BLOCK_SIZE_N
-        [1, 2, 4, 8, 16],           # GROUP_SIZE_M
-        [4, 8],                     # num_warps
+        [16, 32, 64, 128],          # BLOCK_SIZE_M  (16 = MFMA min, padded for M<16)
+        [32, 64, 128, 256, 512],    # BLOCK_SIZE_N  (try big blocks for N=1024 to cut grid)
+        [1, 2, 4, 8],               # GROUP_SIZE_M  (L2 grouping)
+        [2, 4, 8],                  # num_warps     (keep smaller too — small M can use less)
         [1, 2, 3],                  # num_stages
-        [0, 1, 2, 3, 4],            # waves_per_eu
+        [0, 1, 2, 4],               # waves_per_eu
     )
 )
 
@@ -93,8 +94,9 @@ def benchmark(M, config_dict=None, n_iter=30, n_warmup=5):
         for _ in range(n_warmup):
             run()
         torch.cuda.synchronize()
-        # Use triton.testing.do_bench for proper measurement (steady-state)
-        ms = triton.testing.do_bench(run, warmup=10, rep=50)
+        # Use triton.testing.do_bench for proper measurement (steady-state).
+        # Larger warmup + rep → ~0.5% measurement noise (vs ~3% at default).
+        ms = triton.testing.do_bench(run, warmup=25, rep=100)
         return ms * 1e3  # μs
     except Exception:
         return float("inf")
