@@ -190,22 +190,49 @@ def main():
     # arch is auto-detected from the live device (e.g. gfx942 / gfx950).
     arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
     aiter_root = Path(_aiter_triton.__file__).parent
+    config_dir = aiter_root / "configs" / "gemm"
     target_path = (
-        aiter_root
-        / "configs"
-        / "gemm"
+        config_dir
         / f"{arch}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT-N={N}-K={K}.json"
     )
+    default_path = (
+        config_dir
+        / f"{arch}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT.json"
+    )
+
+    # CRITICAL: aiter's _get_gemm_config_cached raises KeyError if M doesn't
+    # fall into any bucket. V4 warmup hits M up to max-num-batched-tokens
+    # (1024 in PR recipe), so we MUST cover all M buckets the runtime might
+    # query. Strategy: start from default JSON (covers all M ranges with
+    # generic configs) and override only buckets we actually tuned. This way
+    # large M falls back to aiter's MLA-tuned defaults; small M uses our
+    # B=2-tuned configs.
+    if default_path.exists():
+        merged_json = json.loads(default_path.read_text())
+        print(
+            f"Merging tuned configs into default ({len(merged_json)} buckets) "
+            f"from {default_path.name}"
+        )
+    else:
+        merged_json = {}
+        print(f"WARNING: no default JSON at {default_path}; tuned-only output")
+    # Override with our tuned buckets
+    for bucket, cfg in aiter_json.items():
+        merged_json[bucket] = cfg
+        print(f"  override: {bucket}")
 
     if args.write:
-        target_path.write_text(json.dumps(aiter_json, indent=4))
+        target_path.write_text(json.dumps(merged_json, indent=4))
         print(f"WROTE tuned config to: {target_path}")
+        print(f"  total buckets: {len(merged_json)}")
+        print(f"  tuned buckets: {len(aiter_json)} (rest inherit from default)")
         print(f"Next V4 run will auto-pick this via _get_config(M, N={N}, K={K}).")
     else:
         print(f"DRY RUN. To write: rerun with --write")
         print(f"Target path would be: {target_path}")
-        print(f"JSON content preview:")
-        print(json.dumps(aiter_json, indent=4))
+        print(f"Merged JSON preview (first 5 buckets):")
+        preview = dict(list(merged_json.items())[:5])
+        print(json.dumps(preview, indent=4))
 
 
 if __name__ == "__main__":
