@@ -10,9 +10,8 @@ Usage on GPU node:
 import torch
 import triton
 
-from atom.config import QuantType
 from atom.model_ops.linear import gemm_a8w8_blockscale_preshuffle_impl
-from aiter.utility import get_hip_quant
+from aiter import QuantType, get_hip_quant
 
 
 # V4 wo_a tp=8 shape
