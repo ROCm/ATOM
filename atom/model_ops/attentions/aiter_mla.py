@@ -392,7 +392,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # sparse_kv_indptr is per-token in MTP mode and must NOT be
         # indexed with [:bs+1] here — that misinterprets the per-token
         # cumsum as per-seq, producing wrong KV lengths and OOB metadata.
-        kv_indptr_for_metadata = var["kv_indptr"].gpu[: bs + 1]
+        kv_indptr_for_metadata = (
+            var["sparse_kv_indptr"].gpu[: bs + 1]
+            if self.is_sparse and max_q_len == 1
+            else var["kv_indptr"].gpu[: bs + 1]
+        )
         if only_update:
             decode_update_mla_metadata_v1(
                 var["cu_seqlens_q"].gpu[: bs + 1],
@@ -485,7 +489,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         V cache or kv_scale).
 
         DeepSeek-V3.2 sparse variant adds an indexer cache contribution
-        (`hf_config.num_hidden_layers` rows, aligned-to-16 fp8).
+        for every bound layer, including draft/MTP layers.
         """
         runner = self.model_runner
         config = runner.config
@@ -498,7 +502,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_dim = hf_config.index_head_dim + 4
             aligned_index_dim = ((index_dim + 15) // 16) * 16
             block_bytes += (
-                hf_config.num_hidden_layers
+                total_num_layers
                 * runner.block_size
                 * aligned_index_dim
                 * dtypes.fp8.itemsize
@@ -536,7 +540,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             aligned = ((index_dim + 15) // 16) * 16
             out["aligned_index_dim"] = aligned
             out["index_cache"] = torch.zeros(
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
                 aligned,

@@ -1387,99 +1387,20 @@ class ModelRunner:
                 f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
             )
 
-        if self.use_mla:
-            self.kv_cache = torch.zeros(
-                total_num_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                576,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
-            if self.is_deepseek_v32:
-                # Align last dimension to 16 bytes for fp8 (1 byte per element)
-                # to avoid unaligned memory access in torch inductor
-                index_dim = hf_config.index_head_dim + 4
-                aligned_index_dim = ((index_dim + 15) // 16) * 16
-                self.index_cache = torch.zeros(
-                    total_num_layers,
-                    self.num_physical_kvcache_blocks,
-                    self.physical_block_size,
-                    aligned_index_dim,
-                    dtype=dtypes.fp8,
-                    device="cuda",
-                )
-        elif self.is_qwen_next():
-
-            self.kv_cache = torch.zeros(
-                2,
-                self.num_full_attn + num_draft_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
-
-            self.kv_scale = torch.zeros(
-                2,
-                self.num_full_attn + num_draft_layers,
-                self.num_physical_kvcache_blocks,
-                num_kv_heads,
-                self.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            )
-
-            mamba_shape = self.gated_delta_net_state_shape(
-                get_tp_group().world_size,
-                hf_config.linear_num_key_heads,
-                hf_config.linear_num_value_heads,
-                hf_config.linear_key_head_dim,
-                hf_config.linear_value_head_dim,
-                hf_config.linear_conv_kernel_dim,
-                self.num_spec_tokens,  # self.num_spec,
-            )
-            mamba_dtypes = self.gated_delta_net_state_dtypes()
-            self.mamba_k_cache = torch.zeros(
-                (self.num_gdn_attn_state, self.max_mamba_slots) + mamba_shape[0],
-                dtype=mamba_dtypes[0],
-                device="cuda",
-            )
-            self.mamba_v_cache = torch.zeros(
-                (self.num_gdn_attn_state, self.max_mamba_slots) + mamba_shape[1],
-                dtype=mamba_dtypes[1],
-                device="cuda",
-            )
-        elif self.is_mimo_v2():
-            # MiMo-V2-Flash: per-layer allocation deferred to the binding
-            # loop, so each layer gets the exact num_kv_heads it needs.
-            self.kv_cache = None
-            self.kv_scale = None
-            self._kv_layer_cache_store = []
-        else:
-            self.kv_cache = torch.zeros(
-                2,
-                hf_config.num_hidden_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
-
-            self.kv_scale = torch.zeros(
-                2,
-                hf_config.num_hidden_layers,
-                self.num_physical_kvcache_blocks,
-                num_kv_heads,
-                self.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            )
-
+        # Primary KV cache allocation (model-agnostic, delegated to the
+        # attention builder). Each builder owns its tensor layout: MLA →
+        # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
+        # MiMo-V2 → defer per-module; standard MHA → split-K/V `[2, L, ...]`.
+        # Returned tensors are setattr'd on `self` under their conventional
+        # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
+        # _kv_layer_cache_store) so binding code and downstream consumers
+        # find them where they expect.
+        main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
+            num_kv_heads, num_draft_layers
+        )
+        for name, value in main_kv.items():
+            setattr(self, name, value)
+        
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
         # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
