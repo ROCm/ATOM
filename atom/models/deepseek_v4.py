@@ -42,7 +42,7 @@ from atom.model_ops.quant_v4 import (
 )
 from atom.model_ops.sparse_attn_v4 import (  # noqa: F401
     hc_split_sinkhorn,
-    sparse_attn_ragged,
+    sparse_attn_ragged_varlen,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_backend_gate import use_new_v4_backend  # noqa: F401
@@ -1498,35 +1498,45 @@ class DeepseekV4Attention(nn.Module):
                     kv_sa = self.swa_kv[slot : slot + 1]
 
             sparse_kvs.append(kv_sa.squeeze(0))
-            sparse_topks.append(topk_idxs.squeeze(0))
+            sparse_topks.append(topk_idxs.reshape(-1))
 
         # Ragged sparse attention: concatenate per-seq queries and KV pools,
-        # then rewrite each token's local topk indices into global KV offsets.
+        # and pass varlen topk spans so the kernel can add global KV offsets.
         q_sa = q.squeeze(0).contiguous()
         kv_sa = torch.cat(sparse_kvs, dim=0).contiguous()
-        max_topk = max(t.size(-1) for t in sparse_topks)
-        topk_sa = torch.full(
-            (q_sa.size(0), max_topk),
-            -1,
-            device=x.device,
-            dtype=torch.int32,
+        topk_flat = torch.cat(sparse_topks).contiguous()
+        ctx = get_forward_context()
+        sparse_layouts = (
+            getattr(ctx.attn_metadata, "v4_sparse_layouts", None)
+            if ctx is not None and ctx.attn_metadata is not None
+            else None
         )
-        kv_offsets = torch.empty(q_sa.size(0), device=x.device, dtype=torch.int32)
-        token_base = 0
-        kv_base = 0
-        for seq_kv, seq_topk in zip(sparse_kvs, sparse_topks):
-            seq_len = seq_topk.size(0)
-            seq_topk = seq_topk.int()
-            topk_sa[token_base : token_base + seq_len, : seq_topk.size(-1)] = (
-                seq_topk
-            )
-            kv_offsets[token_base : token_base + seq_len] = kv_base
-            token_base += seq_len
-            kv_base += seq_kv.size(0)
-        topk_sa = torch.where(topk_sa >= 0, topk_sa + kv_offsets[:, None], topk_sa)
+        assert self.compress_ratio in (0, 4, 128), (
+            f"unexpected V4 compress_ratio={self.compress_ratio}; "
+            "expected one of 0, 4, 128"
+        )
+        if _v4_is_dummy_run():
+            topk_starts = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int64)
+            topk_lens = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int32)
+            kv_offsets = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int32)
+            max_topk = 1
+        else:
+            layout = sparse_layouts[self.compress_ratio]
+            topk_starts = layout["topk_starts"]
+            topk_lens = layout["topk_lens"]
+            kv_offsets = layout["kv_offsets"]
+            max_topk = layout["max_topk"]
 
-        o = sparse_attn_ragged(
-            q_sa, kv_sa, self.attn_sink, topk_sa, self.softmax_scale
+        o = sparse_attn_ragged_varlen(
+            q_sa,
+            kv_sa,
+            self.attn_sink,
+            topk_flat,
+            topk_starts,
+            topk_lens,
+            kv_offsets,
+            max_topk,
+            self.softmax_scale,
         ).unsqueeze(0)
 
         # Inverse RoPE on output's rope dims to remove absolute-position
