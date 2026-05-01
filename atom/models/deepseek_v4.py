@@ -42,7 +42,11 @@ from atom.model_ops.quant_v4 import (
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn, sparse_attn  # noqa: F401
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_backend_gate import use_new_v4_backend  # noqa: F401
-from atom.model_ops.v4_kernels import update_compressor_states, swa_write  # noqa: F401
+from atom.model_ops.v4_kernels import (  # noqa: F401
+    fused_compress_attn,
+    swa_write,
+    update_compressor_states,
+)
 from atom.utils.forward_context import get_forward_context
 
 # ---------------------------------------------------------------------------
@@ -126,36 +130,6 @@ def _v4_is_dummy_run() -> bool:
     """True during the warmup forward (kv_cache bindings may not be in place)."""
     ctx = get_forward_context()
     return ctx is not None and ctx.context is not None and ctx.context.is_dummy_run
-
-
-def _v4_scatter_compressed(
-    kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    kv: torch.Tensor,
-    ci_start: int,
-    n_compressed: int,
-    k_per_block: int,
-) -> None:
-    """Scatter `n_compressed` compressed entries into the classical KV pool.
-
-    Args:
-        kv_cache: [num_blocks, k_per_block, head_dim] per-layer pool view.
-        block_table: [max_blocks] physical block IDs for the current seq.
-        kv: [n_compressed, head_dim] entries to write.
-        ci_start: absolute compressed index of the first entry to write.
-        n_compressed: number of entries to write.
-        k_per_block: entries per block (lcm/m for CSA, lcm/m' for HCA).
-    """
-    if n_compressed == 0:
-        return
-    device = kv.device
-    ci = torch.arange(
-        ci_start, ci_start + n_compressed, device=device, dtype=torch.long
-    )
-    block_in_seq = ci // k_per_block
-    slot_in_block = ci % k_per_block
-    physical_blocks = block_table[block_in_seq].long()
-    kv_cache[physical_blocks, slot_in_block] = kv
 
 
 def _v4_gather_compressed(
@@ -689,11 +663,26 @@ def _get_compress_topk_idxs(
 class Compressor(nn.Module):
     """Compresses KV cache via learned gated pooling over `compress_ratio` consecutive tokens.
 
-    Port of inference/model.py:279-377. When `overlap=True` (always set when
-    ratio==4, used by CSA), the compression uses overlapping windows to smooth
-    block boundaries. When `rotate=True` (only the Indexer's compressor),
-    output is Hadamard-rotated and FP4-simulated; otherwise non-RoPE dims are
-    FP8-simulated.
+    Port of inference/model.py:279-377. `overlap=True` (always set when
+    ratio==4, used by CSA) uses overlapping windows to smooth block boundaries.
+
+    Forward delegates pool + RMSNorm + RoPE + bf16 kv_cache scatter to a single
+    fused Triton kernel (`fused_compress_attn`). Per-source-position dispatch
+    inside the kernel (`s >= start_pos` → INPUT, else state cache) handles
+    fresh prefill / chunked prefill / single-token decode / MTP-N uniformly.
+
+    !!!! TODO: QUANT NOT YET FUSED — output drifts from training-time numerics !!!!
+    The reference model trained with QAT round-trip:
+      - CSA path (rotate=False): `act_quant_inplace(kv[..., :-rd], 64, "ue8m0")`
+                                 (BF16 → FP8 e4m3 with ue8m0 scale → BF16)
+      - Indexer path (rotate=True): `rotate_activation(kv); fp4_act_quant_inplace(kv, 32)`
+                                    (Hadamard rotate then BF16 → FP4 e2m1 → BF16)
+    Currently the fused kernel writes raw post-RoPE BF16 to kv_cache, skipping
+    both. End-to-end testing shows outputs remain coherent (4 prompts from PR
+    #650 baseline still produce sensible completions), but they are NOT
+    byte-equal to baseline; benchmark accuracy (lm_eval / GSM8K) MAY regress.
+    `self.rotate` is preserved on the module as the discriminator for the
+    follow-up PR that ports the two quant flavours into the kernel.
     """
 
     def __init__(
@@ -769,21 +758,6 @@ class Compressor(nn.Module):
             persistent=False,
         )
 
-    def overlap_transform(
-        self, tensor: torch.Tensor, value: float = 0.0
-    ) -> torch.Tensor:
-        """Reshape the [b, s, ratio, 2*d] overlap-projected tensor into [b, s, 2*ratio, d]
-        such that the second half (size ratio) holds the current window's
-        normal-projection slice and the first half (size ratio) holds the
-        previous query position's overlap-projection slice (-inf padded for s=0).
-        """
-        b, s, _, _ = tensor.size()
-        ratio, d = self.compress_ratio, self.head_dim
-        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
-        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
-        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
-        return new_tensor
-
     def forward(
         self,
         x: torch.Tensor,
@@ -792,64 +766,91 @@ class Compressor(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         context_lens: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """Compress KV for the input tokens. Writes into self.kv_cache when a
-        compression block boundary is hit; otherwise just buffers state and returns None.
+        """Compress KV for the input tokens.
+
+        Single fused Triton kernel does pool + RMSNorm + RoPE + bf16 kv_cache
+        scatter in one launch. Generic across fresh prefill / chunked prefill /
+        decode / MTP-N via per-source-position dispatch in the kernel — no
+        .item() sync, no caller-supplied start_pos. Kernel loads
+        `start_pos = positions[0]` and `end_pos = context_lens[0]` itself.
+
+        TODO: quant (FP8 ue8m0 for CSA, FP4 + Hadamard for Indexer) is NOT
+        applied; see class docstring.
 
         Args:
-            x: [num_tokens, dim] (2D, ATOM convention) or [B, S, dim] (3D, legacy).
-                Treated as a SINGLE sequence (caller pre-slices the per-seq chunk
-                in PR3-main multi-seq dispatch).
-            positions: [num_tokens] absolute token positions for this sequence.
-                `positions[0]` drives the compressor's overlap-window bookkeeping
-                and the block-table scatter index.
-            slot: per-request state-cache slot — selects which row of
-                `kv_state` / `score_state` this seq writes/reads. Defaults to 0
-                for legacy single-seq callers.
-            block_table: `[max_blocks]` int — physical block IDs for this seq's
-                classical KV cache. If None (warmup or pre-PR3-main caller),
-                scatter writes are skipped.
+            x:           [num_tokens, dim] or [B, S, dim] (single sequence).
+            positions:   [num_tokens] absolute token positions.
+            slot:        per-request state-cache slot.
+            block_table: [max_blocks] physical block IDs; None during warmup
+                         to skip kv_cache scatter.
+            context_lens: [1] absolute end-of-context for this seq. Required.
+                         Used by both fused kernel (end_pos load) and
+                         `update_compressor_states` (write-window mask).
+
         Returns:
-            Compressed KV slice that was just written ([1, S/ratio, head_dim] in
-            prefill, or [1, 1, head_dim] in decode), or None if no compression
-            boundary was hit on this call.
+            Compressed KV `[1, n_max, head_dim]` post-norm post-rope BF16
+            PADDED tensor (rows past `n_actual` are uninitialized — sparse_attn
+            is gather-based and never reads them). Returns None if
+            `token_num == 0`.
         """
-        # PR3-pre2c-B: kv_cache is bound by the V4 attention builder; during
-        # warmup the binding hasn't run yet but writes are guarded below by
-        # `_v4_is_dummy_run()`, so a None kv_cache is OK in that path.
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
-        # Single GPU→CPU sync per call: needed for the prefill/decode branch,
-        # `should_compress` check, and the scatter `ci` index. Tensor-side ops
-        # below use `positions[0]` directly (0-d tensor index) where the value
-        # only feeds slot/RoPE arithmetic — no extra syncs.
-        start_pos = int(positions[0].item())
+        assert context_lens is not None, (
+            "Compressor.forward: context_lens kwarg is required (caller must "
+            "pass per-seq slice from attn_metadata.context_lens)"
+        )
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # [num_tokens, dim] → [1, num_tokens, dim]
-        bsz, seqlen, _ = x.size()
+            x = x.unsqueeze(0)
+        bsz, token_num, _ = x.size()
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
         rd = self.rope_head_dim
         dtype = x.dtype
 
-        # Compression always done in fp32 for stability.
+        # Projection (always fp32 for stability).
         x = x.float()
         kv = self.wkv(x)
         score = self.wgate(x)
 
-        # Unified in-place update of `kv_state` + `score_state` ring buffer
-        # (per paper §3.6.1 per-request state cache). Each token at absolute
-        # `pos` lands at `kv_state[slot, pos % STATE_SIZE]` where
-        # STATE_SIZE = 2*ratio (CSA overlap) or ratio (HCA). No segment
-        # switching, no roll. Phase (fresh prefill vs decode/prefix-cache)
-        # is derived inside the kernel from `context_lens` vs `cu_seqlens_q`
-        # — no `IS_PREFILL` flag. ape is added inside the kernel; caller
-        # MUST NOT pre-add it.
-        # context_lens MUST be supplied by caller (Attention.forward /
-        # Indexer.forward per-seq slice from `attn_metadata.context_lens`).
-        # No positions-derived fallback inside the kernel/wrapper.
-        assert context_lens is not None, (
-            "Compressor.forward: context_lens kwarg is required (caller must "
-            "pass per-seq slice from attn_metadata.context_lens)"
+        # ====== Unified fused kernel path (CSA + Indexer) ======
+        # Order is critical: fused kernel reads state cache as-of-end-of-
+        # PREVIOUS-fwd (so historic positions still in their ring slots).
+        # `update_compressor_states` overwrites them with this fwd's data
+        # for the NEXT fwd's overlap — must run AFTER the fused kernel.
+        #
+        # The kernel does pool + RMSNorm + RoPE + BF16 store to kv_cache.
+        # No quant is applied (FP8 ue8m0 for CSA, FP4 + Hadamard for Indexer
+        # are both dropped). Trade-off: removes the QAT round-trip the model
+        # was trained with → output quality drops measurably from baseline.
+        # TODO: port the quant variants into the kernel for full byte-equal.
+        cos_cache, sin_cache = self.rotary_emb._caches(x.device)
+        scatter_block_table = (
+            block_table
+            if (block_table is not None and not _v4_is_dummy_run())
+            else None
+        )
+        scatter_kv_cache = self.kv_cache if scatter_block_table is not None else None
+        out = fused_compress_attn(
+            kv_in=kv.squeeze(0).contiguous(),
+            score_in=score.squeeze(0).contiguous(),
+            kv_state=self.kv_state,
+            score_state=self.score_state,
+            slot=slot,
+            positions=positions,
+            context_lens=context_lens,
+            ape=self.ape,
+            rms_weight=self.norm.weight,
+            rms_eps=self.norm.eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=scatter_kv_cache,
+            block_table=scatter_block_table,
+            k_per_block=_V4_BLOCK_SIZE // ratio,
+            overlap=overlap,
+            ratio=ratio,
+            head_dim=d,
+            rope_head_dim=rd,
+            out_dtype=dtype,
         )
         update_compressor_states(
             kv.squeeze(0),
@@ -863,134 +864,7 @@ class Compressor(nn.Module):
             overlap=overlap,
             slot=slot,
         )
-
-        if start_pos == 0:
-            # ===== Prefill softmax-pool path =====
-            should_compress = seqlen >= ratio
-            remainder = seqlen % ratio
-            cutoff = seqlen - remainder
-
-            # Truncate kv/score to the part the downstream softmax-pool
-            # consumes (the `[:cutoff]` rows). Legacy did this implicitly via
-            # `kv, kv_state[...] = kv.split(...)` tuple unpack at the same
-            # time as the partial-state save.
-            if remainder > 0:
-                kv = kv[:, :cutoff]
-                score = score[:, :cutoff]
-            # Reshape to [B, num_blocks, ratio, coff*d] and softmax-pool.
-            kv = kv.unflatten(1, (-1, ratio))
-            score = score.unflatten(1, (-1, ratio)) + self.ape
-            if overlap:
-                kv = self.overlap_transform(kv, 0.0)
-                score = self.overlap_transform(score, float("-inf"))
-            kv = (kv * score.softmax(dim=2)).sum(dim=2)
-        else:
-            # ===== Decode boundary-compression path =====
-            # (state write itself is done by update_compressor_states above)
-            should_compress = (start_pos + 1) % self.compress_ratio == 0
-            if overlap:
-                if should_compress:
-                    # State cache is a pos-%-(2*ratio) ring buffer (no roll).
-                    # The just-completed block id `comp_id = start_pos //
-                    # ratio` determines which half is A-side (current) vs
-                    # B-side (previous):
-                    #   comp_id even: A at slot[0:ratio], B at slot[ratio:2*ratio]
-                    #   comp_id odd:  A at slot[ratio:2*ratio], B at slot[0:ratio]
-                    # Concat order matches old layout: [B-side; A-side].
-                    comp_id = start_pos // ratio
-                    if comp_id % 2 == 0:
-                        b_lo, b_hi = ratio, 2 * ratio
-                        a_lo, a_hi = 0, ratio
-                    else:
-                        b_lo, b_hi = 0, ratio
-                        a_lo, a_hi = ratio, 2 * ratio
-                    kv_state = torch.cat(
-                        [
-                            self.kv_state[slot : slot + 1, b_lo:b_hi, :d],
-                            self.kv_state[slot : slot + 1, a_lo:a_hi, d:],
-                        ],
-                        dim=1,
-                    )
-                    score_state = torch.cat(
-                        [
-                            self.score_state[slot : slot + 1, b_lo:b_hi, :d],
-                            self.score_state[slot : slot + 1, a_lo:a_hi, d:],
-                        ],
-                        dim=1,
-                    )
-                    kv = (kv_state * score_state.softmax(dim=1)).sum(
-                        dim=1, keepdim=True
-                    )
-            else:
-                if should_compress:
-                    kv = (
-                        self.kv_state[slot : slot + 1]
-                        * self.score_state[slot : slot + 1].softmax(dim=1)
-                    ).sum(dim=1, keepdim=True)
-
-        if not should_compress:
-            return None
-
-        kv = self.norm(kv.to(dtype))
-
-        # Apply RoPE to the rope-head-dim tail of compressed entries.
-        if start_pos == 0:
-            comp_pos = torch.arange(0, cutoff, ratio, device=x.device, dtype=torch.long)
-        else:
-            comp_pos = torch.tensor(
-                [start_pos + 1 - self.compress_ratio],
-                device=x.device,
-                dtype=torch.long,
-            )
-        self.rotary_emb(comp_pos, kv[..., -rd:])
-
-        # QAT round-trip: rotated branch (Indexer) uses Hadamard + FP4 sim;
-        # plain branch uses FP8 sim on non-rope dims only.
-        if self.rotate:
-            kv = rotate_activation(kv)
-            fp4_act_quant_inplace(kv, _FP4_BLOCK_SIZE)
-        else:
-            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
-
-        # PR3-pre2c-B: scatter compressed entries into the block-table-indexed
-        # classical KV pool. self.kv_cache here is the per-layer pool view of
-        # shape `[num_blocks, k_per_block, head_dim]` (bound by
-        # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor). During
-        # warmup the builder binding has not yet run, so we skip writes —
-        # warmup forward never reads kv_cache (decode path is not exercised).
-        # PR3-main: `block_table` is now passed by the caller (Attention.forward
-        # iterates over seqs and routes per-seq block_table here).
-        if block_table is not None and not _v4_is_dummy_run():
-            assert self.kv_cache is not None and self.kv_cache.dim() == 3, (
-                f"compressor.kv_cache must be a [num_blocks, k, head_dim] "
-                f"per-layer view post-binding; got "
-                f"{None if self.kv_cache is None else self.kv_cache.shape}"
-            )
-            k_per_block = _V4_BLOCK_SIZE // ratio
-            if start_pos == 0:
-                # Prefill: write all `seqlen // ratio` compressed entries
-                # at compressed indices [0, seqlen // ratio).
-                _v4_scatter_compressed(
-                    self.kv_cache,
-                    block_table,
-                    kv.squeeze(0),  # [n_compressed, head_dim]
-                    ci_start=0,
-                    n_compressed=seqlen // ratio,
-                    k_per_block=k_per_block,
-                )
-            else:
-                # Decode: write the single just-compressed entry at
-                # compressed index `start_pos // ratio`.
-                ci = start_pos // ratio
-                _v4_scatter_compressed(
-                    self.kv_cache,
-                    block_table,
-                    kv.squeeze(0),  # [1, head_dim]
-                    ci_start=ci,
-                    n_compressed=1,
-                    k_per_block=k_per_block,
-                )
-        return kv
+        return out
 
 
 class Indexer(nn.Module):
@@ -1071,6 +945,7 @@ class Indexer(nn.Module):
         slot: int = 0,
         block_table: Optional[torch.Tensor] = None,
         context_lens: Optional[torch.Tensor] = None,
+        start_pos: Optional[int] = None,
     ) -> torch.Tensor:
         """Compute sparse top-k indices over the indexer's compressed KV cache.
 
@@ -1091,14 +966,15 @@ class Indexer(nn.Module):
         """
         assert self.rotary_emb is not None
         assert x.dim() == 2 and qr.dim() == 2
-        seqlen = x.size(0)
-        # Single GPU→CPU sync per call for n_committed Python int + the inner
-        # Compressor (which extracts its own from positions). Tensor-side index
-        # math uses `positions` directly.
-        start_pos = int(positions[0].item())
+        token_num = x.size(0)
+        # start_pos: prefer caller-supplied (from cpu_meta) to avoid .item().
+        # Used locally for the topk masks below; inner Compressor no longer
+        # needs it (kernel loads positions[0] / context_lens[0] itself).
+        if start_pos is None:
+            start_pos = int(positions[0].item())
         ratio = self.compress_ratio
         rd = self.rope_head_dim
-        end_pos = start_pos + seqlen
+        end_pos = start_pos + token_num
 
         # Lazy plumb rotary_emb into compressor (kv_cache is now bound by
         # the V4 attention builder; pre-PR3-pre2c-B the kv_cache plumbing
@@ -1107,7 +983,7 @@ class Indexer(nn.Module):
             self.compressor.rotary_emb = self.rotary_emb
 
         # ----- Indexer Q (2D Linear, then add B=1 dim for RoPE / einsum) -----
-        q = self.wq_b(qr).view(seqlen, self.n_heads, self.head_dim)
+        q = self.wq_b(qr).view(token_num, self.n_heads, self.head_dim)
         q = q.unsqueeze(0)  # [1, S, H, D]
         self.rotary_emb(positions, q[..., -rd:])
         q = rotate_activation(q)
@@ -1149,15 +1025,15 @@ class Indexer(nn.Module):
         # ----- Top-k selection over compressed positions -----
         if start_pos == 0:
             mask = (
-                torch.arange(seqlen // ratio, device=x.device).repeat(seqlen, 1)
-                >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
+                torch.arange(token_num // ratio, device=x.device).repeat(token_num, 1)
+                >= torch.arange(1, token_num + 1, device=x.device).unsqueeze(1) // ratio
             )
             index_score = index_score + torch.where(mask, float("-inf"), 0.0)
         topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
         if start_pos == 0:
             mask = (
                 topk_idxs
-                >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
+                >= torch.arange(1, token_num + 1, device=x.device).unsqueeze(1) // ratio
             )
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
         else:
@@ -1469,8 +1345,8 @@ class DeepseekV4Attention(nn.Module):
         for seq_idx in range(num_seqs):
             seq_start = seq_offsets[seq_idx]
             seq_end = seq_offsets[seq_idx + 1]
-            seqlen = seq_end - seq_start
-            if seqlen == 0:
+            token_num = seq_end - seq_start
+            if token_num == 0:
                 continue
             slot = slots[seq_idx]
             block_table = per_seq_bts[seq_idx]
@@ -1484,6 +1360,7 @@ class DeepseekV4Attention(nn.Module):
                 start_pos = start_pos_per_seq[seq_idx]
             else:
                 start_pos = int(seq_positions[0].item())
+            end_pos = start_pos + token_num
 
             # Per-seq state-cache reset on prefill from scratch.
             # Only this seq's slot is touched — other concurrent seqs are
@@ -1497,9 +1374,9 @@ class DeepseekV4Attention(nn.Module):
                         self.indexer.compressor.kv_state[slot].zero_()
                         self.indexer.compressor.score_state[slot].fill_(float("-inf"))
 
-            # topk_idxs (per-seq, since seqlen + start_pos differ).
+            # topk_idxs (per-seq, since token_num + start_pos differ).
             topk_idxs = _get_window_topk_idxs(
-                win, 1, seqlen, start_pos, device=x.device
+                win, 1, token_num, start_pos, device=x.device
             )
             seq_context_lens = context_lens[seq_idx : seq_idx + 1]
             if self.compress_ratio:
@@ -1514,10 +1391,11 @@ class DeepseekV4Attention(nn.Module):
                         slot=slot,
                         block_table=block_table,
                         context_lens=seq_context_lens,
+                        start_pos=start_pos,
                     )
                 else:
                     compress_topk_idxs = _get_compress_topk_idxs(
-                        ratio, 1, seqlen, start_pos, offset, device=x.device
+                        ratio, 1, token_num, start_pos, offset, device=x.device
                     )
                 topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
             topk_idxs = topk_idxs.int()
@@ -1526,7 +1404,7 @@ class DeepseekV4Attention(nn.Module):
             # (PR-A Phase 1a). The new path writes via Triton kernel using
             # `positions % win` per token; equivalent to legacy ring-rotation.
             if use_new_v4_backend(self.layer_id):
-                if seqlen <= win:
+                if token_num <= win:
                     seq_kv_flat = seq_kv.squeeze(0).contiguous()
                     seq_pos_flat = seq_positions
                 else:
@@ -1540,10 +1418,10 @@ class DeepseekV4Attention(nn.Module):
                 )
                 swa_write(seq_kv_flat, seq_pos_flat, slot_per_token, self.swa_kv, win)
             elif start_pos == 0:
-                if seqlen <= win:
-                    self.swa_kv[slot : slot + 1, :seqlen] = seq_kv
+                if token_num <= win:
+                    self.swa_kv[slot : slot + 1, :token_num] = seq_kv
                 else:
-                    cutoff = seqlen % win
+                    cutoff = token_num % win
                     (
                         self.swa_kv[slot : slot + 1, cutoff:win],
                         self.swa_kv[slot : slot + 1, :cutoff],
@@ -1551,9 +1429,10 @@ class DeepseekV4Attention(nn.Module):
             else:
                 self.swa_kv[slot : slot + 1, start_pos % win] = seq_kv.squeeze(1)
 
-            # Compressor + kv_sa construction. Branches on prefill
-            # (start_pos == 0) vs decode. Compressor extracts its own start_pos
-            # from `seq_positions[0]` internally.
+            # Compressor + kv_sa construction. Prefill (start_pos == 0) directly
+            # consumes the kernel-returned padded compress tensor (sparse_attn is
+            # gather-based via topk_idxs — padded rows past n_actual are never
+            # accessed). Decode reads accumulated history from kv_cache.
             if start_pos == 0:
                 kv_sa = seq_kv
                 if self.compress_ratio:
@@ -1576,9 +1455,11 @@ class DeepseekV4Attention(nn.Module):
                         context_lens=seq_context_lens,
                     )
                     # sparse_attn input layout: [SWA window || compressed
-                    # entries gathered from block-table]. n_committed accounts
-                    # for the entry just written this step (if any).
-                    n_committed = (start_pos + 1) // ratio
+                    # entries gathered from block-table]. n_committed counts
+                    # all boundaries up to and including this fwd's window
+                    # (end_pos // ratio) — generalizes the single-token decode
+                    # formula to MTP-N where multiple boundaries may commit.
+                    n_committed = end_pos // ratio
                     if (
                         block_table is not None
                         and not _v4_is_dummy_run()

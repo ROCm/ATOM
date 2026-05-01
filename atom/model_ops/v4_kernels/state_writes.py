@@ -136,26 +136,22 @@ def swa_write_reference(
     swa_kv[slot_per_token, ring_idx] = kv
 
 
-# === Unified Compressor state save (prefill + decode) ===================
+# === Unified Compressor state save (all phases) =========================
 # Paper §3.6.1: per-request fixed-size state cache for "uncompressed tail
 # tokens + previous block as overlap context (B-side, eq 11)". ATOM keeps
 # this as a single ring of size `STATE_SIZE = 2*ratio` (CSA overlap) or
 # `ratio` (HCA). Each token at absolute `pos` writes to slot
-# `pos % STATE_SIZE`; the consumer (Compressor.forward softmax-pool) reads
-# two halves whose A-side / B-side identity alternates by block-id parity.
+# `pos % STATE_SIZE`; the consumer (`fused_compress.*` kernel) reads its K
+# source rows per-source-position, dispatching INPUT vs state cache by the
+# `s >= start_pos` test.
 #
-# Write mask:
-#   Fresh prefill (start_pos == 0): keep B-side overlap + tail, i.e.
-#     pos in [max(0, cutoff - ratio), seqlen_q) where cutoff = (seqlen_q
-#     // ratio) * ratio. Tokens before are bulk-compressed from input
-#     directly into kv_cache; writing them here would race (multiple pos
-#     mapping to same slot) and waste BW.
-#   Decode / prefix-cache prefill (start_pos > 0): every token in this
-#     forward writes (each pos is in current in-progress block region;
-#     no race because seqlen_q is bounded by ratio for V4 decode).
-#
-# Discriminated by `is_fresh_prefill = (context_n == seqlen_q)` derived
-# inside the kernel from metadata — no IS_PREFILL constexpr or kwarg.
+# Write mask (uniform — no prefill/decode discrimination):
+#   Always preserve the last STATE_SIZE absolute positions of this forward:
+#     write_start_pos = max(0, context_n - STATE_SIZE)
+#     do_write        = pos >= write_start_pos
+#   This is the smallest invariant that keeps the next forward's first
+#   compress-boundary read fully populated regardless of how this forward
+#   was scheduled (fresh prefill, chunked prefill, single decode, MTP-N).
 
 
 @triton.jit
@@ -187,18 +183,25 @@ def _update_compressor_states_kernel(
       seqlen_q   = cu_seqlens_q[seq+1] - cu_seqlens_q[seq]
       context_n  = context_lens[seq]                   (incl. tokens in this fwd)
       start_pos  = context_n - seqlen_q
-      is_fresh_prefill = (start_pos == 0)              ⇔ (context_n == seqlen_q)
 
-    Per-token write mask:
-      Fresh prefill: write iff pos >= max(0, cutoff - RATIO)
-                     where cutoff = (seqlen_q // RATIO) * RATIO
-                     (HCA / no-overlap: write iff pos >= cutoff)
-      Decode:        write iff pos >= start_pos        (always true for tokens
-                     in this forward → all tokens written)
+    Per-token write mask (unified across fresh prefill / chunked prefill /
+    single-token decode / MTP-N):
+      Always preserve the last STATE_SIZE positions of THIS forward in state
+      cache (so the next forward has a full B-side overlap window for its
+      first compress-boundary read):
+
+        write_start_pos = max(0, context_n - STATE_SIZE)
+        do_write        = pos >= write_start_pos
+
+      For fresh prefill with seqlen_q >= STATE_SIZE this writes positions
+      [seqlen-STATE_SIZE, seqlen). For shorter forwards it writes everything.
+      No is_prefill / is_fresh_prefill discrimination — pure function of
+      context length.
 
     Per-token destination:
       dst = pos % STATE_SIZE                           (uniform; consumer
-                                                       resolves A/B by parity)
+                                                       resolves A/B by parity
+                                                       or per-source position)
     """
     tok = tl.program_id(0)
     pos = tl.load(positions_ptr + tok)
@@ -209,16 +212,9 @@ def _update_compressor_states_kernel(
     seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
     seqlen_q = seq_end - seq_start
     context_n = tl.load(context_lens_ptr + seq_idx)
-    start_pos = context_n - seqlen_q
-    is_fresh_prefill = start_pos == 0
 
-    # write_start_pos: first absolute position to preserve in state cache.
-    cutoff = (seqlen_q // RATIO) * RATIO
-    if OVERLAP:
-        prefill_write_start = tl.maximum(cutoff - RATIO, 0)
-    else:
-        prefill_write_start = cutoff
-    write_start_pos = tl.where(is_fresh_prefill, prefill_write_start, start_pos)
+    # Unified write window: last STATE_SIZE absolute positions of this fwd.
+    write_start_pos = tl.maximum(context_n - STATE_SIZE, 0)
     do_write = pos >= write_start_pos
 
     dst = pos % STATE_SIZE
@@ -361,35 +357,24 @@ def update_compressor_states_reference(
     score_state: torch.Tensor,
     *,
     positions: torch.Tensor,
-    seqlen: int,
+    context_n: int,
     ratio: int,
     overlap: bool,
     slot: int,
-    is_prefill: bool,
 ) -> None:
     """Pure-PyTorch reference equivalent of `update_compressor_states`.
 
-    Same `pos % STATE_SIZE` layout as the kernel. `is_prefill` here is for
-    test bookkeeping only — it determines the write mask but does not affect
-    dst computation.
+    Unified write mask (no prefill/decode discrimination): preserve the last
+    STATE_SIZE positions of THIS forward, where STATE_SIZE = 2*ratio (overlap)
+    or ratio (HCA). `context_n` is the absolute end-of-context position +1
+    (i.e., `start_pos + seqlen` for this fwd).
     """
     state_size = (2 if overlap else 1) * ratio
-    if is_prefill:
-        # Fresh prefill: write [max(0, cutoff-ratio), seqlen) for overlap;
-        # [cutoff, seqlen) for HCA.
-        cutoff = (seqlen // ratio) * ratio
-        write_start = max(0, cutoff - ratio) if overlap else cutoff
-        for i in range(seqlen):
-            p = int(positions[i].item())
-            if p < write_start:
-                continue
-            dst = p % state_size
-            kv_state[slot, dst] = kv[i]
-            score_state[slot, dst] = score[i] + ape[p % ratio]
-    else:
-        # Decode/MTP: every token in this fwd writes.
-        for i in range(kv.size(0)):
-            p = int(positions[i].item())
-            dst = p % state_size
-            kv_state[slot, dst] = kv[i]
-            score_state[slot, dst] = score[i] + ape[p % ratio]
+    write_start = max(0, context_n - state_size)
+    for i in range(kv.size(0)):
+        p = int(positions[i].item())
+        if p < write_start:
+            continue
+        dst = p % state_size
+        kv_state[slot, dst] = kv[i]
+        score_state[slot, dst] = score[i] + ape[p % ratio]
