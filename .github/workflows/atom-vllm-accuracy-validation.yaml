@@ -232,7 +232,7 @@ jobs:
               {
                   "toggle_env": "RUN_KIMI_K2_TP8",
                   "model_name": "Kimi-K2-Thinking-MXFP4 TP8",
-                  "model_path": "amd/Kimi-K2-Thinking-MXFP4",
+                  "model_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.90,
                   "env_vars": "",
@@ -241,7 +241,7 @@ jobs:
               {
                   "toggle_env": "RUN_KIMI_K25_TP8",
                   "model_name": "Kimi-K2.5-MXFP4 TP8",
-                  "model_path": "amd/Kimi-K2.5-MXFP4",
+                  "model_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
