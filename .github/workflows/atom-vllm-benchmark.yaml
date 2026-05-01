@@ -399,16 +399,8 @@ jobs:
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
               model_params = []
               seen = set()
-              prefix = str(model.get("prefix", ""))
-              extra_concurrency = (
-                  (128, 256)
-                  if prefix.startswith((
-                      "qwen3-5-",
-                      "kimi-k2-thinking-mxfp4-",
-                      "kimi-k25-mxfp4-",
-                  ))
-                  else ()
-              )
+              # Run all benchmark cases at the two highest supported concurrency levels too.
+              extra_concurrency = (128, 256)
 
               for param in params:
                   variants = [param]
