@@ -33,6 +33,7 @@ from atom.model_ops.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    gemm_a8w8_blockscale_preshuffle_impl,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.quant_v4 import (
@@ -1106,6 +1107,13 @@ class DeepseekV4Attention(nn.Module):
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
         self.scale_fmt = args.scale_fmt
+        # Output-LoRA `wo_a` path: default = G-loop FP8 blockscale (calls
+        # `gemm_a8w8_blockscale_preshuffle` per group; same kernel wo_b/wq_b/wkv
+        # use). env=1 = legacy BF16 grouped einsum (debug fallback).
+        # Read once at init so per-forward branch has zero env-lookup cost; also
+        # determines what `process_weights_after_loading` does (G-loop path lets
+        # LinearBase do standard FP8 + shuffle; einsum path dequants to BF16).
+        self._use_oa_einsum = os.environ.get("ATOM_V4_OA_USE_EINSUM", "0") == "1"
 
         qc = args.quant_config
         p = prefix  # e.g. "layers.7.attn"
@@ -1215,53 +1223,49 @@ class DeepseekV4Attention(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
+        """Set up wo_a for forward.
 
-        Called by ATOM's standard loader (atom.model_loader.loader.load_model)
-        after all weights are filled. wo_a is allocated as FP8 ColumnParallelLinear
-        so both `.weight` (FP8) and `.weight_scale` (e8m0 block scale) load
-        correctly via the standard FP8 path. We then dequant to BF16 because
-        forward needs `wo_a.weight` as BF16 for the grouped LoRA einsum
-        (`bsgd,grd->bsgr`); aiter has no FP8 grouped einsum.
+        Two paths, controlled by ATOM_V4_OA_USE_EINSUM (read in __init__):
 
-        Idempotent: if wo_a.weight is already BF16 (e.g. dequant was applied
-        elsewhere), this is a no-op.
+        - default (env=0): **G-loop FP8 blockscale path**. Leave wo_a as a
+          standard FP8 ColumnParallelLinear; LinearBase's standard post-load
+          will shuffle wo_a.weight into CK GEMM layout (same as wo_b/wq_b/wkv).
+          Forward iterates G_local times calling `gemm_a8w8_blockscale_preshuffle`
+          on per-group weight slices using the on-disk per-128-block scale
+          directly (no requant, no precision loss).
+        - env=1: **BF16 einsum fallback**. Dequant wo_a in place to BF16 and
+          set quant_type = QuantType.No so LinearBase skips its FP8 shuffle.
+          Forward uses `torch.einsum`.
+
+        wo_a arrives FP8 + per-128-block scale on disk via the standard FP8
+        ColumnParallelLinear loader. dummy/toy paths (`quant_config=None`)
+        deliver BF16 directly — handled gracefully in both branches.
+
+        Idempotent: re-runs are no-ops in both paths.
         """
+        if not self._use_oa_einsum:
+            # G-loop blockscale: nothing to do; LinearBase post-load handles
+            # shuffle, weight_scale stays in original (out/128, in/128) layout.
+            return
+
+        # ----- einsum fallback path -----
         w = self.wo_a.weight
         if w.dtype == torch.bfloat16:
-            return  # already dequanted
+            return  # already dequanted (idempotent)
         scale = getattr(self.wo_a, "weight_scale", None)
         if w.dtype != torch.float8_e4m3fn or scale is None:
-            return  # nothing to do
+            return  # nothing to do (dummy / toy path)
         # Dequant: w (FP8 [out, in]) × scale (e8m0 [out/128, in/128]) → BF16
         bf16 = _dequant_fp8_block_to_bf16(
             w.data, scale.data.to(torch.float32), block=128
         )
-        # Replace the weight tensor with BF16, drop the scale param so future
-        # loads / introspection don't try to use a stale FP8 scale.
         self.wo_a.weight = atom_parameter(bf16)
         try:
             delattr(self.wo_a, "weight_scale")
         except AttributeError:
             pass
-        # CRITICAL: prevent LinearBase.process_weights_after_loading from
-        # `shuffle_weights(self.weight)` on the now-BF16 wo_a. That shuffle
-        # is for the FP8 CK GEMM layout; applying it to a plain BF16 matrix
-        # consumed by `torch.einsum` corrupts the layout (rows get permuted
-        # within 16×16 blocks, only rows aligned to the block boundaries
-        # stay in place). Iteration order in load_model is parent-first
-        # (DeepseekV4Attention before its child wo_a Linear), so our hook
-        # runs BEFORE the shuffle — overriding `quant_type` here makes the
-        # subsequent LinearBase post-load a no-op for wo_a.
-        #
-        # TODO(perf): replace dequant-to-BF16 + einsum with FP8 batched BMM
-        # (same path as MLA's `_v_up_proj_and_o_proj`). Steps:
-        #   1. Dequant FP8 per-128-block → BF16 (this code)
-        #   2. Reshape to [n_local_groups, o_lora_rank, d_per_group]
-        #   3. Requant via dynamic_per_batched_tensor_quant → FP8 + scalar scale
-        #   4. Forward: _aiter_triton_fp8_bmm(o, W_OA, W_OA_scale, group_size=128)
-        # This avoids the dequant + einsum overhead and reuses the proven MLA
-        # batched-FP8 kernel. See attention_mla.py:211 for reference.
+        # Block LinearBase shuffle on the now-BF16 weight (shuffle is for FP8
+        # CK GEMM layout; on BF16 it would corrupt the einsum input layout).
         from atom.config import QuantType as _QT
 
         self.wo_a.quant_type = _QT.No
@@ -1511,10 +1515,49 @@ class DeepseekV4Attention(nn.Module):
         freqs_slice = self.rotary_emb.freqs_for_positions(positions)
         _apply_rotary_emb(o[..., -rd:], freqs_slice, inverse=True)
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
+        # Default: G-loop FP8 blockscale (each group is a standard 2D GEMM
+        # via the same kernel wo_b/wq_b/wkv use; per-block W scale used as-is).
+        # Fallback (ATOM_V4_OA_USE_EINSUM=1): legacy BF16 grouped einsum.
         o = o.squeeze(0).view(seqlen_total, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        x = self.wo_b(o.flatten(1))
+        if self._use_oa_einsum:
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        else:
+            # G-loop: slice wo_a's shuffled FP8 weight + per-block scale per
+            # group. Shuffle preserves N-block ordering at the 16-row block
+            # boundary, so rows [g*N : (g+1)*N] of the shuffled weight are
+            # still a valid sub-shuffled per-group weight (o_lora_rank=1024
+            # is divisible by 16). per-1x128 scale isn't shuffled by
+            # LinearBase, so its per-group view is the corresponding
+            # contiguous (N/128, K/128) slice.
+            quant_func = self.wo_a.quant_func
+            n = self.o_lora_rank
+            n_scale_blocks = n // 128
+            W_full = self.wo_a.weight  # (G_local*N, K) FP8 shuffled
+            S_full = self.wo_a.weight_scale  # (G_local*N/128, K/128)
+            out_chunks = []
+            for g in range(self.n_local_groups):
+                x_g = o[:, g, :].contiguous()  # (S, K) bf16
+                W_g = W_full[g * n : (g + 1) * n]
+                S_g = S_full[g * n_scale_blocks : (g + 1) * n_scale_blocks]
+                # Per-1x128 act quant (same call shape as LinearBase forward).
+                x_q, x_scale = quant_func(
+                    x_g,
+                    quant_dtype=self.wo_a.params_dtype,
+                    scale=getattr(self.wo_a, "input_scale", None),
+                    transpose_scale=True,
+                )
+                y_g = gemm_a8w8_blockscale_preshuffle_impl(
+                    x_q,
+                    W_g,
+                    x_scale,
+                    S_g,
+                    dtype=torch.bfloat16,
+                    prefix=f"{self.wo_a.prefix}.g{g}",
+                )  # (S, N) bf16
+                out_chunks.append(y_g)
+            o = torch.stack(out_chunks, dim=1)  # (S, G_local, N)
+        x = self.wo_b(o.reshape(seqlen_total, -1))
         return x
 
 
