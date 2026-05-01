@@ -165,10 +165,12 @@ def _sparse_attn_triton(
     out = torch.empty_like(q)
     topk_idxs = topk_idxs.to(torch.int32)
 
-    # Process a small head tile per program, matching the TileLang kernel's
-    # q[h, d] / acc[h, d] structure while keeping V4's D=512 register
-    # pressure bounded.
-    block_h = 2 if D >= 256 else 4
+    # Process a head tile per program. BLOCK_H must be >= 16 on AMD
+    # MFMA-enabled GPUs (gfx9xx/gfx950): TritonAMDGPUOptimizeDotOperands
+    # cannot lower tl.dot operands smaller than the smallest bf16 MFMA
+    # tile (16x16x16) and crashes the pass pipeline rather than falling
+    # back to FMA.
+    block_h = 16
     block_d = triton.next_power_of_2(D)
     block_k = 16 if D >= 256 else 32
     _sparse_attn_triton_kernel[(B * M, triton.cdiv(H, block_h))](
@@ -321,7 +323,8 @@ def _sparse_attn_ragged_triton(
     out = torch.empty_like(q)
     topk_idxs = topk_idxs.to(torch.int32)
 
-    block_h = 2 if D >= 256 else 4
+    # See _sparse_attn_triton: BLOCK_H must be >= 16 for AMD MFMA lowering.
+    block_h = 16
     block_d = triton.next_power_of_2(D)
     block_k = 16 if D >= 256 else 32
     _sparse_attn_ragged_triton_kernel[(T, triton.cdiv(H, block_h))](
@@ -480,7 +483,8 @@ def _sparse_attn_ragged_varlen_triton(
     topk_lens = topk_lens.to(torch.int32).contiguous()
     kv_offsets = kv_offsets.to(torch.int32).contiguous()
 
-    block_h = 2 if D >= 256 else 4
+    # See _sparse_attn_triton: BLOCK_H must be >= 16 for AMD MFMA lowering.
+    block_h = 16
     block_d = triton.next_power_of_2(D)
     block_k = 16 if D >= 256 else 32
     k_max = _bucket_topk(int(max_topk))
