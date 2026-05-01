@@ -25,6 +25,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501
+    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
+)
 from atom.config import Config
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
@@ -381,14 +384,37 @@ def _have_current_atom_config() -> bool:
 def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
     """Dequant block-scaled FP8 e4m3 → BF16 (for wo_a load path).
 
-    Mirrors convert.py:137-141. The wo_a weight is stored FP8 on disk but
-    used as BF16 in inference because aiter doesn't support FP8 grouped einsum.
+    Mirrors convert.py:137-141. The wo_a weight is stored FP8 on disk; we
+    dequant it to BF16 as an intermediate before per-batched-tensor requant
+    in `_v4_dynamic_per_batched_tensor_quant` (the BMM path) or direct use
+    (the einsum fallback path).
     """
     out_dim, in_dim = w_fp8.shape
     w = w_fp8.unflatten(0, (-1, block)).unflatten(-1, (-1, block)).float()
     s = scale.float()
     deq = w * s[:, None, :, None]
     return deq.flatten(2, 3).flatten(0, 1).bfloat16()
+
+
+def _v4_dynamic_per_batched_tensor_quant(
+    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+):
+    """BF16 → FP8 with a single scalar (per-batched-tensor) scale.
+
+    Mirrors `atom.model_ops.attention_mla.dynamic_per_batched_tensor_quant` —
+    inlined here to avoid creating a deepseek_v4 → attention_mla import
+    dependency for one tiny helper.
+
+    Returns (x_fp8, scale) where `scale` is shape `()` (0-dim float32) and
+    satisfies `x ≈ x_fp8.to(float32) * scale`. This matches the `w_scale`
+    contract of `_aiter_triton_fp8_bmm` (kernel does `acc += int_acc * a_scale * b_scale`).
+    """
+    DTYPE_MAX = torch.finfo(dtype).max
+    min_val, max_val = x.aminmax()
+    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-10)
+    scale = DTYPE_MAX / amax
+    x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
+    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1243,12 @@ class DeepseekV4Attention(nn.Module):
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
         self.scale_fmt = args.scale_fmt
+        # Output-LoRA `wo_a` path: default = FP8 batched BMM (single fused launch
+        # via aiter Triton), env=1 = legacy BF16 grouped einsum (debug fallback).
+        # Read once at init so per-forward branch has no env-lookup cost; also
+        # determines what `process_weights_after_loading` does (BMM path requires
+        # requant; einsum path requires keeping the dequanted BF16 weight).
+        self._use_oa_einsum = os.environ.get("ATOM_V4_OA_USE_EINSUM", "0") == "1"
 
         qc = args.quant_config
         p = prefix  # e.g. "layers.7.attn"
@@ -1326,56 +1358,107 @@ class DeepseekV4Attention(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
+        """Set up wo_a for forward.
 
-        Called by ATOM's standard loader (atom.model_loader.loader.load_model)
-        after all weights are filled. wo_a is allocated as FP8 ColumnParallelLinear
-        so both `.weight` (FP8) and `.weight_scale` (e8m0 block scale) load
-        correctly via the standard FP8 path. We then dequant to BF16 because
-        forward needs `wo_a.weight` as BF16 for the grouped LoRA einsum
-        (`bsgd,grd->bsgr`); aiter has no FP8 grouped einsum.
+        Two paths, controlled by ATOM_V4_OA_USE_EINSUM (read in __init__):
 
-        Idempotent: if wo_a.weight is already BF16 (e.g. dequant was applied
-        elsewhere), this is a no-op.
+        - default (env=0): **FP8 batched BMM path**. Dequant wo_a from on-disk
+          FP8+block-scale to BF16, reshape to (G_local, R, K), then re-quantize
+          to FP8 + a single scalar scale via `_v4_dynamic_per_batched_tensor_quant`.
+          Store the result as `self.W_OA` / `self.W_OA_scale` buffers, and
+          replace `self.wo_a.weight` with a 1-element placeholder (frees the
+          ~8 MB/layer BF16 copy). Forward path uses `_aiter_triton_fp8_bmm`.
+        - env=1: **BF16 einsum fallback**. Dequant wo_a in place to BF16 and
+          stop. Forward path uses `torch.einsum` against `self.wo_a.weight`.
+
+        wo_a is allocated as FP8 ColumnParallelLinear so the standard FP8
+        loader fills both `.weight` (FP8 e4m3) and `.weight_scale` (e8m0
+        per-128-block). For dummy/toy paths (`quant_config=None`), the weight
+        arrives as BF16 — both paths handle this transparently.
+
+        Order assumption: this hook runs BEFORE the child `wo_a` LinearBase's
+        `process_weights_after_loading` (which would `shuffle_weights` the
+        weight for FP8 CK GEMM layout). Iteration in `atom.model_loader.loader`
+        is parent-first (verified at PR #650). After we replace
+        `wo_a.quant_type = QuantType.No`, the subsequent LinearBase post-load
+        is a no-op on the placeholder (BMM path) or the BF16 dequanted weight
+        (einsum path). The order assertion below fails fast if upstream loader
+        order ever changes.
+
+        Idempotent: re-runs are no-ops (BMM path checks `hasattr(self, "W_OA")`,
+        einsum path checks `weight.dtype == bfloat16`).
         """
+        from atom.config import QuantType as _QT
+
+        # ----- Idempotent guard (BMM path) -----
+        if hasattr(self, "W_OA"):
+            return
+
         w = self.wo_a.weight
-        if w.dtype == torch.bfloat16:
-            return  # already dequanted
-        scale = getattr(self.wo_a, "weight_scale", None)
-        if w.dtype != torch.float8_e4m3fn or scale is None:
-            return  # nothing to do
-        # Dequant: w (FP8 [out, in]) × scale (e8m0 [out/128, in/128]) → BF16
-        bf16 = _dequant_fp8_block_to_bf16(
-            w.data, scale.data.to(torch.float32), block=128
+        # ----- Order/dtype assertion (defends against upstream loader changes) -----
+        assert w.dtype in (torch.float8_e4m3fn, torch.bfloat16), (
+            f"wo_a.weight unexpected dtype {w.dtype}; "
+            f"expected FP8 (on-disk) or BF16 (dummy/toy/already-dequanted). "
+            f"Likely upstream loader call-order changed."
         )
-        # Replace the weight tensor with BF16, drop the scale param so future
-        # loads / introspection don't try to use a stale FP8 scale.
-        self.wo_a.weight = atom_parameter(bf16)
+        if w.dtype == torch.float8_e4m3fn:
+            assert (
+                getattr(self.wo_a, "weight_scale", None) is not None
+            ), "FP8 wo_a missing weight_scale — upstream loader did not fill scale"
+            assert not getattr(w, "is_shuffled", False), (
+                "wo_a was already shuffled by LinearBase post-load; "
+                "DeepseekV4Attention post-load must run BEFORE LinearBase."
+            )
+
+        # ----- Step 1: get the BF16 dequanted weight (shared by both paths) -----
+        if w.dtype == torch.float8_e4m3fn:
+            scale = self.wo_a.weight_scale
+            bf16 = _dequant_fp8_block_to_bf16(
+                w.data, scale.data.to(torch.float32), block=128
+            )
+        else:
+            # BF16 already (dummy / toy / quant_config=None / re-entry).
+            bf16 = w.data
+
+        # ----- einsum fallback (env=1): keep BF16 weight, no requant -----
+        if self._use_oa_einsum:
+            self.wo_a.weight = atom_parameter(bf16)
+            try:
+                delattr(self.wo_a, "weight_scale")
+            except AttributeError:
+                pass
+            self.wo_a.quant_type = _QT.No  # block LinearBase shuffle on BF16
+            return
+
+        # ----- BMM path (default): requant to FP8 + scalar scale -----
+        # Reshape into (G_local, o_lora_rank, d_per_group) so each group is an
+        # independent FP8 matrix in the kernel's batch dim. wo_a is already
+        # TP-sharded by ColumnParallelLinear; n_local_groups = o_groups / tp.
+        d_per_group = bf16.shape[-1]
+        w_grouped = bf16.view(
+            self.n_local_groups, self.o_lora_rank, d_per_group
+        ).contiguous()
+        W_OA, W_OA_scale = _v4_dynamic_per_batched_tensor_quant(
+            w_grouped, dtype=torch.float8_e4m3fn
+        )
+        # Buffers (not parameters): no gradient, no optimizer participation.
+        # state_dict will contain them, but we don't support quanted-ckpt
+        # resave anyway (V4 is inference-only on this path; reload always
+        # starts from the on-disk FP8+block-scale and re-runs this hook).
+        self.register_buffer("W_OA", W_OA)
+        self.register_buffer("W_OA_scale", W_OA_scale)
+
+        # Release the original wo_a.weight storage (~8 MB/layer BF16 → bytes).
+        # Use a 1-element placeholder rather than None so anything walking
+        # `named_parameters()` filtered by dtype still finds a tensor.
+        self.wo_a.weight = atom_parameter(
+            torch.empty(1, dtype=torch.bfloat16, device=W_OA.device)
+        )
         try:
             delattr(self.wo_a, "weight_scale")
         except AttributeError:
             pass
-        # CRITICAL: prevent LinearBase.process_weights_after_loading from
-        # `shuffle_weights(self.weight)` on the now-BF16 wo_a. That shuffle
-        # is for the FP8 CK GEMM layout; applying it to a plain BF16 matrix
-        # consumed by `torch.einsum` corrupts the layout (rows get permuted
-        # within 16×16 blocks, only rows aligned to the block boundaries
-        # stay in place). Iteration order in load_model is parent-first
-        # (DeepseekV4Attention before its child wo_a Linear), so our hook
-        # runs BEFORE the shuffle — overriding `quant_type` here makes the
-        # subsequent LinearBase post-load a no-op for wo_a.
-        #
-        # TODO(perf): replace dequant-to-BF16 + einsum with FP8 batched BMM
-        # (same path as MLA's `_v_up_proj_and_o_proj`). Steps:
-        #   1. Dequant FP8 per-128-block → BF16 (this code)
-        #   2. Reshape to [n_local_groups, o_lora_rank, d_per_group]
-        #   3. Requant via dynamic_per_batched_tensor_quant → FP8 + scalar scale
-        #   4. Forward: _aiter_triton_fp8_bmm(o, W_OA, W_OA_scale, group_size=128)
-        # This avoids the dequant + einsum overhead and reuses the proven MLA
-        # batched-FP8 kernel. See attention_mla.py:211 for reference.
-        from atom.config import QuantType as _QT
-
-        self.wo_a.quant_type = _QT.No
+        self.wo_a.quant_type = _QT.No  # block LinearBase shuffle on placeholder
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Compute attention for `x` at absolute token `positions`.
@@ -1617,10 +1700,25 @@ class DeepseekV4Attention(nn.Module):
         freqs_slice = self.rotary_emb.freqs_for_positions(positions)
         _apply_rotary_emb(o[..., -rd:], freqs_slice, inverse=True)
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
+        # Default: FP8 batched BMM via aiter Triton (W_OA + scalar W_OA_scale
+        # built once at load, see process_weights_after_loading).
+        # Fallback (ATOM_V4_OA_USE_EINSUM=1): legacy BF16 grouped einsum.
         o = o.squeeze(0).view(seqlen_total, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        x = self.wo_b(o.flatten(1))
+        if self._use_oa_einsum:
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        else:
+            # Input layout (M=S, B=G, K) via transpose_bm_in=True; output (S,G,N)
+            # via transpose_bm=True so the downstream wo_b reshape is unchanged.
+            o = _aiter_triton_fp8_bmm(
+                o,
+                self.W_OA,
+                self.W_OA_scale,
+                group_size=128,
+                transpose_bm_in=True,
+                transpose_bm=True,
+            )
+        x = self.wo_b(o.reshape(seqlen_total, -1))
         return x
 
 
