@@ -184,13 +184,17 @@ def main():
         print(f"  {bucket}: {t:.2f}us  config={cfg}")
     print()
 
-    # Where aiter expects the JSON
+    # Where aiter expects the JSON.
+    # Path format mirrors aiter's _get_gemm_config_cached:
+    #   {arch}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT-N={N}-K={K}.json
+    # arch is auto-detected from the live device (e.g. gfx942 / gfx950).
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
     aiter_root = Path(_aiter_triton.__file__).parent
     target_path = (
         aiter_root
         / "configs"
         / "gemm"
-        / f"gfx942-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT-N={N}-K={K}.json"
+        / f"{arch}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT-N={N}-K={K}.json"
     )
 
     if args.write:
