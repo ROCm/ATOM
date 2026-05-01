@@ -40,7 +40,10 @@ from atom.model_ops.quant_v4 import (
     fp4_act_quant_inplace,
     rotate_activation,
 )
-from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn, sparse_attn  # noqa: F401
+from atom.model_ops.sparse_attn_v4 import (  # noqa: F401
+    hc_split_sinkhorn,
+    sparse_attn_ragged_varlen,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_backend_gate import use_new_v4_backend  # noqa: F401
 from atom.model_ops.v4_kernels import (  # noqa: F401
@@ -1122,6 +1125,7 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wq_a",
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
+        self.q_norm2 = RMSNorm(self.head_dim, self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1354,7 +1358,8 @@ class DeepseekV4Attention(nn.Module):
             slots = state_slot_mapping[:num_seqs].tolist()
             per_seq_bts = [block_tables[i] for i in range(num_seqs)]
 
-        output_chunks = []
+        sparse_kvs = []
+        sparse_topks = []
         for seq_idx in range(num_seqs):
             seq_start = seq_offsets[seq_idx]
             seq_end = seq_offsets[seq_idx + 1]
@@ -1365,7 +1370,6 @@ class DeepseekV4Attention(nn.Module):
             block_table = per_seq_bts[seq_idx]
             seq_positions = positions[seq_start:seq_end]
             seq_x = x[seq_start:seq_end]
-            seq_q = q[:, seq_start:seq_end]
             seq_kv = kv[:, seq_start:seq_end]
             # PR-A Phase 2: prefer CPU mirror to avoid per-seq GPU→CPU sync
             # (~64 layers × num_seqs syncs eliminated when present).
@@ -1493,16 +1497,47 @@ class DeepseekV4Attention(nn.Module):
                 else:
                     kv_sa = self.swa_kv[slot : slot + 1]
 
-            o_seq = sparse_attn(
-                seq_q, kv_sa, self.attn_sink, topk_idxs, self.softmax_scale
-            )
-            output_chunks.append(o_seq)
+            sparse_kvs.append(kv_sa.squeeze(0))
+            sparse_topks.append(topk_idxs.reshape(-1))
 
-        o = (
-            torch.cat(output_chunks, dim=1)
-            if len(output_chunks) > 1
-            else output_chunks[0]
+        # Ragged sparse attention: concatenate per-seq queries and KV pools,
+        # and pass varlen topk spans so the kernel can add global KV offsets.
+        q_sa = q.squeeze(0).contiguous()
+        kv_sa = torch.cat(sparse_kvs, dim=0).contiguous()
+        topk_flat = torch.cat(sparse_topks).contiguous()
+        ctx = get_forward_context()
+        sparse_layouts = (
+            getattr(ctx.attn_metadata, "v4_sparse_layouts", None)
+            if ctx is not None and ctx.attn_metadata is not None
+            else None
         )
+        assert self.compress_ratio in (0, 4, 128), (
+            f"unexpected V4 compress_ratio={self.compress_ratio}; "
+            "expected one of 0, 4, 128"
+        )
+        if _v4_is_dummy_run():
+            topk_starts = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int64)
+            topk_lens = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int32)
+            kv_offsets = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int32)
+            max_topk = 1
+        else:
+            layout = sparse_layouts[self.compress_ratio]
+            topk_starts = layout["topk_starts"]
+            topk_lens = layout["topk_lens"]
+            kv_offsets = layout["kv_offsets"]
+            max_topk = layout["max_topk"]
+
+        o = sparse_attn_ragged_varlen(
+            q_sa,
+            kv_sa,
+            self.attn_sink,
+            topk_flat,
+            topk_starts,
+            topk_lens,
+            kv_offsets,
+            max_topk,
+            self.softmax_scale,
+        ).unsqueeze(0)
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
