@@ -118,7 +118,42 @@ def main():
                     help="Coarse sweep (only 2 num_warps × 1 num_stages)")
     ap.add_argument("--m-list", nargs="+", type=int, default=M_LIST,
                     help="M values to tune (decode + prefill samples)")
+    ap.add_argument("--microbench", action="store_true",
+                    help="Skip sweep; only run BMM-vs-einsum head-to-head "
+                         "comparison on V4 wo_a shape (~5 min). Useful to "
+                         "verify FP8 BMM kernel-level speedup vs the BF16 "
+                         "einsum baseline (independent of tuning).")
     args = ap.parse_args()
+
+    if args.microbench:
+        print("V4 wo_a FP8 BMM vs BF16 einsum micro-bench")
+        print(f"  shape: B={B}, K={K}, N={N}, group_size={GROUP_SIZE}")
+        print(f"  M values: {args.m_list}")
+        print()
+        print(f"{'M':>5} {'einsum (us)':>14} {'BMM (us)':>14} {'speedup':>10}")
+        print(f"{'':>5} {'-' * 14:>14} {'-' * 14:>14} {'-' * 10:>10}")
+        for M in args.m_list:
+            torch.manual_seed(0)
+            o = torch.randn(M, B, K, dtype=torch.bfloat16, device="cuda")
+            w_bf16 = torch.randn(B, N, K, dtype=torch.bfloat16, device="cuda")
+            w_fp8, w_scale = dynamic_per_batched_tensor_quant(w_bf16)
+            einsum_ms = triton.testing.do_bench(
+                lambda: torch.einsum("sgd,grd->sgr", o, w_bf16),
+                warmup=25, rep=100,
+            )
+            bmm_ms = triton.testing.do_bench(
+                lambda: fp8_bmm(
+                    o, w_fp8, w_scale,
+                    group_size=GROUP_SIZE,
+                    transpose_bm_in=True, transpose_bm=True,
+                ),
+                warmup=25, rep=100,
+            )
+            speedup = einsum_ms / bmm_ms if bmm_ms > 0 else float("inf")
+            print(f"{M:>5} {einsum_ms*1000:>12.2f}   {bmm_ms*1000:>12.2f}   {speedup:>8.2f}x")
+        print()
+        print("note: only wo_a kernel; total V4 TPOT impact is ~wo_a_share% of this.")
+        return
 
     sweep = SWEEP
     if args.quick:
