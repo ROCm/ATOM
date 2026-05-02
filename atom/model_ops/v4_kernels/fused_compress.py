@@ -58,8 +58,10 @@ from atom.model_ops.v4_kernels.compress_plan import CompressPlan
 @triton.jit
 def _fused_compress_attn_kernel(
     # ── source: INPUT (this fwd's projection) ───────────────────────────
-    kv_in_ptr,  # [num_q_tokens, dim_full] fp32
-    score_in_ptr,  # [num_q_tokens, dim_full] fp32 (raw, no ape)
+    kv_in_ptr,  # [num_q_tokens, dim_full] fp32 (strided allowed)
+    kv_in_row_stride,  # row stride; ≥ dim_full when fused upstream split
+    score_in_ptr,  # [num_q_tokens, dim_full] fp32 (raw, no ape; strided allowed)
+    score_in_row_stride,
     dim_full,  # = 2*head_dim if OVERLAP else head_dim
     # ── plan: per-boundary packed metadata ──────────────────────────────
     plan_ptr,  # [num_compress, 4] int32 (ragged_id, batch_id, position, window_len)
@@ -101,13 +103,18 @@ def _fused_compress_attn_kernel(
     K: tl.constexpr,  # = STATE_SIZE (softmax-pool reduce dim)
     HAS_BLOCK_TABLE: tl.constexpr,
 ):
-    """One program per boundary in the plan. Grid = num_compress (no early-exit)."""
+    """One program per boundary in the plan. Grid = plan capacity (CUDAGraph-
+    safe fixed grid); inactive rows are sentinel-marked (position == -1) and
+    bail before any load/store/scatter."""
     pid = tl.program_id(0)
     plan_base = plan_ptr + pid * 4
     ragged_id = tl.load(plan_base + 0)
     batch_id = tl.load(plan_base + 1)
     position = tl.load(plan_base + 2)
     window_len = tl.load(plan_base + 3)
+
+    if position < 0:
+        return
 
     slot = tl.load(state_slot_mapping_ptr + batch_id)
 
@@ -138,7 +145,7 @@ def _fused_compress_attn_kernel(
         # = ragged_id row). Earlier k_static values map to earlier ragged rows.
         in_row = ragged_id - (K - 1 - k_static)
         kv_a = tl.load(
-            kv_in_ptr + in_row * dim_full + col_off + d,
+            kv_in_ptr + in_row * kv_in_row_stride + col_off + d,
             mask=is_input & d_mask,
             other=0.0,
         )
@@ -159,7 +166,7 @@ def _fused_compress_attn_kernel(
 
         # ── score_k load ──
         score_a = tl.load(
-            score_in_ptr + in_row * dim_full + col_off + d,
+            score_in_ptr + in_row * score_in_row_stride + col_off + d,
             mask=is_input & d_mask,
             other=NEG_INF,
         )
@@ -272,6 +279,7 @@ def fused_compress_attn(
     head_dim: int,
     rope_head_dim: int,
     out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Batched fused per-source-position pool + RMSNorm + RoPE + bf16 kv_cache
     scatter, dispatched via SGLang-style packed plan.
@@ -280,16 +288,22 @@ def fused_compress_attn(
     ascending = per-seq grouped). Caller uses `plan.cu_compress_cpu[i:i+2]` to
     slice per-seq chunks.
 
-    Returns None if `plan.num_compress == 0`.
+    Returns None if `plan.num_compress == 0` AND no `out` buffer is provided.
+    When `out` is supplied (CUDAGraph path), kernel ALWAYS launches at full
+    plan capacity — inactive rows are sentinel-skipped inside the kernel —
+    and `out` is returned unchanged when `num_compress == 0`.
 
     Caller MUST invoke BEFORE `update_compressor_states` (state cache reads
     must see previous-fwd data).
     """
-    if plan.num_compress == 0:
-        return None
-
     device = kv_in.device
     num_compress = plan.num_compress
+    plan_capacity = plan.compress_plan_gpu.shape[0]
+    if plan_capacity == 0:
+        return out  # nothing to do; out (or None) returned as-is.
+    if num_compress == 0 and out is None:
+        # Eager path: nothing to do, no caller buffer to fill.
+        return None
 
     # Validate shapes
     dim_full = (2 if overlap else 1) * head_dim
@@ -303,17 +317,24 @@ def fused_compress_attn(
     assert ape.shape == (ratio, dim_full)
     assert rms_weight.shape == (head_dim,)
     assert plan.compress_plan_gpu.shape == (
-        num_compress,
+        plan_capacity,
         4,
-    ), f"plan {plan.compress_plan_gpu.shape}, expected ({num_compress}, 4)"
+    ), f"plan {plan.compress_plan_gpu.shape}, expected ({plan_capacity}, 4)"
     assert plan.compress_plan_gpu.dtype == torch.int32
+    assert num_compress <= plan_capacity, (
+        f"plan.num_compress ({num_compress}) > capacity ({plan_capacity}); "
+        f"caller must size the plan buffer to the worst-case num_compress."
+    )
     assert state_slot_mapping.dim() == 1 and state_slot_mapping.dtype == torch.int32
     assert cos_cache.shape[-1] == rope_head_dim // 2
     assert sin_cache.shape[-1] == rope_head_dim // 2
     assert (
         cos_cache.stride(0) == rope_head_dim // 2
     ), f"cos_cache outer stride {cos_cache.stride(0)} != rope_head_dim/2"
-    assert kv_in.is_contiguous() and score_in.is_contiguous()
+    # kv_in / score_in row-strided allowed (e.g. zero-copy split halves of the
+    # fused wkv_gate output). Inner column stride must be 1 — kernel uses
+    # `+ d` for the BLOCK_D offset.
+    assert kv_in.stride(-1) == 1 and score_in.stride(-1) == 1
     assert kv_state.is_contiguous() and score_state.is_contiguous()
     assert ape.is_contiguous() and rms_weight.is_contiguous()
     has_bt = block_tables is not None
@@ -324,16 +345,35 @@ def fused_compress_attn(
     else:
         bt_seq_stride = 0
 
-    out = torch.empty(num_compress, head_dim, dtype=out_dtype, device=device)
+    if out is None:
+        # Eager path: allocate output sized to the actual num_compress so the
+        # returned tensor has the legacy [num_compress, head_dim] shape.
+        out = torch.empty(num_compress, head_dim, dtype=out_dtype, device=device)
+    else:
+        # CUDAGraph path: caller-provided buffer of capacity ≥ plan_capacity.
+        # Validate shape; kernel will write into rows [0:num_compress) and
+        # leave [num_compress:plan_capacity) untouched (those plan rows are
+        # sentinel-skipped). Inactive output rows therefore carry stale data
+        # but no consumer reads them (caller slices via cu_compress_cpu).
+        assert (
+            out.shape[0] >= plan_capacity and out.shape[1] == head_dim
+        ), f"out {tuple(out.shape)}, expected ≥ ({plan_capacity}, {head_dim})"
+        assert out.dtype == out_dtype
+        assert out.is_contiguous() or out.stride(1) == 1
 
     BLOCK_D = triton.next_power_of_2(head_dim)
     HALF_ROPE = rope_head_dim // 2
     K = state_size
 
-    grid = (num_compress,)
+    # Fixed grid for CUDAGraph compat: launch one program per plan row;
+    # sentinel rows (position=-1) skipped inside the kernel. When out is
+    # eager-allocated above, grid still shrinks to num_compress (no pad).
+    grid = (plan_capacity if out.shape[0] >= plan_capacity else num_compress,)
     _fused_compress_attn_kernel[grid](
         kv_in,
+        kv_in.stride(0),
         score_in,
+        score_in.stride(0),
         dim_full,
         plan.compress_plan_gpu,
         kv_state,

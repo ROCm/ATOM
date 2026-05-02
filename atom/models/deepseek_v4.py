@@ -793,6 +793,12 @@ class Compressor(nn.Module):
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: Optional[torch.Tensor] = None
         self.rotary_emb: Optional[_V4RoPE] = None
+        # Shared compress-output buffer (set by V4 builder.build_kv_cache_tensor
+        # to a per-kind torch.empty pre-allocation in `forward_vars`). When
+        # present, fused_compress_attn writes into it via `out=` so the GPU
+        # pointer stays stable across captures (CUDAGraph requirement); when
+        # None, falls back to the eager fresh-allocation path.
+        self.compress_out: Optional[torch.Tensor] = None
 
         # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
         # window" portion). Indexed as a single ring buffer of size
@@ -899,8 +905,8 @@ class Compressor(nn.Module):
         scatter_kv_cache = self.kv_cache if block_tables is not None else None
         scatter_block_tables = block_tables if scatter_kv_cache is not None else None
         out = fused_compress_attn(
-            kv_in=kv.contiguous(),
-            score_in=score.contiguous(),
+            kv_in=kv,
+            score_in=score,
             kv_state=self.kv_state,
             score_state=self.score_state,
             plan=plan,
@@ -918,6 +924,7 @@ class Compressor(nn.Module):
             head_dim=d,
             rope_head_dim=rd,
             out_dtype=out_dtype,
+            out=self.compress_out,
         )
         update_compressor_states(
             kv,
@@ -1354,14 +1361,12 @@ class DeepseekV4Attention(nn.Module):
         # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
         # quantization. EXPERIMENT only.
         if _V4_FORCE_UE8M0_QUANT:
-            from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
-
             x = x.clone()
-            _v4_aqi(x, 128, "ue8m0")
+            act_quant_inplace(x, 128, "ue8m0")
         qr = self.q_norm(self.wq_a(x))  # [S_total, q_lora_rank], shared with Indexer
         if _V4_FORCE_UE8M0_QUANT:
             qr = qr.clone()
-            _v4_aqi(qr, 128, "ue8m0")
+            act_quant_inplace(qr, 128, "ue8m0")
         q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
         q = _rmsnorm_nw(q, self.eps, self.head_dim)
         q = q.unsqueeze(0)  # [1, S_total, H, D]
@@ -1369,7 +1374,8 @@ class DeepseekV4Attention(nn.Module):
         kv = self.wkv(x)  # [S_total, head_dim]
         kv = self.kv_norm(kv).unsqueeze(0)  # [1, S_total, head_dim]
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
-        act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+        if _V4_USE_REF_QUANT:
+            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
         # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
         # All per-fwd state read once. Production prepare_decode/prefill
         # always populates these; warmup goes through the same path
@@ -1776,10 +1782,8 @@ class MoE(nn.Module):
             # ue8m0 to mirror ref Expert.forward (act_quant before fp4_gemm).
             # See notes/17.
             if _V4_USE_REF_QUANT:
-                from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
-
                 sub_x = sub_x.to(torch.bfloat16)
-                _v4_aqi(sub_x, 128, "ue8m0")
+                act_quant_inplace(sub_x, 128, "ue8m0")
                 sub_x = sub_x.float()
 
             # Dequant w1/w3 (gate/up) from FP4
@@ -1811,9 +1815,7 @@ class MoE(nn.Module):
 
             act_bf = act.to(torch.bfloat16)
             if _V4_USE_REF_QUANT:
-                from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
-
-                _v4_aqi(act_bf, 128, "ue8m0")
+                act_quant_inplace(act_bf, 128, "ue8m0")
             out = act_bf.float() @ w2_f.T  # [N, H]
             y[tok_idx] += out
 
@@ -2318,10 +2320,14 @@ class DeepseekV4Model(nn.Module):
         for layer in self.layers:
             h = layer(h, positions, input_ids)
 
-        logits = self.head(
-            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
+        # CUDAGraph contract: model.forward returns hidden_states sized
+        # [num_tokens, hidden_size]; compute_logits applies the vocab head.
+        # Reduce the hc_mult residual stack here (hc_head + final RMSNorm),
+        # leaving the vocab projection to compute_logits.
+        x_hc = self.head.hc_head(
+            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
-        return logits
+        return self.norm(x_hc)
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -2398,9 +2404,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model(input_ids=input_ids, positions=positions, **model_kwargs)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # In V4, the LM head is fused into DeepseekV4Model.forward (it consumes
-        # the hc_mult-expanded residual). So `hidden_states` already IS logits.
-        return hidden_states
+        # `hidden_states` is post-hc_head + norm (= [num_tokens, dim]); apply
+        # the vocab projection here so DeepseekV4Model.forward can stay aligned
+        # with ATOM's standard hidden_states-shaped contract (required for
+        # CUDAGraph capture: outputs buffer is sized to hidden_size, not vocab).
+        return self.model.head.get_logits(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Return (param_name, weight_name, expert_id, shard_id) tuples for FusedMoE.

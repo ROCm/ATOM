@@ -46,7 +46,7 @@ from atom.model_ops.attentions.backends import (
     CommonAttentionBuilder,
 )
 from atom.utils import CpuGpuBuffer
-from atom.utils.forward_context import AttentionMetaData
+from atom.utils.forward_context import AttentionMetaData, Context
 
 
 class DeepseekV4Backend(AttentionBackend):
@@ -299,6 +299,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             is_indexer_inner = "indexer" in parts
             ratio = module.compress_ratio
 
+            # Per-kind shared compress output buffer (CUDAGraph: stable
+            # data pointer + fixed shape across captures of the same kind).
+            # Read from forward_vars (allocated in _alloc_v4_metadata_buffers).
+            compress_out_buffers = self.model_runner.forward_vars
             if is_indexer_inner:
                 assert ratio == 4, "Indexer-inner Compressor only on CSA layers"
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
@@ -307,16 +311,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # Inner compressor writes target the SAME storage as the
                 # outer Indexer.kv_cache (csa_idx_kv).
                 module.kv_cache = runner.v4_csa_idx_kv[:, pos]
+                module.compress_out = compress_out_buffers["v4_csa_idx_compress_out"]
             elif ratio == 4:
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_main_kv_state[pos]
                 module.score_state = runner.v4_csa_main_score_state[pos]
                 module.kv_cache = runner.v4_csa_main_kv[:, pos]
+                module.compress_out = compress_out_buffers["v4_csa_main_compress_out"]
             elif ratio == 128:
                 pos = self.layer_id_to_hca_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_hca_main_kv_state[pos]
                 module.score_state = runner.v4_hca_main_score_state[pos]
                 module.kv_cache = runner.v4_hca_main_kv[:, pos]
+                module.compress_out = compress_out_buffers["v4_hca_main_compress_out"]
             else:
                 raise ValueError(
                     f"Unknown V4 compress_ratio={ratio} on Compressor at "
@@ -1170,7 +1177,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
         Reuse this from both prepare_decode and prepare_prefill — caller
-        supplies extend_lens / seq_lens (np int32) and target device.
+        supplies extend_lens / seq_lens (np int32) and target device. Plan
+        tensors are written into the pre-allocated `v4_compress_plan_{ratio}`
+        / `v4_write_plan_{ratio}` CpuGpuBuffers (fixed pointers for
+        CUDAGraph capture); the kernels skip sentinel-marked tail rows.
         """
         from atom.model_ops.v4_kernels import make_compress_plans
 
@@ -1181,11 +1191,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             extend_lens_np = extend_lens_np.cpu().numpy().astype(np.int32)
         if isinstance(seq_lens_np, torch.Tensor):
             seq_lens_np = seq_lens_np.cpu().numpy().astype(np.int32)
+        var = self.model_runner.forward_vars
+        plan_buffers = {
+            ratio: {
+                "compress": var[f"v4_compress_plan_{ratio}"],
+                "write": var[f"v4_write_plan_{ratio}"],
+            }
+            for ratio, _ in self._unique_compress_ratios_overlap
+        }
         return make_compress_plans(
             np.ascontiguousarray(extend_lens_np, dtype=np.int32),
             np.ascontiguousarray(seq_lens_np, dtype=np.int32),
             self._unique_compress_ratios_overlap,
             device,
+            plan_buffers=plan_buffers,
         )
 
     def _populate_block_tables(
@@ -1235,18 +1254,108 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return gpu, groups_np
         return gpu
 
-    def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
-        # CUDA Graph capture is disabled for V4 (PR4 scope). Return a stub.
-        return AttentionMetaData(
+    def build_for_cudagraph_capture(self, bs: int) -> tuple[AttentionMetaData, Context]:
+        """Build attn_metadata for CUDAGraph capture using a synthetic decode batch.
+
+        Synthesizes bs sequences each at start_pos=window_size (so SWA window
+        is full + 1 CSA committed entry — exercises the production decode
+        codepath: state-cache reads, sparse_attn gather, indexer fp8 logits).
+
+        Per-fwd metadata is populated through the SAME helpers prepare_decode
+        uses (`_attach_sparse_layout_metadata`, `_attach_v4_per_fwd_meta`,
+        `_build_compress_plans`), so all GPU views point to the pre-allocated
+        buffers in `forward_vars`. Replay-time prepare_decode writes into the
+        SAME buffers — captured graph reads stable addresses.
+
+        NOTE on dynamic-shape kernels (fused_compress_attn / update_compressor_states /
+        swa_write): these currently use variable kernel grids (`grid=(num_compress,)`),
+        which CUDAGraph capture rejects. A follow-up PR converts them to fixed
+        grid + sentinel masking. Until then, capture itself can succeed (the
+        helpers run on CPU + small H2D), but model.forward inside torch.cuda.graph
+        will likely fail at the first such kernel launch — the user can detect
+        this via capture log output.
+        """
+        device = self.model_runner.device
+        var = self.model_runner.forward_vars
+        max_q_len = 1
+        total_tokens = bs * max_q_len
+        win = self.window_size
+
+        # Synthetic state: each seq has already produced `win` tokens; this fwd
+        # is one decode step at position `win`.
+        start_pos = win
+        positions_np = np.full(total_tokens, start_pos, dtype=np.int64)
+        cu_seqlens_q_np = np.arange(0, bs + 1, dtype=np.int32) * max_q_len
+        context_lens_np = np.full(bs, start_pos + max_q_len, dtype=np.int32)
+        # Slot mapping: use real per-req cache slots [0..bs-1].
+        state_slot_np = np.arange(bs, dtype=np.int32)
+        # Block tables: block 0 for every seq (placeholder; capture warmup
+        # fills it via real reads but the data is throwaway).
+        block_tables_np = np.zeros(
+            (bs, var["block_tables"].np.shape[1]), dtype=np.int32
+        )
+
+        # Stage CPU mirrors → forward_vars + capture-time GPU views.
+        var["positions"].np[:total_tokens] = positions_np
+        positions = var["positions"].copy_to_gpu(total_tokens)
+        var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q_np
+        cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(bs + 1)
+        var["context_lens"].np[:bs] = context_lens_np
+        context_lens_gpu = var["context_lens"].copy_to_gpu(bs)
+        var["block_tables"].np[:bs] = block_tables_np
+        block_tables_gpu = var["block_tables"].copy_to_gpu(bs)
+        state_slot_gpu = self._stage("v4_meta_state_slot_groups", state_slot_np)
+
+        attn_metadata = AttentionMetaData(
+            cu_seqlens_q=cu_seqlens_q_gpu,
             cu_seqlens_k=None,
-            max_seqlen_q=1,
-            max_seqlen_k=1,
+            max_seqlen_q=max_q_len,
+            max_seqlen_k=int(context_lens_np.max()) if bs else 1,
             min_seqlen_q=0,
             dropout_p=0.0,
             has_cached=False,
-            total_kv=bs,
+            total_kv=int(context_lens_np.sum()),
             num_cached_tokens=None,
+            block_tables=block_tables_gpu,
+            context_lens=context_lens_gpu,
         )
+        attn_metadata.state_slot_mapping = state_slot_gpu
+        attn_metadata.cu_seqlens_q_cpu = cu_seqlens_q_np
+        attn_metadata.state_slot_mapping_cpu = state_slot_np
+        attn_metadata.start_pos_per_seq_cpu = positions_np[cu_seqlens_q_np[:bs]]
+
+        # Build compress_plans + sparse layouts + per-fwd meta via the same
+        # helpers used at runtime — guarantees addresses match.
+        extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
+        attn_metadata.compress_plans = self._build_compress_plans(
+            extend_lens_np, context_lens_np, device
+        )
+        self._attach_sparse_layout_metadata(
+            attn_metadata,
+            cu_seqlens_q_np,
+            attn_metadata.start_pos_per_seq_cpu,
+            bs,
+            total_tokens,
+            positions_np=positions_np,
+            positions_gpu=positions,
+        )
+        self._attach_v4_per_fwd_meta(
+            attn_metadata,
+            positions,
+            cu_seqlens_q_np,
+            attn_metadata.start_pos_per_seq_cpu,
+            attn_metadata.state_slot_mapping_cpu,
+            bs,
+            total_tokens,
+        )
+
+        context = Context(
+            positions=positions,
+            is_prefill=False,
+            batch_size=bs,
+            graph_bs=bs,
+        )
+        return attn_metadata, context
 
     # ------------------------------------------------------------------ #
     # Helpers.                                                           #
@@ -1284,6 +1393,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"v4_{kind}_sparse_topk_starts"] = CpuGpuBuffer(mnbt, **i64)
             bufs[f"v4_{kind}_sparse_topk_lens"] = CpuGpuBuffer(mnbt, **i32)
             bufs[f"v4_{kind}_sparse_kv_offsets"] = CpuGpuBuffer(mnbt, **i32)
+
+        # `kv_indptr` is touched unconditionally by the global capture loop
+        # (model_runner.capture_cudagraph: `forward_vars["kv_indptr"].zero_()`).
+        # MLA backends own this buffer; V4 doesn't use it for its own kernels
+        # but allocates a min-size stub so the capture loop runs. Sized for
+        # potential future reuse if a V4-side MLA kernel needs paged KV indices.
+        bufs["kv_indptr"] = CpuGpuBuffer(bs + 1, **i32)
 
         # _attach_v4_per_fwd_meta + _populate_state_slot_mapping.
         bufs["v4_meta_start_pos_per_seq"] = CpuGpuBuffer(bs, **i64)
@@ -1339,6 +1455,45 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 bufs[f"v4_{kind}_pack_compress_topk_values"] = CpuGpuBuffer(
                     ckmax, **i32
                 )
+
+        # Compress plan buffers (per-ratio) — pre-allocated for CUDAGraph
+        # plan-tensor address stability. `make_compress_plans(..., plan_buffers=)`
+        # writes into these and sentinel-fills the trailing rows. Worst-case
+        # sizes: num_compress ≤ ⌈mnbt/ratio⌉ + bs (one boundary per seq plus
+        # alignment slack); num_write ≤ bs * STATE_SIZE (per-seq ring window
+        # carries STATE_SIZE rows per fwd at most).
+        max_compress_per_ratio = {}
+        for ratio, is_overlap in self._unique_compress_ratios_overlap:
+            state_size = (2 if is_overlap else 1) * ratio
+            max_compress = mnbt // ratio + bs
+            max_write = min(mnbt, bs * state_size)
+            max_compress_per_ratio[ratio] = max_compress
+            bufs[f"v4_compress_plan_{ratio}"] = CpuGpuBuffer(max_compress, 4, **i32)
+            bufs[f"v4_write_plan_{ratio}"] = CpuGpuBuffer(max_write, 4, **i32)
+            # Pre-fill with sentinel so capture-time buffer state is valid
+            # even before the first non-empty fwd.
+            bufs[f"v4_compress_plan_{ratio}"].cpu.fill_(-1)
+            bufs[f"v4_compress_plan_{ratio}"].copy_to_gpu()
+            bufs[f"v4_write_plan_{ratio}"].cpu.fill_(-1)
+            bufs[f"v4_write_plan_{ratio}"].copy_to_gpu()
+
+        # Compressor output buffers (one per kind, shared across same-kind
+        # layers within a single fwd — Compressor outputs are consumed
+        # immediately by the layer's sparse_attn before the next layer runs).
+        # Sized to (max_compress_per_ratio, head_dim) so fused_compress_attn
+        # can launch with full-capacity grid + sentinel-skip; output rows
+        # past the actual num_compress carry stale data but are never read
+        # (consumer slices via `cu_compress_cpu`).
+        bf16 = {"dtype": torch.bfloat16, "device": self.device}
+        if 4 in max_compress_per_ratio:
+            mc = max_compress_per_ratio[4]
+            bufs["v4_csa_main_compress_out"] = torch.empty((mc, self.head_dim), **bf16)
+            bufs["v4_csa_idx_compress_out"] = torch.empty(
+                (mc, self.index_head_dim), **bf16
+            )
+        if 128 in max_compress_per_ratio:
+            mc = max_compress_per_ratio[128]
+            bufs["v4_hca_main_compress_out"] = torch.empty((mc, self.head_dim), **bf16)
 
         self.model_runner.forward_vars.update(bufs)
 

@@ -47,7 +47,7 @@ import triton.language as tl
 @triton.jit
 def _swa_write_kernel(
     kv_ptr,  # [num_tokens, head_dim]
-    positions_ptr,  # [num_tokens] int
+    positions_ptr,  # [num_tokens] int (sentinel = -1 for inactive slots)
     slot_ptr,  # [num_tokens] int
     swa_kv_ptr,  # [num_slots, win, head_dim]
     swa_kv_slot_stride,  # = win * head_dim
@@ -56,8 +56,16 @@ def _swa_write_kernel(
     win,
     BLOCK_D: tl.constexpr,
 ):
+    """Fixed grid + sentinel mask (CUDAGraph-safe).
+
+    The grid size equals the buffer capacity (`positions.shape[0]`) regardless
+    of how many tokens this fwd actually writes. Inactive grid programs are
+    indicated by `positions[tok_id] < 0` and bail before any load/store.
+    """
     tok_id = tl.program_id(0)
     pos = tl.load(positions_ptr + tok_id)
+    if pos < 0:
+        return
     slot = tl.load(slot_ptr + tok_id)
     ring_idx = pos % win
 
@@ -88,7 +96,9 @@ def swa_write(
 
     Args:
         kv: [num_tokens, head_dim] flat batched KV (BF16).
-        positions: [num_tokens] int absolute positions.
+        positions: [num_tokens] int absolute positions. Slots with `position
+            < 0` are skipped — caller may pass a fixed-capacity buffer with
+            sentinel-filled tail to keep the grid size constant for CUDAGraph.
         slot_per_token: [num_tokens] int per-request slot ids.
         swa_kv: [num_slots, win, head_dim] in-place ring buffer.
         win: sliding-window size.
@@ -157,8 +167,10 @@ def swa_write_reference(
 
 @triton.jit
 def _update_compressor_states_kernel(
-    kv_ptr,  # [N, dim]
-    score_ptr,  # [N, dim]
+    kv_ptr,  # [N, dim] (strided allowed)
+    kv_row_stride,
+    score_ptr,  # [N, dim] (strided allowed)
+    score_row_stride,
     ape_ptr,  # [RATIO, dim]
     write_plan_ptr,  # [num_write, 4] int32 (ragged_id, batch_id, position, _)
     state_slot_mapping_ptr,  # [bs] int32 — per-seq state cache slot
@@ -193,6 +205,12 @@ def _update_compressor_states_kernel(
     batch_id = tl.load(plan_base + 1)
     position = tl.load(plan_base + 2)
 
+    # Fixed-grid + sentinel for CUDAGraph compat: caller may pass a buffer
+    # padded to max capacity; rows beyond `num_write` carry position = -1
+    # and are skipped here.
+    if position < 0:
+        return
+
     slot = tl.load(state_slot_mapping_ptr + batch_id)
     dst = position % STATE_SIZE
     ring_idx_ape = position % RATIO
@@ -200,8 +218,8 @@ def _update_compressor_states_kernel(
     d = tl.arange(0, BLOCK_D)
     m = d < dim
 
-    kv_v = tl.load(kv_ptr + ragged_id * dim + d, mask=m).to(tl.float32)
-    sc_v = tl.load(score_ptr + ragged_id * dim + d, mask=m).to(tl.float32)
+    kv_v = tl.load(kv_ptr + ragged_id * kv_row_stride + d, mask=m).to(tl.float32)
+    sc_v = tl.load(score_ptr + ragged_id * score_row_stride + d, mask=m).to(tl.float32)
     ape_v = tl.load(ape_ptr + ring_idx_ape * dim + d, mask=m).to(tl.float32)
 
     tl.store(
@@ -262,17 +280,28 @@ def update_compressor_states(
     assert (
         kv_state.shape[1] == state_size
     ), f"kv_state.shape[1]={kv_state.shape[1]}, expected {state_size}"
-    if num_write == 0:
-        return
     dim = kv.shape[1]
     assert write_plan.dim() == 2 and write_plan.shape[1] == 4
     assert write_plan.dtype == torch.int32
     assert state_slot_mapping.dim() == 1 and state_slot_mapping.dtype == torch.int32
+    # Grid = plan buffer capacity (fixed at builder __init__ time), NOT the
+    # per-fwd `num_write`. Inactive rows past `num_write` carry sentinel
+    # `position=-1` (filled host-side in `make_compress_plans`); the kernel
+    # bails on those, so this is functionally identical to the variable-grid
+    # version while keeping the launch CUDAGraph-capturable.
+    grid_size = write_plan.shape[0]
+    if grid_size == 0:
+        return
 
+    # Strided kv / score allowed (zero-copy split halves of fused upstream
+    # GEMM); inner column stride must be 1 (kernel uses `+ d`).
+    assert kv.stride(-1) == 1 and score.stride(-1) == 1
     BLOCK_D = triton.next_power_of_2(dim)
-    _update_compressor_states_kernel[(num_write,)](
-        kv if kv.is_contiguous() else kv.contiguous(),
-        score if score.is_contiguous() else score.contiguous(),
+    _update_compressor_states_kernel[(grid_size,)](
+        kv,
+        kv.stride(0),
+        score,
+        score.stride(0),
         ape,
         write_plan,
         state_slot_mapping,
