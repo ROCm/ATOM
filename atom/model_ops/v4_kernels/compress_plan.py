@@ -127,29 +127,3 @@ def make_compress_plans(
             cu_compress_cpu=cu_compress,
         )
     return out
-
-
-def make_single_seq_plan(
-    *,
-    token_num: int,
-    start_pos: int,
-    ratio: int,
-    is_overlap: bool,
-    device: torch.device,
-) -> CompressPlan:
-    """Build a 1-seq CompressPlan. Used by Indexer.forward (which still loops
-    per-seq from the outer dispatch)."""
-    extend_lens = np.array([token_num], dtype=np.int32)
-    seq_lens = np.array([start_pos + token_num], dtype=np.int32)
-    plans = make_compress_plans(extend_lens, seq_lens, [(ratio, is_overlap)], device)
-    if not plans:
-        # token_num == 0 — return an empty plan with consistent shapes.
-        empty = torch.empty((0, 4), dtype=torch.int32, device=device)
-        return CompressPlan(
-            compress_plan_gpu=empty,
-            write_plan_gpu=empty,
-            num_compress=0,
-            num_write=0,
-            cu_compress_cpu=np.array([0, 0], dtype=np.int32),
-        )
-    return plans[ratio]

@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from aiter import QuantType as _AiterQuantType
 from aiter import dtypes, get_hip_quant
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -40,7 +41,6 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.quant_v4 import (
     act_quant_inplace,
-    fp4_act_quant_inplace,
     rotate_activation,
 )
 from atom.model_ops.sparse_attn_v4 import (  # noqa: F401
@@ -51,7 +51,6 @@ from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (  # noqa: F401
     CompressPlan,
     fused_compress_attn,
-    make_single_seq_plan,
     swa_write,
     update_compressor_states,
 )
@@ -76,9 +75,12 @@ from atom.utils.forward_context import get_forward_context
 _V4_BLOCK_SIZE: int = 128
 
 _V4_RMSNORM_BACKEND = os.environ.get("ATOM_V4_RMSNORM_BACKEND", "triton")
-
-
 _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
+# Env-gated quant round-trips. Read once at module load — checking each
+# forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
+_V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
+_V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
+_V4_AITER_HC_POST = os.environ.get("V4_AITER_HC_POST", "") == "1"
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -88,88 +90,154 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
     return rmsnorm2d_fwd_(x, ones, eps, dim)
 
 
-def _v4_get_seq_metadata():
-    """Fetch per-seq batch metadata from the forward context.
-
-    Returns a tuple `(block_tables, state_slot_mapping, cu_seqlens_q,
-    context_lens, num_seqs, cpu_meta)`, or `(None, None, None, None, 0,
-    None)` if no metadata is set (warmup / dummy run / non-V4 path).
-    PR3-main per-seq dispatch uses these to slice the flat
-    `[total_tokens, ...]` Q/KV tensors per sequence and pick each seq's
-    state-cache slot + block_table for compressor scatter / sparse_attn
-    gather.
-
-      - block_tables: `[bs, max_blocks]` int GPU — per-seq physical block IDs
-        (paged-KV block table; same concept as in V2/Llama backends).
-      - state_slot_mapping: `[bs]` int GPU — per-request slot in V4's
-        stateful per-request pool (`swa_kv`, `Compressor.kv_state`). Distinct
-        from the per-token paged-KV `slot_mapping` carried elsewhere on
-        AttentionMetaData. Sourced from `batch.per_req_cache_groups`.
-      - cu_seqlens_q: `[bs+1]` int GPU — per-seq cumulative token offsets.
-      - context_lens: `[bs]` int GPU — per-seq end-of-context absolute
-        position. Drives `update_compressor_states` fresh-prefill vs
-        decode/prefix-cache discrimination.
-      - num_seqs: int — number of sequences in this forward call.
-      - cpu_meta: dict[str, np.ndarray] | None — CPU mirrors published by
-        `DeepseekV4AttentionMetadataBuilder` (PR-A Phase 2). When non-None,
-        per-seq dispatch reads positions / slots / cu_seqlens here instead
-        of `.tolist()` / `.item()` on GPU tensors:
-          - "cu_seqlens_q":      `[bs+1]` int — token offsets
-          - "state_slot_mapping": `[bs]`  int — per-request state slots
-          - "start_pos_per_seq": `[bs]`  int — `positions[seq_start]` per seq
-    """
-    ctx = get_forward_context()
-    if ctx is None or ctx.attn_metadata is None:
-        return None, None, None, None, 0, None
-    md = ctx.attn_metadata
-    if md.block_tables is None or md.block_tables.numel() == 0:
-        return None, None, None, None, 0, None
-    state_slot_mapping = getattr(md, "state_slot_mapping", None)
-    cu_seqlens_q = md.cu_seqlens_q
-    context_lens = getattr(md, "context_lens", None)
-    num_seqs = md.block_tables.size(0)
-    cpu_meta = None
-    cu_cpu = getattr(md, "cu_seqlens_q_cpu", None)
-    if cu_cpu is not None:
-        cpu_meta = {
-            "cu_seqlens_q": cu_cpu,
-            "state_slot_mapping": getattr(md, "state_slot_mapping_cpu", None),
-            "start_pos_per_seq": getattr(md, "start_pos_per_seq_cpu", None),
-        }
-    return (
-        md.block_tables,
-        state_slot_mapping,
-        cu_seqlens_q,
-        context_lens,
-        num_seqs,
-        cpu_meta,
-    )
-
-
-def _v4_is_dummy_run() -> bool:
-    """True during the warmup forward (kv_cache bindings may not be in place)."""
-    ctx = get_forward_context()
-    return ctx is not None and ctx.context is not None and ctx.context.is_dummy_run
-
-
-def _v4_gather_compressed(
+def _v4_gather_compressed_batched(
     kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    n_compressed: int,
-    k_per_block: int,
+    block_tables: torch.Tensor,  # [bs, max_blocks_per_seq]
+    gather_indices: dict,
 ) -> torch.Tensor:
-    """Gather the first `n_compressed` committed compressed entries.
+    """Gather compressed entries from `kv_cache` using pre-built index tensors
+    (built once per fwd in `_build_v4_gather_indices`).
 
-    Returns: `[n_compressed, head_dim]`. Empty if `n_compressed == 0`.
+    Returns:
+      gathered_flat: `[total_committed, head_dim]` concatenated in seq order.
     """
-    head_dim = kv_cache.size(-1)
-    if n_compressed == 0:
-        return torch.empty(0, head_dim, dtype=kv_cache.dtype, device=kv_cache.device)
-    ci = torch.arange(n_compressed, device=kv_cache.device, dtype=torch.long)
-    block_in_seq = ci // k_per_block
-    slot_in_block = ci % k_per_block
-    physical_blocks = block_table[block_in_seq].long()
-    return kv_cache[physical_blocks, slot_in_block]
+    batch_ids_gpu = gather_indices["batch_ids_gpu"]
+    if batch_ids_gpu is None:
+        return torch.empty(
+            0, kv_cache.size(-1), dtype=kv_cache.dtype, device=kv_cache.device
+        )
+    physical_blocks = block_tables[
+        batch_ids_gpu, gather_indices["block_in_seq_gpu"]
+    ].long()
+    return kv_cache[physical_blocks, gather_indices["slot_in_block_gpu"]]
+
+
+def _segment_indices(
+    seq_ids: np.ndarray, lens: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """For ragged segments (one per `seq_ids[i]` of length `lens[i]`), return
+    flat (per-row seq id, per-row local position) arrays of total length
+    `sum(lens)`.
+    """
+    total = int(lens.sum())
+    if total == 0:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+        )
+    token_seq_ids = np.repeat(seq_ids.astype(np.int64), lens)
+    cum = np.concatenate(([0], np.cumsum(lens.astype(np.int64))[:-1]))
+    local_pos = np.arange(total, dtype=np.int64) - np.repeat(cum, lens)
+    return token_seq_ids, local_pos
+
+
+def _v4_build_sparse_inputs_batched(
+    *,
+    kv: torch.Tensor,
+    swa_kv: torch.Tensor,
+    kv_compress_batched: Optional[torch.Tensor],
+    compressor_kv_cache: Optional[torch.Tensor],
+    block_tables_gpu: Optional[torch.Tensor],
+    window_topk_batched: torch.Tensor,
+    indexer_topk_batched: Optional[torch.Tensor],
+    pack_meta: dict,
+    has_indexer: bool,
+    ratio: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """GPU-only `kv_sa` + `topk_flat` packer using pre-built index tensors.
+
+    All the per-(fwd, ratio) CPU index math + H2D copies live in
+    `DeepseekV4AttentionMetadataBuilder._build_v4_pack_meta_for_ratio`. Here
+    we only run the GPU index_copy_/index_select kernels — eliminating the
+    ~14 per-layer `torch.as_tensor` synchronous transfers from the legacy
+    inline path below.
+    """
+    head_dim = kv.size(-1)
+    device = kv.device
+    kv_flat_sa = torch.empty(
+        pack_meta["total_kv"], head_dim, dtype=kv.dtype, device=device
+    )
+    topk_flat = torch.empty(pack_meta["total_topk"], dtype=torch.int32, device=device)
+
+    # Part A: prefill kv slice
+    if pack_meta["prefill_kv_dst_gpu"] is not None:
+        kv_flat_sa.index_copy_(
+            0,
+            pack_meta["prefill_kv_dst_gpu"],
+            kv.squeeze(0).index_select(0, pack_meta["prefill_kv_src_gpu"]),
+        )
+
+    # Part A: decode swa gather
+    if pack_meta["decode_state_slots_gpu"] is not None:
+        decode_swa = swa_kv.index_select(
+            0, pack_meta["decode_state_slots_gpu"]
+        ).reshape(-1, head_dim)
+        kv_flat_sa.index_copy_(0, pack_meta["decode_swa_dst_gpu"], decode_swa)
+
+    # Part B: prefill compress
+    if (
+        ratio > 0
+        and kv_compress_batched is not None
+        and pack_meta["prefill_compress_dst_gpu"] is not None
+    ):
+        kv_flat_sa.index_copy_(
+            0,
+            pack_meta["prefill_compress_dst_gpu"],
+            kv_compress_batched.index_select(0, pack_meta["prefill_compress_src_gpu"]),
+        )
+
+    # Part B: decode compress (gather from compressor's kv_cache)
+    if (
+        ratio > 0
+        and compressor_kv_cache is not None
+        and block_tables_gpu is not None
+        and pack_meta["decode_compress_seqs_gpu"] is not None
+    ):
+        decode_block_tables = block_tables_gpu.index_select(
+            0, pack_meta["decode_compress_seqs_gpu"]
+        )
+        gathered_decode_compress = _v4_gather_compressed_batched(
+            compressor_kv_cache,
+            decode_block_tables,
+            pack_meta["decode_compress_gather_indices"],
+        )
+        kv_flat_sa.index_copy_(
+            0, pack_meta["decode_compress_dst_gpu"], gathered_decode_compress
+        )
+
+    # Topk window
+    if pack_meta["window_topk_dst_gpu"] is not None:
+        topk_flat.index_copy_(
+            0,
+            pack_meta["window_topk_dst_gpu"],
+            window_topk_batched.reshape(-1).index_select(
+                0, pack_meta["window_topk_src_gpu"]
+            ),
+        )
+
+    # Topk compress
+    if pack_meta["compress_topk_dst_gpu"] is not None:
+        if has_indexer:
+            assert (
+                indexer_topk_batched is not None
+                and pack_meta["compress_topk_src_gpu"] is not None
+            )
+            topk_flat.index_copy_(
+                0,
+                pack_meta["compress_topk_dst_gpu"],
+                indexer_topk_batched.reshape(-1).index_select(
+                    0, pack_meta["compress_topk_src_gpu"]
+                ),
+            )
+        else:
+            assert pack_meta["compress_topk_values_gpu"] is not None
+            topk_flat.index_copy_(
+                0,
+                pack_meta["compress_topk_dst_gpu"],
+                pack_meta["compress_topk_values_gpu"],
+            )
+
+    return kv_flat_sa, topk_flat
 
 
 # ---------------------------------------------------------------------------
@@ -612,52 +680,14 @@ class _V4RoPE(nn.Module):
             )
 
 
-@lru_cache(1)
-def _get_window_topk_idxs(
-    window_size: int,
-    bsz: int,
-    seqlen: int,
-    start_pos: int,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Per-query topk-style indices into the sliding window KV cache.
-
-    Port of inference/model.py:255-265. Returns [bsz, seqlen, window_size] of
-    int positions into the KV buffer. -1 marks "skip" (causal mask, no fill).
-    """
-    kw = dict(device=device) if device is not None else {}
-    if start_pos >= window_size - 1:
-        start_pos %= window_size
-        matrix = torch.cat(
-            [
-                torch.arange(start_pos + 1, window_size, **kw),
-                torch.arange(0, start_pos + 1, **kw),
-            ],
-            dim=0,
-        )
-    elif start_pos > 0:
-        matrix = F.pad(
-            torch.arange(start_pos + 1, **kw),
-            (0, window_size - start_pos - 1),
-            value=-1,
-        )
-    else:
-        base = torch.arange(seqlen, **kw).unsqueeze(1)
-        matrix = (base - window_size + 1).clamp(0) + torch.arange(
-            min(seqlen, window_size), **kw
-        )
-        matrix = torch.where(matrix > base, -1, matrix)
-    return matrix.unsqueeze(0).expand(bsz, -1, -1)
-
-
 def _build_window_topk_batched(
     positions: torch.Tensor,  # [total_tokens] int (abs token positions)
     start_pos_per_token: torch.Tensor,  # [total_tokens] int (each token's seq start_pos)
     window_size: int,
 ) -> torch.Tensor:  # [total_tokens, window_size] int32
-    """Vectorized batched form of _get_window_topk_idxs over a flat batch.
+    """Per-token sliding-window topk indices for the whole batch.
 
-    Replicates the original per-seq three-branch logic on a per-token basis:
+    Three-branch semantics:
       - sp == 0 (fresh prefill): matrix entries = abs positions in the window
         [pos-win+1, pos] clamped to [0, pos]; mask future via -1.
       - 0 < sp < win-1 (prefix mode): all tokens in the seq share a single
@@ -693,30 +723,6 @@ def _build_window_topk_batched(
     out = torch.where(sp_in_prefix.expand_as(out), case_b, out)
     out = torch.where(sp_eq_0.expand_as(out), case_a, out)
     return out.to(torch.int32)
-
-
-@lru_cache(2)
-def _get_compress_topk_idxs(
-    ratio: int,
-    bsz: int,
-    seqlen: int,
-    start_pos: int,
-    offset: int,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Per-query indices into the compressed KV cache (for HCA — no Indexer).
-
-    Port of inference/model.py:269-276. -1 marks compressed blocks that are
-    still in the future at this query position.
-    """
-    kw = dict(device=device) if device is not None else {}
-    if start_pos > 0:
-        matrix = torch.arange(0, (start_pos + 1) // ratio, **kw) + offset
-    else:
-        matrix = torch.arange(seqlen // ratio, **kw).repeat(seqlen, 1)
-        mask = matrix >= torch.arange(1, seqlen + 1, **kw).unsqueeze(1) // ratio
-        matrix = torch.where(mask, -1, matrix + offset)
-    return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +851,7 @@ class Compressor(nn.Module):
         Args:
             x:           [num_q_tokens, dim] flat ragged batch.
             plan:        CompressPlan from attn_metadata.compress_plans[ratio]
-                         (or `make_single_seq_plan` for Indexer's bs=1 path).
+                         (or a synthetic bs=1 plan during warmup).
             state_slot_mapping: [bs] int32 — per-seq state cache slot
                          (attn_metadata.state_slot_mapping).
             block_tables: [bs, max_blocks_per_seq] int32 — physical block IDs
@@ -886,12 +892,12 @@ class Compressor(nn.Module):
         # was trained with → output quality drops measurably from baseline.
         # TODO: port the quant variants into the kernel for full byte-equal.
         cos_cache, sin_cache = self.rotary_emb._caches(x.device)
-        scatter_block_tables = (
-            block_tables
-            if (block_tables is not None and not _v4_is_dummy_run())
-            else None
-        )
-        scatter_kv_cache = self.kv_cache if scatter_block_tables is not None else None
+        # Warmup runs through the same path: kv_cache is None until the V4
+        # builder binds it post-warmup, so the kernel skips the scatter.
+        # When real, writes to block 0 are overwritten when slot 0 is later
+        # assigned to a real seq (start_pos==0 path discards prior state).
+        scatter_kv_cache = self.kv_cache if block_tables is not None else None
+        scatter_block_tables = block_tables if scatter_kv_cache is not None else None
         out = fused_compress_attn(
             kv_in=kv.contiguous(),
             score_in=score.contiguous(),
@@ -972,6 +978,9 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
+        # Init-time hoists out of `forward_batched`'s hot path.
+        self._fp8_quant_func = get_hip_quant(_AiterQuantType.per_1x128)
+        self._weights_scale = self.softmax_scale * self.n_heads**-0.5
 
         self.compressor = Compressor(
             args,
@@ -997,179 +1006,102 @@ class Indexer(nn.Module):
         )
         self.rotary_emb: Optional[_V4RoPE] = None
 
-    def forward(
+    def forward_batched(
         self,
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        positions: torch.Tensor,
-        offset: int,
-        slot: int = 0,
-        block_table: Optional[torch.Tensor] = None,
-        context_lens: Optional[torch.Tensor] = None,
-        start_pos: Optional[int] = None,
-        skip_inner_compressor: bool = False,
+        x_full: torch.Tensor,  # [total_tokens, dim]
+        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank]
+        positions: torch.Tensor,  # [total_tokens]
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq]
+        indexer_meta: dict,
     ) -> torch.Tensor:
-        """Compute sparse top-k indices over the indexer's compressed KV cache.
+        """Batched score+topk across all seqs in one fp8_mqa_logits call.
 
-        Args:
-            x: [num_tokens, dim] input hidden states for ONE sequence
-                (caller pre-slices in PR3-main multi-seq dispatch).
-            qr: [num_tokens, q_lora_rank] latent query shared with main Attention's q_a.
-            positions: [num_tokens] absolute token positions for this sequence.
-                `positions[0]` drives index masks + scatter indices.
-            offset: offset added to returned indices to land them in the
-                concatenated (window || compressed) KV layout consumed by sparse_attn.
-            slot: per-request state-cache slot — routed to the inner Compressor.
-            block_table: `[max_blocks]` int — physical block IDs for this seq;
-                routed to inner Compressor for scatter and used here for the
-                gather of committed Indexer compressed entries.
+        Caller must invoke `self.compressor` once batched BEFORE this so all
+        seqs' Indexer kv_cache is already populated.
+
+        `indexer_meta` (built once per fwd in
+        `DeepseekV4AttentionMetadataBuilder._build_v4_indexer_meta`) carries
+        every CPU array and pre-uploaded GPU index tensor — the per-CSA-layer
+        call has zero CPU index math and zero H2D copies.
+
         Returns:
-            topk_idxs: [1, num_tokens, K] int (B=1 implicit). -1 = future-masked.
+          topk_flat: `[total_tokens, max_K] int32`, padded with -1 to max K
+            (max over per-seq K). Per-token usable width = K_per_seq.
         """
         assert self.rotary_emb is not None
-        assert x.dim() == 2 and qr.dim() == 2
-        token_num = x.size(0)
-        # start_pos: prefer caller-supplied (from cpu_meta) to avoid .item().
-        # Used locally for the topk masks below AND for building the bs=1
-        # CompressPlan that the inner Compressor consumes.
-        if start_pos is None:
-            start_pos = int(positions[0].item())
         ratio = self.compress_ratio
         rd = self.rope_head_dim
-        end_pos = start_pos + token_num
+        device = x_full.device
+        total_tokens = x_full.size(0)
 
-        # Lazy plumb rotary_emb into compressor (kv_cache is now bound by
-        # the V4 attention builder; pre-PR3-pre2c-B the kv_cache plumbing
-        # also happened here).
-        if self.compressor.rotary_emb is None:
-            self.compressor.rotary_emb = self.rotary_emb
+        max_k = indexer_meta["max_k"]
+        if max_k == 0:
+            return torch.full((total_tokens, 0), -1, dtype=torch.int32, device=device)
 
-        # ----- Indexer Q (2D Linear, then add B=1 dim for RoPE) -----
-        q = self.wq_b(qr).view(token_num, self.n_heads, self.head_dim)
-        q = q.unsqueeze(0)  # [1, S, H, D]
+        # Q proj + RoPE + rotate (batched).
+        q = self.wq_b(qr_full).view(total_tokens, self.n_heads, self.head_dim)
+        q = q.unsqueeze(0)
         self.rotary_emb(positions, q[..., -rd:])
         q = rotate_activation(q)
-        use_fp8_path = os.environ.get("ATOM_V4_INDEXER_FP8", "1") == "1"
-        if use_fp8_path:
-            # Phase 2b-ii: skip FP4 sim (kernel can't consume it); FP8 quant
-            # is folded into fp8_mqa_logits via per-row q_scale below.
-            pass
-        else:
-            fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
 
-        # ----- Indexer KV (Compressor takes 2D, mutates kv_cache) -----
-        # bs=1 plan path; skipped when caller hoisted the inner Compressor
-        # call (Phase 2b-i) and already updated state cache + kv_cache for
-        # this seq via the batched call.
-        if not skip_inner_compressor:
-            single_plan = make_single_seq_plan(
-                token_num=token_num,
-                start_pos=start_pos,
-                ratio=ratio,
-                is_overlap=self.compressor.overlap,
-                device=x.device,
-            )
-            single_state_slot = torch.tensor([slot], device=x.device, dtype=torch.int32)
-            single_block_tables = (
-                block_table.unsqueeze(0) if block_table is not None else None
-            )
-            self.compressor(
-                x,
-                plan=single_plan,
-                state_slot_mapping=single_state_slot,
-                block_tables=single_block_tables,
-            )
-        # ----- Index score + topk -----
-        # PR3-main: gather committed compressed Indexer entries from the
-        # per-seq block_table (passed in by the caller). During warmup
-        # block_table is None, so we return a zeros placeholder — the
-        # resulting topk_idxs are discarded by the warmup forward path anyway.
-        n_committed = end_pos // ratio
-        K = min(self.index_topk, n_committed)
+        # FP8 quant Q + batched gather K + FP8 quant. `_fp8_quant_func`,
+        # `_weights_scale` precomputed in __init__.
+        q_2d = q.squeeze(0).contiguous().view(-1, self.head_dim)
+        q_fp8, q_scale = self._fp8_quant_func(q_2d, quant_dtype=dtypes.fp8)
+        q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
+        q_scale = q_scale.view(total_tokens, self.n_heads, 1)
 
-        if block_table is None or _v4_is_dummy_run() or n_committed == 0:
-            # Warmup / no committed positions → return all -1 (length K).
-            return torch.full((1, token_num, K), -1, dtype=torch.int32, device=x.device)
+        gathered_flat = _v4_gather_compressed_batched(
+            self.kv_cache, block_tables, indexer_meta["gather_indices"]
+        )
+        k_fp8, k_scale = self._fp8_quant_func(gathered_flat, quant_dtype=dtypes.fp8)
 
-        k_per_block = _V4_BLOCK_SIZE // ratio
-        gathered = _v4_gather_compressed(
-            self.kv_cache, block_table, n_committed, k_per_block
-        )  # [n_committed, head_dim] BF16
-
-        if use_fp8_path:
-            # Phase 2b-ii: fp8_mqa_logits replaces einsum + relu + weight + sum.
-            # Math: relu(Q.K) * weight summed over heads → score[s, t]; identical
-            # to V3.2's sparse_attn_indexer_prefill kernel call.
-            # Local import for aiter QuantType (top-level conflicts with
-            # atom.config.QuantType used elsewhere in this file).
-            from aiter import QuantType as _AiterQuantType
-
-            quant_func = get_hip_quant(_AiterQuantType.per_1x128)
-            q_2d = q.squeeze(0).contiguous().view(-1, self.head_dim)
-            q_fp8, q_scale = quant_func(q_2d, quant_dtype=dtypes.fp8)
-            q_fp8 = q_fp8.view(token_num, self.n_heads, self.head_dim)
-            q_scale = q_scale.view(token_num, self.n_heads, 1)
-
-            k_fp8, k_scale = quant_func(gathered, quant_dtype=dtypes.fp8)
-            # weights with q_scale + softmax_scale + 1/sqrt(H) folded.
-            weights = (
-                (
-                    self.weights_proj(x).unsqueeze(-1)
-                    * q_scale
-                    * self.softmax_scale
-                    * self.n_heads**-0.5
-                )
-                .squeeze(-1)
-                .float()
-            )
-            # Per-row [start, end): start=0, end=(pos+1)//ratio (clamp to n_committed).
-            cu_starts = torch.zeros(token_num, dtype=torch.int32, device=x.device)
-            cu_ends = ((positions + 1) // ratio).clamp(max=n_committed).to(torch.int32)
-            logits = fp8_mqa_logits(
-                Q=q_fp8,
-                KV=k_fp8,
-                kv_scales=k_scale.view(-1).float(),
-                weights=weights,
-                cu_starts=cu_starts,
-                cu_ends=cu_ends,
-            )  # [token_num, n_committed] fp32 (zeros outside [start, end))
-            # Replace zeros outside cu_ends with -inf so topk doesn't pick them.
-            pos_idx = torch.arange(n_committed, device=x.device)
-            mask_out_of_range = pos_idx.unsqueeze(0) >= cu_ends.unsqueeze(1)
-            logits = logits.masked_fill(mask_out_of_range, float("-inf"))
-            topk_idxs = logits.topk(K, dim=-1)[1].to(torch.int32)
-            # Future-mask + offset (same semantics as legacy path).
-            if start_pos == 0:
-                future_threshold = ((positions + 1) // ratio).unsqueeze(1)
-                future_mask = topk_idxs >= future_threshold
-                topk_idxs = torch.where(future_mask, -1, topk_idxs + offset)
-            else:
-                topk_idxs = topk_idxs + offset
-            return topk_idxs.unsqueeze(0)
-
-        # Legacy BF16 einsum path.
+        # weights = weights_proj * q_scale * (softmax_scale * 1/sqrt(H))
         weights = (
-            self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        ).unsqueeze(0)
-        gathered_b = gathered.unsqueeze(0)  # [1, n_committed, head_dim]
-        index_score = torch.einsum("bshd,btd->bsht", q, gathered_b)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        if start_pos == 0:
-            mask = (
-                torch.arange(token_num // ratio, device=x.device).repeat(token_num, 1)
-                >= torch.arange(1, token_num + 1, device=x.device).unsqueeze(1) // ratio
-            )
-            index_score = index_score + torch.where(mask, float("-inf"), 0.0)
-        topk_idxs = index_score.topk(K, dim=-1)[1]
-        if start_pos == 0:
-            mask = (
-                topk_idxs
-                >= torch.arange(1, token_num + 1, device=x.device).unsqueeze(1) // ratio
-            )
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-        else:
-            topk_idxs = topk_idxs + offset
-        return topk_idxs
+            (self.weights_proj(x_full).unsqueeze(-1) * q_scale * self._weights_scale)
+            .squeeze(-1)
+            .float()
+        )
+
+        # All per-token broadcast helpers + layer-invariant derivations are
+        # pre-built in `_build_v4_indexer_meta`.
+        seq_base_per_token = indexer_meta["seq_base_per_token_gpu"]
+        cu_starts = indexer_meta["cu_starts_gpu"]
+        cu_ends = indexer_meta["cu_ends_gpu"]
+        future_threshold = indexer_meta["future_threshold_gpu"]
+        width_mask = indexer_meta["width_mask_gpu"]
+        offset_per_token = indexer_meta["offset_per_token_gpu"]
+        is_prefill_per_token = indexer_meta["is_prefill_per_token_gpu"]
+
+        logits = fp8_mqa_logits(
+            Q=q_fp8,
+            KV=k_fp8,
+            kv_scales=k_scale.view(-1).float(),
+            weights=weights,
+            cu_starts=cu_starts,
+            cu_ends=cu_ends,
+        )  # [total_tokens, total_committed] fp32; outside [start,end) is -inf
+
+        # PyTorch topk over -inf-masked logits. aiter `top_k_per_row_prefill`
+        # would be the obvious replacement but it hardcodes K=2048 — V4's
+        # K=index_topk=64 doesn't fit (the kernel writes 2048 ints/row,
+        # overflowing a [tok, 64] indices buffer and corrupting memory).
+        topk_global = logits.topk(max_k, dim=-1)[1].to(torch.int32)
+        # Global flat index → seq-local compress idx; drop slots past per-seq K.
+        topk_local = topk_global - seq_base_per_token.unsqueeze(1)
+        topk_local = topk_local.masked_fill(width_mask, -1)
+
+        # Per-seq offset to land indices in the [SWA || compressed] kv_sa
+        # layout consumed by sparse_attn (token_num for fresh prefill, win
+        # for decode); future-mask only applies in fresh prefill.
+        future_mask = is_prefill_per_token & (topk_local >= future_threshold)
+        topk_with_offset = topk_local + offset_per_token.unsqueeze(1)
+        topk_final = torch.where(
+            (topk_local < 0) | future_mask,
+            torch.full_like(topk_local, -1),
+            topk_with_offset,
+        )
+        return topk_final
 
 
 # ---------------------------------------------------------------------------
@@ -1408,24 +1340,26 @@ class DeepseekV4Attention(nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        # Idempotent one-time plumb of rotary_emb into compressor / indexer.
+        # Idempotent one-time plumb of rotary_emb into compressor / indexer
+        # (and the indexer's inner compressor). `rotary_emb` is set by the
+        # owning layer after __init__, so this can't move into __init__.
         if self.compress_ratio and self.compressor.rotary_emb is None:
             self.compressor.rotary_emb = self.rotary_emb
             if self.indexer is not None:
                 self.indexer.rotary_emb = self.rotary_emb
+                self.indexer.compressor.rotary_emb = self.rotary_emb
 
         # ----- Batched ops on full flat tensors -----
-        # EXPERIMENT: round-trip x and qr to ue8m0-aligned FP8 to mimic ref's
-        # act_quant(scale_fmt="ue8m0") behavior in Linear input quantization.
-        if os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1":
+        # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
+        # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
+        # quantization. EXPERIMENT only.
+        if _V4_FORCE_UE8M0_QUANT:
             from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
 
             x = x.clone()
             _v4_aqi(x, 128, "ue8m0")
         qr = self.q_norm(self.wq_a(x))  # [S_total, q_lora_rank], shared with Indexer
-        if os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1":
-            from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
-
+        if _V4_FORCE_UE8M0_QUANT:
             qr = qr.clone()
             _v4_aqi(qr, 128, "ue8m0")
         q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
@@ -1436,291 +1370,92 @@ class DeepseekV4Attention(nn.Module):
         kv = self.kv_norm(kv).unsqueeze(0)  # [1, S_total, head_dim]
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
-        # ----- Per-seq dispatch -----
-        # PR-A Phase 2: prefer CPU-mirror metadata published by the V4
-        # attention builder over `.tolist()` on GPU tensors. When available,
-        # `start_pos_per_seq_cpu` also lets the loop body skip the per-seq
-        # `int(seq_positions[0].item())` sync. Falls back to legacy `.tolist()`
-        # path when CPU mirror is absent (warmup / non-V4 dispatch).
-        (
-            block_tables,
-            state_slot_mapping,
-            cu_seqlens_q,
-            context_lens,
-            num_seqs,
-            cpu_meta,
-        ) = _v4_get_seq_metadata()
-        start_pos_per_seq: Optional[list[int]] = None
-        # Compress plan for this fwd's batch (per ratio). Built by
-        # DeepseekV4AttentionMetadataBuilder.prepare_decode/prefill. Absent
-        # during warmup / dummy run — caller builds a fallback single-seq plan.
-        attn_md = (
-            get_forward_context().attn_metadata
-            if get_forward_context() is not None
-            else None
-        )
-        compress_plans = (
-            getattr(attn_md, "compress_plans", None) if attn_md is not None else None
-        )
-        if num_seqs == 0 or block_tables is None or _v4_is_dummy_run():
-            # Warmup / fallback: treat the whole batch as a single dummy seq.
-            seq_offsets = [0, seqlen_total]
-            slots = [0]
-            per_seq_bts: list[Optional[torch.Tensor]] = [None]
-            num_seqs = 1
-            # Dummy context_lens: 1-element tensor sized to seqlen_total
-            # (treats warmup as fresh prefill).
-            context_lens = torch.tensor(
-                [seqlen_total], device=positions.device, dtype=torch.int32
-            )
-            state_slot_mapping = torch.tensor(
-                [0], device=positions.device, dtype=torch.int32
-            )
-            compress_plans = None  # batched call below builds fallback
-            block_tables_gpu = None
-        elif cpu_meta is not None and cpu_meta["start_pos_per_seq"] is not None:
-            seq_offsets = cpu_meta["cu_seqlens_q"][: num_seqs + 1].tolist()
-            slots = cpu_meta["state_slot_mapping"][:num_seqs].tolist()
-            start_pos_per_seq = cpu_meta["start_pos_per_seq"][:num_seqs].tolist()
-            per_seq_bts = [block_tables[i] for i in range(num_seqs)]
-            block_tables_gpu = block_tables
-        else:
-            seq_offsets = cu_seqlens_q[: num_seqs + 1].tolist()
-            slots = state_slot_mapping[:num_seqs].tolist()
-            per_seq_bts = [block_tables[i] for i in range(num_seqs)]
-            block_tables_gpu = block_tables
+        # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
+        # All per-fwd state read once. Production prepare_decode/prefill
+        # always populates these; warmup goes through the same path
+        # (`_populate_state_slot_mapping` falls back to slot 0).
+        attn_md = get_forward_context().attn_metadata
+        compress_plans = attn_md.compress_plans
+        v4_sparse_layouts = attn_md.v4_sparse_layouts
+        v4_indexer_meta = attn_md.v4_indexer_meta
+        window_topk_batched = attn_md.window_topk_batched
+        swa_write_indices = attn_md.swa_write_indices
+        swa_positions_filtered = attn_md.swa_positions_filtered
+        swa_slot_per_token_filtered = attn_md.swa_slot_per_token_filtered
+        block_tables_gpu = attn_md.block_tables
+        state_slot_mapping = attn_md.state_slot_mapping
 
-        # State cache reset on fresh prefill is redundant — verified.
-        # SWA: start_pos==0 path (~line 1603) uses raw seq_kv, never reads
-        # swa_kv. Compressor: fused_compress K-loop's is_state branch is
-        # gated by `s < 0` (is_padding); for fresh prefill (prefix=0,
-        # position=j_in_seq), every is_state iteration falls in s<0 →
-        # masked. See compress_plan.py:88 + fused_compress.py:124-127.
-
-        # ----- Batched compressor call (ONCE for the whole batch) -----
-        # Replaces per-seq self.compressor() inside the loop. Indexer's
-        # internal Compressor is still called per-seq (bs=1 plan) inside the
-        # per-seq loop below, since Indexer needs per-seq topk masks anyway.
-        kv_compress_batched: Optional[torch.Tensor] = None
-        plan_for_layer: Optional[CompressPlan] = None
-        if self.compress_ratio:
-            if compress_plans is not None and ratio in compress_plans:
-                plan_for_layer = compress_plans[ratio]
-            else:
-                # Fallback: build a single-seq plan from positions / token count.
-                # Only path for warmup / non-V4 dispatch.
-                sp_dummy = start_pos_per_seq[0] if start_pos_per_seq is not None else 0
-                plan_for_layer = make_single_seq_plan(
-                    token_num=seqlen_total,
-                    start_pos=sp_dummy,
-                    ratio=ratio,
-                    is_overlap=self.compressor.overlap,
-                    device=x.device,
-                )
-            assert (
-                state_slot_mapping is not None
-                and state_slot_mapping.dtype == torch.int32
-                and state_slot_mapping.is_cuda
-            ), (
-                "batched compressor needs state_slot_mapping as int32 GPU "
-                f"tensor, got {state_slot_mapping}"
-            )
-            kv_compress_batched = self.compressor(
+        # ===== Batched compressor + Indexer (ONCE per layer) =====
+        # State cache reset on fresh prefill is redundant: SWA's start_pos==0
+        # path uses raw seq_kv, and fused_compress's state-cache reads are
+        # already masked by `s < 0` for fresh prefill (compress_plan.py:88 +
+        # fused_compress.py:124-127).
+        plan_for_layer = compress_plans[ratio] if ratio else None
+        kv_compress_batched = (
+            self.compressor(
                 x,
                 plan=plan_for_layer,
                 state_slot_mapping=state_slot_mapping,
                 block_tables=block_tables_gpu,
             )
-
-        # ----- Phase 2b-i: Batched Indexer Compressor (ONCE per layer) -----
-        indexer_batched_done = False
-        if self.compress_ratio == 4 and self.indexer is not None:
-            if self.indexer.compressor.rotary_emb is None:
-                self.indexer.compressor.rotary_emb = self.indexer.rotary_emb
+            if ratio
+            else None
+        )
+        indexer_topk_batched = None
+        if self.indexer is not None:
+            # Indexer's inner compressor populates the indexer kv_cache; the
+            # outer `forward_batched` reads `v4_indexer_meta` (built once per
+            # fwd) so it has zero per-layer H2D / CPU index math.
             self.indexer.compressor(
                 x,
                 plan=plan_for_layer,
                 state_slot_mapping=state_slot_mapping,
                 block_tables=block_tables_gpu,
             )
-            indexer_batched_done = True
-
-        # ----- Batched SWA write (ONCE for the whole batch) -----
-        # Filter to only the last `win` tokens per seq before the kernel call:
-        # the kernel launches num_tokens programs in parallel, and writes go
-        # to swa_kv[slot, pos % win]. Writing all tokens for a long prefill
-        # (token_num > win) creates intra-seq races where multiple programs
-        # target the same ring slot. The "last win tokens" are exactly the
-        # subset whose writes survive cyclic overwrite anyway, matching the
-        # legacy "write tail" optimization.
-        if num_seqs > 0:
-            cu_q_gpu = torch.as_tensor(seq_offsets, device=x.device, dtype=torch.int32)
-            token_num_gpu = cu_q_gpu[1:] - cu_q_gpu[:-1]
-            # Per-seq write range = [seq_start + max(0, token_num-win), seq_end)
-            seq_offsets_arr = np.asarray(seq_offsets, dtype=np.int64)
-            token_num_arr = seq_offsets_arr[1:] - seq_offsets_arr[:-1]
-            write_starts = seq_offsets_arr[:-1] + np.maximum(0, token_num_arr - win)
-            write_ends = seq_offsets_arr[1:]
-            write_indices_np = (
-                np.concatenate(
-                    [
-                        np.arange(s, e, dtype=np.int64)
-                        for s, e in zip(write_starts, write_ends)
-                    ]
-                )
-                if num_seqs
-                else np.empty(0, dtype=np.int64)
-            )
-            if write_indices_np.size > 0:
-                write_idx_gpu = torch.as_tensor(write_indices_np, device=x.device)
-                slot_per_token_full = torch.repeat_interleave(
-                    state_slot_mapping.to(torch.int32), token_num_gpu
-                )
-                kv_flat_in = kv.squeeze(0)
-                swa_write(
-                    kv_flat_in[write_idx_gpu].contiguous(),
-                    positions[write_idx_gpu].contiguous(),
-                    slot_per_token_full[write_idx_gpu].contiguous(),
-                    self.swa_kv,
-                    win,
-                )
-
-        # ----- Batched window topk (ONCE for the whole batch) -----
-        # Pre-build [total_tokens, win] padded with -1; per-seq slice in the
-        # loop trims to width = min(token_num, win) if sp==0 else win, matching
-        # legacy `_get_window_topk_idxs` shape that downstream `topk_lens` in
-        # attn_metadata expects.
-        window_topk_batched: Optional[torch.Tensor] = None
-        if num_seqs > 0:
-            if start_pos_per_seq is not None:
-                sp_per_seq_gpu = torch.as_tensor(
-                    start_pos_per_seq, device=x.device, dtype=torch.long
-                )
-            else:
-                # one sync for whole batch (cu_q_gpu already on device)
-                sp_per_seq_gpu = positions[cu_q_gpu[:-1].to(torch.long)].to(torch.long)
-            sp_per_token = torch.repeat_interleave(sp_per_seq_gpu, token_num_gpu)
-            window_topk_batched = _build_window_topk_batched(
-                positions.to(torch.long), sp_per_token, win
+            indexer_topk_batched = self.indexer.forward_batched(
+                x_full=x,
+                qr_full=qr,
+                positions=positions,
+                block_tables=block_tables_gpu,
+                indexer_meta=v4_indexer_meta,
             )
 
-        # Phase 2d reverted — using legacy cat-list path. Will be redone
-        # together with Phase 2e (loop deletion) where kv_sa packing must
-        # be batched anyway. See bisect notes: standalone Phase 2d showed
-        # 0.94 vs 0.96 on GSM8K-50 (1 sample drift), within stderr but
-        # not bit-exact, deferred to bundle with 2e for cleaner validation.
-        sparse_kvs = []
-        sparse_topks = []
-        for seq_idx in range(num_seqs):
-            seq_start = seq_offsets[seq_idx]
-            seq_end = seq_offsets[seq_idx + 1]
-            token_num = seq_end - seq_start
-            if token_num == 0:
-                continue
-            slot = slots[seq_idx]
-            block_table = per_seq_bts[seq_idx]
-            seq_positions = positions[seq_start:seq_end]
-            seq_x = x[seq_start:seq_end]
-            seq_kv = kv[:, seq_start:seq_end]
-            # PR-A Phase 2: prefer CPU mirror to avoid per-seq GPU→CPU sync
-            # (~64 layers × num_seqs syncs eliminated when present).
-            if start_pos_per_seq is not None:
-                start_pos = start_pos_per_seq[seq_idx]
-            else:
-                start_pos = int(seq_positions[0].item())
-            end_pos = start_pos + token_num
-
-            # Slice batched window topk to per-seq width matching legacy:
-            # min(token_num, win) for fresh prefill, win for continuation.
-            win_per_seq = min(token_num, win) if start_pos == 0 else win
-            topk_idxs = window_topk_batched[seq_start:seq_end, :win_per_seq].unsqueeze(
-                0
+        # ===== SWA write =====
+        # `swa_write_indices` (and the filtered positions/slots) are pre-built
+        # once per fwd in `_attach_v4_per_fwd_meta` — pre-filtered to the last
+        # `win` tokens per seq to avoid intra-seq ring-slot races. None means
+        # "nothing to write" (warmup / empty batch).
+        if swa_write_indices is not None:
+            swa_write(
+                kv.squeeze(0)[swa_write_indices].contiguous(),
+                swa_positions_filtered,
+                swa_slot_per_token_filtered,
+                self.swa_kv,
+                win,
             )
-            seq_context_lens = context_lens[seq_idx : seq_idx + 1]
-            if self.compress_ratio:
-                offset = seq_kv.size(1) if start_pos == 0 else win
-                if self.indexer is not None:
-                    seq_qr = qr[seq_start:seq_end]
-                    compress_topk_idxs = self.indexer(
-                        seq_x,
-                        seq_qr,
-                        seq_positions,
-                        offset,
-                        slot=slot,
-                        block_table=block_table,
-                        context_lens=seq_context_lens,
-                        start_pos=start_pos,
-                        skip_inner_compressor=indexer_batched_done,
-                    )
-                else:
-                    compress_topk_idxs = _get_compress_topk_idxs(
-                        ratio, 1, token_num, start_pos, offset, device=x.device
-                    )
-                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-            topk_idxs = topk_idxs.int()
 
-            # SWA write hoisted to a single batched call before the loop
-            # (filtered to last-win tokens per seq to avoid intra-seq race).
-
-            if start_pos == 0:
-                kv_sa = seq_kv
-                if self.compress_ratio and kv_compress_batched is not None:
-                    cu_c = plan_for_layer.cu_compress_cpu
-                    seq_compress = kv_compress_batched[
-                        int(cu_c[seq_idx]) : int(cu_c[seq_idx + 1])
-                    ]
-                    if seq_compress.shape[0] > 0:
-                        kv_sa = torch.cat([kv_sa, seq_compress.unsqueeze(0)], dim=1)
-            else:
-                if self.compress_ratio:
-                    n_committed = end_pos // ratio
-                    if (
-                        block_table is not None
-                        and not _v4_is_dummy_run()
-                        and n_committed > 0
-                    ):
-                        k_per_block = _V4_BLOCK_SIZE // ratio
-                        gathered = _v4_gather_compressed(
-                            self.compressor.kv_cache,
-                            block_table,
-                            n_committed,
-                            k_per_block,
-                        ).unsqueeze(0)
-                        kv_sa = torch.cat(
-                            [self.swa_kv[slot : slot + 1], gathered], dim=1
-                        )
-                    else:
-                        kv_sa = self.swa_kv[slot : slot + 1]
-                else:
-                    kv_sa = self.swa_kv[slot : slot + 1]
-
-            sparse_kvs.append(kv_sa.squeeze(0))
-            sparse_topks.append(topk_idxs.reshape(-1))
-
+        # ===== Sparse-attn inputs (kv_sa, topk_flat) + ragged layout =====
+        # Pre-built `pack_meta` (built once in `_build_v4_pack_meta_for_ratio`)
+        # carries every CPU/GPU index — the per-layer call is just GPU
+        # index_copy_/select ops.
         q_sa = q.squeeze(0).contiguous()
-        kv_sa = torch.cat(sparse_kvs, dim=0).contiguous()
-        topk_flat = torch.cat(sparse_topks).contiguous()
-        ctx = get_forward_context()
-        sparse_layouts = (
-            getattr(ctx.attn_metadata, "v4_sparse_layouts", None)
-            if ctx is not None and ctx.attn_metadata is not None
-            else None
+        layout = v4_sparse_layouts[ratio]
+        kv_sa, topk_flat = _v4_build_sparse_inputs_batched(
+            kv=kv,
+            swa_kv=self.swa_kv,
+            kv_compress_batched=kv_compress_batched,
+            compressor_kv_cache=self.compressor.kv_cache if ratio else None,
+            block_tables_gpu=block_tables_gpu,
+            window_topk_batched=window_topk_batched,
+            indexer_topk_batched=indexer_topk_batched,
+            pack_meta=layout["pack_meta"],
+            has_indexer=self.indexer is not None,
+            ratio=ratio,
         )
-        assert self.compress_ratio in (0, 4, 128), (
-            f"unexpected V4 compress_ratio={self.compress_ratio}; "
-            "expected one of 0, 4, 128"
-        )
-        if _v4_is_dummy_run():
-            topk_starts = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int64)
-            topk_lens = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int32)
-            kv_offsets = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int32)
-            max_topk = 1
-        else:
-            layout = sparse_layouts[self.compress_ratio]
-            topk_starts = layout["topk_starts"]
-            topk_lens = layout["topk_lens"]
-            kv_offsets = layout["kv_offsets"]
-            max_topk = layout["max_topk"]
+        topk_starts = layout["topk_starts"]
+        topk_lens = layout["topk_lens"]
+        kv_offsets = layout["kv_offsets"]
+        max_topk = layout["max_topk"]
 
         o = sparse_attn_ragged_varlen(
             q_sa,
@@ -2037,10 +1772,10 @@ class MoE(nn.Module):
             top_idx = idx[:, 1]
             sub_x = x[tok_idx].float()
             sub_w = topk_weights[tok_idx, top_idx].unsqueeze(-1)
-            # V4_USE_REF_QUANT: round-trip sub_x through FP8 ue8m0 to mirror
-            # ref Expert.forward (which quantizes input to FP8 with ue8m0
-            # scale via act_quant before fp4_gemm). See notes/17.
-            if os.environ.get("V4_USE_REF_QUANT", "0") == "1":
+            # `_V4_USE_REF_QUANT` (module-level): round-trip sub_x through FP8
+            # ue8m0 to mirror ref Expert.forward (act_quant before fp4_gemm).
+            # See notes/17.
+            if _V4_USE_REF_QUANT:
                 from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
 
                 sub_x = sub_x.to(torch.bfloat16)
@@ -2075,7 +1810,7 @@ class MoE(nn.Module):
             w2_f = w2_f.reshape(w2_e.shape[0], -1)
 
             act_bf = act.to(torch.bfloat16)
-            if os.environ.get("V4_USE_REF_QUANT", "0") == "1":
+            if _V4_USE_REF_QUANT:
                 from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
 
                 _v4_aqi(act_bf, 128, "ue8m0")
@@ -2270,9 +2005,7 @@ class Block(nn.Module):
         `/app/logs_claude/deepseek_v4/notes/12_aiter_mhc_post_root_cause.md`
         for the diagnosis. Re-enable aiter once the kernel is fixed upstream.
         """
-        import os as _os
-
-        if _os.environ.get("V4_AITER_HC_POST", "") == "1":
+        if _V4_AITER_HC_POST:
             try:
                 import aiter as _aiter
 

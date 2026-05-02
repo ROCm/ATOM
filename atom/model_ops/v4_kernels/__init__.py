@@ -12,7 +12,6 @@ derived from device data via `.item()`.
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
-    make_single_seq_plan,
 )
 from atom.model_ops.v4_kernels.fused_compress import (
     fused_compress_attn,
@@ -27,5 +26,4 @@ __all__ = [
     "fused_compress_attn_reference",
     "CompressPlan",
     "make_compress_plans",
-    "make_single_seq_plan",
 ]
