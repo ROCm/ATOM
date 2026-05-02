@@ -48,6 +48,8 @@ echo "[router] decode ready"
 
 mkdir -p /workspace/logs
 
+export HF_HUB_CACHE=/mnt/hf_hub_cache
+
 ${MESH_BIN} launch \
     --host 0.0.0.0 --port "${ROUTER_PORT}" \
     --pd-disaggregation \
