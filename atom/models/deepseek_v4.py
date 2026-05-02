@@ -1006,6 +1006,7 @@ class Indexer(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         context_lens: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = None,
+        skip_inner_compressor: bool = False,
     ) -> torch.Tensor:
         """Compute sparse top-k indices over the indexer's compressed KV cache.
 
@@ -1050,26 +1051,27 @@ class Indexer(nn.Module):
         fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
 
         # ----- Indexer KV (Compressor takes 2D, mutates kv_cache) -----
-        # Wrap as a bs=1 plan for the batched Compressor interface. The
-        # block_table arg is per-seq [max_blocks]; convert to [1, max_blocks]
-        # for the batched API. State slot also wrapped as [1].
-        single_plan = make_single_seq_plan(
-            token_num=token_num,
-            start_pos=start_pos,
-            ratio=ratio,
-            is_overlap=self.compressor.overlap,
-            device=x.device,
-        )
-        single_state_slot = torch.tensor([slot], device=x.device, dtype=torch.int32)
-        single_block_tables = (
-            block_table.unsqueeze(0) if block_table is not None else None
-        )
-        self.compressor(
-            x,
-            plan=single_plan,
-            state_slot_mapping=single_state_slot,
-            block_tables=single_block_tables,
-        )
+        # bs=1 plan path; skipped when caller hoisted the inner Compressor
+        # call (Phase 2b-i) and already updated state cache + kv_cache for
+        # this seq via the batched call.
+        if not skip_inner_compressor:
+            single_plan = make_single_seq_plan(
+                token_num=token_num,
+                start_pos=start_pos,
+                ratio=ratio,
+                is_overlap=self.compressor.overlap,
+                device=x.device,
+            )
+            single_state_slot = torch.tensor([slot], device=x.device, dtype=torch.int32)
+            single_block_tables = (
+                block_table.unsqueeze(0) if block_table is not None else None
+            )
+            self.compressor(
+                x,
+                plan=single_plan,
+                state_slot_mapping=single_state_slot,
+                block_tables=single_block_tables,
+            )
         # weights_proj is ATOM Linear → 2D input; restore B=1 dim for einsum.
         weights = (
             self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
@@ -1474,6 +1476,19 @@ class DeepseekV4Attention(nn.Module):
                 block_tables=block_tables_gpu,
             )
 
+        # ----- Phase 2b-i: Batched Indexer Compressor (ONCE per layer) -----
+        indexer_batched_done = False
+        if self.compress_ratio == 4 and self.indexer is not None:
+            if self.indexer.compressor.rotary_emb is None:
+                self.indexer.compressor.rotary_emb = self.indexer.rotary_emb
+            self.indexer.compressor(
+                x,
+                plan=plan_for_layer,
+                state_slot_mapping=state_slot_mapping,
+                block_tables=block_tables_gpu,
+            )
+            indexer_batched_done = True
+
         # ----- Batched SWA write (ONCE for the whole batch) -----
         # Filter to only the last `win` tokens per seq before the kernel call:
         # the kernel launches num_tokens programs in parallel, and writes go
@@ -1579,6 +1594,7 @@ class DeepseekV4Attention(nn.Module):
                         block_table=block_table,
                         context_lens=seq_context_lens,
                         start_pos=start_pos,
+                        skip_inner_compressor=indexer_batched_done,
                     )
                 else:
                     compress_topk_idxs = _get_compress_topk_idxs(
