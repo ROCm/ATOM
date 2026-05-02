@@ -583,7 +583,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         return {
             "max_k": max_k,
+            "max_committed": int(n_committed_per_seq.max()) if bs > 0 else 0,
+            "num_seqs": int(bs),
             "gather_indices": gather_indices,
+            "batch_id_per_token_gpu": batch_id_per_token_gpu,
+            "n_committed_per_seq_gpu": n_committed_per_seq_gpu,
             "seq_base_per_token_gpu": seq_base_per_token_gpu,
             "cu_starts_gpu": seq_base_per_token_gpu,  # alias for fp8_mqa_logits
             "cu_ends_gpu": cu_ends_gpu,

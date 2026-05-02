@@ -25,10 +25,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from aiter import QuantType as _AiterQuantType
-from aiter import dtypes, get_hip_quant
+from aiter import dtypes
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
-from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.attention.dsv4_indexer import dsv4_indexer_topk
 from atom.config import Config
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
@@ -41,6 +40,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.quant_v4 import (
     act_quant_inplace,
+    fp4_act_quant_inplace,
     rotate_activation,
 )
 from atom.model_ops.sparse_attn_v4 import (  # noqa: F401
@@ -985,8 +985,6 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
-        # Init-time hoists out of `forward_batched`'s hot path.
-        self._fp8_quant_func = get_hip_quant(_AiterQuantType.per_1x128)
         self._weights_scale = self.softmax_scale * self.n_heads**-0.5
 
         self.compressor = Compressor(
@@ -1021,7 +1019,7 @@ class Indexer(nn.Module):
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq]
         indexer_meta: dict,
     ) -> torch.Tensor:
-        """Batched score+topk across all seqs in one fp8_mqa_logits call.
+        """Batched score+topk across all seqs with AITER's DSv4 Indexer op.
 
         Caller must invoke `self.compressor` once batched BEFORE this so all
         seqs' Indexer kv_cache is already populated.
@@ -1045,66 +1043,69 @@ class Indexer(nn.Module):
         if max_k == 0:
             return torch.full((total_tokens, 0), -1, dtype=torch.int32, device=device)
 
-        # Q proj + RoPE + rotate (batched).
+        # Q proj + RoPE + reference Indexer FP4 simulation (batched).
         q = self.wq_b(qr_full).view(total_tokens, self.n_heads, self.head_dim)
         q = q.unsqueeze(0)
         self.rotary_emb(positions, q[..., -rd:])
         q = rotate_activation(q)
-
-        # FP8 quant Q + batched gather K + FP8 quant. `_fp8_quant_func`,
-        # `_weights_scale` precomputed in __init__.
-        q_2d = q.squeeze(0).contiguous().view(-1, self.head_dim)
-        q_fp8, q_scale = self._fp8_quant_func(q_2d, quant_dtype=dtypes.fp8)
-        q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
-        q_scale = q_scale.view(total_tokens, self.n_heads, 1)
+        q = q.squeeze(0).contiguous()
+        fp4_act_quant_inplace(q, 32)
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            q = q.to(torch.bfloat16)
 
         gathered_flat = _v4_gather_compressed_batched(
             self.kv_cache, block_tables, indexer_meta["gather_indices"]
         )
-        k_fp8, k_scale = self._fp8_quant_func(gathered_flat, quant_dtype=dtypes.fp8)
+        # The fused compressor currently stores dequantized BF16. Convert the
+        # gathered Indexer KV into the same rotated FP4-dequantized basis as Q
+        # before handing it to the AITER scorer.
+        gathered_flat = rotate_activation(gathered_flat.contiguous())
+        fp4_act_quant_inplace(gathered_flat, 32)
+        if gathered_flat.dtype not in (torch.float16, torch.bfloat16):
+            gathered_flat = gathered_flat.to(torch.bfloat16)
 
-        # weights = weights_proj * q_scale * (softmax_scale * 1/sqrt(H))
-        weights = (
-            (self.weights_proj(x_full).unsqueeze(-1) * q_scale * self._weights_scale)
-            .squeeze(-1)
-            .float()
+        # AITER PR #2998 accepts batched dense KV, not ATOM's paged cache. Build
+        # the dense [B, max_committed, D] view from the already-gathered flat
+        # cache. Invalid tail rows are masked by kv_lens inside the kernel.
+        num_seqs = indexer_meta["num_seqs"]
+        max_committed = indexer_meta["max_committed"]
+        kv_batched = torch.zeros(
+            (num_seqs, max_committed, self.head_dim),
+            dtype=gathered_flat.dtype,
+            device=device,
         )
+        gather_indices = indexer_meta["gather_indices"]
+        batch_ids = gather_indices["batch_ids_gpu"]
+        if batch_ids is not None and gathered_flat.numel() > 0:
+            local_idx = (
+                gather_indices["block_in_seq_gpu"] * (_V4_BLOCK_SIZE // ratio)
+                + gather_indices["slot_in_block_gpu"]
+            )
+            kv_batched[batch_ids.long(), local_idx.long()] = gathered_flat
+
+        weights = (self.weights_proj(x_full) * self._weights_scale).float()
 
         # All per-token broadcast helpers + layer-invariant derivations are
         # pre-built in `_build_v4_indexer_meta`.
-        seq_base_per_token = indexer_meta["seq_base_per_token_gpu"]
-        cu_starts = indexer_meta["cu_starts_gpu"]
-        cu_ends = indexer_meta["cu_ends_gpu"]
-        future_threshold = indexer_meta["future_threshold_gpu"]
-        width_mask = indexer_meta["width_mask_gpu"]
         offset_per_token = indexer_meta["offset_per_token_gpu"]
-        is_prefill_per_token = indexer_meta["is_prefill_per_token_gpu"]
-
-        logits = fp8_mqa_logits(
-            Q=q_fp8,
-            KV=k_fp8,
-            kv_scales=k_scale.view(-1).float(),
+        topk_local = dsv4_indexer_topk(
+            q=q,
+            kv=kv_batched,
             weights=weights,
-            cu_starts=cu_starts,
-            cu_ends=cu_ends,
-        )  # [total_tokens, total_committed] fp32; outside [start,end) is -inf
-
-        # PyTorch topk over -inf-masked logits. aiter `top_k_per_row_prefill`
-        # would be the obvious replacement but it hardcodes K=2048 — V4's
-        # K=index_topk=64 doesn't fit (the kernel writes 2048 ints/row,
-        # overflowing a [tok, 64] indices buffer and corrupting memory).
-        topk_global = logits.topk(max_k, dim=-1)[1].to(torch.int32)
-        # Global flat index → seq-local compress idx; drop slots past per-seq K.
-        topk_local = topk_global - seq_base_per_token.unsqueeze(1)
-        topk_local = topk_local.masked_fill(width_mask, -1)
+            positions=positions,
+            index_topk=self.index_topk,
+            offset=0,
+            seq_ids=indexer_meta["batch_id_per_token_gpu"],
+            kv_lens=indexer_meta["n_committed_per_seq_gpu"],
+            ratio=ratio,
+        )
 
         # Per-seq offset to land indices in the [SWA || compressed] kv_sa
-        # layout consumed by sparse_attn (token_num for fresh prefill, win
-        # for decode); future-mask only applies in fresh prefill.
-        future_mask = is_prefill_per_token & (topk_local >= future_threshold)
+        # layout consumed by sparse_attn. AITER already applies the DSv4 causal
+        # compressed-entry visibility rule, so only invalid rows need masking.
         topk_with_offset = topk_local + offset_per_token.unsqueeze(1)
         topk_final = torch.where(
-            (topk_local < 0) | future_mask,
+            topk_local < 0,
             torch.full_like(topk_local, -1),
             topk_with_offset,
         )
