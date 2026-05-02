@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Iterable, Literal, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -45,7 +46,6 @@ from atom.model_ops.sparse_attn_v4 import (  # noqa: F401
     sparse_attn_ragged_varlen,
 )
 from atom.model_ops.utils import atom_parameter
-from atom.model_ops.v4_backend_gate import use_new_v4_backend  # noqa: F401
 from atom.model_ops.v4_kernels import (  # noqa: F401
     CompressPlan,
     fused_compress_attn,
@@ -647,6 +647,51 @@ def _get_window_topk_idxs(
         )
         matrix = torch.where(matrix > base, -1, matrix)
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
+
+
+def _build_window_topk_batched(
+    positions: torch.Tensor,  # [total_tokens] int (abs token positions)
+    start_pos_per_token: torch.Tensor,  # [total_tokens] int (each token's seq start_pos)
+    window_size: int,
+) -> torch.Tensor:  # [total_tokens, window_size] int32
+    """Vectorized batched form of _get_window_topk_idxs over a flat batch.
+
+    Replicates the original per-seq three-branch logic on a per-token basis:
+      - sp == 0 (fresh prefill): matrix entries = abs positions in the window
+        [pos-win+1, pos] clamped to [0, pos]; mask future via -1.
+      - 0 < sp < win-1 (prefix mode): all tokens in the seq share a single
+        matrix [0..sp, -1, ..., -1] (matches original semantics, including
+        MTP-N where the same start_pos is reused).
+      - sp >= win-1 (cyclic mode): cyclic ring offsets starting at sp+1 mod win.
+    """
+    device = positions.device
+    total = positions.size(0)
+    arange_w = torch.arange(window_size, device=device, dtype=positions.dtype).view(
+        1, window_size
+    )
+    pos_col = positions.view(total, 1)
+    sp_col = start_pos_per_token.view(total, 1)
+    neg1 = torch.tensor(-1, device=device, dtype=positions.dtype)
+
+    # Case A: sp == 0 (fresh prefill) — abs positions [pos-win+1, pos] clamped.
+    case_a = (pos_col - window_size + 1).clamp(min=0) + arange_w
+    case_a = torch.where(case_a > pos_col, neg1, case_a)
+
+    # Case B: 0 < sp < win-1 (prefix mode) — shared per-seq matrix.
+    case_b = arange_w.expand(total, window_size).clone()
+    case_b = torch.where(arange_w > sp_col, neg1, case_b)
+
+    # Case C: sp >= win-1 (cyclic mode) — ring offsets.
+    sp_mod = sp_col % window_size
+    case_c = (sp_mod + 1 + arange_w) % window_size
+
+    sp_eq_0 = sp_col == 0
+    sp_in_prefix = (sp_col > 0) & (sp_col < window_size - 1)
+
+    out = case_c
+    out = torch.where(sp_in_prefix.expand_as(out), case_b, out)
+    out = torch.where(sp_eq_0.expand_as(out), case_a, out)
+    return out.to(torch.int32)
 
 
 @lru_cache(2)
@@ -1387,27 +1432,12 @@ class DeepseekV4Attention(nn.Module):
             per_seq_bts = [block_tables[i] for i in range(num_seqs)]
             block_tables_gpu = block_tables
 
-        # ----- Per-seq state-cache reset on prefill from scratch -----
-        # Done BEFORE batched compressor so the state cache contains correct
-        # initial -inf scores when the kernel reads it.
-        for seq_idx in range(num_seqs):
-            seq_token_num = seq_offsets[seq_idx + 1] - seq_offsets[seq_idx]
-            if seq_token_num == 0:
-                continue
-            sp = (
-                start_pos_per_seq[seq_idx]
-                if start_pos_per_seq is not None
-                else int(positions[seq_offsets[seq_idx]].item())
-            )
-            if sp == 0:
-                slot = slots[seq_idx]
-                self.swa_kv[slot].zero_()
-                if self.compress_ratio:
-                    self.compressor.kv_state[slot].zero_()
-                    self.compressor.score_state[slot].fill_(float("-inf"))
-                    if self.indexer is not None:
-                        self.indexer.compressor.kv_state[slot].zero_()
-                        self.indexer.compressor.score_state[slot].fill_(float("-inf"))
+        # State cache reset on fresh prefill is redundant — verified.
+        # SWA: start_pos==0 path (~line 1603) uses raw seq_kv, never reads
+        # swa_kv. Compressor: fused_compress K-loop's is_state branch is
+        # gated by `s < 0` (is_padding); for fresh prefill (prefix=0,
+        # position=j_in_seq), every is_state iteration falls in s<0 →
+        # masked. See compress_plan.py:88 + fused_compress.py:124-127.
 
         # ----- Batched compressor call (ONCE for the whole batch) -----
         # Replaces per-seq self.compressor() inside the loop. Indexer's
@@ -1444,6 +1474,70 @@ class DeepseekV4Attention(nn.Module):
                 block_tables=block_tables_gpu,
             )
 
+        # ----- Batched SWA write (ONCE for the whole batch) -----
+        # Filter to only the last `win` tokens per seq before the kernel call:
+        # the kernel launches num_tokens programs in parallel, and writes go
+        # to swa_kv[slot, pos % win]. Writing all tokens for a long prefill
+        # (token_num > win) creates intra-seq races where multiple programs
+        # target the same ring slot. The "last win tokens" are exactly the
+        # subset whose writes survive cyclic overwrite anyway, matching the
+        # legacy "write tail" optimization.
+        if num_seqs > 0:
+            cu_q_gpu = torch.as_tensor(seq_offsets, device=x.device, dtype=torch.int32)
+            token_num_gpu = cu_q_gpu[1:] - cu_q_gpu[:-1]
+            # Per-seq write range = [seq_start + max(0, token_num-win), seq_end)
+            seq_offsets_arr = np.asarray(seq_offsets, dtype=np.int64)
+            token_num_arr = seq_offsets_arr[1:] - seq_offsets_arr[:-1]
+            write_starts = seq_offsets_arr[:-1] + np.maximum(0, token_num_arr - win)
+            write_ends = seq_offsets_arr[1:]
+            write_indices_np = (
+                np.concatenate(
+                    [
+                        np.arange(s, e, dtype=np.int64)
+                        for s, e in zip(write_starts, write_ends)
+                    ]
+                )
+                if num_seqs
+                else np.empty(0, dtype=np.int64)
+            )
+            if write_indices_np.size > 0:
+                write_idx_gpu = torch.as_tensor(write_indices_np, device=x.device)
+                slot_per_token_full = torch.repeat_interleave(
+                    state_slot_mapping.to(torch.int32), token_num_gpu
+                )
+                kv_flat_in = kv.squeeze(0)
+                swa_write(
+                    kv_flat_in[write_idx_gpu].contiguous(),
+                    positions[write_idx_gpu].contiguous(),
+                    slot_per_token_full[write_idx_gpu].contiguous(),
+                    self.swa_kv,
+                    win,
+                )
+
+        # ----- Batched window topk (ONCE for the whole batch) -----
+        # Pre-build [total_tokens, win] padded with -1; per-seq slice in the
+        # loop trims to width = min(token_num, win) if sp==0 else win, matching
+        # legacy `_get_window_topk_idxs` shape that downstream `topk_lens` in
+        # attn_metadata expects.
+        window_topk_batched: Optional[torch.Tensor] = None
+        if num_seqs > 0:
+            if start_pos_per_seq is not None:
+                sp_per_seq_gpu = torch.as_tensor(
+                    start_pos_per_seq, device=x.device, dtype=torch.long
+                )
+            else:
+                # one sync for whole batch (cu_q_gpu already on device)
+                sp_per_seq_gpu = positions[cu_q_gpu[:-1].to(torch.long)].to(torch.long)
+            sp_per_token = torch.repeat_interleave(sp_per_seq_gpu, token_num_gpu)
+            window_topk_batched = _build_window_topk_batched(
+                positions.to(torch.long), sp_per_token, win
+            )
+
+        # Phase 2d reverted — using legacy cat-list path. Will be redone
+        # together with Phase 2e (loop deletion) where kv_sa packing must
+        # be batched anyway. See bisect notes: standalone Phase 2d showed
+        # 0.94 vs 0.96 on GSM8K-50 (1 sample drift), within stderr but
+        # not bit-exact, deferred to bundle with 2e for cleaner validation.
         sparse_kvs = []
         sparse_topks = []
         for seq_idx in range(num_seqs):
@@ -1465,13 +1559,11 @@ class DeepseekV4Attention(nn.Module):
                 start_pos = int(seq_positions[0].item())
             end_pos = start_pos + token_num
 
-            # NOTE: state-cache reset moved BEFORE the batched compressor
-            # call (above), so the kernel's first read sees zeroed state +
-            # -inf scores for fresh-prefill seqs.
-
-            # topk_idxs (per-seq, since token_num + start_pos differ).
-            topk_idxs = _get_window_topk_idxs(
-                win, 1, token_num, start_pos, device=x.device
+            # Slice batched window topk to per-seq width matching legacy:
+            # min(token_num, win) for fresh prefill, win for continuation.
+            win_per_seq = min(token_num, win) if start_pos == 0 else win
+            topk_idxs = window_topk_batched[seq_start:seq_end, :win_per_seq].unsqueeze(
+                0
             )
             seq_context_lens = context_lens[seq_idx : seq_idx + 1]
             if self.compress_ratio:
@@ -1495,39 +1587,9 @@ class DeepseekV4Attention(nn.Module):
                 topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
             topk_idxs = topk_idxs.int()
 
-            # SWA write — gated swap-out point for v4_kernels.swa_write
-            # (PR-A Phase 1a). The new path writes via Triton kernel using
-            # `positions % win` per token; equivalent to legacy ring-rotation.
-            if use_new_v4_backend(self.layer_id):
-                if token_num <= win:
-                    seq_kv_flat = seq_kv.squeeze(0).contiguous()
-                    seq_pos_flat = seq_positions
-                else:
-                    seq_kv_flat = seq_kv.squeeze(0)[-win:].contiguous()
-                    seq_pos_flat = seq_positions[-win:]
-                slot_per_token = torch.full(
-                    (seq_kv_flat.size(0),),
-                    slot,
-                    device=seq_kv_flat.device,
-                    dtype=torch.int32,
-                )
-                swa_write(seq_kv_flat, seq_pos_flat, slot_per_token, self.swa_kv, win)
-            elif start_pos == 0:
-                if token_num <= win:
-                    self.swa_kv[slot : slot + 1, :token_num] = seq_kv
-                else:
-                    cutoff = token_num % win
-                    (
-                        self.swa_kv[slot : slot + 1, cutoff:win],
-                        self.swa_kv[slot : slot + 1, :cutoff],
-                    ) = seq_kv[:, -win:].split([win - cutoff, cutoff], dim=1)
-            else:
-                self.swa_kv[slot : slot + 1, start_pos % win] = seq_kv.squeeze(1)
+            # SWA write hoisted to a single batched call before the loop
+            # (filtered to last-win tokens per seq to avoid intra-seq race).
 
-            # Compressor was called ONCE batched above (kv_compress_batched
-            # holds all seqs' boundaries packed in plan order). Per-seq
-            # prefill cat its slice; decode reads accumulated history from
-            # kv_cache via _v4_gather_compressed.
             if start_pos == 0:
                 kv_sa = seq_kv
                 if self.compress_ratio and kv_compress_batched is not None:
@@ -1539,11 +1601,6 @@ class DeepseekV4Attention(nn.Module):
                         kv_sa = torch.cat([kv_sa, seq_compress.unsqueeze(0)], dim=1)
             else:
                 if self.compress_ratio:
-                    # sparse_attn input layout: [SWA window || compressed
-                    # entries gathered from block-table]. n_committed counts
-                    # all boundaries up to and including this fwd's window
-                    # (end_pos // ratio) — generalizes the single-token decode
-                    # formula to MTP-N where multiple boundaries may commit.
                     n_committed = end_pos // ratio
                     if (
                         block_table is not None
@@ -1568,8 +1625,6 @@ class DeepseekV4Attention(nn.Module):
             sparse_kvs.append(kv_sa.squeeze(0))
             sparse_topks.append(topk_idxs.reshape(-1))
 
-        # Ragged sparse attention: concatenate per-seq queries and KV pools,
-        # and pass varlen topk spans so the kernel can add global KV offsets.
         q_sa = q.squeeze(0).contiguous()
         kv_sa = torch.cat(sparse_kvs, dim=0).contiguous()
         topk_flat = torch.cat(sparse_topks).contiguous()
