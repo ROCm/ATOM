@@ -25,7 +25,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from aiter import dtypes, get_hip_quant
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from atom.config import Config
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
@@ -320,7 +322,6 @@ def make_v4_quant_config(hf_config):
       - All RMSNorm weights, attn_sink, hc_*: BF16/fp32 raw, no quant.
     """
     from atom.config import LayerQuantConfig, QuantizationConfig, QuantType
-    from aiter import dtypes
 
     base = QuantizationConfig(hf_config)
 
@@ -1043,12 +1044,18 @@ class Indexer(nn.Module):
         if self.compressor.rotary_emb is None:
             self.compressor.rotary_emb = self.rotary_emb
 
-        # ----- Indexer Q (2D Linear, then add B=1 dim for RoPE / einsum) -----
+        # ----- Indexer Q (2D Linear, then add B=1 dim for RoPE) -----
         q = self.wq_b(qr).view(token_num, self.n_heads, self.head_dim)
         q = q.unsqueeze(0)  # [1, S, H, D]
         self.rotary_emb(positions, q[..., -rd:])
         q = rotate_activation(q)
-        fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
+        use_fp8_path = os.environ.get("ATOM_V4_INDEXER_FP8", "1") == "1"
+        if use_fp8_path:
+            # Phase 2b-ii: skip FP4 sim (kernel can't consume it); FP8 quant
+            # is folded into fp8_mqa_logits via per-row q_scale below.
+            pass
+        else:
+            fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
 
         # ----- Indexer KV (Compressor takes 2D, mutates kv_cache) -----
         # bs=1 plan path; skipped when caller hoisted the inner Compressor
@@ -1072,39 +1079,88 @@ class Indexer(nn.Module):
                 state_slot_mapping=single_state_slot,
                 block_tables=single_block_tables,
             )
-        # weights_proj is ATOM Linear → 2D input; restore B=1 dim for einsum.
-        weights = (
-            self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        ).unsqueeze(0)
-
-        # ----- Index score -----
+        # ----- Index score + topk -----
         # PR3-main: gather committed compressed Indexer entries from the
         # per-seq block_table (passed in by the caller). During warmup
         # block_table is None, so we return a zeros placeholder — the
         # resulting topk_idxs are discarded by the warmup forward path anyway.
         n_committed = end_pos // ratio
-        if block_table is not None and not _v4_is_dummy_run() and n_committed > 0:
-            k_per_block = _V4_BLOCK_SIZE // ratio
-            gathered = _v4_gather_compressed(
-                self.kv_cache, block_table, n_committed, k_per_block
-            ).unsqueeze(
-                0
-            )  # [1, n_committed, head_dim]
-        else:
-            gathered = torch.zeros(
-                1, n_committed, self.head_dim, dtype=q.dtype, device=q.device
-            )
-        index_score = torch.einsum("bshd,btd->bsht", q, gathered)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        K = min(self.index_topk, n_committed)
 
-        # ----- Top-k selection over compressed positions -----
+        if block_table is None or _v4_is_dummy_run() or n_committed == 0:
+            # Warmup / no committed positions → return all -1 (length K).
+            return torch.full((1, token_num, K), -1, dtype=torch.int32, device=x.device)
+
+        k_per_block = _V4_BLOCK_SIZE // ratio
+        gathered = _v4_gather_compressed(
+            self.kv_cache, block_table, n_committed, k_per_block
+        )  # [n_committed, head_dim] BF16
+
+        if use_fp8_path:
+            # Phase 2b-ii: fp8_mqa_logits replaces einsum + relu + weight + sum.
+            # Math: relu(Q.K) * weight summed over heads → score[s, t]; identical
+            # to V3.2's sparse_attn_indexer_prefill kernel call.
+            # Local import for aiter QuantType (top-level conflicts with
+            # atom.config.QuantType used elsewhere in this file).
+            from aiter import QuantType as _AiterQuantType
+
+            quant_func = get_hip_quant(_AiterQuantType.per_1x128)
+            q_2d = q.squeeze(0).contiguous().view(-1, self.head_dim)
+            q_fp8, q_scale = quant_func(q_2d, quant_dtype=dtypes.fp8)
+            q_fp8 = q_fp8.view(token_num, self.n_heads, self.head_dim)
+            q_scale = q_scale.view(token_num, self.n_heads, 1)
+
+            k_fp8, k_scale = quant_func(gathered, quant_dtype=dtypes.fp8)
+            # weights with q_scale + softmax_scale + 1/sqrt(H) folded.
+            weights = (
+                (
+                    self.weights_proj(x).unsqueeze(-1)
+                    * q_scale
+                    * self.softmax_scale
+                    * self.n_heads**-0.5
+                )
+                .squeeze(-1)
+                .float()
+            )
+            # Per-row [start, end): start=0, end=(pos+1)//ratio (clamp to n_committed).
+            cu_starts = torch.zeros(token_num, dtype=torch.int32, device=x.device)
+            cu_ends = ((positions + 1) // ratio).clamp(max=n_committed).to(torch.int32)
+            logits = fp8_mqa_logits(
+                Q=q_fp8,
+                KV=k_fp8,
+                kv_scales=k_scale.view(-1).float(),
+                weights=weights,
+                cu_starts=cu_starts,
+                cu_ends=cu_ends,
+            )  # [token_num, n_committed] fp32 (zeros outside [start, end))
+            # Replace zeros outside cu_ends with -inf so topk doesn't pick them.
+            pos_idx = torch.arange(n_committed, device=x.device)
+            mask_out_of_range = pos_idx.unsqueeze(0) >= cu_ends.unsqueeze(1)
+            logits = logits.masked_fill(mask_out_of_range, float("-inf"))
+            topk_idxs = logits.topk(K, dim=-1)[1].to(torch.int32)
+            # Future-mask + offset (same semantics as legacy path).
+            if start_pos == 0:
+                future_threshold = ((positions + 1) // ratio).unsqueeze(1)
+                future_mask = topk_idxs >= future_threshold
+                topk_idxs = torch.where(future_mask, -1, topk_idxs + offset)
+            else:
+                topk_idxs = topk_idxs + offset
+            return topk_idxs.unsqueeze(0)
+
+        # Legacy BF16 einsum path.
+        weights = (
+            self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        ).unsqueeze(0)
+        gathered_b = gathered.unsqueeze(0)  # [1, n_committed, head_dim]
+        index_score = torch.einsum("bshd,btd->bsht", q, gathered_b)
+        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if start_pos == 0:
             mask = (
                 torch.arange(token_num // ratio, device=x.device).repeat(token_num, 1)
                 >= torch.arange(1, token_num + 1, device=x.device).unsqueeze(1) // ratio
             )
             index_score = index_score + torch.where(mask, float("-inf"), 0.0)
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
+        topk_idxs = index_score.topk(K, dim=-1)[1]
         if start_pos == 0:
             mask = (
                 topk_idxs
