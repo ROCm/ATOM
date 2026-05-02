@@ -206,6 +206,7 @@ class GatedDeltaNet(nn.Module):
 
         if attn_metadata is None:
             # V1 profile run
+            core_attn_out.zero_()
             return core_attn_out
 
         assert isinstance(attn_metadata, dict)
@@ -436,5 +437,9 @@ class GatedDeltaNet(nn.Module):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+
+        # Zero padding tail for CUDA graph replay safety
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
 
         return core_attn_out
