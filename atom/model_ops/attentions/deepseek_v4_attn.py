@@ -125,23 +125,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
         self._classical_dtype = torch.bfloat16  # compressed KV is BF16
 
-        # Sparse-attn layout metadata, aligned with aiter_mla's CpuGpuBuffer
-        # convention. Values are per-token and reusable across layers with the
-        # same compress_ratio; the actual topk indices remain layer-specific.
-        i32_kwargs = {"dtype": torch.int32, "device": self.device}
-        i64_kwargs = {"dtype": torch.int64, "device": self.device}
-        v4_sparse_metadata = {}
-        for kind in ("dense", "csa", "hca"):
-            v4_sparse_metadata[f"v4_{kind}_sparse_topk_starts"] = CpuGpuBuffer(
-                self.max_num_batched_tokens, **i64_kwargs
-            )
-            v4_sparse_metadata[f"v4_{kind}_sparse_topk_lens"] = CpuGpuBuffer(
-                self.max_num_batched_tokens, **i32_kwargs
-            )
-            v4_sparse_metadata[f"v4_{kind}_sparse_kv_offsets"] = CpuGpuBuffer(
-                self.max_num_batched_tokens, **i32_kwargs
-            )
-        self.model_runner.forward_vars.update(v4_sparse_metadata)
+        # Sparse-attn + per-fwd metadata buffers (CG-A: pre-allocate for fixed
+        # GPU pointers, prerequisite for CUDAGraph capture). All H2D copies in
+        # the V4 metadata builder go through these buffers via the
+        # `np[:n] = arr; copy_to_gpu(n)` pattern instead of per-call
+        # `torch.as_tensor(arr)` allocations.
+        self._alloc_v4_metadata_buffers()
 
     # ------------------------------------------------------------------ #
     # AttentionMetadataBuilder hooks (per-request cache abstraction).    #
@@ -457,6 +446,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # (no positions/slots) — V4Attention.forward then falls back to
             # the inline path.
             pack_meta = self._build_v4_pack_meta_for_ratio(
+                kind=kind,
                 ratio=ratio,
                 has_indexer=(ratio == 4),
                 cu_seqlens_q_np=cu_seqlens_q_np,
@@ -527,6 +517,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Pre-built gather indices for `_v4_gather_compressed_batched` —
         # eliminates 3 H2D copies per CSA layer's gather call.
         gather_indices = self._build_v4_gather_indices(
+            tag="indexer",
             n_per_seq=n_committed_per_seq,
             k_per_block=_V4_BLOCK_SIZE // ratio,
             cu_committed_cpu=cu_committed_cpu,
@@ -547,11 +538,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         k_per_token_np = k_per_seq_cpu[batch_id_per_token_np]
 
         # H2D once for each tensor consumed by `Indexer.forward_batched`.
-        batch_id_per_token_gpu = torch.as_tensor(batch_id_per_token_np, device=device)
-        cu_committed_gpu = torch.as_tensor(cu_committed_cpu, device=device)
-        n_committed_per_seq_gpu = torch.as_tensor(n_committed_per_seq, device=device)
-        k_per_token_gpu = torch.as_tensor(
-            k_per_token_np, device=device, dtype=torch.int32
+        batch_id_per_token_gpu = self._stage(
+            "v4_indexer_batch_id_per_token", batch_id_per_token_np
+        )
+        cu_committed_gpu = self._stage("v4_indexer_cu_committed", cu_committed_cpu)
+        n_committed_per_seq_gpu = self._stage(
+            "v4_indexer_n_committed_per_seq", n_committed_per_seq
+        )
+        k_per_token_gpu = self._stage(
+            "v4_indexer_k_per_token", k_per_token_np.astype(np.int32)
         )
 
         # Layer-invariant GPU derivations (each was previously rebuilt ~30x
@@ -570,6 +565,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         col_arange = torch.arange(max_k, device=device, dtype=torch.int32)
         width_mask_gpu = col_arange.unsqueeze(0) >= k_per_token_gpu.unsqueeze(1)
 
+        offset_per_token_gpu = self._stage(
+            "v4_indexer_offset_per_token",
+            offset_per_seq_np[batch_id_per_token_np].astype(np.int32),
+        )
+        is_prefill_per_token_gpu = self._stage(
+            "v4_indexer_is_prefill_per_token",
+            is_prefill[batch_id_per_token_np],
+        ).unsqueeze(1)
+
         return {
             "max_k": max_k,
             "gather_indices": gather_indices,
@@ -578,19 +582,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "cu_ends_gpu": cu_ends_gpu,
             "future_threshold_gpu": future_threshold_gpu,
             "width_mask_gpu": width_mask_gpu,
-            "offset_per_token_gpu": torch.as_tensor(
-                offset_per_seq_np[batch_id_per_token_np],
-                device=device,
-                dtype=torch.int32,
-            ),
-            "is_prefill_per_token_gpu": torch.as_tensor(
-                is_prefill[batch_id_per_token_np], device=device
-            ).unsqueeze(1),
+            "offset_per_token_gpu": offset_per_token_gpu,
+            "is_prefill_per_token_gpu": is_prefill_per_token_gpu,
         }
 
     def _build_v4_gather_indices(
         self,
         *,
+        tag: str,
         n_per_seq: np.ndarray,
         k_per_block: int,
         cu_committed_cpu: np.ndarray,
@@ -599,6 +598,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Pre-build the per-seq gather indices consumed by
         `_v4_gather_compressed_batched`. Returns a dict with all-None GPU
         tensors when total == 0 (caller's gather returns empty).
+
+        `tag` selects which pre-allocated buffer set this call writes into
+        (one of "indexer", "csa_dc", "hca_dc"). Each tag has its own
+        `v4_{tag}_gather_{batch_ids,block_in_seq,slot_in_block}` buffer.
         """
         bs = len(n_per_seq)
         total = int(n_per_seq.sum())
@@ -616,15 +619,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         block_in_seq_np = committed_idx_np // k_per_block
         slot_in_block_np = committed_idx_np % k_per_block
         return {
-            "batch_ids_gpu": torch.as_tensor(batch_ids_np, device=device),
-            "block_in_seq_gpu": torch.as_tensor(block_in_seq_np, device=device),
-            "slot_in_block_gpu": torch.as_tensor(slot_in_block_np, device=device),
+            "batch_ids_gpu": self._stage(f"v4_{tag}_gather_batch_ids", batch_ids_np),
+            "block_in_seq_gpu": self._stage(
+                f"v4_{tag}_gather_block_in_seq", block_in_seq_np
+            ),
+            "slot_in_block_gpu": self._stage(
+                f"v4_{tag}_gather_slot_in_block", slot_in_block_np
+            ),
             "cu_committed_cpu": cu_committed_cpu,
         }
 
     def _build_v4_pack_meta_for_ratio(
         self,
         *,
+        kind: str,
         ratio: int,
         has_indexer: bool,
         cu_seqlens_q_np,
@@ -727,23 +735,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             tok_seq, local = _segment_indices(
                 prefill_seqs, token_num_per_seq[prefill_seqs]
             )
-            prefill_kv_src_gpu = torch.as_tensor(
-                cu_seqlens_q_arr[tok_seq] + local, device=device
+            prefill_kv_src_gpu = self._stage(
+                f"v4_{kind}_pack_prefill_kv_src", cu_seqlens_q_arr[tok_seq] + local
             )
-            prefill_kv_dst_gpu = torch.as_tensor(
-                cu_kv_off[tok_seq] + local, device=device
+            prefill_kv_dst_gpu = self._stage(
+                f"v4_{kind}_pack_prefill_kv_dst", cu_kv_off[tok_seq] + local
             )
 
         # ---- Part A: decode swa gather ----
         decode_seqs = np.flatnonzero(~is_prefill)
         decode_state_slots_gpu = decode_swa_dst_gpu = None
         if decode_seqs.size:
-            decode_state_slots_gpu = torch.as_tensor(
-                slots_arr[decode_seqs], device=device
+            decode_state_slots_gpu = self._stage(
+                f"v4_{kind}_pack_decode_state_slots", slots_arr[decode_seqs]
             )
-            decode_swa_dst_gpu = torch.as_tensor(
+            decode_swa_dst_gpu = self._stage(
+                f"v4_{kind}_pack_decode_swa_dst",
                 (cu_kv_off[decode_seqs][:, None] + np.arange(win)).reshape(-1),
-                device=device,
             )
 
         # ---- Part B: prefill compress ----
@@ -753,12 +761,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if pc_seqs.size:
                 seg_lens = n_compress_prefill[pc_seqs]
                 tok_seq, local = _segment_indices(pc_seqs, seg_lens)
-                prefill_compress_src_gpu = torch.as_tensor(
-                    cu_compress_cpu[tok_seq].astype(np.int64) + local, device=device
+                prefill_compress_src_gpu = self._stage(
+                    f"v4_{kind}_pack_prefill_compress_src",
+                    cu_compress_cpu[tok_seq].astype(np.int64) + local,
                 )
-                prefill_compress_dst_gpu = torch.as_tensor(
+                prefill_compress_dst_gpu = self._stage(
+                    f"v4_{kind}_pack_prefill_compress_dst",
                     cu_kv_off[tok_seq] + token_num_per_seq[tok_seq] + local,
-                    device=device,
                 )
 
         # ---- Part B: decode compress ----
@@ -767,21 +776,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if ratio > 0 and decode_seqs.size:
             dc_seqs = decode_seqs[n_committed_decode[decode_seqs] > 0]
             if dc_seqs.size:
-                decode_compress_seqs_gpu = torch.as_tensor(
-                    dc_seqs.astype(np.int64), device=device
+                decode_compress_seqs_gpu = self._stage(
+                    f"v4_{kind}_pack_decode_compress_seqs",
+                    dc_seqs.astype(np.int64),
                 )
                 seg_lens = n_committed_decode[dc_seqs]
                 tok_seq, local = _segment_indices(dc_seqs, seg_lens)
-                decode_compress_dst_gpu = torch.as_tensor(
-                    cu_kv_off[tok_seq] + win + local, device=device
+                decode_compress_dst_gpu = self._stage(
+                    f"v4_{kind}_pack_decode_compress_dst",
+                    cu_kv_off[tok_seq] + win + local,
                 )
                 # Gather indices for `_v4_gather_compressed_batched` on the
                 # filtered subset (dc_seqs). cu_committed here is the
-                # subset-local prefix sum.
+                # subset-local prefix sum. Per-kind tag selects buffer set.
                 dc_cu_committed = np.concatenate(
                     [np.zeros(1, dtype=np.int64), np.cumsum(seg_lens, dtype=np.int64)]
                 )
                 decode_compress_gather_indices = self._build_v4_gather_indices(
+                    tag=f"{kind}_dc",
                     n_per_seq=seg_lens,
                     k_per_block=_V4_BLOCK_SIZE // ratio,
                     cu_committed_cpu=dc_cu_committed,
@@ -797,11 +809,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 np.arange(total_tokens, dtype=np.int64),
                 window_topk_width_per_token,
             )
-            window_topk_src_gpu = torch.as_tensor(
-                tok_idx_w * win + k_idx_w, device=device
+            window_topk_src_gpu = self._stage(
+                f"v4_{kind}_pack_window_topk_src", tok_idx_w * win + k_idx_w
             )
-            window_topk_dst_gpu = torch.as_tensor(
-                topk_starts_per_token[tok_idx_w] + k_idx_w, device=device
+            window_topk_dst_gpu = self._stage(
+                f"v4_{kind}_pack_window_topk_dst",
+                topk_starts_per_token[tok_idx_w] + k_idx_w,
             )
 
         # ---- Topk: compress part ----
@@ -813,11 +826,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 np.arange(total_tokens, dtype=np.int64),
                 compress_topk_width_per_token,
             )
-            compress_topk_dst_gpu = torch.as_tensor(
+            compress_topk_dst_gpu = self._stage(
+                f"v4_{kind}_pack_compress_topk_dst",
                 topk_starts_per_token[tok_idx_c]
                 + window_topk_width_per_token[tok_idx_c]
                 + k_idx_c,
-                device=device,
             )
             if has_indexer:
                 # CSA: src is per-token gather offset into indexer_topk_batched;
@@ -828,8 +841,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # k_per_seq = min(index_topk, n_committed_per_seq).
                 indexer_max = int(compress_topk_width_per_seq.max())
                 if indexer_max > 0:
-                    compress_topk_src_gpu = torch.as_tensor(
-                        tok_idx_c * indexer_max + k_idx_c, device=device
+                    compress_topk_src_gpu = self._stage(
+                        f"v4_{kind}_pack_compress_topk_src",
+                        tok_idx_c * indexer_max + k_idx_c,
                     )
             elif positions_np is not None:
                 # HCA: precompute the int32 values (k_idx + offset, future-mask
@@ -850,7 +864,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 values = np.where(
                     future_mask, -1, k_idx_c + offset_per_token[tok_idx_c]
                 ).astype(np.int32)
-                compress_topk_values_gpu = torch.as_tensor(values, device=device)
+                compress_topk_values_gpu = self._stage(
+                    f"v4_{kind}_pack_compress_topk_values", values
+                )
 
         return {
             "total_kv": total_kv,
@@ -1098,11 +1114,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         # ----- window_topk_batched (per-token) -----
-        start_pos_per_seq_gpu = torch.as_tensor(
-            start_pos_per_seq_np, device=device, dtype=torch.long
+        start_pos_per_seq_gpu = self._stage(
+            "v4_meta_start_pos_per_seq", start_pos_per_seq_np
         )
-        token_num_per_seq_gpu = torch.as_tensor(
-            token_num_per_seq, device=device, dtype=torch.long
+        token_num_per_seq_gpu = self._stage(
+            "v4_meta_token_num_per_seq", token_num_per_seq
         )
         start_pos_per_token = torch.repeat_interleave(
             start_pos_per_seq_gpu, token_num_per_seq_gpu
@@ -1136,9 +1152,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         write_indices_np = np.concatenate(
             [np.arange(s, e, dtype=np.int64) for s, e in zip(write_starts, write_ends)]
         )
-        write_indices_gpu = torch.as_tensor(write_indices_np, device=device)
-        state_slot_mapping_gpu_i32 = torch.as_tensor(
-            state_slot_mapping_cpu[:scheduled_bs], device=device, dtype=torch.int32
+        write_indices_gpu = self._stage("v4_meta_swa_write_indices", write_indices_np)
+        state_slot_mapping_gpu_i32 = self._stage(
+            "v4_meta_state_slot_i32",
+            np.asarray(state_slot_mapping_cpu[:scheduled_bs], dtype=np.int32),
         )
         slot_per_token_full = torch.repeat_interleave(
             state_slot_mapping_gpu_i32, token_num_per_seq_gpu
@@ -1213,7 +1230,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # state reads, fresh writes overwrite warmup pollution).
         if len(groups_np) < scheduled_bs:
             groups_np = np.zeros(scheduled_bs, dtype=np.int32)
-        gpu = torch.from_numpy(groups_np).to(self.model_runner.device)
+        gpu = self._stage("v4_meta_state_slot_groups", groups_np)
         if return_cpu:
             return gpu, groups_np
         return gpu
@@ -1234,6 +1251,115 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # ------------------------------------------------------------------ #
     # Helpers.                                                           #
     # ------------------------------------------------------------------ #
+
+    def _alloc_v4_metadata_buffers(self) -> None:
+        """Pre-allocate every CpuGpuBuffer the V4 metadata builder writes into.
+
+        Bounds:
+          - per-seq:        max_bs
+          - per-token:      max_num_batched_tokens
+          - window_topk:    max_num_batched_tokens * window_size
+          - csa compress:   max_num_batched_tokens * index_topk
+          - hca compress:   max_num_batched_tokens * max_num_blocks_per_seq
+          - csa gather:     max_bs * max_num_blocks_per_seq * (block_size // 4)
+          - decode swa dst: max_bs * window_size
+
+        Memory footprint at typical config (max_bs=16, mnbt=8192, win=128,
+        index_topk=64, max_num_blocks_per_seq=64): ~80 MB total. Allocated
+        once at builder init; pointers stay fixed for CUDAGraph capture.
+        """
+        i32 = {"dtype": torch.int32, "device": self.device}
+        i64 = {"dtype": torch.int64, "device": self.device}
+        bool_kw = {"dtype": torch.bool, "device": self.device}
+        mnbt = self.max_num_batched_tokens
+        bs = self.max_bs
+        win = self.window_size
+        nbps = self.max_num_blocks_per_seq
+        k1_csa = self.k1_csa  # block_size // 4 = 32
+
+        bufs: dict = {}
+
+        # Sparse-attn layout (per-token, per-kind). Existing v4_{kind}_sparse_*.
+        for kind in ("dense", "csa", "hca"):
+            bufs[f"v4_{kind}_sparse_topk_starts"] = CpuGpuBuffer(mnbt, **i64)
+            bufs[f"v4_{kind}_sparse_topk_lens"] = CpuGpuBuffer(mnbt, **i32)
+            bufs[f"v4_{kind}_sparse_kv_offsets"] = CpuGpuBuffer(mnbt, **i32)
+
+        # _attach_v4_per_fwd_meta + _populate_state_slot_mapping.
+        bufs["v4_meta_start_pos_per_seq"] = CpuGpuBuffer(bs, **i64)
+        bufs["v4_meta_token_num_per_seq"] = CpuGpuBuffer(bs, **i64)
+        bufs["v4_meta_state_slot_i32"] = CpuGpuBuffer(bs, **i32)
+        bufs["v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
+        bufs["v4_meta_swa_write_indices"] = CpuGpuBuffer(mnbt, **i64)
+
+        # _build_v4_indexer_meta (CSA only — but allocate unconditionally;
+        # never accessed when CSA layers are absent).
+        bufs["v4_indexer_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i64)
+        bufs["v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i64)
+        bufs["v4_indexer_n_committed_per_seq"] = CpuGpuBuffer(bs, **i64)
+        bufs["v4_indexer_k_per_token"] = CpuGpuBuffer(mnbt, **i32)
+        bufs["v4_indexer_offset_per_token"] = CpuGpuBuffer(mnbt, **i32)
+        bufs["v4_indexer_is_prefill_per_token"] = CpuGpuBuffer(mnbt, **bool_kw)
+
+        # Gather indices — 3 sets: indexer (CSA), csa decode_compress, hca
+        # decode_compress. Each set has 3 i64 tensors. Sized to the CSA
+        # bound (max_bs * max_num_blocks_per_seq * 32) since CSA is the
+        # ratio-4 (largest) case; HCA reuses the same bound for simplicity.
+        gather_max = bs * nbps * k1_csa
+        for tag in ("indexer", "csa_dc", "hca_dc"):
+            bufs[f"v4_{tag}_gather_batch_ids"] = CpuGpuBuffer(gather_max, **i64)
+            bufs[f"v4_{tag}_gather_block_in_seq"] = CpuGpuBuffer(gather_max, **i64)
+            bufs[f"v4_{tag}_gather_slot_in_block"] = CpuGpuBuffer(gather_max, **i64)
+
+        # _build_v4_pack_meta_for_ratio (per-(kind) variant).
+        # window_topk fixed-width = win.
+        # compress_topk width per kind: csa = index_topk, hca = nbps.
+        compress_topk_max_per_kind = {
+            "dense": 0,
+            "csa": self.index_topk,
+            "hca": nbps,
+        }
+        for kind in ("dense", "csa", "hca"):
+            ckmax = compress_topk_max_per_kind[kind] * mnbt
+            bufs[f"v4_{kind}_pack_prefill_kv_src"] = CpuGpuBuffer(mnbt, **i64)
+            bufs[f"v4_{kind}_pack_prefill_kv_dst"] = CpuGpuBuffer(mnbt, **i64)
+            bufs[f"v4_{kind}_pack_decode_state_slots"] = CpuGpuBuffer(bs, **i64)
+            bufs[f"v4_{kind}_pack_decode_swa_dst"] = CpuGpuBuffer(bs * win, **i64)
+            bufs[f"v4_{kind}_pack_prefill_compress_src"] = CpuGpuBuffer(mnbt, **i64)
+            bufs[f"v4_{kind}_pack_prefill_compress_dst"] = CpuGpuBuffer(mnbt, **i64)
+            bufs[f"v4_{kind}_pack_decode_compress_seqs"] = CpuGpuBuffer(bs, **i64)
+            bufs[f"v4_{kind}_pack_decode_compress_dst"] = CpuGpuBuffer(
+                gather_max, **i64
+            )
+            bufs[f"v4_{kind}_pack_window_topk_src"] = CpuGpuBuffer(mnbt * win, **i64)
+            bufs[f"v4_{kind}_pack_window_topk_dst"] = CpuGpuBuffer(mnbt * win, **i64)
+            if ckmax > 0:
+                bufs[f"v4_{kind}_pack_compress_topk_src"] = CpuGpuBuffer(ckmax, **i64)
+                bufs[f"v4_{kind}_pack_compress_topk_dst"] = CpuGpuBuffer(ckmax, **i64)
+                bufs[f"v4_{kind}_pack_compress_topk_values"] = CpuGpuBuffer(
+                    ckmax, **i32
+                )
+
+        self.model_runner.forward_vars.update(bufs)
+
+    def _stage(self, name: str, arr) -> torch.Tensor:
+        """Write numpy `arr` into `forward_vars[name]` (CpuGpuBuffer) and
+        return its GPU view sliced to len(arr). Auto-casts dtype to match
+        the buffer (e.g. int64 → int32). Asserts the buffer is large enough.
+        """
+        buf = self.model_runner.forward_vars[name]
+        n = arr.shape[0] if arr.ndim > 0 else 1
+        if n == 0:
+            return buf.gpu[:0]
+        cap = buf.np.shape[0]
+        assert n <= cap, (
+            f"V4 buffer {name!r} too small: need {n}, have {cap}. "
+            f"Increase the corresponding bound in _alloc_v4_metadata_buffers."
+        )
+        if arr.dtype != buf.np.dtype:
+            arr = arr.astype(buf.np.dtype, copy=False)
+        buf.np[:n] = arr
+        return buf.copy_to_gpu(n)
 
     @staticmethod
     def _numel(shape: tuple) -> int:
