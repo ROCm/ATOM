@@ -29,10 +29,6 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.split_chunk import (
-    fused_split_chunk_qwen_next_qkvz_ba,
-    fused_split_chunk_qwen_next_qkvzba,
-)
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -114,6 +110,75 @@ def mamba_v2_sharded_weight_loader(
             # move indexing boundaries
             boundary += shard_size
             loaded_boundary += full_dim - extra
+
+    return loader
+
+
+def _qkvz_deinterleave_weight_loader(
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    tp_size: int,
+    tp_rank: int,
+):
+    """Weight loader that deinterleaves Qwen3-Next in_proj_qkvz checkpoint.
+
+    Checkpoint layout per k-head group:
+        [q(head_k_dim) | k(head_k_dim) | v0..vR(R*head_v_dim) | z0..zR(R*head_v_dim)]
+    Output layout: [q_all | k_all | v_all | z_all] contiguous.
+    """
+    nk = num_k_heads // tp_size
+    R = num_v_heads // num_k_heads
+    group_size = 2 * head_k_dim + 2 * head_v_dim * R
+    q_total = nk * head_k_dim
+    k_total = nk * head_k_dim
+    v_total = (num_v_heads // tp_size) * head_v_dim
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        src = loaded_weight.narrow(0, tp_rank * nk * group_size, nk * group_size)
+        for g in range(nk):
+            base = g * group_size
+            # q
+            param.data[g * head_k_dim : (g + 1) * head_k_dim] = src[
+                base : base + head_k_dim
+            ]
+            # k
+            param.data[q_total + g * head_k_dim : q_total + (g + 1) * head_k_dim] = src[
+                base + head_k_dim : base + 2 * head_k_dim
+            ]
+            # v sub-heads
+            for s in range(R):
+                v_src = base + 2 * head_k_dim + s * head_v_dim
+                v_dst = q_total + k_total + (g * R + s) * head_v_dim
+                param.data[v_dst : v_dst + head_v_dim] = src[v_src : v_src + head_v_dim]
+            # z sub-heads
+            for s in range(R):
+                z_src = base + 2 * head_k_dim + R * head_v_dim + s * head_v_dim
+                z_dst = q_total + k_total + v_total + (g * R + s) * head_v_dim
+                param.data[z_dst : z_dst + head_v_dim] = src[z_src : z_src + head_v_dim]
+
+    return loader
+
+
+def _ba_deinterleave_weight_loader(
+    num_v_heads: int,
+    tp_size: int,
+    tp_rank: int,
+):
+    """Weight loader that deinterleaves Qwen3-Next in_proj_ba checkpoint.
+
+    Checkpoint layout: [b0, a0, b1, a1, ...] (interleaved pairs).
+    Output layout: [b_all | a_all] contiguous.
+    """
+    nv = num_v_heads // tp_size
+    ba_total = 2 * nv
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        src = loaded_weight.narrow(0, tp_rank * ba_total, ba_total)
+        # Even indices → b, odd indices → a
+        param.data[:nv] = src[0::2]
+        param.data[nv:] = src[1::2]
 
     return loader
 
@@ -616,14 +681,29 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         value_dim: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-    ) -> MergedColumnParallelLinear:
-        return MergedColumnParallelLinear(
+    ) -> ColumnParallelLinear:
+        linear = ColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[sum((key_dim, key_dim, value_dim, value_dim))],
+            output_size=sum((key_dim, key_dim, value_dim, value_dim)),
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_qkvz",
         )
+        # Deinterleave checkpoint's per-k-head-group layout → [q|k|v|z]
+        delattr(linear.weight, "weight_loader")
+        setattr(
+            linear.weight,
+            "weight_loader",
+            _qkvz_deinterleave_weight_loader(
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.tp_size,
+                self.tp_rank,
+            ),
+        )
+        return linear
 
     def create_ba_proj(
         self,
@@ -631,14 +711,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_v_heads: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-    ) -> MergedColumnParallelLinear:
-        return MergedColumnParallelLinear(
+    ) -> ColumnParallelLinear:
+        linear = ColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[num_v_heads, num_v_heads],
+            output_size=num_v_heads * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_ba",
         )
+        # Deinterleave checkpoint's [b0,a0,b1,a1,...] layout → [b_all|a_all]
+        delattr(linear.weight, "weight_loader")
+        setattr(
+            linear.weight,
+            "weight_loader",
+            _ba_deinterleave_weight_loader(
+                self.num_v_heads,
+                self.tp_size,
+                self.tp_rank,
+            ),
+        )
+        return linear
 
     def fix_query_key_value_ordering(
         self,
@@ -726,40 +818,35 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        v_heads_tp = self.num_v_heads // self.tp_size
+        qkv_size = self.conv_dim // self.tp_size
+        z_size = v_heads_tp * self.head_v_dim
+        b_size = v_heads_tp
+        a_size = v_heads_tp
+
         if hasattr(self, "in_proj_qkvzba"):
-            projected_states_qkvzba = self.in_proj_qkvzba(hidden_states)
-            k_heads_after_tp = self.num_k_heads // self.tp_size
-            v_heads_after_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_qwen_next_qkvzba(
-                projected_states_qkvzba,
-                k_heads_after_tp,
-                v_heads_after_tp,
-                self.head_k_dim,
-                self.head_v_dim,
+            projected = self.in_proj_qkvzba(hidden_states)
+            # Output layout is [q|k|v|z|b|a] contiguous (deinterleaved at load)
+            mixed_qkv, z_flat, b, a = torch.split(
+                projected, [qkv_size, z_size, b_size, a_size], dim=-1
             )
         else:
             if x_fp8 is not None:
-                projected_states_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
+                projected_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
             else:
-                projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-            projected_states_ba = self.in_proj_ba(hidden_states)  # always BF16
-            # Use Triton kernel to process qkvz and ba
-            num_k_heads_tp = self.num_k_heads // self.tp_size
-            num_v_heads_tp = self.num_v_heads // self.tp_size
-            mixed_qkv, z, b, a, core_attn_out = fused_split_chunk_qwen_next_qkvz_ba(
-                projected_states_qkvz,
-                projected_states_ba,
-                num_k_heads_tp,
-                num_v_heads_tp,
-                self.head_k_dim,
-                self.head_v_dim,
-            )
+                projected_qkvz = self.in_proj_qkvz(hidden_states)
+            projected_ba = self.in_proj_ba(hidden_states)  # always BF16
+            # Output layout is [q|k|v|z] contiguous (deinterleaved at load)
+            mixed_qkv, z_flat = torch.split(projected_qkvz, [qkv_size, z_size], dim=-1)
+            # Output layout is [b|a] contiguous (deinterleaved at load)
+            b, a = torch.split(projected_ba, [b_size, a_size], dim=-1)
+
+        z = z_flat.view(num_tokens, v_heads_tp, self.head_v_dim)
+        core_attn_out = torch.empty_like(z)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
 
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
 

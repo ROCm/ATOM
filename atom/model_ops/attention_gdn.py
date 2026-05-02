@@ -161,6 +161,7 @@ class GatedDeltaNet(nn.Module):
             fwd_ctx.attn_metadata, "gdn_metadata", None
         )
         if gdn_metadata is None:
+            core_attn_out.zero_()
             return core_attn_out
 
         gdn_cache = fwd_ctx.kv_cache_data
@@ -372,5 +373,9 @@ class GatedDeltaNet(nn.Module):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+        # Zero padding tail for CUDA graph replay safety
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
 
         return core_attn_out

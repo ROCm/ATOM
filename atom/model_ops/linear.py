@@ -652,6 +652,17 @@ class MergedColumnParallelLinear(LinearBase):
 
 
 class QKVZBAParallelLinear(ColumnParallelLinear):
+    """Fused QKVZBA linear with deinterleaved output layout.
+
+    Output layout is always ``[q | k | v | z | b | a]`` contiguous on dim-0,
+    so the caller can use ``torch.split`` for zero-copy views.
+
+    The weight_loader deinterleaves the Qwen3-Next interleaved per-k-head-group
+    checkpoint layout during loading.  Qwen3.5 checkpoints (which have separate
+    per-component weights) are loaded via individual shard_ids and work without
+    deinterleaving.
+    """
+
     def __init__(
         self,
         input_size: int,
@@ -672,11 +683,15 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         tp_size = get_tp_group().world_size
         self.num_k_heads = divide(self.num_k_heads, tp_size)
         self.num_v_heads = divide(self.num_v_heads, tp_size)
-        output_sizes = [
-            (2 * head_k_dim * self.num_k_heads + 2 * head_v_dim * self.num_v_heads)
-            * tp_size,
-            2 * self.num_v_heads * tp_size,
-        ]
+        # Output layout: [q_all | k_all | v_all | z_all | b_all | a_all]
+        q_size = self.num_k_heads * head_k_dim
+        k_size = self.num_k_heads * head_k_dim
+        v_size = self.num_v_heads * head_v_dim
+        z_size = self.num_v_heads * head_v_dim
+        b_size = self.num_v_heads
+        a_size = self.num_v_heads
+        self._section_sizes = [q_size, k_size, v_size, z_size, b_size, a_size]
+        output_sizes = [s * tp_size for s in self._section_sizes]
         super().__init__(
             input_size,
             output_sizes,
@@ -686,66 +701,132 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
             prefix=prefix,
         )
 
+    # -- helpers for deinterleaving during weight loading --
+
+    def _deinterleave_qkvz(self, param_data: torch.Tensor, loaded_weight: torch.Tensor):
+        """Scatter interleaved qkvz checkpoint rows into [q|k|v|z] regions.
+
+        Checkpoint layout per k-head group (``QKVZ_DIM_SIZE`` rows):
+            [q(head_k_dim) | k(head_k_dim) | v0..vR(R*head_v_dim) | z0..zR(R*head_v_dim)]
+        where R = num_v_heads / num_k_heads (KV_HEAD_RATIO).
+        """
+        nk = self.num_k_heads
+        hk = self.head_k_dim
+        hv = self.head_v_dim
+        R = self.num_v_heads // nk  # KV_HEAD_RATIO
+        group_size = 2 * hk + 2 * hv * R
+
+        q_total = nk * hk
+        k_total = nk * hk
+        v_total = self.num_v_heads * hv
+
+        # TP shard the source
+        src = loaded_weight.narrow(
+            self.tp_dim, self.tp_rank * nk * group_size, nk * group_size
+        )
+
+        for g in range(nk):
+            base = g * group_size
+            # q rows
+            param_data[g * hk : (g + 1) * hk] = src[base : base + hk]
+            # k rows
+            param_data[q_total + g * hk : q_total + (g + 1) * hk] = src[
+                base + hk : base + 2 * hk
+            ]
+            # v sub-heads
+            for s in range(R):
+                v_src_start = base + 2 * hk + s * hv
+                v_dst_start = q_total + k_total + (g * R + s) * hv
+                param_data[v_dst_start : v_dst_start + hv] = src[
+                    v_src_start : v_src_start + hv
+                ]
+            # z sub-heads
+            for s in range(R):
+                z_src_start = base + 2 * hk + R * hv + s * hv
+                z_dst_start = q_total + k_total + v_total + (g * R + s) * hv
+                param_data[z_dst_start : z_dst_start + hv] = src[
+                    z_src_start : z_src_start + hv
+                ]
+
+    def _deinterleave_ba(self, param_data: torch.Tensor, loaded_weight: torch.Tensor):
+        """Scatter interleaved ba checkpoint rows into [b|a] regions.
+
+        Checkpoint layout per k-head group (2*R elements):
+            [b_sub0, b_sub1, ..., b_subR-1, a_sub0, a_sub1, ..., a_subR-1]
+        where R = num_v_heads / num_k_heads.
+        """
+        nk = self.num_k_heads
+        nv = self.num_v_heads
+        R = nv // nk
+        ba_total = 2 * nv
+
+        # TP shard the source
+        src = loaded_weight.narrow(self.tp_dim, self.tp_rank * ba_total, ba_total)
+
+        qkvz_total = sum(self._section_sizes[:4])
+        b_offset = qkvz_total
+        a_offset = qkvz_total + nv
+
+        for g in range(nk):
+            group_base = g * 2 * R
+            # b sub-heads
+            for s in range(R):
+                param_data[b_offset + g * R + s] = src[group_base + s]
+            # a sub-heads
+            for s in range(R):
+                param_data[a_offset + g * R + s] = src[group_base + R + s]
+
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str
     ):
         param_data = param.data
         assert loaded_shard_id in ["qkvz", "ba", "qkv", "z", "b", "a"]
-        if loaded_shard_id == "qkvz":
-            shard_size = (
-                2 * self.num_k_heads * self.head_k_dim
-                + 2 * self.num_v_heads * self.head_v_dim
-            )
-            shard_offset = 0
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "qkv":
-            shard_size = (
-                2 * self.num_k_heads * self.head_k_dim
-                + self.num_v_heads * self.head_v_dim
-            )
-            shard_offset = 0
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "z":
-            shard_size = self.num_v_heads * self.head_v_dim
-            shard_offset = (
-                2 * self.num_k_heads * self.head_k_dim
-                + self.num_v_heads * self.head_v_dim
-            )
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "ba":
-            shard_size = 2 * self.num_v_heads
-            shard_offset = (
-                2 * self.num_k_heads * self.head_k_dim
-                + 2 * self.num_v_heads * self.head_v_dim
-            )
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "b":
-            shard_size = self.num_v_heads
-            shard_offset = (
-                2 * self.num_k_heads * self.head_k_dim
-                + 2 * self.num_v_heads * self.head_v_dim
-            )
-            shard_rank = self.tp_rank
-        elif loaded_shard_id == "a":
-            shard_size = self.num_v_heads
-            shard_offset = (
-                2 * self.num_k_heads * self.head_k_dim
-                + 2 * self.num_v_heads * self.head_v_dim
-                + self.num_v_heads
-            )
-            shard_rank = self.tp_rank
 
-        if param is getattr(self, "weight_scale", None) or param is getattr(
+        is_scale = param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
-        ):
+        )
+
+        # For interleaved checkpoint shards ("qkvz", "ba"), deinterleave
+        # weight rows so output is [q|k|v|z|b|a] contiguous.
+        if loaded_shard_id == "qkvz" and not is_scale:
+            self._deinterleave_qkvz(param_data, loaded_weight)
+            return
+        if loaded_shard_id == "ba" and not is_scale:
+            self._deinterleave_ba(param_data, loaded_weight)
+            return
+
+        # For individual shard_ids or scale params, use offset-based loading.
+        q_size, k_size, v_size, z_size, b_size, a_size = self._section_sizes
+        if loaded_shard_id == "qkvz":
+            shard_size = q_size + k_size + v_size + z_size
+            shard_offset = 0
+        elif loaded_shard_id == "qkv":
+            shard_size = q_size + k_size + v_size
+            shard_offset = 0
+        elif loaded_shard_id == "z":
+            shard_size = z_size
+            shard_offset = q_size + k_size + v_size
+        elif loaded_shard_id == "ba":
+            shard_size = b_size + a_size
+            shard_offset = q_size + k_size + v_size + z_size
+        elif loaded_shard_id == "b":
+            shard_size = b_size
+            shard_offset = q_size + k_size + v_size + z_size
+        elif loaded_shard_id == "a":
+            shard_size = a_size
+            shard_offset = q_size + k_size + v_size + z_size + b_size
+
+        if is_scale:
             if self.quant_type == QuantType.per_1x128:
                 shard_offset = (shard_offset + 127) // 128
                 shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
-                shard_offset = ["qkvz", "ba"].index(loaded_shard_id)
+                shard_offset = ["qkvz", "ba", "qkv", "z", "b", "a"].index(
+                    loaded_shard_id
+                )
                 shard_size = 1
-        start_idx = shard_rank * shard_size
+        start_idx = self.tp_rank * shard_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
