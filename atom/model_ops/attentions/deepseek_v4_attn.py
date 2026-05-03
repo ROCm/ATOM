@@ -179,6 +179,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.index_head_dim = getattr(hf, "index_head_dim", 128)
         self.window_size = getattr(hf, "sliding_window", 128)
         self.index_topk = getattr(hf, "index_topk", 1024)
+        # `deepgemm_fp8_paged_mqa_logits` decode-path output column count
+        # = max compressed K positions per seq. CSA ratio=4 is the
+        # max-density ratio (1 indexer slot per 4 source tokens).
+        self.max_model_len_idx = model_runner.config.max_model_len // 4
 
         # Compressor state shape: [coff * ratio, coff * head_dim], fp32.
         # CSA: ratio=4, overlap=True -> coff=2 -> [8, 2*head_dim]
@@ -635,7 +639,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         k_per_seq_cpu = np.minimum(self.index_topk, n_committed_per_seq).astype(
             np.int64
         )
-        max_k = int(k_per_seq_cpu.max()) if bs > 0 else 0
         cu_committed_cpu = np.concatenate(
             [
                 np.zeros(1, dtype=np.int64),
@@ -644,20 +647,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         total_committed = int(cu_committed_cpu[-1])
 
-        # FP8 write-side slot_mapping (independent of max_k — written even when
-        # there's nothing to read because num_compress can be > 0 on the same
-        # fwd that crosses a compress boundary for the FIRST committed entry
-        # of a fresh seq).
+        # FP8 write-side slot_mapping (independent of `total_committed` —
+        # written even when there's nothing to read because num_compress can
+        # be > 0 on the same fwd that crosses a compress boundary for the
+        # FIRST committed entry of a fresh seq).
         compress_slot_mapping_gpu = self._build_indexer_compress_slot_mapping(
             csa_compress_plan_cpu, scheduled_bs, k_per_block, ratio
         )
 
-        # All-empty batch: forward_batched short-circuits on `max_k == 0` and
-        # returns -1; the FP8 read side is unused.
-        if max_k == 0:
+        # All-empty batch: forward_batched short-circuits on
+        # `total_committed == 0` and returns -1; the FP8 read side is unused.
+        if total_committed == 0:
             return {
-                "max_k": 0,
-                "total_committed": total_committed,
+                "total_committed": 0,
                 "cu_committed_gpu": None,
                 "compress_slot_mapping_gpu": compress_slot_mapping_gpu,
             }
@@ -692,17 +694,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # per fwd inside the per-CSA-layer body).
         seq_base_per_token_gpu = cu_committed_gpu[batch_id_per_token_gpu].to(
             torch.int32
-        )
+        )  # [total_tokens] int32 — per-token offset into concat'd seqs' compressed K
         visible_end_gpu = torch.minimum(
             (positions_gpu[:total_tokens] + 1) // ratio,
             n_committed_per_seq_gpu[batch_id_per_token_gpu],
-        ).to(torch.int32)
-        cu_ends_gpu = seq_base_per_token_gpu + visible_end_gpu
+        ).to(
+            torch.int32
+        )  # [total_tokens] int32 — per-token causal upper bound
+        cu_ends_gpu = (
+            seq_base_per_token_gpu + visible_end_gpu
+        )  # [total_tokens] int32 — fp8_mqa_logits per-token end offset
         future_threshold_gpu = (
             ((positions_gpu[:total_tokens] + 1) // ratio).to(torch.int32).unsqueeze(1)
-        )
-        col_arange = torch.arange(max_k, device=device, dtype=torch.int32)
-        width_mask_gpu = col_arange.unsqueeze(0) >= k_per_token_gpu.unsqueeze(1)
+        )  # [total_tokens, 1] int32 — broadcast threshold for prefill causal mask
+        # Width-overflow mask shaped [total_tokens, index_topk] — matches the
+        # uniform indexer output layout (both prefill torch.topk + pad and
+        # decode `top_k_per_row_decode` write `index_topk` cols per row, with
+        # cols past per-row valid range carrying -1 sentinels).
+        col_arange = torch.arange(
+            self.index_topk, device=device, dtype=torch.int32
+        )  # [index_topk] int32
+        width_mask_gpu = col_arange.unsqueeze(0) >= k_per_token_gpu.unsqueeze(
+            1
+        )  # [total_tokens, index_topk] bool
 
         offset_per_token_gpu = self._stage(
             "v4_indexer_offset_per_token",
@@ -713,11 +727,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             is_prefill[batch_id_per_token_np],
         ).unsqueeze(1)
 
+        # Pre-allocated decode-path buffers (full [max_bs, ...] views). Decode
+        # helper slices each to [:total_tokens]. Returned full because
+        # `_build_v4_indexer_meta` is called for both prefill and decode
+        # batches; prefill's `total_tokens` may exceed `max_bs` so builder
+        # can't pre-slice. Prefill path doesn't read these.
+        decode_logits_gpu = self.model_runner.forward_vars[
+            "v4_indexer_decode_logits"
+        ].gpu  # [max_bs, max_model_len_idx] fp32
+        decode_topk_indices_gpu = self.model_runner.forward_vars[
+            "v4_indexer_decode_topk_indices"
+        ].gpu  # [max_bs, index_topk] int32
+
         return {
-            "max_k": max_k,
             "total_committed": total_committed,
             "cu_committed_gpu": cu_committed_gpu,
-            "n_committed_per_seq_gpu": n_committed_per_seq_gpu,  # int64, [bs]
+            "n_committed_per_seq_gpu": n_committed_per_seq_gpu,  # int32, [bs]
             "compress_slot_mapping_gpu": compress_slot_mapping_gpu,
             "seq_base_per_token_gpu": seq_base_per_token_gpu,
             "cu_starts_gpu": seq_base_per_token_gpu,  # alias for fp8_mqa_logits
@@ -726,6 +751,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "width_mask_gpu": width_mask_gpu,
             "offset_per_token_gpu": offset_per_token_gpu,
             "is_prefill_per_token_gpu": is_prefill_per_token_gpu,
+            "decode_logits_gpu": decode_logits_gpu,
+            "decode_topk_indices_gpu": decode_topk_indices_gpu,
         }
 
     def _build_indexer_compress_slot_mapping(
@@ -1011,18 +1038,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 + k_idx_c,
             )
             if has_indexer:
-                # CSA: src is per-token gather offset into indexer_topk_batched;
-                # the batched indexer's K width depends on max_k computed at
-                # forward time, but its layout is uniform [total_tokens, max_k].
-                # Stride = max_k = max(compress_topk_width_per_seq). The actual
-                # max_k matches `compress_topk_width_per_seq.max()` since
-                # k_per_seq = min(index_topk, n_committed_per_seq).
-                indexer_max = int(compress_topk_width_per_seq.max())
-                if indexer_max > 0:
-                    compress_topk_src_gpu = self._stage(
-                        f"v4_{kind}_pack_compress_topk_src",
-                        tok_idx_c * indexer_max + k_idx_c,
-                    )
+                # CSA: src is per-token gather offset into indexer_topk_batched
+                # (flattened with `.reshape(-1)` then `index_select`-ed). The
+                # gather index is `tok_idx * stride + k_idx`, so the stride
+                # MUST match the batched indexer's actual col count.
+                #
+                # Indexer emits a uniform [total_tokens, index_topk] int32
+                # layout for BOTH prefill and decode paths (cols past per-row
+                # valid range hold -1 sentinels; consumer width-masks them).
+                indexer_max = int(self.index_topk)
+                compress_topk_src_gpu = self._stage(
+                    f"v4_{kind}_pack_compress_topk_src",
+                    tok_idx_c * indexer_max + k_idx_c,
+                )
             elif positions_np is not None:
                 # HCA: precompute the int32 values (k_idx + offset, future-mask
                 # for prefill). Depends on `positions` which is per-fwd / layer-
@@ -1542,7 +1570,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           - decode swa dst: max_bs * window_size
 
         Memory footprint at typical config (max_bs=16, mnbt=8192, win=128,
-        index_topk=64, max_num_blocks_per_seq=64): ~80 MB total. Allocated
+        index_topk=1024, max_num_blocks_per_seq=64): ~80 MB total. Allocated
         once at builder init; pointers stay fixed for CUDAGraph capture.
         """
         i32 = {"dtype": torch.int32, "device": self.device}
@@ -1583,7 +1611,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # for cu_seq_lens. Also reused as cu_starts/cu_ends for fp8_mqa_logits
         # (which accepts both int32 and int64).
         bufs["v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
-        bufs["v4_indexer_n_committed_per_seq"] = CpuGpuBuffer(bs, **i64)
+        # int32 — consumed both by `deepgemm_fp8_paged_mqa_logits` and
+        # `top_k_per_row_decode`, both of which require int32.
+        bufs["v4_indexer_n_committed_per_seq"] = CpuGpuBuffer(bs, **i32)
+        # Decode-path logits buffer for `deepgemm_fp8_paged_mqa_logits`.
+        # Sized [max_bs, max_model_len_idx] fp32 — assumes V4-Pro next_n=1.
+        # deepgemm writes valid cols [0, n_committed_per_seq[batch]) per row;
+        # padding cols carry stale data but `top_k_per_row_decode` honors
+        # `n_committed_per_seq` per-row so unwritten cols are never selected.
+        bufs["v4_indexer_decode_logits"] = CpuGpuBuffer(
+            bs, self.max_model_len_idx, dtype=torch.float32, device=self.device
+        )
+        # Decode-path top-k indices buffer (consumed by `top_k_per_row_decode`).
+        # Sized [max_bs, index_topk] int32 — V4-Pro next_n=1; multi-token decode
+        # would scale rows by next_n. Replaces the per-fwd torch.topk allocation.
+        bufs["v4_indexer_decode_topk_indices"] = CpuGpuBuffer(
+            bs, self.index_topk, dtype=torch.int32, device=self.device
+        )
         bufs["v4_indexer_k_per_token"] = CpuGpuBuffer(mnbt, **i32)
         bufs["v4_indexer_offset_per_token"] = CpuGpuBuffer(mnbt, **i32)
         bufs["v4_indexer_is_prefill_per_token"] = CpuGpuBuffer(mnbt, **bool_kw)

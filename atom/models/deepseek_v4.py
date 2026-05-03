@@ -34,6 +34,7 @@ from aiter import (
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
@@ -1013,17 +1014,28 @@ class Indexer(nn.Module):
         `context.is_prefill`. Mixed batches go through prefill path.
 
         Returns:
-          topk_flat: `[total_tokens, max_K] int32`, padded with -1 to max K
-            (max over per-seq K). Per-token usable width = K_per_seq.
+          topk_flat: `[total_tokens, index_topk] int32`, uniform-stride layout
+            shared by both prefill and decode paths. Cols past per-token
+            usable width hold -1 sentinels; consumer width-masks via the
+            builder-staged `width_mask_gpu`.
         """
         assert self.rotary_emb is not None
         rd = self.rope_head_dim
         device = x_full.device
         total_tokens = x_full.size(0)
 
-        max_k = indexer_meta["max_k"]
-        if max_k == 0:
-            return torch.full((total_tokens, 0), -1, dtype=torch.int32, device=device)
+        # Empty-K early return: all seqs have n_committed==0 (no compressed K
+        # written yet). Builder also leaves `compress_topk_src_gpu = None` in
+        # this case, so the all-`-1` tensor is never indexed downstream — but
+        # we still return the uniform `[total_tokens, index_topk]` shape for
+        # layout-consistency with the populated path.
+        if indexer_meta["total_committed"] == 0:
+            return torch.full(
+                (total_tokens, self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )  # [total_tokens, index_topk] int32
 
         # Q proj + RoPE + rotate (batched). rotary_emb internally reshapes
         # to (1, num_tokens, -1, rotary_dim) so the input doesn't need an
@@ -1084,8 +1096,8 @@ class Indexer(nn.Module):
             preshuffle=True,
         )
 
-        cu_starts = indexer_meta["cu_starts_gpu"]
-        cu_ends = indexer_meta["cu_ends_gpu"]
+        cu_starts = indexer_meta["cu_starts_gpu"]  # [total_tokens] int32
+        cu_ends = indexer_meta["cu_ends_gpu"]  # [total_tokens] int32
         logits = fp8_mqa_logits(
             Q=q_fp8,
             KV=k_fp8,
@@ -1095,12 +1107,27 @@ class Indexer(nn.Module):
             cu_ends=cu_ends,
         )  # [total_tokens, total_committed] fp32; outside [start,end) is -inf
 
-        # PyTorch topk over -inf-masked logits. aiter `top_k_per_row_prefill`
-        # would be the obvious replacement but it hardcodes K=2048 — V4's
-        # K=index_topk=64 doesn't fit (the kernel writes 2048 ints/row,
-        # overflowing a [tok, 64] indices buffer and corrupting memory).
-        max_k = indexer_meta["max_k"]
-        topk_global = logits.topk(max_k, dim=-1)[1].to(torch.int32)
+        # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
+        # pybind kwarg). Honors per-row [cu_starts[i], cu_ends[i]) so cells
+        # outside each row's valid window are never selected; rows shorter
+        # than `index_topk` get -1 sentinels for tail cols, matching the
+        # decode path's [N, index_topk] layout.
+        # [total_tokens, index_topk] int32 — eager-only path so per-fwd alloc
+        # is fine (prefill total_tokens is dynamic; no CG capture here).
+        topk_global = torch.empty(
+            (total_tokens, self.index_topk), dtype=torch.int32, device=device
+        )
+        top_k_per_row_prefill(
+            logits,
+            cu_starts,
+            cu_ends,
+            topk_global,
+            None,  # values not needed, only indices
+            total_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=self.index_topk,
+        )
         return self._post_process_topk(topk_global, indexer_meta, is_decode=False)
 
     def _score_topk_decode(
@@ -1115,48 +1142,70 @@ class Indexer(nn.Module):
         logits — CUDAGraph-friendly (no per-fwd `total_committed`-shaped
         allocation). Mirrors V3.2 sparse_attn_indexer decode branch
         (deepseek_v2.py:1047-1084).
+
+        Top-k uses aiter `top_k_per_row_decode` (radix kernel, parametric `k`):
+        the kernel honors `n_committed_per_seq` per row, so logits cells past
+        each row's valid range are never selected — no `fill_(-inf)` required.
+        Rows whose valid range is shorter than `index_topk` get -1 sentinels
+        for tail cols, which `_post_process_topk` masks via `width_mask_gpu`.
         """
-        device = q_fp8.device
         total_tokens = q_fp8.size(0)
-        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]
+        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
         bs = block_tables.size(0)
         # V4-Pro has no MTP, so next_n = total_tokens // bs = 1. The reshape
         # also handles future multi-token decode (MTP) without code change.
         next_n = total_tokens // bs
         # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
         # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
-        q_4d = q_fp8.view(bs, next_n, self.n_heads, self.head_dim)
-        kv_cache_4d = self.kv_cache.unsqueeze(-2)
-        # -inf init (not torch.empty): deepgemm only fills cols [0..n_committed_per_seq[batch])
-        # per row; cols beyond that stay at -inf so they lose to real K in topk.
-        # `width_mask` then trims the topk output to per-token k_per_token via masked_fill.
-        logits = torch.full(
-            (total_tokens, self._max_model_len_idx),
-            float("-inf"),
-            dtype=torch.float32,
-            device=device,
-        )
+        q_4d = q_fp8.view(
+            bs, next_n, self.n_heads, self.head_dim
+        )  # [bs, next_n, n_heads, head_dim] fp8
+        kv_cache_4d = self.kv_cache.unsqueeze(
+            -2
+        )  # [num_blocks, k1_csa, 1, head_dim+scale_dim] uint8
+        # Pre-allocated decode logits buffer (sized [max_bs, max_model_len_idx]
+        # in builder, sliced here to [total_tokens, max_model_len_idx]).
+        # No `fill_(-inf)` needed — `top_k_per_row_decode` bounds each row
+        # by `n_committed_per_seq[batch]` so unwritten cols are never picked.
+        logits = indexer_meta["decode_logits_gpu"][
+            :total_tokens
+        ]  # [total_tokens, max_model_len_idx] fp32
         deepgemm_fp8_paged_mqa_logits(
             q_4d,
             kv_cache_4d,
             weights,
             logits,
-            n_committed_per_seq_gpu.to(torch.int32),
+            n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
             block_tables,
             self._max_model_len_idx,
             KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
             Preshuffle=True,
         )
+        # Pre-allocated indices buffer — fixed [max_bs, index_topk] int32 in
+        # builder, sliced to [total_tokens, index_topk] for this fwd. Kernel
+        # writes exactly `index_topk` ints per row (valid indices then -1
+        # sentinels), no overflow risk.
+        topk_local = indexer_meta["decode_topk_indices_gpu"][
+            :total_tokens
+        ]  # [total_tokens, index_topk] int32
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            n_committed_per_seq_gpu,
+            topk_local,
+            total_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=self.index_topk,
+        )
         # Decode topk indices are seq-local (each row's columns are 0-indexed
         # into that batch's compressed K), so `_post_process_topk` skips the
         # seq_base subtraction via `is_decode=True`.
-        max_k = indexer_meta["max_k"]
-        topk_local = logits.topk(max_k, dim=-1)[1].to(torch.int32)
         return self._post_process_topk(topk_local, indexer_meta, is_decode=True)
 
     def _post_process_topk(
         self,
-        topk_indices: torch.Tensor,  # [total_tokens, max_k] int32
+        topk_indices: torch.Tensor,  # [total_tokens, index_topk] int32 (uniform layout, both paths)
         indexer_meta: dict,
         *,
         is_decode: bool,
@@ -1168,26 +1217,43 @@ class Indexer(nn.Module):
           (fp8_mqa_logits scores all seqs' K concatenated), need
           `seq_base_per_token` subtraction to recover seq-local idx.
         Decode (`is_decode=True`): topk indices are already SEQ-LOCAL
-          (deepgemm produces per-row [bs*next_n, max_model_len_idx] where
-          each row's columns are local to its batch's compressed K).
+          (`top_k_per_row_decode` produces per-row [total_tokens, index_topk]
+          where each row's cols are local to its batch's compressed K).
+
+        Both paths emit a uniform [total_tokens, index_topk] int32 layout;
+        cols past per-row valid range hold -1 sentinels (decode kernel native;
+        prefill via explicit pad). `width_mask_gpu` is `[total_tokens,
+        index_topk]` bool and flags those tail cols.
         """
-        future_threshold = indexer_meta["future_threshold_gpu"]
-        width_mask = indexer_meta["width_mask_gpu"]
-        offset_per_token = indexer_meta["offset_per_token_gpu"]
-        is_prefill_per_token = indexer_meta["is_prefill_per_token_gpu"]
+        future_threshold = indexer_meta[
+            "future_threshold_gpu"
+        ]  # [total_tokens, 1] int32
+        width_mask = indexer_meta["width_mask_gpu"]  # [total_tokens, index_topk] bool
+        offset_per_token = indexer_meta["offset_per_token_gpu"]  # [total_tokens] int32
+        is_prefill_per_token = indexer_meta[
+            "is_prefill_per_token_gpu"
+        ]  # [total_tokens, 1] bool
 
         if is_decode:
-            topk_local = topk_indices
+            topk_local = topk_indices  # [total_tokens, index_topk] int32
         else:
-            seq_base_per_token = indexer_meta["seq_base_per_token_gpu"]
-            topk_local = topk_indices - seq_base_per_token.unsqueeze(1)
+            seq_base_per_token = indexer_meta[
+                "seq_base_per_token_gpu"
+            ]  # [total_tokens] int32
+            topk_local = topk_indices - seq_base_per_token.unsqueeze(
+                1
+            )  # [total_tokens, index_topk] int32 (seq-local idx)
         # Combined invalid mask: slots past per-seq K (width_mask) OR future
-        # tokens in fresh prefill. width_mask is computed off the SHAPE so
-        # `topk_local` for width-masked slots can be garbage (we don't pre-fill
-        # to -1 — the final masked_fill_ overwrites those positions anyway).
-        invalid = width_mask | (is_prefill_per_token & (topk_local >= future_threshold))
+        # tokens in fresh prefill. Width-masked slots in `topk_local` may be
+        # -1 sentinels (decode + prefill pad) or garbage from `subtract` —
+        # the final masked_fill_ overwrites them with -1 either way.
+        invalid = width_mask | (
+            is_prefill_per_token & (topk_local >= future_threshold)
+        )  # [total_tokens, index_topk] bool
         # In-place over `topk_local + offset` (a fresh tensor from `+`); saves
         # a `full_like(-1)` allocation and the `torch.where` launch.
+        # Returns [total_tokens, index_topk] int32: (idx + offset) for valid
+        # slots, -1 for invalid.
         return (topk_local + offset_per_token.unsqueeze(1)).masked_fill_(invalid, -1)
 
 
