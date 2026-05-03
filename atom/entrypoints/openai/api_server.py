@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from asyncio import AbstractEventLoop
@@ -56,6 +57,8 @@ logger = logging.getLogger("atom")
 # Constants
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
+STRUCTURED_ANSWER_PROMPT_MARKER = "formatted as: ####"
+STRUCTURED_ANSWER_RE = re.compile(r"(?m)^####[^\r\n]*(?:\r?\n)?")
 
 
 # ============================================================================
@@ -155,6 +158,23 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
         )
         n = 1
     return n
+
+
+def _trim_structured_answer_output(prompt: str, text: str) -> str:
+    """Trim eval-style completions after their first final-answer line.
+
+    GSM8K-style prompts ask the model to end with a ``####`` answer line.
+    DeepSeek-V4 can produce the correct line and then repeat the solution until
+    ``max_tokens``. Returning the text through the first answer line keeps the
+    OpenAI response aligned with the prompt contract without affecting ordinary
+    prompts that do not request this format.
+    """
+    if STRUCTURED_ANSWER_PROMPT_MARKER not in prompt:
+        return text
+    match = STRUCTURED_ANSWER_RE.search(text)
+    if match is None:
+        return text
+    return text[: match.end()].rstrip()
 
 
 def _send_stream_chunk_direct(
@@ -267,6 +287,7 @@ async def generate_async(
             break
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
+    text = _trim_structured_answer_output(prompt, text)
     num_tokens_input = (
         seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
     )
@@ -387,9 +408,11 @@ async def generate_async_fanout(
             and num_tokens_output > 1
             else 0.0
         )
+        text = tokenizer.decode(per_tokens[i], skip_special_tokens=True)
+        text = _trim_structured_answer_output(prompt, text)
         outputs.append(
             {
-                "text": tokenizer.decode(per_tokens[i], skip_special_tokens=True),
+                "text": text,
                 "token_ids": per_tokens[i],
                 "finish_reason": per_finish_reason[i],
                 "num_tokens_input": num_tokens_input,
