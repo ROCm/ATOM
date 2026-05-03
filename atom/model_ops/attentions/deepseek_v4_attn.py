@@ -39,6 +39,7 @@ from typing import Type
 
 import numpy as np
 import torch
+from aiter import dtypes
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
@@ -194,7 +195,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         self._state_dtype = torch.float32  # fp32 required for softmax-pool
         self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
-        self._classical_dtype = torch.bfloat16  # compressed KV is BF16
+        self._classical_dtype = torch.bfloat16  # CSA Main / HCA Main KV is BF16
+        # CSA Indexer cache is FP8 + 4-byte fp32 scale per row, aligned to 16
+        # bytes (matches V3.2 sparse MLA pattern; avoids torch inductor
+        # unaligned-access slowdowns). Written by `indexer_k_quant_and_cache`,
+        # read by `cp_gather_indexer_k_quant_cache`.
+        self._aligned_index_dim = ((self.index_head_dim + 4 + 15) // 16) * 16
 
         # Sparse-attn + per-fwd metadata buffers (CG-A: pre-allocate for fixed
         # GPU pointers, prerequisite for CUDAGraph capture). All H2D copies in
@@ -234,16 +240,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return 1
 
     def compute_block_bytes(self) -> int:
-        """Per-V4-block bytes for the three classical KV pools (BF16).
+        """Per-V4-block bytes for the three classical KV pools.
 
         Each V4 block (block_size=128 original tokens) stores per layer:
-          - CSA layer: k1=32 entries × head_dim (Main) + k1×idx_head_dim (Indexer)
-          - HCA layer: k2=1 entry × head_dim
+          - CSA Main:   k1=32 entries × head_dim BF16
+          - CSA Indexer: k1=32 entries × aligned_index_dim bytes FP8
+                        (= ((index_head_dim + 4 + 15) // 16) * 16 — 16-byte
+                        alignment matches V3.2 sparse MLA index cache and
+                        avoids unaligned-access slowdowns in torch inductor.
+                        FP8 quantized data + 4-byte fp32 scale interleaved
+                        per row; written by `indexer_k_quant_and_cache`,
+                        read by `cp_gather_indexer_k_quant_cache`).
+          - HCA Main:   k2=1 entry × head_dim BF16
         """
-        elem = self._classical_dtype.itemsize
-        csa_main_per_block = self.k1_csa * self.head_dim * elem
-        csa_idx_per_block = self.k1_csa * self.index_head_dim * elem
-        hca_main_per_block = self.k2_hca * self.head_dim * elem
+        elem_bf16 = self._classical_dtype.itemsize
+        csa_main_per_block = self.k1_csa * self.head_dim * elem_bf16
+        csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
+        hca_main_per_block = self.k2_hca * self.head_dim * elem_bf16
         return (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
             + len(self.hca_layers) * hca_main_per_block
@@ -273,9 +286,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 dtype=self._classical_dtype,
                 device=device,
             ),
+            # CSA Indexer cache: FP8 + 4-byte fp32 scale per row, packed as
+            # FP8 (1 byte per element) and aligned to 16 bytes per row to
+            # match V3.2 sparse MLA layout (avoid unaligned access).
+            # Written by `indexer_k_quant_and_cache` (V4 inner Compressor),
+            # read by `cp_gather_indexer_k_quant_cache` (Indexer.forward_batched).
+            #
+            # Layer-major axis order `[n_csa, NB, k1, aligned_dim]` so each
+            # per-CSA slice `pool[pos]` is contiguous in storage and can be
+            # `.view`-flattened to `[NB*k1, 1, aligned_dim]` (the layout aiter
+            # kernels expect: a flat slot index in [0, NB*k1) selects the row).
             "v4_csa_idx_kv": torch.zeros(
-                (num_blocks, n_csa, self.k1_csa, self.index_head_dim),
-                dtype=self._classical_dtype,
+                (n_csa, num_blocks, self.k1_csa, self._aligned_index_dim),
+                dtype=dtypes.fp8,
                 device=device,
             ),
             "v4_hca_main_kv": torch.zeros(
@@ -356,9 +379,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if isinstance(module, _V4Indexer):
             # Indexer.kv_cache — CSA Indexer compressed pool, per CSA layer.
             # prefix: "layers.<L>.attn.indexer"
+            #
+            # Shape MUST stay [NB, k1_csa, aligned_dim] (3D, block_size dim
+            # explicit) because `cp_gather_indexer_k_quant_cache` infers
+            # block_size from `kv_cache.shape[1]` to compute
+            # `physical_block * block_size + slot_in_block`. Flattening to
+            # [NB*k1, 1, aligned_dim] makes the kernel see block_size=1 and
+            # OOB-index block_table. Matches V3.2's [num_blocks, block_size,
+            # head_dim] layout (deepseek_v2.py:1049).
             layer_id_from_prefix = int(module.prefix.split(".")[1])
             pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
-            module.kv_cache = runner.v4_csa_idx_kv[:, pos]
+            module.kv_cache = runner.v4_csa_idx_kv[pos]
             return None
 
         if isinstance(module, _V4Compressor):
@@ -380,8 +411,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_state = runner.v4_csa_idx_kv_state[pos]
                 module.score_state = runner.v4_csa_idx_score_state[pos]
                 # Inner compressor writes target the SAME storage as the
-                # outer Indexer.kv_cache (csa_idx_kv).
-                module.kv_cache = runner.v4_csa_idx_kv[:, pos]
+                # outer Indexer.kv_cache (csa_idx_kv). Same 3D shape — write
+                # via slot_mapping is shape-agnostic (flat indexing), but we
+                # keep [NB, k1_csa, aligned_dim] for symmetry with the read
+                # binding above.
+                module.kv_cache = runner.v4_csa_idx_kv[pos]
                 module.compress_out = compress_out_buffers["v4_csa_idx_compress_out"]
             elif ratio == 4:
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
@@ -542,6 +576,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Indexer (CSA only) per-fwd GPU metadata. Hoists ~6 H2D calls per
         # CSA layer (batch_id_per_token / cu_committed / n_committed /
         # k_per_token / offset_per_token / is_prefill_per_token).
+        # compress_plans[4] (CSA, ratio=4) carries the compress rows that the
+        # indexer-FP8 path needs to derive its write-side slot_mapping. None
+        # for warmup or empty fwd; _build_v4_indexer_meta handles both.
+        csa_compress_plan_cpu = None
+        plans = getattr(attn_metadata, "compress_plans", None) or {}
+        if 4 in plans:
+            csa_compress_plan_cpu = plans[4].compress_plan_cpu
         attn_metadata.v4_indexer_meta = self._build_v4_indexer_meta(
             cu_seqlens_q_np=cu_seqlens_q_np,
             start_pos_per_seq_np=np.asarray(start_pos_per_seq, dtype=np.int64),
@@ -549,6 +590,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             scheduled_bs=scheduled_bs,
             total_tokens=total_tokens,
             device=self.device,
+            csa_compress_plan_cpu=csa_compress_plan_cpu,
         )
 
     def _build_v4_indexer_meta(
@@ -560,12 +602,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         scheduled_bs: int,
         total_tokens: int,
         device,
+        csa_compress_plan_cpu,
     ):
         """Build per-fwd GPU index tensors consumed by `Indexer.forward_batched`.
 
         Returns None for warmup batches (the indexer falls back to its
         inline H2D path) or when CSA / Indexer is not on the model. CSA
         ratio is fixed at 4; we always build under that assumption.
+
+        The FP8-cache write side (`indexer_k_quant_and_cache`) needs a flat
+        `compress_slot_mapping` int64 tensor — one entry per row in
+        `csa_compress_plan_cpu` mapping the compress entry to a global slot
+        in the `[n_csa, NB, k1, aligned_dim=144]` cache pool (layer-major,
+        FP8 + 4-byte fp32 scale per row, 16B-aligned). Computed here host-side
+        because the plan rows + block_tables_cpu are both already on host.
         """
         from atom.models.deepseek_v4 import _V4_BLOCK_SIZE
 
@@ -574,6 +624,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         bs = scheduled_bs
         ratio = 4  # CSA
+        k_per_block = _V4_BLOCK_SIZE // ratio  # 32
         cu_seqlens_q_arr = cu_seqlens_q_np[: bs + 1].astype(np.int64)
         token_num_per_seq = (cu_seqlens_q_arr[1:] - cu_seqlens_q_arr[:bs]).astype(
             np.int64
@@ -591,20 +642,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 np.cumsum(n_committed_per_seq, dtype=np.int64),
             ]
         )
+        total_committed = int(cu_committed_cpu[-1])
 
-        # Pre-built gather indices for `_v4_gather_compressed_batched` —
-        # eliminates 3 H2D copies per CSA layer's gather call.
-        gather_indices = self._build_v4_gather_indices(
-            tag="indexer",
-            n_per_seq=n_committed_per_seq,
-            k_per_block=_V4_BLOCK_SIZE // ratio,
-            cu_committed_cpu=cu_committed_cpu,
-            device=device,
+        # FP8 write-side slot_mapping (independent of max_k — written even when
+        # there's nothing to read because num_compress can be > 0 on the same
+        # fwd that crosses a compress boundary for the FIRST committed entry
+        # of a fresh seq).
+        compress_slot_mapping_gpu = self._build_indexer_compress_slot_mapping(
+            csa_compress_plan_cpu, scheduled_bs, k_per_block, ratio
         )
+
         # All-empty batch: forward_batched short-circuits on `max_k == 0` and
-        # returns -1; doesn't touch any other field.
+        # returns -1; the FP8 read side is unused.
         if max_k == 0:
-            return {"max_k": 0, "gather_indices": gather_indices}
+            return {
+                "max_k": 0,
+                "total_committed": total_committed,
+                "cu_committed_gpu": None,
+                "compress_slot_mapping_gpu": compress_slot_mapping_gpu,
+            }
 
         batch_id_per_token_np = np.repeat(
             np.arange(bs, dtype=np.int64), token_num_per_seq
@@ -619,7 +675,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         batch_id_per_token_gpu = self._stage(
             "v4_indexer_batch_id_per_token", batch_id_per_token_np
         )
-        cu_committed_gpu = self._stage("v4_indexer_cu_committed", cu_committed_cpu)
+        # cu_committed_gpu is consumed both as `cu_starts/cu_ends` for the
+        # fp8_mqa_logits per-token range AND as `cu_seq_lens` for the
+        # cp_gather_indexer_k_quant_cache call (per-seq cumulative committed K).
+        cu_committed_gpu = self._stage(
+            "v4_indexer_cu_committed", cu_committed_cpu.astype(np.int32)
+        )
         n_committed_per_seq_gpu = self._stage(
             "v4_indexer_n_committed_per_seq", n_committed_per_seq
         )
@@ -654,7 +715,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         return {
             "max_k": max_k,
-            "gather_indices": gather_indices,
+            "total_committed": total_committed,
+            "cu_committed_gpu": cu_committed_gpu,
+            "compress_slot_mapping_gpu": compress_slot_mapping_gpu,
             "seq_base_per_token_gpu": seq_base_per_token_gpu,
             "cu_starts_gpu": seq_base_per_token_gpu,  # alias for fp8_mqa_logits
             "cu_ends_gpu": cu_ends_gpu,
@@ -663,6 +726,42 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "offset_per_token_gpu": offset_per_token_gpu,
             "is_prefill_per_token_gpu": is_prefill_per_token_gpu,
         }
+
+    def _build_indexer_compress_slot_mapping(
+        self,
+        csa_compress_plan_cpu,
+        scheduled_bs: int,
+        k_per_block: int,
+        ratio: int,
+    ):
+        """Compute the per-compress-row flat slot in `v4_csa_idx_kv` pool.
+
+        For each row in `csa_compress_plan_cpu` (= `(ragged_id, batch_id,
+        position, window_len)`):
+          ci = position // ratio                        # compress entry idx in seq
+          block_in_seq  = ci // k_per_block
+          slot_in_block = ci %  k_per_block
+          physical_block = block_tables_cpu[batch_id, block_in_seq]
+          slot = physical_block * k_per_block + slot_in_block
+
+        Returns None when the plan is empty (no boundary crossed this fwd) —
+        the caller skips the `indexer_k_quant_and_cache` write entirely.
+        """
+        if csa_compress_plan_cpu is None or csa_compress_plan_cpu.shape[0] == 0:
+            return None
+        var = self.model_runner.forward_vars
+        block_tables_np = var["block_tables"].np[:scheduled_bs]
+        bid = csa_compress_plan_cpu[:, 1]
+        pos = csa_compress_plan_cpu[:, 2]
+        ci = pos // ratio
+        block_in_seq = ci // k_per_block
+        slot_in_block = ci % k_per_block
+        physical_block = block_tables_np[bid, block_in_seq]
+        # int64 — `indexer_k_quant_and_cache` kernel signature is `int64_t*`
+        # (matches V3.2's `attn_metadata.slot_mapping` dtype). int32 caused
+        # GPU memory access faults from 2x stride mis-stepping.
+        slot_mapping_np = physical_block.astype(np.int64) * k_per_block + slot_in_block
+        return self._stage("v4_indexer_compress_slot_mapping", slot_mapping_np)
 
     def _build_v4_gather_indices(
         self,
@@ -678,7 +777,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         tensors when total == 0 (caller's gather returns empty).
 
         `tag` selects which pre-allocated buffer set this call writes into
-        (one of "indexer", "csa_dc", "hca_dc"). Each tag has its own
+        (one of "csa_dc", "hca_dc"). Each tag has its own
         `v4_{tag}_gather_{batch_ids,block_in_seq,slot_in_block}` buffer.
         """
         bs = len(n_per_seq)
@@ -1479,18 +1578,32 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # _build_v4_indexer_meta (CSA only — but allocate unconditionally;
         # never accessed when CSA layers are absent).
         bufs["v4_indexer_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i64)
-        bufs["v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i64)
+        # int32 — `cp_gather_indexer_k_quant_cache` kernel signature is `int32_t*`
+        # for cu_seq_lens. Also reused as cu_starts/cu_ends for fp8_mqa_logits
+        # (which accepts both int32 and int64).
+        bufs["v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
         bufs["v4_indexer_n_committed_per_seq"] = CpuGpuBuffer(bs, **i64)
         bufs["v4_indexer_k_per_token"] = CpuGpuBuffer(mnbt, **i32)
         bufs["v4_indexer_offset_per_token"] = CpuGpuBuffer(mnbt, **i32)
         bufs["v4_indexer_is_prefill_per_token"] = CpuGpuBuffer(mnbt, **bool_kw)
+        # FP8 cache write-side slot mapping (one entry per compress row).
+        # Bound = ⌈mnbt/4⌉ + bs (worst-case num_compress for ratio=4 CSA;
+        # matches v4_compress_plan_4 row count).
+        # int64 — `indexer_k_quant_and_cache` requires int64 slot_mapping.
+        idx_compress_bound = mnbt // 4 + bs
+        bufs["v4_indexer_compress_slot_mapping"] = CpuGpuBuffer(
+            idx_compress_bound, **i64
+        )
 
-        # Gather indices — 3 sets: indexer (CSA), csa decode_compress, hca
-        # decode_compress. Each set has 3 i64 tensors. Sized to the CSA
-        # bound (max_bs * max_num_blocks_per_seq * 32) since CSA is the
-        # ratio-4 (largest) case; HCA reuses the same bound for simplicity.
+        # Gather indices — 2 sets: csa decode_compress, hca decode_compress.
+        # Each set has 3 i64 tensors. Sized to the CSA bound
+        # (max_bs * max_num_blocks_per_seq * k1_csa) since CSA is the ratio-4
+        # (largest) case; HCA reuses the same bound for simplicity.
+        # The indexer side no longer needs a gather buffer set —
+        # `cp_gather_indexer_k_quant_cache` consumes block_tables + cu_seq_lens
+        # directly.
         gather_max = bs * nbps * k1_csa
-        for tag in ("indexer", "csa_dc", "hca_dc"):
+        for tag in ("csa_dc", "hca_dc"):
             bufs[f"v4_{tag}_gather_batch_ids"] = CpuGpuBuffer(gather_max, **i64)
             bufs[f"v4_{tag}_gather_block_in_seq"] = CpuGpuBuffer(gather_max, **i64)
             bufs[f"v4_{tag}_gather_slot_in_block"] = CpuGpuBuffer(gather_max, **i64)

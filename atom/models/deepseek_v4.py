@@ -26,7 +26,12 @@ import torch.nn.functional as F
 from torch import nn
 
 import aiter
-from aiter import dtypes, get_hip_quant
+from aiter import (
+    cp_gather_indexer_k_quant_cache,
+    dtypes,
+    get_hip_quant,
+    indexer_k_quant_and_cache,
+)
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -774,6 +779,7 @@ class Compressor(nn.Module):
         state_slot_mapping: torch.Tensor,  # [bs] int32
         block_tables: Optional[torch.Tensor] = None,  # [bs, max_blocks_per_seq] int32
         out_dtype: Optional[torch.dtype] = None,
+        idx_slot_mapping: Optional[torch.Tensor] = None,  # [num_compress] int64
     ) -> Optional[torch.Tensor]:  # [num_compress, head_dim] BF16  (None if plan empty)
         """Batched plan-style compress: one fused kernel call for the whole
         fwd's batch (across all seqs).
@@ -784,8 +790,10 @@ class Compressor(nn.Module):
         (write order critical — fused kernel reads state-cache-as-of-previous-
         fwd; update_compressor_states overwrites for next fwd).
 
-        TODO: quant (FP8 ue8m0 for CSA, FP4 + Hadamard for Indexer) is NOT
-        applied; see class docstring.
+        TODO: quant (FP8 ue8m0 for CSA Main, FP4 + Hadamard for Indexer) is
+        NOT applied for the Main path; see class docstring. The Indexer-inner
+        path *does* apply FP8 quantization via `indexer_k_quant_and_cache`
+        when `idx_slot_mapping` is provided.
 
         Args:
             x:           [num_tokens, dim] flat ragged batch hidden state.
@@ -796,6 +804,14 @@ class Compressor(nn.Module):
             block_tables: [bs, max_blocks_per_seq] int32 — physical block IDs
                          per seq; None during warmup (skips kv_cache scatter).
             out_dtype:   override kernel output dtype. Defaults to bf16.
+            idx_slot_mapping: [num_compress] int64 — global flat slot in the
+                         FP8 indexer cache pool, one per compress row (kernel
+                         signature requires int64). When provided, the fused
+                         kernel skips its BF16 scatter and we instead call
+                         `indexer_k_quant_and_cache` to FP8-quantize+write each
+                         row into `self.kv_cache` (interleaved [head_dim] FP8 +
+                         4-byte fp32 scale per row, dtypes.fp8 storage).
+                         Only set by the CSA-inner-Compressor caller.
 
         Returns:
             Compressed KV `[num_compress, head_dim]` post-norm post-rope BF16,
@@ -827,18 +843,27 @@ class Compressor(nn.Module):
         # fwd's data for the NEXT fwd's overlap — must run AFTER the fused
         # kernel.
         #
-        # The kernel does pool + RMSNorm + RoPE + BF16 store to kv_cache.
-        # No quant is applied (FP8 ue8m0 for CSA, FP4 + Hadamard for Indexer
-        # are both dropped). Trade-off: removes the QAT round-trip the model
-        # was trained with → output quality drops measurably from baseline.
-        # TODO: port the quant variants into the kernel for full byte-equal.
+        # The kernel does pool + RMSNorm + RoPE + (optional) BF16 store to
+        # kv_cache. For the Indexer-inner path (`idx_slot_mapping is not None`)
+        # we bypass the kernel scatter and instead call
+        # `indexer_k_quant_and_cache` separately, which FP8-quantizes the
+        # post-process K row and writes the (FP8 + scale) interleaved layout
+        # into the uint8 indexer pool.
         cos_cache, sin_cache = self.rotary_emb._caches(x.device)
+        is_idx_fp8 = idx_slot_mapping is not None
         # Warmup runs through the same path: kv_cache is None until the V4
         # builder binds it post-warmup, so the kernel skips the scatter.
-        # When real, writes to block 0 are overwritten when slot 0 is later
-        # assigned to a real seq (start_pos==0 path discards prior state).
-        scatter_kv_cache = self.kv_cache if block_tables is not None else None
-        scatter_block_tables = block_tables if scatter_kv_cache is not None else None
+        # Indexer-FP8 path always skips the kernel scatter (separate write).
+        scatter_kv_cache = (
+            None
+            if is_idx_fp8
+            else (self.kv_cache if block_tables is not None else None)
+        )
+        scatter_block_tables = (
+            None
+            if is_idx_fp8
+            else (block_tables if scatter_kv_cache is not None else None)
+        )
         out = fused_compress_attn(
             kv_in=kv,
             score_in=score,
@@ -861,6 +886,17 @@ class Compressor(nn.Module):
             out_dtype=out_dtype,
             out=self.compress_out,
         )
+        # Indexer-FP8 path: quantize the post-RoPE BF16 K rows into the uint8
+        # FP8+scale layout of `self.kv_cache`. `out` is [num_compress, head_dim]
+        # BF16 in plan order (matches `idx_slot_mapping` row order).
+        if is_idx_fp8 and out is not None and self.kv_cache is not None:
+            indexer_k_quant_and_cache(
+                out,
+                self.kv_cache,
+                idx_slot_mapping,
+                d,  # quant_block_size = head_dim (one fp32 scale per row)
+                self.scale_fmt,
+            )
         update_compressor_states(
             kv,
             score,
@@ -986,17 +1022,31 @@ class Indexer(nn.Module):
         self.rotary_emb(positions, q[..., -rd:])
         q = rotate_activation(q)
 
-        # FP8 quant Q + batched gather K + FP8 quant. `_fp8_quant_func`,
-        # `_weights_scale` precomputed in __init__.
+        # FP8 quant Q (still online — Q is recomputed each fwd, no cache).
+        # `_fp8_quant_func` / `_weights_scale` precomputed in __init__.
         q_2d = q.view(-1, self.head_dim)
         q_fp8, q_scale = self._fp8_quant_func(q_2d, quant_dtype=dtypes.fp8)
         q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
         q_scale = q_scale.view(total_tokens, self.n_heads, 1)
 
-        gathered_flat = _v4_gather_compressed_batched(
-            self.kv_cache, block_tables, indexer_meta["gather_indices"]
+        # K side: cache stores FP8 + 4-byte fp32 scale per row interleaved
+        # (uint8 layout written by `indexer_k_quant_and_cache` from the inner
+        # Compressor). `cp_gather_indexer_k_quant_cache` does paged-gather
+        # + split into separate (FP8, scale) buffers in one kernel — no
+        # per-row index list, no online quant.
+        total_committed = indexer_meta["total_committed"]
+        cu_committed = indexer_meta["cu_committed_gpu"]
+        k_fp8 = torch.empty(
+            (total_committed, self.head_dim), device=device, dtype=dtypes.fp8
         )
-        k_fp8, k_scale = self._fp8_quant_func(gathered_flat, quant_dtype=dtypes.fp8)
+        k_scale = torch.empty((total_committed, 1), device=device, dtype=torch.float32)
+        cp_gather_indexer_k_quant_cache(
+            self.kv_cache,
+            k_fp8,
+            k_scale.view(dtypes.fp8),  # 4-byte scale rows treated as fp8 bytes
+            block_tables,
+            cu_committed,
+        )
 
         # weights = weights_proj * q_scale * (softmax_scale * 1/sqrt(H))
         weights = (
@@ -1018,7 +1068,7 @@ class Indexer(nn.Module):
         logits = fp8_mqa_logits(
             Q=q_fp8,
             KV=k_fp8,
-            kv_scales=k_scale.view(-1).float(),
+            kv_scales=k_scale,
             weights=weights,
             cu_starts=cu_starts,
             cu_ends=cu_ends,
@@ -1335,14 +1385,21 @@ class DeepseekV4Attention(nn.Module):
         )
         indexer_topk_batched = None
         if self.indexer is not None:
-            # Indexer's inner compressor populates the indexer kv_cache; the
-            # outer `forward_batched` reads `v4_indexer_meta` (built once per
-            # fwd) so it has zero per-layer H2D / CPU index math.
+            # Indexer's inner compressor populates the indexer kv_cache (FP8
+            # via indexer_k_quant_and_cache when idx_slot_mapping is set);
+            # the outer `forward_batched` reads `v4_indexer_meta` (built once
+            # per fwd) so it has zero per-layer H2D / CPU index math.
+            idx_slot_mapping = (
+                v4_indexer_meta.get("compress_slot_mapping_gpu")
+                if v4_indexer_meta is not None
+                else None
+            )
             self.indexer.compressor(
                 x,
                 plan=plan_for_layer,
                 state_slot_mapping=state_slot_mapping,
                 block_tables=block_tables_gpu,
+                idx_slot_mapping=idx_slot_mapping,
             )
             indexer_topk_batched = self.indexer.forward_batched(
                 x_full=x,
