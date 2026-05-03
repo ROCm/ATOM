@@ -815,6 +815,173 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         param.weight_loader_process(param_data, loaded_weight)
 
 
+class QKVZParallelLinear(ColumnParallelLinear):
+    """Deinterleaving linear for the separate ``in_proj_qkvz`` checkpoint.
+
+    The Qwen3-Next checkpoint stores qkvz in per-k-head-group interleaved
+    layout::
+
+        [q(hk) | k(hk) | v0..vR(R*hv) | z0..zR(R*hv)]  per group
+
+    This class deinterleaves both weight rows **and** per-1x128 block scales
+    during loading so the output layout is ``[q_all | k_all | v_all | z_all]``
+    contiguous, enabling zero-copy ``torch.split`` at runtime.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
+        **kwargs,
+    ):
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        tp_size = get_tp_group().world_size
+        self.nk = divide(num_k_heads, tp_size)
+        self.nv = divide(num_v_heads, tp_size)
+        self.R = num_v_heads // num_k_heads  # v-heads per k-head group
+        output_size = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
+        super().__init__(
+            input_size,
+            output_size,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+        )
+
+    @staticmethod
+    def _deinterleave(param_data, src, nk, R, hk, hv):
+        """Scatter interleaved rows into [q|k|v|z] regions."""
+        group_size = 2 * hk + 2 * hv * R
+        q_total = nk * hk
+        k_total = nk * hk
+        v_total = nk * R * hv
+
+        for g in range(nk):
+            base = g * group_size
+            # q
+            param_data[g * hk : (g + 1) * hk] = src[base : base + hk]
+            # k
+            param_data[q_total + g * hk : q_total + (g + 1) * hk] = src[
+                base + hk : base + 2 * hk
+            ]
+            # v sub-heads
+            for s in range(R):
+                v_src = base + 2 * hk + s * hv
+                v_dst = q_total + k_total + (g * R + s) * hv
+                param_data[v_dst : v_dst + hv] = src[v_src : v_src + hv]
+            # z sub-heads
+            for s in range(R):
+                z_src = base + 2 * hk + R * hv + s * hv
+                z_dst = q_total + k_total + v_total + (g * R + s) * hv
+                param_data[z_dst : z_dst + hv] = src[z_src : z_src + hv]
+
+    @staticmethod
+    def _match_dtype(param_data, loaded_weight):
+        """View param_data as loaded_weight's dtype if they differ but share element size.
+
+        This mirrors ``weight_loader_process`` behaviour for FP8 on ROCm where
+        the param is ``float8_e4m3fnuz`` but the checkpoint stores
+        ``float8_e4m3fn``.  The normalisation happens later in
+        ``process_weights_after_loading``.
+        """
+        if (
+            param_data.dtype != loaded_weight.dtype
+            and param_data.element_size() == loaded_weight.element_size()
+        ):
+            return param_data.view(loaded_weight.dtype)
+        return param_data
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # Load like ColumnParallelLinear (no deinterleave at load time).
+        super().weight_loader(param, loaded_weight)
+
+    def process_weights_after_loading(self):
+        nk, R = self.nk, self.R
+        hk, hv = self.head_k_dim, self.head_v_dim
+
+        # Deinterleave weight rows: interleaved → [q|k|v|z]
+        w = self.weight.data
+        dw = torch.empty_like(w)
+        self._deinterleave(dw, w, nk, R, hk, hv)
+        self.weight.data = dw
+
+        # Deinterleave weight_scale rows (per_1x128 block scale)
+        ws = getattr(self, "weight_scale", None)
+        if ws is not None:
+            hk_s, hv_s = hk // 128, hv // 128
+            s = ws.data
+            ds = torch.empty_like(s)
+            self._deinterleave(ds, s, nk, R, hk_s, hv_s)
+            self.weight_scale.data = ds
+
+        super().process_weights_after_loading()
+
+
+class BAParallelLinear(ColumnParallelLinear):
+    """Deinterleaving linear for the separate ``in_proj_ba`` checkpoint.
+
+    The Qwen3-Next checkpoint stores ba in per-k-head-group layout::
+
+        [b_s0..b_sR | a_s0..a_sR]  per group  (R = num_v_heads / num_k_heads)
+
+    This class deinterleaves during loading so the output layout is
+    ``[b_all | a_all]`` contiguous, enabling zero-copy ``torch.split``.
+
+    ``in_proj_ba`` is always BF16 (listed in ``modules_to_not_convert``),
+    so no weight-scale handling is needed.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
+        **kwargs,
+    ):
+        tp_size = get_tp_group().world_size
+        self.nk = divide(num_k_heads, tp_size)
+        self.R = num_v_heads // num_k_heads
+        self.nv = self.nk * self.R
+        output_size = 2 * num_v_heads
+        super().__init__(
+            input_size,
+            output_size,
+            bias=bias,
+            quant_config=quant_config,
+            source_quant_dtype=source_quant_dtype,
+            prefix=prefix,
+        )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # Load like ColumnParallelLinear (no deinterleave at load time).
+        super().weight_loader(param, loaded_weight)
+
+    def process_weights_after_loading(self):
+        nk, R, nv = self.nk, self.R, self.nv
+        w = self.weight.data
+        dw = torch.empty_like(w)
+        group_size = 2 * R
+        for g in range(nk):
+            base = g * group_size
+            dw[g * R : (g + 1) * R] = w[base : base + R]
+            dw[nv + g * R : nv + (g + 1) * R] = w[base + R : base + 2 * R]
+        self.weight.data = dw
+        super().process_weights_after_loading()
+
+
 class QKVGParallelLinear(ColumnParallelLinear):
     """QKV + output-Gate parallel linear.
 
