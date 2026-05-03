@@ -48,6 +48,77 @@ from atom.model_ops.attentions.backends import (
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, Context
 
+# ---------------------------------------------------------------------------
+# Builder-local helpers (private). Used by `_build_v4_pack_meta_for_ratio`
+# and `_attach_v4_per_fwd_meta` for ragged-segment index math + per-token
+# sliding-window topk index generation. Live here (not in the model file)
+# because their only callers are inside this builder.
+# ---------------------------------------------------------------------------
+
+
+def _segment_indices(
+    seq_ids: np.ndarray, lens: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """For ragged segments (one per `seq_ids[i]` of length `lens[i]`), return
+    flat (per-row seq id, per-row local position) arrays of total length
+    `sum(lens)`.
+    """
+    total = int(lens.sum())
+    if total == 0:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+        )
+    token_seq_ids = np.repeat(seq_ids.astype(np.int64), lens)
+    cum = np.concatenate(([0], np.cumsum(lens.astype(np.int64))[:-1]))
+    local_pos = np.arange(total, dtype=np.int64) - np.repeat(cum, lens)
+    return token_seq_ids, local_pos
+
+
+def _build_window_topk_batched(
+    positions: torch.Tensor,  # [total_tokens] int (abs token positions)
+    start_pos_per_token: torch.Tensor,  # [total_tokens] int (each token's seq start_pos)
+    window_size: int,
+) -> torch.Tensor:  # [total_tokens, window_size] int32
+    """Per-token sliding-window topk indices for the whole batch.
+
+    Three-branch semantics:
+      - sp == 0 (fresh prefill): matrix entries = abs positions in the window
+        [pos-win+1, pos] clamped to [0, pos]; mask future via -1.
+      - 0 < sp < win-1 (prefix mode): all tokens in the seq share a single
+        matrix [0..sp, -1, ..., -1] (matches original semantics, including
+        MTP-N where the same start_pos is reused).
+      - sp >= win-1 (cyclic mode): cyclic ring offsets starting at sp+1 mod win.
+    """
+    device = positions.device
+    total = positions.size(0)
+    arange_w = torch.arange(window_size, device=device, dtype=positions.dtype).view(
+        1, window_size
+    )
+    pos_col = positions.view(total, 1)
+    sp_col = start_pos_per_token.view(total, 1)
+    neg1 = torch.tensor(-1, device=device, dtype=positions.dtype)
+
+    # Case A: sp == 0 (fresh prefill) — abs positions [pos-win+1, pos] clamped.
+    case_a = (pos_col - window_size + 1).clamp(min=0) + arange_w
+    case_a = torch.where(case_a > pos_col, neg1, case_a)
+
+    # Case B: 0 < sp < win-1 (prefix mode) — shared per-seq matrix.
+    case_b = arange_w.expand(total, window_size).clone()
+    case_b = torch.where(arange_w > sp_col, neg1, case_b)
+
+    # Case C: sp >= win-1 (cyclic mode) — ring offsets.
+    sp_mod = sp_col % window_size
+    case_c = (sp_mod + 1 + arange_w) % window_size
+
+    sp_eq_0 = sp_col == 0
+    sp_in_prefix = (sp_col > 0) & (sp_col < window_size - 1)
+
+    out = case_c
+    out = torch.where(sp_in_prefix.expand_as(out), case_b, out)
+    out = torch.where(sp_eq_0.expand_as(out), case_a, out)
+    return out.to(torch.int32)
+
 
 class DeepseekV4Backend(AttentionBackend):
     """Backend selector entry for V4 hybrid attention.
@@ -91,8 +162,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.csa_layers = [i for i, r in enumerate(ratios) if r == 4]
         self.hca_layers = [i for i, r in enumerate(ratios) if r == 128]
         self.dense_layers = [i for i, r in enumerate(ratios) if r == 0]
-        self.layer_id_to_csa_pos = {l: p for p, l in enumerate(self.csa_layers)}
-        self.layer_id_to_hca_pos = {l: p for p, l in enumerate(self.hca_layers)}
+        self.layer_id_to_csa_pos = {lid: p for p, lid in enumerate(self.csa_layers)}
+        self.layer_id_to_hca_pos = {lid: p for p, lid in enumerate(self.hca_layers)}
         # Unique (ratio, is_overlap) pairs needed for compress-plan generation.
         # CSA ratio=4 has overlap=True; HCA ratio=128 has overlap=False.
         unique = []
@@ -659,7 +730,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         `state_slot_mapping_cpu`; the V4 forward then falls back to its
         inline path.
         """
-        from atom.models.deepseek_v4 import _segment_indices, _V4_BLOCK_SIZE
+        from atom.models.deepseek_v4 import _V4_BLOCK_SIZE
 
         if (
             scheduled_bs == 0
@@ -1100,8 +1171,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         tokens — only possible during cudagraph dry runs that go through this
         path), the swa_* fields are set to None.
         """
-        from atom.models.deepseek_v4 import _build_window_topk_batched
-
         if scheduled_bs == 0 or total_tokens == 0:
             attn_metadata.window_topk_batched = None
             attn_metadata.swa_write_indices = None
@@ -1109,7 +1178,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.swa_slot_per_token_filtered = None
             return
 
-        device = positions.device
         win = self.window_size
 
         cu_seqlens_q_arr = np.asarray(
