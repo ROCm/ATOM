@@ -549,11 +549,37 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
+        # Use the aiter HIP fused_qk_rmsnorm_group_quant kernel in no-quant mode
+        # (q_out_scale=None) to perform Gemma RMSNorm + optional residual add.
+        # Same math as the Triton kernel: out = rmsnorm(x [+ residual]) * (1 + w),
+        # but executed by the aiter kernel for higher achieved bandwidth.
+        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
 
-        return gemma_rmsnorm_triton(
-            x, self.weight.data, self.variance_epsilon, residual
+        ori_shape = x.shape
+        x_2d = x.view(-1, ori_shape[-1])
+
+        out = torch.empty_like(x_2d)
+        if residual is not None:
+            residual_2d = residual.view(-1, ori_shape[-1])
+            res_out = torch.empty_like(x_2d)
+        else:
+            residual_2d = None
+            res_out = None
+
+        fused_qk_rmsnorm_group_quant(
+            q=x_2d,
+            q_weight=self.weight.data,
+            q_epsilon=self.variance_epsilon,
+            q_out_unquantized=out,
+            q_res_out=res_out,
+            q_residual=residual_2d,
+            gemma_norm=True,
         )
+
+        out = out.view(ori_shape)
+        if residual is not None:
+            return out, res_out.view(ori_shape)
+        return out
 
     def _forward_fused_fp8(self, x, residual=None):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
