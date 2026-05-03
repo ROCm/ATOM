@@ -49,6 +49,10 @@ class CompressPlan:
     cu_compress_cpu: (
         np.ndarray
     )  # [bs+1] int32 — per-seq slice into out[num_compress, D]
+    # Host copy of the compress rows (only the active head [:num_compress, 4]).
+    # Consumed by the indexer-FP8 path to derive a flat slot_mapping for
+    # `indexer_k_quant_and_cache`. None for empty fwds.
+    compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
 
 
 def make_compress_plans(
@@ -105,6 +109,7 @@ def make_compress_plans(
                 num_compress=0,
                 num_write=0,
                 cu_compress_cpu=np.zeros(max(bs, 1) + 1, dtype=np.int32),
+                compress_plan_cpu=None,
             )
         return out
 
@@ -188,5 +193,6 @@ def make_compress_plans(
             num_compress=n_compress,
             num_write=n_write,
             cu_compress_cpu=cu_compress,
+            compress_plan_cpu=compress_plan if n_compress > 0 else None,
         )
     return out
