@@ -717,6 +717,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "max_k": max_k,
             "total_committed": total_committed,
             "cu_committed_gpu": cu_committed_gpu,
+            "n_committed_per_seq_gpu": n_committed_per_seq_gpu,  # int64, [bs]
             "compress_slot_mapping_gpu": compress_slot_mapping_gpu,
             "seq_base_per_token_gpu": seq_base_per_token_gpu,
             "cu_starts_gpu": seq_base_per_token_gpu,  # alias for fp8_mqa_logits

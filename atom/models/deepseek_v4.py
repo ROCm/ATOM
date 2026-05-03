@@ -35,6 +35,7 @@ from aiter import (
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
     LayerQuantConfig,
@@ -896,6 +897,7 @@ class Compressor(nn.Module):
                 idx_slot_mapping,
                 d,  # quant_block_size = head_dim (one fp32 scale per row)
                 self.scale_fmt,
+                preshuffle=True,
             )
         update_compressor_states(
             kv,
@@ -959,6 +961,9 @@ class Indexer(nn.Module):
         # Init-time hoists out of `forward_batched`'s hot path.
         self._fp8_quant_func = get_hip_quant(QuantType.per_1x128)
         self._weights_scale = self.softmax_scale * self.n_heads**-0.5
+        # `deepgemm_fp8_paged_mqa_logits` decode-path output column count:
+        # one indexer slot per `compress_ratio` source tokens.
+        self._max_model_len_idx = args.max_seq_len // compress_ratio
 
         self.compressor = Compressor(
             args,
@@ -992,7 +997,7 @@ class Indexer(nn.Module):
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq]
         indexer_meta: dict,
     ) -> torch.Tensor:
-        """Batched score+topk across all seqs in one fp8_mqa_logits call.
+        """Batched score+topk across all seqs.
 
         Caller must invoke `self.compressor` once batched BEFORE this so all
         seqs' Indexer kv_cache is already populated.
@@ -1001,6 +1006,11 @@ class Indexer(nn.Module):
         `DeepseekV4AttentionMetadataBuilder._build_v4_indexer_meta`) carries
         every CPU array and pre-uploaded GPU index tensor — the per-CSA-layer
         call has zero CPU index math and zero H2D copies.
+
+        Dispatches to `_score_topk_prefill` (variable-K cp_gather +
+        fp8_mqa_logits, eager-only) or `_score_topk_decode` (fixed-shape
+        deepgemm_fp8_paged_mqa_logits, CUDAGraph-friendly) based on
+        `context.is_prefill`. Mixed batches go through prefill path.
 
         Returns:
           topk_flat: `[total_tokens, max_K] int32`, padded with -1 to max K
@@ -1029,6 +1039,31 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
         q_scale = q_scale.view(total_tokens, self.n_heads, 1)
 
+        # weights = weights_proj * q_scale * (softmax_scale * 1/sqrt(H))
+        weights = (
+            (self.weights_proj(x_full).unsqueeze(-1) * q_scale * self._weights_scale)
+            .squeeze(-1)
+            .float()
+        )
+
+        if get_forward_context().context.is_prefill:
+            return self._score_topk_prefill(q_fp8, weights, block_tables, indexer_meta)
+        return self._score_topk_decode(q_fp8, weights, block_tables, indexer_meta)
+
+    def _score_topk_prefill(
+        self,
+        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+        indexer_meta: dict,
+    ) -> torch.Tensor:
+        """Variable-K prefill / mixed batch: cp_gather + fp8_mqa_logits.
+
+        Eager-only — total_committed varies per fwd, so output logits shape
+        is dynamic and incompatible with CUDAGraph capture.
+        """
+        device = q_fp8.device
+        total_tokens = q_fp8.size(0)
         # K side: cache stores FP8 + 4-byte fp32 scale per row interleaved
         # (uint8 layout written by `indexer_k_quant_and_cache` from the inner
         # Compressor). `cp_gather_indexer_k_quant_cache` does paged-gather
@@ -1046,25 +1081,11 @@ class Indexer(nn.Module):
             k_scale.view(dtypes.fp8),  # 4-byte scale rows treated as fp8 bytes
             block_tables,
             cu_committed,
+            preshuffle=True,
         )
 
-        # weights = weights_proj * q_scale * (softmax_scale * 1/sqrt(H))
-        weights = (
-            (self.weights_proj(x_full).unsqueeze(-1) * q_scale * self._weights_scale)
-            .squeeze(-1)
-            .float()
-        )
-
-        # All per-token broadcast helpers + layer-invariant derivations are
-        # pre-built in `_build_v4_indexer_meta`.
-        seq_base_per_token = indexer_meta["seq_base_per_token_gpu"]
         cu_starts = indexer_meta["cu_starts_gpu"]
         cu_ends = indexer_meta["cu_ends_gpu"]
-        future_threshold = indexer_meta["future_threshold_gpu"]
-        width_mask = indexer_meta["width_mask_gpu"]
-        offset_per_token = indexer_meta["offset_per_token_gpu"]
-        is_prefill_per_token = indexer_meta["is_prefill_per_token_gpu"]
-
         logits = fp8_mqa_logits(
             Q=q_fp8,
             KV=k_fp8,
@@ -1078,11 +1099,88 @@ class Indexer(nn.Module):
         # would be the obvious replacement but it hardcodes K=2048 — V4's
         # K=index_topk=64 doesn't fit (the kernel writes 2048 ints/row,
         # overflowing a [tok, 64] indices buffer and corrupting memory).
+        max_k = indexer_meta["max_k"]
         topk_global = logits.topk(max_k, dim=-1)[1].to(torch.int32)
-        # Global flat index → seq-local compress idx; per-seq offset to land
-        # indices in the [SWA || compressed] kv_sa layout consumed by
-        # sparse_attn (token_num for fresh prefill, win for decode).
-        topk_local = topk_global - seq_base_per_token.unsqueeze(1)
+        return self._post_process_topk(topk_global, indexer_meta, is_decode=False)
+
+    def _score_topk_decode(
+        self,
+        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+        indexer_meta: dict,
+    ) -> torch.Tensor:
+        """Pure-decode path: `deepgemm_fp8_paged_mqa_logits` reads paged FP8
+        cache directly, producing fixed-shape `[bs*next_n, max_model_len_idx]`
+        logits — CUDAGraph-friendly (no per-fwd `total_committed`-shaped
+        allocation). Mirrors V3.2 sparse_attn_indexer decode branch
+        (deepseek_v2.py:1047-1084).
+        """
+        device = q_fp8.device
+        total_tokens = q_fp8.size(0)
+        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]
+        bs = block_tables.size(0)
+        # V4-Pro has no MTP, so next_n = total_tokens // bs = 1. The reshape
+        # also handles future multi-token decode (MTP) without code change.
+        next_n = total_tokens // bs
+        # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
+        # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
+        q_4d = q_fp8.view(bs, next_n, self.n_heads, self.head_dim)
+        kv_cache_4d = self.kv_cache.unsqueeze(-2)
+        # -inf init (not torch.empty): deepgemm only fills cols [0..n_committed_per_seq[batch])
+        # per row; cols beyond that stay at -inf so they lose to real K in topk.
+        # `width_mask` then trims the topk output to per-token k_per_token via masked_fill.
+        logits = torch.full(
+            (total_tokens, self._max_model_len_idx),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        deepgemm_fp8_paged_mqa_logits(
+            q_4d,
+            kv_cache_4d,
+            weights,
+            logits,
+            n_committed_per_seq_gpu.to(torch.int32),
+            block_tables,
+            self._max_model_len_idx,
+            KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
+            Preshuffle=True,
+        )
+        # Decode topk indices are seq-local (each row's columns are 0-indexed
+        # into that batch's compressed K), so `_post_process_topk` skips the
+        # seq_base subtraction via `is_decode=True`.
+        max_k = indexer_meta["max_k"]
+        topk_local = logits.topk(max_k, dim=-1)[1].to(torch.int32)
+        return self._post_process_topk(topk_local, indexer_meta, is_decode=True)
+
+    def _post_process_topk(
+        self,
+        topk_indices: torch.Tensor,  # [total_tokens, max_k] int32
+        indexer_meta: dict,
+        *,
+        is_decode: bool,
+    ) -> torch.Tensor:
+        """Map topk indices into the [SWA || compressed] kv_sa layout consumed
+        by sparse_attn, masking out width-overflow and future-token slots.
+
+        Prefill (`is_decode=False`): topk indices are GLOBAL flat positions
+          (fp8_mqa_logits scores all seqs' K concatenated), need
+          `seq_base_per_token` subtraction to recover seq-local idx.
+        Decode (`is_decode=True`): topk indices are already SEQ-LOCAL
+          (deepgemm produces per-row [bs*next_n, max_model_len_idx] where
+          each row's columns are local to its batch's compressed K).
+        """
+        future_threshold = indexer_meta["future_threshold_gpu"]
+        width_mask = indexer_meta["width_mask_gpu"]
+        offset_per_token = indexer_meta["offset_per_token_gpu"]
+        is_prefill_per_token = indexer_meta["is_prefill_per_token_gpu"]
+
+        if is_decode:
+            topk_local = topk_indices
+        else:
+            seq_base_per_token = indexer_meta["seq_base_per_token_gpu"]
+            topk_local = topk_indices - seq_base_per_token.unsqueeze(1)
         # Combined invalid mask: slots past per-seq K (width_mask) OR future
         # tokens in fresh prefill. width_mask is computed off the SHAPE so
         # `topk_local` for width-masked slots can be garbage (we don't pre-fill
