@@ -75,6 +75,12 @@ class Sampler(nn.Module):
         Returns:
             Sampled token IDs (num_tokens,)
         """
+        # Temperature=0 is a hard greedy request. Handle it before deciding
+        # whether top-k/top-p filtering is needed; otherwise the no-filter
+        # path still runs the temperature sampler with an epsilon temperature.
+        if all_greedy:
+            return logits.argmax(dim=-1).to(torch.int)
+
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             return self._temperature_sample(

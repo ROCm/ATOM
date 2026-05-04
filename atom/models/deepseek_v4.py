@@ -104,6 +104,118 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 # forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
 _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
+_V4_DIAG_EQUIV = os.environ.get("ATOM_DSV4_DIAG_EQUIV", "0") == "1"
+_V4_DIAG_LAYER_SPEC = os.environ.get(
+    "ATOM_DSV4_DIAG_LAYERS", "0,1,2,3,31,63"
+)
+_V4_DIAG_TOKEN_LIMIT = int(os.environ.get("ATOM_DSV4_DIAG_TOKEN_LIMIT", "4"))
+_V4_DIAG_VERBOSE = os.environ.get("ATOM_DSV4_DIAG_VERBOSE", "0") == "1"
+_V4_DIAG_TOL = float(os.environ.get("ATOM_DSV4_DIAG_TOL", "1e-3"))
+
+
+def _v4_diag_layer_enabled(layer_id: int) -> bool:
+    if not _V4_DIAG_EQUIV:
+        return False
+    spec = _V4_DIAG_LAYER_SPEC.strip().lower()
+    if spec in {"all", "*"}:
+        return True
+    try:
+        return layer_id in {int(x) for x in spec.split(",") if x.strip()}
+    except ValueError:
+        return False
+
+
+def _v4_diag_get_equal_batch(input_ids: Optional[torch.Tensor]):
+    if not _V4_DIAG_EQUIV or input_ids is None:
+        return None
+    try:
+        ctx = get_forward_context()
+        attn_md = ctx.attn_metadata if ctx is not None else None
+        cu = getattr(attn_md, "cu_seqlens_q_cpu", None)
+        if cu is None or attn_md is None or attn_md.block_tables is None:
+            return None
+        bs = int(attn_md.block_tables.size(0))
+        if bs < 2 or len(cu) < bs + 1:
+            return None
+        lens = [int(cu[i + 1] - cu[i]) for i in range(bs)]
+        if not lens or len(set(lens)) != 1 or lens[0] <= 0:
+            return None
+        seqlen = lens[0]
+        total = bs * seqlen
+        if input_ids.numel() < total:
+            return None
+        ids = input_ids[:total].reshape(bs, seqlen)
+        if not bool((ids == ids[0:1]).all().item()):
+            return None
+        return bs, seqlen, total
+    except Exception as exc:
+        print(f"[DSv4 diag] equiv setup skipped: {exc!r}", flush=True)
+        return None
+
+
+def _v4_diag_selected_tokens(seqlen: int) -> list[int]:
+    if seqlen <= 0:
+        return []
+    base = [0, seqlen // 2, seqlen - 1]
+    if _V4_DIAG_TOKEN_LIMIT > 3:
+        base.extend(range(min(seqlen, _V4_DIAG_TOKEN_LIMIT - 3)))
+    return sorted(set(i for i in base if 0 <= i < seqlen))
+
+
+def _v4_diag_check_equiv(
+    label: str,
+    tensor: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+) -> None:
+    batch = _v4_diag_get_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, total = batch
+    if tensor.size(0) < total:
+        return
+    try:
+        toks = _v4_diag_selected_tokens(seqlen)
+        view = tensor[:total].detach().reshape(bs, seqlen, -1).index_select(
+            1, torch.tensor(toks, dtype=torch.long, device=tensor.device)
+        )
+        ref = view[0:1].float()
+        diff = (view.float() - ref).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        bad_rows = int((diff.reshape(bs, -1).amax(dim=1) > _V4_DIAG_TOL).sum().item())
+        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL:
+            print(
+                "[DSv4 diag] "
+                f"{label}: bs={bs} seqlen={seqlen} toks={toks} "
+                f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+                f"bad_rows={bad_rows}/{bs}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[DSv4 diag] {label}: check failed: {exc!r}", flush=True)
+
+
+def _v4_diag_check_logits(label: str, logits: torch.Tensor) -> None:
+    if not _V4_DIAG_EQUIV or logits.dim() != 2 or logits.size(0) < 2:
+        return
+    try:
+        ref = logits[0:1].float()
+        diff = (logits.float() - ref).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        bad_rows = int((diff.amax(dim=1) > _V4_DIAG_TOL).sum().item())
+        argmax = logits.argmax(dim=-1).detach().cpu().tolist()
+        unique_argmax = len(set(int(x) for x in argmax))
+        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL or unique_argmax > 1:
+            print(
+                "[DSv4 diag] "
+                f"{label}: bs={logits.size(0)} max_abs={max_abs:.6g} "
+                f"mean_abs={mean_abs:.6g} bad_rows={bad_rows}/{logits.size(0)} "
+                f"unique_argmax={unique_argmax} argmax_head={argmax[:8]}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[DSv4 diag] {label}: logits check failed: {exc!r}", flush=True)
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -1328,7 +1440,6 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wqkv_a",
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.q_norm2 = RMSNorm(self.head_dim, self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -2081,6 +2192,10 @@ class Block(nn.Module):
             torch.Tensor
         ],  # [num_tokens] int  for hash-routed MoE layers
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
+        diag = _v4_diag_layer_enabled(self.layer_id)
+        if diag:
+            _v4_diag_check_equiv(f"L{self.layer_id}.input_mhc", x, input_ids)
+
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
         x, post, comb = (
@@ -2088,17 +2203,30 @@ class Block(nn.Module):
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
         )
+        if diag:
+            _v4_diag_check_equiv(f"L{self.layer_id}.attn_hc_pre", x, input_ids)
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions)  # [num_tokens, dim]
+        if diag:
+            _v4_diag_check_equiv(f"L{self.layer_id}.attn_out", x, input_ids)
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
+        if diag:
+            _v4_diag_check_equiv(f"L{self.layer_id}.attn_hc_post", x, input_ids)
+
         # ----- FFN sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
+        if diag:
+            _v4_diag_check_equiv(f"L{self.layer_id}.ffn_hc_pre", x, input_ids)
         x = self.ffn_norm(x)  # [num_tokens, dim]
         x = self.ffn(x, input_ids)  # [num_tokens, dim]
+        if diag:
+            _v4_diag_check_equiv(f"L{self.layer_id}.ffn_out", x, input_ids)
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
+        if diag:
+            _v4_diag_check_equiv(f"L{self.layer_id}.ffn_hc_post", x, input_ids)
         return x
 
 
@@ -2338,8 +2466,10 @@ class DeepseekV4Model(nn.Module):
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         h = self.embed(input_ids)  # [num_tokens, dim]
+        _v4_diag_check_equiv("model.embed", h, input_ids)
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        _v4_diag_check_equiv("model.embed_mhc", h, input_ids)
         if positions is None:
             positions = torch.arange(
                 input_ids.numel(), device=input_ids.device, dtype=torch.long
@@ -2353,7 +2483,10 @@ class DeepseekV4Model(nn.Module):
         x_hc = self.head.hc_head(  # [num_tokens, dim]
             h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
-        return self.norm(x_hc)
+        _v4_diag_check_equiv("model.hc_head", x_hc, input_ids)
+        out = self.norm(x_hc)
+        _v4_diag_check_equiv("model.final_norm", out, input_ids)
+        return out
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -2442,7 +2575,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Vocab projection is split off from `model.forward` so the latter
         # returns hidden_size-shaped tensors — required by ATOM's CUDAGraph
         # capture contract (outputs buffer is sized to hidden_size, not vocab).
-        return self.model.head.get_logits(hidden_states)
+        logits = self.model.head.get_logits(hidden_states)
+        _v4_diag_check_logits("model.logits", logits)
+        return logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Return (param_name, weight_name, expert_id, shard_id) tuples for FusedMoE.
