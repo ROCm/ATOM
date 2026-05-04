@@ -1312,6 +1312,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_q_np[: scheduled_bs + 1], dtype=np.int64
         )
         token_num_per_seq = cu_seqlens_q_arr[1:] - cu_seqlens_q_arr[:scheduled_bs]
+        repeat_output_size = int(token_num_per_seq.sum())
+        if repeat_output_size != total_tokens:
+            raise ValueError(
+                "DeepSeek-V4 metadata token count mismatch: "
+                f"sum(cu_seqlens_q diff)={repeat_output_size}, "
+                f"total_tokens={total_tokens}"
+            )
         start_pos_per_seq_np = np.asarray(
             start_pos_per_seq_cpu[:scheduled_bs], dtype=np.int64
         )
@@ -1323,8 +1330,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         token_num_per_seq_gpu = self._stage(
             "v4_meta_token_num_per_seq", token_num_per_seq
         )
+        # `repeats` is a CUDA tensor. Supplying the CPU-known output size avoids
+        # PyTorch synchronizing to compute sum(repeats) on every high-conc prefill.
         start_pos_per_token = torch.repeat_interleave(
-            start_pos_per_seq_gpu, token_num_per_seq_gpu
+            start_pos_per_seq_gpu,
+            token_num_per_seq_gpu,
+            output_size=repeat_output_size,
         )
         attn_metadata.window_topk_batched = _build_window_topk_batched(
             positions[:total_tokens].to(torch.long), start_pos_per_token, win
@@ -1361,7 +1372,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             np.asarray(state_slot_mapping_cpu[:scheduled_bs], dtype=np.int32),
         )
         slot_per_token_full = torch.repeat_interleave(
-            state_slot_mapping_gpu_i32, token_num_per_seq_gpu
+            state_slot_mapping_gpu_i32,
+            token_num_per_seq_gpu,
+            output_size=repeat_output_size,
         )
         attn_metadata.swa_write_indices = write_indices_gpu
         attn_metadata.swa_positions_filtered = positions[write_indices_gpu].contiguous()
