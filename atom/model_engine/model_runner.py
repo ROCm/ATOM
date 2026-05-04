@@ -997,6 +997,15 @@ class ModelRunner:
         )
         dp_size = get_dp_group().world_size
         warmup_max_tokens = max_num_batched_tokens // dp_size
+        warmup_cap = int(os.environ.get("ATOM_WARMUP_MAX_NUM_BATCHED_TOKENS", "0"))
+        if warmup_cap > 0:
+            capped_warmup_tokens = max(1, warmup_cap // dp_size)
+            if capped_warmup_tokens < warmup_max_tokens:
+                logger.info(
+                    f"{self.label}: capping warmup tokens from {warmup_max_tokens} "
+                    f"to {capped_warmup_tokens} via ATOM_WARMUP_MAX_NUM_BATCHED_TOKENS"
+                )
+                warmup_max_tokens = capped_warmup_tokens
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
