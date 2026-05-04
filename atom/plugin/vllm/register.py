@@ -45,7 +45,11 @@ def register_platform() -> Optional[str]:
         logger.info("Disable ATOM OOT plugin platforms")
         return None
 
-    _set_plugin_mode()
+    # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
+    # vllm.platform_plugins and would set atom's backbone to "vllm" before
+    # importing SGLang plugin modules — then atom.models.qwen3_5's ``if is_vllm():``
+    # branch runs and requires vllm.model_executor.models.qwen3_5, which may be
+    # absent. Backbone is set in register_model() for real vLLM runs.
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
@@ -84,6 +88,8 @@ def register_model() -> None:
     if disable_vllm_plugin:
         logger.info("Disable ATOM model register")
         return
+
+    _set_plugin_mode()
 
     import vllm.model_executor.models.registry as vllm_model_registry
 
