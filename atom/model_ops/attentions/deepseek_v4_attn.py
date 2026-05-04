@@ -1764,9 +1764,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # context_lens / block_tables CPU mirrors are populated by the caller
         # (prepare_decode / build_for_cudagraph_capture) BEFORE this runs.
         ctx_per_seq = np.asarray(var["context_lens"].np[:scheduled_bs], dtype=np.int64)
-        state_slot_per_seq = np.asarray(
-            state_slot_mapping_cpu[:scheduled_bs], dtype=np.int64
-        )
         # The single per-token mapping. Built once in `_attach_v4_per_fwd_meta`
         # (so swa_write / indexer can also consume it). Pull the GPU view from
         # attn_metadata; recompute the np copy here only for cumsum math below.
