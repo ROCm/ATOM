@@ -13,9 +13,17 @@ from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
 )
+from atom.model_ops.v4_kernels.csa_packed_write import (
+    csa_packed_write,
+    csa_packed_write_reference,
+)
 from atom.model_ops.v4_kernels.fused_compress import (
     fused_compress_attn,
     fused_compress_attn_reference,
+)
+from atom.model_ops.v4_kernels.paged_decode import (
+    sparse_attn_v4_paged_decode,
+    sparse_attn_v4_paged_decode_reference,
 )
 from atom.model_ops.v4_kernels.state_writes import update_compressor_states, swa_write
 
@@ -24,6 +32,10 @@ __all__ = [
     "swa_write",
     "fused_compress_attn",
     "fused_compress_attn_reference",
+    "sparse_attn_v4_paged_decode",
+    "sparse_attn_v4_paged_decode_reference",
+    "csa_packed_write",
+    "csa_packed_write_reference",
     "CompressPlan",
     "make_compress_plans",
 ]
