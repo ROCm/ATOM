@@ -18,38 +18,68 @@ import math
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Iterable, Literal, Optional, Tuple
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Tuple, cast
+
+if TYPE_CHECKING:
+    from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+import aiter
+from aiter import (
+    cp_gather_indexer_k_quant_cache,
+    dtypes,
+    get_hip_quant,
+    indexer_k_quant_and_cache,
+)
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
-from atom.config import Config
+from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
+from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from atom.config import (
+    Config,
+    LayerQuantConfig,
+    QuantizationConfig,
+    QuantType,
+    get_current_atom_config,
+)
+from atom.model_loader.loader import WeightsMapper
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.quant_v4 import (
     act_quant_inplace,
-    fp4_act_quant_inplace,
     rotate_activation,
 )
-from atom.model_ops.sparse_attn_v4 import (  # noqa: F401
+from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
     sparse_attn_ragged_varlen,
 )
 from atom.model_ops.utils import atom_parameter
-from atom.model_ops.v4_backend_gate import use_new_v4_backend  # noqa: F401
-from atom.model_ops.v4_kernels import (  # noqa: F401
+from atom.utils import envs
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
+# (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
+# MoE.forward dispatches via the former so torch.compile/Dynamo treats stream
+# code as opaque; Indexer.forward_batched dispatches via the latter to hide
+# its dynamic-shape internals from Dynamo / fake-tensor mode.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.v4_kernels import (
     CompressPlan,
     fused_compress_attn,
-    make_single_seq_plan,
     swa_write,
     update_compressor_states,
 )
@@ -74,9 +104,11 @@ from atom.utils.forward_context import get_forward_context
 _V4_BLOCK_SIZE: int = 128
 
 _V4_RMSNORM_BACKEND = os.environ.get("ATOM_V4_RMSNORM_BACKEND", "triton")
-
-
 _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
+# Env-gated quant round-trips. Read once at module load — checking each
+# forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
+_V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
+_V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -86,88 +118,135 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
     return rmsnorm2d_fwd_(x, ones, eps, dim)
 
 
-def _v4_get_seq_metadata():
-    """Fetch per-seq batch metadata from the forward context.
-
-    Returns a tuple `(block_tables, state_slot_mapping, cu_seqlens_q,
-    context_lens, num_seqs, cpu_meta)`, or `(None, None, None, None, 0,
-    None)` if no metadata is set (warmup / dummy run / non-V4 path).
-    PR3-main per-seq dispatch uses these to slice the flat
-    `[total_tokens, ...]` Q/KV tensors per sequence and pick each seq's
-    state-cache slot + block_table for compressor scatter / sparse_attn
-    gather.
-
-      - block_tables: `[bs, max_blocks]` int GPU — per-seq physical block IDs
-        (paged-KV block table; same concept as in V2/Llama backends).
-      - state_slot_mapping: `[bs]` int GPU — per-request slot in V4's
-        stateful per-request pool (`swa_kv`, `Compressor.kv_state`). Distinct
-        from the per-token paged-KV `slot_mapping` carried elsewhere on
-        AttentionMetaData. Sourced from `batch.per_req_cache_groups`.
-      - cu_seqlens_q: `[bs+1]` int GPU — per-seq cumulative token offsets.
-      - context_lens: `[bs]` int GPU — per-seq end-of-context absolute
-        position. Drives `update_compressor_states` fresh-prefill vs
-        decode/prefix-cache discrimination.
-      - num_seqs: int — number of sequences in this forward call.
-      - cpu_meta: dict[str, np.ndarray] | None — CPU mirrors published by
-        `DeepseekV4AttentionMetadataBuilder` (PR-A Phase 2). When non-None,
-        per-seq dispatch reads positions / slots / cu_seqlens here instead
-        of `.tolist()` / `.item()` on GPU tensors:
-          - "cu_seqlens_q":      `[bs+1]` int — token offsets
-          - "state_slot_mapping": `[bs]`  int — per-request state slots
-          - "start_pos_per_seq": `[bs]`  int — `positions[seq_start]` per seq
-    """
-    ctx = get_forward_context()
-    if ctx is None or ctx.attn_metadata is None:
-        return None, None, None, None, 0, None
-    md = ctx.attn_metadata
-    if md.block_tables is None or md.block_tables.numel() == 0:
-        return None, None, None, None, 0, None
-    state_slot_mapping = getattr(md, "state_slot_mapping", None)
-    cu_seqlens_q = md.cu_seqlens_q
-    context_lens = getattr(md, "context_lens", None)
-    num_seqs = md.block_tables.size(0)
-    cpu_meta = None
-    cu_cpu = getattr(md, "cu_seqlens_q_cpu", None)
-    if cu_cpu is not None:
-        cpu_meta = {
-            "cu_seqlens_q": cu_cpu,
-            "state_slot_mapping": getattr(md, "state_slot_mapping_cpu", None),
-            "start_pos_per_seq": getattr(md, "start_pos_per_seq_cpu", None),
-        }
-    return (
-        md.block_tables,
-        state_slot_mapping,
-        cu_seqlens_q,
-        context_lens,
-        num_seqs,
-        cpu_meta,
-    )
-
-
-def _v4_is_dummy_run() -> bool:
-    """True during the warmup forward (kv_cache bindings may not be in place)."""
-    ctx = get_forward_context()
-    return ctx is not None and ctx.context is not None and ctx.context.is_dummy_run
-
-
-def _v4_gather_compressed(
+def _v4_gather_compressed_batched(
     kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    n_compressed: int,
-    k_per_block: int,
+    block_tables: torch.Tensor,  # [bs, max_blocks_per_seq]
+    gather_indices: dict,
 ) -> torch.Tensor:
-    """Gather the first `n_compressed` committed compressed entries.
+    """Gather compressed entries from `kv_cache` using pre-built index tensors
+    (built once per fwd in `_build_v4_gather_indices`).
 
-    Returns: `[n_compressed, head_dim]`. Empty if `n_compressed == 0`.
+    Returns:
+      gathered_flat: `[total_committed, head_dim]` concatenated in seq order.
     """
-    head_dim = kv_cache.size(-1)
-    if n_compressed == 0:
-        return torch.empty(0, head_dim, dtype=kv_cache.dtype, device=kv_cache.device)
-    ci = torch.arange(n_compressed, device=kv_cache.device, dtype=torch.long)
-    block_in_seq = ci // k_per_block
-    slot_in_block = ci % k_per_block
-    physical_blocks = block_table[block_in_seq].long()
-    return kv_cache[physical_blocks, slot_in_block]
+    batch_ids_gpu = gather_indices["batch_ids_gpu"]
+    if batch_ids_gpu is None:
+        return torch.empty(
+            0, kv_cache.size(-1), dtype=kv_cache.dtype, device=kv_cache.device
+        )
+    physical_blocks = block_tables[
+        batch_ids_gpu, gather_indices["block_in_seq_gpu"]
+    ].long()
+    return kv_cache[physical_blocks, gather_indices["slot_in_block_gpu"]]
+
+
+def _v4_build_sparse_inputs_batched(
+    *,
+    kv: torch.Tensor,
+    swa_kv: torch.Tensor,
+    kv_compress_batched: Optional[torch.Tensor],
+    compressor_kv_cache: Optional[torch.Tensor],
+    block_tables_gpu: Optional[torch.Tensor],
+    window_topk_batched: torch.Tensor,
+    indexer_topk_batched: Optional[torch.Tensor],
+    pack_meta: dict,
+    has_indexer: bool,
+    ratio: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """GPU-only `kv_sa` + `topk_flat` packer using pre-built index tensors.
+
+    All the per-(fwd, ratio) CPU index math + H2D copies live in
+    `DeepseekV4AttentionMetadataBuilder._build_v4_pack_meta_for_ratio`. Here
+    we only run the GPU index_copy_/index_select kernels — eliminating the
+    ~14 per-layer `torch.as_tensor` synchronous transfers from the legacy
+    inline path below.
+    """
+    head_dim = kv.size(-1)
+    device = kv.device
+    kv_flat_sa = torch.empty(
+        pack_meta["total_kv"], head_dim, dtype=kv.dtype, device=device
+    )
+    topk_flat = torch.empty(pack_meta["total_topk"], dtype=torch.int32, device=device)
+
+    # Part A: prefill kv slice
+    if pack_meta["prefill_kv_dst_gpu"] is not None:
+        kv_flat_sa.index_copy_(
+            0,
+            pack_meta["prefill_kv_dst_gpu"],
+            kv.index_select(0, pack_meta["prefill_kv_src_gpu"]),
+        )
+
+    # Part A: decode swa gather
+    if pack_meta["decode_state_slots_gpu"] is not None:
+        decode_swa = swa_kv.index_select(
+            0, pack_meta["decode_state_slots_gpu"]
+        ).reshape(-1, head_dim)
+        kv_flat_sa.index_copy_(0, pack_meta["decode_swa_dst_gpu"], decode_swa)
+
+    # Part B: prefill compress
+    if (
+        ratio > 0
+        and kv_compress_batched is not None
+        and pack_meta["prefill_compress_dst_gpu"] is not None
+    ):
+        kv_flat_sa.index_copy_(
+            0,
+            pack_meta["prefill_compress_dst_gpu"],
+            kv_compress_batched.index_select(0, pack_meta["prefill_compress_src_gpu"]),
+        )
+
+    # Part B: decode compress (gather from compressor's kv_cache)
+    if (
+        ratio > 0
+        and compressor_kv_cache is not None
+        and block_tables_gpu is not None
+        and pack_meta["decode_compress_seqs_gpu"] is not None
+    ):
+        decode_block_tables = block_tables_gpu.index_select(
+            0, pack_meta["decode_compress_seqs_gpu"]
+        )
+        gathered_decode_compress = _v4_gather_compressed_batched(
+            compressor_kv_cache,
+            decode_block_tables,
+            pack_meta["decode_compress_gather_indices"],
+        )
+        kv_flat_sa.index_copy_(
+            0, pack_meta["decode_compress_dst_gpu"], gathered_decode_compress
+        )
+
+    # Topk window
+    if pack_meta["window_topk_dst_gpu"] is not None:
+        topk_flat.index_copy_(
+            0,
+            pack_meta["window_topk_dst_gpu"],
+            window_topk_batched.reshape(-1).index_select(
+                0, pack_meta["window_topk_src_gpu"]
+            ),
+        )
+
+    # Topk compress
+    if pack_meta["compress_topk_dst_gpu"] is not None:
+        if has_indexer:
+            assert (
+                indexer_topk_batched is not None
+                and pack_meta["compress_topk_src_gpu"] is not None
+            )
+            topk_flat.index_copy_(
+                0,
+                pack_meta["compress_topk_dst_gpu"],
+                indexer_topk_batched.reshape(-1).index_select(
+                    0, pack_meta["compress_topk_src_gpu"]
+                ),
+            )
+        else:
+            assert pack_meta["compress_topk_values_gpu"] is not None
+            topk_flat.index_copy_(
+                0,
+                pack_meta["compress_topk_dst_gpu"],
+                pack_meta["compress_topk_values_gpu"],
+            )
+
+    return kv_flat_sa, topk_flat
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +270,7 @@ class DeepseekV4Args:
     n_hash_layers: int = 3  # num_hash_layers
     norm_eps: float = 1e-6  # rms_norm_eps
     max_seq_len: int = 1048576  # max_position_embeddings
-    max_batch_size: int = 4  # PR1 toy default; PR3 driven by ATOM scheduler
+    max_batch_size: int = 4  # default placeholder; production driven by ATOM scheduler
 
     # Attention (MQA, single shared KV head)
     n_heads: int = 128  # num_attention_heads
@@ -237,9 +316,8 @@ class DeepseekV4Args:
     expert_dtype: Optional[Literal["fp4", "fp8"]] = None
     scale_fmt: Optional[Literal["ue8m0"]] = None
 
-    # ATOM QuantizationConfig — wired in PR3c so Linear layers auto-build the
-    # right (FP8 / FP4 / BF16) weight + scale params for real-checkpoint loading.
-    # When None, all Linears are BF16 (used by toy / dummy validation paths).
+    # V4QuantizationConfig — Linear layers auto-build the right (FP8 / FP4
+    # / BF16) weight + scale params. Set by DeepseekV4ForCausalLM at init.
     quant_config: Optional[Any] = None
 
     @classmethod
@@ -249,7 +327,9 @@ class DeepseekV4Args:
         # populated with extra V4 attrs (some fields may live only in the raw
         # config_dict, not on the config object — `transformers` strips unknown
         # kwargs unless they're in the schema).
-        g = lambda k, default=None: getattr(hf_config, k, default)
+        def g(k, default=None):
+            return getattr(hf_config, k, default)
+
         rope_scaling = g("rope_scaling", {}) or {}
         return cls(
             vocab_size=g("vocab_size"),
@@ -319,8 +399,6 @@ def make_v4_quant_config(hf_config):
         (or fp32 internally; reference declares dtype= explicitly). Loaded raw.
       - All RMSNorm weights, attn_sink, hc_*: BF16/fp32 raw, no quant.
     """
-    from atom.config import LayerQuantConfig, QuantizationConfig, QuantType
-    from aiter import dtypes
 
     base = QuantizationConfig(hf_config)
 
@@ -351,23 +429,6 @@ def make_v4_quant_config(hf_config):
 
     base.get_layer_quant_config = overridden
     return base
-
-
-def _have_current_atom_config() -> bool:
-    """Check whether ATOM's global Config has been set.
-
-    `FusedMoE.__init__` calls `get_current_atom_config()` (which asserts non-None)
-    to read TP/EP/dtype globals. The toy / dummy validation paths run before any
-    ATOM ModelRunner sets it, so MoE falls back to its manual per-expert path
-    when this returns False.
-    """
-    try:
-        from atom.config import get_current_atom_config
-
-        get_current_atom_config()
-        return True
-    except (AssertionError, ImportError):
-        return False
 
 
 def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
@@ -579,8 +640,6 @@ class _V4RoPE(nn.Module):
     ) -> None:
         """In-place RoPE on `query` (and `key` if given). All inputs are the
         rope-slice only (`head_size == rotary_dim`)."""
-        import aiter as ops
-
         cos, sin = self._caches(query.device)
         num_tokens = positions.numel()
         # rotate_style=1 → GPT-J / interleaved (matches V4's view_as_complex).
@@ -589,7 +648,7 @@ class _V4RoPE(nn.Module):
         positions_view = positions.view(1, num_tokens)
         if key is not None:
             k_view = key.view(1, num_tokens, -1, self.rotary_dim)
-            ops.rope_cached_positions_2c_fwd_inplace(
+            aiter.rope_cached_positions_2c_fwd_inplace(
                 q_view,
                 k_view,
                 cos,
@@ -600,7 +659,7 @@ class _V4RoPE(nn.Module):
                 nope_first=False,
             )
         else:
-            ops.rope_cached_positions_fwd_inplace(
+            aiter.rope_cached_positions_fwd_inplace(
                 q_view,
                 cos,
                 sin,
@@ -609,68 +668,6 @@ class _V4RoPE(nn.Module):
                 reuse_freqs_front_part=True,
                 nope_first=False,
             )
-
-
-@lru_cache(1)
-def _get_window_topk_idxs(
-    window_size: int,
-    bsz: int,
-    seqlen: int,
-    start_pos: int,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Per-query topk-style indices into the sliding window KV cache.
-
-    Port of inference/model.py:255-265. Returns [bsz, seqlen, window_size] of
-    int positions into the KV buffer. -1 marks "skip" (causal mask, no fill).
-    """
-    kw = dict(device=device) if device is not None else {}
-    if start_pos >= window_size - 1:
-        start_pos %= window_size
-        matrix = torch.cat(
-            [
-                torch.arange(start_pos + 1, window_size, **kw),
-                torch.arange(0, start_pos + 1, **kw),
-            ],
-            dim=0,
-        )
-    elif start_pos > 0:
-        matrix = F.pad(
-            torch.arange(start_pos + 1, **kw),
-            (0, window_size - start_pos - 1),
-            value=-1,
-        )
-    else:
-        base = torch.arange(seqlen, **kw).unsqueeze(1)
-        matrix = (base - window_size + 1).clamp(0) + torch.arange(
-            min(seqlen, window_size), **kw
-        )
-        matrix = torch.where(matrix > base, -1, matrix)
-    return matrix.unsqueeze(0).expand(bsz, -1, -1)
-
-
-@lru_cache(2)
-def _get_compress_topk_idxs(
-    ratio: int,
-    bsz: int,
-    seqlen: int,
-    start_pos: int,
-    offset: int,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Per-query indices into the compressed KV cache (for HCA — no Indexer).
-
-    Port of inference/model.py:269-276. -1 marks compressed blocks that are
-    still in the future at this query position.
-    """
-    kw = dict(device=device) if device is not None else {}
-    if start_pos > 0:
-        matrix = torch.arange(0, (start_pos + 1) // ratio, **kw) + offset
-    else:
-        matrix = torch.arange(seqlen // ratio, **kw).repeat(seqlen, 1)
-        mask = matrix >= torch.arange(1, seqlen + 1, **kw).unsqueeze(1) // ratio
-        matrix = torch.where(mask, -1, matrix + offset)
-    return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -726,21 +723,27 @@ class Compressor(nn.Module):
         self.ape = atom_parameter(
             torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
         )
-        # wkv/wgate stored as fp32 (matches reference's Linear(dtype=fp32) BF16 path).
-        # Kept as nn.Linear (not ATOM Linear) because the fp32 path through
-        # ATOM's tgemm auto-casts output to BF16 — losing precision the
-        # Compressor's softmax-pool step depends on. PR3+ may revisit.
-        self.wkv = nn.Linear(
-            self.dim, coff * self.head_dim, bias=False, dtype=torch.float32
-        )
-        self.wgate = nn.Linear(
-            self.dim, coff * self.head_dim, bias=False, dtype=torch.float32
+        # Fused [wkv; wgate]: both BF16 on disk (same dim out per shard).
+        # quant_config=None → BF16 weight; forward calls with otype=fp32 to
+        # keep the Compressor's softmax-pool path in fp32 accumulate.
+        self.wkv_gate = MergedReplicatedLinear(
+            self.dim,
+            [coff * self.head_dim, coff * self.head_dim],
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.wkv_gate",
         )
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
 
         # External tensors — assigned by the owning Attention / Indexer at first forward.
         self.kv_cache: Optional[torch.Tensor] = None
         self.rotary_emb: Optional[_V4RoPE] = None
+        # Shared compress-output buffer (set by V4 builder.build_kv_cache_tensor
+        # to a per-kind torch.empty pre-allocation in `forward_vars`). When
+        # present, fused_compress_attn writes into it via `out=` so the GPU
+        # pointer stays stable across captures (CUDAGraph requirement); when
+        # None, falls back to the eager fresh-allocation path.
+        self.compress_out: Optional[torch.Tensor] = None
 
         # State cache (per paper §3.6.1 "uncompressed tail + B-side overlap
         # window" portion). Indexed as a single ring buffer of size
@@ -778,12 +781,13 @@ class Compressor(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,  # [num_tokens, dim]
         plan: "CompressPlan",
-        state_slot_mapping: torch.Tensor,
-        block_tables: Optional[torch.Tensor] = None,
+        state_slot_mapping: torch.Tensor,  # [bs] int32
+        block_tables: Optional[torch.Tensor] = None,  # [bs, max_blocks_per_seq] int32
         out_dtype: Optional[torch.dtype] = None,
-    ) -> Optional[torch.Tensor]:
+        idx_slot_mapping: Optional[torch.Tensor] = None,  # [num_compress] int64
+    ) -> Optional[torch.Tensor]:  # [num_compress, head_dim] BF16  (None if plan empty)
         """Batched plan-style compress: one fused kernel call for the whole
         fwd's batch (across all seqs).
 
@@ -793,18 +797,28 @@ class Compressor(nn.Module):
         (write order critical — fused kernel reads state-cache-as-of-previous-
         fwd; update_compressor_states overwrites for next fwd).
 
-        TODO: quant (FP8 ue8m0 for CSA, FP4 + Hadamard for Indexer) is NOT
-        applied; see class docstring.
+        TODO: quant (FP8 ue8m0 for CSA Main, FP4 + Hadamard for Indexer) is
+        NOT applied for the Main path; see class docstring. The Indexer-inner
+        path *does* apply FP8 quantization via `indexer_k_quant_and_cache`
+        when `idx_slot_mapping` is provided.
 
         Args:
-            x:           [num_q_tokens, dim] flat ragged batch.
+            x:           [num_tokens, dim] flat ragged batch hidden state.
             plan:        CompressPlan from attn_metadata.compress_plans[ratio]
-                         (or `make_single_seq_plan` for Indexer's bs=1 path).
+                         (or a synthetic bs=1 plan during warmup).
             state_slot_mapping: [bs] int32 — per-seq state cache slot
                          (attn_metadata.state_slot_mapping).
             block_tables: [bs, max_blocks_per_seq] int32 — physical block IDs
                          per seq; None during warmup (skips kv_cache scatter).
             out_dtype:   override kernel output dtype. Defaults to bf16.
+            idx_slot_mapping: [num_compress] int64 — global flat slot in the
+                         FP8 indexer cache pool, one per compress row (kernel
+                         signature requires int64). When provided, the fused
+                         kernel skips its BF16 scatter and we instead call
+                         `indexer_k_quant_and_cache` to FP8-quantize+write each
+                         row into `self.kv_cache` (interleaved [head_dim] FP8 +
+                         4-byte fp32 scale per row, dtypes.fp8 storage).
+                         Only set by the CSA-inner-Compressor caller.
 
         Returns:
             Compressed KV `[num_compress, head_dim]` post-norm post-rope BF16,
@@ -812,10 +826,9 @@ class Compressor(nn.Module):
             Returns None if `plan.num_compress == 0`.
         """
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
-        if x.dim() == 3:
-            assert x.size(0) == 1, f"3D x must have B=1, got {x.size(0)}"
-            x = x.squeeze(0)
-        assert x.dim() == 2, f"x must be [num_q_tokens, dim], got {x.shape}"
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
@@ -823,10 +836,13 @@ class Compressor(nn.Module):
         if out_dtype is None:
             out_dtype = torch.bfloat16 if x.dtype == torch.float32 else x.dtype
 
-        # Projection (always fp32 for stability).
-        x = x.float()
-        kv = self.wkv(x)  # [num_q_tokens, coff*head_dim]
-        score = self.wgate(x)
+        # Single fused BF16 GEMM via tgemm; otype=fp32 keeps softmax-pool
+        # accumulator in fp32. torch.split returns zero-copy strided views;
+        # downstream kernels (fused_compress_attn, update_compressor_states)
+        # accept strided kv/score (only inner stride must be 1).
+        coff_d = (1 + overlap) * d
+        combined = self.wkv_gate(x, otype=torch.float32)
+        kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
         # Order is critical: fused kernel reads state cache as-of-end-of-
@@ -834,21 +850,30 @@ class Compressor(nn.Module):
         # fwd's data for the NEXT fwd's overlap — must run AFTER the fused
         # kernel.
         #
-        # The kernel does pool + RMSNorm + RoPE + BF16 store to kv_cache.
-        # No quant is applied (FP8 ue8m0 for CSA, FP4 + Hadamard for Indexer
-        # are both dropped). Trade-off: removes the QAT round-trip the model
-        # was trained with → output quality drops measurably from baseline.
-        # TODO: port the quant variants into the kernel for full byte-equal.
+        # The kernel does pool + RMSNorm + RoPE + (optional) BF16 store to
+        # kv_cache. For the Indexer-inner path (`idx_slot_mapping is not None`)
+        # we bypass the kernel scatter and instead call
+        # `indexer_k_quant_and_cache` separately, which FP8-quantizes the
+        # post-process K row and writes the (FP8 + scale) interleaved layout
+        # into the uint8 indexer pool.
         cos_cache, sin_cache = self.rotary_emb._caches(x.device)
-        scatter_block_tables = (
-            block_tables
-            if (block_tables is not None and not _v4_is_dummy_run())
-            else None
+        is_idx_fp8 = idx_slot_mapping is not None
+        # Warmup runs through the same path: kv_cache is None until the V4
+        # builder binds it post-warmup, so the kernel skips the scatter.
+        # Indexer-FP8 path always skips the kernel scatter (separate write).
+        scatter_kv_cache = (
+            None
+            if is_idx_fp8
+            else (self.kv_cache if block_tables is not None else None)
         )
-        scatter_kv_cache = self.kv_cache if scatter_block_tables is not None else None
+        scatter_block_tables = (
+            None
+            if is_idx_fp8
+            else (block_tables if scatter_kv_cache is not None else None)
+        )
         out = fused_compress_attn(
-            kv_in=kv.contiguous(),
-            score_in=score.contiguous(),
+            kv_in=kv,
+            score_in=score,
             kv_state=self.kv_state,
             score_state=self.score_state,
             plan=plan,
@@ -866,7 +891,20 @@ class Compressor(nn.Module):
             head_dim=d,
             rope_head_dim=rd,
             out_dtype=out_dtype,
+            out=self.compress_out,
         )
+        # Indexer-FP8 path: quantize the post-RoPE BF16 K rows into the uint8
+        # FP8+scale layout of `self.kv_cache`. `out` is [num_compress, head_dim]
+        # BF16 in plan order (matches `idx_slot_mapping` row order).
+        if is_idx_fp8 and out is not None and self.kv_cache is not None:
+            indexer_k_quant_and_cache(
+                out,
+                self.kv_cache,
+                idx_slot_mapping,
+                d,  # quant_block_size = head_dim (one fp32 scale per row)
+                self.scale_fmt,
+                preshuffle=True,
+            )
         update_compressor_states(
             kv,
             score,
@@ -926,6 +964,12 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
+        # Init-time hoists out of `forward_batched`'s hot path.
+        self._fp8_quant_func = get_hip_quant(QuantType.per_1x128)
+        self._weights_scale = self.softmax_scale * self.n_heads**-0.5
+        # `deepgemm_fp8_paged_mqa_logits` decode-path output column count:
+        # one indexer slot per `compress_ratio` source tokens.
+        self._max_model_len_idx = args.max_seq_len // compress_ratio
 
         self.compressor = Compressor(
             args,
@@ -951,122 +995,340 @@ class Indexer(nn.Module):
         )
         self.rotary_emb: Optional[_V4RoPE] = None
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        positions: torch.Tensor,
-        offset: int,
-        slot: int = 0,
-        block_table: Optional[torch.Tensor] = None,
-        context_lens: Optional[torch.Tensor] = None,
-        start_pos: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Compute sparse top-k indices over the indexer's compressed KV cache.
+        # Register self in static_forward_context so the
+        # `torch.ops.aiter.indexer_score_topk` dispatcher can look us up by
+        # `layer_name` (= self.prefix). Same pattern as V4 MoE registration.
+        get_current_atom_config().compilation_config.static_forward_context[
+            prefix
+        ] = self
 
-        Args:
-            x: [num_tokens, dim] input hidden states for ONE sequence
-                (caller pre-slices in PR3-main multi-seq dispatch).
-            qr: [num_tokens, q_lora_rank] latent query shared with main Attention's q_a.
-            positions: [num_tokens] absolute token positions for this sequence.
-                `positions[0]` drives index masks + scatter indices.
-            offset: offset added to returned indices to land them in the
-                concatenated (window || compressed) KV layout consumed by sparse_attn.
-            slot: per-request state-cache slot — routed to the inner Compressor.
-            block_table: `[max_blocks]` int — physical block IDs for this seq;
-                routed to inner Compressor for scatter and used here for the
-                gather of committed Indexer compressed entries.
+    def forward_batched(
+        self,
+        x_full: torch.Tensor,  # [total_tokens, dim]
+        qr_full: torch.Tensor,  # [total_tokens, q_lora_rank]
+        positions: torch.Tensor,  # [total_tokens]
+    ) -> torch.Tensor:
+        """Q proj + RoPE + FP8-quant + weights compute (have module state),
+        then dispatch to `torch.ops.aiter.indexer_score_topk`, which calls
+        back into `self.indexer_score_topk(q_fp8, weights, self.index_topk)`.
+
+        Caller must invoke `self.compressor` once batched BEFORE this so all
+        seqs' Indexer kv_cache is already populated.
+
         Returns:
-            topk_idxs: [1, num_tokens, K] int (B=1 implicit). -1 = future-masked.
+          topk_flat: `[total_tokens, index_topk] int32`, uniform-stride layout
+            shared by both prefill and decode paths. Cols past per-token
+            usable width hold -1 sentinels; consumer width-masks via the
+            builder-staged `width_mask_gpu`.
         """
         assert self.rotary_emb is not None
-        assert x.dim() == 2 and qr.dim() == 2
-        token_num = x.size(0)
-        # start_pos: prefer caller-supplied (from cpu_meta) to avoid .item().
-        # Used locally for the topk masks below AND for building the bs=1
-        # CompressPlan that the inner Compressor consumes.
-        if start_pos is None:
-            start_pos = int(positions[0].item())
-        ratio = self.compress_ratio
         rd = self.rope_head_dim
-        end_pos = start_pos + token_num
+        total_tokens = x_full.size(0)
 
-        # Lazy plumb rotary_emb into compressor (kv_cache is now bound by
-        # the V4 attention builder; pre-PR3-pre2c-B the kv_cache plumbing
-        # also happened here).
-        if self.compressor.rotary_emb is None:
-            self.compressor.rotary_emb = self.rotary_emb
-
-        # ----- Indexer Q (2D Linear, then add B=1 dim for RoPE / einsum) -----
-        q = self.wq_b(qr).view(token_num, self.n_heads, self.head_dim)
-        q = q.unsqueeze(0)  # [1, S, H, D]
+        # Q proj + RoPE + rotate (batched). rotary_emb internally reshapes
+        # to (1, num_tokens, -1, rotary_dim) so the input doesn't need an
+        # explicit batch dim. rotate_activation is last-dim-only.
+        q = self.wq_b(qr_full).view(total_tokens, self.n_heads, self.head_dim)
         self.rotary_emb(positions, q[..., -rd:])
         q = rotate_activation(q)
-        fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
 
-        # ----- Indexer KV (Compressor takes 2D, mutates kv_cache) -----
-        # Wrap as a bs=1 plan for the batched Compressor interface. The
-        # block_table arg is per-seq [max_blocks]; convert to [1, max_blocks]
-        # for the batched API. State slot also wrapped as [1].
-        single_plan = make_single_seq_plan(
-            token_num=token_num,
-            start_pos=start_pos,
-            ratio=ratio,
-            is_overlap=self.compressor.overlap,
-            device=x.device,
-        )
-        single_state_slot = torch.tensor([slot], device=x.device, dtype=torch.int32)
-        single_block_tables = (
-            block_table.unsqueeze(0) if block_table is not None else None
-        )
-        self.compressor(
-            x,
-            plan=single_plan,
-            state_slot_mapping=single_state_slot,
-            block_tables=single_block_tables,
-        )
-        # weights_proj is ATOM Linear → 2D input; restore B=1 dim for einsum.
+        # FP8 quant Q (still online — Q is recomputed each fwd, no cache).
+        # `_fp8_quant_func` / `_weights_scale` precomputed in __init__.
+        q_2d = q.view(-1, self.head_dim)
+        q_fp8, q_scale = self._fp8_quant_func(q_2d, quant_dtype=dtypes.fp8)
+        q_fp8 = q_fp8.view(total_tokens, self.n_heads, self.head_dim)
+        q_scale = q_scale.view(total_tokens, self.n_heads, 1)
+
+        # weights = weights_proj * q_scale * (softmax_scale * 1/sqrt(H))
         weights = (
-            self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        ).unsqueeze(0)
+            (self.weights_proj(x_full).unsqueeze(-1) * q_scale * self._weights_scale)
+            .squeeze(-1)
+            .float()
+        )
 
-        # ----- Index score -----
-        # PR3-main: gather committed compressed Indexer entries from the
-        # per-seq block_table (passed in by the caller). During warmup
-        # block_table is None, so we return a zeros placeholder — the
-        # resulting topk_idxs are discarded by the warmup forward path anyway.
-        n_committed = end_pos // ratio
-        if block_table is not None and not _v4_is_dummy_run() and n_committed > 0:
-            k_per_block = _V4_BLOCK_SIZE // ratio
-            gathered = _v4_gather_compressed(
-                self.kv_cache, block_table, n_committed, k_per_block
-            ).unsqueeze(
-                0
-            )  # [1, n_committed, head_dim]
-        else:
-            gathered = torch.zeros(
-                1, n_committed, self.head_dim, dtype=q.dtype, device=q.device
-            )
-        index_score = torch.einsum("bshd,btd->bsht", q, gathered)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        return torch.ops.aiter.indexer_score_topk(
+            q_fp8, weights, self.prefix, self.index_topk
+        )  # [total_tokens, index_topk] int32
 
-        # ----- Top-k selection over compressed positions -----
-        if start_pos == 0:
-            mask = (
-                torch.arange(token_num // ratio, device=x.device).repeat(token_num, 1)
-                >= torch.arange(1, token_num + 1, device=x.device).unsqueeze(1) // ratio
-            )
-            index_score = index_score + torch.where(mask, float("-inf"), 0.0)
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
-        if start_pos == 0:
-            mask = (
-                topk_idxs
-                >= torch.arange(1, token_num + 1, device=x.device).unsqueeze(1) // ratio
-            )
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+    def indexer_score_topk(
+        self,
+        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        topk: int,
+    ) -> torch.Tensor:
+        """Module-side entry invoked by `torch.ops.aiter.indexer_score_topk`.
+
+        Reads `block_tables` and `v4_indexer_meta` from
+        `get_forward_context().attn_metadata` (built once per fwd in
+        `DeepseekV4AttentionMetadataBuilder._build_v4_indexer_meta`) — the
+        per-CSA-layer call has zero CPU index math and zero H2D copies.
+
+        Returns:
+          topk_flat: `[total_tokens, topk] int32`. Cols past per-token
+            usable width hold -1 sentinels (decode native; prefill via
+            explicit pad inside `_score_topk_prefill`).
+        """
+        fc = get_forward_context()
+        indexer_meta = fc.attn_metadata.indexer_meta
+        block_tables = fc.attn_metadata.block_tables  # [bs, max_blocks_per_seq] int32
+        total_tokens = q_fp8.size(0)
+
+        # `_build_v4_indexer_meta` returns None for warmup / empty-batch
+        # forwards (scheduled_bs == 0 or total_tokens == 0). In those paths
+        # the caller still invokes us — return an all-`-1` placeholder of
+        # the right shape so downstream `index_copy_` sees sentinels.
+        if indexer_meta is None:
+            return torch.full(
+                (total_tokens, topk),
+                -1,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            )  # [total_tokens, topk] int32
+
+        # Empty-K early return: every seq has n_committed==0 (no compressed
+        # K written yet). Builder also leaves `compress_topk_src_gpu = None`
+        # here, so the all-`-1` tensor is never indexed downstream.
+        if indexer_meta["total_committed"] == 0:
+            return torch.full(
+                (total_tokens, topk),
+                -1,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            )  # [total_tokens, topk] int32
+
+        if fc.context.is_prefill:
+            return self._score_topk_prefill(
+                q_fp8, weights, block_tables, indexer_meta, topk
+            )  # [total_tokens, topk] int32
+        return self._score_topk_decode(
+            q_fp8, weights, block_tables, indexer_meta, topk
+        )  # [total_tokens, topk] int32
+
+    def _score_topk_prefill(
+        self,
+        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """Variable-K prefill / mixed batch: cp_gather + fp8_mqa_logits.
+
+        Eager-only — total_committed varies per fwd, so output logits shape
+        is dynamic and incompatible with CUDAGraph capture.
+        """
+        device = q_fp8.device
+        total_tokens = q_fp8.size(0)
+        # K side: cache stores FP8 + 4-byte fp32 scale per row interleaved
+        # (uint8 layout written by `indexer_k_quant_and_cache` from the inner
+        # Compressor). `cp_gather_indexer_k_quant_cache` does paged-gather
+        # + split into separate (FP8, scale) buffers in one kernel — no
+        # per-row index list, no online quant.
+        total_committed = indexer_meta["total_committed"]
+        cu_committed = indexer_meta["cu_committed_gpu"]
+        k_fp8 = torch.empty(
+            (total_committed, self.head_dim), device=device, dtype=dtypes.fp8
+        )
+        k_scale = torch.empty((total_committed, 1), device=device, dtype=torch.float32)
+        cp_gather_indexer_k_quant_cache(
+            self.kv_cache,
+            k_fp8,
+            k_scale.view(dtypes.fp8),  # 4-byte scale rows treated as fp8 bytes
+            block_tables,
+            cu_committed,
+            preshuffle=True,
+        )
+
+        cu_starts = indexer_meta["cu_starts_gpu"]  # [total_tokens] int32
+        cu_ends = indexer_meta["cu_ends_gpu"]  # [total_tokens] int32
+        logits = fp8_mqa_logits(
+            Q=q_fp8,
+            KV=k_fp8,
+            kv_scales=k_scale,
+            weights=weights,
+            cu_starts=cu_starts,
+            cu_ends=cu_ends,
+        )  # [total_tokens, total_committed] fp32; outside [start,end) is -inf
+
+        # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
+        # pybind kwarg). Honors per-row [cu_starts[i], cu_ends[i]) so cells
+        # outside each row's valid window are never selected; rows shorter
+        # than `topk` get -1 sentinels for tail cols, matching the decode
+        # path's [N, topk] layout.
+        # [total_tokens, topk] int32 — eager-only path so per-fwd alloc
+        # is fine (prefill total_tokens is dynamic; no CG capture here).
+        topk_global = torch.empty(
+            (total_tokens, topk), dtype=torch.int32, device=device
+        )
+        top_k_per_row_prefill(
+            logits,
+            cu_starts,
+            cu_ends,
+            topk_global,
+            None,  # values not needed, only indices
+            total_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
+        )
+        # Prefill is eager-only — pull `width_mask_gpu` (built in
+        # _build_v4_indexer_meta) since fresh allocation across prefill calls
+        # is harmless without CG capture.
+        return self._post_process_topk(
+            topk_global,
+            indexer_meta,
+            width_mask=indexer_meta["width_mask_gpu"],
+            is_decode=False,
+        )
+
+    def _score_topk_decode(
+        self,
+        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """Pure-decode path: `deepgemm_fp8_paged_mqa_logits` reads paged FP8
+        cache directly, producing fixed-shape `[bs*next_n, max_model_len_idx]`
+        logits — CUDAGraph-friendly (no per-fwd `total_committed`-shaped
+        allocation). Mirrors V3.2 sparse_attn_indexer decode branch
+        (deepseek_v2.py:1047-1084).
+
+        Top-k uses aiter `top_k_per_row_decode` (radix kernel, parametric `k`):
+        the kernel honors `n_committed_per_seq` per row, so logits cells past
+        each row's valid range are never selected — no `fill_(-inf)` required.
+        Rows whose valid range is shorter than `index_topk` get -1 sentinels
+        for tail cols, which `_post_process_topk` masks via `width_mask_gpu`.
+        """
+        total_tokens = q_fp8.size(0)
+        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
+        bs = block_tables.size(0)
+        # V4-Pro has no MTP, so next_n = total_tokens // bs = 1. The reshape
+        # also handles future multi-token decode (MTP) without code change.
+        next_n = total_tokens // bs
+        # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
+        # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
+        q_4d = q_fp8.view(
+            bs, next_n, self.n_heads, self.head_dim
+        )  # [bs, next_n, n_heads, head_dim] fp8
+        kv_cache_4d = self.kv_cache.unsqueeze(
+            -2
+        )  # [num_blocks, k1_csa, 1, head_dim+scale_dim] uint8
+        # Pre-allocated decode logits buffer (sized [max_bs, max_model_len_idx]
+        # in builder, sliced here to [total_tokens, max_model_len_idx]).
+        # No `fill_(-inf)` needed — `top_k_per_row_decode` bounds each row
+        # by `n_committed_per_seq[batch]` so unwritten cols are never picked.
+        logits = indexer_meta["decode_logits_gpu"][
+            :total_tokens
+        ]  # [total_tokens, max_model_len_idx] fp32
+        deepgemm_fp8_paged_mqa_logits(
+            q_4d,
+            kv_cache_4d,
+            weights,
+            logits,
+            n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
+            block_tables,
+            self._max_model_len_idx,
+            KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
+            Preshuffle=True,
+        )
+        # Pre-allocated indices buffer — fixed [max_bs, index_topk] int32 in
+        # builder, sliced to [total_tokens, index_topk] for this fwd. Kernel
+        # writes exactly `index_topk` ints per row (valid indices then -1
+        # sentinels), no overflow risk.
+        topk_local = indexer_meta["decode_topk_indices_gpu"][
+            :total_tokens
+        ]  # [total_tokens, index_topk] int32
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            n_committed_per_seq_gpu,
+            topk_local,
+            total_tokens,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
+        )
+        # Compute width_mask in-graph so its allocation lives in the CG
+        # mempool — captured ops then read a stable address on replay.
+        # `n_committed_per_seq_gpu` and `batch_id_per_token_gpu` are both
+        # staged into pre-allocated forward_vars. Use scalar `clamp` (Python
+        # int) instead of `torch.minimum(..., torch.tensor(topk))`: building
+        # an H2D tensor mid-capture triggers `hipErrorStreamCaptureUnsupported`.
+        batch_id_per_token = indexer_meta["batch_id_per_token_gpu"]
+        k_per_token = n_committed_per_seq_gpu[batch_id_per_token].clamp(
+            max=topk
+        )  # [total_tokens] int32
+        col_arange = torch.arange(
+            topk, device=logits.device, dtype=torch.int32
+        )  # [topk] int32
+        width_mask = col_arange.unsqueeze(0) >= k_per_token.unsqueeze(
+            1
+        )  # [total_tokens, topk] bool
+        # Decode topk indices are seq-local (each row's columns are 0-indexed
+        # into that batch's compressed K), so `_post_process_topk` skips the
+        # seq_base subtraction via `is_decode=True`.
+        return self._post_process_topk(
+            topk_local, indexer_meta, width_mask=width_mask, is_decode=True
+        )
+
+    def _post_process_topk(
+        self,
+        topk_indices: torch.Tensor,  # [total_tokens, index_topk] int32 (uniform layout, both paths)
+        indexer_meta: dict,
+        *,
+        width_mask: torch.Tensor,  # [total_tokens, index_topk] bool
+        is_decode: bool,
+    ) -> torch.Tensor:
+        """Map topk indices into the [SWA || compressed] kv_sa layout consumed
+        by sparse_attn, masking out width-overflow and future-token slots.
+
+        Prefill (`is_decode=False`): topk indices are GLOBAL flat positions
+          (fp8_mqa_logits scores all seqs' K concatenated), need
+          `seq_base_per_token` subtraction to recover seq-local idx; future
+          tokens in fresh prefill are masked via `future_threshold`.
+        Decode (`is_decode=True`): topk indices are already SEQ-LOCAL
+          (`top_k_per_row_decode` produces per-row [total_tokens, index_topk]
+          where each row's cols are local to its batch's compressed K). No
+          future-token mask (decode tokens are always at the seq tail), so
+          `invalid = width_mask` directly. Caller computes `width_mask`
+          in-graph for CG-safe addresses.
+
+        Both paths emit a uniform [total_tokens, index_topk] int32 layout;
+        cols past per-row valid range hold -1 sentinels (decode kernel native;
+        prefill via explicit pad).
+        """
+        offset_per_token = indexer_meta["offset_per_token_gpu"]  # [total_tokens] int32
+
+        if is_decode:
+            topk_local = topk_indices  # [total_tokens, index_topk] int32
+            invalid = width_mask  # decode has no future-token mask
         else:
-            topk_idxs = topk_idxs + offset
-        return topk_idxs
+            seq_base_per_token = indexer_meta[
+                "seq_base_per_token_gpu"
+            ]  # [total_tokens] int32
+            future_threshold = indexer_meta[
+                "future_threshold_gpu"
+            ]  # [total_tokens, 1] int32
+            is_prefill_per_token = indexer_meta[
+                "is_prefill_per_token_gpu"
+            ]  # [total_tokens, 1] bool
+            topk_local = topk_indices - seq_base_per_token.unsqueeze(
+                1
+            )  # [total_tokens, index_topk] int32 (seq-local idx)
+            # Combined invalid mask: slots past per-seq K (width_mask) OR future
+            # tokens in fresh prefill. Width-masked slots in `topk_local` may be
+            # -1 sentinels or garbage from `subtract` — final masked_fill_
+            # overwrites them with -1 either way.
+            invalid = width_mask | (
+                is_prefill_per_token & (topk_local >= future_threshold)
+            )  # [total_tokens, index_topk] bool
+        # In-place over `topk_local + offset` (a fresh tensor from `+`); saves
+        # a `full_like(-1)` allocation and the `torch.where` launch.
+        # Returns [total_tokens, index_topk] int32: (idx + offset) for valid
+        # slots, -1 for invalid.
+        return (topk_local + offset_per_token.unsqueeze(1)).masked_fill_(invalid, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -1129,12 +1391,15 @@ class DeepseekV4Attention(nn.Module):
         self.attn_sink = atom_parameter(
             torch.empty(self.n_local_heads, dtype=torch.float32)
         )
-        self.wq_a = ReplicatedLinear(
+        # Fused [wq_a; wkv]: both ReplicatedLinear FP8 sharing input x.
+        # On disk still split (`attn.wq_a.{weight,scale}` + `attn.wkv.{weight,scale}`);
+        # routed via packed_modules_mapping in DeepseekV4ForCausalLM.
+        self.wqkv_a = MergedReplicatedLinear(
             self.dim,
-            self.q_lora_rank,
+            [self.q_lora_rank, self.head_dim],
             bias=False,
             quant_config=qc,
-            prefix=f"{p}.wq_a",
+            prefix=f"{p}.wqkv_a",
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.q_norm2 = RMSNorm(self.head_dim, self.eps)
@@ -1144,13 +1409,6 @@ class DeepseekV4Attention(nn.Module):
             bias=False,
             quant_config=qc,
             prefix=f"{p}.wq_b",
-        )
-        self.wkv = ReplicatedLinear(
-            self.dim,
-            self.head_dim,
-            bias=False,
-            quant_config=qc,
-            prefix=f"{p}.wkv",
         )
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a: grouped LoRA — V4QuantConfig forces this BF16 even though disk is FP8.
@@ -1278,403 +1536,262 @@ class DeepseekV4Attention(nn.Module):
         #   4. Forward: _aiter_triton_fp8_bmm(o, W_OA, W_OA_scale, group_size=128)
         # This avoids the dequant + einsum overhead and reuses the proven MLA
         # batched-FP8 kernel. See attention_mla.py:211 for reference.
-        from atom.config import QuantType as _QT
+        self.wo_a.quant_type = QuantType.No
 
-        self.wo_a.quant_type = _QT.No
-
-    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
+        positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+    ) -> torch.Tensor:  # [num_tokens, dim]  BF16 attention output
         """Compute attention for `x` at absolute token `positions`.
 
         PR3-main: handles batched multi-sequence input. Linear projections + RoPE
-        run once on the flat `[S_total, ...]` batch; SWA write, Compressor scatter,
-        sparse_attn (gather + score) iterate over sequences using per-seq slot +
-        block_table from the V4 attention builder's metadata.
-
-        Args:
-            x: [num_tokens, dim] flat ATOM ragged-batch convention.
-            positions: [num_tokens] absolute token positions per token.
-                Per-seq slicing uses `cu_seqlens_q` from `forward_context`.
-        Returns:
-            [num_tokens, dim] attention output (BF16).
+        run once on the flat `[num_tokens, ...]` batch; SWA write, Compressor
+        scatter, sparse_attn (gather + score) iterate over sequences using
+        per-seq slot + block_table from the V4 attention builder's metadata.
+        Per-seq slicing uses `cu_seqlens_q` from `forward_context`.
         """
         assert (
-            x.dim() == 2
-        ), f"DeepseekV4Attention expects 2D [num_tokens, dim], got {x.shape}"
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
         seqlen_total = x.size(0)
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        # Idempotent one-time plumb of rotary_emb into compressor / indexer.
+        # Idempotent one-time plumb of rotary_emb into compressor / indexer
+        # (and the indexer's inner compressor). `rotary_emb` is set by the
+        # owning layer after __init__, so this can't move into __init__.
         if self.compress_ratio and self.compressor.rotary_emb is None:
             self.compressor.rotary_emb = self.rotary_emb
             if self.indexer is not None:
                 self.indexer.rotary_emb = self.rotary_emb
+                self.indexer.compressor.rotary_emb = self.rotary_emb
 
         # ----- Batched ops on full flat tensors -----
-        # EXPERIMENT: round-trip x and qr to ue8m0-aligned FP8 to mimic ref's
-        # act_quant(scale_fmt="ue8m0") behavior in Linear input quantization.
-        if os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1":
-            from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
-
+        # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
+        # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
+        # quantization. EXPERIMENT only.
+        if _V4_FORCE_UE8M0_QUANT:
             x = x.clone()
-            _v4_aqi(x, 128, "ue8m0")
-        qr = self.q_norm(self.wq_a(x))  # [S_total, q_lora_rank], shared with Indexer
-        if os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1":
-            from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
-
+            act_quant_inplace(x, 128, "ue8m0")
+        # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
+        qkv_a = self.wqkv_a(x)
+        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
+        if _V4_FORCE_UE8M0_QUANT:
             qr = qr.clone()
-            _v4_aqi(qr, 128, "ue8m0")
+            act_quant_inplace(qr, 128, "ue8m0")
         q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
         q = _rmsnorm_nw(q, self.eps, self.head_dim)
-        q = q.unsqueeze(0)  # [1, S_total, H, D]
-
-        kv = self.wkv(x)  # [S_total, head_dim]
-        kv = self.kv_norm(kv).unsqueeze(0)  # [1, S_total, head_dim]
+        # q [S, H, D] / kv [S, head_dim] — rotary_emb internally reshapes to
+        # (1, num_tokens, -1, rotary_dim) so explicit batch dim is unnecessary.
+        kv = self.kv_norm(kv_pre)
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
-        act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
-        # ----- Per-seq dispatch -----
-        # PR-A Phase 2: prefer CPU-mirror metadata published by the V4
-        # attention builder over `.tolist()` on GPU tensors. When available,
-        # `start_pos_per_seq_cpu` also lets the loop body skip the per-seq
-        # `int(seq_positions[0].item())` sync. Falls back to legacy `.tolist()`
-        # path when CPU mirror is absent (warmup / non-V4 dispatch).
-        (
-            block_tables,
-            state_slot_mapping,
-            cu_seqlens_q,
-            context_lens,
-            num_seqs,
-            cpu_meta,
-        ) = _v4_get_seq_metadata()
-        start_pos_per_seq: Optional[list[int]] = None
-        # Compress plan for this fwd's batch (per ratio). Built by
-        # DeepseekV4AttentionMetadataBuilder.prepare_decode/prefill. Absent
-        # during warmup / dummy run — caller builds a fallback single-seq plan.
-        attn_md = (
-            get_forward_context().attn_metadata
-            if get_forward_context() is not None
-            else None
-        )
-        compress_plans = (
-            getattr(attn_md, "compress_plans", None) if attn_md is not None else None
-        )
-        if num_seqs == 0 or block_tables is None or _v4_is_dummy_run():
-            # Warmup / fallback: treat the whole batch as a single dummy seq.
-            seq_offsets = [0, seqlen_total]
-            slots = [0]
-            per_seq_bts: list[Optional[torch.Tensor]] = [None]
-            num_seqs = 1
-            # Dummy context_lens: 1-element tensor sized to seqlen_total
-            # (treats warmup as fresh prefill).
-            context_lens = torch.tensor(
-                [seqlen_total], device=positions.device, dtype=torch.int32
-            )
-            state_slot_mapping = torch.tensor(
-                [0], device=positions.device, dtype=torch.int32
-            )
-            compress_plans = None  # batched call below builds fallback
-            block_tables_gpu = None
-        elif cpu_meta is not None and cpu_meta["start_pos_per_seq"] is not None:
-            seq_offsets = cpu_meta["cu_seqlens_q"][: num_seqs + 1].tolist()
-            slots = cpu_meta["state_slot_mapping"][:num_seqs].tolist()
-            start_pos_per_seq = cpu_meta["start_pos_per_seq"][:num_seqs].tolist()
-            per_seq_bts = [block_tables[i] for i in range(num_seqs)]
-            block_tables_gpu = block_tables
-        else:
-            seq_offsets = cu_seqlens_q[: num_seqs + 1].tolist()
-            slots = state_slot_mapping[:num_seqs].tolist()
-            per_seq_bts = [block_tables[i] for i in range(num_seqs)]
-            block_tables_gpu = block_tables
+        if _V4_USE_REF_QUANT:
+            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+        # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
+        # All per-fwd state read once. Production prepare_decode/prefill
+        # always populates these; warmup goes through the same path
+        # (`_populate_state_slot_mapping` falls back to slot 0).
+        # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
+        # compress_plans, swa_write_indices, ...) is well-typed for pyright.
+        attn_md = cast("AttentionMetaData_DSV4", get_forward_context().attn_metadata)
+        compress_plans = attn_md.compress_plans
+        v4_sparse_layouts = attn_md.sparse_layouts
+        v4_indexer_meta = attn_md.indexer_meta
+        window_topk_batched = attn_md.window_topk_batched
+        swa_write_indices = attn_md.swa_write_indices
+        v4_batch_id_per_token = attn_md.batch_id_per_token
+        block_tables_gpu = attn_md.block_tables
+        state_slot_mapping = attn_md.state_slot_mapping
 
-        # ----- Per-seq state-cache reset on prefill from scratch -----
-        # Done BEFORE batched compressor so the state cache contains correct
-        # initial -inf scores when the kernel reads it.
-        for seq_idx in range(num_seqs):
-            seq_token_num = seq_offsets[seq_idx + 1] - seq_offsets[seq_idx]
-            if seq_token_num == 0:
-                continue
-            sp = (
-                start_pos_per_seq[seq_idx]
-                if start_pos_per_seq is not None
-                else int(positions[seq_offsets[seq_idx]].item())
-            )
-            if sp == 0:
-                slot = slots[seq_idx]
-                self.swa_kv[slot].zero_()
-                if self.compress_ratio:
-                    self.compressor.kv_state[slot].zero_()
-                    self.compressor.score_state[slot].fill_(float("-inf"))
-                    if self.indexer is not None:
-                        self.indexer.compressor.kv_state[slot].zero_()
-                        self.indexer.compressor.score_state[slot].fill_(float("-inf"))
-
-        # ----- Batched compressor call (ONCE for the whole batch) -----
-        # Replaces per-seq self.compressor() inside the loop. Indexer's
-        # internal Compressor is still called per-seq (bs=1 plan) inside the
-        # per-seq loop below, since Indexer needs per-seq topk masks anyway.
-        kv_compress_batched: Optional[torch.Tensor] = None
-        plan_for_layer: Optional[CompressPlan] = None
-        if self.compress_ratio:
-            if compress_plans is not None and ratio in compress_plans:
-                plan_for_layer = compress_plans[ratio]
-            else:
-                # Fallback: build a single-seq plan from positions / token count.
-                # Only path for warmup / non-V4 dispatch.
-                sp_dummy = start_pos_per_seq[0] if start_pos_per_seq is not None else 0
-                plan_for_layer = make_single_seq_plan(
-                    token_num=seqlen_total,
-                    start_pos=sp_dummy,
-                    ratio=ratio,
-                    is_overlap=self.compressor.overlap,
-                    device=x.device,
-                )
-            assert (
-                state_slot_mapping is not None
-                and state_slot_mapping.dtype == torch.int32
-                and state_slot_mapping.is_cuda
-            ), (
-                "batched compressor needs state_slot_mapping as int32 GPU "
-                f"tensor, got {state_slot_mapping}"
-            )
-            kv_compress_batched = self.compressor(
+        # ===== Batched compressor + Indexer (ONCE per layer) =====
+        # State cache reset on fresh prefill is redundant: SWA's start_pos==0
+        # path uses raw seq_kv, and fused_compress's state-cache reads are
+        # already masked by `s < 0` for fresh prefill (compress_plan.py:88 +
+        # fused_compress.py:124-127).
+        plan_for_layer = compress_plans[ratio] if ratio else None
+        kv_compress_batched = (
+            self.compressor(
                 x,
                 plan=plan_for_layer,
                 state_slot_mapping=state_slot_mapping,
                 block_tables=block_tables_gpu,
             )
-
-        sparse_kvs = []
-        sparse_topks = []
-        for seq_idx in range(num_seqs):
-            seq_start = seq_offsets[seq_idx]
-            seq_end = seq_offsets[seq_idx + 1]
-            token_num = seq_end - seq_start
-            if token_num == 0:
-                continue
-            slot = slots[seq_idx]
-            block_table = per_seq_bts[seq_idx]
-            seq_positions = positions[seq_start:seq_end]
-            seq_x = x[seq_start:seq_end]
-            seq_kv = kv[:, seq_start:seq_end]
-            # PR-A Phase 2: prefer CPU mirror to avoid per-seq GPU→CPU sync
-            # (~64 layers × num_seqs syncs eliminated when present).
-            if start_pos_per_seq is not None:
-                start_pos = start_pos_per_seq[seq_idx]
-            else:
-                start_pos = int(seq_positions[0].item())
-            end_pos = start_pos + token_num
-
-            # NOTE: state-cache reset moved BEFORE the batched compressor
-            # call (above), so the kernel's first read sees zeroed state +
-            # -inf scores for fresh-prefill seqs.
-
-            # topk_idxs (per-seq, since token_num + start_pos differ).
-            topk_idxs = _get_window_topk_idxs(
-                win, 1, token_num, start_pos, device=x.device
-            )
-            seq_context_lens = context_lens[seq_idx : seq_idx + 1]
-            if self.compress_ratio:
-                offset = seq_kv.size(1) if start_pos == 0 else win
-                if self.indexer is not None:
-                    seq_qr = qr[seq_start:seq_end]
-                    compress_topk_idxs = self.indexer(
-                        seq_x,
-                        seq_qr,
-                        seq_positions,
-                        offset,
-                        slot=slot,
-                        block_table=block_table,
-                        context_lens=seq_context_lens,
-                        start_pos=start_pos,
-                    )
-                else:
-                    compress_topk_idxs = _get_compress_topk_idxs(
-                        ratio, 1, token_num, start_pos, offset, device=x.device
-                    )
-                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-            topk_idxs = topk_idxs.int()
-
-            # SWA write — gated swap-out point for v4_kernels.swa_write
-            # (PR-A Phase 1a). The new path writes via Triton kernel using
-            # `positions % win` per token; equivalent to legacy ring-rotation.
-            if use_new_v4_backend(self.layer_id):
-                if token_num <= win:
-                    seq_kv_flat = seq_kv.squeeze(0).contiguous()
-                    seq_pos_flat = seq_positions
-                else:
-                    seq_kv_flat = seq_kv.squeeze(0)[-win:].contiguous()
-                    seq_pos_flat = seq_positions[-win:]
-                slot_per_token = torch.full(
-                    (seq_kv_flat.size(0),),
-                    slot,
-                    device=seq_kv_flat.device,
-                    dtype=torch.int32,
-                )
-                swa_write(seq_kv_flat, seq_pos_flat, slot_per_token, self.swa_kv, win)
-            elif start_pos == 0:
-                if token_num <= win:
-                    self.swa_kv[slot : slot + 1, :token_num] = seq_kv
-                else:
-                    cutoff = token_num % win
-                    (
-                        self.swa_kv[slot : slot + 1, cutoff:win],
-                        self.swa_kv[slot : slot + 1, :cutoff],
-                    ) = seq_kv[:, -win:].split([win - cutoff, cutoff], dim=1)
-            else:
-                self.swa_kv[slot : slot + 1, start_pos % win] = seq_kv.squeeze(1)
-
-            # Compressor was called ONCE batched above (kv_compress_batched
-            # holds all seqs' boundaries packed in plan order). Per-seq
-            # prefill cat its slice; decode reads accumulated history from
-            # kv_cache via _v4_gather_compressed.
-            if start_pos == 0:
-                kv_sa = seq_kv
-                if self.compress_ratio and kv_compress_batched is not None:
-                    cu_c = plan_for_layer.cu_compress_cpu
-                    seq_compress = kv_compress_batched[
-                        int(cu_c[seq_idx]) : int(cu_c[seq_idx + 1])
-                    ]
-                    if seq_compress.shape[0] > 0:
-                        kv_sa = torch.cat([kv_sa, seq_compress.unsqueeze(0)], dim=1)
-            else:
-                if self.compress_ratio:
-                    # sparse_attn input layout: [SWA window || compressed
-                    # entries gathered from block-table]. n_committed counts
-                    # all boundaries up to and including this fwd's window
-                    # (end_pos // ratio) — generalizes the single-token decode
-                    # formula to MTP-N where multiple boundaries may commit.
-                    n_committed = end_pos // ratio
-                    if (
-                        block_table is not None
-                        and not _v4_is_dummy_run()
-                        and n_committed > 0
-                    ):
-                        k_per_block = _V4_BLOCK_SIZE // ratio
-                        gathered = _v4_gather_compressed(
-                            self.compressor.kv_cache,
-                            block_table,
-                            n_committed,
-                            k_per_block,
-                        ).unsqueeze(0)
-                        kv_sa = torch.cat(
-                            [self.swa_kv[slot : slot + 1], gathered], dim=1
-                        )
-                    else:
-                        kv_sa = self.swa_kv[slot : slot + 1]
-                else:
-                    kv_sa = self.swa_kv[slot : slot + 1]
-
-            sparse_kvs.append(kv_sa.squeeze(0))
-            sparse_topks.append(topk_idxs.reshape(-1))
-
-        # Ragged sparse attention: concatenate per-seq queries and KV pools,
-        # and pass varlen topk spans so the kernel can add global KV offsets.
-        q_sa = q.squeeze(0).contiguous()
-        kv_sa = torch.cat(sparse_kvs, dim=0).contiguous()
-        topk_flat = torch.cat(sparse_topks).contiguous()
-        ctx = get_forward_context()
-        sparse_layouts = (
-            getattr(ctx.attn_metadata, "v4_sparse_layouts", None)
-            if ctx is not None and ctx.attn_metadata is not None
+            if ratio
             else None
         )
-        assert self.compress_ratio in (0, 4, 128), (
-            f"unexpected V4 compress_ratio={self.compress_ratio}; "
-            "expected one of 0, 4, 128"
-        )
-        if _v4_is_dummy_run():
-            topk_starts = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int64)
-            topk_lens = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int32)
-            kv_offsets = torch.zeros(q_sa.size(0), device=x.device, dtype=torch.int32)
-            max_topk = 1
+        indexer_topk_batched = None
+        if self.indexer is not None:
+            # Indexer's inner compressor populates the indexer kv_cache (FP8
+            # via indexer_k_quant_and_cache when idx_slot_mapping is set);
+            # the outer `forward_batched` reads `v4_indexer_meta` (built once
+            # per fwd) so it has zero per-layer H2D / CPU index math.
+            idx_slot_mapping = (
+                v4_indexer_meta.get("compress_slot_mapping_gpu")
+                if v4_indexer_meta is not None
+                else None
+            )
+            self.indexer.compressor(
+                x,
+                plan=plan_for_layer,
+                state_slot_mapping=state_slot_mapping,
+                block_tables=block_tables_gpu,
+                idx_slot_mapping=idx_slot_mapping,
+            )
+            indexer_topk_batched = self.indexer.forward_batched(
+                x_full=x,
+                qr_full=qr,
+                positions=positions,
+            )
+            # Phase C: build CSA paged-compress section in
+            # `v4_kv_indices_csa` (window prefix already filled by Phase B).
+            # Layer-local because indexer output differs per layer; consumed by
+            # Phase E (sparse_attn_v4_paged_decode dispatch) once that ships.
+            # Until then this is a side-effectful no-op against the existing
+            # ragged_varlen attention path.
+            if ratio == 4 and attn_md.is_pure_decode:
+                self._fill_csa_paged_compress(attn_md, seqlen_total)
+
+        # ===== SWA write =====
+        # `swa_write_indices` is pre-built once per fwd in
+        # `_attach_v4_per_fwd_meta` — sentinel-padded to `total_tokens` so the
+        # kernel grid stays deterministic per (capture_bs, max_q_len) for
+        # CUDAGraph; long-prefill rows past num_write carry -1 (skip).
+        # Kernel does all per-token gathers (kv row, position, batch id) and
+        # per-seq state-slot lookup (state_slot_per_seq[bid]) internally —
+        # no captured-region alloc, no per-token slot alias.
+        if swa_write_indices is not None:
+            swa_write(
+                kv,
+                swa_write_indices,
+                positions,
+                v4_batch_id_per_token,
+                state_slot_mapping,
+                self.swa_kv,
+                win,
+            )
+
+        # ===== Sparse attention dispatch =====
+        # Phase E: when is_pure_decode (Phase B/C have prepared kv_indices +
+        # kv_indptr in stable forward_vars buffers), use the unified-pool
+        # paged_decode kernel — single base ptr, packed-cumsum kv_indices,
+        # CG-friendly. Otherwise fall back to ragged_varlen for prefill /
+        # mixed batches.
+        q_sa = q.contiguous()
+        if attn_md.is_pure_decode:
+            from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
+
+            if ratio == 0:
+                kv_indices = attn_md.kv_indices_swa
+                kv_indptr = attn_md.kv_indptr_swa
+            elif ratio == 4:
+                kv_indices = attn_md.kv_indices_csa
+                kv_indptr = attn_md.kv_indptr_csa
+            else:  # ratio == 128
+                kv_indices = attn_md.kv_indices_hca
+                kv_indptr = attn_md.kv_indptr_hca
+            o = sparse_attn_v4_paged_decode(
+                q_sa,
+                self.unified_kv,
+                kv_indices,
+                kv_indptr,
+                self.attn_sink,
+                self.softmax_scale,
+            )  # [S, H, head_dim]
         else:
-            layout = sparse_layouts[self.compress_ratio]
+            # Pre-built `pack_meta` (built once in `_build_v4_pack_meta_for_ratio`)
+            # carries every CPU/GPU index — the per-layer call is just GPU
+            # index_copy_/select ops.
+            layout = v4_sparse_layouts[ratio]
+            kv_sa, topk_flat = _v4_build_sparse_inputs_batched(
+                kv=kv,
+                swa_kv=self.swa_kv,
+                kv_compress_batched=kv_compress_batched,
+                compressor_kv_cache=self.compressor.kv_cache if ratio else None,
+                block_tables_gpu=block_tables_gpu,
+                window_topk_batched=window_topk_batched,
+                indexer_topk_batched=indexer_topk_batched,
+                pack_meta=layout["pack_meta"],
+                has_indexer=self.indexer is not None,
+                ratio=ratio,
+            )
             topk_starts = layout["topk_starts"]
             topk_lens = layout["topk_lens"]
             kv_offsets = layout["kv_offsets"]
             max_topk = layout["max_topk"]
-
-        o = sparse_attn_ragged_varlen(
-            q_sa,
-            kv_sa,
-            self.attn_sink,
-            topk_flat,
-            topk_starts,
-            topk_lens,
-            kv_offsets,
-            max_topk,
-            self.softmax_scale,
-        ).unsqueeze(0)
+            o = sparse_attn_ragged_varlen(
+                q_sa,
+                kv_sa,
+                self.attn_sink,
+                topk_flat,
+                topk_starts,
+                topk_lens,
+                kv_offsets,
+                max_topk,
+                self.softmax_scale,
+            )  # [S, H, head_dim]
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
         # aiter has no inverse-RoPE kernel; rebuild per-token complex freqs
         # from the rotary_emb's cos/sin cache and reuse the manual multiply.
+        # `_apply_rotary_emb` 3D branch assumes [B, S, D] (broadcasts over B
+        # only); pass a 4D view [1, S, H, D] so the rope cache broadcasts
+        # over B and H. In-place writes hit the underlying storage.
         freqs_slice = self.rotary_emb.freqs_for_positions(positions)
-        _apply_rotary_emb(o[..., -rd:], freqs_slice, inverse=True)
+        _apply_rotary_emb(o.unsqueeze(0)[..., -rd:], freqs_slice, inverse=True)
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
-        o = o.squeeze(0).view(seqlen_total, self.n_local_groups, -1)
+        o = o.view(seqlen_total, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
         x = self.wo_b(o.flatten(1))
         return x
 
+    def _fill_csa_paged_compress(self, attn_md, total_tokens: int) -> None:
+        """Phase C: translate indexer raw `topk_local` → physical paged
+        offsets in `unified_kv` and packed-write into the CSA paged-decode
+        buffer prepared by Phase B (`v4_kv_indices_csa`).
 
-class Gate(nn.Module):
-    """MoE gate with sqrtsoftplus/sigmoid/softmax scoring + hash routing.
+        Per doc §6.4:
+          block_idx_in_seq = topk_local // csa_block_capacity
+          slot_in_block    = topk_local %  csa_block_capacity
+          physical_block   = block_tables[batch_id_per_token[t], block_idx_in_seq]
+          paged_offset     = swa_pages + physical_block * csa_block_capacity
+                             + slot_in_block
 
-    Port of inference/model.py:546-584. For `layer_id < args.n_hash_layers`,
-    routing is by precomputed token-id-to-expert table (`tid2eid`); no scoring,
-    no bias. Otherwise routing is by `score_func(W @ x) + bias` topk.
+        Fully fused into one triton kernel — no [T, index_topk] intermediates,
+        no PyTorch fancy index, single CG node per CSA layer (was 7-8). CG
+        sentinel and OOB clamp are handled in-kernel; downstream
+        `sparse_attn_v4_paged_decode` strict-slices via `kv_indptr_csa`, so
+        tail cols beyond `valid_k` are never read and need no `-1` fill.
 
-    Bias affects expert SELECTION (added before topk) but NOT routing weights —
-    weights come from the original (pre-bias) score gathered at the topk indices.
-    """
+        Only invoked for CSA layers (`ratio == 4`) under is_pure_decode.
+        """
+        from atom.model_ops.v4_kernels import csa_translate_pack
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args):
-        super().__init__()
-        self.dim = args.dim
-        self.topk = args.n_activated_experts
-        self.score_func = args.score_func
-        self.route_scale = args.route_scale
-        self.hash = layer_id < args.n_hash_layers
-        self.weight = atom_parameter(torch.empty(args.n_routed_experts, args.dim))
-        if self.hash:
-            self.tid2eid = atom_parameter(
-                torch.empty(
-                    args.vocab_size, args.n_activated_experts, dtype=torch.int32
-                ),
-            )
-            self.bias = None
-        else:
-            self.bias = atom_parameter(
-                torch.empty(args.n_routed_experts, dtype=torch.float32)
-            )
+        indexer_meta = attn_md.indexer_meta
+        topk_local_raw = indexer_meta["decode_topk_indices_gpu"][
+            :total_tokens
+        ]  # [T, index_topk] int32, seq-local with -1 tails
 
-    def forward(
-        self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        scores = F.linear(x.float(), self.weight.float())
-        if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1)
-        elif self.score_func == "sigmoid":
-            scores = scores.sigmoid()
-        else:  # sqrtsoftplus (V4 default)
-            scores = F.softplus(scores).sqrt()
-        original_scores = scores
-        if self.bias is not None:
-            scores = scores + self.bias
-        if self.hash:
-            assert input_ids is not None, "hash routing requires input_ids"
-            indices = self.tid2eid[input_ids].long()
-        else:
-            indices = scores.topk(self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
-        if self.score_func != "softmax":
-            weights = weights / weights.sum(dim=-1, keepdim=True)
-        weights = weights * self.route_scale
-        return weights, indices
+        # csa_block_capacity = block_size // ratio = 128 // 4 = 32.
+        # `compressor.kv_cache.size(1)` is bound to k1_csa by builder
+        # `build_kv_cache_tensor`, so this stays in sync if config changes.
+        csa_block_capacity = self.compressor.kv_cache.size(1)
+
+        csa_translate_pack(
+            topk_local_raw,
+            attn_md.block_tables,
+            attn_md.n_committed_csa_per_seq,
+            attn_md.kv_indptr_csa,
+            attn_md.batch_id_per_token,
+            attn_md.kv_indices_csa,
+            swa_pages=attn_md.swa_pages,
+            window_size=self.window_size,
+            csa_block_capacity=csa_block_capacity,
+        )
 
 
 class Expert(nn.Module):
@@ -1695,48 +1812,43 @@ class Expert(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        if quant_config is None:
-            self.w1 = nn.Linear(dim, inter_dim, bias=False)
-            self.w2 = nn.Linear(inter_dim, dim, bias=False)
-            self.w3 = nn.Linear(dim, inter_dim, bias=False)
-        else:
-            self.w1 = ColumnParallelLinear(
-                dim,
-                inter_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.w1",
-            )
-            self.w2 = RowParallelLinear(
-                inter_dim,
-                dim,
-                bias=False,
-                quant_config=quant_config,
-                reduce_results=reduce_results,
-                prefix=f"{prefix}.w2",
-            )
-            self.w3 = ColumnParallelLinear(
-                dim,
-                inter_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.w3",
-            )
+        # Fused [w1; w3] (gate_up_proj): both share input x, both ColumnParallel
+        # — standard llama/dsv2 fusion. Disk still split; routed via
+        # packed_modules_mapping in DeepseekV4ForCausalLM.
+        self.gate_up_proj = MergedColumnParallelLinear(
+            dim,
+            [inter_dim, inter_dim],
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.w2 = RowParallelLinear(
+            inter_dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            prefix=f"{prefix}.w2",
+        )
         self.swiglu_limit = swiglu_limit
 
     def forward(
-        self, x: torch.Tensor, weights: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        weights: Optional[torch.Tensor] = None,  # [num_tokens, 1]  optional gate
+    ) -> torch.Tensor:  # [num_tokens, dim]
         dtype = x.dtype
-        gate = self.w1(x).float()
-        up = self.w3(x).float()
+        # Single fused GEMM, then chunk(2) along last dim so TP-sharded per-rank
+        # output (inter_dim_per_tp * 2) is split correctly regardless of tp_size.
+        combined = self.gate_up_proj(x).float()  # [num_tokens, 2*inter_dim_per_tp]
+        gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, inter_dim_per_tp]
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
-        x = F.silu(gate) * up
+        x = F.silu(gate) * up  # [num_tokens, inter_dim_per_tp]
         if weights is not None:
             x = weights * x
-        return self.w2(x.to(dtype))
+        return self.w2(x.to(dtype))  # [num_tokens, dim]
 
 
 class MoE(nn.Module):
@@ -1756,76 +1868,87 @@ class MoE(nn.Module):
     will produce incorrect routing; correct hash routing lands in PR3+.
     """
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ):
         super().__init__()
         self.layer_id = layer_id
+        self.prefix = prefix
         self.dim = args.dim
         self.n_routed_experts = args.n_routed_experts
         self.n_activated_experts = args.n_activated_experts
         self.is_hash_layer = layer_id < args.n_hash_layers
         self.routed_scaling_factor = args.route_scale
-        qc = args.quant_config
-        # FusedMoE requires `get_current_atom_config()` (TP/EP/dtype globals).
-        # When that's not set (toy / dummy validation path), fall back to the
-        # manual per-expert path which preserves PR1 bit-exact reference parity.
-        self.use_fused = qc is not None and _have_current_atom_config()
-        self.use_torch_moe = bool(os.environ.get("ATOM_V4_TORCH_MOE"))
         self.swiglu_limit = args.swiglu_limit
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.alt_stream = alt_stream
+        qc = args.quant_config
 
-        if self.use_fused:
-            # ----- Production path: ReplicatedLinear gate + FusedMoE experts -----
-            self.gate = ReplicatedLinear(
-                self.dim,
-                self.n_routed_experts,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.gate",
+        self.gate = ReplicatedLinear(
+            self.dim,
+            self.n_routed_experts,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.gate",
+        )
+        # V4 hash-routed layers (layer_id < n_hash_layers) use tid2eid lookup,
+        # not bias-corrected gate-logit routing — checkpoint has no
+        # `gate.bias` for those layers. Only allocate the bias for
+        # sqrtsoftplus layers to avoid 3 spurious unloaded-param warnings.
+        if not self.is_hash_layer:
+            self.gate.e_score_correction_bias = atom_parameter(
+                torch.empty(self.n_routed_experts, dtype=torch.float32)
             )
-            # V4 hash-routed layers (layer_id < n_hash_layers) use tid2eid lookup,
-            # not bias-corrected gate-logit routing — checkpoint has no
-            # `gate.bias` for those layers. Only allocate the bias for
-            # sqrtsoftplus layers to avoid 3 spurious unloaded-param warnings.
-            if not self.is_hash_layer:
-                self.gate.e_score_correction_bias = atom_parameter(
-                    torch.empty(self.n_routed_experts, dtype=torch.float32)
-                )
-            if self.is_hash_layer:
-                # tid2eid: per-token-id top-k expert lookup table (V4 first 3
-                # layers use this in lieu of gate-logit routing).
-                self.gate.tid2eid = atom_parameter(
-                    torch.empty(
-                        args.vocab_size, args.n_activated_experts, dtype=torch.int32
-                    ),
-                )
-                # Cache for input_ids — set by forward() right before the FusedMoE
-                # call so the custom routing closure can index tid2eid.
-                self._hash_input_ids: Optional[torch.Tensor] = None
-
-            from types import SimpleNamespace
-
-            moe_cfg = SimpleNamespace(
-                routed_scaling_factor=self.routed_scaling_factor,
-                n_shared_experts=args.n_shared_experts,
-            )
-            self.experts = FusedMoE(
-                num_experts=self.n_routed_experts,
-                top_k=self.n_activated_experts,
-                hidden_size=self.dim,
-                intermediate_size=args.moe_inter_dim,
-                reduce_results=False,
-                renormalize=True,
-                quant_config=qc,
-                use_grouped_topk=False,
-                prefix=f"{prefix}.experts",
-                scoring_func=args.score_func,  # "sqrtsoftplus"
-                e_score_correction_bias=getattr(
-                    self.gate, "e_score_correction_bias", None
+        else:
+            # tid2eid: per-token-id top-k expert lookup table (V4 first 3
+            # layers use this in lieu of gate-logit routing).
+            self.gate.tid2eid = atom_parameter(
+                torch.empty(
+                    args.vocab_size, args.n_activated_experts, dtype=torch.int32
                 ),
-                config=moe_cfg,
             )
-            self.experts.swiglu_limit = args.swiglu_limit
-            assert args.n_shared_experts == 1
+            # Cache for input_ids — set by forward() right before the FusedMoE
+            # call so the custom routing closure can index tid2eid.
+            self._hash_input_ids: Optional[torch.Tensor] = None
+
+        moe_cfg = SimpleNamespace(
+            routed_scaling_factor=self.routed_scaling_factor,
+            n_shared_experts=args.n_shared_experts,
+        )
+        self.experts = FusedMoE(
+            num_experts=self.n_routed_experts,
+            top_k=self.n_activated_experts,
+            hidden_size=self.dim,
+            intermediate_size=args.moe_inter_dim,
+            reduce_results=False,
+            renormalize=True,
+            quant_config=qc,
+            use_grouped_topk=False,
+            prefix=f"{prefix}.experts",
+            scoring_func=args.score_func,  # "sqrtsoftplus"
+            e_score_correction_bias=getattr(self.gate, "e_score_correction_bias", None),
+            config=moe_cfg,
+        )
+        self.experts.swiglu_limit = args.swiglu_limit
+        assert args.n_shared_experts == 1
+        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
+        # when shared and routed have the same quant dtype.
+        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
+        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
+        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
+        # True for V4 because shared matches global, missing the routed-shared
+        # mismatch. Direct comparison: get routed and shared specs and compare.
+        routed_dtype = qc.get_layer_quant_config(f"{prefix}.experts").quant_dtype
+        shared_dtype = qc.get_layer_quant_config(f"{prefix}.shared_experts").quant_dtype
+        self._fuse_shared_into_routed = (
+            routed_dtype == shared_dtype
+            and is_rocm_aiter_fusion_shared_expert_enabled()
+        )
+        if not self._fuse_shared_into_routed:
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
@@ -1834,25 +1957,30 @@ class MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
-            if self.is_hash_layer:
-                # Inject hash routing into FusedMoE.select_experts via the
-                # custom_routing_function hook (added in atom/model_ops/moe.py).
-                self.experts.custom_routing_function = self._hash_topk
         else:
-            # ----- Toy / dummy path: manual Gate + per-expert nn.Linear -----
-            # Preserves bit-exact reference parity for PR1 verify (no FusedMoE
-            # math drift, no requirement on global atom config).
-            self.gate = Gate(layer_id, args)
-            self.experts = nn.ModuleList(
-                [
-                    Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
-                    for _ in range(self.n_routed_experts)
-                ]
-            )
-            assert args.n_shared_experts == 1
-            self.shared_experts = Expert(
-                args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit
-            )
+            self.shared_experts = None
+        if self.is_hash_layer:
+            # Inject hash routing into FusedMoE.select_experts via the
+            # custom_routing_function hook (added in atom/model_ops/moe.py).
+            self.experts.custom_routing_function = self._hash_topk
+
+        # Dual-stream: run shared_experts on `alt_stream` in parallel with
+        # routed experts on the current stream. Mirrors V2's pattern. Only
+        # active when shared_experts exist (not fused into routed) AND the
+        # env threshold is positive AND we got an alt_stream from the model.
+        # Per-call token count gating happens inside the custom op dispatcher
+        # — prefill (large batch) skips dual-stream (overhead > benefit).
+        self._use_dual_stream = (
+            self.shared_experts is not None
+            and self.alt_stream is not None
+            and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+        )
+        if self._use_dual_stream:
+            # Register self in static_forward_context so the custom op
+            # dispatcher can look us up by `layer_name` (= self.prefix).
+            get_current_atom_config().compilation_config.static_forward_context[
+                prefix
+            ] = self
 
     def _hash_topk(
         self,
@@ -1881,155 +2009,110 @@ class MoE(nn.Module):
         topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights, topk_ids
 
-    def _torch_moe_forward(
-        self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Per-expert torch loop using unshuffled FP4 weights from FusedMoE.
+    def routed_expert_forward(
+        self, x: torch.Tensor  # [num_tokens, dim]
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """Gate + FusedMoE routed-expert pass.
 
-        Supports swiglu_limit clamping that the fused kernel path cannot do.
-        Requires ATOM_V4_TORCH_MOE=1 (skips weight shuffle in post-load).
+        For hash layers the gate's `tid2eid` lookup needs `input_ids`; we
+        stash it on `self._hash_input_ids` in `forward()` before reaching
+        here so `_hash_topk` (FusedMoE's custom_routing_function callback)
+        can read it.
         """
-        from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+        router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        return self.experts(hidden_states=x, router_logits=router_logits)
 
-        w13 = self.experts.w13_weight  # [E, 2*inter_tp, H//2] fp4x2
-        w2 = self.experts.w2_weight  # [E, H, inter_tp//2] fp4x2
-        w13_s = self.experts.w13_weight_scale  # [E, 2*inter_tp, H//32] uint8
-        w2_s = self.experts.w2_weight_scale  # [E, H, inter_tp//32] uint8
+    def combine_outputs(
+        self,
+        routed: torch.Tensor,  # [num_tokens, dim]
+        shared: Optional[torch.Tensor],  # [num_tokens, dim] or None
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """Add shared-expert contribution (when not fused into routed) and
+        all-reduce across TP ranks.
+        """
+        if shared is not None:
+            routed = routed + shared
+        if self.tp_size > 1:
+            routed = tensor_model_parallel_all_reduce(routed)
+        return routed
 
-        E = w13.shape[0]
-        inter_tp = w13.shape[1] // 2
-        limit = self.swiglu_limit
+    def single_stream_moe_forward(
+        self, x: torch.Tensor  # [num_tokens, dim]
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """Sequential: shared_experts → routed_experts → combine."""
+        shared = self.shared_experts(x) if self.shared_experts is not None else None
+        routed = self.routed_expert_forward(x)
+        return self.combine_outputs(routed, shared)
 
-        y = torch.zeros_like(x, dtype=torch.float32)
-        for e_id in range(E):
-            mask = topk_ids == e_id
-            if not mask.any():
-                continue
-            idx = mask.nonzero(as_tuple=False)
-            tok_idx = idx[:, 0]
-            top_idx = idx[:, 1]
-            sub_x = x[tok_idx].float()
-            sub_w = topk_weights[tok_idx, top_idx].unsqueeze(-1)
-            # V4_USE_REF_QUANT: round-trip sub_x through FP8 ue8m0 to mirror
-            # ref Expert.forward (which quantizes input to FP8 with ue8m0
-            # scale via act_quant before fp4_gemm). See notes/17.
-            if os.environ.get("V4_USE_REF_QUANT", "0") == "1":
-                from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
+    def dual_stream_moe_forward(
+        self, x: torch.Tensor  # [num_tokens, dim]
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """Run shared_experts on `alt_stream` in parallel with routed_experts
+        on the current stream. Mirrors V2's pattern. Both reads of `x` are
+        independent; main stream waits on alt_stream's completion before
+        combining.
+        """
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            shared = self.shared_experts(x)
+        routed = self.routed_expert_forward(x)
+        current_stream.wait_stream(self.alt_stream)
+        return self.combine_outputs(routed, shared)
 
-                sub_x = sub_x.to(torch.bfloat16)
-                _v4_aqi(sub_x, 128, "ue8m0")
-                sub_x = sub_x.float()
-
-            # Dequant w1/w3 (gate/up) from FP4
-            w13_e = mxfp4_to_f32(w13[e_id])  # [2*inter_tp, H]
-            w13_s_e = e8m0_to_f32(w13_s[e_id].contiguous().view(torch.float8_e8m0fnu))
-            # Apply block scale: w13 [2*inter_tp, H], scale [2*inter_tp, H//32]
-            w13_f = w13_e.view(2 * inter_tp, -1, 32) * w13_s_e.view(2 * inter_tp, -1, 1)
-            w13_f = w13_f.reshape(2 * inter_tp, -1)
-            w1_f = w13_f[:inter_tp]  # gate [inter_tp, H]
-            w3_f = w13_f[inter_tp:]  # up   [inter_tp, H]
-
-            gate = sub_x @ w1_f.T  # [N, inter_tp]
-            up = sub_x @ w3_f.T
-
-            if limit > 0:
-                gate = gate.clamp(max=limit)
-                up = up.clamp(-limit, limit)
-            act = F.silu(gate) * up * sub_w  # weight before w2
-
-            # Dequant w2 (down) from FP4
-            w2_e = mxfp4_to_f32(w2[e_id])  # [H, inter_tp]
-            w2_s_e = e8m0_to_f32(w2_s[e_id].contiguous().view(torch.float8_e8m0fnu))
-            w2_f = w2_e.view(-1, w2_e.shape[1] // 1, 1) * 1.0  # placeholder
-            # Correct: w2 [H, inter_tp], scale [H, inter_tp//32]
-            w2_f = w2_e.view(w2_e.shape[0], -1, 32) * w2_s_e.view(
-                w2_s_e.shape[0], -1, 1
-            )
-            w2_f = w2_f.reshape(w2_e.shape[0], -1)
-
-            act_bf = act.to(torch.bfloat16)
-            if os.environ.get("V4_USE_REF_QUANT", "0") == "1":
-                from atom.model_ops.quant_v4 import act_quant_inplace as _v4_aqi
-
-                _v4_aqi(act_bf, 128, "ue8m0")
-            out = act_bf.float() @ w2_f.T  # [N, H]
-            y[tok_idx] += out
-
-        return y
-
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        if self.use_fused and self.use_torch_moe:
-            # Torch fallback: use FusedMoE's select_experts for routing,
-            # then per-expert torch loop with FP4 dequant + swiglu_limit clamp.
-            router_logits = self.gate(x)
-            if self.is_hash_layer:
-                self._hash_input_ids = input_ids
-            topk_weights, topk_ids = FusedMoE.select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=self.n_activated_experts,
-                use_grouped_topk=False,
-                renormalize=True,
-                custom_routing_function=(
-                    self._hash_topk if self.is_hash_layer else None
-                ),
-                scoring_func=self.experts.scoring_func,
-                e_score_correction_bias=getattr(
-                    self.gate, "e_score_correction_bias", None
-                ),
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-            if self.is_hash_layer:
-                self._hash_input_ids = None
-            y = self._torch_moe_forward(x, topk_weights, topk_ids)
-        elif self.use_fused:
-            router_logits = self.gate(x)
-            if self.is_hash_layer:
-                self._hash_input_ids = input_ids
-            y = self.experts(hidden_states=x, router_logits=router_logits)
-            if self.is_hash_layer:
-                self._hash_input_ids = None
+    def forward(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]  hidden state (post ffn_norm)
+        input_ids: torch.Tensor,  # [num_tokens] int  for hash-routed layers
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        # Stash input_ids for hash layers — `_hash_topk` reads it via self.
+        # Cleared after the dispatched MoE forward returns to avoid holding
+        # a stale reference across forwards.
+        if self.is_hash_layer:
+            self._hash_input_ids = input_ids
+        if self._use_dual_stream:
+            # Shared custom op (also used by V2). Dispatcher reads
+            # `_use_dual_stream` + per-call num_tokens vs threshold to pick
+            # dual vs single. Custom op = Dynamo barrier so stream context
+            # inside `dual_stream_moe_forward` is opaque to torch.compile.
+            y = torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
         else:
-            weights, indices = self.gate(x, input_ids.flatten())
-            y = torch.zeros_like(x, dtype=torch.float32)
-            counts = torch.bincount(
-                indices.flatten(), minlength=self.n_routed_experts
-            ).tolist()
-            for i in range(self.n_routed_experts):
-                if counts[i] == 0:
-                    continue
-                idx, top = torch.where(indices == i)
-                y[idx] = y[idx] + self.experts[i](x[idx], weights[idx, top, None])
-        # shared_out = self.shared_experts(x)
-        # y = y + shared_out
-        if self.use_fused and self.tp_size > 1:
-            from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-
-            y = tensor_model_parallel_all_reduce(y)
-        return y.type_as(x).view(shape)
+            y = self.single_stream_moe_forward(x)
+        if self.is_hash_layer:
+            self._hash_input_ids = None
+        return y
 
 
 class Block(nn.Module):
     """Transformer block with Manifold-Constrained Hyper-Connections (mHC).
 
-    Port of inference/model.py:648-701. The residual stream is widened to
-    `[B, S, hc_mult, D]`. Each sub-layer (attn / ffn):
-      1. `hc_pre`: project `[B, S, hc_mult, D]` -> `[B, S, D]` via Sinkhorn-projected
-         pre-weights (also producing post-weights and combination matrix for hc_post).
-      2. `attn_norm` + `attn` (or `ffn_norm` + `ffn`): standard sub-layer in `[B, S, D]`.
-      3. `hc_post`: expand `[B, S, D]` back to `[B, S, hc_mult, D]` using the
-         post-weights (gate on the new contribution) + the combination matrix
-         applied to the previous residual.
+    Port of inference/model.py:648-701. ATOM 2D-flat convention: the residual
+    stream is widened to `[num_tokens, hc_mult, dim]`. Each sub-layer (attn / ffn):
+      1. `hc_pre`: project `[num_tokens, hc_mult, dim]` → `[num_tokens, dim]` via
+         Sinkhorn-projected pre-weights (also producing post-weights and combination
+         matrix for hc_post).
+      2. `attn_norm` + `attn` (or `ffn_norm` + `ffn`): standard sub-layer in
+         `[num_tokens, dim]`.
+      3. `hc_post`: expand `[num_tokens, dim]` back to `[num_tokens, hc_mult, dim]`
+         using the post-weights (gate on the new contribution) + the combination
+         matrix applied to the previous residual.
     """
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, prefix: str = ""):
+    def __init__(
+        self,
+        layer_id: int,
+        args: DeepseekV4Args,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.attn = DeepseekV4Attention(layer_id, args, prefix=f"{prefix}.attn")
-        self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn")
+        self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn", alt_stream=alt_stream)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
@@ -2049,50 +2132,42 @@ class Block(nn.Module):
         self.hc_attn_scale = atom_parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = atom_parameter(torch.empty(3, dtype=torch.float32))
 
+        # aiter mhc_pre/post kernels assert hidden % 512 == 0 OR hidden % 256 == 0
+        # (mhc_kernels.cu:864 calls __builtin_trap on violation). Bind kernel refs
+        # at init: present + dim-compatible → use fused; else None → torch fallback.
+        # `x.is_cuda` is implicit here — model lives on GPU post-`.to()`; a CPU tensor
+        # would have crashed earlier in DeepseekV4Attention.
+        _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
+        self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
+        self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
+
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
 
     def hc_pre(
         self,
-        x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
+        residual: torch.Tensor,  # [num_tokens, hc, dim]  mHC-widened residual
+        hc_fn: torch.Tensor,  # [mix_hc, hc*dim]  fp32
+        hc_scale: torch.Tensor,  # [3] fp32
+        hc_base: torch.Tensor,  # [mix_hc] fp32
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reduce [..., hc, D] residual to [..., D] sub-layer input.
+        """Reduce mHC residual `[num_tokens, hc, dim]` to sub-layer input `[num_tokens, dim]`.
 
         Prefers the fused aiter `mhc_pre` kernel (single ROCm op for RMSNorm +
         hc-fn linear + Sinkhorn projection + weighted reduction). Falls back to
-        the torch `hc_split_sinkhorn` reference implementation when aiter is
-        unavailable (toy validation paths in PR1).
+        the torch `hc_split_sinkhorn` reference when the aiter kernel is
+        unavailable or `dim` doesn't satisfy the `% 256/512 == 0` constraint.
 
-        Shape-agnostic in leading dims: works for [B, S, hc, D] (legacy 4D) and
-        [num_tokens, hc, D] (ATOM 2D-flat convention) alike.
-
-        Returns: (layer_input, post, comb) — order matches torch fallback.
+        Returns:
+          y:    [num_tokens, dim]      sub-layer input
+          post: [num_tokens, hc]       post-gate weights for hc_post
+          comb: [num_tokens, hc, hc]   combination matrix for hc_post
         """
-        # Fused path: aiter.mhc_pre takes the residual as [m, hc_mult, dim] and
-        # returns (post_mix [m, hc, 1], comb_mix [m, hc, hc], layer_input [m, dim]).
-        # When the leading dims are >2 (e.g. [B, S, hc, D]), flatten to [B*S, hc, D]
-        # and unflatten the outputs.
-        try:
-            import aiter as _aiter  # local import; avoids hard dep at module load
-
-            mhc_pre = getattr(_aiter, "mhc_pre", None)
-        except ImportError:
-            mhc_pre = None
-        # aiter mhc_pre kernel asserts hidden % 512 == 0 OR hidden % 256 == 0
-        # (mhc_kernels.cu:864 calls __builtin_trap on violation, NOT a raise).
-        # Pre-check in Python so toy / small-dim configs gracefully fall through.
-        dim = x.shape[-1]
-        aiter_ok = (
-            mhc_pre is not None and x.is_cuda and (dim % 512 == 0 or dim % 256 == 0)
-        )
-        if aiter_ok:
-            lead = x.shape[:-2]
-            r = x.reshape(-1, *x.shape[-2:])  # [M, hc, D]
-            post, comb, y = mhc_pre(
-                r,
+        if self._mhc_pre is not None:
+            # aiter mhc_pre wants [M, hc, dim] and returns
+            # (post [M, hc, 1], comb [M, hc, hc], y [M, dim]).
+            post, comb, y = self._mhc_pre(
+                residual,
                 hc_fn,
                 hc_scale,
                 hc_base,
@@ -2102,19 +2177,13 @@ class Block(nn.Module):
                 self.HC_POST_MULT,
                 int(self.hc_sinkhorn_iters),
             )
-            post = post.squeeze(-1)  # aiter: [M, hc, 1] → [M, hc]
-            return (
-                y.reshape(*lead, y.shape[-1]),
-                post.reshape(*lead, post.shape[-1]),
-                comb.reshape(*lead, *comb.shape[-2:]),
-            )
+            return y, post.squeeze(-1), comb
 
-        # Torch fallback (PR1 toy mode / no-aiter): mirrors the reference math.
-        shape, dtype = x.size(), x.dtype
-        x = x.flatten(-2)  # [..., hc*D]
-        hc_dim = x.shape[-1]
-        x_normed = _rmsnorm_nw(x, self.norm_eps, hc_dim)
-        mixes = F.linear(x_normed.float(), hc_fn)  # [..., mix_hc]
+        # Torch fallback (no-aiter): mirrors the reference math.
+        dtype = residual.dtype
+        x_flat = residual.flatten(-2)  # [num_tokens, hc*dim]
+        x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1])
+        mixes = F.linear(x_normed.float(), hc_fn)  # [num_tokens, mix_hc]
         pre, post, comb = hc_split_sinkhorn(
             mixes,
             hc_scale,
@@ -2123,57 +2192,37 @@ class Block(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
+        y = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)  # [num_tokens, dim]
         return y.to(dtype), post, comb
 
     def hc_post(
         self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-    ) -> torch.Tensor:
-        """Expand [..., D] sub-layer output back to [..., hc, D] residual.
+        x: torch.Tensor,  # [num_tokens, dim]      sub-layer output
+        residual: torch.Tensor,  # [num_tokens, hc, dim]  pre-layer residual
+        post: torch.Tensor,  # [num_tokens, hc]       from hc_pre
+        comb: torch.Tensor,  # [num_tokens, hc, hc]   from hc_pre
+    ) -> torch.Tensor:  # [num_tokens, hc, dim]  new residual
+        """Expand sub-layer output `[num_tokens, dim]` back to mHC residual
+        `[num_tokens, hc, dim]`.
 
-        Defaults to the torch reference; aiter `mhc_post` is opt-in via
-        `V4_AITER_HC_POST=1`. The aiter kernel produces small numerical drift
-        per call that compounds over 30+ autoregressive decode steps and
-        collapses long generations into degenerate same-word repetition; the
-        torch path is bit-stable across the full decode trajectory. See
-        `/app/logs_claude/deepseek_v4/notes/12_aiter_mhc_post_root_cause.md`
-        for the diagnosis. Re-enable aiter once the kernel is fixed upstream.
+        Prefers the fused aiter `mhc_post` kernel; falls back to the torch
+        reference when aiter is unavailable or shape constraints aren't met
+        (kernel asserts hidden % 512 == 0 OR hidden % 256 == 0).
+
+        See `/app/logs_claude/deepseek_v4/notes/12_aiter_mhc_post_root_cause.md`
+        for past numerical-drift notes on long decode trajectories.
         """
-        import os as _os
+        if self._mhc_post is not None:
+            # `out` inherits residual.dtype = x.dtype (residual stream is BF16
+            # end-to-end in Block.forward), so no cast needed on the kernel path.
+            out = torch.empty_like(residual)
+            self._mhc_post(out, x, residual, post.unsqueeze(-1), comb)
+            return out
 
-        if _os.environ.get("V4_AITER_HC_POST", "") == "1":
-            try:
-                import aiter as _aiter
-
-                mhc_post = getattr(_aiter, "mhc_post", None)
-            except ImportError:
-                mhc_post = None
-            dim = residual.shape[-1]
-            aiter_ok = (
-                mhc_post is not None
-                and x.is_cuda
-                and (dim % 512 == 0 or dim % 256 == 0)
-            )
-        else:
-            aiter_ok = False
-        if aiter_ok:
-            lead = residual.shape[:-2]
-            x_ = x.reshape(-1, x.shape[-1])
-            r_ = residual.reshape(-1, *residual.shape[-2:])
-            post_ = post.reshape(-1, post.shape[-1]).unsqueeze(-1)
-            comb_ = comb.reshape(-1, *comb.shape[-2:])
-            out = torch.empty_like(r_)
-            mhc_post(out, x_, r_, post_, comb_)
-            return out.reshape(*lead, *r_.shape[-2:]).type_as(x)
-
-        # Torch fallback.
-        # x: [..., D]; residual: [..., hc, D]
-        # post.unsqueeze(-1) * x.unsqueeze(-2): [..., hc, D] gating
-        # comb.unsqueeze(-1) * residual.unsqueeze(-2): [..., hc, hc, D]; sum over hc-dim
+        # Torch fallback. fp32 (post, comb) × BF16 (x, residual) promotes to
+        # fp32 by PyTorch promotion rules — cast back to x.dtype before return.
+        # post.unsqueeze(-1) * x.unsqueeze(-2): [num_tokens, hc, dim] gating
+        # comb.unsqueeze(-1) * residual.unsqueeze(-2): [num_tokens, hc, hc, dim]; sum over hc
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
             comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3
         )
@@ -2181,27 +2230,30 @@ class Block(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        input_ids: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-
+        x: torch.Tensor,  # [num_tokens, hc, dim]  mHC residual stream
+        positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+        input_ids: Optional[
+            torch.Tensor
+        ],  # [num_tokens] int  for hash-routed MoE layers
+    ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
         # ----- Attention sub-layer with mHC mixing -----
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        residual = x  # [num_tokens, hc, dim]
+        x, post, comb = (
+            self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
         )
-        x = self.attn_norm(x)
-        x = self.attn(x, positions)
-        x = self.hc_post(x, residual, post, comb)
+        x = self.attn_norm(x)  # [num_tokens, dim]
+        x = self.attn(x, positions)  # [num_tokens, dim]
+        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
         # ----- FFN sub-layer with mHC mixing -----
-        residual = x
+        residual = x  # [num_tokens, hc, dim]
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
+        x = self.ffn_norm(x)  # [num_tokens, dim]
+        x = self.ffn(x, input_ids)  # [num_tokens, dim]
+        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
         return x
 
 
@@ -2210,11 +2262,12 @@ class ParallelHead(nn.Module):
 
     Port of inference/model.py:704-736. Unlike `Block.hc_pre` (which uses
     Sinkhorn projection on the combination matrix), `hc_head` uses simple
-    `Sigmoid(mix*scale + base) + eps` weights to reduce the [B, S, hc, D]
-    residual to [B, S, D] before applying the LM head linear projection.
+    `Sigmoid(mix*scale + base) + eps` weights to reduce the [num_tokens, hc, dim]
+    residual to [num_tokens, dim] before applying the LM head linear projection.
 
-    `get_logits` projects only the last token (decode mode); for prefill the
-    caller should slice the desired positions before passing through.
+    `get_logits` projects only the last token of each sequence (decode mode);
+    for prefill the caller should slice the desired positions before passing
+    through.
     """
 
     def __init__(
@@ -2230,63 +2283,61 @@ class ParallelHead(nn.Module):
             torch.empty(self.vocab_size, self.dim, dtype=torch.float32)
         )
 
-    def get_logits(self, x: torch.Tensor) -> torch.Tensor:
+    def get_logits(
+        self, x: torch.Tensor  # [num_tokens, dim]
+    ) -> torch.Tensor:  # [bs, vocab]
         """Project the last-token-per-seq slice of `x` to vocab logits.
 
-        Accepts either:
-          - 2D [num_tokens, D] (ATOM ragged-batch convention): picks the
-            last token of each sequence using `cu_seqlens_q` from the
-            forward_context — returns `[bs, vocab]`. Falls back to `x[-1:]`
-            (single-seq) when no forward_context is set (warmup / standalone).
-          - 3D [B, S, D] (legacy): takes `x[:, -1, :]` → `[B, vocab]`.
+        Picks the last token of each sequence using `cu_seqlens_q` from the
+        forward_context. Falls back to `x[-1:]` (single-seq) when no
+        forward_context is set (warmup / standalone).
         """
-        if x.dim() == 2:
-            ctx = get_forward_context()
-            cu_seqlens_q = (
-                ctx.attn_metadata.cu_seqlens_q
-                if ctx is not None and ctx.attn_metadata is not None
-                else None
-            )
-            if cu_seqlens_q is not None and cu_seqlens_q.numel() >= 2:
-                # Last-token positions per seq: cu_seqlens_q[1:bs+1] - 1.
-                # block_tables tells us the actual scheduled bs (cu_seqlens_q
-                # may have trailing zeros from the CpuGpuBuffer pool).
-                bs = ctx.attn_metadata.block_tables.size(0)
-                last_idx = cu_seqlens_q[1 : bs + 1] - 1
-                return F.linear(x.index_select(0, last_idx.long()).float(), self.weight)
-            return F.linear(x[-1:].float(), self.weight)
-        return F.linear(x[:, -1].float(), self.weight)
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"get_logits expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        ctx = get_forward_context()
+        cu_seqlens_q = (
+            ctx.attn_metadata.cu_seqlens_q
+            if ctx is not None and ctx.attn_metadata is not None
+            else None
+        )
+        if cu_seqlens_q is not None and cu_seqlens_q.numel() >= 2:
+            # Last-token positions per seq: cu_seqlens_q[1:bs+1] - 1.
+            # block_tables tells us the actual scheduled bs (cu_seqlens_q
+            # may have trailing zeros from the CpuGpuBuffer pool).
+            bs = ctx.attn_metadata.block_tables.size(0)
+            last_idx = cu_seqlens_q[1 : bs + 1] - 1
+            return F.linear(x.index_select(0, last_idx.long()).float(), self.weight)
+        return F.linear(x[-1:].float(), self.weight)
 
     def hc_head(
         self,
-        x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-    ) -> torch.Tensor:
-        """Reduce [..., hc, D] → [..., D] via Sigmoid-gated weighted sum.
-
-        Shape-agnostic in leading dims (mirrors Block.hc_pre / hc_post).
+        x: torch.Tensor,  # [num_tokens, hc, dim]  mHC residual
+        hc_fn: torch.Tensor,  # [hc, hc*dim]  fp32
+        hc_scale: torch.Tensor,  # [1] fp32
+        hc_base: torch.Tensor,  # [hc] fp32
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
+        via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
-        shape, dtype = x.size(), x.dtype
-        x = x.flatten(-2)  # [..., hc*D]
-        hc_dim = x.shape[-1]
-        x_normed = _rmsnorm_nw(x, self.norm_eps, hc_dim)
-        mixes = F.linear(x_normed.float(), hc_fn)
+        dtype = x.dtype
+        x_flat = x.flatten(-2)  # [num_tokens, hc*dim]
+        x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1])
+        mixes = F.linear(x_normed.float(), hc_fn)  # [num_tokens, hc]
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
+        y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)  # [num_tokens, dim]
         return y.to(dtype)
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,  # [num_tokens, hc, dim]
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
         norm: nn.Module,
-    ) -> torch.Tensor:
-        x = self.hc_head(x, hc_fn, hc_scale, hc_base)
-        logits = self.get_logits(norm(x))
+    ) -> torch.Tensor:  # [bs, vocab]
+        x = self.hc_head(x, hc_fn, hc_scale, hc_base)  # [num_tokens, dim]
+        logits = self.get_logits(norm(x))  # [bs, vocab]
         # PR1 single-rank: skip all_gather
         return logits
 
@@ -2343,33 +2394,24 @@ class MTPBlock(Block):
         self.head: Optional[ParallelHead] = None
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, input_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Forward.
-
-        Args:
-            x: residual stream from main model. Either [num_tokens, hc, D]
-                (ATOM 2D-flat convention) or [B, S, hc, D] (legacy 4D).
-            positions: [num_tokens] absolute token positions.
-            input_ids: matching token ids.
-        Returns:
-            Logits of the last token (vocab projected by self.head).
-        """
+        self,
+        x: torch.Tensor,  # [num_tokens, hc, dim]  residual stream from main model
+        positions: torch.Tensor,  # [num_tokens] int  absolute positions
+        input_ids: torch.Tensor,  # [num_tokens] int
+    ) -> torch.Tensor:  # [bs, vocab]  last-token logits via self.head
         assert (
             self.embed is not None and self.head is not None
         ), "MTPBlock requires .embed and .head to be assigned by the parent model"
-        e = self.embed(input_ids)  # [num_tokens, D] or [B, S, D]
-        e = self.enorm(e)
-        x = self.hnorm(x)
-        # Mix embedding + hidden into a fresh residual stream. The unsqueeze
-        # adds the hc dim before the trailing D so [num_tokens, D] → [num_tokens, 1, D]
-        # broadcasts correctly against x [num_tokens, hc, D]. Same for 4D path.
-        x = self.e_proj(e).unsqueeze(-2) + self.h_proj(x)
-        x = super().forward(x, positions, input_ids)
-        logits = self.head(
+        e = self.enorm(self.embed(input_ids))  # [num_tokens, dim]
+        x = self.hnorm(x)  # [num_tokens, hc, dim]
+        # Mix token-embed + hidden into a fresh residual. e_proj output is
+        # [num_tokens, dim]; unsqueeze adds the hc axis so it broadcasts
+        # against h_proj(x) [num_tokens, hc, dim].
+        x = self.e_proj(e).unsqueeze(-2) + self.h_proj(x)  # [num_tokens, hc, dim]
+        x = super().forward(x, positions, input_ids)  # [num_tokens, hc, dim]
+        return self.head(
             x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
         )
-        return logits
 
 
 class DeepseekV4Model(nn.Module):
@@ -2396,9 +2438,20 @@ class DeepseekV4Model(nn.Module):
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
         # directly. At TP>1 each rank holds vocab_size/tp rows.
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
+        # alt_stream for dual-stream MoE (shared_experts // routed_experts).
+        # Allocated once and shared across all blocks; MoE.__init__ decides
+        # per-layer whether to actually use it (env-gated, mismatched-dtype-aware).
+        self.alt_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if torch.cuda.is_available() else None
+        )
         self.layers = nn.ModuleList(
             [
-                Block(layer_id, args, prefix=f"layers.{layer_id}")
+                Block(
+                    layer_id,
+                    args,
+                    prefix=f"layers.{layer_id}",
+                    alt_stream=self.alt_stream,
+                )
                 for layer_id in range(args.n_layers)
             ]
         )
@@ -2426,27 +2479,19 @@ class DeepseekV4Model(nn.Module):
     @torch.inference_mode()
     def forward(
         self,
-        input_ids: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
+        positions: Optional[torch.Tensor] = None,  # [num_tokens] int  abs positions
         **model_kwargs: dict,
-    ) -> torch.Tensor:
-        """Forward.
+    ) -> (
+        torch.Tensor
+    ):  # [num_tokens, dim]  hidden_states (vocab head deferred to compute_logits)
+        """Forward over `num_tokens` flat ragged-batch tokens.
 
-        Args:
-            input_ids: 1D `[num_tokens]` (ATOM 2D-flat convention) OR 2D
-                `[B, S]` (legacy reference convention; treated as a single
-                sequence of B*S tokens — only correct for B=1).
-            positions: [num_tokens] absolute token positions. If None, defaults
-                to `arange(num_tokens)` (i.e. start_pos=0 prefill).
-        Returns:
-            Logits of the last token: `[vocab]` (1D path) or `[B, vocab]` (2D path).
+        Returns hidden_states `[num_tokens, dim]` — the vocab projection is
+        deferred to `compute_logits` to satisfy ATOM's CUDAGraph contract
+        (capture buffer is sized to hidden_size, not vocab).
         """
-        # Normalize input_ids to 1D [num_tokens] for the 2D internal convention.
-        if input_ids.dim() == 2:
-            assert (
-                input_ids.size(0) == 1
-            ), "B>1 batched input_ids needs attn_metadata; not supported yet"
-            input_ids = input_ids.flatten()
+        assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
@@ -2456,12 +2501,14 @@ class DeepseekV4Model(nn.Module):
             )
 
         for layer in self.layers:
-            h = layer(h, positions, input_ids)
+            h = layer(h, positions, input_ids)  # [num_tokens, hc, dim]
 
-        logits = self.head(
-            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
+        # Reduce the mHC residual stack (hc_head + final RMSNorm); leave the
+        # vocab projection to compute_logits.
+        x_hc = self.head.hc_head(  # [num_tokens, dim]
+            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
-        return logits
+        return self.norm(x_hc)
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -2497,9 +2544,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     # - `.scale` → `.weight_scale_inv` (V4 ckpt suffix → ATOM's expected name;
     #   load_model then auto-renames `_inv` → `` so the final param is
     #   `.weight_scale`).
-    from atom.model_loader.loader import WeightsMapper as _WeightsMapper
-
-    weights_mapper = _WeightsMapper(
+    weights_mapper = WeightsMapper(
         orig_to_new_prefix={
             "embed.": "model.embed.",
             "layers.": "model.layers.",
@@ -2512,6 +2557,14 @@ class DeepseekV4ForCausalLM(nn.Module):
     weights_mapping = {
         ".gate.bias": ".gate.e_score_correction_bias",
         ".scale": ".weight_scale_inv",
+    }
+    packed_modules_mapping = {
+        "attn.wq_a": ("attn.wqkv_a", 0),
+        "attn.wkv": ("attn.wqkv_a", 1),
+        "compressor.wkv": ("compressor.wkv_gate", 0),
+        "compressor.wgate": ("compressor.wkv_gate", 1),
+        "shared_experts.w1": ("shared_experts.gate_up_proj", 0),
+        "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
     def __init__(self, config: Config, prefix: str = "") -> None:
@@ -2529,18 +2582,22 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor,  # [num_tokens] int
+        positions: Optional[torch.Tensor] = None,  # [num_tokens] int
         intermediate_tensors: Optional[Any] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **model_kwargs: dict,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor:  # [num_tokens, dim]  hidden_states
         return self.model(input_ids=input_ids, positions=positions, **model_kwargs)
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # In V4, the LM head is fused into DeepseekV4Model.forward (it consumes
-        # the hc_mult-expanded residual). So `hidden_states` already IS logits.
-        return hidden_states
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,  # [num_tokens, dim]  post hc_head + final norm
+    ) -> torch.Tensor:  # [bs, vocab]
+        # Vocab projection is split off from `model.forward` so the latter
+        # returns hidden_size-shaped tensors — required by ATOM's CUDAGraph
+        # capture contract (outputs buffer is sized to hidden_size, not vocab).
+        return self.model.head.get_logits(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Return (param_name, weight_name, expert_id, shard_id) tuples for FusedMoE.
