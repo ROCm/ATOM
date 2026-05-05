@@ -33,16 +33,7 @@ _chunk_tensor_for_rdma = chunk_tensor_for_rdma
 
 _MORIIO_AVAILABLE = False
 try:
-    from mori.io import (
-        BackendType,
-        EngineDesc,
-        IOEngine,
-        IOEngineConfig,
-        MemoryDesc,
-        MemoryLocationType,
-        PollCqMode,
-        RdmaBackendConfig,
-    )
+    import mori.io  # noqa: F401
 
     _MORIIO_AVAILABLE = True
     logger.info("MoRIIO RDMA library loaded successfully")
