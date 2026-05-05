@@ -25,6 +25,10 @@ from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_decode_reference,
 )
+from atom.model_ops.v4_kernels.paged_prefill import (
+    sparse_attn_v4_paged_prefill,
+    sparse_attn_v4_paged_prefill_reference,
+)
 from atom.model_ops.v4_kernels.state_writes import update_compressor_states, swa_write
 
 __all__ = [
@@ -34,6 +38,8 @@ __all__ = [
     "fused_compress_attn_reference",
     "sparse_attn_v4_paged_decode",
     "sparse_attn_v4_paged_decode_reference",
+    "sparse_attn_v4_paged_prefill",
+    "sparse_attn_v4_paged_prefill_reference",
     "csa_translate_pack",
     "csa_translate_pack_reference",
     "CompressPlan",

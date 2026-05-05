@@ -31,10 +31,9 @@ unchanged across batches.
 Returns:
   out: [N, H, D] same dtype as q.
 
-Numerics: identical online-softmax + sink finalization as
-`atom.model_ops.sparse_attn_v4.sparse_attn_ragged_varlen` (which this
-replaces for the decode path) — bit-exact when the existing kernel is
-called with `kv_offsets=0`.
+Numerics: standard online-softmax with attention sink as a virtual K.
+Bit-exact against the PyTorch reference (`_sparse_attn_ragged_torch`)
+when invoked with the same per-token gather indices.
 """
 
 import os
@@ -132,10 +131,11 @@ def _sparse_attn_v4_paged_decode_kernel(
 
     sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
     m_final = tl.maximum(m_i, sink)
-    l_final = l_i * tl.exp(m_i - m_final) + tl.exp(sink - m_final)
+    alpha = tl.exp(m_i - m_final)
+    l_final = l_i * alpha + tl.exp(sink - m_final)
 
     denom = tl.maximum(l_final, 1.0e-30)
-    out = tl.where(l_final[:, None] > 0.0, acc / denom[:, None], 0.0)
+    out = tl.where(l_final[:, None] > 0.0, (acc * alpha[:, None]) / denom[:, None], 0.0)
     tl.store(
         out_ptr
         + t * out_stride_t

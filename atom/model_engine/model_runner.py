@@ -1837,9 +1837,26 @@ class ModelRunner:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
 
-        assert (
-            self.graph_bs[0] <= self.config.max_num_seqs
-        ), "cudagraph capture sizes must be less than max_num_seqs."
+        # Drop any capture size that exceeds max_num_seqs — those graphs would
+        # never be replayed since the scheduler can't produce a batch larger
+        # than max_num_seqs. Warn so the user notices a misconfig (default
+        # cuda_graph_sizes=[512] vs e.g. max_num_seqs=16) without crashing.
+        max_bs = self.config.max_num_seqs
+        oversized = [s for s in self.graph_bs if s > max_bs]
+        if oversized:
+            self.graph_bs = [s for s in self.graph_bs if s <= max_bs]
+            logger.warning(
+                "cudagraph capture sizes %s exceed max_num_seqs=%d; dropping. "
+                "Remaining: %s",
+                oversized,
+                max_bs,
+                self.graph_bs,
+            )
+        assert self.graph_bs, (
+            f"no cudagraph capture sizes left after filtering by "
+            f"max_num_seqs={max_bs}; pass --cudagraph-capture-sizes or raise "
+            f"--max-num-seqs."
+        )
 
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu

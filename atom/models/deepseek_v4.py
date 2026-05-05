@@ -66,7 +66,6 @@ from atom.model_ops.quant_v4 import (
 )
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
-    sparse_attn_ragged_varlen,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.utils import envs
@@ -79,7 +78,10 @@ from atom.utils import envs
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.v4_kernels import (
     CompressPlan,
+    csa_translate_pack,
     fused_compress_attn,
+    sparse_attn_v4_paged_decode,
+    sparse_attn_v4_paged_prefill,
     swa_write,
     update_compressor_states,
 )
@@ -116,137 +118,6 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
-
-
-def _v4_gather_compressed_batched(
-    kv_cache: torch.Tensor,
-    block_tables: torch.Tensor,  # [bs, max_blocks_per_seq]
-    gather_indices: dict,
-) -> torch.Tensor:
-    """Gather compressed entries from `kv_cache` using pre-built index tensors
-    (built once per fwd in `_build_v4_gather_indices`).
-
-    Returns:
-      gathered_flat: `[total_committed, head_dim]` concatenated in seq order.
-    """
-    batch_ids_gpu = gather_indices["batch_ids_gpu"]
-    if batch_ids_gpu is None:
-        return torch.empty(
-            0, kv_cache.size(-1), dtype=kv_cache.dtype, device=kv_cache.device
-        )
-    physical_blocks = block_tables[
-        batch_ids_gpu, gather_indices["block_in_seq_gpu"]
-    ].long()
-    return kv_cache[physical_blocks, gather_indices["slot_in_block_gpu"]]
-
-
-def _v4_build_sparse_inputs_batched(
-    *,
-    kv: torch.Tensor,
-    swa_kv: torch.Tensor,
-    kv_compress_batched: Optional[torch.Tensor],
-    compressor_kv_cache: Optional[torch.Tensor],
-    block_tables_gpu: Optional[torch.Tensor],
-    window_topk_batched: torch.Tensor,
-    indexer_topk_batched: Optional[torch.Tensor],
-    pack_meta: dict,
-    has_indexer: bool,
-    ratio: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """GPU-only `kv_sa` + `topk_flat` packer using pre-built index tensors.
-
-    All the per-(fwd, ratio) CPU index math + H2D copies live in
-    `DeepseekV4AttentionMetadataBuilder._build_v4_pack_meta_for_ratio`. Here
-    we only run the GPU index_copy_/index_select kernels — eliminating the
-    ~14 per-layer `torch.as_tensor` synchronous transfers from the legacy
-    inline path below.
-    """
-    head_dim = kv.size(-1)
-    device = kv.device
-    kv_flat_sa = torch.empty(
-        pack_meta["total_kv"], head_dim, dtype=kv.dtype, device=device
-    )
-    topk_flat = torch.empty(pack_meta["total_topk"], dtype=torch.int32, device=device)
-
-    # Part A: prefill kv slice
-    if pack_meta["prefill_kv_dst_gpu"] is not None:
-        kv_flat_sa.index_copy_(
-            0,
-            pack_meta["prefill_kv_dst_gpu"],
-            kv.index_select(0, pack_meta["prefill_kv_src_gpu"]),
-        )
-
-    # Part A: decode swa gather
-    if pack_meta["decode_state_slots_gpu"] is not None:
-        decode_swa = swa_kv.index_select(
-            0, pack_meta["decode_state_slots_gpu"]
-        ).reshape(-1, head_dim)
-        kv_flat_sa.index_copy_(0, pack_meta["decode_swa_dst_gpu"], decode_swa)
-
-    # Part B: prefill compress
-    if (
-        ratio > 0
-        and kv_compress_batched is not None
-        and pack_meta["prefill_compress_dst_gpu"] is not None
-    ):
-        kv_flat_sa.index_copy_(
-            0,
-            pack_meta["prefill_compress_dst_gpu"],
-            kv_compress_batched.index_select(0, pack_meta["prefill_compress_src_gpu"]),
-        )
-
-    # Part B: decode compress (gather from compressor's kv_cache)
-    if (
-        ratio > 0
-        and compressor_kv_cache is not None
-        and block_tables_gpu is not None
-        and pack_meta["decode_compress_seqs_gpu"] is not None
-    ):
-        decode_block_tables = block_tables_gpu.index_select(
-            0, pack_meta["decode_compress_seqs_gpu"]
-        )
-        gathered_decode_compress = _v4_gather_compressed_batched(
-            compressor_kv_cache,
-            decode_block_tables,
-            pack_meta["decode_compress_gather_indices"],
-        )
-        kv_flat_sa.index_copy_(
-            0, pack_meta["decode_compress_dst_gpu"], gathered_decode_compress
-        )
-
-    # Topk window
-    if pack_meta["window_topk_dst_gpu"] is not None:
-        topk_flat.index_copy_(
-            0,
-            pack_meta["window_topk_dst_gpu"],
-            window_topk_batched.reshape(-1).index_select(
-                0, pack_meta["window_topk_src_gpu"]
-            ),
-        )
-
-    # Topk compress
-    if pack_meta["compress_topk_dst_gpu"] is not None:
-        if has_indexer:
-            assert (
-                indexer_topk_batched is not None
-                and pack_meta["compress_topk_src_gpu"] is not None
-            )
-            topk_flat.index_copy_(
-                0,
-                pack_meta["compress_topk_dst_gpu"],
-                indexer_topk_batched.reshape(-1).index_select(
-                    0, pack_meta["compress_topk_src_gpu"]
-                ),
-            )
-        else:
-            assert pack_meta["compress_topk_values_gpu"] is not None
-            topk_flat.index_copy_(
-                0,
-                pack_meta["compress_topk_dst_gpu"],
-                pack_meta["compress_topk_values_gpu"],
-            )
-
-    return kv_flat_sa, topk_flat
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +383,8 @@ def _apply_rotary_emb(
     expose.
     """
     y = x
-    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    x_f = x.float()
+    x = torch.view_as_complex(x_f.reshape(*x_f.shape[:-1], -1, 2))
     if inverse:
         freqs_cis = freqs_cis.conj()
     if x.ndim == 3:
@@ -641,29 +513,26 @@ class _V4RoPE(nn.Module):
         """In-place RoPE on `query` (and `key` if given). All inputs are the
         rope-slice only (`head_size == rotary_dim`)."""
         cos, sin = self._caches(query.device)
-        num_tokens = positions.numel()
         # rotate_style=1 → GPT-J / interleaved (matches V4's view_as_complex).
         rotate_style = 1
-        q_view = query.view(1, num_tokens, -1, self.rotary_dim)
-        positions_view = positions.view(1, num_tokens)
+        num_tokens = positions.numel()
         if key is not None:
-            k_view = key.view(1, num_tokens, -1, self.rotary_dim)
             aiter.rope_cached_positions_2c_fwd_inplace(
-                q_view,
-                k_view,
+                query.view(1, num_tokens, -1, self.rotary_dim),
+                key.view(1, num_tokens, -1, self.rotary_dim),
                 cos,
                 sin,
-                positions_view,
+                positions.view(1, num_tokens),
                 rotate_style,
                 reuse_freqs_front_part=True,
                 nope_first=False,
             )
         else:
             aiter.rope_cached_positions_fwd_inplace(
-                q_view,
+                query.view(1, num_tokens, -1, self.rotary_dim),
                 cos,
                 sin,
-                positions_view,
+                positions.view(1, num_tokens),
                 rotate_style,
                 reuse_freqs_front_part=True,
                 nope_first=False,
@@ -1016,10 +885,13 @@ class Indexer(nn.Module):
         seqs' Indexer kv_cache is already populated.
 
         Returns:
-          topk_flat: `[total_tokens, index_topk] int32`, uniform-stride layout
-            shared by both prefill and decode paths. Cols past per-token
-            usable width hold -1 sentinels; consumer width-masks via the
-            builder-staged `width_mask_gpu`.
+          topk_in_seq: `[total_tokens, index_topk] int32` — RAW seq-local row
+            indices (each token's column refers to row in its own seq's
+            compressed K). Cols past per-token visibility cap hold -1
+            sentinels (kernel-native: prefill `top_k_per_row_prefill` and
+            decode `top_k_per_row_decode` both write -1 in the tail).
+            Consumer (`csa_translate_pack`) skips negative entries via its
+            `topk >= 0` write mask.
         """
         assert self.rotary_emb is not None
         rd = self.rope_head_dim
@@ -1040,11 +912,10 @@ class Indexer(nn.Module):
         q_scale = q_scale.view(total_tokens, self.n_heads, 1)
 
         # weights = weights_proj * q_scale * (softmax_scale * 1/sqrt(H))
-        weights = (
-            (self.weights_proj(x_full).unsqueeze(-1) * q_scale * self._weights_scale)
-            .squeeze(-1)
-            .float()
-        )
+        # weights_proj is BF16 but auto-promotes to fp32 via fp32 q_scale,
+        # so no explicit `.float()` cast needed.
+        weights = self.weights_proj(x_full)
+        weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(-1)
 
         return torch.ops.aiter.indexer_score_topk(
             q_fp8, weights, self.prefix, self.index_topk
@@ -1064,38 +935,21 @@ class Indexer(nn.Module):
         per-CSA-layer call has zero CPU index math and zero H2D copies.
 
         Returns:
-          topk_flat: `[total_tokens, topk] int32`. Cols past per-token
-            usable width hold -1 sentinels (decode native; prefill via
-            explicit pad inside `_score_topk_prefill`).
+          topk_in_seq: `[total_tokens, topk] int32` — RAW seq-local row
+            indices into each token's seq's compressed K cache. Cols past
+            per-token visibility cap hold -1 sentinels (kernel-native).
+            `csa_translate_pack` consumes this layout directly.
         """
         fc = get_forward_context()
         indexer_meta = fc.attn_metadata.indexer_meta
         block_tables = fc.attn_metadata.block_tables  # [bs, max_blocks_per_seq] int32
-        total_tokens = q_fp8.size(0)
 
-        # `_build_v4_indexer_meta` returns None for warmup / empty-batch
-        # forwards (scheduled_bs == 0 or total_tokens == 0). In those paths
-        # the caller still invokes us — return an all-`-1` placeholder of
-        # the right shape so downstream `index_copy_` sees sentinels.
-        if indexer_meta is None:
-            return torch.full(
-                (total_tokens, topk),
-                -1,
-                dtype=torch.int32,
-                device=q_fp8.device,
-            )  # [total_tokens, topk] int32
-
-        # Empty-K early return: every seq has n_committed==0 (no compressed
-        # K written yet). Builder also leaves `compress_topk_src_gpu = None`
-        # here, so the all-`-1` tensor is never indexed downstream.
-        if indexer_meta["total_committed"] == 0:
-            return torch.full(
-                (total_tokens, topk),
-                -1,
-                dtype=torch.int32,
-                device=q_fp8.device,
-            )  # [total_tokens, topk] int32
-
+        # No host-side `if total_committed == 0: return torch.full(-1)`
+        # short-circuit — that would freeze a Python branch into the
+        # CUDAGraph at capture time. The hot path handles the corner
+        # natively: when n_committed == 0 the per-token K bound is 0, the
+        # underlying top-k kernels write -1 sentinels across the row, and
+        # `csa_translate_pack` skips them via its `topk >= 0` mask.
         if fc.context.is_prefill:
             return self._score_topk_prefill(
                 q_fp8, weights, block_tables, indexer_meta, topk
@@ -1153,8 +1007,13 @@ class Indexer(nn.Module):
         # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
         # pybind kwarg). Honors per-row [cu_starts[i], cu_ends[i]) so cells
         # outside each row's valid window are never selected; rows shorter
-        # than `topk` get -1 sentinels for tail cols, matching the decode
-        # path's [N, topk] layout.
+        # than `topk` get -1 sentinels for tail cols.
+        #
+        # Output is GLOBAL: each cell holds either -1 or
+        # `cu_starts[t] + col_in_seq` (= seq_base + seq-local idx). We
+        # subtract `seq_base_per_token` to produce the raw seq-local layout
+        # `csa_translate_pack` expects. The -1 sentinels are preserved via
+        # `torch.where`.
         # [total_tokens, topk] int32 — eager-only path so per-fwd alloc
         # is fine (prefill total_tokens is dynamic; no CG capture here).
         topk_global = torch.empty(
@@ -1171,15 +1030,14 @@ class Indexer(nn.Module):
             logits.stride(1),
             k=topk,
         )
-        # Prefill is eager-only — pull `width_mask_gpu` (built in
-        # _build_v4_indexer_meta) since fresh allocation across prefill calls
-        # is harmless without CG capture.
-        return self._post_process_topk(
-            topk_global,
-            indexer_meta,
-            width_mask=indexer_meta["width_mask_gpu"],
-            is_decode=False,
-        )
+        seq_base = indexer_meta["seq_base_per_token_gpu"].unsqueeze(
+            1
+        )  # [total_tokens, 1] int32
+        return torch.where(
+            topk_global < 0,
+            topk_global,  # preserve -1 sentinel
+            topk_global - seq_base,
+        )  # [total_tokens, topk] int32, raw seq-local with -1 in tail
 
     def _score_topk_decode(
         self,
@@ -1199,7 +1057,9 @@ class Indexer(nn.Module):
         the kernel honors `n_committed_per_seq` per row, so logits cells past
         each row's valid range are never selected — no `fill_(-inf)` required.
         Rows whose valid range is shorter than `index_topk` get -1 sentinels
-        for tail cols, which `_post_process_topk` masks via `width_mask_gpu`.
+        for tail cols. Output is RAW seq-local (each row's cols are 0-indexed
+        into that batch's compressed K), exactly the layout
+        `csa_translate_pack` consumes.
         """
         total_tokens = q_fp8.size(0)
         n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
@@ -1235,8 +1095,8 @@ class Indexer(nn.Module):
         )
         # Pre-allocated indices buffer — fixed [max_bs, index_topk] int32 in
         # builder, sliced to [total_tokens, index_topk] for this fwd. Kernel
-        # writes exactly `index_topk` ints per row (valid indices then -1
-        # sentinels), no overflow risk.
+        # writes exactly `index_topk` ints per row (valid seq-local indices
+        # then -1 sentinels), no overflow risk.
         topk_local = indexer_meta["decode_topk_indices_gpu"][
             :total_tokens
         ]  # [total_tokens, index_topk] int32
@@ -1250,85 +1110,7 @@ class Indexer(nn.Module):
             logits.stride(1),
             k=topk,
         )
-        # Compute width_mask in-graph so its allocation lives in the CG
-        # mempool — captured ops then read a stable address on replay.
-        # `n_committed_per_seq_gpu` and `batch_id_per_token_gpu` are both
-        # staged into pre-allocated forward_vars. Use scalar `clamp` (Python
-        # int) instead of `torch.minimum(..., torch.tensor(topk))`: building
-        # an H2D tensor mid-capture triggers `hipErrorStreamCaptureUnsupported`.
-        batch_id_per_token = indexer_meta["batch_id_per_token_gpu"]
-        k_per_token = n_committed_per_seq_gpu[batch_id_per_token].clamp(
-            max=topk
-        )  # [total_tokens] int32
-        col_arange = torch.arange(
-            topk, device=logits.device, dtype=torch.int32
-        )  # [topk] int32
-        width_mask = col_arange.unsqueeze(0) >= k_per_token.unsqueeze(
-            1
-        )  # [total_tokens, topk] bool
-        # Decode topk indices are seq-local (each row's columns are 0-indexed
-        # into that batch's compressed K), so `_post_process_topk` skips the
-        # seq_base subtraction via `is_decode=True`.
-        return self._post_process_topk(
-            topk_local, indexer_meta, width_mask=width_mask, is_decode=True
-        )
-
-    def _post_process_topk(
-        self,
-        topk_indices: torch.Tensor,  # [total_tokens, index_topk] int32 (uniform layout, both paths)
-        indexer_meta: dict,
-        *,
-        width_mask: torch.Tensor,  # [total_tokens, index_topk] bool
-        is_decode: bool,
-    ) -> torch.Tensor:
-        """Map topk indices into the [SWA || compressed] kv_sa layout consumed
-        by sparse_attn, masking out width-overflow and future-token slots.
-
-        Prefill (`is_decode=False`): topk indices are GLOBAL flat positions
-          (fp8_mqa_logits scores all seqs' K concatenated), need
-          `seq_base_per_token` subtraction to recover seq-local idx; future
-          tokens in fresh prefill are masked via `future_threshold`.
-        Decode (`is_decode=True`): topk indices are already SEQ-LOCAL
-          (`top_k_per_row_decode` produces per-row [total_tokens, index_topk]
-          where each row's cols are local to its batch's compressed K). No
-          future-token mask (decode tokens are always at the seq tail), so
-          `invalid = width_mask` directly. Caller computes `width_mask`
-          in-graph for CG-safe addresses.
-
-        Both paths emit a uniform [total_tokens, index_topk] int32 layout;
-        cols past per-row valid range hold -1 sentinels (decode kernel native;
-        prefill via explicit pad).
-        """
-        offset_per_token = indexer_meta["offset_per_token_gpu"]  # [total_tokens] int32
-
-        if is_decode:
-            topk_local = topk_indices  # [total_tokens, index_topk] int32
-            invalid = width_mask  # decode has no future-token mask
-        else:
-            seq_base_per_token = indexer_meta[
-                "seq_base_per_token_gpu"
-            ]  # [total_tokens] int32
-            future_threshold = indexer_meta[
-                "future_threshold_gpu"
-            ]  # [total_tokens, 1] int32
-            is_prefill_per_token = indexer_meta[
-                "is_prefill_per_token_gpu"
-            ]  # [total_tokens, 1] bool
-            topk_local = topk_indices - seq_base_per_token.unsqueeze(
-                1
-            )  # [total_tokens, index_topk] int32 (seq-local idx)
-            # Combined invalid mask: slots past per-seq K (width_mask) OR future
-            # tokens in fresh prefill. Width-masked slots in `topk_local` may be
-            # -1 sentinels or garbage from `subtract` — final masked_fill_
-            # overwrites them with -1 either way.
-            invalid = width_mask | (
-                is_prefill_per_token & (topk_local >= future_threshold)
-            )  # [total_tokens, index_topk] bool
-        # In-place over `topk_local + offset` (a fresh tensor from `+`); saves
-        # a `full_like(-1)` allocation and the `torch.where` launch.
-        # Returns [total_tokens, index_topk] int32: (idx + offset) for valid
-        # slots, -1 for invalid.
-        return (topk_local + offset_per_token.unsqueeze(1)).masked_fill_(invalid, -1)
+        return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
 
 # ---------------------------------------------------------------------------
@@ -1453,6 +1235,9 @@ class DeepseekV4Attention(nn.Module):
         #   warmup fallback (warmup runs before allocate_kv_cache); after
         #   binding it is setattr-replaced with the per_req_cache pool slice
         #   `[max_num_seqs, n_win, head_dim]` and the original buffer is GC'd.
+        # `unified_kv` (paged_decode/paged_prefill base) is NOT pre-registered
+        # — V4Attention.forward short-circuits the sparse_attn dispatch on
+        # `is_dummy_run` so warmup never reads it.
         self.register_buffer(
             "swa_kv",
             torch.zeros(1, args.window_size, self.head_dim),
@@ -1487,6 +1272,14 @@ class DeepseekV4Attention(nn.Module):
             beta_slow=args.beta_slow,
             dtype=torch.bfloat16,
         )
+        # Plumb rotary_emb into compressor / indexer here in __init__ rather
+        # than lazily in forward — Dynamo can't trace NNModule setattr inside
+        # a compiled forward (graph break + backend re-entry).
+        if self.compressor is not None:
+            self.compressor.rotary_emb = self.rotary_emb
+        if self.indexer is not None:
+            self.indexer.rotary_emb = self.rotary_emb
+            self.indexer.compressor.rotary_emb = self.rotary_emb
 
     def process_weights_after_loading(self) -> None:
         """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
@@ -1554,19 +1347,18 @@ class DeepseekV4Attention(nn.Module):
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"DeepseekV4Attention expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        seqlen_total = x.size(0)
+        # warmup_model runs BEFORE allocate_kv_cache → `unified_kv` is unbound
+        # and the new sparse_attn_v4_paged_{decode,prefill} kernels would read
+        # OOB. Same pattern as `attention_mha.py:98` — short-circuit dummy_run
+        # with a zero output of the correct shape; downstream layers compile
+        # on a real fwd. swa_write / Compressor / Indexer are also skipped to
+        # avoid touching unbound state caches.
+        if get_forward_context().context.is_dummy_run:
+            return torch.zeros_like(x)
+        num_tokens = x.size(0)
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
-
-        # Idempotent one-time plumb of rotary_emb into compressor / indexer
-        # (and the indexer's inner compressor). `rotary_emb` is set by the
-        # owning layer after __init__, so this can't move into __init__.
-        if self.compress_ratio and self.compressor.rotary_emb is None:
-            self.compressor.rotary_emb = self.rotary_emb
-            if self.indexer is not None:
-                self.indexer.rotary_emb = self.rotary_emb
-                self.indexer.compressor.rotary_emb = self.rotary_emb
 
         # ----- Batched ops on full flat tensors -----
         # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
@@ -1582,10 +1374,10 @@ class DeepseekV4Attention(nn.Module):
         if _V4_FORCE_UE8M0_QUANT:
             qr = qr.clone()
             act_quant_inplace(qr, 128, "ue8m0")
-        q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
+        q = self.wq_b(qr).view(num_tokens, self.n_local_heads, self.head_dim)
         q = _rmsnorm_nw(q, self.eps, self.head_dim)
-        # q [S, H, D] / kv [S, head_dim] — rotary_emb internally reshapes to
-        # (1, num_tokens, -1, rotary_dim) so explicit batch dim is unnecessary.
+        # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
+        # to (1, num_tokens, ...) for aiter's per-position rope kernel.
         kv = self.kv_norm(kv_pre)
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         if _V4_USE_REF_QUANT:
@@ -1598,9 +1390,7 @@ class DeepseekV4Attention(nn.Module):
         # compress_plans, swa_write_indices, ...) is well-typed for pyright.
         attn_md = cast("AttentionMetaData_DSV4", get_forward_context().attn_metadata)
         compress_plans = attn_md.compress_plans
-        v4_sparse_layouts = attn_md.sparse_layouts
         v4_indexer_meta = attn_md.indexer_meta
-        window_topk_batched = attn_md.window_topk_batched
         swa_write_indices = attn_md.swa_write_indices
         v4_batch_id_per_token = attn_md.batch_id_per_token
         block_tables_gpu = attn_md.block_tables
@@ -1611,28 +1401,23 @@ class DeepseekV4Attention(nn.Module):
         # path uses raw seq_kv, and fused_compress's state-cache reads are
         # already masked by `s < 0` for fresh prefill (compress_plan.py:88 +
         # fused_compress.py:124-127).
+        # Compressor's return value is unused — paged_decode/paged_prefill read
+        # the scattered compress entries from `unified_kv` via per-fwd indices.
+        # Called purely for its side-effect (scatter into self.kv_cache).
         plan_for_layer = compress_plans[ratio] if ratio else None
-        kv_compress_batched = (
+        if ratio:
             self.compressor(
                 x,
                 plan=plan_for_layer,
                 state_slot_mapping=state_slot_mapping,
                 block_tables=block_tables_gpu,
             )
-            if ratio
-            else None
-        )
-        indexer_topk_batched = None
-        if self.indexer is not None:
+        if self.indexer is not None:  # i.e. CSA layer, compress_ratio == 4
             # Indexer's inner compressor populates the indexer kv_cache (FP8
             # via indexer_k_quant_and_cache when idx_slot_mapping is set);
             # the outer `forward_batched` reads `v4_indexer_meta` (built once
             # per fwd) so it has zero per-layer H2D / CPU index math.
-            idx_slot_mapping = (
-                v4_indexer_meta.get("compress_slot_mapping_gpu")
-                if v4_indexer_meta is not None
-                else None
-            )
+            idx_slot_mapping = v4_indexer_meta.get("compress_slot_mapping_gpu")
             self.indexer.compressor(
                 x,
                 plan=plan_for_layer,
@@ -1644,25 +1429,35 @@ class DeepseekV4Attention(nn.Module):
                 x_full=x,
                 qr_full=qr,
                 positions=positions,
-            )
-            # Phase C: build CSA paged-compress section in
-            # `v4_kv_indices_csa` (window prefix already filled by Phase B).
-            # Layer-local because indexer output differs per layer; consumed by
-            # Phase E (sparse_attn_v4_paged_decode dispatch) once that ships.
-            # Until then this is a side-effectful no-op against the existing
-            # ragged_varlen attention path.
-            if ratio == 4 and attn_md.is_pure_decode:
-                self._fill_csa_paged_compress(attn_md, seqlen_total)
+            )  # raw seq-local [T, index_topk] int32, -1 sentinels in tail cols
+            # Translate seq-local topk → physical paged offsets and write into
+            # the CSA section of either:
+            #   - decode buffer `kv_indices_csa` (is_pure_decode)
+            #   - prefill buffer `kv_indices_prefix_csa` (otherwise)
+            # `_fill_csa_paged_compress` dispatches internally on is_pure_decode.
+            self._fill_csa_paged_compress(attn_md, indexer_topk_batched, num_tokens)
 
-        # ===== SWA write =====
-        # `swa_write_indices` is pre-built once per fwd in
-        # `_attach_v4_per_fwd_meta` — sentinel-padded to `total_tokens` so the
-        # kernel grid stays deterministic per (capture_bs, max_q_len) for
-        # CUDAGraph; long-prefill rows past num_write carry -1 (skip).
-        # Kernel does all per-token gathers (kv row, position, batch id) and
-        # per-seq state-slot lookup (state_slot_per_seq[bid]) internally —
-        # no captured-region alloc, no per-token slot alias.
-        if swa_write_indices is not None:
+        # ===== Sparse attention dispatch =====
+        # Two paths over the unified KV pool. The order of `swa_write` vs
+        # `sparse_attn` differs because the two kernels read SWA differently:
+        #
+        # decode (is_pure_decode==True):
+        #   `paged_decode` reads SWA from `unified_kv` ring slot `pos % win`.
+        #   The current decode token's K must be present in the ring before
+        #   attn fires, otherwise the token can't see its own K. So:
+        #     swa_write → paged_decode
+        #
+        # prefill / mixed (is_pure_decode==False):
+        #   `paged_prefill` reads in-chunk K from per-fwd `kv` tensor (extend
+        #   region) and prior-chunk K from `unified_kv` ring (prefix region).
+        #   `swa_write` writes the LAST `win` tokens of THIS fwd into ring
+        #   slots `pos % win`, which OVERLAP with prior-chunk slots that the
+        #   prefix SWA region wants to read (chunked prefill). So:
+        #     paged_prefill → swa_write
+        #   Pure prefill (chunk_start==0) has prefix_swa_count==0 so no prior
+        #   ring read; swa_write order is irrelevant in that subcase.
+        q_sa = q.contiguous()
+        if attn_md.is_pure_decode:
             swa_write(
                 kv,
                 swa_write_indices,
@@ -1672,17 +1467,6 @@ class DeepseekV4Attention(nn.Module):
                 self.swa_kv,
                 win,
             )
-
-        # ===== Sparse attention dispatch =====
-        # Phase E: when is_pure_decode (Phase B/C have prepared kv_indices +
-        # kv_indptr in stable forward_vars buffers), use the unified-pool
-        # paged_decode kernel — single base ptr, packed-cumsum kv_indices,
-        # CG-friendly. Otherwise fall back to ragged_varlen for prefill /
-        # mixed batches.
-        q_sa = q.contiguous()
-        if attn_md.is_pure_decode:
-            from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
-
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
@@ -1701,37 +1485,41 @@ class DeepseekV4Attention(nn.Module):
                 self.softmax_scale,
             )  # [S, H, head_dim]
         else:
-            # Pre-built `pack_meta` (built once in `_build_v4_pack_meta_for_ratio`)
-            # carries every CPU/GPU index — the per-layer call is just GPU
-            # index_copy_/select ops.
-            layout = v4_sparse_layouts[ratio]
-            kv_sa, topk_flat = _v4_build_sparse_inputs_batched(
-                kv=kv,
-                swa_kv=self.swa_kv,
-                kv_compress_batched=kv_compress_batched,
-                compressor_kv_cache=self.compressor.kv_cache if ratio else None,
-                block_tables_gpu=block_tables_gpu,
-                window_topk_batched=window_topk_batched,
-                indexer_topk_batched=indexer_topk_batched,
-                pack_meta=layout["pack_meta"],
-                has_indexer=self.indexer is not None,
-                ratio=ratio,
-            )
-            topk_starts = layout["topk_starts"]
-            topk_lens = layout["topk_lens"]
-            kv_offsets = layout["kv_offsets"]
-            max_topk = layout["max_topk"]
-            o = sparse_attn_ragged_varlen(
+            # Two-source paged prefill: prefix from `unified_kv` (per-ratio
+            # buffer with SWA history + compress section), extend from per-fwd
+            # `kv` tensor (in-chunk SWA tail; extend buffer is layer-invariant).
+            if ratio == 0:
+                kv_indices_prefix = attn_md.kv_indices_prefix_swa
+                kv_indptr_prefix = attn_md.kv_indptr_prefix_swa
+            elif ratio == 4:
+                kv_indices_prefix = attn_md.kv_indices_prefix_csa
+                kv_indptr_prefix = attn_md.kv_indptr_prefix_csa
+            else:  # ratio == 128
+                kv_indices_prefix = attn_md.kv_indices_prefix_hca
+                kv_indptr_prefix = attn_md.kv_indptr_prefix_hca
+            o = sparse_attn_v4_paged_prefill(
                 q_sa,
-                kv_sa,
+                self.unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                kv,
+                attn_md.kv_indices_extend,
+                attn_md.kv_indptr_extend,
                 self.attn_sink,
-                topk_flat,
-                topk_starts,
-                topk_lens,
-                kv_offsets,
-                max_topk,
                 self.softmax_scale,
             )  # [S, H, head_dim]
+            # swa_write AFTER attn so chunked-prefill prefix SWA reads see
+            # prior-chunk's ring contents (current swa_write would overwrite
+            # ring slots `pos % win` for positions in this chunk's tail).
+            swa_write(
+                kv,
+                swa_write_indices,
+                positions,
+                v4_batch_id_per_token,
+                state_slot_mapping,
+                self.swa_kv,
+                win,
+            )
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
@@ -1743,16 +1531,27 @@ class DeepseekV4Attention(nn.Module):
         freqs_slice = self.rotary_emb.freqs_for_positions(positions)
         _apply_rotary_emb(o.unsqueeze(0)[..., -rd:], freqs_slice, inverse=True)
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
-        o = o.view(seqlen_total, self.n_local_groups, -1)
+        o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
         x = self.wo_b(o.flatten(1))
         return x
 
-    def _fill_csa_paged_compress(self, attn_md, total_tokens: int) -> None:
-        """Phase C: translate indexer raw `topk_local` → physical paged
-        offsets in `unified_kv` and packed-write into the CSA paged-decode
-        buffer prepared by Phase B (`v4_kv_indices_csa`).
+    def _fill_csa_paged_compress(
+        self,
+        attn_md,
+        topk_local_raw: torch.Tensor,
+        total_tokens: int,
+    ) -> None:
+        """Per-CSA-layer: translate indexer raw `topk_in_seq` → physical paged
+        offsets in `unified_kv` and packed-write into the CSA section of the
+        active prefix buffer.
+
+        Dispatch:
+          - is_pure_decode → write into decode buffer `kv_indices_csa`,
+                             skip = `window_size` (full SWA prefix per token)
+          - prefill / mixed → write into prefill buffer `kv_indices_prefix_csa`,
+                              skip = per-token `prefix_swa_count[t]`
 
         Per doc §6.4:
           block_idx_in_seq = topk_local // csa_block_capacity
@@ -1762,34 +1561,39 @@ class DeepseekV4Attention(nn.Module):
                              + slot_in_block
 
         Fully fused into one triton kernel — no [T, index_topk] intermediates,
-        no PyTorch fancy index, single CG node per CSA layer (was 7-8). CG
-        sentinel and OOB clamp are handled in-kernel; downstream
-        `sparse_attn_v4_paged_decode` strict-slices via `kv_indptr_csa`, so
-        tail cols beyond `valid_k` are never read and need no `-1` fill.
+        no PyTorch fancy index. CG sentinel (batch_id=-1) and OOB clamp are
+        handled in-kernel; downstream paged_decode/paged_prefill kernels
+        strict-slice via `kv_indptr*`, so tail cols beyond `valid_k` are never
+        read and need no `-1` fill (CSA section was -1 pre-filled by builder).
 
-        Only invoked for CSA layers (`ratio == 4`) under is_pure_decode.
+        Args:
+          topk_local_raw: [total_tokens, index_topk] int32 — RAW seq-local
+            output of `Indexer.forward_batched` (negative tails are sentinels;
+            csa_translate_pack skips them via `topk >= 0` write mask).
         """
-        from atom.model_ops.v4_kernels import csa_translate_pack
-
-        indexer_meta = attn_md.indexer_meta
-        topk_local_raw = indexer_meta["decode_topk_indices_gpu"][
-            :total_tokens
-        ]  # [T, index_topk] int32, seq-local with -1 tails
-
         # csa_block_capacity = block_size // ratio = 128 // 4 = 32.
-        # `compressor.kv_cache.size(1)` is bound to k1_csa by builder
-        # `build_kv_cache_tensor`, so this stays in sync if config changes.
-        csa_block_capacity = self.compressor.kv_cache.size(1)
+        # Derived from constants (not `compressor.kv_cache.size(1)`) because
+        # warmup runs before `build_kv_cache_tensor` binds compressor.kv_cache,
+        # and this method now fires for both decode and prefill (including
+        # warmup batches). Equivalent post-bind: `compressor.kv_cache.size(1)`.
+        csa_block_capacity = _V4_BLOCK_SIZE // 4
+
+        if attn_md.is_pure_decode:
+            kv_indptr = attn_md.kv_indptr_csa
+            kv_indices = attn_md.kv_indices_csa
+        else:
+            kv_indptr = attn_md.kv_indptr_prefix_csa
+            kv_indices = attn_md.kv_indices_prefix_csa
 
         csa_translate_pack(
             topk_local_raw,
             attn_md.block_tables,
             attn_md.n_committed_csa_per_seq,
-            attn_md.kv_indptr_csa,
+            kv_indptr,
             attn_md.batch_id_per_token,
-            attn_md.kv_indices_csa,
+            attn_md.skip_prefix_len_csa,
+            kv_indices,
             swa_pages=attn_md.swa_pages,
-            window_size=self.window_size,
             csa_block_capacity=csa_block_capacity,
         )
 
@@ -1911,9 +1715,10 @@ class MoE(nn.Module):
                     args.vocab_size, args.n_activated_experts, dtype=torch.int32
                 ),
             )
-            # Cache for input_ids — set by forward() right before the FusedMoE
-            # call so the custom routing closure can index tid2eid.
-            self._hash_input_ids: Optional[torch.Tensor] = None
+            # input_ids for hash routing is read from forward_context.context
+            # (set by ModelRunner). torch.compile silently drops NNModule
+            # attribute mutation across the compile boundary, so stashing on
+            # `self.foo` from inside forward is a no-op at runtime.
 
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
@@ -1995,10 +1800,15 @@ class MoE(nn.Module):
         topk_weights = sqrtsoftplus(router_logits) gathered at topk_ids
         Then renormalize so weights sum to 1 per token.
         """
+        # input_ids comes from forward_context.context (stashed by
+        # `DeepseekV4ForCausalLM.forward`). This callback runs inside the
+        # FusedMoE expert call, which is wrapped in `maybe_dual_stream_forward`
+        # — a custom op opaque to Dynamo, so context access is safe here.
+        fwd_input_ids = get_forward_context().context.input_ids
         assert (
-            self._hash_input_ids is not None
-        ), "MoE.forward() must set self._hash_input_ids before calling experts() in hash layers"
-        ids = self._hash_input_ids.flatten()
+            fwd_input_ids is not None
+        ), "forward_context.context.input_ids is None — caller must invoke DeepseekV4ForCausalLM.forward, not DeepseekV4Model.forward directly."
+        ids = fwd_input_ids.flatten()
         topk_ids = self.gate.tid2eid[ids].to(torch.int32)  # [N, topk]
         scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
         topk_weights = scores.gather(dim=-1, index=topk_ids.long())
@@ -2014,10 +1824,10 @@ class MoE(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Gate + FusedMoE routed-expert pass.
 
-        For hash layers the gate's `tid2eid` lookup needs `input_ids`; we
-        stash it on `self._hash_input_ids` in `forward()` before reaching
-        here so `_hash_topk` (FusedMoE's custom_routing_function callback)
-        can read it.
+        For hash layers the gate's `tid2eid` lookup needs `input_ids`;
+        `DeepseekV4ForCausalLM.forward` stashes it on
+        `forward_context.context.input_ids` before each forward, and
+        `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
         return self.experts(hidden_states=x, router_logits=router_logits)
@@ -2063,27 +1873,20 @@ class MoE(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]  hidden state (post ffn_norm)
-        input_ids: torch.Tensor,  # [num_tokens] int  for hash-routed layers
     ) -> torch.Tensor:  # [num_tokens, dim]
+        # Hash-layer routing reads `input_ids` from forward_context.context
+        # inside `_hash_topk` (FusedMoE.custom_routing_function callback);
+        # the MoE call itself doesn't need it as a parameter.
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        # Stash input_ids for hash layers — `_hash_topk` reads it via self.
-        # Cleared after the dispatched MoE forward returns to avoid holding
-        # a stale reference across forwards.
-        if self.is_hash_layer:
-            self._hash_input_ids = input_ids
         if self._use_dual_stream:
             # Shared custom op (also used by V2). Dispatcher reads
             # `_use_dual_stream` + per-call num_tokens vs threshold to pick
             # dual vs single. Custom op = Dynamo barrier so stream context
             # inside `dual_stream_moe_forward` is opaque to torch.compile.
-            y = torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
-        else:
-            y = self.single_stream_moe_forward(x)
-        if self.is_hash_layer:
-            self._hash_input_ids = None
-        return y
+            return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
+        return self.single_stream_moe_forward(x)
 
 
 class Block(nn.Module):
@@ -2232,9 +2035,6 @@ class Block(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, hc, dim]  mHC residual stream
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
-        input_ids: Optional[
-            torch.Tensor
-        ],  # [num_tokens] int  for hash-routed MoE layers
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
@@ -2252,7 +2052,9 @@ class Block(nn.Module):
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         x = self.ffn_norm(x)  # [num_tokens, dim]
-        x = self.ffn(x, input_ids)  # [num_tokens, dim]
+        x = self.ffn(
+            x
+        )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
         return x
 
@@ -2408,7 +2210,7 @@ class MTPBlock(Block):
         # [num_tokens, dim]; unsqueeze adds the hc axis so it broadcasts
         # against h_proj(x) [num_tokens, hc, dim].
         x = self.e_proj(e).unsqueeze(-2) + self.h_proj(x)  # [num_tokens, hc, dim]
-        x = super().forward(x, positions, input_ids)  # [num_tokens, hc, dim]
+        x = super().forward(x, positions)  # [num_tokens, hc, dim]
         return self.head(
             x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
         )
@@ -2426,7 +2228,11 @@ class DeepseekV4Model(nn.Module):
     with reference's `ParallelEmbedding` since both store a single `weight` parameter).
     """
 
-    def __init__(self, *, args: DeepseekV4Args):
+    def __init__(
+        self,
+        *,
+        args: DeepseekV4Args,
+    ):
         super().__init__()
         self.args = args
         self.max_seq_len = args.max_seq_len
@@ -2480,8 +2286,7 @@ class DeepseekV4Model(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
-        positions: Optional[torch.Tensor] = None,  # [num_tokens] int  abs positions
-        **model_kwargs: dict,
+        positions: torch.Tensor,  # [num_tokens] int  abs positions (required)
     ) -> (
         torch.Tensor
     ):  # [num_tokens, dim]  hidden_states (vocab head deferred to compute_logits)
@@ -2495,13 +2300,9 @@ class DeepseekV4Model(nn.Module):
         h = self.embed(input_ids)  # [num_tokens, dim]
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-        if positions is None:
-            positions = torch.arange(
-                input_ids.numel(), device=input_ids.device, dtype=torch.long
-            )
 
         for layer in self.layers:
-            h = layer(h, positions, input_ids)  # [num_tokens, hc, dim]
+            h = layer(h, positions)  # [num_tokens, hc, dim]
 
         # Reduce the mHC residual stack (hc_head + final RMSNorm); leave the
         # vocab projection to compute_logits.
@@ -2583,12 +2384,17 @@ class DeepseekV4ForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int
-        positions: Optional[torch.Tensor] = None,  # [num_tokens] int
-        intermediate_tensors: Optional[Any] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        **model_kwargs: dict,
+        positions: torch.Tensor,  # [num_tokens] int  required
     ) -> torch.Tensor:  # [num_tokens, dim]  hidden_states
-        return self.model(input_ids=input_ids, positions=positions, **model_kwargs)
+        # Stash input_ids on forward_context for the V4 hash MoE routing
+        # callback (`MoE._hash_topk`), which runs inside the Dynamo-opaque
+        # `maybe_dual_stream_forward` custom op and can't receive input_ids
+        # via the FusedMoE custom-routing-function fixed signature. Setting
+        # it here (rather than in ModelRunner) means any caller of
+        # `model.forward` — production runner, warmup, benchmarks — gets
+        # correct hash routing without a separate setup step.
+        get_forward_context().context.input_ids = input_ids
+        return self.model(input_ids, positions)
 
     def compute_logits(
         self,
