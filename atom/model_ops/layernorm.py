@@ -567,8 +567,6 @@ class GemmaRMSNorm(nn.Module):
             res_out = None
 
         fused_qk_rmsnorm_group_quant(
-            q_out_quantized=None,
-            q_out_scale=None,
             q=x_2d,
             q_weight=self.weight.data,
             q_epsilon=self.variance_epsilon,
