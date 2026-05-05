@@ -472,7 +472,7 @@ jobs:
 
       - name: Collect GPU info (inside container)
         id: gpu-info
-        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Download model if needed
         run: |

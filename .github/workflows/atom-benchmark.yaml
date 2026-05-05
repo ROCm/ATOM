@@ -215,7 +215,8 @@ jobs:
       - name: Collect GPU info (inside container)
         id: gpu-info
         run: |
-          bash .github/scripts/collect_gpu_info.sh atom-benchmark
+          RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}"
+          bash .github/scripts/collect_gpu_info.sh atom-benchmark docker "$RUNNER_HINT"
           # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
           DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
           if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then

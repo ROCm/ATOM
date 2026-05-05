@@ -2,20 +2,28 @@
 # Collect GPU info from a (running) container or the local host and emit
 # `gpu_name`, `gpu_vram_gb`, and `rocm_version` to $GITHUB_OUTPUT (when set).
 #
-# Prefers `amd-smi` because it correctly identifies recent ASICs (e.g. MI355X)
-# whose marketing name is missing from `rocm-smi`'s product table. Falls back
-# to `rocm-smi` and `rocminfo` for older container images that do not yet ship
-# `amd-smi`.
+# Probing order for the GPU marketing name:
+#   1. `amd-smi static --asic` MARKET_NAME
+#   2. `rocm-smi --showproductname` Card Series
+#   3. `rocminfo` Marketing Name
+#   4. <runner_hint> pattern match (mi355 / mi325 / mi300 / mi250)
+#
+# Step 4 is needed because on freshly-released ASICs (currently MI355X) every
+# in-container SMI tool can still report "Radeon Graphics" until the
+# marketing-name table is patched. The CI runner name is operator-asserted
+# and reliable, so we use it as the final tie-breaker for the dashboard label.
 #
 # Usage:
-#   collect_gpu_info.sh                              # run directly on the host
-#   collect_gpu_info.sh <container>                  # docker exec <container>
-#   collect_gpu_info.sh <container> <engine>         # custom engine, e.g. podman
+#   collect_gpu_info.sh                                          # local host
+#   collect_gpu_info.sh <container>                              # docker exec
+#   collect_gpu_info.sh <container> <engine>                     # custom engine
+#   collect_gpu_info.sh <container> <engine> <runner_hint>       # + runner hint
 
 set -uo pipefail
 
 CONTAINER="${1:-}"
 ENGINE="${2:-docker}"
+RUNNER_HINT="${3:-${RUNNER_HINT:-}}"
 
 if [ -n "$CONTAINER" ]; then
     exec_in() { "$ENGINE" exec "$CONTAINER" bash -lc "$1" 2>/dev/null; }
@@ -36,11 +44,26 @@ if [ -z "${GPU_NAME:-}" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; then
         | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' | trim)
 fi
 
-# 3) rocminfo Marketing Name (last resort; matches device tree).
+# 3) rocminfo Marketing Name.
 if [ -z "${GPU_NAME:-}" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; then
     GPU_NAME=$(exec_in 'rocminfo' \
         | grep -A1 "Uuid:.*GPU-" | grep "Marketing Name" | head -1 \
         | sed 's/.*:\s*//' | trim)
+fi
+
+# 4) Runner-name hint (last resort: every in-container SMI tool can still
+#    return "Radeon Graphics" on freshly-released ASICs until the marketing
+#    table is patched. The CI runner name encodes the chip family.)
+if { [ -z "${GPU_NAME:-}" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; } \
+    && [ -n "${RUNNER_HINT:-}" ]; then
+    hint_lc=$(echo "$RUNNER_HINT" | tr '[:upper:]' '[:lower:]')
+    case "$hint_lc" in
+        *mi355*) GPU_NAME="AMD Instinct MI355X" ;;
+        *mi325*) GPU_NAME="AMD Instinct MI325X" ;;
+        *mi300x*|*mi300*) GPU_NAME="AMD Instinct MI300X" ;;
+        *mi250x*|*mi250*) GPU_NAME="AMD Instinct MI250X" ;;
+        *mi210*) GPU_NAME="AMD Instinct MI210" ;;
+    esac
 fi
 GPU_NAME="${GPU_NAME:-unknown}"
 

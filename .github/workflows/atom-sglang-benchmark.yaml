@@ -588,7 +588,7 @@ jobs:
       - name: Collect GPU info (inside container)
         if: steps.check.outputs.enabled == 'true'
         id: gpu-info
-        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
 
       - name: Download model if needed
         if: steps.check.outputs.enabled == 'true'
