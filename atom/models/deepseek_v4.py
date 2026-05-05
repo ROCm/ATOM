@@ -2002,8 +2002,8 @@ class MoE(nn.Module):
                     continue
                 idx, top = torch.where(indices == i)
                 y[idx] = y[idx] + self.experts[i](x[idx], weights[idx, top, None])
-        shared_out = self.shared_experts(x)
-        y = y + shared_out
+        # shared_out = self.shared_experts(x)
+        # y = y + shared_out
         if self.use_fused and self.tp_size > 1:
             from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 

@@ -15,6 +15,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
+from aiter.ops.flydsl.moe_common import GateMode
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -900,6 +901,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
             return
+        elif (
+            get_gfx() == "gfx950"
+            and self.quant_type == QuantType.per_1x32
+            and self.quant_dtype == dtypes.fp4x2
+            and not self.use_triton
+        ):
+            layer.w13_weight.data = shuffle_weight_a16w4(
+                layer.w13_weight.contiguous(), 16, True
+            )
+            layer.w2_weight.data = shuffle_weight_a16w4(
+                layer.w2_weight.contiguous(), 16, False
+            )
+            layer.w13_weight_scale.data = shuffle_scale_a16w4(
+                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]).contiguous(),
+                self.num_experts,
+                True,
+            )
+            layer.w2_weight_scale.data = shuffle_scale_a16w4(
+                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]).contiguous(),
+                self.num_experts,
+                False,
+            )
+            return
         else:
             shuffle_weights(layer.w13_weight, layer.w2_weight)
             shuffled_w13_scale = fp4_utils.e8m0_shuffle(
@@ -1065,6 +1089,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_pad=self.intermediate_pad,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
+                swiglu_limit=10.0,
+                gate_mode=GateMode.INTERLEAVE.value
             )
         return self.fused_experts(
             hidden_states=x,
@@ -1974,7 +2000,7 @@ class FusedMoE(torch.nn.Module):
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
-        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+        fuse_shared_experts = False
         self.num_fused_shared_experts = (
             config.n_shared_experts
             if config is not None
