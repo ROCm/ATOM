@@ -31,10 +31,10 @@ class KVConnectorFactory:
         # Registration (happens once, typically at import time)
         KVConnectorFactory.register(
             "moriio",
-            worker_module="atom.kv_transfer.disaggregation.kv_transfer_engine",
-            worker_class="KVConnector",
-            scheduler_module="atom.kv_transfer.disaggregation.kv_transfer_engine",
-            scheduler_class="KVConnectorScheduler",
+            worker_module="atom.kv_transfer.disaggregation.moriio.moriio_connector",
+            worker_class="MoRIIOConnector",
+            scheduler_module="atom.kv_transfer.disaggregation.moriio.moriio_connector",
+            scheduler_class="MoRIIOConnectorScheduler",
         )
 
         # Instantiation (called from forward_context.py)
@@ -121,8 +121,16 @@ class KVConnectorFactory:
 
 KVConnectorFactory.register(
     "moriio",
-    worker_module="atom.kv_transfer.disaggregation.kv_transfer_engine",
-    worker_class="KVConnector",
-    scheduler_module="atom.kv_transfer.disaggregation.kv_transfer_engine",
-    scheduler_class="KVConnectorScheduler",
+    worker_module="atom.kv_transfer.disaggregation.moriio.moriio_connector",
+    worker_class="MoRIIOConnector",
+    scheduler_module="atom.kv_transfer.disaggregation.moriio.moriio_connector",
+    scheduler_class="MoRIIOConnectorScheduler",
+)
+
+KVConnectorFactory.register(
+    "mooncake",
+    worker_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
+    worker_class="MooncakeConnector",
+    scheduler_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
+    scheduler_class="MooncakeConnectorScheduler",
 )

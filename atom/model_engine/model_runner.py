@@ -10,6 +10,8 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 import torch.profiler as torch_profiler
 import tqdm
 from aiter import destroy_dist_env, init_dist_env
@@ -470,6 +472,25 @@ class tokenIDProcessor:
         return ret
 
 
+@triton.jit
+def _gpu_fence_kernel(
+    kv_ptr,
+    block_ids_ptr,
+    total_blocks: tl.int64,
+    elems_per_block: tl.int64,
+    NUM_CL: tl.constexpr,
+):
+    blk_idx = tl.program_id(0)
+    layer_idx = tl.program_id(1).to(tl.int64)
+    blk = tl.load(block_ids_ptr + blk_idx).to(tl.int64)
+    base = (layer_idx * total_blocks + blk) * elems_per_block
+    cl_offsets = tl.arange(0, NUM_CL).to(tl.int64) * 32
+    mask = cl_offsets < elems_per_block
+    tl.atomic_or(
+        kv_ptr + base + cl_offsets, tl.zeros([NUM_CL], dtype=tl.int32), mask=mask
+    )
+
+
 class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
@@ -679,6 +700,7 @@ class ModelRunner:
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
+        self._fence_event: Optional[torch.cuda.Event] = None
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
@@ -1879,8 +1901,41 @@ class ModelRunner:
         if connector is None:
             return KVConnectorOutput(finished_sending=[], finished_recving=[])
         done_sending, done_recving = connector.get_finished()
+
+        fence_blocks = connector.get_finished_recv_blocks()
+        if fence_blocks:
+            with torch.cuda.stream(self.async_execute_stream):
+                self._gpu_memory_fence(fence_blocks)
+            event = torch.cuda.Event()
+            event.record(self.async_execute_stream)
+            self._fence_event = event
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
+        )
+
+    def _gpu_memory_fence(self, block_ids: list[int]) -> None:
+        """Force GPU memory coherence for RDMA-written KV cache blocks.
+
+        Single Triton kernel launch — one atomic_or(0) per cache line (128 bytes)
+        across all (layer, block) pairs.
+        """
+        block_ids_t = torch.tensor(block_ids, dtype=torch.int32, device=self.device)
+        kv_flat = self.kv_cache.view(torch.int32)
+        if self.use_mla:
+            num_layers = self.kv_cache.shape[0]
+            total_blocks = self.kv_cache.shape[1]
+        else:
+            num_layers = 2 * self.kv_cache.shape[1]
+            total_blocks = self.kv_cache.shape[2]
+        elems_per_block = kv_flat.numel() // (num_layers * total_blocks)
+        num_cl = triton.cdiv(elems_per_block, 32)
+        NUM_CL = triton.next_power_of_2(num_cl)
+        _gpu_fence_kernel[(len(block_ids), num_layers)](
+            kv_flat,
+            block_ids_t,
+            total_blocks,
+            elems_per_block,
+            NUM_CL=NUM_CL,
         )
 
     def propose_draft_token_ids(
