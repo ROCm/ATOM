@@ -99,7 +99,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """[bs] int32 GPU — per-seq state cache slot. Shared by swa_write +
     Compressor + paged-decode kernels (looked up via batch_id_per_token)."""
     n_committed_csa_per_seq: Optional[torch.Tensor] = None
-    """[bs] int32 GPU — `ctx_len // 4`. Consumed by csa_packed_write
+    """[bs] int32 GPU — `ctx_len // 4`. Consumed by csa_translate_pack
     (kernel masks `(k < n_committed) & (k < index_topk)` — clamp lives in
     kernel, not builder) AND by the indexer (cast to long inline)."""
 
@@ -107,7 +107,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     batch_id_per_token: Optional[torch.Tensor] = None
     """[padded_T] int64 GPU — the SINGLE per-token mapping
     (token_idx → seq_idx). int64 dtype is required by PyTorch fancy-index
-    (used in the indexer); triton kernels (swa_write, csa_packed_write)
+    (used in the indexer); triton kernels (swa_write, csa_translate_pack)
     read int64 fine. Padded tail [T:padded_T] = -1 sentinel; consumer
     kernels skip on `bid < 0`. All other per-token quantities resolved as
     `per_seq_data[batch_id_per_token[t]]` — no [T] aliases of seq data."""
@@ -130,7 +130,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """[T*win] int32 GPU — flat paged offsets into `unified_kv` for SWA path."""
     kv_indices_csa: Optional[torch.Tensor] = None
     """[csa_indptr[T]] int32 GPU — packed paged offsets for CSA layers
-    (window prefix + per-token compress entries via csa_packed_write)."""
+    (window prefix + per-token compress entries via csa_translate_pack)."""
     kv_indices_hca: Optional[torch.Tensor] = None
     """[hca_indptr[T]] int32 GPU — packed paged offsets for HCA layers
     (window prefix + n_committed_hca compress entries; layer-invariant)."""
@@ -1527,8 +1527,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             per token (single per-token mapping; consumed by `swa_write`,
             Phase B/C/E paged-decode kernels, and the indexer).
           - `attn_metadata.n_committed_csa_per_seq`: [bs] int32 per-seq
-            `ctx_len // 4` (shared by csa_packed_write + indexer; kernels do
-            their own `min(., index_topk)` clamp via mask).
+            `ctx_len // 4` (shared by csa_translate_pack + indexer; kernels
+            do their own `min(., index_topk)` clamp via mask).
           - `attn_metadata.state_slot_mapping`: [bs] int32 GPU view of
             per-seq state cache slot (already set by prepare_*; passed
             through unchanged here).
@@ -1595,11 +1595,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Built unconditionally. Consumed by swa_write, Phase B/C/E
         # paged-decode kernels, AND the indexer (cast to long inline).
         # CG: real data [0:total_tokens]; padded slots get -1 sentinel so
-        # consumer kernels (csa_packed_write, `_fill_csa_paged_compress`
-        # via where mask + clamp) skip them.
+        # consumer kernels (csa_translate_pack, swa_write) skip on `bid<0`.
         # int64 dtype: PyTorch fancy-index requires int64 INDEX (used by
         # the indexer in `_build_v4_indexer_meta`); triton kernels (swa_write,
-        # csa_packed_write) read whatever dtype the pointer carries — int64
+        # csa_translate_pack) read whatever dtype the pointer carries — int64
         # works for them too. Single buffer for all consumers, no dtype mirror.
         batch_id_per_token_np = np.full(padded_total_tokens, -1, dtype=np.int64)
         batch_id_per_token_np[:total_tokens] = np.repeat(
@@ -1610,7 +1609,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         # ----- n_committed_csa_per_seq (per-seq CSA committed count) -----
-        # = ctx_len // 4. Built unconditionally so both csa_packed_write
+        # = ctx_len // 4. Built unconditionally so both csa_translate_pack
         # (via batch_id_per_token lookup) and the indexer (uses raw per-seq
         # vector) read from this single H2D-staged buffer. Kernel-side
         # consumers do their own `min(., index_topk)` clamp via mask.
@@ -1722,7 +1721,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           - kv_indices_swa : SWA paged offsets, uniform stride win
           - kv_indices_csa : SWA prefix written here; CSA compress section
                              left UNINITIALIZED — V4Attention.forward fills
-                             it per-layer via csa_packed_write (Phase C)
+                             it per-layer via csa_translate_pack (Phase C)
           - kv_indices_hca : SWA prefix + HCA compress section, both fully
                              written (HCA is layer-invariant)
           - kv_indptr_{swa,csa,hca} : 3 indptr cumsums (SWA uniform, CSA /
@@ -1777,7 +1776,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # ----- 3 indptr cumsums (CPU numpy, per doc §6.3) -----
         # Per-token kv_len = f(per-seq quantity)[batch_id_per_token]. CSA
-        # length is clamped to index_topk because csa_packed_write only
+        # length is clamped to index_topk because csa_translate_pack only
         # writes that many rows per seq (kernel mask `(k < n_committed) &
         # (k < index_topk)`); the host-side clamp here just keeps the indices
         # buffer correctly sized — the staged GPU n_committed_csa stays raw.
@@ -2175,14 +2174,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
-        # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by csa_packed_write
+        # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by csa_translate_pack
         # (kernel masks `(k < n_committed) & (k < index_topk)`) AND by the
         # indexer (cast to int64 inline). Built unconditionally in
         # `_attach_v4_per_fwd_meta`.
         bufs["v4_n_committed_csa_per_seq"] = CpuGpuBuffer(bs, **i32)
         # Single per-token mapping shared across ALL V4 consumers:
-        #   - swa_write / csa_packed_write (triton kernels, read int64 fine)
-        #   - _fill_csa_paged_compress (PyTorch fancy index, REQUIRES int64)
+        #   - swa_write / csa_translate_pack (triton kernels, read int64 fine)
         #   - _build_v4_indexer_meta (PyTorch fancy index, REQUIRES int64)
         # int64 dtype satisfies the PyTorch constraint with one buffer rather
         # than maintaining an int32 + int64 mirror. Sized to `mnbt`

@@ -1761,64 +1761,36 @@ class DeepseekV4Attention(nn.Module):
           paged_offset     = swa_pages + physical_block * csa_block_capacity
                              + slot_in_block
 
-        `topk_local` is read from the same in-place buffer the indexer wrote
-        (`indexer_meta["decode_topk_indices_gpu"][:T]`) — `_post_process_topk`
-        returns a NEW tensor (`+ offset_per_token`), leaving this raw buffer
-        with seq-local indices in `[0, n_committed_csa)` and `-1` sentinels
-        for width-overflow tail cols.
+        Fully fused into one triton kernel — no [T, index_topk] intermediates,
+        no PyTorch fancy index, single CG node per CSA layer (was 7-8). CG
+        sentinel and OOB clamp are handled in-kernel; downstream
+        `sparse_attn_v4_paged_decode` strict-slices via `kv_indptr_csa`, so
+        tail cols beyond `valid_k` are never read and need no `-1` fill.
 
         Only invoked for CSA layers (`ratio == 4`) under is_pure_decode.
         """
-        from atom.model_ops.v4_kernels import csa_packed_write
+        from atom.model_ops.v4_kernels import csa_translate_pack
 
         indexer_meta = attn_md.indexer_meta
         topk_local_raw = indexer_meta["decode_topk_indices_gpu"][
             :total_tokens
         ]  # [T, index_topk] int32, seq-local with -1 tails
 
-        index_topk = topk_local_raw.size(1)
         # csa_block_capacity = block_size // ratio = 128 // 4 = 32.
         # `compressor.kv_cache.size(1)` is bound to k1_csa by builder
         # `build_kv_cache_tensor`, so this stays in sync if config changes.
         csa_block_capacity = self.compressor.kv_cache.size(1)
-        swa_pages = attn_md.swa_pages
-        block_tables = attn_md.block_tables  # [bs, mnbps] int32
-        batch_id_per_token = attn_md.batch_id_per_token  # [T] int32
 
-        # Translate (no per-token persistent tensor — fancy index produces a
-        # transient that lives in the CG mempool, freed after this layer).
-        block_idx_in_seq = topk_local_raw // csa_block_capacity
-        slot_in_block = topk_local_raw % csa_block_capacity
-        # `block_tables[batch_id_per_token[t], block_idx_in_seq[t,k]]` via
-        # broadcasted fancy indexing. CG-padded slots carry batch_id=-1 and
-        # garbage block_idx from the indexer's stale output; clamp both dims
-        # to safe in-bounds values so the GPU fancy-index op never OOBs.
-        # The bogus paged_compress those slots produce is skipped downstream
-        # by csa_packed_write's own `bid < 0` sentinel check.
-        mnbps = block_tables.size(1)
-        safe_bid = batch_id_per_token.clamp(min=0).long()
-        batch_id_expanded = safe_bid.unsqueeze(1).expand(-1, index_topk)
-        safe_block_idx = block_idx_in_seq.long().clamp(0, mnbps - 1)
-        physical_block = block_tables[batch_id_expanded, safe_block_idx]
-        paged_compress = swa_pages + physical_block * csa_block_capacity + slot_in_block
-        # Preserve `-1` sentinel from topk_local in the translated output;
-        # csa_packed_write itself bounds writes by `valid_count_per_seq`, so
-        # garbage in tail columns is never written, but keeping `-1` makes
-        # the buffer self-describing for debug.
-        paged_compress = torch.where(
-            topk_local_raw >= 0,
-            paged_compress.to(torch.int32),
-            torch.full_like(topk_local_raw, -1),
-        )
-
-        csa_packed_write(
-            paged_compress,
-            attn_md.kv_indices_csa,
-            attn_md.kv_indptr_csa,
+        csa_translate_pack(
+            topk_local_raw,
+            attn_md.block_tables,
             attn_md.n_committed_csa_per_seq,
-            batch_id_per_token,
+            attn_md.kv_indptr_csa,
+            attn_md.batch_id_per_token,
+            attn_md.kv_indices_csa,
+            swa_pages=attn_md.swa_pages,
             window_size=self.window_size,
-            index_topk=index_topk,
+            csa_block_capacity=csa_block_capacity,
         )
 
 

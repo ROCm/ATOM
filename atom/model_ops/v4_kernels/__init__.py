@@ -13,9 +13,9 @@ from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
 )
-from atom.model_ops.v4_kernels.csa_packed_write import (
-    csa_packed_write,
-    csa_packed_write_reference,
+from atom.model_ops.v4_kernels.csa_translate_pack import (
+    csa_translate_pack,
+    csa_translate_pack_reference,
 )
 from atom.model_ops.v4_kernels.fused_compress import (
     fused_compress_attn,
@@ -34,8 +34,8 @@ __all__ = [
     "fused_compress_attn_reference",
     "sparse_attn_v4_paged_decode",
     "sparse_attn_v4_paged_decode_reference",
-    "csa_packed_write",
-    "csa_packed_write_reference",
+    "csa_translate_pack",
+    "csa_translate_pack_reference",
     "CompressPlan",
     "make_compress_plans",
 ]
