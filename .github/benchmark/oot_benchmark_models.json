@@ -69,6 +69,18 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
+    "display": "Kimi-K2.5-MXFP4 TP2",
+    "dashboard_model": "Kimi-K2.5-MXFP4-tp2",
+    "source_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
+    "path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
+    "prefix": "kimi-k25-mxfp4-tp2",
+    "nightly_group": "B",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 2",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+  },
+  {
     "display": "Kimi-K2.5-MXFP4 TP4",
     "dashboard_model": "Kimi-K2.5-MXFP4-tp4",
     "source_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
@@ -163,6 +175,18 @@
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0"
+  },
+  {
+    "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
+    "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-tp2",
+    "source_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+    "path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+    "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp2",
+    "nightly_group": "A",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 32768 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1"
   },
   {
     "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
