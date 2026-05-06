@@ -173,12 +173,12 @@ LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
 
-RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL versions before SGLang build ==========" && \
+RUN echo "========== [SGLANG-ATOM] Check Aiter/FlyDSL versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom mori amd-aiter flydsl || true
 
 # Preserve the exact Triton that comes with the ATOM base image. SGLang installs
 # can perturb Triton metadata, so restore this copy after dependency installs.
-RUN echo "========== [SGLANG-ATOM] Back up base image triton ==========" && \
+RUN echo "========== [SGLANG-ATOM 0/6] Back up base image triton ==========" && \
     BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
     mkdir -p /tmp/sglang-triton-base-backup && \
     printf '%s\n' "${BASE_TRITON_VERSION}" > /tmp/sglang-triton-base-backup/import_version.txt && \
@@ -301,7 +301,7 @@ RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" 
     echo "Validated sglang launch_server entrypoint"
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
-    "${VENV_PYTHON}" -m pip show atom mori amd-aiter flydsl || true
+    "${VENV_PYTHON}" -m pip show atom mori amd-aiter flydsl triton || true
 
 CMD ["/bin/bash"]
 
