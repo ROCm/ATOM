@@ -760,6 +760,37 @@
 </section>
 </section>
 <hr class="docutils" />
+<section id="v4-attention-backend-migration">
+<h2>V4 Attention Backend (Migration)<a class="headerlink" href="#v4-attention-backend-migration" title="Link to this heading"></a></h2>
+<p>Selects between the legacy per-seq Python dispatch path in <code class="docutils literal notranslate"><span class="pre">atom/models/deepseek_v4.py</span></code>
+and the new batched <code class="docutils literal notranslate"><span class="pre">V4AttentionBackend</span></code> (<code class="docutils literal notranslate"><span class="pre">atom/model_ops/v4_attention_backend.py</span></code>).
+The new backend removes ~256 GPU→CPU <code class="docutils literal notranslate"><span class="pre">.item()</span></code> syncs per forward and is required
+to enable CUDAGraph capture for V4. Legacy stays available during PR-A migration
+for byte-equal A/B verification via dump-bisect; it is removed once all phases
+land. See <code class="docutils literal notranslate"><span class="pre">atom/model_ops/v4_backend_gate.py</span></code> for the selector.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>ATOM_V4_BACKEND</strong></p></td>
+<td><p>str</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">legacy</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">legacy</span></code> keeps the per-seq dispatch loop. <code class="docutils literal notranslate"><span class="pre">new</span></code> routes through <code class="docutils literal notranslate"><span class="pre">V4AttentionBackend</span></code>. Layer-restricted by <code class="docutils literal notranslate"><span class="pre">ATOM_V4_BACKEND_LAYERS</span></code> if set.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>ATOM_V4_BACKEND_LAYERS</strong></p></td>
+<td><p>csv int</p></td>
+<td><p>“” (= all)</p></td>
+<td><p>Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply <code class="docutils literal notranslate"><span class="pre">ATOM_V4_BACKEND</span></code> uniformly. Used for layer-by-layer bisect during migration (e.g. <code class="docutils literal notranslate"><span class="pre">0,3,15,30</span></code>).</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
 <section id="profiling-debugging">
 <h2>Profiling &amp; Debugging<a class="headerlink" href="#profiling-debugging" title="Link to this heading"></a></h2>
 <table class="docutils align-default">
@@ -788,6 +819,82 @@
 </tr>
 </tbody>
 </table>
+<section id="debug-dump-atom-utils-debug-helper">
+<h3>Debug Dump (<code class="docutils literal notranslate"><span class="pre">atom.utils.debug_helper</span></code>)<a class="headerlink" href="#debug-dump-atom-utils-debug-helper" title="Link to this heading"></a></h3>
+<p>Env-gated dump / compare / monkey-patch primitives for forward bisect &amp;
+batch invariance investigation. All entries are <strong>no-op when their
+controlling <code class="docutils literal notranslate"><span class="pre">*_DIR</span></code> is unset</strong>, so they are safe to leave wired into
+production paths. See <code class="docutils literal notranslate"><span class="pre">.claude/skills/dump-bisect-debug.md</span></code> for the
+methodology and <code class="docutils literal notranslate"><span class="pre">atom/utils/debug_helper/</span></code> for the implementation.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>ATOM_FWD_DUMP_DIR</strong></p></td>
+<td><p>str</p></td>
+<td><p>—</p></td>
+<td><p>Enables <code class="docutils literal notranslate"><span class="pre">install_block_forward_hooks</span></code>. Per-Block hidden state is saved to <code class="docutils literal notranslate"><span class="pre">{DIR}/layer{LL}_{Cls}_rank{R}[_call{NNN}].pt</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>ATOM_FWD_DUMP_LAYERS</strong></p></td>
+<td><p>csv int</p></td>
+<td><p>“” (= all)</p></td>
+<td><p>Comma-separated layer ids to dump (e.g. <code class="docutils literal notranslate"><span class="pre">0,5,15,30</span></code>). Empty string means dump every layer.</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>ATOM_FWD_DUMP_BLOCK_CLASS</strong></p></td>
+<td><p>csv str</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Block</span></code></p></td>
+<td><p>Module class names to hook. Multiple values supported (e.g. <code class="docutils literal notranslate"><span class="pre">Block,DeepseekV4Attention,MoE,Compressor,Indexer</span></code>) for sub-stage bisect. Override per model.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>ATOM_FWD_DUMP_LAYER_ATTR</strong></p></td>
+<td><p>str</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">layer_id</span></code></p></td>
+<td><p>Attribute name on the block carrying its index. Some non-DeepSeek models use <code class="docutils literal notranslate"><span class="pre">layer_idx</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>ATOM_FWD_DUMP_ONE_SHOT</strong></p></td>
+<td><p>bool</p></td>
+<td><p>1 (true)</p></td>
+<td><p>When <code class="docutils literal notranslate"><span class="pre">1</span></code>, only the first call per layer is dumped (typical: warmup). Set to <code class="docutils literal notranslate"><span class="pre">0</span></code> to enumerate every call (<code class="docutils literal notranslate"><span class="pre">_call000.pt</span></code>, <code class="docutils literal notranslate"><span class="pre">_call001.pt</span></code>, …) — required when bisecting per-seq dispatch loops.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>ATOM_WEIGHT_DUMP_DIR</strong></p></td>
+<td><p>str</p></td>
+<td><p>—</p></td>
+<td><p>Enables <code class="docutils literal notranslate"><span class="pre">maybe_dump_weights_and_exit</span></code>. Per-rank params + buffers for selected layers dumped to <code class="docutils literal notranslate"><span class="pre">{DIR}/weight_rank{R}_layer{L}.pt</span></code>. Skips <code class="docutils literal notranslate"><span class="pre">.experts.*</span></code> (FP4 packed).</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>ATOM_WEIGHT_DUMP_LAYERS</strong></p></td>
+<td><p>csv int</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Comma-separated layer ids to dump weights for.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>ATOM_WEIGHT_DUMP_EXIT</strong></p></td>
+<td><p>bool</p></td>
+<td><p>1 (true)</p></td>
+<td><p>When <code class="docutils literal notranslate"><span class="pre">1</span></code> (default), call <code class="docutils literal notranslate"><span class="pre">sys.exit(0)</span></code> after dumping. Set to <code class="docutils literal notranslate"><span class="pre">0</span></code> to continue inference after dump.</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>ATOM_DEBUG_TOPK</strong></p></td>
+<td><p>int</p></td>
+<td><p>0</p></td>
+<td><p>Set to <code class="docutils literal notranslate"><span class="pre">K</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> to log top-K logits per row from <code class="docutils literal notranslate"><span class="pre">Sampler.forward</span></code> via <code class="docutils literal notranslate"><span class="pre">maybe_log_topk()</span></code>. Only rank 0 writes.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>ATOM_DEBUG_TOPK_PATH</strong></p></td>
+<td><p>str</p></td>
+<td><p>—</p></td>
+<td><p>Optional output file for top-K logs. Writes to stderr if unset.</p></td>
+</tr>
+</tbody>
+</table>
+<p>CLI for comparing dumps:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.utils.debug_helper.compare<span class="w"> </span>slot-invariance<span class="w"> </span>--dir<span class="w"> </span>DIR<span class="w"> </span>--n-slots<span class="w"> </span><span class="m">4</span>
+python<span class="w"> </span>-m<span class="w"> </span>atom.utils.debug_helper.compare<span class="w"> </span>ref-vs-target<span class="w">  </span>--dir<span class="w"> </span>DIR
+python<span class="w"> </span>-m<span class="w"> </span>atom.utils.debug_helper.compare<span class="w"> </span>layer-bisect<span class="w">   </span>--dir<span class="w"> </span>DIR<span class="w"> </span>--threshold<span class="w"> </span><span class="m">0</span>.99
+python<span class="w"> </span>-m<span class="w"> </span>atom.utils.debug_helper.compare<span class="w"> </span>schema<span class="w"> </span>--a<span class="w"> </span>A.pt<span class="w"> </span>--b<span class="w"> </span>B.pt
+</pre></div>
+</div>
+</section>
 </section>
 <hr class="docutils" />
 <section id="benchmarks-optional">
