@@ -138,8 +138,8 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
     Returns:
     A Tuple of shuffled tensors.
     """
-    if envs.ATOM_WEIGHT_PRESHUFFLE:
-        logger.info("Skipping weight shuffle since ATOM_WEIGHT_PRESHUFFLE is set.")
+    if not envs.ATOM_WEIGHT_PRESHUFFLE:
+        logger.info("Skipping weight shuffle since ATOM_WEIGHT_PRESHUFFLE is not set.")
         return
     for tensor in tensors:
         if not isinstance(tensor, torch.nn.Parameter):

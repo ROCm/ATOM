@@ -13,6 +13,7 @@ from aiter import (
     gemm_a8w8,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
+    gemm_a8w8_blockscale,
     get_hip_quant,
 )
 
@@ -444,14 +445,23 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
-                y = gemm_a8w8_blockscale_preshuffle_impl(
-                    x,
-                    self.weight,
-                    x_scale,
-                    self.weight_scale,
-                    dtype=otype,
-                    prefix=self.prefix,
-                )
+                if envs.ATOM_WEIGHT_PRESHUFFLE:
+                    y = gemm_a8w8_blockscale_preshuffle_impl(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        dtype=otype,
+                        prefix=self.prefix,
+                    )
+                else:
+                    y = gemm_a8w8_blockscale(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        dtype=otype,
+                    )
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
