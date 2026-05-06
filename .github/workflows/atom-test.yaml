@@ -70,15 +70,60 @@ jobs:
           AUTH_HEADER="Authorization: token ${{ secrets.GITHUB_TOKEN }}"
           AITER_TEST_WORKFLOW_ID=179476100
 
+          ARTIFACT_ID=""
+          ARTIFACT_NAME=""
+          ARTIFACT_RUN_ID=""
+          ARTIFACT_RUN_SHA=""
+          ARTIFACT_RUN_CREATED_AT=""
+
+          resolve_download_url() {
+            python3 -c 'import sys
+            from urllib.parse import quote, unquote, urlsplit, urlunsplit
+            parts = urlsplit(sys.argv[1])
+            encoded_path = "/".join(quote(unquote(segment), safe="") for segment in parts.path.split("/"))
+            print(urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)))' "$1"
+          }
+
+          find_latest_artifact() {
+            local runs_json artifact_json run_id
+
+            if [ -n "$ARTIFACT_ID" ] && [ "$ARTIFACT_ID" != "null" ]; then
+              return 0
+            fi
+
+            echo "=== Finding latest aiter-whl-* artifact from ROCm/aiter ==="
+            runs_json=$(curl -fsSL -H "$AUTH_HEADER" \
+              "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
+
+            for run_id in $(echo "$runs_json" | jq -r '.workflow_runs[].id'); do
+              artifact_json=$(curl -fsSL -H "$AUTH_HEADER" \
+                "$API_URL/repos/ROCm/aiter/actions/runs/$run_id/artifacts" \
+                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-")) | select(.expired == false)] | sort_by(.created_at) | last')
+
+              if [ "$artifact_json" != "null" ] && [ -n "$artifact_json" ]; then
+                ARTIFACT_ID=$(echo "$artifact_json" | jq -r '.id')
+                ARTIFACT_NAME=$(echo "$artifact_json" | jq -r '.name')
+                ARTIFACT_RUN_ID="$run_id"
+                ARTIFACT_RUN_SHA=$(echo "$runs_json" | jq -r --arg run_id "$run_id" '.workflow_runs[] | select((.id | tostring) == $run_id) | .head_sha')
+                ARTIFACT_RUN_CREATED_AT=$(echo "$runs_json" | jq -r --arg run_id "$run_id" '.workflow_runs[] | select((.id | tostring) == $run_id) | .created_at')
+                echo "Found artifact in run $ARTIFACT_RUN_ID: $ARTIFACT_NAME (ID: $ARTIFACT_ID, SHA: $ARTIFACT_RUN_SHA)"
+                return 0
+              fi
+            done
+
+            return 1
+          }
+
           download_from_s3_manifest() {
-            local manifest_file manifest_branch manifest_timestamp manifest_commit wheel_name wheel_url
+            local manifest_file manifest_fetch_url manifest_branch manifest_timestamp manifest_commit wheel_name wheel_url resolved_wheel_url
 
             mkdir -p aiter-whl
             rm -f aiter-whl/amd_aiter*.whl
 
             manifest_file=$(mktemp)
             trap 'rm -f "$manifest_file"' RETURN
-            curl -fsSL "$S3_MAIN_MANIFEST_URL" -o "$manifest_file" || return 1
+            manifest_fetch_url="${S3_MAIN_MANIFEST_URL}?ts=$(date +%s)"
+            curl -fsSL -H "Cache-Control: no-cache" "$manifest_fetch_url" -o "$manifest_file" || return 1
 
             manifest_branch=$(jq -r '.branch // empty' "$manifest_file")
             manifest_timestamp=$(jq -r '.timestamp // empty' "$manifest_file")
@@ -91,12 +136,26 @@ jobs:
               return 1
             fi
 
+            if find_latest_artifact; then
+              if [ -n "$ARTIFACT_RUN_SHA" ] && [ "$manifest_commit" != "$ARTIFACT_RUN_SHA" ]; then
+                if [ -n "$ARTIFACT_RUN_CREATED_AT" ] && [[ "$manifest_timestamp" < "$ARTIFACT_RUN_CREATED_AT" ]]; then
+                  echo "Manifest commit $manifest_commit is older than latest artifact run $ARTIFACT_RUN_ID ($ARTIFACT_RUN_SHA); treating manifest as stale"
+                  return 1
+                fi
+                echo "Manifest commit $manifest_commit differs from latest artifact run $ARTIFACT_RUN_ID ($ARTIFACT_RUN_SHA), but manifest timestamp is not older"
+              fi
+            else
+              echo "No GitHub fallback artifact found while checking manifest freshness"
+            fi
+
+            resolved_wheel_url=$(resolve_download_url "$wheel_url")
+
             echo "Selected latest main wheel manifest: $S3_MAIN_MANIFEST_URL"
             echo "Manifest timestamp: $manifest_timestamp"
             echo "Manifest commit: $manifest_commit"
             echo "Manifest wheel: $wheel_name"
-            echo "Downloading manifest-selected wheel: $wheel_url"
-            curl -fsSL "$wheel_url" -o "aiter-whl/$wheel_name" || return 1
+            echo "Downloading manifest-selected wheel: $resolved_wheel_url"
+            curl -fsSL "$resolved_wheel_url" -o "aiter-whl/$wheel_name" || return 1
             echo "Downloaded wheel from manifest: aiter-whl/$wheel_name"
 
             rm -f "$manifest_file"
@@ -104,30 +163,11 @@ jobs:
           }
 
           download_from_artifact() {
-            echo "=== Falling back to latest aiter-whl-main artifact from ROCm/aiter ==="
-
-            RUNS=$(curl -fsSL -H "$AUTH_HEADER" \
-              "$API_URL/repos/ROCm/aiter/actions/workflows/$AITER_TEST_WORKFLOW_ID/runs?per_page=100&branch=main&event=push")
-
-            ARTIFACT_ID=""
-            ARTIFACT_NAME=""
-            for RUN_ID in $(echo "$RUNS" | jq -r '.workflow_runs[].id'); do
-              ARTIFACT_JSON=$(curl -fsSL -H "$AUTH_HEADER" \
-                "$API_URL/repos/ROCm/aiter/actions/runs/$RUN_ID/artifacts" \
-                | jq '[.artifacts[] | select(.name | startswith("aiter-whl-main")) | select(.expired == false)] | first')
-
-              if [ "$ARTIFACT_JSON" != "null" ] && [ -n "$ARTIFACT_JSON" ]; then
-                ARTIFACT_ID=$(echo "$ARTIFACT_JSON" | jq -r '.id')
-                ARTIFACT_NAME=$(echo "$ARTIFACT_JSON" | jq -r '.name')
-                echo "Found artifact in run $RUN_ID: $ARTIFACT_NAME (ID: $ARTIFACT_ID)"
-                break
-              fi
-            done
-
-            if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
-              echo "ERROR: No aiter-whl-main artifact found in recent Aiter Test runs"
+            echo "=== Falling back to latest aiter-whl-* artifact from ROCm/aiter ==="
+            find_latest_artifact || {
+              echo "ERROR: No aiter-whl-* artifact found in recent Aiter Test runs"
               return 1
-            fi
+            }
 
             mkdir -p aiter-whl
             rm -f aiter-whl/amd_aiter*.whl
