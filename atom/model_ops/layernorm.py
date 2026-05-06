@@ -289,6 +289,7 @@ class RMSNorm(nn.Module):
                     )
                     return x, residual
 
+
 # decode
 @triton.jit
 def _rmsnorm_gated_contiguous_128_kernel(
@@ -314,6 +315,7 @@ def _rmsnorm_gated_contiguous_128_kernel(
     out = x * inv_rms * weight * gate
 
     tl.store(out_ptr + row_offset + offsets, out)
+
 
 # prefill
 @triton.jit
