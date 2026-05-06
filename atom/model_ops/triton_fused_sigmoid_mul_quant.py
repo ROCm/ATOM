@@ -130,7 +130,7 @@ def fused_sigmoid_mul_fp8_quant(
         group_size: Quantization group size (default 128, matching per_1x128).
         transpose_scale: If True, produce column-major x_scale (for preshuffle GEMM).
                          If False, produce row-major x_scale (for non-preshuffle GEMM).
-                         If None (default), follows ATOM_WEIGHT_PRESHUFFLE env var.
+                         If None (default), follows ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE env var.
 
     Returns:
         (x_fp8, x_scale):
@@ -140,7 +140,7 @@ def fused_sigmoid_mul_fp8_quant(
     if transpose_scale is None:
         from atom.utils import envs
 
-        transpose_scale = envs.ATOM_WEIGHT_PRESHUFFLE
+        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
 
     M, N = attn_output.shape
     assert (
