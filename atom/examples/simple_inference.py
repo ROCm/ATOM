@@ -23,7 +23,7 @@ parser.add_argument(
 parser.add_argument(
     "--max-tokens",
     type=int,
-    default=256,
+    default=300,
     help="max sampled tokens per prompt",
 )
 
@@ -44,6 +44,8 @@ def main():
         "list all prime numbers within 100",
         "1+2+3=?",
         "如何在一个月内增肌10公斤",
+        "+".join([f"{i}-{i+1}" for i in range(1000)]) + "=? 最后结果是什么",
+        "+".join([f"{i}+{i+1}" for i in range(3000)]) + "=? 最后结果是什么",
     ]
     args = parser.parse_args()
     # Generate power of 2 sizes for CUDA graph: [1, 2, 4, 8, ...]

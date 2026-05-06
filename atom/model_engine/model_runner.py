@@ -1336,13 +1336,28 @@ class ModelRunner:
         # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
         set_kv_cache_data(kv_cache_data, config)
 
-        # Cross-validate: compare estimated vs actual KV cache allocation
+        # Cross-validate: compare estimated vs actual KV cache allocation.
+        # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
+        # `block_bytes × num_blocks`) AND the per-request cache tensors (state
+        # buffers + SWA window prefix embedded in unified_kv). The budget
+        # math in `get_num_blocks()` reserves both separately, so the cross-
+        # check must mirror that — otherwise it spuriously fires for any
+        # backend with non-zero `compute_per_req_cache_bytes()` (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
-        expected_kv_bytes = self._compute_block_bytes() * num_kvcache_blocks
+        expected_kv_bytes = (
+            self._compute_block_bytes() * num_kvcache_blocks
+            + self.attn_metadata_builder.compute_per_req_cache_bytes()
+            * self.max_per_req_cache_slots
+        )
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
-            if diff_pct > 0.01:
+            # 3% threshold: budget formula matches allocation exactly, but the
+            # measured `post_alloc - pre_alloc` includes allocator alignment
+            # (round to 256 B / 16 MiB segments) and ephemeral init buffers
+            # from `_zero_state` / `_neg_inf_state` views, accounting for ~2%
+            # noise on multi-GiB pools. Lower thresholds spuriously fire.
+            if diff_pct > 0.03:
                 logger.warning(
                     f"KV cache allocation mismatch: "
                     f"expected={expected_kv_bytes / (1 << 30):.3f}GB, "

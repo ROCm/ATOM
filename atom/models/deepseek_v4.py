@@ -61,10 +61,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from aiter import rope_rotate_activation
-from atom.model_ops.quant_v4 import (
-    act_quant_inplace,
-    rotate_activation,
-)
+from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
@@ -1836,7 +1833,9 @@ class MoE(nn.Module):
         `forward_context.context.input_ids` before each forward, and
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
-        router_logits = self.gate(x, otype=torch.float32)  # [num_tokens, n_routed_experts]
+        router_logits = self.gate(
+            x, otype=torch.float32
+        )  # [num_tokens, n_routed_experts]
         return self.experts(hidden_states=x, router_logits=router_logits)
 
     def combine_outputs(
@@ -2129,7 +2128,9 @@ class ParallelHead(nn.Module):
         """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
-        _, _, y = aiter.mhc_pre(x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0)
+        _, _, y = aiter.mhc_pre(
+            x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
+        )
         return y
 
     def forward(
