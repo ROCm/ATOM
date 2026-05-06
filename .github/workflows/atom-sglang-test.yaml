@@ -127,6 +127,24 @@ jobs:
               ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
             accuracy_test_threshold: 0.92
             runner: linux-atom-mi35x-4
+          - model_name: "Qwen3.5-35B-A3B-FP8 TP2"
+            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
+            extra_args: "--tensor-parallel-size 2"
+            env_vars: ""
+            accuracy_test_threshold: 0.89
+            runner: linux-atom-mi35x-4
+          - model_name: "Qwen3.5-27B-FP8 TP2"
+            model_path: "Qwen/Qwen3.5-27B-FP8"
+            extra_args: "--tensor-parallel-size 2"
+            env_vars: ""
+            accuracy_test_threshold: 0.88
+            runner: linux-atom-mi35x-4
+          - model_name: "Qwen3.5-35B-A3B TP2"
+            model_path: "Qwen/Qwen3.5-35B-A3B"
+            extra_args: "--tensor-parallel-size 2"
+            env_vars: ""
+            accuracy_test_threshold: 0.95
+            runner: linux-atom-mi35x-4
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:

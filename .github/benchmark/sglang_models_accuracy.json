@@ -10,5 +10,41 @@
     "accuracy_baseline": null,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528",
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
+    "model_name": "Qwen3.5-35B-A3B-FP8 TP2",
+    "model_path": "Qwen/Qwen3.5-35B-A3B-FP8",
+    "extraArgs": "--tensor-parallel-size 2",
+    "env_vars": "",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.89,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-35B-A3B-FP8",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
+    "model_name": "Qwen3.5-27B-FP8 TP2",
+    "model_path": "Qwen/Qwen3.5-27B-FP8",
+    "extraArgs": "--tensor-parallel-size 2",
+    "env_vars": "",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.88,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-27B-FP8",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+  },
+  {
+    "model_name": "Qwen3.5-35B-A3B TP2",
+    "model_path": "Qwen/Qwen3.5-35B-A3B",
+    "extraArgs": "--tensor-parallel-size 2",
+    "env_vars": "",
+    "runner": "linux-atom-mi35x-4",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.95,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "Qwen/Qwen3.5-35B-A3B",
+    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
   }
 ]
