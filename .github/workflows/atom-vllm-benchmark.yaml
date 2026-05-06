@@ -90,8 +90,123 @@ on:
         default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
 
 jobs:
+  wait-for-older-manual-runs:
+    name: Wait for older manual benchmark runs
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for older workflow_dispatch runs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MAX_WAIT_MINUTES: "2880"
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          from datetime import datetime
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          if event != "schedule":
+              print("Not a scheduled run; skipping manual-run wait gate.")
+              raise SystemExit(0)
+
+          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ.get("GITHUB_TOKEN", "")
+          max_wait_minutes = int(os.environ.get("MAX_WAIT_MINUTES", "2880"))
+          pending_statuses = {"queued", "in_progress", "waiting", "pending"}
+
+          def api_json(url: str) -> dict:
+              request = Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "User-Agent": "atom-vllm-benchmark-manual-priority-gate",
+                  },
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except HTTPError as exc:
+                  detail = exc.read().decode("utf-8", errors="replace").strip()
+                  raise RuntimeError(
+                      f"GitHub API returned HTTP {exc.code} while reading workflow runs: {detail}"
+                  ) from exc
+              except URLError as exc:
+                  raise RuntimeError(
+                      f"Failed to reach GitHub API while reading workflow runs: {exc}"
+                  ) from exc
+
+          current_run = api_json(f"{api_url}/repos/{repository}/actions/runs/{run_id}")
+          current_created_at = datetime.fromisoformat(
+              current_run["created_at"].replace("Z", "+00:00")
+          )
+
+          print(
+              f"Scheduled run #{run_id} created at {current_run['created_at']} will wait for older manual runs."
+          )
+
+          deadline = time.time() + max_wait_minutes * 60
+          poll_seconds = 300
+
+          while True:
+              runs = api_json(
+                  f"{api_url}/repos/{repository}/actions/workflows/atom-vllm-benchmark.yaml/runs"
+                  "?event=workflow_dispatch&per_page=100"
+              ).get("workflow_runs", [])
+
+              blockers = []
+              for run in runs:
+                  if str(run.get("id")) == str(run_id):
+                      continue
+                  status = run.get("status")
+                  created_at = run.get("created_at")
+                  if status not in pending_statuses or not created_at:
+                      continue
+                  run_created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                  if run_created_at >= current_created_at:
+                      continue
+                  blockers.append(
+                      (
+                          run_created_at,
+                          run.get("id"),
+                          status,
+                          run.get("head_branch", ""),
+                          run.get("display_title") or run.get("name", ""),
+                      )
+                  )
+
+              blockers.sort()
+              if not blockers:
+                  print("No older manual ATOM vLLM Benchmark runs are queued or in progress.")
+                  break
+
+              print("Waiting for older manual benchmark runs to finish before starting scheduled benchmarks:")
+              for created_at, blocker_id, status, branch, title in blockers:
+                  print(
+                      f" - run #{blocker_id} status={status} branch={branch} created_at={created_at.isoformat()} title={title}"
+                  )
+
+              if time.time() >= deadline:
+                  raise SystemExit(
+                      f"Timed out after {max_wait_minutes} minutes waiting for older manual benchmark runs."
+                  )
+
+              print(f"Sleeping {poll_seconds} seconds before re-checking blockers...")
+              time.sleep(poll_seconds)
+          PY
+
   resolve-atom-source:
     name: Resolve ATOM benchmark source
+    needs: [wait-for-older-manual-runs]
     runs-on: ubuntu-latest
     outputs:
       atom_repository: ${{ steps.resolve.outputs.atom_repository }}
@@ -273,6 +388,7 @@ jobs:
 
   parse-param-lists:
     name: Parse parameter lists
+    needs: [wait-for-older-manual-runs]
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
@@ -312,6 +428,7 @@ jobs:
 
   load-models:
     name: Load OOT model configs
+    needs: [wait-for-older-manual-runs]
     runs-on: ubuntu-latest
     permissions:
       actions: read
