@@ -493,7 +493,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         # Verified 2026-04-24: cos_sim >= 0.9999 for inter=160->192 and
         # inter=320->384 vs torch reference.
         w13 = layer.w13_weight.data  # [E, 2*inter, hidden]
-        w2 = layer.w2_weight.data    # [E, hidden, inter]
+        w2 = layer.w2_weight.data  # [E, hidden, inter]
         inter_dim = w2.shape[2]
         # Stage1 dispatch: inter<=192 uses NPerBlock=64, inter>192 uses NPerBlock=128.
         # Stage2 dispatch: inter>192 uses KPerBlock=64.
@@ -507,12 +507,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             w13_new = torch.zeros(
                 E, 2 * inter_pad, hidden, dtype=w13.dtype, device=w13.device
             )
-            w13_new[:, :inter_dim, :] = w13[:, :inter_dim, :]       # gate
-            w13_new[:, inter_pad : inter_pad + inter_dim, :] = w13[:, inter_dim:, :]  # up
+            w13_new[:, :inter_dim, :] = w13[:, :inter_dim, :]  # gate
+            w13_new[:, inter_pad : inter_pad + inter_dim, :] = w13[
+                :, inter_dim:, :
+            ]  # up
             # pad w2: [E, hidden, inter_pad]
-            w2_new = torch.zeros(
-                E, hidden, inter_pad, dtype=w2.dtype, device=w2.device
-            )
+            w2_new = torch.zeros(E, hidden, inter_pad, dtype=w2.dtype, device=w2.device)
             w2_new[:, :, :inter_dim] = w2
             layer.w13_weight = atom_parameter(w13_new)
             layer.w2_weight = atom_parameter(w2_new)
@@ -1034,10 +1034,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     global_num_experts=global_num_experts,
                     expert_map=expert_map,
                 )
-                _tp_size = getattr(self, 'tp_size', getattr(self.moe, 'tp_size', 1)) if hasattr(self, 'moe') else getattr(self, 'tp_size', 1)
-                _ep_size = getattr(self, 'ep_size', getattr(self.moe, 'ep_size', 1)) if hasattr(self, 'moe') else getattr(self, 'ep_size', 1)
+                _tp_size = (
+                    getattr(self, "tp_size", getattr(self.moe, "tp_size", 1))
+                    if hasattr(self, "moe")
+                    else getattr(self, "tp_size", 1)
+                )
+                _ep_size = (
+                    getattr(self, "ep_size", getattr(self.moe, "ep_size", 1))
+                    if hasattr(self, "moe")
+                    else getattr(self, "ep_size", 1)
+                )
                 if layer.reduce_results and (_tp_size > 1 or _ep_size > 1):
                     from aiter.dist.parallel_state import get_tp_group
+
                     _moe_result = get_tp_group().all_reduce(
                         _moe_result, ca_fp8_quant=False
                     )
@@ -1730,18 +1739,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             hidden = layer.w13_weight.shape[-1]
             w13 = layer.w13_weight.data
             w13_new = torch.zeros(
-                E, 2 * inter_pad, hidden,
-                dtype=w13.dtype, device=w13.device
+                E, 2 * inter_pad, hidden, dtype=w13.dtype, device=w13.device
             )
-            w13_new[:, :inter_dim, :] = w13[:, :inter_dim, :]        # gate
-            w13_new[:, inter_pad:inter_pad + inter_dim, :] = w13[:, inter_dim:, :]  # up
+            w13_new[:, :inter_dim, :] = w13[:, :inter_dim, :]  # gate
+            w13_new[:, inter_pad : inter_pad + inter_dim, :] = w13[
+                :, inter_dim:, :
+            ]  # up
             layer.w13_weight = atom_parameter(w13_new)
 
             w2 = layer.w2_weight.data
-            w2_new = torch.zeros(
-                E, hidden, inter_pad,
-                dtype=w2.dtype, device=w2.device
-            )
+            w2_new = torch.zeros(E, hidden, inter_pad, dtype=w2.dtype, device=w2.device)
             w2_new[:, :, :inter_dim] = w2
             layer.w2_weight = atom_parameter(w2_new)
 
@@ -2329,7 +2336,9 @@ class FusedMoE(torch.nn.Module):
                 if shard_id == "w1":
                     expert_data.narrow(shard_dim, 0, expert_shard_size).zero_()
                 else:
-                    expert_data.narrow(shard_dim, expert_shard_size, expert_shard_size).zero_()
+                    expert_data.narrow(
+                        shard_dim, expert_shard_size, expert_shard_size
+                    ).zero_()
             return
         size = min(load_shard_size, loaded_weight.shape[shard_dim] - start)
         loaded_weight = loaded_weight.narrow(shard_dim, start, size)
@@ -2840,7 +2849,6 @@ class FusedMoE(torch.nn.Module):
 
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
-
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(

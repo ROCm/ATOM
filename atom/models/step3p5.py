@@ -19,7 +19,7 @@ Step-3.5 is a sparse MoE transformer with:
 """
 
 import os
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import torch
 from aiter import ActivationType
@@ -52,7 +52,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 
-def _uses_swiglustep_at_layer(config: PretrainedConfig, layer_idx: Optional[int]) -> bool:
+def _uses_swiglustep_at_layer(
+    config: PretrainedConfig, layer_idx: Optional[int]
+) -> bool:
     """Return True iff the routed FusedMoE at this layer needs the SwigluStep
     activation (i.e. ``swiglu_limits[layer_idx] > 0``).
 
@@ -125,7 +127,9 @@ class Step3p5MLP(nn.Module):
         )
         self.act_fn = SiluAndMul()
         # 0.0 means no clamping (disabled), only apply if > 0
-        self.clamp_limit = clamp_limit if (clamp_limit is not None and clamp_limit > 0) else None
+        self.clamp_limit = (
+            clamp_limit if (clamp_limit is not None and clamp_limit > 0) else None
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.gate_up_proj(x)
@@ -184,7 +188,9 @@ class Step3p5MoE(nn.Module):
         swiglu_limits = getattr(config, "swiglu_limits", None)
         self.clamp_limit = (
             swiglu_limits[layer_idx]
-            if (swiglu_limits and layer_idx is not None and swiglu_limits[layer_idx] > 0)
+            if (
+                swiglu_limits and layer_idx is not None and swiglu_limits[layer_idx] > 0
+            )
             else None
         )
         self._uses_swiglustep = self.clamp_limit is not None
@@ -207,9 +213,7 @@ class Step3p5MoE(nn.Module):
             requires_grad=False,
         )
 
-        self.routed_scaling_factor = getattr(
-            config, "moe_router_scaling_factor", 1.0
-        )
+        self.routed_scaling_factor = getattr(config, "moe_router_scaling_factor", 1.0)
         self._need_fp32_gate = getattr(config, "need_fp32_gate", False)
 
         # Routed experts (fused MoE kernel) --------------------------------
@@ -219,7 +223,9 @@ class Step3p5MoE(nn.Module):
         # or 0 at layer 43).  Fall back to the dense Step3p5MLP path there.
         self._fuse_shared = _fuse_shared_at_layer(config, layer_idx)
         n_shared = 1 if self._fuse_shared else 0
-        self._n_shared_fused = n_shared  # 1 when shared expert is fused as expert num_experts
+        self._n_shared_fused = (
+            n_shared  # 1 when shared expert is fused as expert num_experts
+        )
         self.experts = FusedMoE(
             num_experts=num_experts + n_shared,
             top_k=top_k + n_shared,  # +1 so kernel selects top_k routed + 1 shared
@@ -254,9 +260,7 @@ class Step3p5MoE(nn.Module):
         _, indices = torch.topk(gate_prob_biased, k=top_k_routed, dim=1)
         topk_prob = torch.gather(gate_prob, 1, indices)
         if renormalize:
-            topk_prob = topk_prob / (
-                topk_prob.sum(dim=-1, keepdim=True) + 1e-20
-            )
+            topk_prob = topk_prob / (topk_prob.sum(dim=-1, keepdim=True) + 1e-20)
         topk_prob = topk_prob * self.routed_scaling_factor
 
         if n_shared > 0:
@@ -264,7 +268,10 @@ class Step3p5MoE(nn.Module):
             T = gating_output.shape[0]
             num_routed = gating_output.shape[1]  # 288
             shared_ids = torch.full(
-                (T, n_shared), num_routed, dtype=torch.int32, device=gating_output.device
+                (T, n_shared),
+                num_routed,
+                dtype=torch.int32,
+                device=gating_output.device,
             )
             shared_weights = torch.ones(
                 (T, n_shared), dtype=torch.float32, device=gating_output.device
@@ -345,7 +352,7 @@ class Step3p5Attention(nn.Module):
 
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
 
         # RoPE configuration -----------------------------------------------
         rope_theta_cfg = getattr(config, "rope_theta", 10000.0)
@@ -362,9 +369,7 @@ class Step3p5Attention(nn.Module):
 
         rotary_dim = int(self.head_dim * partial_rotary_factor)
 
-        max_position_embeddings = getattr(
-            config, "max_position_embeddings", 262144
-        )
+        max_position_embeddings = getattr(config, "max_position_embeddings", 262144)
 
         # Determine rope_scaling for this layer
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -398,9 +403,7 @@ class Step3p5Attention(nn.Module):
         self.k_norm = Step3p5RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         # Head-wise attention gate -------------------------------------------
-        self.use_head_wise_attn_gate = getattr(
-            config, "use_head_wise_attn_gate", False
-        )
+        self.use_head_wise_attn_gate = getattr(config, "use_head_wise_attn_gate", False)
         if self.use_head_wise_attn_gate:
             self.g_proj = ColumnParallelLinear(
                 input_size=self.hidden_size,
@@ -430,9 +433,7 @@ class Step3p5Attention(nn.Module):
             sliding_window = getattr(config, "sliding_window", None)
             sink_size = getattr(config, "sink", 0)
             if sink_size > 0:
-                sinks = nn.Parameter(
-                    torch.empty(self.num_heads, requires_grad=False)
-                )
+                sinks = nn.Parameter(torch.empty(self.num_heads, requires_grad=False))
 
         self.attn = Attention(
             self.num_heads,
@@ -453,25 +454,30 @@ class Step3p5Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         import os
+
         debug_nan = os.environ.get("ATOM_DEBUG_NAN2")
 
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = torch.split(
-            qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
-        )
+        q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         if debug_nan and (q.isnan().any() or k.isnan().any() or v.isnan().any()):
-            print(f"[NAN-ATTN] qkv has NaN: q={q.isnan().any()} k={k.isnan().any()} v={v.isnan().any()}")
+            print(
+                f"[NAN-ATTN] qkv has NaN: q={q.isnan().any()} k={k.isnan().any()} v={v.isnan().any()}"
+            )
 
         # QK Norm – apply per-head RMSNorm
         # Reshape to (..., num_heads, head_dim), apply norm, reshape back
         q = self.q_norm(q.reshape(*q.shape[:-1], -1, self.head_dim)).flatten(-2)
         k = self.k_norm(k.reshape(*k.shape[:-1], -1, self.head_dim)).flatten(-2)
         if debug_nan and (q.isnan().any() or k.isnan().any()):
-            print(f"[NAN-ATTN] after qk_norm NaN: q={q.isnan().any()} k={k.isnan().any()}")
+            print(
+                f"[NAN-ATTN] after qk_norm NaN: q={q.isnan().any()} k={k.isnan().any()}"
+            )
 
         attn_output = self.attn(q, k, v, positions)
         if debug_nan and attn_output.isnan().any():
-            print(f"[NAN-ATTN] attn output has NaN, num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, q_size={self.q_size}, kv_size={self.kv_size}, attn_output.shape={attn_output.shape}")
+            print(
+                f"[NAN-ATTN] attn output has NaN, num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, q_size={self.q_size}, kv_size={self.kv_size}, attn_output.shape={attn_output.shape}"
+            )
 
         # Head-wise gating
         if self.use_head_wise_attn_gate:
@@ -482,14 +488,16 @@ class Step3p5Attention(nn.Module):
             gate = torch.sigmoid(gate).unsqueeze(-1)
             reshaped = attn_output.reshape(*attn_output.shape[:-1], -1, self.head_dim)
             if debug_nan:
-                print(f"[NAN-ATTN] attn_output.shape={attn_output.shape} reshaped.shape={reshaped.shape} gate.shape={gate.shape}")
+                print(
+                    f"[NAN-ATTN] attn_output.shape={attn_output.shape} reshaped.shape={reshaped.shape} gate.shape={gate.shape}"
+                )
             attn_output = (reshaped * gate).flatten(-2)
             if debug_nan and attn_output.isnan().any():
-                print(f"[NAN-ATTN] after gate multiply has NaN")
+                print("[NAN-ATTN] after gate multiply has NaN")
 
         output = self.o_proj(attn_output)
         if debug_nan and output.isnan().any():
-            print(f"[NAN-ATTN] o_proj output has NaN")
+            print("[NAN-ATTN] o_proj output has NaN")
         return output
 
 
@@ -530,9 +538,7 @@ class Step3p5DecoderLayer(nn.Module):
         moe_layers_enum = getattr(config, "moe_layers_enum", None)
         if moe_layers_enum is not None:
             if isinstance(moe_layers_enum, str):
-                moe_layers_idx = [
-                    int(i) for i in moe_layers_enum.strip().split(",")
-                ]
+                moe_layers_idx = [int(i) for i in moe_layers_enum.strip().split(",")]
             else:
                 moe_layers_idx = list(moe_layers_enum)
         else:
@@ -541,10 +547,10 @@ class Step3p5DecoderLayer(nn.Module):
         self.is_moe_layer = layer_idx in moe_layers_idx
 
         # Per-layer SwiGLU clamp limits
-        swiglu_limits = getattr(config, "swiglu_limits", None)
         swiglu_limits_shared = getattr(config, "swiglu_limits_shared", None)
-        clamp_limit = swiglu_limits[layer_idx] if swiglu_limits else None
-        clamp_limit_shared = swiglu_limits_shared[layer_idx] if swiglu_limits_shared else None
+        clamp_limit_shared = (
+            swiglu_limits_shared[layer_idx] if swiglu_limits_shared else None
+        )
 
         if self.is_moe_layer:
             self.moe = Step3p5MoE(
@@ -577,9 +583,7 @@ class Step3p5DecoderLayer(nn.Module):
 
         # Layer norms (zero-centered RMSNorm)
         rms_norm_eps = getattr(config, "rms_norm_eps", 1e-5)
-        self.input_layernorm = Step3p5RMSNorm(
-            config.hidden_size, eps=rms_norm_eps
-        )
+        self.input_layernorm = Step3p5RMSNorm(config.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = Step3p5RMSNorm(
             config.hidden_size, eps=rms_norm_eps
         )
@@ -595,18 +599,12 @@ class Step3p5DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual
-            )
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self.self_attn(
-            positions=positions, hidden_states=hidden_states
-        )
+        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # FFN
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual
-        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         if self.is_moe_layer:
             moe_output = self.moe(hidden_states)
@@ -670,10 +668,8 @@ class Step3p5Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size
-            )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -698,14 +694,22 @@ class Step3p5Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         import os as _dbg_os
+
         _dbg_layer = _dbg_os.environ.get("ATOM_DEBUG_LAYER")
         for i, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             hidden_states, residual = layer(positions, hidden_states, residual)
             if _dbg_layer:
                 _hs_nan = torch.isnan(hidden_states).any().item()
-                _res_nan = torch.isnan(residual).any().item() if residual is not None else False
+                _res_nan = (
+                    torch.isnan(residual).any().item()
+                    if residual is not None
+                    else False
+                )
                 if _hs_nan or _res_nan:
-                    print(f"[LAYER NaN] layer={i} hs_nan={_hs_nan} res_nan={_res_nan} hs_norm={hidden_states.float().norm():.3f}", flush=True)
+                    print(
+                        f"[LAYER NaN] layer={i} hs_nan={_hs_nan} res_nan={_res_nan} hs_norm={hidden_states.float().norm():.3f}",
+                        flush=True,
+                    )
                     break
 
         if not get_pp_group().is_last_rank:
@@ -894,7 +898,9 @@ class Step3p5ForCausalLM(nn.Module):
                     if success:
                         loaded_local_expert = True
                 except TypeError:
-                    weight_loader(param, loaded_weight[expert_id], name, shard_id, expert_id)
+                    weight_loader(
+                        param, loaded_weight[expert_id], name, shard_id, expert_id
+                    )
                     loaded_local_expert = True
 
         return loaded_local_expert
@@ -912,7 +918,5 @@ class Step3p5ForCausalLM(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.moe_num_experts
-            + (
-                1 if is_rocm_aiter_fusion_shared_expert_enabled() else 0
-            ),
+            + (1 if is_rocm_aiter_fusion_shared_expert_enabled() else 0),
         )

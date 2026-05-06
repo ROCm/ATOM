@@ -1029,8 +1029,9 @@ class ModelRunner:
         """Return the per-rank number of KV heads."""
         hf_config = self.config.hf_config
         num_kv_heads_cfg = getattr(
-            hf_config, "num_key_value_heads",
-            getattr(hf_config, "num_attention_groups", None)
+            hf_config,
+            "num_key_value_heads",
+            getattr(hf_config, "num_attention_groups", None),
         )
         if num_kv_heads_cfg >= self.world_size:
             assert num_kv_heads_cfg % self.world_size == 0
@@ -1327,8 +1328,9 @@ class ModelRunner:
             num_kvcache_blocks * self.attn_metadata_builder.block_ratio
         )
         num_kv_heads_cfg = getattr(
-            hf_config, "num_key_value_heads",
-            getattr(hf_config, "num_attention_groups", None)
+            hf_config,
+            "num_key_value_heads",
+            getattr(hf_config, "num_attention_groups", None),
         )
         if num_kv_heads_cfg >= self.world_size:
             assert num_kv_heads_cfg % self.world_size == 0

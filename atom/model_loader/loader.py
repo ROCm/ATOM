@@ -350,7 +350,11 @@ def load_model(
                 if "mlp.experts." in name and name not in params_dict:
                     continue
                 # Skip fused expert weights — handled below in expert loading path
-                if is_fused_expert and detect_fused_expert_fn is not None and detect_fused_expert_fn(name):
+                if (
+                    is_fused_expert
+                    and detect_fused_expert_fn is not None
+                    and detect_fused_expert_fn(name)
+                ):
                     continue
                 if k in name:
                     packed_value = packed_modules_mapping[k]

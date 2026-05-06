@@ -53,7 +53,9 @@ def main():
         args.model, trust_remote_code=getattr(args, "trust_remote_code", False)
     )
 
-    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
+    sampling_params = SamplingParams(
+        temperature=args.temperature, max_tokens=args.max_tokens
+    )
 
     prompts = [
         tokenizer.apply_chat_template(
