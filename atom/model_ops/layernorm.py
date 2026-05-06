@@ -585,7 +585,7 @@ class RMSNormGated(nn.Module):
         if self.use_fused_fp8_quant:
             return self.forward_fused_fp8(x, z)
 
-        return self.forward_native(x, z)
+        return self.forward_triton(x, z)
 
 
 class GemmaRMSNorm(nn.Module):
