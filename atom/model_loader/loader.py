@@ -12,10 +12,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import safetensors
+import safetensors.torch
 import torch
 from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig
+
+# safetensors<=0.7.0 ships a Python `_TYPES` dict missing the `F8_E8M0`
+# (MX scale) entry, even though both torch and the safetensors-rust binary
+# support it. The mmap'd `safe_open` path goes through Rust and works, but
+# the `safetensors.torch.load(bytes)` path used when `ATOM_DISABLE_MMAP=true`
+# raises `KeyError: 'F8_E8M0'` on DeepSeek-V4-Pro shards. Register the
+# missing dtype string so both paths behave identically.
+if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"):
+    safetensors.torch._TYPES["F8_E8M0"] = torch.float8_e8m0fnu
 
 from atom.utils import envs
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
