@@ -2,8 +2,8 @@ name: ATOM vLLM Benchmark
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event_name }}-${{ github.ref_name }}
-  # Nightly runs should preempt the previous nightly run at 23:00 Beijing time.
-  cancel-in-progress: ${{ github.event_name == 'schedule' }}
+  # Keep long-running nightly jobs alive; the next nightly run can queue behind them.
+  cancel-in-progress: false
 
 on:
   schedule:
@@ -133,7 +133,7 @@ jobs:
           RESOLVED_NIGHTLY_TAG=""
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            PUBLISH_TO_DASHBOARD=false
+            PUBLISH_TO_DASHBOARD=true
           else
             PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
           fi
@@ -313,6 +313,9 @@ jobs:
   load-models:
     name: Load OOT model configs
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
       has_enabled_models: ${{ steps.load.outputs.has_enabled_models }}
@@ -336,6 +339,7 @@ jobs:
           ENABLE_QWEN3_5_397B_A17B_MXFP4: ${{ inputs.qwen3-5-397b-a17b-mxfp4 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -343,6 +347,8 @@ jobs:
           import sys
           from datetime import date, datetime, timedelta, timezone
           from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
 
           models = json.loads(
               Path(".github/benchmark/oot_benchmark_models.json").read_text(encoding="utf-8")
@@ -367,9 +373,41 @@ jobs:
               "qwen3-next-80b-a3b-instruct-fp8-tp4": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4", "").lower() == "true",
           }
 
+          def fetch_run_created_at() -> datetime:
+              api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+              repository = os.environ["GITHUB_REPOSITORY"]
+              run_id = os.environ["GITHUB_RUN_ID"]
+              token = os.environ.get("GITHUB_TOKEN", "")
+              request = Request(
+                  f"{api_url}/repos/{repository}/actions/runs/{run_id}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "User-Agent": "atom-vllm-benchmark-nightly-rotation",
+                  },
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+              except HTTPError as exc:
+                  detail = exc.read().decode("utf-8", errors="replace").strip()
+                  raise RuntimeError(
+                      f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
+                  ) from exc
+              except URLError as exc:
+                  raise RuntimeError(
+                      f"Failed to reach GitHub API for workflow run metadata: {exc}"
+                  ) from exc
+
+              created_at = payload.get("created_at")
+              if not created_at:
+                  raise RuntimeError("Workflow run metadata did not include created_at")
+              return datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+
           selected_group = ""
           if event == "schedule":
-              beijing_date = (datetime.now(timezone.utc) + timedelta(hours=8)).date()
+              beijing_tz = timezone(timedelta(hours=8))
+              beijing_date = fetch_run_created_at().astimezone(beijing_tz).date()
               # Rotation anchor: 2026-05-06 runs group A, then B, then C.
               anchor_date = date(2026, 5, 6)
               rotation = ("A", "B", "C")
