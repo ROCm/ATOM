@@ -56,16 +56,19 @@ on:
         description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
         type: boolean
         default: true
+      oot_tag_suffix:
+        description: "Optional suffix appended to the OOT vLLM nightly tag for manual runs. Example: custom -> rocm/atom-dev:vllm-v<version>-nightly_<date>-custom. When set, vllm-latest is not updated."
+        default: ""
       build_sglang_image:
         description: "Build SGLang+ATOM image for manual runs (scheduled nightly runs always build SGLang+ATOM; default enabled so manual releases also publish SGLang+ATOM)"
         type: boolean
         default: true
       only_release_oot:
-        description: "Only release the OOT vLLM image: skip native image test/push and always build/push OOT"
+        description: "Release the OOT vLLM image (skips native image test/push). If both this and SGLang are checked, both will be released."
         type: boolean
         default: false
       only_release_sglang:
-        description: "Only release the SGLang+ATOM image: skip native image test/push and always build/push SGLang+ATOM"
+        description: "Release the SGLang+ATOM image (skips native image test/push). If both this and OOT are checked, both will be released."
         type: boolean
         default: false
 
@@ -112,6 +115,7 @@ jobs:
           echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
           echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
           echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
+          echo "OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}"
           echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
           echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
           echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
@@ -193,7 +197,7 @@ jobs:
           docker push rocm/atom-dev:${TAG}
 
       - name: Build OOT Docker image
-        if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
+        if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
         timeout-minutes: 180
         run: |
           OOT_BASE_IMAGE="atom_release:ci"
@@ -209,18 +213,31 @@ jobs:
           docker inspect atom_oot_release:ci
 
       - name: Push OOT Docker image
-        if: ${{ success() && inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true || inputs.only_release_oot == true) }}
+        if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
         run: |
+          set -euo pipefail
           VLLM_VER="${{ env.VLLM_VERSION }}"
+          OOT_TAG_SUFFIX="${{ inputs.oot_tag_suffix || '' }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
           OOT_LATEST_TAG="vllm-latest"
+          if [ -n "${OOT_TAG_SUFFIX}" ]; then
+            if [[ ! "${OOT_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid oot_tag_suffix '${OOT_TAG_SUFFIX}'. Allowed characters: letters, numbers, '.', '_' and '-'."
+              exit 1
+            fi
+            OOT_TAG="${OOT_TAG}-${OOT_TAG_SUFFIX}"
+          fi
           docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
           docker push rocm/atom-dev:${OOT_TAG}
-          docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
-          docker push rocm/atom-dev:${OOT_LATEST_TAG}
+          if [ -z "${OOT_TAG_SUFFIX}" ]; then
+            docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
+            docker push rocm/atom-dev:${OOT_LATEST_TAG}
+          else
+            echo "Custom OOT tag suffix '${OOT_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${OOT_LATEST_TAG} update."
+          fi
 
       - name: Build SGLang Docker image
-        if: ${{ success() && inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true || inputs.only_release_sglang == true) }}
+        if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
         timeout-minutes: 180
         run: |
           SGLANG_BASE_IMAGE="atom_release:ci"
@@ -235,7 +252,7 @@ jobs:
           docker inspect atom_sglang_release:ci
 
       - name: Push SGLang+ATOM Docker image
-        if: ${{ success() && inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true || inputs.only_release_sglang == true) }}
+        if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}
         run: |
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
           SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"

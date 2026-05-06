@@ -13,7 +13,23 @@ from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from torch import nn
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
+
+
+def atom_parameter(data: torch.Tensor) -> nn.Parameter:
+    """Create an ``nn.Parameter`` with gradient tracking controlled by
+    the ``ATOM_REQUIRES_GRAD`` environment variable (default: disabled).
+
+    Use this instead of ``nn.Parameter(...)`` everywhere in ATOM so that
+    inference vs. training gradient behaviour is controlled from a single
+    place.
+    """
+    requires_grad = envs.ATOM_REQUIRES_GRAD and (
+        data.is_floating_point() or data.is_complex()
+    )
+    return nn.Parameter(data, requires_grad=requires_grad)
 
 
 @cache
@@ -123,11 +139,23 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
     A Tuple of shuffled tensors.
     """
     for tensor in tensors:
-        if isinstance(tensor, torch.nn.Parameter):
-            tensor.data = shuffle_weight(tensor, layout=layout)
-            tensor.is_shuffled = True
-        else:
+        if not isinstance(tensor, torch.nn.Parameter):
             raise TypeError(f"Expected torch.nn.Parameter, but got {type(tensor)}")
+
+        weight = tensor.data
+        if weight.dim() == 2:
+            tensor.data = shuffle_weight(weight, layout=layout)
+        elif weight.dim() == 3:
+            # Split fully on dim0 and shuffle each 2D slice independently.
+            for i in range(weight.shape[0]):
+                weight[i].copy_(shuffle_weight(weight[i], layout=layout))
+            tensor.data = weight
+        else:
+            raise ValueError(
+                f"Expected weight dim to be 2 or 3 for shuffle, got {weight.dim()}"
+            )
+
+        tensor.is_shuffled = True
 
 
 def all_close_1d(x: torch.Tensor) -> bool:

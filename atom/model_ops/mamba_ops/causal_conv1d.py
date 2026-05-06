@@ -656,7 +656,9 @@ def causal_conv1d_fn(
         stride_istate_seq = conv_states.stride(0)
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
-        assert stride_istate_dim == 1
+        # Keep this aligned with upstream: the Triton kernel consumes the
+        # runtime conv_state strides directly instead of requiring dim-stride 1.
+        # assert stride_istate_dim == 1
     if out.dim() == 2:
         stride_o_dim = out.stride(0)
         stride_o_token = out.stride(1)
@@ -894,21 +896,24 @@ def _causal_conv1d_update_kernel(
     dim_limits = dim
     if idx_feats_start < k_start_point:
         o_ptr = query_ptr
-        stride_o_token = stride_q_token
+        # In VARLEN mode, tokens are indexed along dim-0 of the output tensor,
+        # so the token stride is stride_q_seq (not stride_q_token which is the
+        # last-dim stride of the [num_tokens, k_dim, 1] output).
+        stride_o_token = stride_q_seq if IS_VARLEN else stride_q_token
         stride_o_dim = stride_q_dim
         idx_feats_o = idx_feats
         dim_limits = k_dim_size
         stride_o_seq = stride_q_seq
     elif idx_feats_start < v_start_point:
         o_ptr = key_ptr
-        stride_o_token = stride_k_token
+        stride_o_token = stride_k_seq if IS_VARLEN else stride_k_token
         stride_o_dim = stride_k_dim
         idx_feats_o = idx_feats - k_start_point
         dim_limits = k_dim_size
         stride_o_seq = stride_k_seq
     elif idx_feats_start < dim:
         o_ptr = value_ptr
-        stride_o_token = stride_v_token
+        stride_o_token = stride_v_seq if IS_VARLEN else stride_v_token
         stride_o_dim = stride_v_dim
         idx_feats_o = idx_feats - v_start_point
         dim_limits = v_dim_size
@@ -1271,9 +1276,15 @@ def causal_conv1d_update(
 
     if validate_data:
         assert dim == weight.size(0)
-        assert (
-            conv_state.stride(-2) == 1
-        ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
+        # Keep this old guard disabled: SGLang passes conv_state with logical
+        # shape [slot, conv_dim, state_len], but its row-major cache layout can
+        # have conv_state.stride(-2) != 1. The Triton kernel below uses the runtime
+        # stride_istate_seq/dim/token values for all conv_state loads/stores, so
+        # Pass this layout straight through to the kernel, rather than
+        # rejecting it here or converting it to another layout in Python first.
+        # assert (
+        #     conv_state.stride(-2) == 1
+        # ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
         assert state_len >= width - 1
         # when above happens, we don't shift-left to keep any records in conv_state
         assert dim == conv_state.size(1)

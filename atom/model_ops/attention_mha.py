@@ -135,40 +135,84 @@ class PagedAttentionImpl(nn.Module):
             and self.q_norm is not None
             and self.k_norm is not None
         ):
-            # fused_qk_norm_rope_cache_quant_shuffle expects V cache layout
-            # [num_blocks, num_kv_heads, block_size//x, head_size, x], not [n, nh, hd, bs]
-            x = 16 // k_cache.element_size()
-            if k_cache.dim() == 5 and v_cache.dim() == 4:
-                n, nh, hd, bs = v_cache.shape
-                v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
-            else:
-                v_cache_shuffle = v_cache
-            fused_qk_norm_rope_cache_quant_shuffle(
-                qkv,
-                num_heads_q=self.num_heads,
-                num_heads_k=self.num_kv_heads,
-                num_heads_v=self.num_kv_heads,
-                head_dim=self.head_dim,
-                eps=self.q_norm.eps,
-                qw=self.q_norm.weight,
-                kw=self.k_norm.weight,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox_style=self.rotary_emb.is_neox_style,
-                pos_ids=position,
-                k_cache=k_cache,
-                v_cache=v_cache_shuffle,
-                slot_mapping=attn_metadata.slot_mapping,
-                kv_cache_dtype=(
-                    "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
-                ),
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
+            from atom.model_ops.layernorm import GemmaRMSNorm
 
-            qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
-            q, k, v = qkv.split(
-                [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
-            )
+            if isinstance(self.q_norm, GemmaRMSNorm):
+                # GemmaRMSNorm (1+w) path — use the Triton fused kernel
+                from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
+                    triton_fused_norm_rope_cache,
+                )
+
+                # qkv is a packed [q, k, v] tensor — split
+                q_size = self.num_heads * self.head_dim
+                kv_size = self.num_kv_heads * self.head_dim
+                q_raw, k_raw, v_raw = torch.split(
+                    qkv, [q_size, kv_size, kv_size], dim=-1
+                )
+                # Reshape V cache to SHUFFLE layout for the Triton kernel
+                x = 16 // k_cache.element_size()
+                if k_cache.dim() == 5 and v_cache.dim() == 4:
+                    n, nh, hd, bs = v_cache.shape
+                    v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+                else:
+                    v_cache_shuffle = v_cache
+                q, k = triton_fused_norm_rope_cache(
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    position,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    rotary_emb=self.rotary_emb,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    k_cache=k_cache,
+                    v_cache=v_cache_shuffle,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+                q = q.view(-1, self.num_heads, self.head_dim)
+                k = k.view(-1, self.num_kv_heads, self.head_dim)
+                v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+            else:
+                # Standard RMSNorm — use existing aiter kernel
+                # fused_qk_norm_rope_cache_quant_shuffle expects V cache layout
+                # [num_blocks, num_kv_heads, block_size//x, head_size, x]
+                x = 16 // k_cache.element_size()
+                if k_cache.dim() == 5 and v_cache.dim() == 4:
+                    n, nh, hd, bs = v_cache.shape
+                    v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+                else:
+                    v_cache_shuffle = v_cache
+                fused_qk_norm_rope_cache_quant_shuffle(
+                    qkv,
+                    num_heads_q=self.num_heads,
+                    num_heads_k=self.num_kv_heads,
+                    num_heads_v=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    eps=self.q_norm.eps,
+                    qw=self.q_norm.weight,
+                    kw=self.k_norm.weight,
+                    cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                    is_neox_style=self.rotary_emb.is_neox_style,
+                    pos_ids=position,
+                    k_cache=k_cache,
+                    v_cache=v_cache_shuffle,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    kv_cache_dtype=(
+                        "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+                    ),
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+                qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
+                q, k, v = qkv.split(
+                    [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
+                )
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
@@ -196,7 +240,7 @@ class PagedAttentionImpl(nn.Module):
         else:
             # for asm paged attention
             asm_layout = True
-            if use_triton_attn:
+            if use_triton_attn and v_cache.dim() != 5:
                 asm_layout = False
             if self.rotary_emb is not None:
                 assert position is not None

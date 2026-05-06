@@ -23,7 +23,8 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep scheduled main runs from blocking push-triggered validation.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -76,14 +77,11 @@ jobs:
           ARTIFACT_RUN_CREATED_AT=""
 
           resolve_download_url() {
-            python3 - "$1" <<'PY'
-          import sys
-          from urllib.parse import quote, unquote, urlsplit, urlunsplit
-
-          parts = urlsplit(sys.argv[1])
-          encoded_path = "/".join(quote(unquote(segment), safe="") for segment in parts.path.split("/"))
-          print(urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)))
-          PY
+            python3 -c 'import sys
+            from urllib.parse import quote, unquote, urlsplit, urlunsplit
+            parts = urlsplit(sys.argv[1])
+            encoded_path = "/".join(quote(unquote(segment), safe="") for segment in parts.path.split("/"))
+            print(urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment)))' "$1"
           }
 
           find_latest_artifact() {
@@ -235,7 +233,7 @@ jobs:
 
   atom-test:
     needs: [download_aiter_wheel, load-test-models]
-    name: ATOM Test
+    name: Accuracy
     strategy:
       fail-fast: false
       matrix:
@@ -277,6 +275,39 @@ jobs:
         run: |
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
+      - name: Resolve immutable native dashboard image
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+        run: |
+          set -euo pipefail
+          if RESOLUTION_JSON="$(
+            python3 .github/scripts/resolve_atom_image.py \
+              --repository rocm/atom-dev \
+              --reference-tag latest \
+              --image-family native
+          )"; then
+            RESOLVED_ATOM_IMAGE="$(
+              RESOLUTION_JSON="${RESOLUTION_JSON}" python3 - <<'PY'
+          import json
+          import os
+
+          resolution = json.loads(os.environ["RESOLUTION_JSON"])
+          print(resolution["resolved_image"])
+          PY
+            )"
+            echo "Resolved native dashboard image: ${RESOLVED_ATOM_IMAGE}"
+          else
+            echo "::error::Failed to resolve ${ATOM_BASE_IMAGE} to an immutable reference for dashboard-uploading native runs."
+            exit 1
+          fi
+          echo "RESOLVED_ATOM_BASE_IMAGE=${RESOLVED_ATOM_IMAGE}" >> "$GITHUB_ENV"
+          echo "ATOM_DASHBOARD_DOCKER_IMAGE=${RESOLVED_ATOM_IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Pull immutable native dashboard image
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+        run: |
+          echo "Pulling immutable native dashboard image: ${RESOLVED_ATOM_BASE_IMAGE}"
+          docker pull "${RESOLVED_ATOM_BASE_IMAGE}"
+
       - name: Generate Dockerfile for forked repo
         if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
@@ -314,6 +345,10 @@ jobs:
           name: aiter-whl
           path: /tmp/aiter-whl
 
+      - name: Set HF token for predownload runner
+        if: matrix.runner == 'atom-mi355-8gpu.predownload'
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
+
       - name: Start CI container
         run: |
           echo "Clean up containers..."
@@ -336,13 +371,15 @@ jobs:
           # Write env_vars via env block (avoids expression injection)
           printenv MODEL_ENV_VARS | grep -v '^$' > /tmp/env_file.txt || true
 
-          IMAGE_TAG=${{ env.ATOM_BASE_IMAGE }}
+          IMAGE_TAG="${RESOLVED_ATOM_BASE_IMAGE:-$ATOM_BASE_IMAGE}"
           echo "Starting container with image: $IMAGE_TAG"
           echo "Model-specific environment variables:"
           cat /tmp/env_file.txt
 
           PULL_FLAG=""
-          if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+          if [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
+            PULL_FLAG=""
+          elif [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
             PULL_FLAG="--pull always"
           fi
 
@@ -355,6 +392,7 @@ jobs:
           --privileged \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
+          -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
           --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
@@ -372,6 +410,17 @@ jobs:
       - name: Check shm size
         run: |
           docker exec "$CONTAINER_NAME" df -h /dev/shm
+
+      - name: Collect GPU info (inside container)
+        id: gpu-info
+        run: |
+          GPU_NAME=$(docker exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
+          GPU_VRAM_GB=$(docker exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
+          ROCM_VERSION=$(docker exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          echo "gpu_name=${GPU_NAME}" >> "$GITHUB_OUTPUT"
+          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> "$GITHUB_OUTPUT"
+          echo "rocm_version=${ROCM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
 
       - name: Install aiter from wheel
         run: |
@@ -501,6 +550,8 @@ jobs:
       
       - name: Run ATOM accuracy test
         timeout-minutes: 30
+        env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
         run: |
           set -euo pipefail
           echo ""
@@ -510,15 +561,30 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
-          docker exec "$CONTAINER_NAME" bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
-          "
+          # Pipe via stdin so container bash parses shell quoting in extraArgs
+          # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
+          echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
+            docker exec -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
-          docker exec "$CONTAINER_NAME" bash -lc "
+          docker exec \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            "$CONTAINER_NAME" bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
       
+      - name: Dump server log
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log 2>/dev/null || true
+
+      - name: Dump client log
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" cat /tmp/atom_client.log 2>/dev/null || true
+
       - name: Check accuracy test results
         if: success()
         env:

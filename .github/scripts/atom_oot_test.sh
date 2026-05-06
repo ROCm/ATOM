@@ -9,6 +9,7 @@ set -euo pipefail
 #   OOT_MODEL_NAME
 #   OOT_MODEL_PATH
 #   OOT_EXTRA_ARGS
+#   LM_EVAL_NUM_FEWSHOT
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
@@ -48,7 +49,14 @@ KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
+OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
+LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LAST_VLLM_LOG_LINE=0
+
+if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
+  echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
+  exit 2
+fi
 
 declare -a ACTIVE_MODELS=()
 if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
@@ -143,7 +151,19 @@ launch_one_model() {
   resolved_model_path=$(resolve_model_path "${model_path}")
 
   if [[ -n "${extra_args}" ]]; then
-    read -r -a extra_arg_array <<< "${extra_args}"
+    while IFS= read -r -d '' token; do
+      extra_arg_array+=("${token}")
+    done < <(
+      EXTRA_ARGS="${extra_args}" python3 - <<'PY'
+import os
+import shlex
+import sys
+
+for token in shlex.split(os.environ["EXTRA_ARGS"]):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
   fi
 
   echo ""
@@ -209,11 +229,12 @@ accuracy_one_model() {
   echo ""
   echo "========== Running OOT gsm8k accuracy =========="
   echo "Model name: ${model_name}"
+  echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
 
   lm_eval --model local-completions \
     --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
     --tasks gsm8k \
-    --num_fewshot 3 \
+    --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
     --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
 
   # lm-eval output layout differs across versions: output_path may be a file
@@ -251,6 +272,38 @@ PY
   if [[ "${result_file}" != "${flat_result_file}" ]]; then
     cp -f "${result_file}" "${flat_result_file}"
     result_file="${flat_result_file}"
+  fi
+
+  if [[ -n "${OOT_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then
+    RESULT_FILE="${result_file}" \
+    OOT_DOCKER_IMAGE="${OOT_DOCKER_IMAGE:-}" \
+    GPU_NAME="${GPU_NAME:-}" \
+    GPU_VRAM_GB="${GPU_VRAM_GB:-}" \
+    ROCM_VERSION="${ROCM_VERSION:-}" \
+    python - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+if os.environ.get("OOT_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["OOT_DOCKER_IMAGE"]
+if os.environ.get("GPU_NAME"):
+    metadata["gpu_name"] = os.environ["GPU_NAME"]
+if os.environ.get("GPU_VRAM_GB"):
+    try:
+        metadata["gpu_vram_gb"] = int(float(os.environ["GPU_VRAM_GB"]))
+    except ValueError:
+        pass
+if os.environ.get("ROCM_VERSION"):
+    metadata["rocm_version"] = os.environ["ROCM_VERSION"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
   fi
 
   local value

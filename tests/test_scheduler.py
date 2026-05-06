@@ -1,10 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/scheduler.py — public API only
 
-from atom.model_engine.scheduler import Scheduler, ScheduledBatchOutput
+
+from atom.model_engine.scheduler import Scheduler, ScheduledBatchOutput, SpecStats
 from atom.model_engine.sequence import SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 from conftest import MockConfig
+
+# ── SpecStats ──────────────────────────────────────────────────────────────
+
+
+class TestSpecStats:
+    def test_no_division_by_zero_with_valid_mtp_k(self):
+        """SpecStats with mtp_k >= 1 must not raise on update()."""
+        stats = SpecStats(mtp_k=1)
+        # Should not raise ZeroDivisionError
+        stats.update(num_accepted_tokens=1)
+        stats.update(num_accepted_tokens=2)
+
+    def test_update_accumulates_draft_tokens(self):
+        stats = SpecStats(mtp_k=2)
+        stats.update(num_accepted_tokens=1)
+        assert stats.total_draft_tokens == 2
+
+    def test_acceptance_rate_zero_when_no_updates(self):
+        stats = SpecStats(mtp_k=3)
+        assert stats.acceptance_rate == 0.0
+
 
 # ── add / extend / query ───────────────────────────────────────────────────
 
@@ -320,17 +342,19 @@ class TestPostprocess:
 
 class TestGetNextBatchInfo:
     def test_empty(self, scheduler):
-        assert scheduler.get_next_batch_info() == (False, 0)
+        assert scheduler.get_next_batch_info() == (False, 0, 0)
 
     def test_waiting(self, scheduler, seq_factory):
         scheduler.add(seq_factory([1, 2, 3, 4]))
-        is_prefill, n = scheduler.get_next_batch_info()
+        is_prefill, n, num_reqs = scheduler.get_next_batch_info()
         assert is_prefill is True
         assert n == 4
+        assert num_reqs == 1
 
     def test_running(self, scheduler, seq_factory):
         scheduler.add(seq_factory([1, 2, 3, 4]))
         scheduler.schedule()
-        is_prefill, n = scheduler.get_next_batch_info()
+        is_prefill, n, num_reqs = scheduler.get_next_batch_info()
         assert is_prefill is False
         assert n == 1
+        assert num_reqs == 1

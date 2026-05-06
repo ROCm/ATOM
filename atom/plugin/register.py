@@ -16,6 +16,21 @@ _ATOM_SUPPORTED_MODELS = {
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
 }
 
+if is_sglang():
+    from atom.models.qwen3_next import Qwen3NextForCausalLM
+    from atom.models.qwen3_5 import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5MoeForCausalLM,
+    )
+
+    _ATOM_SUPPORTED_MODELS.update(
+        {
+            "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
+            "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
+            "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
+        }
+    )
+
 
 def _register_custom_attention_to_sglang() -> None:
     """Override sglang's built-in "aiter" attention backend with ATOM's implementation.
