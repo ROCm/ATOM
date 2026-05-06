@@ -29,6 +29,7 @@ class EngineUtilityHandler:
         "release_memory": "_handle_release_memory",
         "resume_memory": "_handle_resume_memory",
         "clear_kv_cache": "_handle_clear_kv_cache",
+        "configure_hidden_states": "_handle_configure_hidden_states",
     }
 
     def __init__(self, runner_mgr, output_queue, label: str = "Engine Core"):
@@ -192,4 +193,19 @@ class EngineUtilityHandler:
         logger.info(f"{self.label}: KV cache cleared")
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "clear_kv_cache", "result": result})
+        )
+
+    def _handle_configure_hidden_states(self, args: dict):
+        """Configure hidden states extraction on all model runners (TorchSpec)."""
+        aux_layer_ids = args.get("aux_layer_ids", [])
+        mooncake_config = args.get("mooncake_config", {})
+        result = self.runner_mgr.call_func(
+            "configure_hidden_states", aux_layer_ids, mooncake_config, wait_out=True
+        )
+        logger.info(
+            f"{self.label}: configure_hidden_states completed, "
+            f"aux_layers={aux_layer_ids}"
+        )
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "configure_hidden_states", "result": result})
         )

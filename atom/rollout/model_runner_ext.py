@@ -3,15 +3,19 @@
 
 import logging
 import os
+from typing import Optional
 
+import numpy as np
 import torch
 
 from aiter import init_dist_env
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method
 from atom.model_engine.model_runner import ModelRunner
+from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.memory_manager import MemoryManagerMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
@@ -19,9 +23,13 @@ logger = logging.getLogger("atom")
 class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     """ModelRunner with RLHF extensions (weight sync + memory lifecycle + DP isolation).
 
-    Used when ATOM is driven by an external RLHF framework.
+    Used when ATOM is driven by an external RLHF framework (veRL or TorchSpec).
     Pure inference deployments use the base ModelRunner, which carries no
     RLHF-specific code.
+
+    TorchSpec hidden states extraction is opt-in via ``configure_hidden_states()``.
+    When not configured (``_extract_mode=False``), all code paths are identical
+    to the base veRL behavior.
     """
 
     # Environment variable whose value is a comma-separated list of physical
@@ -104,3 +112,109 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             ca_comm.signal = signal
             ca_comm.register_input_buffer(signal)
             ca_comm.buffer = ca_comm._pool["input"].tensor
+
+    _extract_mode: bool = False
+
+    def configure_hidden_states(self, aux_layer_ids, mooncake_config):
+        """Enable hidden states extraction for TorchSpec.
+
+        Called via utility command. When not called, ``_extract_mode`` stays
+        ``False`` and all TorchSpec code paths are skipped.
+
+        Args:
+            aux_layer_ids: Layer indices whose post-layer residual stream
+                should be captured (e.g. ``[1, 15, 28]``).
+            mooncake_config: Dict with Mooncake connection parameters
+                (``local_hostname``, ``metadata_server``, ``protocol``, etc.).
+        """
+        from torchspec.config.mooncake_config import MooncakeConfig
+        from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+
+        self._aux_layer_ids = set(aux_layer_ids)
+        mc_cfg = MooncakeConfig(**mooncake_config)
+        self._mooncake_store = EagleMooncakeStore(mc_cfg)
+        self._extract_mode = True
+        self._captured_hidden_states: Optional[dict[int, torch.Tensor]] = None
+        self._captured_last_hidden_states: Optional[torch.Tensor] = None
+        logger.info(
+            f"{self.label}: hidden states extraction enabled, "
+            f"aux_layers={sorted(self._aux_layer_ids)}"
+        )
+        return sorted(self._aux_layer_ids)
+
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        batch: Optional[ScheduledBatch] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._extract_mode:
+            return super().run_model(input_ids, batch)
+
+        forward_context = get_forward_context()
+        context = forward_context.context
+
+        if context.is_prefill:
+            positions = context.positions
+            result = self.model(
+                input_ids,
+                positions,
+                capture_hidden_state_layers=self._aux_layer_ids,
+            )
+            if isinstance(result, tuple):
+                hidden_states, captured = result
+            else:
+                hidden_states = result
+                captured = {}
+            logits = self.model.compute_logits(hidden_states)
+            self._captured_hidden_states = captured
+            self._captured_last_hidden_states = hidden_states.detach()
+            return logits, hidden_states
+
+        return super().run_model(input_ids, batch)
+
+    @torch.inference_mode()
+    def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        result = super().forward(batch)
+
+        if self._extract_mode and self._captured_hidden_states is not None:
+            self._store_hidden_states(batch)
+            self._captured_hidden_states = None
+            self._captured_last_hidden_states = None
+
+        return result
+
+    def _store_hidden_states(self, batch: ScheduledBatch):
+        """Write captured hidden states to Mooncake store, one entry per request."""
+        captured = self._captured_hidden_states
+        last_hs = self._captured_last_hidden_states
+        if not captured:
+            return
+
+        sorted_layers = sorted(captured.keys())
+        aux_hs = torch.cat([captured[lid] for lid in sorted_layers], dim=-1)
+
+        num_scheduled = batch.num_scheduled_tokens
+        offsets = np.cumsum(num_scheduled)
+        start = 0
+        for i, req_id in enumerate(batch.req_ids):
+            end = int(offsets[i])
+            ext_id = batch.external_request_ids[i]
+            if ext_id is None:
+                logger.warning(
+                    f"{self.label}: skipping hidden states for req {req_id} "
+                    f"(no external_request_id)"
+                )
+                start = end
+                continue
+
+            seq_input_ids = torch.from_numpy(
+                batch.scheduled_tokens[start:end].astype(np.int64)
+            ).to(self.device)
+
+            self._mooncake_store.put(
+                key=ext_id,
+                hidden_states=aux_hs[start:end],
+                input_ids=seq_input_ids,
+                last_hidden_states=last_hs[start:end],
+            )
+            start = end
