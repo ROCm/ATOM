@@ -1,10 +1,14 @@
 name: ATOM vLLM Benchmark
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event_name }}-${{ github.ref_name }}
+  # Keep long-running nightly jobs alive; the next nightly run can queue behind them.
+  cancel-in-progress: false
 
 on:
+  schedule:
+    # Nightly at 23:00 Beijing time (15:00 UTC)
+    - cron: '0 15 * * *'
   workflow_dispatch:
     inputs:
       deepseek-r1-fp8:
@@ -39,20 +43,12 @@ on:
         description: "Kimi-K2.5-MXFP4 TP8"
         type: boolean
         default: false
-      qwen3-5-397b-a17b-tp2:
-        description: "Qwen3.5-397B-A17B TP2"
-        type: boolean
-        default: false
       qwen3-5-397b-a17b-tp4:
         description: "Qwen3.5-397B-A17B TP4"
         type: boolean
         default: false
       qwen3-5-397b-a17b:
         description: "Qwen3.5-397B-A17B TP8"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-tp2:
-        description: "Qwen3.5-397B-A17B-FP8 TP2"
         type: boolean
         default: false
       qwen3-5-397b-a17b-fp8-tp4:
@@ -136,7 +132,11 @@ jobs:
           PREBUILT_RESOLUTION_TYPE=""
           RESOLVED_NIGHTLY_TAG=""
 
-          PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            PUBLISH_TO_DASHBOARD=true
+          else
+            PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
+          fi
 
           mapfile -t VLLM_META < <(python3 - <<'PY'
           import re
@@ -313,9 +313,13 @@ jobs:
   load-models:
     name: Load OOT model configs
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
       has_enabled_models: ${{ steps.load.outputs.has_enabled_models }}
+      selected_group: ${{ steps.load.outputs.selected_group }}
     steps:
       - uses: actions/checkout@v6
       - id: load
@@ -328,45 +332,111 @@ jobs:
           ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
           ENABLE_KIMI_K25_TP4: ${{ inputs.kimi-k2-5-mxfp4-tp4 }}
           ENABLE_KIMI_K25_TP8: ${{ inputs.kimi-k2-5-mxfp4-tp8 }}
-          ENABLE_QWEN3_5_397B_A17B_TP2: ${{ inputs.qwen3-5-397b-a17b-tp2 }}
           ENABLE_QWEN3_5_397B_A17B_TP4: ${{ inputs.qwen3-5-397b-a17b-tp4 }}
           ENABLE_QWEN3_5_397B_A17B: ${{ inputs.qwen3-5-397b-a17b }}
-          ENABLE_QWEN3_5_397B_A17B_FP8_TP2: ${{ inputs.qwen3-5-397b-a17b-fp8-tp2 }}
           ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}
           ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
           ENABLE_QWEN3_5_397B_A17B_MXFP4: ${{ inputs.qwen3-5-397b-a17b-mxfp4 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          MODELS_JSON="$(jq -c '
-            map(select(
-              (.prefix == "deepseek-r1-fp8" and env.ENABLE_DEEPSEEK_R1_FP8 == "true")
-              or (.prefix == "deepseek-r1-mxfp4" and env.ENABLE_DEEPSEEK_R1_MXFP4 == "true")
-              or (.prefix == "gpt-oss-120b" and env.ENABLE_GPT_OSS_120B == "true")
-              or (.prefix == "glm-5-1-fp8-tp8" and env.ENABLE_GLM_5_1_FP8_TP8 == "true")
-              or (.prefix == "kimi-k2-thinking-mxfp4-tp4" and env.ENABLE_KIMI_K2_TP4 == "true")
-              or (.prefix == "kimi-k2-thinking-mxfp4-tp8" and env.ENABLE_KIMI_K2_TP8 == "true")
-              or (.prefix == "kimi-k25-mxfp4-tp4" and env.ENABLE_KIMI_K25_TP4 == "true")
-              or (.prefix == "kimi-k25-mxfp4-tp8" and env.ENABLE_KIMI_K25_TP8 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-tp2" and env.ENABLE_QWEN3_5_397B_A17B_TP2 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-tp4" and env.ENABLE_QWEN3_5_397B_A17B_TP4 == "true")
-              or (.prefix == "qwen3-5-397b-a17b" and env.ENABLE_QWEN3_5_397B_A17B == "true")
-              or (.prefix == "qwen3-5-397b-a17b-fp8-tp2" and env.ENABLE_QWEN3_5_397B_A17B_FP8_TP2 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-fp8-tp4" and env.ENABLE_QWEN3_5_397B_A17B_FP8_TP4 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-fp8" and env.ENABLE_QWEN3_5_397B_A17B_FP8 == "true")
-              or (.prefix == "qwen3-5-397b-a17b-mxfp4" and env.ENABLE_QWEN3_5_397B_A17B_MXFP4 == "true")
-              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp1" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1 == "true")
-              or (.prefix == "qwen3-next-80b-a3b-instruct-fp8-tp4" and env.ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4 == "true")
-            ))
-          ' .github/benchmark/oot_benchmark_models.json)"
-          echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
-          if [ "${MODELS_JSON}" = "[]" ]; then
-            echo "has_enabled_models=false" >> "$GITHUB_OUTPUT"
-            echo "No models selected for OOT benchmark."
-          else
-            echo "has_enabled_models=true" >> "$GITHUB_OUTPUT"
-            echo "Selected models: ${MODELS_JSON}"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          models = json.loads(
+              Path(".github/benchmark/oot_benchmark_models.json").read_text(encoding="utf-8")
+          )
+          event = os.environ["GITHUB_EVENT_NAME"]
+
+          manual_toggles = {
+              "deepseek-r1-fp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP8", "").lower() == "true",
+              "deepseek-r1-mxfp4": os.environ.get("ENABLE_DEEPSEEK_R1_MXFP4", "").lower() == "true",
+              "gpt-oss-120b": os.environ.get("ENABLE_GPT_OSS_120B", "").lower() == "true",
+              "glm-5-1-fp8-tp8": os.environ.get("ENABLE_GLM_5_1_FP8_TP8", "").lower() == "true",
+              "kimi-k2-thinking-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K2_TP4", "").lower() == "true",
+              "kimi-k2-thinking-mxfp4-tp8": os.environ.get("ENABLE_KIMI_K2_TP8", "").lower() == "true",
+              "kimi-k25-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K25_TP4", "").lower() == "true",
+              "kimi-k25-mxfp4-tp8": os.environ.get("ENABLE_KIMI_K25_TP8", "").lower() == "true",
+              "qwen3-5-397b-a17b-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_TP4", "").lower() == "true",
+              "qwen3-5-397b-a17b": os.environ.get("ENABLE_QWEN3_5_397B_A17B", "").lower() == "true",
+              "qwen3-5-397b-a17b-fp8-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4", "").lower() == "true",
+              "qwen3-5-397b-a17b-fp8": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8", "").lower() == "true",
+              "qwen3-5-397b-a17b-mxfp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_MXFP4", "").lower() == "true",
+              "qwen3-next-80b-a3b-instruct-fp8-tp1": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1", "").lower() == "true",
+              "qwen3-next-80b-a3b-instruct-fp8-tp4": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4", "").lower() == "true",
+          }
+
+          def fetch_run_created_at() -> datetime:
+              api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+              repository = os.environ["GITHUB_REPOSITORY"]
+              run_id = os.environ["GITHUB_RUN_ID"]
+              token = os.environ.get("GITHUB_TOKEN", "")
+              request = Request(
+                  f"{api_url}/repos/{repository}/actions/runs/{run_id}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "User-Agent": "atom-vllm-benchmark-nightly-rotation",
+                  },
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+              except HTTPError as exc:
+                  detail = exc.read().decode("utf-8", errors="replace").strip()
+                  raise RuntimeError(
+                      f"Failed to fetch workflow run metadata: HTTP {exc.code} {detail}"
+                  ) from exc
+              except URLError as exc:
+                  raise RuntimeError(
+                      f"Failed to reach GitHub API for workflow run metadata: {exc}"
+                  ) from exc
+
+              created_at = payload.get("created_at")
+              if not created_at:
+                  raise RuntimeError("Workflow run metadata did not include created_at")
+              return datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+
+          selected_group = ""
+          if event == "schedule":
+              beijing_tz = timezone(timedelta(hours=8))
+              beijing_date = fetch_run_created_at().astimezone(beijing_tz).date()
+              # Rotation anchor: 2026-05-06 runs group A, then B, then C.
+              anchor_date = date(2026, 5, 6)
+              rotation = ("A", "B", "C")
+              selected_group = rotation[(beijing_date - anchor_date).days % len(rotation)]
+              selected = [
+                  model for model in models if model.get("nightly_group") == selected_group
+              ]
+              if not selected:
+                  print(
+                      f"No models configured for nightly benchmark group {selected_group}.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          else:
+              selected = [
+                  model for model in models if manual_toggles.get(model["prefix"], False)
+              ]
+
+          print(f"models_json={json.dumps(selected, separators=(',', ':'))}")
+          print(f"selected_group={selected_group}")
+          print(f"has_enabled_models={'true' if selected else 'false'}")
+          PY
+
+      - name: Print selected models
+        run: |
+          if [ -n "${{ steps.load.outputs.selected_group }}" ]; then
+            echo "Scheduled nightly benchmark group: ${{ steps.load.outputs.selected_group }}"
           fi
+          echo "Selected models: ${{ steps.load.outputs.models_json }}"
 
   build-benchmark-matrix:
     name: Build OOT benchmark matrix
@@ -399,7 +469,8 @@ jobs:
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
               model_params = []
               seen = set()
-              extra_concurrency = (128, 256) if str(model.get("prefix", "")).startswith("qwen3-5-") else ()
+              # Run all benchmark cases at the two highest supported concurrency levels too.
+              extra_concurrency = (128, 256)
 
               for param in params:
                   variants = [param]
@@ -604,6 +675,11 @@ jobs:
       - name: Check if model is enabled
         id: check
         run: |
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           case "${{ matrix.model.prefix }}" in
             deepseek-r1-fp8) echo "enabled=${{ inputs.deepseek-r1-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
@@ -613,10 +689,8 @@ jobs:
             kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-tp2) echo "enabled=${{ inputs.qwen3-5-397b-a17b-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b) echo "enabled=${{ inputs.qwen3-5-397b-a17b }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-tp2) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-fp8-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-mxfp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
