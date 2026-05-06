@@ -23,6 +23,10 @@ on:
         description: "GLM-5.1-FP8 TP8"
         type: boolean
         default: false
+      glm-4-7-fp8-tp4:
+        description: "GLM-4.7-FP8 TP8"
+        type: boolean
+        default: false
       kimi-k2-thinking-mxfp4-tp4:
         description: "Kimi-K2-Thinking-MXFP4 TP4"
         type: boolean
@@ -37,6 +41,10 @@ on:
         default: false
       kimi-k2-5-mxfp4-tp8:
         description: "Kimi-K2.5-MXFP4 TP8"
+        type: boolean
+        default: false
+      minimax-m2-5-tp2:
+        description: "MiniMax-M2.5 TP2"
         type: boolean
         default: false
       qwen3-5-397b-a17b-tp2:
@@ -324,10 +332,12 @@ jobs:
           ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4 }}
           ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b }}
           ENABLE_GLM_5_1_FP8_TP8: ${{ inputs.glm-5-1-fp8-tp8 }}
+          ENABLE_GLM_4_7_FP8_TP4: ${{ inputs.glm-4-7-fp8-tp4 }}
           ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
           ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
           ENABLE_KIMI_K25_TP4: ${{ inputs.kimi-k2-5-mxfp4-tp4 }}
           ENABLE_KIMI_K25_TP8: ${{ inputs.kimi-k2-5-mxfp4-tp8 }}
+          ENABLE_MINIMAX_M2_5_TP2: ${{ inputs.minimax-m2-5-tp2 }}
           ENABLE_QWEN3_5_397B_A17B_TP2: ${{ inputs.qwen3-5-397b-a17b-tp2 }}
           ENABLE_QWEN3_5_397B_A17B_TP4: ${{ inputs.qwen3-5-397b-a17b-tp4 }}
           ENABLE_QWEN3_5_397B_A17B: ${{ inputs.qwen3-5-397b-a17b }}
@@ -344,10 +354,12 @@ jobs:
               or (.prefix == "deepseek-r1-mxfp4" and env.ENABLE_DEEPSEEK_R1_MXFP4 == "true")
               or (.prefix == "gpt-oss-120b" and env.ENABLE_GPT_OSS_120B == "true")
               or (.prefix == "glm-5-1-fp8-tp8" and env.ENABLE_GLM_5_1_FP8_TP8 == "true")
+              or (.prefix == "glm-4-7-fp8-tp4" and env.ENABLE_GLM_4_7_FP8_TP4 == "true")
               or (.prefix == "kimi-k2-thinking-mxfp4-tp4" and env.ENABLE_KIMI_K2_TP4 == "true")
               or (.prefix == "kimi-k2-thinking-mxfp4-tp8" and env.ENABLE_KIMI_K2_TP8 == "true")
               or (.prefix == "kimi-k25-mxfp4-tp4" and env.ENABLE_KIMI_K25_TP4 == "true")
               or (.prefix == "kimi-k25-mxfp4-tp8" and env.ENABLE_KIMI_K25_TP8 == "true")
+              or (.prefix == "MiniMax-M2.5-tp2" and env.ENABLE_MINIMAX_M2_5_TP2 == "true")
               or (.prefix == "qwen3-5-397b-a17b-tp2" and env.ENABLE_QWEN3_5_397B_A17B_TP2 == "true")
               or (.prefix == "qwen3-5-397b-a17b-tp4" and env.ENABLE_QWEN3_5_397B_A17B_TP4 == "true")
               or (.prefix == "qwen3-5-397b-a17b" and env.ENABLE_QWEN3_5_397B_A17B == "true")
@@ -609,10 +621,12 @@ jobs:
             deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> "$GITHUB_OUTPUT" ;;
             glm-5-1-fp8-tp8) echo "enabled=${{ inputs.glm-5-1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            glm-4-7-fp8-tp4) echo "enabled=${{ inputs.glm-4-7-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            MiniMax-M2.5-tp2) echo "enabled=${{ inputs.minimax-m2-5-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-tp2) echo "enabled=${{ inputs.qwen3-5-397b-a17b-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b) echo "enabled=${{ inputs.qwen3-5-397b-a17b }}" >> "$GITHUB_OUTPUT" ;;

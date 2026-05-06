@@ -41,6 +41,17 @@
     "env_vars": ""
   },
   {
+    "display": "GLM-4.7-FP8 TP8",
+    "dashboard_model": "GLM-4.7-FP8",
+    "source_path": "zai-org/GLM-4.7-FP8",
+    "path": "zai-org/GLM-4.7-FP8",
+    "prefix": "glm-4-7-fp8-tp4",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --default-chat-template-kwargs '{\"enable_thinking\":false}' --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": ""
+  },
+  {
     "display": "Kimi-K2-Thinking-MXFP4 TP4",
     "dashboard_model": "Kimi-K2-Thinking-MXFP4-tp4",
     "source_path": "amd/Kimi-K2-Thinking-MXFP4",
@@ -83,6 +94,17 @@
     "bench_args": "",
     "runner": "atom-mi355-8gpu-oot-benchmark",
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+  },
+  {
+    "display": "MiniMax-M2.5 TP2",
+    "dashboard_model": "MiniMax-M2.5",
+    "source_path": "MiniMaxAI/MiniMax-M2.5",
+    "path": "MiniMaxAI/MiniMax-M2.5",
+    "prefix": "MiniMax-M2.5-tp2",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 2",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": ""
   },
   {
     "display": "Qwen3.5-397B-A17B-FP8 TP8",
