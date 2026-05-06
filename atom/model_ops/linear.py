@@ -102,6 +102,15 @@ def _blockscale_splitk_for_shape(m: int, n: int, k: int) -> Optional[int]:
     Returns None when the lookup helper is unavailable, when no CSV is
     configured for the active mode, or when the tuner has no entry that
     matches (m, n, k) (including its padded-M fallbacks).
+
+    NOT currently called from ``LinearBase.forward`` because every viable
+    way to invoke it from inside the traced backbone (direct call, behind
+    ``@torch.compiler.disable``, behind a Python ``if``) trips a Dynamo
+    graph break, and ATOM's ``VllmBackend`` asserts a single compile call
+    per backend instance. Kept as a utility for offline / non-traced
+    callers (e.g., ``op_tests/bench_zero_init_splitk_demo.py``) and as a
+    starting point for the shape-aware staging follow-up tracked by
+    ``TODO(zero-init-splitk)`` in ``LinearBase.forward``.
     """
     if _get_blockscale_config is None or _BLOCKSCALE_TUNED_CSV is None:
         return None
@@ -255,7 +264,11 @@ def gemm_a8w8_blockscale_preshuffle_fake(
     w_scale: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    out: Optional[torch.Tensor] = None,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor:
+    if out is not None:
+        return out
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
@@ -518,6 +531,31 @@ class LinearBase(nn.Module):
             # pre-allocate so the GEMM-side Y.zero_() writes into a buffer
             # we own (otherwise gemm_a8w8_blockscale_bpreshuffle allocates
             # its own and we lose the ability to compare configs trivially).
+            #
+            # KNOWN LIMITATION (intentional, see TODO below):
+            # In ``splitk_fused`` mode we currently stage the producer-side
+            # zero-init unconditionally, regardless of whether the tuned CSV
+            # picked splitK>0 for this (M,N,K). The ideal behavior is to
+            # only zero when splitK>0, but a CSV lookup at this point would
+            # have to call into pandas-backed ``get_CKGEMM_config``. Wrapping
+            # that in ``@torch.compiler.disable`` (or any other shape-aware
+            # branching here) introduces a Dynamo graph break, which is
+            # fatal under ATOM's one-shot ``VllmBackend`` (asserts a single
+            # compile call per backend instance). Until we can hoist the
+            # decision out of the traced region (e.g., precomputing per
+            # LinearBase at module-init for the warmup M), we accept the
+            # extra zero-write traffic for splitK=0 layers in exchange for
+            # a Dynamo-stable call signature.
+            #
+            # TODO(zero-init-splitk): make staging shape-aware without
+            # tripping the one-shot VllmBackend. Options to evaluate:
+            #   1. Resolve the splitK bool at LinearBase.__init__ for each
+            #      cudagraph_capture_size and store on `self`.
+            #   2. Pre-compute splitK in a preprocessing pass over the
+            #      module tree before warmup.
+            #   3. Wrap the lookup in a torch custom op that returns a
+            #      0-d bool tensor so dynamo treats it as a graph node
+            #      instead of a Python branch.
             preallocated_y: Optional[torch.Tensor] = None
             zero_init_target: Optional[torch.Tensor] = None
             # producer_zeroed flips True only when we actually pass
@@ -539,17 +577,9 @@ class LinearBase(nn.Module):
                     m, self.output_size, dtype=otype, device=x.device
                 )
                 if BLOCKSCALE_SPLITK_MODE == "splitk_fused":
-                    shape_splitk = _blockscale_splitk_for_shape(
-                        m, self.output_size, self.input_size
-                    )
-                    # Only stage the producer-side zero-init when the
-                    # tuner actually picked splitK > 0 for this shape.
-                    # shape_splitk is 0 when no CSV match exists either;
-                    # in that case the GEMM falls back to splitK=0 too
-                    # (no atomic-add pass), so there is nothing to zero
-                    # and staging would just waste producer bandwidth.
-                    if shape_splitk is not None and shape_splitk > 0:
-                        zero_init_target = preallocated_y
+                    # Stage zero-init unconditionally; see KNOWN LIMITATION
+                    # block above for why this is not currently shape-aware.
+                    zero_init_target = preallocated_y
 
             if x_scale is None:
                 quant_func = self.quant_func
@@ -558,17 +588,30 @@ class LinearBase(nn.Module):
                         self.quant_func, transpose_scale=True
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
-                    quant_kwargs = {
-                        "quant_dtype": self.params_dtype,
-                        "scale": getattr(self, "input_scale", None),
-                    }
-                    if (
-                        zero_init_target is not None
-                        and self.quant_type.value == QuantType.per_1x128.value
-                    ):
-                        quant_kwargs["gemm_out_zero_init"] = zero_init_target
-                        producer_zeroed = True
-                    x, x_scale = quant_func(x, **quant_kwargs)
+                    if self.quant_type.value == QuantType.per_1x128.value:
+                        # Always pass gemm_out_zero_init= as a kwarg here so
+                        # Dynamo sees a single, stable call signature for
+                        # per_group_quant_hip across all per_1x128 layers in
+                        # the traced backbone (mixing "kwarg present" vs
+                        # "kwarg absent" between sibling LinearBase calls
+                        # produces two specialized graphs and trips ATOM's
+                        # one-shot VllmBackend assertion). The custom op
+                        # schema is `Tensor(a7!)? gemm_out_zero_init=None`,
+                        # so passing None when we are not staging a
+                        # producer-fused zero-init is a no-op.
+                        x, x_scale = quant_func(
+                            x,
+                            quant_dtype=self.params_dtype,
+                            scale=getattr(self, "input_scale", None),
+                            gemm_out_zero_init=zero_init_target,
+                        )
+                        producer_zeroed = zero_init_target is not None
+                    else:
+                        x, x_scale = quant_func(
+                            x,
+                            quant_dtype=self.params_dtype,
+                            scale=getattr(self, "input_scale", None),
+                        )
             if self.quant_type.value == QuantType.per_Tensor.value:
                 y = tgemm.mm(
                     x,
