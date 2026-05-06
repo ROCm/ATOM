@@ -95,7 +95,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
     # --- Bpreshuffle for weight ---
     # Preshuffle weight.  Default "1" (enabled)
-    "ATOM_WEIGHT_PRESHUFFLE": lambda: os.getenv("ATOM_WEIGHT_PRESHUFFLE", "1") == "1",
+    "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": lambda: os.getenv(
+        "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1"
+    )
+    == "1",
 }
 
 
