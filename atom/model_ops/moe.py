@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from aiter import ActivationType, QuantType, dtypes, get_hip_quant
+from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_softplus
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
@@ -2637,32 +2637,23 @@ class FusedMoE(torch.nn.Module):
 
                 topk_ids = topk_ids.to(torch.int32)
             elif scoring_func == "sqrtsoftplus":
-                # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
-                # weights gathered from the unbiased sqrt(softplus(.)) values.
-                routing_weights = torch.nn.functional.softplus(
-                    router_logits.float()
-                ).sqrt()
-                scores_for_choice = routing_weights
-                if e_score_correction_bias is not None:
-                    scores_for_choice = scores_for_choice + e_score_correction_bias
-
-                topk_ids = torch.topk(
-                    scores_for_choice, top_k, dim=-1, sorted=False
-                ).indices
-                topk_weights = routing_weights.gather(dim=-1, index=topk_ids)
-
-                if renormalize:
-                    topk_weights = topk_weights / topk_weights.sum(
-                        dim=-1, keepdim=True
-                    ).clamp_min(1e-20)
-                # Match reference Gate.forward (deepseek_v4 inference/model.py:583):
-                # `weights *= route_scale` is applied for every non-softmax routing
-                # path. The hash routing path (`_hash_topk`) already does this
-                # internally; do it here for the sqrtsoftplus topk path so callers
-                # don't need to re-scale.
-                topk_weights = topk_weights * routed_scaling_factor
-
-                topk_ids = topk_ids.to(torch.int32)
+                # # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
+                # # weights gathered from the unbiased sqrt(softplus(.)) values.
+                tokens_num = router_logits.shape[0]
+                topk_ids = torch.empty(
+                    tokens_num, top_k, dtype=torch.int32, device=router_logits.device
+                )
+                topk_weights = torch.empty(
+                    tokens_num, top_k, dtype=torch.float32, device=router_logits.device
+                )
+                topk_softplus(
+                    topk_weights,
+                    topk_ids,
+                    router_logits,
+                    e_score_correction_bias,
+                    renormalize,
+                    routed_scaling_factor,
+                )
             else:
                 raise ValueError(
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"

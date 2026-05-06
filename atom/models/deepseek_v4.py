@@ -60,6 +60,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from aiter import rope_rotate_activation
 from atom.model_ops.quant_v4 import (
     act_quant_inplace,
     rotate_activation,
@@ -81,6 +82,7 @@ from atom.model_ops.v4_kernels import (
     csa_translate_pack,
     fused_compress_attn,
     inverse_rope_inplace,
+    scale_indexer_weights,
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
     swa_write,
@@ -910,8 +912,10 @@ class Indexer(nn.Module):
         # to (1, num_tokens, -1, rotary_dim) so the input doesn't need an
         # explicit batch dim. rotate_activation is last-dim-only.
         q = self.wq_b(qr_full).view(total_tokens, self.n_heads, self.head_dim)
-        self.rotary_emb(positions, q[..., -rd:])
-        q = rotate_activation(q)
+        # self.rotary_emb(positions, q[..., -rd:])
+        # q = rotate_activation(q)
+        cos, sin = self.rotary_emb._caches(q.device)
+        rope_rotate_activation(q, q, cos, sin, positions, rd)
 
         # FP8 quant Q (still online — Q is recomputed each fwd, no cache).
         # `_fp8_quant_func` / `_weights_scale` precomputed in __init__.
@@ -924,7 +928,7 @@ class Indexer(nn.Module):
         # weights_proj is BF16 but auto-promotes to fp32 via fp32 q_scale,
         # so no explicit `.float()` cast needed.
         weights = self.weights_proj(x_full)
-        weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(-1)
+        weights = scale_indexer_weights(weights, q_scale, self._weights_scale)
 
         return torch.ops.aiter.indexer_score_topk(
             q_fp8, weights, self.prefix, self.index_topk
@@ -1832,7 +1836,7 @@ class MoE(nn.Module):
         `forward_context.context.input_ids` before each forward, and
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
-        router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        router_logits = self.gate(x, otype=torch.float32)  # [num_tokens, n_routed_experts]
         return self.experts(hidden_states=x, router_logits=router_logits)
 
     def combine_outputs(
@@ -2125,13 +2129,8 @@ class ParallelHead(nn.Module):
         """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
-        dtype = x.dtype
-        x_flat = x.flatten(-2)  # [num_tokens, hc*dim]
-        x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1])
-        mixes = F.linear(x_normed.float(), hc_fn)  # [num_tokens, hc]
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)  # [num_tokens, dim]
-        return y.to(dtype)
+        _, _, y = aiter.mhc_pre(x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0)
+        return y
 
     def forward(
         self,
