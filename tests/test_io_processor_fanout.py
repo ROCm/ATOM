@@ -53,7 +53,7 @@ def _make_processor() -> InputOutputProcessor:
     proc.tokenizer = tokenizer
     proc.block_size = 4
     proc.requests = {}
-    proc.mamba_enabled = False
+    proc.has_per_req_cache = False
     proc.num_speculative_tokens = 0
     return proc
 

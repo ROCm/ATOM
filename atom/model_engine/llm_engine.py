@@ -162,7 +162,12 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
-        self.mamba_enabled = False
+        # `has_per_req_cache` flags model architectures that need a
+        # per-request stateful buffer outside the paged KV pool. Sequences
+        # constructed for these models trigger BlockManager to reserve a
+        # per-req cache slot. Currently: GDN-based models (Qwen3-Next /
+        # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
+        self.has_per_req_cache = False
         self.num_speculative_tokens = 0
         if (
             hasattr(self.config, "speculative_config")
@@ -171,9 +176,20 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
-        mamba_model_types = {"qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"}
-        if self.config.hf_config.model_type in mamba_model_types:
-            self.mamba_enabled = True
+        if self.config.hf_config.model_type in self._per_req_cache_model_types():
+            self.has_per_req_cache = True
+
+    @staticmethod
+    def _per_req_cache_model_types() -> frozenset[str]:
+        """Single source of truth for which model_types use per-req cache.
+
+        Read by Sequence-construction (here) AND by ModelRunner's startup
+        sanity check, which asserts that any model whose attention builder
+        returns `compute_per_req_cache_bytes() > 0` has its model_type
+        registered here. Adding a new stateful-attention model means
+        adding its model_type to this set.
+        """
+        return frozenset({"qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"})
 
     def preprocess(
         self,
@@ -265,7 +281,7 @@ class InputOutputProcessor:
                 stop_token_sequences,
                 stream_callback=cb,
                 num_draft_tokens=self.num_speculative_tokens,
-                mamba_enabled=self.mamba_enabled,
+                has_per_req_cache=self.has_per_req_cache,
                 kv_transfer_params=kv_transfer_params,
                 needs_independent_noise=(n > 1),
                 parent_request_id=parent_request_id,

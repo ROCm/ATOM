@@ -288,6 +288,244 @@ class AiterAttentionMetadataBuilder:
             "reduce_partial_map": reduce_partial_map,
         }
 
+    def compute_block_bytes(self) -> int:
+        """Standard split-K/V MHA per-block bytes.
+
+        - Standard models: `[2, num_hidden_layers, blocks, block_size,
+          num_kv_heads, head_dim]` for kv_cache + matching kv_scale (fp32).
+        - MiMo-V2-Flash: per-layer-type accounting (full vs SWA layers
+          have different num_kv_heads).
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        num_kv_heads = runner._get_num_kv_heads()
+        total_num_layers = runner._get_total_num_layers()
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
+        if runner.is_mimo_v2():
+            # Mixed full + SWA layers, possibly different num_kv_heads.
+            pattern = hf_config.hybrid_layer_pattern
+            num_swa_layers = sum(
+                1 for i in range(hf_config.num_hidden_layers) if pattern[i] == 1
+            )
+            num_full_layers = hf_config.num_hidden_layers - num_swa_layers
+            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
+            num_swa_layers += num_draft_layers
+
+            _swa_raw = getattr(hf_config, "swa_num_key_value_heads", 0)
+            swa_kv_heads = (
+                _swa_raw // runner.world_size
+                if _swa_raw >= runner.world_size
+                else (1 if _swa_raw else 0)
+            )
+            block_bytes = (
+                2
+                * num_full_layers
+                * runner.block_size
+                * num_kv_heads
+                * hf_config.head_dim
+                * kv_dtype_size
+            )
+            block_bytes += (
+                2
+                * num_swa_layers
+                * runner.block_size
+                * swa_kv_heads
+                * hf_config.head_dim
+                * kv_dtype_size
+            )
+            block_bytes += (
+                2
+                * num_full_layers
+                * num_kv_heads
+                * runner.physical_block_size
+                * 4  # float32 kv_scale
+            )
+            block_bytes += (
+                2
+                * num_swa_layers
+                * swa_kv_heads
+                * runner.physical_block_size
+                * 4  # float32 kv_scale
+            )
+            return block_bytes
+
+        # Standard MHA path.
+        block_bytes = (
+            2
+            * hf_config.num_hidden_layers
+            * runner.block_size
+            * num_kv_heads
+            * hf_config.head_dim
+            * kv_dtype_size
+        )
+        block_bytes += (
+            2
+            * hf_config.num_hidden_layers
+            * num_kv_heads
+            * runner.physical_block_size
+            * 4  # float32 kv_scale
+        )
+        return block_bytes
+
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads: int, num_draft_layers: int
+    ) -> dict:
+        """Allocate the standard split-K/V paged KV cache.
+
+        - MiMo-V2-Flash defers per-module allocation to build_kv_cache_tensor
+          (each module has its own num_kv_heads), returning sentinels here.
+        - All other models use a single `[2, num_hidden_layers, ...]` tensor
+          shared across layers; per-layer slicing happens in build_kv_cache_tensor.
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+
+        if runner.is_mimo_v2():
+            # Per-layer allocation deferred (each module gets its own
+            # correctly-sized tensor matching its num_kv_heads).
+            return {
+                "kv_cache": None,
+                "kv_scale": None,
+                "_kv_layer_cache_store": [],
+            }
+
+        return {
+            "kv_cache": torch.zeros(
+                2,
+                hf_config.num_hidden_layers,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                num_kv_heads,
+                hf_config.head_dim,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            ),
+            "kv_scale": torch.zeros(
+                2,
+                hf_config.num_hidden_layers,
+                runner.num_physical_kvcache_blocks,
+                num_kv_heads,
+                runner.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            ),
+        }
+
+    def build_kv_cache_tensor(self, layer_id: int, module):
+        """Bind one MHA (non-MLA) attention module to its KV slice.
+
+        Handles both standard hybrid models (Qwen3-Next pattern: full-attn
+        layers interleaved with linear-attn) and MiMo-V2-Flash (per-layer
+        allocation with potentially different num_kv_heads per module).
+
+        Returns the KVCacheTensor to register, or None if the module is not
+        an MHA attention this builder owns. Side effects: sets module
+        `k_cache`, `v_cache`, `k_scale`, `v_scale`, `max_model_len`.
+        """
+        from atom.config import KVCacheTensor
+        from aiter import dtypes
+
+        if not (
+            hasattr(module, "base_attention")
+            and hasattr(module, "use_mla")
+            and not module.use_mla
+        ):
+            return None
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+
+        # attn_idx: hybrid models (Qwen3-Next) skip linear-attention layers
+        # in the kv_cache slot ordering; non-hybrid models use layer_id 1:1.
+        if runner.is_qwen_next():
+            mtp_start = runner.mtp_start_layer_idx
+            if layer_id < mtp_start:
+                attn_idx = layer_id // runner.full_attention_interval
+            else:
+                attn_idx = runner.num_full_attn + (layer_id - mtp_start)
+        else:
+            attn_idx = layer_id
+
+        if runner.is_mimo_v2():
+            # Per-layer allocation: each module gets its own correctly-sized
+            # tensor matching its num_kv_heads.
+            kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+            x = 16 // kv_dtype.itemsize
+            module_kv_heads = module.num_kv_heads
+            k_cache = torch.zeros(
+                runner.num_physical_kvcache_blocks,
+                module_kv_heads,
+                hf_config.head_dim // x,
+                runner.physical_block_size,
+                x,
+                dtype=kv_dtype,
+                device="cuda",
+            )
+            v_cache = torch.zeros(
+                runner.num_physical_kvcache_blocks,
+                module_kv_heads,
+                runner.physical_block_size // x,
+                hf_config.head_dim,
+                x,
+                dtype=kv_dtype,
+                device="cuda",
+            )
+            if config.kv_cache_dtype == "fp8":
+                module.k_scale = torch.zeros(
+                    runner.num_physical_kvcache_blocks,
+                    module_kv_heads,
+                    runner.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                )
+                module.v_scale = torch.zeros(
+                    runner.num_physical_kvcache_blocks,
+                    module_kv_heads,
+                    runner.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                )
+            runner._kv_layer_cache_store.append(
+                (k_cache, v_cache, module.k_scale, module.v_scale)
+            )
+        else:
+            x = 16 // runner.kv_cache.element_size()
+            k_cache = runner.kv_cache[0, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.num_kv_heads,
+                hf_config.head_dim // x,
+                runner.physical_block_size,
+                x,
+            )
+            v_cache = runner.kv_cache[1, attn_idx].view(
+                runner.num_physical_kvcache_blocks,
+                runner.num_kv_heads,
+                hf_config.head_dim,
+                runner.physical_block_size,
+            )
+            if config.kv_cache_dtype == "fp8":
+                module.k_scale = runner.kv_scale[0, attn_idx]
+                module.v_scale = runner.kv_scale[1, attn_idx]
+
+        module.max_model_len = config.max_model_len
+        module.k_cache = k_cache
+        module.v_cache = v_cache
+        return KVCacheTensor(
+            layer_num=layer_id,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=module.k_scale,
+            v_scale=module.v_scale,
+        )
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0

@@ -2,13 +2,13 @@
 
 Registers model architecture classes via SGLANG_EXTERNAL_MODEL_PACKAGE,
 replacing sglang's built-in implementations with ATOM-optimized versions.
-
-To add a new model, append its architecture class name to _MODEL_NAMES.
 """
 
 import logging
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterable, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, ClassVar, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -20,9 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 
 logger = logging.getLogger("atom.plugin.sglang.models")
 
-# Context for patched DeepSeek attention layers that need wrapper state without
-# changing every intermediate forward signature. ContextVar keeps nested or
-# concurrent forwards isolated and lets us reliably restore the prior value.
+
 _current_forward_batch: ContextVar[Optional[ForwardBatch]] = ContextVar(
     "atom_sglang_current_forward_batch", default=None
 )
@@ -32,13 +30,83 @@ def get_current_forward_batch():
     return _current_forward_batch.get()
 
 
-_MODEL_NAMES = [
-    "DeepseekV3ForCausalLM",
-    "Qwen3MoeForCausalLM",
-]
+@dataclass(frozen=True)
+class SGLangForwardBatchMetadata:
+    """Small context object for one SGLang model forward."""
 
-_DEEPSEEK_ARCHS = {
-    "DeepseekV3ForCausalLM",
+    forward_batch: Optional[ForwardBatch]
+    pp_proxy_tensors: Optional[PPProxyTensors] = None
+    save_kv_cache: bool = True
+    _current: ClassVar[ContextVar[Optional["SGLangForwardBatchMetadata"]]] = ContextVar(
+        "atom_sglang_current_forward_batch_metadata",
+        default=None,
+    )
+
+    @classmethod
+    def current(cls) -> Optional["SGLangForwardBatchMetadata"]:
+        return cls._current.get()
+
+    @classmethod
+    def build(
+        cls,
+        forward_batch: Optional[
+            Union[ForwardBatch, "SGLangForwardBatchMetadata"]
+        ] = None,
+        *,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        save_kv_cache: Optional[bool] = None,
+    ) -> Optional["SGLangForwardBatchMetadata"]:
+        if isinstance(forward_batch, cls):
+            return forward_batch
+        if forward_batch is None and pp_proxy_tensors is None and save_kv_cache is None:
+            return cls.current()
+        return cls(
+            forward_batch=forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            save_kv_cache=True if save_kv_cache is None else save_kv_cache,
+        )
+
+    @classmethod
+    @contextmanager
+    def bind(cls, metadata: Optional["SGLangForwardBatchMetadata"]):
+        meta_token = cls._current.set(metadata)
+        batch_token = _current_forward_batch.set(
+            None if metadata is None else metadata.forward_batch
+        )
+        try:
+            yield metadata
+        finally:
+            _current_forward_batch.reset(batch_token)
+            cls._current.reset(meta_token)
+
+    @staticmethod
+    def to_intermediate_tensors(
+        intermediate_tensors,
+        metadata: Optional["SGLangForwardBatchMetadata"],
+    ):
+        if intermediate_tensors is not None or metadata is None:
+            return intermediate_tensors
+        pp_proxy_tensors = metadata.pp_proxy_tensors
+        if pp_proxy_tensors is None:
+            return intermediate_tensors
+        tensors = getattr(pp_proxy_tensors, "tensors", None)
+        if tensors is None:
+            return intermediate_tensors
+        from atom.models.utils import IntermediateTensors
+
+        return IntermediateTensors(dict(tensors))
+
+
+@dataclass(frozen=True)
+class ModelArchSpec:
+    wrapper_binds_gdn_context: bool = False
+    apply_deepseek_patch: bool = False
+
+
+_MODEL_ARCH_SPECS = {
+    "DeepseekV3ForCausalLM": ModelArchSpec(apply_deepseek_patch=True),
+    "Qwen3MoeForCausalLM": ModelArchSpec(),
+    "Qwen3NextForCausalLM": ModelArchSpec(wrapper_binds_gdn_context=True),
 }
 
 
@@ -64,28 +132,22 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.unpadded_vocab_size = config.vocab_size
+        self.model_arch = getattr(config, "architectures", [""])[0]
+        self.model_arch_spec = _MODEL_ARCH_SPECS.get(self.model_arch, ModelArchSpec())
 
         import atom
 
-        # TODO: prepare_model() currently handles model construction, config
-        # generation, attention backend registration, and distributed init.
-        # Refactor so this wrapper only dispatches the attention backend
-        # (register_ops_to_sglang + set_attn_cls), and let sglang handle
-        # model construction directly
         self.model = atom.prepare_model(config=config, engine="sglang")
         if self.model is None:
-            model_arch = getattr(config, "architectures", ["unknown"])[0]
             raise ValueError(
-                f"ATOM failed to create model for architecture {model_arch}"
+                f"ATOM failed to create model for architecture {self.model_arch}"
             )
 
         self.logits_processor = LogitsProcessor(config)
 
         # Apply ds model-specific sglang patches (attn dispatch, weight hooks, etc.)
         # TODO: will remove this after sglang supports atom attention backend
-        arch = getattr(config, "architectures", [""])[0]
-        self._uses_forward_batch_context = arch in _DEEPSEEK_ARCHS
-        if arch in _DEEPSEEK_ARCHS:
+        if self.model_arch_spec.apply_deepseek_patch:
             from atom.plugin.sglang.attention_backend.sgl_attention_mla import (
                 setup_deepseek_for_sglang,
             )
@@ -103,26 +165,29 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **model_kwargs: Any,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        metadata = SGLangForwardBatchMetadata.build(
+            forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            save_kv_cache=model_kwargs.get("save_kv_cache"),
+        )
         model_inputs = dict(
             input_ids=input_ids,
             positions=positions,
-            intermediate_tensors=pp_proxy_tensors,
+            intermediate_tensors=SGLangForwardBatchMetadata.to_intermediate_tensors(
+                pp_proxy_tensors, metadata
+            ),
             inputs_embeds=input_embeds,
         )
-        if self._uses_forward_batch_context:
-            token = _current_forward_batch.set(forward_batch)
-            try:
+        with SGLangForwardBatchMetadata.bind(metadata):
+            if self.model_arch_spec.wrapper_binds_gdn_context:
+                from atom.plugin.sglang.attention_backend.attention_gdn import (
+                    SGLangGDNForwardContext,
+                )
+
+                with SGLangGDNForwardContext.bind(metadata):
+                    hidden_states = self.model(**model_inputs)
+            else:
                 hidden_states = self.model(**model_inputs)
-            finally:
-                _current_forward_batch.reset(token)
-        else:
-            hidden_states = self.model(
-                **model_inputs,
-                forward_batch=forward_batch,
-                get_embedding=get_embedding,
-                pp_proxy_tensors=pp_proxy_tensors,
-                **model_kwargs,
-            )
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -146,7 +211,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
 
 EntryClass = []
-for _name in _MODEL_NAMES:
+for _name in _MODEL_ARCH_SPECS:
     _cls = type(_name, (_AtomCausalLMBaseForSglang,), {})
     globals()[_name] = _cls
     EntryClass.append(_cls)

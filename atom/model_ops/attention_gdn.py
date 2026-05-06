@@ -157,8 +157,9 @@ class GatedDeltaNet(nn.Module):
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 
         fwd_ctx: ForwardContext = get_forward_context()
-        gdn_metadata: GDNAttentionMetadata = fwd_ctx.attn_metadata.gdn_metadata
-
+        gdn_metadata: GDNAttentionMetadata = getattr(
+            fwd_ctx.attn_metadata, "gdn_metadata", None
+        )
         if gdn_metadata is None:
             return core_attn_out
 
@@ -177,7 +178,13 @@ class GatedDeltaNet(nn.Module):
             gdn_metadata.non_spec_state_indices_tensor
         )  # noqa: E501
 
-        conv_state = conv_state.transpose(-1, -2)
+        # `causal_conv1d_*` expects the logical shape [slot, conv_dim, state_len].
+        # ModelRunner stores [slot, state_len, conv_dim], so it needs the
+        # transpose below. SGLang already provides [slot, conv_dim, state_len],
+        # and the Triton kernel consumes the original conv_state strides directly.
+        if conv_state.size(1) != self.conv1d.weight.size(0):
+            # transpose for ModelRunner
+            conv_state = conv_state.transpose(-1, -2)
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         num_accepted_tokens = gdn_metadata.num_accepted_tokens
