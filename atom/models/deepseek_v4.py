@@ -80,6 +80,7 @@ from atom.model_ops.v4_kernels import (
     CompressPlan,
     csa_translate_pack,
     fused_compress_attn,
+    inverse_rope_inplace,
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
     swa_write,
@@ -537,6 +538,14 @@ class _V4RoPE(nn.Module):
                 reuse_freqs_front_part=True,
                 nope_first=False,
             )
+
+    def inverse(self, positions: torch.Tensor, x: torch.Tensor) -> None:
+        """In-place inverse RoPE via fused Triton kernel.
+
+        ``x`` must be the rope-slice only (last dim == rotary_dim).
+        """
+        cos, sin = self._caches(x.device)
+        inverse_rope_inplace(x, cos, sin, positions)
 
 
 # ---------------------------------------------------------------------------
@@ -1523,13 +1532,7 @@ class DeepseekV4Attention(nn.Module):
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
-        # aiter has no inverse-RoPE kernel; rebuild per-token complex freqs
-        # from the rotary_emb's cos/sin cache and reuse the manual multiply.
-        # `_apply_rotary_emb` 3D branch assumes [B, S, D] (broadcasts over B
-        # only); pass a 4D view [1, S, H, D] so the rope cache broadcasts
-        # over B and H. In-place writes hit the underlying storage.
-        freqs_slice = self.rotary_emb.freqs_for_positions(positions)
-        _apply_rotary_emb(o.unsqueeze(0)[..., -rd:], freqs_slice, inverse=True)
+        self.rotary_emb.inverse(positions, o[..., -rd:])
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)

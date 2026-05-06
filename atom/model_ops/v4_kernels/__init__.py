@@ -29,6 +29,7 @@ from atom.model_ops.v4_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
     sparse_attn_v4_paged_prefill_reference,
 )
+from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
 from atom.model_ops.v4_kernels.state_writes import update_compressor_states, swa_write
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     "csa_translate_pack_reference",
     "CompressPlan",
     "make_compress_plans",
+    "inverse_rope_inplace",
 ]
