@@ -35,6 +35,42 @@ class PluginConfig:
     sglang_port_args: Any = None
 
 
+def _normalize_sglang_parallel_config(
+    tp_size: int,
+    dp_size: int,
+    tp_rank: int,
+    enable_dp_attention: bool,
+) -> tuple[int, int, int, int]:
+    """Translate SGLang parallel args into the runtime layout ATOM expects.
+
+    SGLang's ``tp_size`` is the whole world used by the model runner, while
+    ``dp_size`` under dp-attention is only an attention-layout factor inside
+    that world. For pure-DP, SGLang launches multiple independent TP workers,
+    so ATOM should treat that DP dimension as external scheduling rather than
+    a model-internal communication group.
+    """
+
+    if enable_dp_attention:
+        if dp_size < 1:
+            raise ValueError(f"SGLang dp_size must be >= 1, got {dp_size}")
+        if tp_size % dp_size != 0:
+            raise ValueError(
+                "SGLang tp_size must be divisible by dp_size when "
+                f"enable_dp_attention=True, got tp_size={tp_size}, dp_size={dp_size}"
+            )
+
+        runtime_tp_size = 1
+        runtime_dp_size = tp_size
+        runtime_dp_rank = tp_rank
+        aiter_rank_id = 0
+        return runtime_tp_size, runtime_dp_size, runtime_dp_rank, aiter_rank_id
+
+    # Without dp-attention, SGLang's DP workers are external replicas. Keep
+    # ATOM/aiter on the per-worker TP world and do not create an internal DP
+    # communication group.
+    return tp_size, 1, 0, tp_rank
+
+
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     from atom.config import Config, CompilationConfig
 
@@ -159,18 +195,23 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # get rank number through the torch.distributed.get_rank()
     rank = torch.distributed.get_rank()
 
-    # Derive DP rank from SGLang's TP-local rank rather than the global
-    # distributed rank so PP/multi-stage layouts do not skew the result.
-    data_parallel_rank = 0
-    if server_args.dp_size > 1:
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_group_size = max(1, server_args.tp_size // server_args.dp_size)
-        data_parallel_rank = tp_rank // tp_group_size
+    tp_rank = get_tensor_model_parallel_rank()
+    (
+        atom_tensor_parallel_size,
+        atom_data_parallel_size,
+        atom_data_parallel_rank,
+        sglang_aiter_rank_id,
+    ) = _normalize_sglang_parallel_config(
+        tp_size=server_args.tp_size,
+        dp_size=server_args.dp_size,
+        tp_rank=tp_rank,
+        enable_dp_attention=server_args.enable_dp_attention,
+    )
 
     # sglang uses the atom parallel config
     sgl_parallel_config = ParallelConfig(
-        data_parallel_size=server_args.dp_size,
-        data_parallel_rank=data_parallel_rank,
+        data_parallel_size=atom_data_parallel_size,
+        data_parallel_rank=atom_data_parallel_rank,
     )
 
     # use sglang torch compile policy and cuda graph policy
@@ -207,7 +248,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         max_num_seqs=server_args.max_running_requests,
         max_model_len=server_args.context_length,
         gpu_memory_utilization=server_args.mem_fraction_static,
-        tensor_parallel_size=server_args.tp_size,
+        tensor_parallel_size=atom_tensor_parallel_size,
         # Disable ATOM's own torch.compile and CUDA graph capture —
         # sglang manages its own compilation/graph strategy, and the
         # @support_torch_compile decorator checks enforce_eager to skip,

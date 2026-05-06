@@ -547,13 +547,11 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if torch.compiler.is_compiling():
-            return self.forward_native(x, residual)
+        from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 
-        if not getattr(self, "_is_compiled", False):
-            self.forward_static = torch.compile(self.forward_static)  # type: ignore
-            self._is_compiled = True
-        return self.forward_native(x, residual)
+        return gemma_rmsnorm_triton(
+            x, self.weight.data, self.variance_epsilon, residual
+        )
 
     def _forward_fused_fp8(self, x, residual=None):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
