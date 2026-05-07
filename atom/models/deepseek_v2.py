@@ -386,6 +386,7 @@ def _fuse_rmsnorm_quant(
     shuffle: bool = True,
     scale_shuffle_padding: bool = False,
     group_size: int = 128,
+    quant_type: Optional[QuantType] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ):
@@ -405,7 +406,7 @@ def _fuse_rmsnorm_quant(
             )
         )
     elif dtype_quant == dtypes.fp8:
-        if group_size == 0:
+        if quant_type == QuantType.per_Token:
             out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
                 _fused_rms_fp8_per_token_quant(
                     x1,
@@ -1600,8 +1601,8 @@ class DeepseekV2MLAAttention(nn.Module):
         # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if FP8 or (use_triton_gemm() and FP4),
         self.prefix = prefix
         self.quant_dtype = None
+        self.qknorm_quant_type = None
         self.fuse_qknorm_quant = False
-        self.use_per_token_quant = False
         # always fuse qknorm
         self.fuse_qknorm = ENABLE_DS_QKNORM_FUSION
         if quant_config is not None and ENABLE_DS_QKNORM_QUANT_FUSION:
@@ -1609,8 +1610,8 @@ class DeepseekV2MLAAttention(nn.Module):
                 layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
             ):
                 self.quant_dtype = layer_quant_dtype
+                self.qknorm_quant_type = layer_quant_type
                 self.fuse_qknorm_quant = True
-                self.use_per_token_quant = layer_quant_type == QuantType.per_Token
 
     def forward(
         self,
@@ -1672,7 +1673,8 @@ class DeepseekV2MLAAttention(nn.Module):
                         dtype_quant=self.quant_dtype,
                         shuffle=False,
                         scale_shuffle_padding=False,
-                        group_size=0 if self.use_per_token_quant else 128,
+                        group_size=128,
+                        quant_type=self.qknorm_quant_type,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
