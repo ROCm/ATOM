@@ -10,8 +10,6 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 import torch.profiler as torch_profiler
 import tqdm
 from aiter import destroy_dist_env, init_dist_env
@@ -59,7 +57,6 @@ support_model_arch_dict = {
     "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
@@ -472,25 +469,6 @@ class tokenIDProcessor:
         return ret
 
 
-@triton.jit
-def _gpu_fence_kernel(
-    kv_ptr,
-    block_ids_ptr,
-    total_blocks: tl.int64,
-    elems_per_block: tl.int64,
-    NUM_CL: tl.constexpr,
-):
-    blk_idx = tl.program_id(0)
-    layer_idx = tl.program_id(1).to(tl.int64)
-    blk = tl.load(block_ids_ptr + blk_idx).to(tl.int64)
-    base = (layer_idx * total_blocks + blk) * elems_per_block
-    cl_offsets = tl.arange(0, NUM_CL).to(tl.int64) * 32
-    mask = cl_offsets < elems_per_block
-    tl.atomic_or(
-        kv_ptr + base + cl_offsets, tl.zeros([NUM_CL], dtype=tl.int32), mask=mask
-    )
-
-
 class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
@@ -514,7 +492,6 @@ class ModelRunner:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
-        self.use_v4 = self.is_deepseek_v4()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -574,7 +551,6 @@ class ModelRunner:
             self.block_size,
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
-            use_v4=self.use_v4,
         )
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
@@ -626,18 +602,6 @@ class ModelRunner:
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
         logger.info(f"Model load done: {config.model}")
-
-        # Optional debug instrumentation; no-op when env vars unset.
-        # See atom/utils/debug_helper/.
-        from atom.utils.debug_helper import (
-            install_block_forward_hooks,
-            maybe_dump_weights_and_exit,
-        )
-
-        _n_fwd_hooks = install_block_forward_hooks(self.model)
-        if _n_fwd_hooks > 0:
-            logger.info(f"[ATOM_FWD_DUMP] {_n_fwd_hooks} Block forward hooks installed")
-        maybe_dump_weights_and_exit(self.model)
 
         if self.config.speculative_config and get_pp_group().is_last_rank:
             from atom.utils.backends import set_model_tag
@@ -700,7 +664,9 @@ class ModelRunner:
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
-        self._fence_event: Optional[torch.cuda.Event] = None
+        self._fence_event: Optional[torch.cuda.Event] = (
+            None  # for cross-partition fence
+        )
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
@@ -746,11 +712,6 @@ class ModelRunner:
         ):
             return True
         return False
-
-    def is_deepseek_v4(self) -> bool:
-        if not hasattr(self.hf_text_config, "model_type"):
-            return False
-        return self.hf_text_config.model_type == "deepseek_v4"
 
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -1423,28 +1384,13 @@ class ModelRunner:
         # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
         set_kv_cache_data(kv_cache_data, config)
 
-        # Cross-validate: compare estimated vs actual KV cache allocation.
-        # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
-        # `block_bytes × num_blocks`) AND the per-request cache tensors (state
-        # buffers + SWA window prefix embedded in unified_kv). The budget
-        # math in `get_num_blocks()` reserves both separately, so the cross-
-        # check must mirror that — otherwise it spuriously fires for any
-        # backend with non-zero `compute_per_req_cache_bytes()` (V4, GDN).
+        # Cross-validate: compare estimated vs actual KV cache allocation
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
-        expected_kv_bytes = (
-            self._compute_block_bytes() * num_kvcache_blocks
-            + self.attn_metadata_builder.compute_per_req_cache_bytes()
-            * self.max_per_req_cache_slots
-        )
+        expected_kv_bytes = self._compute_block_bytes() * num_kvcache_blocks
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
-            # 3% threshold: budget formula matches allocation exactly, but the
-            # measured `post_alloc - pre_alloc` includes allocator alignment
-            # (round to 256 B / 16 MiB segments) and ephemeral init buffers
-            # from `_zero_state` / `_neg_inf_state` views, accounting for ~2%
-            # noise on multi-GiB pools. Lower thresholds spuriously fire.
-            if diff_pct > 0.03:
+            if diff_pct > 0.01:
                 logger.warning(
                     f"KV cache allocation mismatch: "
                     f"expected={expected_kv_bytes / (1 << 30):.3f}GB, "
@@ -1902,43 +1848,12 @@ class ModelRunner:
             return KVConnectorOutput(finished_sending=[], finished_recving=[])
         done_sending, done_recving = connector.get_finished()
 
-        # GPU memory fence for RDMA-written KV blocks.
-        # Not needed when producer and consumer are in the same network partition
-        # fence_blocks = connector.get_finished_recv_blocks()
-        # if fence_blocks:
-        #     with torch.cuda.stream(self.async_execute_stream):
-        #         self._gpu_memory_fence(fence_blocks)
-        #     event = torch.cuda.Event()
-        #     event.record(self.async_execute_stream)
-        #     self._fence_event = event
+        # GPU memory fence for RDMA-written KV blocks — disabled for
+        # same-partition deployments.  See gpu_memory_fence() in
+        # atom/kv_transfer/disaggregation/utils.py for cross-partition use.
 
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
-        )
-
-    def _gpu_memory_fence(self, block_ids: list[int]) -> None:
-        """Force GPU memory coherence for RDMA-written KV cache blocks.
-
-        Single Triton kernel launch — one atomic_or(0) per cache line (128 bytes)
-        across all (layer, block) pairs.
-        """
-        block_ids_t = torch.tensor(block_ids, dtype=torch.int32, device=self.device)
-        kv_flat = self.kv_cache.view(torch.int32)
-        if self.use_mla:
-            num_layers = self.kv_cache.shape[0]
-            total_blocks = self.kv_cache.shape[1]
-        else:
-            num_layers = 2 * self.kv_cache.shape[1]
-            total_blocks = self.kv_cache.shape[2]
-        elems_per_block = kv_flat.numel() // (num_layers * total_blocks)
-        num_cl = triton.cdiv(elems_per_block, 32)
-        NUM_CL = triton.next_power_of_2(num_cl)
-        _gpu_fence_kernel[(len(block_ids), num_layers)](
-            kv_flat,
-            block_ids_t,
-            total_blocks,
-            elems_per_block,
-            NUM_CL=NUM_CL,
         )
 
     def propose_draft_token_ids(
@@ -1987,26 +1902,9 @@ class ModelRunner:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
 
-        # Drop any capture size that exceeds max_num_seqs — those graphs would
-        # never be replayed since the scheduler can't produce a batch larger
-        # than max_num_seqs. Warn so the user notices a misconfig (default
-        # cuda_graph_sizes=[512] vs e.g. max_num_seqs=16) without crashing.
-        max_bs = self.config.max_num_seqs
-        oversized = [s for s in self.graph_bs if s > max_bs]
-        if oversized:
-            self.graph_bs = [s for s in self.graph_bs if s <= max_bs]
-            logger.warning(
-                "cudagraph capture sizes %s exceed max_num_seqs=%d; dropping. "
-                "Remaining: %s",
-                oversized,
-                max_bs,
-                self.graph_bs,
-            )
-        assert self.graph_bs, (
-            f"no cudagraph capture sizes left after filtering by "
-            f"max_num_seqs={max_bs}; pass --cudagraph-capture-sizes or raise "
-            f"--max-num-seqs."
-        )
+        assert (
+            self.graph_bs[0] <= self.config.max_num_seqs
+        ), "cudagraph capture sizes must be less than max_num_seqs."
 
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu
