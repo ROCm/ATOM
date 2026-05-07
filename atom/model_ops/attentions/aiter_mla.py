@@ -461,7 +461,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
             # Recompute sparse_kv_indptr: per-seq sparse count = min(dense_kv_count, index_topk)
             sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
-            kv_counts = kv_indptr[1 : bs + 1] - kv_indptr[0]
+            kv_counts = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
             sparse_counts = torch.clamp(kv_counts, max=self.index_topk)
             sparse_kv_indptr[0] = 0
             sparse_kv_indptr[1 : bs + 1] = torch.cumsum(sparse_counts, dim=0)

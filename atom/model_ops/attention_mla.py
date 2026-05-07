@@ -910,7 +910,7 @@ def triton_convert_req_index_to_global_index(
     token_indices_c = token_indices.contiguous()
     page_kv_indptr_c = page_kv_indptr.contiguous()
     # NOTE: MTP (max_seqlen_q > 1) uses triton_convert_req_index_to_global_index_dsa_prefill instead
-    new_kv_indices = torch.zeros_like(kv_indices)
+    new_kv_indices = torch.empty_like(kv_indices)
 
     # Strides in elements
     ti_stride0, ti_stride1 = token_indices_c.stride()
@@ -1017,7 +1017,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     num_tokens = dsa_qo_indptr.shape[0] - 1
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
-    new_kv_indices = torch.zeros(
+    new_kv_indices = torch.empty(
         num_tokens * NUM_TOPK_TOKENS, dtype=torch.int32, device=topk_indices.device
     )
 
@@ -1108,7 +1108,7 @@ def triton_gather_kv_indices_sparse(
     num_tokens = token_to_seq_idxs.shape[0]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
-    out = torch.zeros(
+    out = torch.empty(
         num_tokens * NUM_TOPK_TOKENS, dtype=torch.int32, device=topk_indices.device
     )
 
