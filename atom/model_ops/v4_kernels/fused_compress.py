@@ -148,7 +148,7 @@ def _fused_compress_attn_kernel(
             kv_in_ptr + in_row * kv_in_row_stride + col_off + d,
             mask=is_input & d_mask,
             other=0.0,
-        )
+        ).to(tl.float32)
 
         # State cache source: ring slot indexed by absolute s.
         s_safe = tl.maximum(s, 0)
@@ -169,7 +169,7 @@ def _fused_compress_attn_kernel(
             score_in_ptr + in_row * score_in_row_stride + col_off + d,
             mask=is_input & d_mask,
             other=NEG_INF,
-        )
+        ).to(tl.float32)
         ape_v = tl.load(
             ape_ptr + ape_row * dim_full + col_off + d,
             mask=is_input & d_mask,

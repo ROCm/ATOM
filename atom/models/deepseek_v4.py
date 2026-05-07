@@ -829,7 +829,7 @@ class Compressor(nn.Module):
         # downstream kernels (fused_compress_attn, update_compressor_states)
         # accept strided kv/score (only inner stride must be 1).
         coff_d = (1 + overlap) * d
-        combined = self.wkv_gate(x, otype=torch.float32)
+        combined = self.wkv_gate(x, otype=torch.bfloat16)
         kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
