@@ -1454,6 +1454,7 @@ def AiterBackendDecoratorForPluginMode(cls):
     """
     is_vllm_mode = is_vllm()
     if is_vllm_mode:
+        is_sparse_mla = False
         if not issubclass(cls.get_impl_cls(), MLAAttention):
             methods_cls = vllmAiterAttentionBackendMethods
         else:
@@ -1465,7 +1466,16 @@ def AiterBackendDecoratorForPluginMode(cls):
         for name in dir(methods_cls):
             if name.startswith("_"):
                 continue
-            setattr(cls, name, getattr(methods_cls, name))
+            raw = methods_cls.__dict__.get(name)
+            if is_sparse_mla and isinstance(raw, classmethod):
+                # Re-wrap so cls binds to the target class, not methods_cls.
+                # For backends like sparse MLA where more than one attention
+                # backends are registered through this decorator exist, the
+                # different backends need to return distinct identities
+                # through full_cls_name().
+                setattr(cls, name, classmethod(raw.__func__))
+            else:
+                setattr(cls, name, getattr(methods_cls, name))
     return cls
 
 
@@ -1742,9 +1752,6 @@ class AiterMLASparseMetadataForPluginMode:
 
     block_size: int = 1
     topk_tokens: int = 2048
-
-    # Flag to run ragged layout conversion only once per forward (shared across MLA layers)
-    ragged_layout_built: bool = False
 
 
 class vllmMLASparseAttentionMetadataBuilderMethods:

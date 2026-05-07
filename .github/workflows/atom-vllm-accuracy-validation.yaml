@@ -69,6 +69,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_dsv32_fp8_tp8:
+        description: "DeepSeek-V3.2-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
       run_gpt_oss_120b_tp1:
         description: "gpt-oss-120b TP1"
         required: false
@@ -141,6 +146,7 @@ jobs:
           RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
           RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
+          RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
           RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
@@ -261,6 +267,16 @@ jobs:
                   "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
                   "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
                   "extra_args": "--tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-8",
+              },
+              {
+                  "toggle_env": "RUN_DSV32_FP8_TP8",
+                  "model_name": "DeepSeek-V3.2-FP8 TP8",
+                  "model_path": "deepseek-ai/DeepSeek-V3.2",
+                  "extra_args": "--tensor-parallel-size 8 --block-size 1",
+                  "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
                   "runner": "linux-atom-mi35x-8",

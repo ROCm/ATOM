@@ -1976,7 +1976,9 @@ class DeepseekV2ForCausalLM(nn.Module):
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
-    pass
+    # DeepSeek-V3.2's indexer weights_proj are not quantized, but they are not listed in
+    # model's quant exclude mapping. So we add it to quant_default_exclude_layers.
+    quant_default_exclude_layers: list[str] = ["*.indexer.weights_proj"]
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
