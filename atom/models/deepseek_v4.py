@@ -180,40 +180,54 @@ def fused_q_norm_qk_rope_swa_write(
     kernel also writes the windowed kv into `swa_kv`; the caller must then
     skip the standalone `swa_write` for those rows.
     """
-    M = q.shape[0]
-    q_out = torch.empty(
-        (M, n_local_heads, head_dim),
-        dtype=torch.bfloat16,
-        device=q.device,
-    )
-    fused_reduce_q_norm_qk_rope_swa_write(
-        q,
-        kv,
-        None,
-        eps,
-        rope_head_dim,
-        cos_cache,
-        sin_cache,
-        positions,
-        q_out=q_out,
-        is_neox=False,
-        dtype=torch.bfloat16,
-        write_indices=swa_write_indices if M <= 64 else None,
-        batch_id_per_token=batch_id_per_token if M <= 64 else None,
-        state_slot_mapping=state_slot_mapping if M <= 64 else None,
-        swa_kv=swa_kv if M <= 64 else None,
-        win=win,
-    )
-    if M > 64:
-        swa_write(
-            kv,
-            swa_write_indices,
-            positions,
-            batch_id_per_token,
-            state_slot_mapping,
-            swa_kv,
-            win,
+    num_tokens = q.shape[0]
+    if num_tokens <= 64:
+        q_out = torch.empty(
+            (num_tokens, n_local_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
         )
+        fused_reduce_q_norm_qk_rope_swa_write(
+            q,
+            kv,
+            None,
+            eps,
+            rope_head_dim,
+            cos_cache,
+            sin_cache,
+            positions,
+            q_out=q_out,
+            is_neox=False,
+            dtype=torch.bfloat16,
+            write_indices=swa_write_indices,
+            batch_id_per_token=batch_id_per_token,
+            state_slot_mapping=state_slot_mapping,
+            swa_kv=swa_kv,
+            win=win,
+        )
+    else:
+        q = q.view(num_tokens, n_local_heads, head_dim)
+        q_out = _rmsnorm_nw(q, eps, head_dim)
+        aiter.rope_cached_positions_2c_fwd_inplace(
+            q_out[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
+            kv[..., -rope_head_dim:].view(1, num_tokens, -1, rope_head_dim),
+            cos_cache,
+            sin_cache,
+            positions.view(1, num_tokens),
+            1,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+        if not swa_write_indices:
+            swa_write(
+                kv,
+                swa_write_indices,
+                positions,
+                batch_id_per_token,
+                state_slot_mapping,
+                swa_kv,
+                win,
+            )
     return q_out
 
 
