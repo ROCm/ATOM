@@ -22,6 +22,17 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
+    "display": "MiniMax-M2.5 TP2",
+    "dashboard_model": "MiniMax-M2.5",
+    "source_path": "MiniMaxAI/MiniMax-M2.5",
+    "path": "MiniMaxAI/MiniMax-M2.5",
+    "prefix": "MiniMax-M2.5-tp2",
+    "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+  },
+  {
     "display": "gpt-oss-120b TP1",
     "source_path": "openai/gpt-oss-120b",
     "path": "openai/gpt-oss-120b",
