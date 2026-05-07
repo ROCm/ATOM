@@ -129,7 +129,6 @@ class MLAAttention(nn.Module):
         self.head_dim = head_dim
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
-        self.kv_cache_dtype = kv_cache_dtype if kv_cache_dtype == "fp8" else "auto"
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
