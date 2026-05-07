@@ -23,7 +23,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
-from atom.plugin.prepare import is_vllm
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import PretrainedConfig
@@ -247,9 +246,6 @@ class MiniMaxM2Attention(nn.Module):
                 orig_dtype
             )
 
-            # TODO: is_vllm will be removed after vllm plugin supporting q,k,v rather than qkv
-            if is_vllm():
-                qkv = torch.cat([q, k, v], dim=-1)
             attn_output = self.attn(
                 query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
             )
