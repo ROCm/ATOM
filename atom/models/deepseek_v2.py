@@ -306,6 +306,7 @@ def _fused_rms_fp8_quant(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
+@mark_trace(prefix="rmsnorm_quant", torch_compile=True)
 def _fuse_rmsnorm_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -359,13 +360,6 @@ def _fuse_rmsnorm_quant(
             f"No fused rmsnorm quant kernel availble for quant dtype: {dtype_quant}."
         )
     return (out1_quantized, out1_bs), out1_unquantized, out2, out_res1
-
-
-# Keep the base function marker-free so attention can use one dispatch path
-# without splitting the compiled graph. Input RMSNorm quant still uses markers.
-_fuse_rmsnorm_quant_mark_trace = mark_trace(
-    _fuse_rmsnorm_quant, prefix="rmsnorm_quant", torch_compile=True
-)
 
 
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
@@ -1735,7 +1729,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             if residual is None:
                 residual = hidden_states
                 (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
-                    _fuse_rmsnorm_quant_mark_trace(
+                    _fuse_rmsnorm_quant(
                         hidden_states,
                         weight,
                         eps,
@@ -1754,7 +1748,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
             else:
                 (hidden_states_quant, hidden_states_quant_scale), _, _, residual = (
-                    _fuse_rmsnorm_quant_mark_trace(
+                    _fuse_rmsnorm_quant(
                         hidden_states,
                         weight,
                         eps,
