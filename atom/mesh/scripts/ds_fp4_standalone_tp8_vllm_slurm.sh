@@ -17,7 +17,7 @@
 # on vLLM. Mirrors ds_fp4_1p_tp8_1d_tp8_vllm_slurm.sh structure but strips all
 # PD/Mooncake plumbing — used to isolate model vs PD-framework regressions.
 #
-# Workload sweep: ISL:OSL pairs (default "8192:1,1:1024") × CONC list.
+# Workload sweep: ISL:OSL pairs (default "8192:1,1:1024,8192:1024") × CONC list.
 #
 # Usage:
 #   mkdir -p /it-share/yajizhan/slurm_logs
@@ -29,7 +29,7 @@
 set -euo pipefail
 
 # ======================== configuration ========================
-MODEL_PATH="${MODEL_PATH:-amd/DeepSeek-R1-0528-MXFP4}"
+MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:mesh-vllm-latest}"
 CONTAINER="${CONTAINER:-atom_vllm_standalone_${SLURM_JOB_ID}}"
 
@@ -46,7 +46,7 @@ CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
 CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-256}"
 
 # Workload: comma-separated ISL:OSL pairs.
-ISL_OSL_LIST="${ISL_OSL_LIST:-8192:1,1:1024}"
+ISL_OSL_LIST="${ISL_OSL_LIST:-8192:1,1:1024,8192:1024}"
 CONC_LIST="${CONC_LIST:-1,2,4,8,16}"
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1}"
 
