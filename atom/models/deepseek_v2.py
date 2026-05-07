@@ -165,6 +165,7 @@ def _fused_rms_fp8_group_quant_fake(
     res1: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     group_size: int = 128,
+    quant_type: Optional[QuantType] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ) -> Tuple[
@@ -274,6 +275,7 @@ def _fused_rms_fp8_group_quant(
     res1: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     group_size: int = 128,
+    quant_type: Optional[QuantType] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ) -> Tuple[
@@ -294,14 +296,21 @@ def _fused_rms_fp8_group_quant(
             res1,
             dtype_quant,
             group_size,
+            quant_type,
             output_unquantized_inp1,
             transpose_scale,
         )
     )
 
-    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm
 
-    fused_qk_rmsnorm_group_quant(
+    if quant_type is None:
+        if group_size == 32:
+            quant_type = QuantType.per_1x32
+        else:
+            quant_type = QuantType.per_1x128
+
+    fused_qk_rmsnorm(
         q_out_quantized=out1_quantized,
         q_out_scale=out1_bs,
         q=x1,
@@ -314,6 +323,7 @@ def _fused_rms_fp8_group_quant(
         k_weight=x2_weight,
         k_epsilon=x2_epsilon,
         q_residual=res1,
+        quant_type=quant_type,
         group_size=group_size,
         transpose_scale=transpose_scale,
     )
@@ -354,9 +364,9 @@ def _fused_rms_fp8_per_token_quant(
         )
     )
 
-    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_per_token_quant
+    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm
 
-    fused_qk_rmsnorm_per_token_quant(
+    fused_qk_rmsnorm(
         q_out_quantized=out1_quantized,
         q_out_scale=out1_bs,
         q=x1,
@@ -369,6 +379,7 @@ def _fused_rms_fp8_per_token_quant(
         k_weight=x2_weight,
         k_epsilon=x2_epsilon,
         q_residual=res1,
+        quant_type=QuantType.per_Token,
     )
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
@@ -431,10 +442,11 @@ def _fuse_rmsnorm_quant(
                     x2_weight,
                     x2_epsilon,
                     res1,
-                    dtype_quant,
-                    group_size,
-                    output_unquantized_inp1,
-                    transpose_scale,
+                    dtype_quant=dtype_quant,
+                    group_size=group_size,
+                    quant_type=quant_type,
+                    output_unquantized_inp1=output_unquantized_inp1,
+                    transpose_scale=transpose_scale,
                 )
             )
     else:
@@ -1766,6 +1778,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             if quant_config is None
             else quant_config.get_layer_quant_config(prefix).quant_dtype
         )
+        self.input_norm_quant_type = (
+            None
+            if quant_config is None
+            else quant_config.get_layer_quant_config(prefix).quant_type
+        )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
@@ -1849,6 +1866,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                         shuffle=True,
                         scale_shuffle_padding=True,
                         group_size=128,
+                        quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
@@ -1867,6 +1885,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                         shuffle=True,
                         scale_shuffle_padding=True,
                         group_size=128,
+                        quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
