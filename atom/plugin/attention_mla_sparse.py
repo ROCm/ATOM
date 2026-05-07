@@ -119,18 +119,15 @@ class MLASparseAttentionImplPluginModeMethods:
             device=q.device,
         )
 
-        # Build ragged layout only once per forward as it shared across MLA layers
-        if not getattr(sparse_meta, "ragged_layout_built", False):
-            seq_len = (topk_indices_global != -1).sum(dim=-1)
-            torch.cumsum(seq_len, dim=0, out=sparse_meta.paged_kv_indptr[1:])
-            sparse_meta.paged_kv_indptr_rest.fill_(sparse_meta.paged_kv_indptr[-1])
-            fetch_id_to_ragged_triton(
-                topk_indices_global,
-                sparse_meta.paged_kv_indptr,
-                sparse_meta.paged_kv_indices,
-                sparse_meta.topk_tokens,
-            )
-            sparse_meta.ragged_layout_built = True
+        seq_len = (topk_indices_global != -1).sum(dim=-1)
+        torch.cumsum(seq_len, dim=0, out=sparse_meta.paged_kv_indptr[1:])
+        sparse_meta.paged_kv_indptr_rest.fill_(sparse_meta.paged_kv_indptr[-1])
+        fetch_id_to_ragged_triton(
+            topk_indices_global,
+            sparse_meta.paged_kv_indptr,
+            sparse_meta.paged_kv_indices,
+            sparse_meta.topk_tokens,
+        )
 
         kv_buffer = kv_cache.unsqueeze(2)
 
@@ -483,20 +480,19 @@ def sparse_attn_indexer_plugin_mode(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            top_k_per_row_prefill(
-                logits=logits,
-                rowStarts=chunk.cu_seqlen_ks,
-                rowEnds=chunk.cu_seqlen_ke,
-                indices=topk_indices,
-                values=None,
-                numRows=num_rows,
-                stride0=logits.stride(0),
-                stride1=logits.stride(1),
+            # Use top_k_per_row_prefill from vLLM to correctly handle row starts
+            # and ends. It also produces 0-based local indices, eliminating the
+            # need for conversion from global.
+            torch.ops._C.top_k_per_row_prefill(
+                logits,
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
             )
-            # Convert global concatenated KV buffer indices to request-local
-            valid_mask = topk_indices != -1
-            topk_indices.sub_(chunk.cu_seqlen_ks.unsqueeze(1))
-            topk_indices.masked_fill_(~valid_mask, -1)
 
     if has_decode:
         decode_metadata = indexer_meta.decode
