@@ -116,10 +116,10 @@ class PagedAttentionImplPluginModeMethods:
                 v = v.view(-1, kv_size)
 
                 q, k = triton_fused_norm_rope_cache(
-                    q=q,
-                    k=k,
-                    v=v,
-                    position=position,
+                    q,
+                    k,
+                    v,
+                    position,
                     q_norm=self.q_norm,
                     k_norm=self.k_norm,
                     rotary_emb=self.rotary_emb,
