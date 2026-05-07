@@ -10,6 +10,16 @@
     "env_vars": ""
   },
   {
+    "display": "DeepSeek-V4-Pro",
+    "path": "deepseek-ai/DeepSeek-V4-Pro",
+    "prefix": "deepseek-v4-pro",
+    "args": "--kv_cache_dtype fp8 -tp 8",
+    "bench_args": "",
+    "suffix": "",
+    "runner": "atom-mi355-8gpu.predownload",
+    "env_vars": "ATOM_USE_TRITON_MOE=1"
+  },
+  {
     "display": "DeepSeek-R1-0528 MTP3",
     "path": "deepseek-ai/DeepSeek-R1-0528",
     "prefix": "deepseek-r1-0528",
