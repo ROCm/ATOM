@@ -19,6 +19,7 @@ import logging
 
 from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
+from atom.model_ops.layernorm import MiniMaxText01RMSNormTP
 from atom.utils.decorators import mark_trace
 from atom.model_ops.base_attention import cp_mha_gather_cache
 
@@ -77,6 +78,9 @@ class PagedAttentionImpl(nn.Module):
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
+        self.norm_accross_all_heads = False
+        if isinstance(self.q_norm, MiniMaxText01RMSNormTP):
+            self.norm_accross_all_heads = True
 
         # for plugin mode(vllm), the query quant is disabled for now
         if is_vllm():
@@ -130,10 +134,16 @@ class PagedAttentionImpl(nn.Module):
         use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
         self.use_triton_attn = use_triton_attn
 
+        if self.norm_accross_all_heads:
+            q, k = MiniMaxText01RMSNormTP.forward_qk(
+                self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
+            )
+
         if (
             self.rotary_emb is not None
             and self.q_norm is not None
             and self.k_norm is not None
+            and not self.norm_accross_all_heads
         ):
             from atom.model_ops.layernorm import GemmaRMSNorm
 
@@ -245,9 +255,9 @@ class PagedAttentionImpl(nn.Module):
             if self.rotary_emb is not None:
                 assert position is not None
                 q, k = self.rotary_emb(position, q, k)
-            if self.q_norm is not None:
+            if self.q_norm is not None and not self.norm_accross_all_heads:
                 q = self.q_norm(q)
-            if self.k_norm is not None:
+            if self.k_norm is not None and not self.norm_accross_all_heads:
                 k = self.k_norm(k)
             if self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(

@@ -11,7 +11,7 @@ from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.layernorm import RMSNorm, MiniMaxText01RMSNormTP
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
@@ -175,22 +175,16 @@ class MiniMaxM2Attention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
-        self.use_qk_norm = use_qk_norm
-        if self.use_qk_norm:
-            # TP-aware RMSNorm for QK norm: weight is sharded across TP ranks
-            # with a custom weight_loader, and variance is all-reduced during
-            # forward so normalization uses the global (not per-rank) variance.
-            self.q_norm = RMSNorm(self.q_size, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.kv_size, eps=rms_norm_eps)
-            self.rms_norm_eps = rms_norm_eps
-            # Attach TP-shard weight loaders for tp>1 correctness.
-            if tp_size > 1:
-                self.q_norm.weight.weight_loader = self._make_tp_norm_loader(
-                    self.total_num_heads * self.head_dim
-                )
-                self.k_norm.weight.weight_loader = self._make_tp_norm_loader(
-                    self.total_num_kv_heads * self.head_dim
-                )
+        # TP-aware RMSNorm for QK norm: weight is sharded across TP ranks
+        # with a custom weight_loader, and variance is all-reduced during
+        # forward so normalization uses the global (not per-rank) variance.
+        self.q_norm = MiniMaxText01RMSNormTP(
+            self.head_dim * self.total_num_heads, eps=rms_norm_eps
+        )
+        self.k_norm = MiniMaxText01RMSNormTP(
+            self.head_dim * self.total_num_kv_heads, eps=rms_norm_eps
+        )
+        self.rms_norm_eps = rms_norm_eps
 
         self.attn = Attention(
             self.num_heads,
@@ -201,20 +195,9 @@ class MiniMaxM2Attention(nn.Module):
             layer_num=layer_num,
             use_mla=False,
             rotary_emb=self.rotary_emb,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
         )
-
-    @staticmethod
-    def _make_tp_norm_loader(full_size: int):
-        """Return a weight_loader that TP-shards a full norm weight."""
-
-        def _loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
-            tp_world = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-            shard_size = full_size // tp_world
-            shard = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
-            param.data.copy_(shard)
-
-        return _loader
 
     def forward(
         self,
@@ -223,27 +206,6 @@ class MiniMaxM2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        if self.use_qk_norm:
-            # TP-aware RMSNorm: all-reduce variance across TP ranks so
-            # normalization uses the global variance (over 6144/1024 dims)
-            # rather than per-rank variance (768/128 dims).
-            orig_dtype = q.dtype
-            q = q.to(torch.float32)
-            k = k.to(torch.float32)
-            q_var = q.pow(2).mean(dim=-1, keepdim=True)
-            k_var = k.pow(2).mean(dim=-1, keepdim=True)
-            if self.tp_size > 1:
-                qk_var = torch.cat([q_var, k_var], dim=-1)
-                qk_var = tensor_model_parallel_all_reduce(qk_var) / self.tp_size
-                q_var, k_var = qk_var.chunk(2, dim=-1)
-            q = (q * torch.rsqrt(q_var + self.rms_norm_eps) * self.q_norm.weight).to(
-                orig_dtype
-            )
-            k = (k * torch.rsqrt(k_var + self.rms_norm_eps) * self.k_norm.weight).to(
-                orig_dtype
-            )
-
         attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output

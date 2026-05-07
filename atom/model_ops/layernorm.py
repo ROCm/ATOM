@@ -12,8 +12,14 @@ from aiter import (
     rmsnorm2d_fwd,
     rmsnorm2d_fwd_with_add,
 )
-from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.communication_op import (
+    tensor_model_parallel_fused_allreduce_rmsnorm,
+    tensor_model_parallel_all_reduce,
+)
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
@@ -286,6 +292,82 @@ class RMSNorm(nn.Module):
                         x, self.weight, residual, self.eps, self.dim
                     )
                     return x, residual
+
+
+class MiniMaxText01RMSNormTP(nn.Module):
+    name = "MiniMaxText01RMSNormTP"
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.tp_world = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world)))
+
+        self.weight.weight_loader = self.weight_loader
+        self.variance_epsilon = eps
+
+    @staticmethod
+    def weight_loader(
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        tp_world = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        shard_size = loaded_weight.shape[0] // tp_world
+        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        param.data.copy_(loaded_weight[shard])
+
+    def _forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
+        if self.tp_world > 1:
+            variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        x = (x * self.weight).to(orig_dtype)
+        return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert residual is None, "RMSNorm does not support residual connection."
+        return self._forward(x)
+
+    @staticmethod
+    def forward_qk(
+        q_norm: "MiniMaxText01RMSNormTP",
+        k_norm: "MiniMaxText01RMSNormTP",
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_dim = q.dim()
+        k_dim = k.dim()
+        orig_q_shape = q.shape
+        orig_k_shape = k.shape
+        assert q_dim == k_dim, "q and k must have the same number of dimensions."
+        if q_dim == 3:
+            q = q.reshape(q.shape[0], -1)
+            k = k.reshape(k.shape[0], -1)
+        orig_dtype = q.dtype
+        q = q.to(torch.float32)
+        k = k.to(torch.float32)
+        q_var = q.pow(2).mean(dim=-1, keepdim=True)
+        k_var = k.pow(2).mean(dim=-1, keepdim=True)
+        if q_norm.tp_world > 1:
+            qk_var = torch.cat([q_var, k_var], dim=-1)
+            qk_var = tensor_model_parallel_all_reduce(qk_var) / q_norm.tp_world
+            q_var, k_var = qk_var.chunk(2, dim=-1)
+        q = q * torch.rsqrt(q_var + q_norm.variance_epsilon) * q_norm.weight
+        k = k * torch.rsqrt(k_var + k_norm.variance_epsilon) * k_norm.weight
+        q = q.to(orig_dtype)
+        k = k.to(orig_dtype)
+        return q.view(orig_q_shape), k.view(orig_k_shape)
 
 
 class RMSNormGated(nn.Module):

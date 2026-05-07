@@ -212,21 +212,21 @@ jobs:
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
-            extra_args: "--tensor-parallel-size 1"
+            extra_args: "--tensor-parallel-size 1 --kv_cache_dtype fp8 --gpu-memory-utilization 0.4"
             env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
             accuracy_test_threshold: 0.38
             runner: linux-atom-mi35x-1
           - display_name: "Kimi-K2-Thinking-MXFP4 TP4"
             model_name: "Kimi-K2-Thinking-MXFP4"
             model_path: "amd/Kimi-K2-Thinking-MXFP4"
-            extra_args: "--tensor-parallel-size 4"
+            extra_args: "--tensor-parallel-size 4 --gpu-memory-utilization 0.7"
             env_vars: ""
             accuracy_test_threshold: 0.90
             runner: linux-atom-mi35x-4
           - display_name: "Qwen3.5-35B-A3B-FP8 TP2"
             model_name: "Qwen3.5-35B-A3B-FP8"
             model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
-            extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA"
+            extra_args: "--tensor-parallel-size 2 --attention-backend ROCM_AITER_FA --gpu-memory-utilization 0.7"
             # FIXME: Remove these temporary Qwen3.5 workarounds after the
             # aiter fix landed
             env_vars: |
