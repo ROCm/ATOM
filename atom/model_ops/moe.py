@@ -58,6 +58,23 @@ from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 
 
+def _use_generic_swiglu_mxfp4_layout() -> bool:
+    return os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1"
+
+
+def _shuffle_generic_mxfp4_weight_scale(
+    scale: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if scale is None:
+        return None
+    if scale.ndim < 2:
+        return fp4_utils.e8m0_shuffle(scale)
+    # Generic preshuffle packs the combined [expert, row] axis, not experts alone.
+    return fp4_utils.e8m0_shuffle(scale.reshape(-1, scale.shape[-1])).reshape(
+        scale.shape
+    )
+
+
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
 
@@ -868,18 +885,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .contiguous()
                 .view(e, n, -1)
             )
-            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
-            shuffled_w13_scale = shuffle_scale_a16w4(
-                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
-                self.num_experts,
-                True,
-            )
-            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
-            shuffled_w2_scale = shuffle_scale_a16w4(
-                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
-                self.num_experts,
-                False,
-            )
             if layer.w13_bias is not None:
                 layer.w13_bias.data = (
                     layer.w13_bias.data.view(-1, n // 2, 2)
@@ -887,18 +892,38 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     .contiguous()
                     .view(-1, n)
                 )
+
+            if _use_generic_swiglu_mxfp4_layout():
+                # New GPT-OSS A4W4 Swiglu path: use the same generic preshuffle
+                # layout for bf16 and fp4x2 activations.
+                shuffle_weights(layer.w13_weight, layer.w2_weight)
+                shuffled_w13_scale, shuffled_w2_scale = (
+                    _shuffle_generic_mxfp4_weight_scale(layer.w13_weight_scale),
+                    _shuffle_generic_mxfp4_weight_scale(layer.w2_weight_scale),
+                )
+            else:
+                # Legacy path: keep the original A16W4-style Swiglu layout.
+                layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+                shuffled_w13_scale = shuffle_scale_a16w4(
+                    layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                    self.num_experts,
+                    True,
+                )
+                layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+                shuffled_w2_scale = shuffle_scale_a16w4(
+                    layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                    self.num_experts,
+                    False,
+                )
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
             shuffle_weights(layer.w13_weight, layer.w2_weight)
-            s0, s1, _ = layer.w13_weight_scale.shape
-            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-            w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
-            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
-
-            s0, s1, _ = layer.w2_weight_scale.shape
-            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-            w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+            layer.w13_weight_scale.data = _shuffle_generic_mxfp4_weight_scale(
+                layer.w13_weight_scale
+            )
+            layer.w2_weight_scale.data = _shuffle_generic_mxfp4_weight_scale(
+                layer.w2_weight_scale
+            )
             return
         else:
             shuffle_weights(layer.w13_weight, layer.w2_weight)

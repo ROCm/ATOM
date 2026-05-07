@@ -271,7 +271,7 @@ jobs:
                   "model_path": "openai/gpt-oss-120b",
                   "extra_args": "--tensor-parallel-size 1",
                   "accuracy_test_threshold": 0.38,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1",
                   "runner": "linux-atom-mi35x-1",
               },
               {
@@ -280,7 +280,7 @@ jobs:
                   "model_path": "openai/gpt-oss-120b",
                   "extra_args": "--tensor-parallel-size 2",
                   "accuracy_test_threshold": 0.38,
-                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1",
                   "runner": "linux-atom-mi35x-4",
               },
               {
