@@ -352,7 +352,12 @@ class vllmAttentionMetadataBuilderMethods:
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
+        # The spec-decode draft path invalidates it between proposal steps when
+        # num_speculative_tokens > 1.
+        # Fall back to seq_lens - query_lens computed on already-CPU tensors.
         num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+        if num_computed_tokens_cpu is None:
+            num_computed_tokens_cpu = seq_lens - query_lens_cpu
 
         prefill_max_query_len = decode_max_query_len = (
             common_attn_metadata.max_query_len
