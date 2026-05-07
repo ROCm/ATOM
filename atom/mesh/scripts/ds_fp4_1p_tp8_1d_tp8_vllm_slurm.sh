@@ -301,6 +301,12 @@ RESULT_DIR="/workspace/benchmark_results"
 echo "[bench] model=${MODEL_PATH} endpoint=http://127.0.0.1:${ROUTER_PORT}"
 echo "[bench] ISL=[${ISL_LIST}] OSL=${OSL} CONC=[${CONC_LIST}] ratio=${RANDOM_RANGE_RATIO}"
 
+if [[ ! -d /tmp/sglang-benchmark/bench_serving ]]; then
+    rm -rf /tmp/sglang-benchmark
+    mkdir -p /tmp/sglang-benchmark
+    git clone --depth 1 https://github.com/kimbochen/bench_serving.git /tmp/sglang-benchmark/bench_serving
+fi
+
 mkdir -p "${RESULT_DIR}"
 
 IFS=',' read -ra ISLS <<< "${ISL_LIST}"
@@ -314,21 +320,24 @@ for ISL in "${ISLS[@]}"; do
         echo "[bench] ISL=${ISL} OSL=${OSL} CONC=${CONC}"
         echo "========================================="
 
-        vllm bench serve \
-            --host 127.0.0.1 \
-            --port "${ROUTER_PORT}" \
-            --model "${MODEL_PATH}" \
-            --dataset-name random \
-            --random-input-len "${ISL}" \
-            --random-output-len "${OSL}" \
+        PYTHONDONTWRITEBYTECODE=1 python /tmp/sglang-benchmark/bench_serving/benchmark_serving.py \
+            --model="${MODEL_PATH}" \
+            --backend=vllm \
+            --base-url="http://127.0.0.1:${ROUTER_PORT}" \
+            --dataset-name=random \
+            --random-input-len="${ISL}" \
+            --random-output-len="${OSL}" \
             --random-range-ratio "${RANDOM_RANGE_RATIO}" \
-            --num-prompts $(( CONC * 10 )) \
-            --max-concurrency "${CONC}" \
+            --num-prompts=$(( CONC * 10 )) \
+            --max-concurrency="${CONC}" \
             --trust-remote-code \
-            --percentile-metrics ttft,tpot,itl,e2el \
+            --num-warmups=$(( 2 * CONC )) \
+            --request-rate=inf \
+            --ignore-eos \
             --save-result \
-            --result-dir "${RESULT_DIR}" \
-            --result-filename "${RESULT_FILENAME}.json"
+            --percentile-metrics='ttft,tpot,itl,e2el' \
+            --result-dir="${RESULT_DIR}" \
+            --result-filename="${RESULT_FILENAME}.json"
     done
 done
 
