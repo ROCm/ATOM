@@ -196,6 +196,8 @@ def load_model_in_plugin_mode(
     prefix: str = "",
     weights_mapper: WeightsMapper | None = None,
     load_fused_expert_weights_fn=None,
+    spec_decode: bool = False,
+    hf_config_override: AutoConfig | None = None,
 ) -> set[str]:
 
     # during loading model, the outplace operation may consume more
@@ -216,17 +218,24 @@ def load_model_in_plugin_mode(
         model_name_or_path = config.plugin_config.model_config.model_path
 
     _empty_cache()
-    config_for_loading = (
-        config.hf_config.text_config
-        if hasattr(config.hf_config, "text_config")
-        else config.hf_config
-    )
+    if hf_config_override is not None:
+        config_for_loading = getattr(
+            hf_config_override, "hf_config", hf_config_override
+        )
+        if hasattr(config_for_loading, "text_config"):
+            config_for_loading = config_for_loading.text_config
+    else:
+        config_for_loading = (
+            config.hf_config.text_config
+            if hasattr(config.hf_config, "text_config")
+            else config.hf_config
+        )
     loaded_weights_record = load_model(
         model=model,
         model_name_or_path=model_name_or_path,
         hf_config=config_for_loading,
         load_dummy=config.load_dummy,
-        spec_decode=False,
+        spec_decode=spec_decode,
         prefix=prefix,
         is_plugin_mode=True,
         weights_mapper=weights_mapper,

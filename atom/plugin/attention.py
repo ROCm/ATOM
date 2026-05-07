@@ -1,4 +1,5 @@
 from typing import Generic, Optional, TypeVar
+import inspect
 import logging
 
 from dataclasses import dataclass
@@ -846,7 +847,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
             if query_start_loc_cpu.numel() > 1
             else 1
         )
-
         kv_indices_generate_triton(
             block_table_tensor,
             self.paged_kv_indices,
@@ -883,7 +883,12 @@ class vllmMLAAttentionMetadataBuilderMethods:
                 self.qo_indptr[1 + num_reqs :] = num_decode_tokens
         qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
-        ctx_mla_ps = self._set_mla_persistent_worker_buffers(num_reqs, qo_indptr, 1)
+        # MTP/spec decode can verify multiple decode tokens per request in one
+        # forward pass. The persistent MLA metadata must use the actual query
+        # length rather than assuming single-token decode.
+        ctx_mla_ps = self._set_mla_persistent_worker_buffers(
+            num_reqs, qo_indptr, max_qo_len
+        )
         self.mla_persistent_metadata.update(ctx_mla_ps)
 
         attn_metadata = AiterMLADecodeMetadataForPluginMode(
@@ -937,7 +942,6 @@ class vllmMLAAttentionMetadataBuilderMethods:
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
-
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
@@ -1448,6 +1452,16 @@ class vllmAiterMLABackendMethods:
         return (1, 0, 2, 3) if include_num_layers_dimension else (0, 1, 2)
 
 
+def _copy_public_attrs_without_binding(src_cls, dst_cls):
+    """Copy public attributes without descriptor rebinding."""
+    for name in dir(src_cls):
+        if name.startswith("_"):
+            continue
+        # Avoid getattr(), which binds classmethod to src_cls.
+        raw_attr = inspect.getattr_static(src_cls, name)
+        setattr(dst_cls, name, raw_attr)
+
+
 def AiterBackendDecoratorForPluginMode(cls):
     """
     Decorator for AiterBackend to add specific methods and attributes for plugin mode
@@ -1462,10 +1476,7 @@ def AiterBackendDecoratorForPluginMode(cls):
                 methods_cls = vllmAiterMLASparseBackendMethods
             else:
                 methods_cls = vllmAiterMLABackendMethods
-        for name in dir(methods_cls):
-            if name.startswith("_"):
-                continue
-            setattr(cls, name, getattr(methods_cls, name))
+        _copy_public_attrs_without_binding(methods_cls, cls)
     return cls
 
 
@@ -2140,16 +2151,27 @@ def create_mla_sparse_indexer_metadata_builder_init_method(base_class):
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(
             self.model_config.max_model_len
         )
-        self.num_speculative_tokens = (
-            self.vllm_config.speculative_config.num_speculative_tokens
-            if self.vllm_config.speculative_config
-            else 0
-        )
-        self.reorder_batch_threshold += self.num_speculative_tokens
+        # Determine if this builder is for draft model layers (MTP).
+        # Draft model layers have layer indices >= num_hidden_layers.
+        # The draft model itself does not do speculative decoding, so
+        # num_speculative_tokens should be 0 for its builders.
+        _is_draft_layer = False
+        if layer_names:
+            if len(layer_names) < config.model_config.hf_config.num_hidden_layers:
+                _is_draft_layer = True
+        if _is_draft_layer:
+            self.num_speculative_tokens = 0
+        else:
+            self.num_speculative_tokens = (
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config
+                else 0
+            )
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count
@@ -2216,6 +2238,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         parallel_config = config.parallel_config
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
@@ -2269,8 +2292,9 @@ def setup_mla_sparse_attn_metadata_builder_base_class_and_attributes(class_dict:
     generic_base = AttentionMetadataBuilder
     needs_generic = True
 
-    # align with vllm ROCMAiterMLASparseMetadataBuilder
-    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # The plugin sparse MLA path builds per-token ragged metadata, so uniform
+    # spec-decode batches from the main model can use full decode cudagraphs.
+    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_BATCH
     # For indexer metadata, not present in vllm sparse MLA
     class_dict["reorder_batch_threshold"] = 1
 
@@ -2291,12 +2315,32 @@ def unified_attention_with_output_base_for_plugin_mode(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    atom_config = get_current_atom_config()
+    current_atom_config = None
+    try:
+        from vllm.forward_context import (
+            get_forward_context as get_vllm_forward_context,
+            is_forward_context_available,
+        )
+
+        if is_forward_context_available():
+            current_atom_config = get_vllm_forward_context().additional_kwargs.get(
+                "atom_config"
+            )
+    except Exception:
+        # Keep backward compatibility when vLLM forward_context is unavailable.
+        current_atom_config = None
+
+    if current_atom_config is None:
+        current_atom_config = get_current_atom_config()
+    static_forward_context = (
+        current_atom_config.compilation_config.static_forward_context
+    )
+
     if use_mla:
         # raise NotImplementedError("MLA is not supported for plugin mode for now")
         kv_c_normed = k
         k_pe = v
-        self = atom_config.compilation_config.static_forward_context[layer_name]
+        self = static_forward_context[layer_name]
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
@@ -2315,7 +2359,7 @@ def unified_attention_with_output_base_for_plugin_mode(
         )
         return self.o_proj(output)
     else:
-        self = atom_config.compilation_config.static_forward_context[layer_name]
+        self = static_forward_context[layer_name]
         # here is the standard vllm attention impl interface
         # when using fusion, we need to pass the qkv and positions through the q,k,v
         # [watch out] accept_output_buffer must be False for plugin mode
