@@ -1407,6 +1407,8 @@ class DeepseekV2MLAAttention(nn.Module):
         layer_quant_type = quant_config.get_layer_quant_config(
             f"{prefix}.{q_a_proj_name}"
         ).quant_type
+        # Keep a plain int on the module so Dynamo does not guard on a
+        # QuantType enum attribute.
         layer_quant_type_value = (
             None if layer_quant_type is None else layer_quant_type.value
         )
@@ -1643,6 +1645,9 @@ class DeepseekV2MLAAttention(nn.Module):
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
                 if self.fuse_qknorm_quant:
                     if self.quant_dtype == dtypes.fp8:
+                        # AttnFP8 uses the custom ops directly here. Going through
+                        # _fuse_rmsnorm_quant's mark_trace wrapper can split the
+                        # compiled graph and re-enter the vLLM backend.
                         qknorm_quant_type = self.qknorm_quant_type
                         if qknorm_quant_type == QuantType.per_Token.value:
                             (
