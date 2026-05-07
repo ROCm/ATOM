@@ -1902,13 +1902,16 @@ class ModelRunner:
             return KVConnectorOutput(finished_sending=[], finished_recving=[])
         done_sending, done_recving = connector.get_finished()
 
-        fence_blocks = connector.get_finished_recv_blocks()
-        if fence_blocks:
-            with torch.cuda.stream(self.async_execute_stream):
-                self._gpu_memory_fence(fence_blocks)
-            event = torch.cuda.Event()
-            event.record(self.async_execute_stream)
-            self._fence_event = event
+        # GPU memory fence for RDMA-written KV blocks.
+        # Not needed when producer and consumer are in the same network partition
+        # fence_blocks = connector.get_finished_recv_blocks()
+        # if fence_blocks:
+        #     with torch.cuda.stream(self.async_execute_stream):
+        #         self._gpu_memory_fence(fence_blocks)
+        #     event = torch.cuda.Event()
+        #     event.record(self.async_execute_stream)
+        #     self._fence_event = event
+
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
         )
