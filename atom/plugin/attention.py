@@ -11,7 +11,6 @@ from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.config import get_current_atom_config
-
 from atom.utils.forward_context import Context, AttentionMetaData
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
@@ -2316,13 +2315,16 @@ def unified_attention_with_output_base_for_plugin_mode(
         return self.o_proj(output)
     else:
         self = atom_config.compilation_config.static_forward_context[layer_name]
+
         # here is the standard vllm attention impl interface
         # when using fusion, we need to pass the qkv and positions through the q,k,v
         # [watch out] accept_output_buffer must be False for plugin mode
         # because we don't want vllm to manipulate the q k v and output buffer
         # ATOM needs to handle all of the buffer here
+        # Positions for compiled unified_attention are provided via vLLM ForwardContext
+        # (atom_positions) in ATOMModelBase.forward, not via this Python arg.
         if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            output = self.attn(q, positions, qkv)
+            output = self.attn(q, k, v)
         else:
             # calculate the q and k with rotary embedding
             if self.rotary_emb is not None:
