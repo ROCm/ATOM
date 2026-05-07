@@ -170,7 +170,7 @@ def _fused_rms_fp8_group_quant_fake(
     res1: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     group_size: int = 128,
-    quant_type: Optional[QuantType] = None,
+    quant_type: Optional[int] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ) -> Tuple[
@@ -280,7 +280,7 @@ def _fused_rms_fp8_group_quant(
     res1: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     group_size: int = 128,
-    quant_type: Optional[QuantType] = None,
+    quant_type: Optional[int] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ) -> Tuple[
@@ -312,6 +312,8 @@ def _fused_rms_fp8_group_quant(
             quant_type = QuantType.per_1x32
         else:
             quant_type = QuantType.per_1x128
+    else:
+        quant_type = QuantType(quant_type)
 
     fused_qk_rmsnorm(
         q_out_quantized=out1_quantized,
@@ -398,10 +400,13 @@ def _fuse_rmsnorm_quant(
     shuffle: bool = True,
     scale_shuffle_padding: bool = False,
     group_size: int = 128,
-    quant_type: Optional[QuantType] = None,
+    quant_type: Optional[int] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ):
+    if quant_type is not None:
+        quant_type = QuantType(quant_type)
+
     if dtype_quant == dtypes.fp4x2:
         out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
             _fuse_rmsnorm_fp4_quant(
@@ -445,7 +450,7 @@ def _fuse_rmsnorm_quant(
                     res1,
                     dtype_quant=dtype_quant,
                     group_size=group_size,
-                    quant_type=quant_type,
+                    quant_type=quant_type.value if quant_type is not None else None,
                     output_unquantized_inp1=output_unquantized_inp1,
                     transpose_scale=transpose_scale,
                 )
@@ -1402,6 +1407,9 @@ class DeepseekV2MLAAttention(nn.Module):
         layer_quant_type = quant_config.get_layer_quant_config(
             f"{prefix}.{q_a_proj_name}"
         ).quant_type
+        layer_quant_type_value = (
+            None if layer_quant_type is None else layer_quant_type.value
+        )
         if layer_quant_dtype == dtypes.fp4x2:
             if not use_triton_gemm():
                 source_quant_dtype = None
@@ -1587,7 +1595,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
             ):
                 self.quant_dtype = layer_quant_dtype
-                self.qknorm_quant_type = layer_quant_type
+                self.qknorm_quant_type = layer_quant_type_value
                 self.fuse_qknorm_quant = True
 
     def forward(
@@ -1634,27 +1642,74 @@ class DeepseekV2MLAAttention(nn.Module):
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
                 if self.fuse_qknorm_quant:
-                    (
-                        (hidden_states_or_q_c, hidden_states_or_q_c_scale),
-                        _,
-                        kv_c_normed,
-                        _,
-                    ) = _fuse_rmsnorm_quant(
-                        q_c,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.eps,
-                        kv_c,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.eps,
-                        None,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=False,
-                        scale_shuffle_padding=False,
-                        group_size=128,
-                        quant_type=self.qknorm_quant_type,
-                        output_unquantized_inp1=False,
-                        transpose_scale=True,
-                    )
+                    if self.quant_dtype == dtypes.fp8:
+                        qknorm_quant_type = self.qknorm_quant_type
+                        if qknorm_quant_type == QuantType.per_Token.value:
+                            (
+                                hidden_states_or_q_c,
+                                hidden_states_or_q_c_scale,
+                                _,
+                                kv_c_normed,
+                                _,
+                            ) = _fused_rms_fp8_per_token_quant(
+                                q_c,
+                                self.q_a_layernorm.weight,
+                                self.q_a_layernorm.eps,
+                                kv_c,
+                                self.kv_a_layernorm.weight,
+                                self.kv_a_layernorm.eps,
+                                None,
+                                dtype_quant=self.quant_dtype,
+                                output_unquantized_inp1=False,
+                                transpose_scale=True,
+                            )
+                        else:
+                            (
+                                hidden_states_or_q_c,
+                                hidden_states_or_q_c_scale,
+                                _,
+                                kv_c_normed,
+                                _,
+                            ) = _fused_rms_fp8_group_quant(
+                                q_c,
+                                self.q_a_layernorm.weight,
+                                self.q_a_layernorm.eps,
+                                kv_c,
+                                self.kv_a_layernorm.weight,
+                                self.kv_a_layernorm.eps,
+                                None,
+                                dtype_quant=self.quant_dtype,
+                                group_size=128,
+                                quant_type=(
+                                    qknorm_quant_type
+                                    if qknorm_quant_type is not None
+                                    else None
+                                ),
+                                output_unquantized_inp1=False,
+                                transpose_scale=True,
+                            )
+                    else:
+                        (
+                            (hidden_states_or_q_c, hidden_states_or_q_c_scale),
+                            _,
+                            kv_c_normed,
+                            _,
+                        ) = _fuse_rmsnorm_quant(
+                            q_c,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.eps,
+                            kv_c,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.eps,
+                            None,
+                            dtype_quant=self.quant_dtype,
+                            shuffle=False,
+                            scale_shuffle_padding=False,
+                            group_size=128,
+                            quant_type=self.qknorm_quant_type,
+                            output_unquantized_inp1=False,
+                            transpose_scale=True,
+                        )
                 elif self.fuse_qknorm:
                     hidden_states_or_q_c, kv_c_normed = _fused_qk_rmsnorm(
                         q_c,
@@ -1746,7 +1801,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.input_norm_quant_type = (
             None
             if quant_config is None
-            else quant_config.get_layer_quant_config(prefix).quant_type
+            else quant_config.get_layer_quant_config(prefix).quant_type.value
         )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
