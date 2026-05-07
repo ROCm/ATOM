@@ -21,7 +21,6 @@ from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.decorators import mark_trace
-from atom.utils import envs
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
@@ -348,9 +347,8 @@ class RMSNormGated(nn.Module):
                 # Extract group size from quant type
                 if quant_type == QuantType.per_1x128:
                     self.group_size_quant = 128
-                    # preshuffle GEMM expects column-major x_scale;
-                    # non-preshuffle GEMM expects row-major x_scale
-                    self.transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+                    # per_1x128 blockscale GEMM requires transposed scale layout
+                    self.transpose_scale = True
                 elif quant_type == QuantType.per_1x32:
                     self.group_size_quant = 32
                     self.transpose_scale = False
@@ -549,59 +547,25 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # Use the aiter HIP fused_qk_rmsnorm_group_quant kernel in no-quant mode
-        # (q_out_scale=None) to perform Gemma RMSNorm + optional residual add.
-        # Same math as the Triton kernel: out = rmsnorm(x [+ residual]) * (1 + w),
-        # but executed by the aiter kernel for higher achieved bandwidth.
-        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+        from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 
-        ori_shape = x.shape
-        x_2d = x.view(-1, ori_shape[-1])
-
-        out = torch.empty_like(x_2d)
-        if residual is not None:
-            residual_2d = residual.view(-1, ori_shape[-1])
-            res_out = torch.empty_like(x_2d)
-        else:
-            residual_2d = None
-            res_out = None
-
-        fused_qk_rmsnorm_group_quant(
-            q=x_2d,
-            q_weight=self.weight.data,
-            q_epsilon=self.variance_epsilon,
-            q_out_unquantized=out,
-            q_res_out=res_out,
-            q_residual=residual_2d,
-            gemma_norm=True,
+        return gemma_rmsnorm_triton(
+            x, self.weight.data, self.variance_epsilon, residual
         )
-
-        out = out.view(ori_shape)
-        if residual is not None:
-            return out, res_out.view(ori_shape)
-        return out
 
     def _forward_fused_fp8(self, x, residual=None):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
         from aiter.utility.dtypes import fp8
 
-        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         group_size = 128
         M = x.shape[0]
         N = x.shape[1]
         num_groups = N // group_size
 
         out_fp8 = torch.empty((M, N), dtype=fp8, device=x.device)
-        if transpose_scale:
-            # column-major: allocate (num_groups, M) then view as (M, num_groups)
-            out_scale = torch.empty(
-                (num_groups, M), dtype=torch.float32, device=x.device
-            ).view(M, num_groups)
-        else:
-            # row-major: allocate (M, num_groups) directly
-            out_scale = torch.empty(
-                (M, num_groups), dtype=torch.float32, device=x.device
-            )
+        out_scale = torch.empty(
+            (num_groups, M), dtype=torch.float32, device=x.device
+        ).view(M, num_groups)
         out_bf16 = (
             torch.empty((M, N), dtype=x.dtype, device=x.device)
             if self.write_bf16
@@ -619,7 +583,7 @@ class GemmaRMSNorm(nn.Module):
             q_res_out=res_out,
             q_residual=residual,
             group_size=group_size,
-            transpose_scale=transpose_scale,
+            transpose_scale=True,
             gemma_norm=True,
         )
         if residual is not None:
