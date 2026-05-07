@@ -108,7 +108,8 @@ class AsyncIOProc:
             self.io_threads.append(t)
 
         runner_class = resolve_obj_by_qualname(runner_qualname)
-        self.runners: list[object] = [runner_class(rank, *args, **kwargs)]
+        self.runners: list[object] = []
+        self.runners = [runner_class(rank, *args, **kwargs)]
         self.busy_loop()
 
     def exit(self):

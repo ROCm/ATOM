@@ -234,22 +234,28 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
         
-        # Mamba/GDN recurrent state: per-request slot groups + equiv-block accounting
+        # Per-request cache: per-request slot pool + equiv-block accounting.
+        # Used by attention types whose state lives outside the paged KV pool
+        # (currently GDN recurrent state; future stateful attentions plug in
+        # via AttentionMetadataBuilder.compute_per_req_cache_bytes()).
         # Each slot group contains (1+num_spec) contiguous tensor indices.
-        # free_mamba_slots tracks group indices (0..num_groups-1).
-        self.mamba_equiv_per_req: int = getattr(config, "mamba_equiv_per_req", 0)
-        num_mamba_groups: int = getattr(config, "num_mamba_groups", 0)
-        self.free_mamba_slots: list[int] = list(range(num_mamba_groups))
-        # seq_id → list of accounting block_ids
-        self.mamba_accounting: dict[int, list[int]] = {}
+        self.per_req_cache_equiv_blocks: int = getattr(
+            config, "per_req_cache_equiv_blocks", 0
+        )
+        num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
+        self.free_per_req_cache_groups: list[int] = list(
+            range(num_per_req_cache_groups)
+        )
+        # seq_id → list of accounting block_ids (memory bookkeeping only)
+        self.per_req_cache_accounting: dict[int, list[int]] = {}
 ```
 
 The block pool is pre-allocated at startup. `free_block_ids` is a deque for O(1) pop/push, `used_block_ids` tracks active blocks, and `hash_to_block_id` maps content hashes to block IDs for prefix caching.
 
-**Mamba/GDN State Pools (Hybrid Models):** For models with Gated DeltaNet (GDN) recurrent attention (Qwen3-Next, Qwen3.5):
-- `free_mamba_slots` -- list of available per-request state slot indices (0 to `num_mamba_groups - 1`). Each slot holds one request's (or one speculative token's) recurrent state.
-- `mamba_accounting` -- maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and GDN state through dynamic competition; GDN memory is accounted for as block equivalents.
-- `mamba_equiv_per_req` -- number of KV cache block equivalents reserved per request for its GDN state.
+**Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (currently GDN: Qwen3-Next, Qwen3.5; future: DeepseekV4 ring buffer + compressor state, etc.):
+- `free_per_req_cache_groups` -- list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `1 + num_speculative_tokens` contiguous tensor slot indices.
+- `per_req_cache_accounting` -- maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.
+- `per_req_cache_equiv_blocks` -- number of KV cache block equivalents reserved per request for its per-request cache (computed from `AttentionMetadataBuilder.compute_per_req_cache_bytes() / block_bytes`).
 
 ### 3.3 Allocation (`allocate`)
 
@@ -268,11 +274,11 @@ def allocate(self, seq: Sequence):
    - **Cache miss:** Allocates from `free_block_ids[0]`.
 4. Full blocks are registered in `hash_to_block_id`.
 
-**Mamba/GDN state allocation (if `seq.mamba_enabled`):**
+**Per-request cache allocation (if `seq.has_per_req_cache`):**
 
-1. Allocates `mamba_equiv_per_req` accounting blocks from the free pool (for memory accounting).
-2. Stores these block IDs in `mamba_accounting[seq.id]` to track GDN memory usage.
-3. Pops one slot index from `free_mamba_slots` and assigns it to `seq.mamba_state_slot` (per-request state indexing).
+1. Allocates `per_req_cache_equiv_blocks` accounting blocks from the free pool (for memory accounting only).
+2. Stores these block IDs in `per_req_cache_accounting[seq.id]` to track per-request memory usage.
+3. Pops one slot group index from `free_per_req_cache_groups` and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors).
 
 ### 3.4 Deallocation (`deallocate`)
 
@@ -287,35 +293,39 @@ def deallocate(self, seq: Sequence):
             self._deallocate_block(block_id)
     seq.num_cached_tokens = 0
     seq.block_table.clear()
-    if seq.mamba_enabled and seq.mamba_state_slot >= 0:
-        for block_id in self.mamba_accounting.pop(seq.id, []):
+    if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
+        for block_id in self.per_req_cache_accounting.pop(seq.id, []):
             block = self.blocks[block_id]
             block.ref_count = 0  # accounting blocks bypass ref-counting
             self._deallocate_block(block_id)
-        self.free_mamba_slots.append(seq.mamba_state_slot)
-        seq.mamba_state_slot = -1
+        self.free_per_req_cache_groups.append(seq.per_req_cache_group)
+        seq.per_req_cache_group = -1
 ```
 
 **KV Cache deallocation:** Blocks are released in reverse order. Shared blocks (with `ref_count > 1` from prefix caching) are not freed until all referencing sequences release them.
 
-**Mamba/GDN state deallocation (if `seq.mamba_enabled`):**
+**Per-request cache deallocation (if `seq.has_per_req_cache`):**
 
-1. Releases all accounting blocks for this sequence from `mamba_accounting[seq.id]` directly (bypassing ref-counting, as they are internal to the accounting system).
-2. Returns the slot index `seq.mamba_state_slot` to `free_mamba_slots` for reuse.
-3. Clears `seq.mamba_state_slot` to `-1` to mark it as released.
+1. Releases all accounting blocks for this sequence from `per_req_cache_accounting[seq.id]` directly (bypassing ref-counting, as they are internal to the accounting system).
+2. Returns the slot group index `seq.per_req_cache_group` to `free_per_req_cache_groups` for reuse.
+3. Clears `seq.per_req_cache_group` to `-1` to mark it as released.
 
 ### 3.5 Can-Allocate and Can-Append Checks
 
 ```python
 def can_allocate(self, seq: Sequence) -> bool:
-    mamba_cost = self.mamba_equiv_per_req if seq.mamba_enabled else 0
-    mamba_slot_ok = (not seq.mamba_enabled) or len(self.free_mamba_slots) > 0
+    per_req_cache_cost = (
+        self.per_req_cache_equiv_blocks if seq.has_per_req_cache else 0
+    )
+    per_req_cache_slot_ok = (
+        (not seq.has_per_req_cache) or len(self.free_per_req_cache_groups) > 0
+    )
     if not self.enable_prefix_caching:
         return (
-            len(self.free_block_ids_set) >= seq.num_blocks + mamba_cost
-            and mamba_slot_ok
+            len(self.free_block_ids_set) >= seq.num_blocks + per_req_cache_cost
+            and per_req_cache_slot_ok
         )
-    # ... (prefix caching dry-run logic with mamba_cost included)
+    # ... (prefix caching dry-run logic with per_req_cache_cost included)
 
 def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
     seq_len = len(seq)
@@ -326,8 +336,8 @@ def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
 ```
 
 - `can_allocate` checks that:
-  - Enough free KV blocks exist for the full sequence (`seq.num_blocks + mamba_cost` accounting blocks for GDN state if hybrid).
-  - At least one mamba slot is available if the sequence has `mamba_enabled=True`.
+  - Enough free KV blocks exist for the full sequence (`seq.num_blocks + per_req_cache_cost` accounting blocks for per-request state if applicable).
+  - At least one per-request cache slot group is available if the sequence has `has_per_req_cache=True`.
   
 - `can_append` checks whether a decode step needs a new block. Calculates the required block count given `num_new_tokens` (typically `mtp_k + 1` for speculative decode) and returns whether enough free blocks remain.
 
@@ -566,8 +576,8 @@ class Sequence:
 | `num_prompt_tokens` | `int` | Number of prompt tokens (fixed at init) |
 | `num_cached_tokens` | `int` | Tokens served from prefix cache |
 | `block_table` | `list[int]` | Ordered list of block IDs assigned to this sequence |
-| `mamba_enabled` | `bool` | Whether the model uses Gated DeltaNet recurrent attention (set at sequence init) |
-| `mamba_state_slot` | `int` | Per-request GDN recurrent state slot index (assigned by BlockManager during allocation, `-1` if unallocated) |
+| `has_per_req_cache` | `bool` | Whether the model's attention type maintains per-request state outside the paged KV pool (set at sequence init; True for GDN-based models, future stateful attentions) |
+| `per_req_cache_group` | `int` | Per-request stateful-attention slot group index (assigned by BlockManager during allocation, `-1` if unallocated) |
 | `last_token` | `int` | Most recently appended token ID |
 | `temperature` | `float` | Sampling temperature (from `SamplingParams`) |
 | `max_tokens` | `int` | Max completion tokens (from `SamplingParams`, default 64) |

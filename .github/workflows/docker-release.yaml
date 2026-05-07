@@ -56,6 +56,9 @@ on:
         description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
         type: boolean
         default: true
+      oot_tag_suffix:
+        description: "Optional suffix appended to the OOT vLLM nightly tag for manual runs. Example: custom -> rocm/atom-dev:vllm-v<version>-nightly_<date>-custom. When set, vllm-latest is not updated."
+        default: ""
       build_sglang_image:
         description: "Build SGLang+ATOM image for manual runs (scheduled nightly runs always build SGLang+ATOM; default enabled so manual releases also publish SGLang+ATOM)"
         type: boolean
@@ -112,6 +115,7 @@ jobs:
           echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
           echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
           echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
+          echo "OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}"
           echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
           echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
           echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
@@ -211,13 +215,26 @@ jobs:
       - name: Push OOT Docker image
         if: ${{ success() && (inputs.only_release_oot == true || (inputs.only_release_sglang != true && (github.event_name == 'schedule' || inputs.build_oot_image == true))) }}
         run: |
+          set -euo pipefail
           VLLM_VER="${{ env.VLLM_VERSION }}"
+          OOT_TAG_SUFFIX="${{ inputs.oot_tag_suffix || '' }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
           OOT_LATEST_TAG="vllm-latest"
+          if [ -n "${OOT_TAG_SUFFIX}" ]; then
+            if [[ ! "${OOT_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid oot_tag_suffix '${OOT_TAG_SUFFIX}'. Allowed characters: letters, numbers, '.', '_' and '-'."
+              exit 1
+            fi
+            OOT_TAG="${OOT_TAG}-${OOT_TAG_SUFFIX}"
+          fi
           docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
           docker push rocm/atom-dev:${OOT_TAG}
-          docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
-          docker push rocm/atom-dev:${OOT_LATEST_TAG}
+          if [ -z "${OOT_TAG_SUFFIX}" ]; then
+            docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
+            docker push rocm/atom-dev:${OOT_LATEST_TAG}
+          else
+            echo "Custom OOT tag suffix '${OOT_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${OOT_LATEST_TAG} update."
+          fi
 
       - name: Build SGLang Docker image
         if: ${{ success() && (inputs.only_release_sglang == true || (inputs.only_release_oot != true && (github.event_name == 'schedule' || inputs.build_sglang_image == true))) }}

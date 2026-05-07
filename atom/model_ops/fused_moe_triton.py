@@ -52,9 +52,9 @@ def _swizzle_mxfp4(quant_tensor, scale):
     scale_layout_opts: dict[str, Any] = {}
     value_layout = StridedLayout
     if get_gfx() == "gfx950":
-        from triton_kernels.tensor_details.layout import GFX950MXScaleLayout
+        from triton_kernels.tensor_details.layout import CDNA4MXScaleLayout
 
-        scale_layout = GFX950MXScaleLayout
+        scale_layout = CDNA4MXScaleLayout
     else:
         scale_layout = StridedLayout
 
@@ -253,9 +253,13 @@ def triton_kernel_fused_experts(
     )
 
     # Standard SiLU/SwiGLU activation: silu(gate) * up
+    # With optional swiglu_limit clamping (V4: limit=10.0)
     raw_2d = raw_intermediate.view(M * topk, N)
     gate = raw_2d[:, :half_N]
     up = raw_2d[:, half_N:]
+    if swiglu_limit > 0:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(-swiglu_limit, swiglu_limit)
     intermediate_cache[0] = torch.nn.functional.silu(gate) * up
 
     matmul_ogs(

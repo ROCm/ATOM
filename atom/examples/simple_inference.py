@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import os
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
@@ -18,6 +19,12 @@ EngineArgs.add_cli_args(parser)
 # Add example-specific arguments
 parser.add_argument(
     "--temperature", type=float, default=0.6, help="temperature for sampling"
+)
+parser.add_argument(
+    "--max-tokens",
+    type=int,
+    default=300,
+    help="max sampled tokens per prompt",
 )
 
 
@@ -37,6 +44,8 @@ def main():
         "list all prime numbers within 100",
         "1+2+3=?",
         "如何在一个月内增肌10公斤",
+        "+".join([f"{i}-{i+1}" for i in range(1000)]) + "=? 最后结果是什么",
+        "+".join([f"{i}+{i+1}" for i in range(1500)]) + "=? 最后结果是什么",
     ]
     args = parser.parse_args()
     # Generate power of 2 sizes for CUDA graph: [1, 2, 4, 8, ...]
@@ -48,17 +57,45 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=256)
+    sampling_params = SamplingParams(
+        temperature=args.temperature, max_tokens=args.max_tokens
+    )
 
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
-        )
-        for prompt in prompts
-    ]
+    # Apply chat template. DeepSeek-V4 ships without a HuggingFace
+    # chat_template; use its custom encoding_dsv4.py if available.
+    if getattr(tokenizer, "chat_template", None):
+        prompts = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for prompt in prompts
+        ]
+    else:
+        try:
+            import importlib.util
+
+            enc_path = os.path.join(args.model, "encoding", "encoding_dsv4.py")
+            if os.path.exists(enc_path):
+                spec = importlib.util.spec_from_file_location("encoding_dsv4", enc_path)
+                enc_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(enc_mod)
+                prompts = [
+                    enc_mod.encode_messages(
+                        [{"role": "user", "content": p}], thinking_mode="chat"
+                    )
+                    for p in prompts
+                ]
+                print(
+                    f"  (applied V4 encoding_dsv4, prompt tokens: "
+                    f"{[len(tokenizer.encode(p)) for p in prompts]})"
+                )
+            else:
+                print("  (tokenizer has no chat_template — feeding raw prompts as-is)")
+        except Exception as e:
+            print(f"  (V4 encoding failed: {e} — feeding raw prompts as-is)")
     print("This is prompts:", prompts)
     # print("Warming up...")
     # _ = llm.generate(["warmup"], sampling_params)

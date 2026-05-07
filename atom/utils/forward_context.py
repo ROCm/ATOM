@@ -143,6 +143,11 @@ class Context:
     batch_size: int = 0
     graph_bs: int = 0
     is_draft: bool = False
+    # Optional flat token ids for the current forward. Read by callbacks
+    # invoked inside Dynamo-opaque custom ops (e.g. V4 MoE hash routing)
+    # that need the token ids but cannot receive them as a function arg
+    # (the op signature is fixed by the consumer's plugin contract).
+    input_ids: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -152,6 +157,7 @@ class Context:
         batch_size: int = 0,
         graph_bs: int = 0,
         is_draft: bool = False,
+        input_ids: Optional[torch.Tensor] = None,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -159,6 +165,7 @@ class Context:
         self.batch_size = batch_size
         self.graph_bs = graph_bs
         self.is_draft = is_draft
+        self.input_ids = input_ids
 
 
 @dataclass
