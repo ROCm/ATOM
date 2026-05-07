@@ -302,8 +302,6 @@ def _fused_rms_fp8_group_quant(
         )
     )
 
-    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm
-
     if quant_type is None:
         if group_size == 32:
             quant_type = QuantType.per_1x32
@@ -363,8 +361,6 @@ def _fused_rms_fp8_per_token_quant(
             transpose_scale,
         )
     )
-
-    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm
 
     fused_qk_rmsnorm(
         q_out_quantized=out1_quantized,
