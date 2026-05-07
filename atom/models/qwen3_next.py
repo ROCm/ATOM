@@ -34,6 +34,7 @@ from atom.model_ops.split_chunk import (
     fused_split_chunk_qwen_next_qkvzba,
 )
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
+from atom.model_ops.triton_mrope import try_mrope_qk_fused
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -405,7 +406,6 @@ class Qwen3NextAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        output: torch.Tensor,
         hidden_states: torch.Tensor,
         x_scale=None,
     ) -> torch.Tensor:
@@ -431,7 +431,19 @@ class Qwen3NextAttention(nn.Module):
             )
         else:
             q, k = self.qk_norm(q, k)
-            q, k = self.rotary_emb(positions, q, k)
+            fused_qk = try_mrope_qk_fused(
+                self.rotary_emb,
+                positions,
+                q,
+                k,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            if fused_qk is None:
+                q, k = self.rotary_emb(positions, q, k)
+            else:
+                q, k = fused_qk
             attn_output = self.attn(q, k, v)
 
         if self.use_fused_sigmoid_mul_quant:
@@ -440,13 +452,13 @@ class Qwen3NextAttention(nn.Module):
             )
 
             attn_output, attn_scale = fused_sigmoid_mul_fp8_quant(attn_output, gate)
-            output[:] = self.o_proj(attn_output, x_scale=attn_scale)
+            output = self.o_proj(attn_output, x_scale=attn_scale)
         elif self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
-            output[:] = self.o_proj(attn_output)
+            output = self.o_proj(attn_output)
         else:
-            output[:] = self.o_proj(attn_output)
+            output = self.o_proj(attn_output)
 
         return output
 
@@ -714,7 +726,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
         x_fp8=None,
         x_scale=None,
     ):
@@ -724,8 +735,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        num_tokens = hidden_states.size(0)
-
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
@@ -771,7 +780,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # ============================================================
 
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
-        output[:num_tokens] = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        output = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        return output
 
 
 if is_vllm():
@@ -963,28 +973,22 @@ class Qwen3NextDecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        self_attention_output = torch.empty(
-            hidden_states.shape, dtype=residual.dtype, device=hidden_states.device
-        )
         if self.layer_type == "linear_attention":
-            self.linear_attn(
+            hidden_states = self.linear_attn(
                 hidden_states=(
                     hidden_bf16 if hidden_bf16 is not None else hidden_states
                 ),
-                output=self_attention_output,
                 x_fp8=hidden_states if x_scale is not None else None,
                 x_scale=x_scale,
             )
         elif self.layer_type == "full_attention":
-            self.self_attn(
+            hidden_states = self.self_attn(
                 hidden_states=hidden_states,
-                output=self_attention_output,
                 positions=positions,
                 x_scale=x_scale,
             )
         else:
             raise ValueError("Invalid layer_type")
-        hidden_states = self_attention_output
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
