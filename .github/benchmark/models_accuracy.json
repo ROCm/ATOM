@@ -111,7 +111,7 @@
   {
     "model_name": "Qwen3-Next-80B-A3B-Thinking",
     "model_path": "Qwen/Qwen3-Next-80B-A3B-Thinking",
-    "extraArgs": "-tp 8",
+    "extraArgs": "-tp 8 --kv_cache_dtype fp8",
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
