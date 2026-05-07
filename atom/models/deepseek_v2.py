@@ -75,6 +75,11 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
+# shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
+# `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.plugin.attention_mla_sparse import (
@@ -767,42 +772,6 @@ class DeepseekV2MLP(nn.Module):
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
-
-
-def maybe_dual_stream_forward(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    """Dual-stream MoE forward: shared experts on alt stream, routed on main."""
-    atom_config = get_current_atom_config()
-    self = atom_config.compilation_config.static_forward_context[layer_name]
-    DUAL_STREAM_TOKEN_THRESHOLD = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    num_tokens, hidden_dim = hidden_states.shape
-    if (
-        self._use_dual_stream
-        and num_tokens > 0
-        and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
-        # and not get_forward_context().context.is_prefill
-    ):
-        return self.dual_stream_moe_forward(hidden_states)
-    else:
-        return self.single_stream_moe_forward(hidden_states)
-
-
-def maybe_dual_stream_forward_fake(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="maybe_dual_stream_forward",
-    op_func=maybe_dual_stream_forward,
-    mutates_args=["hidden_states"],
-    fake_impl=maybe_dual_stream_forward_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
 
 
 class DeepseekV2MoE(nn.Module):

@@ -39,6 +39,10 @@ on:
         description: "Kimi-K2-Thinking-MXFP4 TP8"
         type: boolean
         default: false
+      kimi-k2-5-mxfp4-tp2:
+        description: "Kimi-K2.5-MXFP4 TP2"
+        type: boolean
+        default: false
       kimi-k2-5-mxfp4-tp4:
         description: "Kimi-K2.5-MXFP4 TP4"
         type: boolean
@@ -71,6 +75,10 @@ on:
         description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1"
         type: boolean
         default: false
+      qwen3-next-80b-a3b-instruct-fp8-tp2:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP2"
+        type: boolean
+        default: false
       qwen3-next-80b-a3b-instruct-fp8-tp4:
         description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
         type: boolean
@@ -94,8 +102,123 @@ on:
         default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
 
 jobs:
+  wait-for-older-manual-runs:
+    name: Wait for older manual benchmark runs
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for older workflow_dispatch runs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MAX_WAIT_MINUTES: "2880"
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          from datetime import datetime
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          if event != "schedule":
+              print("Not a scheduled run; skipping manual-run wait gate.")
+              raise SystemExit(0)
+
+          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ.get("GITHUB_TOKEN", "")
+          max_wait_minutes = int(os.environ.get("MAX_WAIT_MINUTES", "2880"))
+          pending_statuses = {"queued", "in_progress", "waiting", "pending"}
+
+          def api_json(url: str) -> dict:
+              request = Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "User-Agent": "atom-vllm-benchmark-manual-priority-gate",
+                  },
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except HTTPError as exc:
+                  detail = exc.read().decode("utf-8", errors="replace").strip()
+                  raise RuntimeError(
+                      f"GitHub API returned HTTP {exc.code} while reading workflow runs: {detail}"
+                  ) from exc
+              except URLError as exc:
+                  raise RuntimeError(
+                      f"Failed to reach GitHub API while reading workflow runs: {exc}"
+                  ) from exc
+
+          current_run = api_json(f"{api_url}/repos/{repository}/actions/runs/{run_id}")
+          current_created_at = datetime.fromisoformat(
+              current_run["created_at"].replace("Z", "+00:00")
+          )
+
+          print(
+              f"Scheduled run #{run_id} created at {current_run['created_at']} will wait for older manual runs."
+          )
+
+          deadline = time.time() + max_wait_minutes * 60
+          poll_seconds = 300
+
+          while True:
+              runs = api_json(
+                  f"{api_url}/repos/{repository}/actions/workflows/atom-vllm-benchmark.yaml/runs"
+                  "?event=workflow_dispatch&per_page=100"
+              ).get("workflow_runs", [])
+
+              blockers = []
+              for run in runs:
+                  if str(run.get("id")) == str(run_id):
+                      continue
+                  status = run.get("status")
+                  created_at = run.get("created_at")
+                  if status not in pending_statuses or not created_at:
+                      continue
+                  run_created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                  if run_created_at >= current_created_at:
+                      continue
+                  blockers.append(
+                      (
+                          run_created_at,
+                          run.get("id"),
+                          status,
+                          run.get("head_branch", ""),
+                          run.get("display_title") or run.get("name", ""),
+                      )
+                  )
+
+              blockers.sort()
+              if not blockers:
+                  print("No older manual ATOM vLLM Benchmark runs are queued or in progress.")
+                  break
+
+              print("Waiting for older manual benchmark runs to finish before starting scheduled benchmarks:")
+              for created_at, blocker_id, status, branch, title in blockers:
+                  print(
+                      f" - run #{blocker_id} status={status} branch={branch} created_at={created_at.isoformat()} title={title}"
+                  )
+
+              if time.time() >= deadline:
+                  raise SystemExit(
+                      f"Timed out after {max_wait_minutes} minutes waiting for older manual benchmark runs."
+                  )
+
+              print(f"Sleeping {poll_seconds} seconds before re-checking blockers...")
+              time.sleep(poll_seconds)
+          PY
+
   resolve-atom-source:
     name: Resolve ATOM benchmark source
+    needs: [wait-for-older-manual-runs]
     runs-on: ubuntu-latest
     outputs:
       atom_repository: ${{ steps.resolve.outputs.atom_repository }}
@@ -277,6 +400,7 @@ jobs:
 
   parse-param-lists:
     name: Parse parameter lists
+    needs: [wait-for-older-manual-runs]
     runs-on: ubuntu-latest
     outputs:
       matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
@@ -316,6 +440,7 @@ jobs:
 
   load-models:
     name: Load OOT model configs
+    needs: [wait-for-older-manual-runs]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -335,6 +460,7 @@ jobs:
           ENABLE_GLM_5_1_FP8_TP8: ${{ inputs.glm-5-1-fp8-tp8 }}
           ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
           ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
+          ENABLE_KIMI_K25_TP2: ${{ inputs.kimi-k2-5-mxfp4-tp2 }}
           ENABLE_KIMI_K25_TP4: ${{ inputs.kimi-k2-5-mxfp4-tp4 }}
           ENABLE_KIMI_K25_TP8: ${{ inputs.kimi-k2-5-mxfp4-tp8 }}
           ENABLE_QWEN3_5_397B_A17B_TP4: ${{ inputs.qwen3-5-397b-a17b-tp4 }}
@@ -343,6 +469,7 @@ jobs:
           ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
           ENABLE_QWEN3_5_397B_A17B_MXFP4: ${{ inputs.qwen3-5-397b-a17b-mxfp4 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}
+          ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP2: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp2 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -368,6 +495,7 @@ jobs:
               "glm-5-1-fp8-tp8": os.environ.get("ENABLE_GLM_5_1_FP8_TP8", "").lower() == "true",
               "kimi-k2-thinking-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K2_TP4", "").lower() == "true",
               "kimi-k2-thinking-mxfp4-tp8": os.environ.get("ENABLE_KIMI_K2_TP8", "").lower() == "true",
+              "kimi-k25-mxfp4-tp2": os.environ.get("ENABLE_KIMI_K25_TP2", "").lower() == "true",
               "kimi-k25-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K25_TP4", "").lower() == "true",
               "kimi-k25-mxfp4-tp8": os.environ.get("ENABLE_KIMI_K25_TP8", "").lower() == "true",
               "qwen3-5-397b-a17b-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_TP4", "").lower() == "true",
@@ -376,6 +504,7 @@ jobs:
               "qwen3-5-397b-a17b-fp8": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8", "").lower() == "true",
               "qwen3-5-397b-a17b-mxfp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_MXFP4", "").lower() == "true",
               "qwen3-next-80b-a3b-instruct-fp8-tp1": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1", "").lower() == "true",
+              "qwen3-next-80b-a3b-instruct-fp8-tp2": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP2", "").lower() == "true",
               "qwen3-next-80b-a3b-instruct-fp8-tp4": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4", "").lower() == "true",
           }
 
@@ -694,6 +823,7 @@ jobs:
             glm-5-1-fp8-tp8) echo "enabled=${{ inputs.glm-5-1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            kimi-k25-mxfp4-tp2) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-tp4 }}" >> "$GITHUB_OUTPUT" ;;
@@ -702,6 +832,7 @@ jobs:
             qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-5-397b-a17b-mxfp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-next-80b-a3b-instruct-fp8-tp1) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}" >> "$GITHUB_OUTPUT" ;;
+            qwen3-next-80b-a3b-instruct-fp8-tp2) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-next-80b-a3b-instruct-fp8-tp4) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
@@ -829,17 +960,7 @@ jobs:
       - name: Collect GPU info (inside container)
         if: steps.check.outputs.enabled == 'true'
         id: gpu-info
-        run: |
-          GPU_NAME=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
-          if [ -z "$GPU_NAME" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; then
-            GPU_NAME=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" rocminfo 2>/dev/null | grep -A1 "Uuid:.*GPU-" | grep "Marketing Name" | head -1 | sed 's/.*:\s*//' | xargs || echo "")
-          fi
-          GPU_VRAM_GB=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
-          ROCM_VERSION=$($CONTAINER_ENGINE exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
-          echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
-          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
-          echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
-          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" "$CONTAINER_ENGINE" "${{ matrix.model.runner }}"
 
       - name: Download model if needed
         if: steps.check.outputs.enabled == 'true'

@@ -322,7 +322,12 @@ RUN echo "========== [Parallel] Building Triton ==========" && \
     cd /triton-test && \
     pip install -r python/requirements.txt && \
     pip install filecheck && \
-    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
+    MAX_JOBS=64 pip --retries=10 --default-timeout=60 install . && \
+    # Companion `triton_kernels` package (pure-Python). Required by ATOM when
+    # `ATOM_USE_TRITON_MOE=1` (e.g. DeepSeek-V4 launch path). Lives under
+    # python/triton_kernels in the same ROCm/triton checkout.
+    pip install ./python/triton_kernels && \
+    python -c "import triton_kernels; print(f'triton_kernels: {triton_kernels.__file__}')"
 
 # --------------------------------------------------------------------
 # Stage 4: Aiter — parallel
@@ -365,10 +370,15 @@ RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
 
 # Triton: copy package from build stage into current venv
 # Use RUN --mount to avoid COPY glob issues, and preserve mori already in venv
+# Also copy the companion `triton_kernels` package (pure-Python, built in the
+# same stage) — required by ATOM_USE_TRITON_MOE=1 model paths.
 RUN --mount=from=build_triton,source=/opt/venv/lib/python3.12/site-packages,target=/triton-pkgs \
     cp -a /triton-pkgs/triton /opt/venv/lib/python3.12/site-packages/ && \
     cp -a /triton-pkgs/triton-*.dist-info /opt/venv/lib/python3.12/site-packages/ && \
-    pip show triton
+    cp -a /triton-pkgs/triton_kernels /opt/venv/lib/python3.12/site-packages/ && \
+    cp -a /triton-pkgs/triton_kernels-*.dist-info /opt/venv/lib/python3.12/site-packages/ && \
+    pip show triton triton_kernels && \
+    python -c "import triton, triton_kernels; print(f'triton {triton.__version__}; triton_kernels {triton_kernels.__file__}')"
 
 # Aiter: copy compiled source tree + re-register editable install
 # (pip install -e creates egg-link automatically, no need to COPY them)
