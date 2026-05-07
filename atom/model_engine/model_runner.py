@@ -1400,7 +1400,7 @@ class ModelRunner:
         )
         for name, value in main_kv.items():
             setattr(self, name, value)
-        
+
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
         # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
