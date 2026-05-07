@@ -39,7 +39,14 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.fusions.fused_clamp_act_mul_quant import (
+    fused_clamp_act_mul_fp8_group_quant,
+)
+from aiter.ops.triton.fusions.fused_reduce_q_norm_qk_rope_swa_write import (
+    fused_reduce_q_norm_qk_rope_swa_write,
+)
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import (
     Config,
     LayerQuantConfig,
@@ -67,6 +74,7 @@ from atom.model_ops.sparse_attn_v4 import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.utils import envs
+from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
 # (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
@@ -111,6 +119,9 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 # forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
 _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
+# Fused-kernel switches. Default off; flip via env to A/B against the eager path.
+_V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -118,6 +129,92 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
+
+
+def _fused_q_norm_qk_rope_swa_write_fake(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    eps: float,
+    win: int,
+    swa_write_indices: Optional[torch.Tensor] = None,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    M = q.shape[0]
+    return torch.empty(
+        (M, n_local_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_fused_q_norm_qk_rope_swa_write_fake)
+def fused_q_norm_qk_rope_swa_write(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    n_local_heads: int,
+    head_dim: int,
+    rope_head_dim: int,
+    eps: float,
+    win: int,
+    swa_write_indices: Optional[torch.Tensor] = None,
+    batch_id_per_token: Optional[torch.Tensor] = None,
+    state_slot_mapping: Optional[torch.Tensor] = None,
+    swa_kv: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw + RoPE on
+    q/kv tail (+ SWA write) in a single triton kernel.
+
+    `kv` must already be kv_norm-applied; the kernel does not weight-norm kv.
+    `kv` is RoPE-mutated in place. When all SWA tensors are provided, the
+    kernel also writes the windowed kv into `swa_kv`; the caller must then
+    skip the standalone `swa_write` for those rows.
+    """
+    M = q.shape[0]
+    q_out = torch.empty(
+        (M, n_local_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+    fused_reduce_q_norm_qk_rope_swa_write(
+        q,
+        kv,
+        None,
+        eps,
+        rope_head_dim,
+        cos_cache,
+        sin_cache,
+        positions,
+        q_out=q_out,
+        is_neox=False,
+        dtype=torch.bfloat16,
+        write_indices=swa_write_indices if M <= 64 else None,
+        batch_id_per_token=batch_id_per_token if M <= 64 else None,
+        state_slot_mapping=state_slot_mapping if M <= 64 else None,
+        swa_kv=swa_kv if M <= 64 else None,
+        win=win,
+    )
+    if M > 64:
+        swa_write(
+            kv,
+            swa_write_indices,
+            positions,
+            batch_id_per_token,
+            state_slot_mapping,
+            swa_kv,
+            win,
+        )
+    return q_out
 
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1388,25 @@ class DeepseekV4Attention(nn.Module):
             self.indexer.rotary_emb = self.rotary_emb
             self.indexer.compressor.rotary_emb = self.rotary_emb
 
+        # Switch: route wq_b GEMM + per-head RMSNorm + Q/KV RoPE-tail through
+        # the aiter fused triton kernel. SWA write stays as a separate call —
+        # the fused kernel's SWA path uses `write_indices[pid_m]` as the kv row
+        # to RoPE on, which is incompatible with ATOM's sentinel-padded
+        # `swa_write_indices` (would OOB on -1 entries). HAS_SWA=False makes
+        # the kernel iterate over all M rows for kv RoPE, matching the eager
+        # path.
+        self.use_fused_q_norm_qk_rope_swa_write = _V4_USE_TRITON_FUSION
+        self.fuse_qknorm_quant = False
+        self.quant_dtype = None
+        quant_dtype = qc.get_layer_quant_config(
+            f"{p}.wq_b"
+        ).quant_dtype
+        if qc is not None and ENABLE_DS_QKNORM_QUANT_FUSION and not _V4_FORCE_UE8M0_QUANT:
+            self.quant_dtype = dtypes.fp8
+            if quant_dtype == dtypes.fp8 or quant_dtype == dtypes.fp4x2:
+                self.quant_dtype = quant_dtype
+                self.fuse_qknorm_quant = True
+
     def process_weights_after_loading(self) -> None:
         """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
 
@@ -1370,28 +1486,15 @@ class DeepseekV4Attention(nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        # ----- Batched ops on full flat tensors -----
-        # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
-        # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
-        # quantization. EXPERIMENT only.
-        if _V4_FORCE_UE8M0_QUANT:
-            x = x.clone()
-            act_quant_inplace(x, 128, "ue8m0")
-        # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
-        qkv_a = self.wqkv_a(x)
-        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
-        if _V4_FORCE_UE8M0_QUANT:
-            qr = qr.clone()
-            act_quant_inplace(qr, 128, "ue8m0")
-        q = self.wq_b(qr).view(num_tokens, self.n_local_heads, self.head_dim)
-        q = _rmsnorm_nw(q, self.eps, self.head_dim)
-        # q [S, H, D] / kv [S, head_dim] — rotary_emb internally unsqueezes
-        # to (1, num_tokens, ...) for aiter's per-position rope kernel.
-        kv = self.kv_norm(kv_pre)
-        self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
-        if _V4_USE_REF_QUANT:
-            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+        # Idempotent one-time plumb of rotary_emb into compressor / indexer
+        # (and the indexer's inner compressor). `rotary_emb` is set by the
+        # owning layer after __init__, so this can't move into __init__.
+        if self.compress_ratio and self.compressor.rotary_emb is None:
+            self.compressor.rotary_emb = self.rotary_emb
+            if self.indexer is not None:
+                self.indexer.rotary_emb = self.rotary_emb
+                self.indexer.compressor.rotary_emb = self.rotary_emb
+
         # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
         # All per-fwd state read once. Production prepare_decode/prefill
         # always populates these; warmup goes through the same path
@@ -1405,6 +1508,88 @@ class DeepseekV4Attention(nn.Module):
         v4_batch_id_per_token = attn_md.batch_id_per_token
         block_tables_gpu = attn_md.block_tables
         state_slot_mapping = attn_md.state_slot_mapping
+        
+        # ----- Batched ops on full flat tensors -----
+        # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
+        # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
+        # quantization. EXPERIMENT only.
+        if _V4_FORCE_UE8M0_QUANT:
+            x = x.clone()
+            act_quant_inplace(x, 128, "ue8m0")
+        # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
+        qkv_a = self.wqkv_a(x)
+        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        if self.fuse_qknorm_quant:
+            (
+                (qr_quant, qr_scale),
+                qr,
+                kv,
+                _,
+            ) = _fuse_rmsnorm_quant(
+                q_lora,
+                self.q_norm.weight,
+                self.q_norm.eps,
+                kv_pre,
+                self.kv_norm.weight,
+                self.kv_norm.eps,
+                None,
+                dtype_quant=self.quant_dtype,
+                shuffle=False,
+                scale_shuffle_padding=False,
+                group_size=128,
+                output_unquantized_inp1=True,
+                transpose_scale=True,
+            )
+            q = self.wq_b(qr_quant, x_scale=qr_scale)
+        else:
+            qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
+            kv = self.kv_norm(kv_pre)
+            if _V4_FORCE_UE8M0_QUANT:
+                qr = qr.clone()
+                act_quant_inplace(qr, 128, "ue8m0")
+            q = self.wq_b(qr)
+            
+        if attn_md.is_pure_decode and self.use_fused_q_norm_qk_rope_swa_write:
+            # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
+            # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
+            # kernel. KV RMSNorm stays out (kernel doesn't apply weighted norm
+            # to kv); the standalone swa_write below is gated off when this
+            # path runs since the kernel already wrote the window slots.
+            cos_cache, sin_cache = self.rotary_emb._caches(x.device)
+            if swa_write_indices is not None:
+                write_indices = swa_write_indices
+                batch_id = v4_batch_id_per_token
+                slot_map = state_slot_mapping
+                swa_kv_buf = self.swa_kv
+            else:
+                write_indices = None
+                batch_id = None
+                slot_map = None
+                swa_kv_buf = None
+            q = fused_q_norm_qk_rope_swa_write(
+                q,
+                kv,
+                cos_cache,
+                sin_cache,
+                positions,
+                self.n_local_heads,
+                self.head_dim,
+                rd,
+                self.eps,
+                win,
+                swa_write_indices=write_indices,
+                batch_id_per_token=batch_id,
+                state_slot_mapping=slot_map,
+                swa_kv=swa_kv_buf,
+            )
+        else:
+            q = q.view(num_tokens, self.n_local_heads, self.head_dim)
+            q = _rmsnorm_nw(q, self.eps, self.head_dim)
+            # q [S, H, D] / kv [S, head_dim] — rotary_emb internally reshapes to
+            # (1, num_tokens, -1, rotary_dim) so explicit batch dim is unnecessary.
+            self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
+        if _V4_USE_REF_QUANT:
+            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
         # ===== Batched compressor + Indexer (ONCE per layer) =====
         # State cache reset on fresh prefill is redundant: SWA's start_pos==0
@@ -1468,15 +1653,16 @@ class DeepseekV4Attention(nn.Module):
         #   ring read; swa_write order is irrelevant in that subcase.
         q_sa = q.contiguous()
         if attn_md.is_pure_decode:
-            swa_write(
-                kv,
-                swa_write_indices,
-                positions,
-                v4_batch_id_per_token,
-                state_slot_mapping,
-                self.swa_kv,
-                win,
-            )
+            if not self.use_fused_q_norm_qk_rope_swa_write:
+                swa_write(
+                    kv,
+                    swa_write_indices,
+                    positions,
+                    v4_batch_id_per_token,
+                    state_slot_mapping,
+                    self.swa_kv,
+                    win,
+                )
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
@@ -1639,6 +1825,10 @@ class Expert(nn.Module):
             prefix=f"{prefix}.w2",
         )
         self.swiglu_limit = swiglu_limit
+        # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
+        # quant through a single aiter triton kernel. The fused kernel emits
+        # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
+        self.use_fused_clamp_act_mul_quant = _V4_USE_TRITON_FUSION
 
     def forward(
         self,
@@ -1648,7 +1838,20 @@ class Expert(nn.Module):
         dtype = x.dtype
         # Single fused GEMM, then chunk(2) along last dim so TP-sharded per-rank
         # output (inter_dim_per_tp * 2) is split correctly regardless of tp_size.
-        combined = self.gate_up_proj(x).float()  # [num_tokens, 2*inter_dim_per_tp]
+        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp] BF16
+        
+        if self.use_fused_clamp_act_mul_quant:
+            x_fp8, x_scale = fused_clamp_act_mul_fp8_group_quant(
+                combined,
+                swiglu_limit=self.swiglu_limit,
+                activation="silu",
+                weights=weights,
+                dtype_quant=dtypes.fp8,
+                transpose_scale=True,
+            )
+            return self.w2(x_fp8, x_scale=x_scale)
+
+        combined = combined.float()
         gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, inter_dim_per_tp]
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
