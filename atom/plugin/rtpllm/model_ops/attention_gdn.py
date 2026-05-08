@@ -7,6 +7,9 @@ from typing import Any
 
 import torch
 
+from atom.plugin.rtpllm.utils.forward_context import RTPForwardContext
+from atom.plugin.rtpllm.utils.tensor_dump import dump_tensor as dump_atom_tensor
+
 logger = logging.getLogger("atom.plugin.rtpllm.model_ops.attention_gdn")
 
 _PATCHED = False
@@ -68,19 +71,24 @@ def apply_attention_gdn_rtpllm_patch() -> None:
             fwd_ctx.attn_metadata, layer_name
         )
         if gdn_metadata is None:
-            return core_attn_out
+            raise RuntimeError(
+                "RTP plugin missing GDN metadata in forward context; "
+                "fallback/placeholder metadata is not allowed."
+            )
 
         gdn_cache = fwd_ctx.kv_cache_data
         if gdn_cache is None:
-            return core_attn_out
+            raise RuntimeError(
+                "RTP plugin missing kv_cache_data in forward context; "
+                "fallback/placeholder cache is not allowed."
+            )
 
         layer_cache = gdn_cache.get(f"layer_{self.layer_num}")
         if layer_cache is None:
-            logger.warning(
-                "Missing GDN cache for layer_%s, skip GDN attention path",
-                self.layer_num,
+            raise RuntimeError(
+                "RTP plugin missing GDN layer cache for "
+                f"layer_{self.layer_num}; fallback path is not allowed."
             )
-            return core_attn_out
         conv_state = layer_cache.k_cache
         ssm_state = layer_cache.v_cache
 
@@ -92,8 +100,70 @@ def apply_attention_gdn_rtpllm_patch() -> None:
         non_spec_token_indx = gdn_metadata.non_spec_token_indx
         spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
         non_spec_state_indices_tensor = gdn_metadata.non_spec_state_indices_tensor
+        is_prefill = bool(int(gdn_metadata.num_prefills) > 0)
+        dump_meta = {"is_prefill": is_prefill}
+        rtp_attn_inputs = getattr(gdn_metadata, "rtp_attn_inputs", None)
+        rtp_seq_size_per_block = int(
+            getattr(gdn_metadata, "rtp_seq_size_per_block", 0) or 0
+        )
+        if rtp_attn_inputs is not None and rtp_seq_size_per_block > 0:
+            layer_block_map = RTPForwardContext._select_block_table_for_layer(
+                attn_inputs=rtp_attn_inputs,
+                layer_num=int(self.layer_num),
+            )
+            non_spec_state_indices_tensor = RTPForwardContext.state_indices_for_layer(
+                attn_inputs=rtp_attn_inputs,
+                is_prefill=bool(gdn_metadata.num_prefills > 0),
+                device=conv_state.device,
+                seq_size_per_block=rtp_seq_size_per_block,
+                layer_num=int(self.layer_num),
+            )
+            dump_atom_tensor(
+                tag="gdn/block_map",
+                tensor=layer_block_map,
+                layer=int(self.layer_num),
+                meta=dump_meta,
+            )
+            dump_atom_tensor(
+                tag="gdn/sequence_lengths",
+                tensor=getattr(rtp_attn_inputs, "sequence_lengths", None),
+                layer=int(self.layer_num),
+                meta=dump_meta,
+            )
+            dump_atom_tensor(
+                tag="gdn/sequence_lengths_plus_1",
+                tensor=getattr(rtp_attn_inputs, "sequence_lengths_plus_1_d", None),
+                layer=int(self.layer_num),
+                meta=dump_meta,
+            )
+            dump_atom_tensor(
+                tag="gdn/prefix_lengths",
+                tensor=getattr(rtp_attn_inputs, "prefix_lengths", None),
+                layer=int(self.layer_num),
+                meta=dump_meta,
+            )
+            dump_atom_tensor(
+                tag="gdn/prefix_lengths_d",
+                tensor=getattr(rtp_attn_inputs, "prefix_lengths_d", None),
+                layer=int(self.layer_num),
+                meta=dump_meta,
+            )
+        dump_atom_tensor(
+            tag="gdn/non_spec_state_indices",
+            tensor=non_spec_state_indices_tensor,
+            layer=int(self.layer_num),
+            meta={
+                "is_prefill": is_prefill,
+                "num_prefills": int(gdn_metadata.num_prefills),
+                "num_decodes": int(gdn_metadata.num_decodes),
+                "num_actual_tokens": int(gdn_metadata.num_actual_tokens),
+            },
+        )
 
-        conv_state = conv_state.transpose(-1, -2)
+        # ModelRunner cache is [slot, state_len, conv_dim] and needs transpose.
+        # RTP plugin may already pass [slot, conv_dim, state_len].
+        if conv_state.size(1) != self.conv1d.weight.size(0):
+            conv_state = conv_state.transpose(-1, -2)
         num_actual_tokens = gdn_metadata.num_actual_tokens
         num_accepted_tokens = gdn_metadata.num_accepted_tokens
         if num_actual_tokens <= 0:
@@ -102,6 +172,27 @@ def apply_attention_gdn_rtpllm_patch() -> None:
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
+        dump_atom_tensor(
+            tag="gdn/mixed_qkv",
+            tensor=mixed_qkv,
+            layer=int(self.layer_num),
+            meta={
+                "is_prefill": is_prefill,
+                "num_actual_tokens": int(num_actual_tokens),
+            },
+        )
+        dump_atom_tensor(
+            tag="gdn/b",
+            tensor=b,
+            layer=int(self.layer_num),
+            meta=dump_meta,
+        )
+        dump_atom_tensor(
+            tag="gdn/a",
+            tensor=a,
+            layer=int(self.layer_num),
+            meta=dump_meta,
+        )
 
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -269,6 +360,16 @@ def apply_attention_gdn_rtpllm_patch() -> None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif core_attn_out_non_spec is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+        # Keep core/output semantics explicit: this is the pre-projection core output.
+        dump_atom_tensor(
+            tag="gdn/core_attn_output",
+            tensor=core_attn_out[:num_actual_tokens],
+            layer=int(self.layer_num),
+            meta={
+                "is_prefill": is_prefill,
+                "num_actual_tokens": int(num_actual_tokens),
+            },
+        )
         return core_attn_out
 
     attention_gdn._extract_gdn_metadata = _extract_gdn_metadata
