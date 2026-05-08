@@ -6,6 +6,12 @@ MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
 ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
 
+is_gpt_oss_model() {
+  local model_path_lc
+  model_path_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "${model_path_lc}" == *gpt-oss* ]]
+}
+
 
 if [ "$TYPE" == "launch" ]; then
   echo ""
@@ -121,12 +127,23 @@ if [ "$TYPE" == "accuracy" ]; then
   RUN_TAG=$(date +%Y%m%d%H%M%S)
   OUTPUT_PATH=accuracy_test_results/${RUN_TAG}
   FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
-  lm_eval --model local-completions \
-          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
-          --tasks gsm8k \
-          --num_fewshot 3 \
-          --output_path "${OUTPUT_PATH}" \
-          2>&1 | tee "$ATOM_CLIENT_LOG"
+  if is_gpt_oss_model "$MODEL_PATH"; then
+    echo "Using chat completions + apply_chat_template for gpt-oss accuracy."
+    lm_eval --model local-chat-completions \
+            --apply_chat_template \
+            --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True \
+            --tasks gsm8k \
+            --num_fewshot 3 \
+            --output_path "${OUTPUT_PATH}" \
+            2>&1 | tee "$ATOM_CLIENT_LOG"
+  else
+    lm_eval --model local-completions \
+            --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
+            --tasks gsm8k \
+            --num_fewshot 3 \
+            --output_path "${OUTPUT_PATH}" \
+            2>&1 | tee "$ATOM_CLIENT_LOG"
+  fi
 
   RESULT_FILENAME=$(
     python3 - <<PY
