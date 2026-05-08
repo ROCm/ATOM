@@ -14,6 +14,10 @@ on:
         description: "Benchmark DeepSeek-R1-0528 (+ MTP3)"
         type: boolean
         default: true
+      deepseek-v4-pro:
+        description: "Benchmark DeepSeek-V4-Pro"
+        type: boolean
+        default: true
       glm-5-fp8:
         description: "Benchmark GLM-5-FP8"
         type: boolean
