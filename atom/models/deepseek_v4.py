@@ -46,7 +46,6 @@ from aiter.ops.triton.fusions.fused_reduce_q_norm_qk_rope_swa_write import (
     fused_reduce_q_norm_qk_rope_swa_write,
 )
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import (
     Config,
     LayerQuantConfig,
@@ -1588,7 +1587,6 @@ class DeepseekV4Attention(nn.Module):
         # compress_plans, swa_write_indices, ...) is well-typed for pyright.
         attn_md = cast("AttentionMetaData_DSV4", get_forward_context().attn_metadata)
         compress_plans = attn_md.compress_plans
-        v4_indexer_meta = attn_md.indexer_meta
         swa_write_indices = attn_md.swa_write_indices
         v4_batch_id_per_token = attn_md.batch_id_per_token
         block_tables_gpu = attn_md.block_tables
