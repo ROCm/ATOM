@@ -81,6 +81,14 @@ resolve_model_path() {
   fi
 }
 
+# gpt-oss OpenAI weights require Chat Completions (messages); local-completions sends "prompt" and vLLM returns 400.
+is_gpt_oss_model() {
+  local name_lc path_lc
+  name_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  path_lc="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+  [[ "${name_lc}" == *gpt-oss* || "${path_lc}" == *gpt-oss* ]]
+}
+
 emit_new_vllm_logs() {
   if [[ "${STREAM_VLLM_LOGS}" != "1" || ! -f "${VLLM_LOG_FILE}" ]]; then
     return 0
@@ -231,11 +239,29 @@ accuracy_one_model() {
   echo "Model name: ${model_name}"
   echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
 
-  lm_eval --model local-completions \
-    --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
-    --tasks gsm8k \
-    --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-    --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+  local lm_args=(
+    --model_args
+    model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
+  )
+  if is_gpt_oss_model "${model_name}" "${model_path}"; then
+    echo "Using chat completions + apply_chat_template for gpt-oss (OpenAI-compatible messages API)."
+    lm_args=(
+      --model_args
+      model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/chat/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True
+    )
+    lm_eval --model local-chat-completions \
+      --apply_chat_template \
+      "${lm_args[@]}" \
+      --tasks gsm8k \
+      --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+      --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+  else
+    lm_eval --model local-completions \
+      "${lm_args[@]}" \
+      --tasks gsm8k \
+      --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+      --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
+  fi
 
   # lm-eval output layout differs across versions: output_path may be a file
   # or a directory containing one/more JSON files. Follow native CI style:
