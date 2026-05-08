@@ -39,7 +39,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
-        os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
+        os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "1") == "1"
     ),
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
