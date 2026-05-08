@@ -26,7 +26,7 @@
   {
     "model_name": "DeepSeek-V4-Pro",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --level 0",
     "env_vars": "ATOM_USE_TRITON_MOE=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
