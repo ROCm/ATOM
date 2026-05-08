@@ -11,14 +11,6 @@ on:
     - cron: '0 15 * * *'
   workflow_dispatch:
     inputs:
-      deepseek-r1-fp8:
-        description: "DeepSeek-R1 FP8 TP8"
-        type: boolean
-        default: false
-      deepseek-r1-mxfp4:
-        description: "DeepSeek-R1 MXFP4 TP8"
-        type: boolean
-        default: false
       deepseek-v3-2-fp8:
         description: "DeepSeek-V3.2 FP8 TP8"
         type: boolean
@@ -75,14 +67,6 @@ on:
         description: "MiniMax-M2.5 TP8"
         type: boolean
         default: false
-      kimi-k2-thinking-mxfp4-tp4:
-        description: "Kimi-K2-Thinking-MXFP4 TP4"
-        type: boolean
-        default: false
-      kimi-k2-thinking-mxfp4-tp8:
-        description: "Kimi-K2-Thinking-MXFP4 TP8"
-        type: boolean
-        default: false
       kimi-k2-5-mxfp4-tp1:
         description: "Kimi-K2.5-MXFP4 TP1"
         type: boolean
@@ -97,26 +81,6 @@ on:
         default: false
       kimi-k2-5-mxfp4-tp8:
         description: "Kimi-K2.5-MXFP4 TP8"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-tp4:
-        description: "Qwen3.5-397B-A17B TP4"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b:
-        description: "Qwen3.5-397B-A17B TP8"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8-tp4:
-        description: "Qwen3.5-397B-A17B-FP8 TP4"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-fp8:
-        description: "Qwen3.5-397B-A17B-FP8 TP8"
-        type: boolean
-        default: false
-      qwen3-5-397b-a17b-mxfp4:
-        description: "Qwen3.5-397B-A17B-MXFP4 TP4"
         type: boolean
         default: false
       qwen3-next-80b-a3b-instruct-fp8-tp1:
@@ -505,8 +469,6 @@ jobs:
       - uses: actions/checkout@v6
       - id: load
         env:
-          ENABLE_DEEPSEEK_R1_FP8: ${{ inputs.deepseek-r1-fp8 }}
-          ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4 }}
           ENABLE_DEEPSEEK_V3_2_FP8: ${{ inputs.deepseek-v3-2-fp8 }}
           ENABLE_DEEPSEEK_V3_2_FP8_TP4: ${{ inputs.deepseek-v3-2-fp8-tp4 }}
           ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b }}
@@ -521,17 +483,10 @@ jobs:
           ENABLE_MINIMAX_M25_TP2: ${{ inputs.minimax-m2-5-tp2 }}
           ENABLE_MINIMAX_M25_TP4: ${{ inputs.minimax-m2-5-tp4 }}
           ENABLE_MINIMAX_M25_TP8: ${{ inputs.minimax-m2-5-tp8 }}
-          ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
-          ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
           ENABLE_KIMI_K25_TP1: ${{ inputs.kimi-k2-5-mxfp4-tp1 }}
           ENABLE_KIMI_K25_TP2: ${{ inputs.kimi-k2-5-mxfp4-tp2 }}
           ENABLE_KIMI_K25_TP4: ${{ inputs.kimi-k2-5-mxfp4-tp4 }}
           ENABLE_KIMI_K25_TP8: ${{ inputs.kimi-k2-5-mxfp4-tp8 }}
-          ENABLE_QWEN3_5_397B_A17B_TP4: ${{ inputs.qwen3-5-397b-a17b-tp4 }}
-          ENABLE_QWEN3_5_397B_A17B: ${{ inputs.qwen3-5-397b-a17b }}
-          ENABLE_QWEN3_5_397B_A17B_FP8_TP4: ${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}
-          ENABLE_QWEN3_5_397B_A17B_FP8: ${{ inputs.qwen3-5-397b-a17b-fp8 }}
-          ENABLE_QWEN3_5_397B_A17B_MXFP4: ${{ inputs.qwen3-5-397b-a17b-mxfp4 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP2: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp2 }}
           ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4: ${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}
@@ -553,8 +508,6 @@ jobs:
           event = os.environ["GITHUB_EVENT_NAME"]
 
           manual_toggles = {
-              "deepseek-r1-fp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP8", "").lower() == "true",
-              "deepseek-r1-mxfp4": os.environ.get("ENABLE_DEEPSEEK_R1_MXFP4", "").lower() == "true",
               "deepseek-v3-2-fp8": os.environ.get("ENABLE_DEEPSEEK_V3_2_FP8", "").lower() == "true",
               "deepseek-v3-2-fp8-tp4": os.environ.get("ENABLE_DEEPSEEK_V3_2_FP8_TP4", "").lower() == "true",
               "gpt-oss-120b": os.environ.get("ENABLE_GPT_OSS_120B", "").lower() == "true",
@@ -569,17 +522,10 @@ jobs:
               "MiniMax-M2.5-tp2": os.environ.get("ENABLE_MINIMAX_M25_TP2", "").lower() == "true",
               "MiniMax-M2.5-tp4": os.environ.get("ENABLE_MINIMAX_M25_TP4", "").lower() == "true",
               "MiniMax-M2.5-tp8": os.environ.get("ENABLE_MINIMAX_M25_TP8", "").lower() == "true",
-              "kimi-k2-thinking-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K2_TP4", "").lower() == "true",
-              "kimi-k2-thinking-mxfp4-tp8": os.environ.get("ENABLE_KIMI_K2_TP8", "").lower() == "true",
               "kimi-k25-mxfp4-tp1": os.environ.get("ENABLE_KIMI_K25_TP1", "").lower() == "true",
               "kimi-k25-mxfp4-tp2": os.environ.get("ENABLE_KIMI_K25_TP2", "").lower() == "true",
               "kimi-k25-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K25_TP4", "").lower() == "true",
               "kimi-k25-mxfp4-tp8": os.environ.get("ENABLE_KIMI_K25_TP8", "").lower() == "true",
-              "qwen3-5-397b-a17b-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_TP4", "").lower() == "true",
-              "qwen3-5-397b-a17b": os.environ.get("ENABLE_QWEN3_5_397B_A17B", "").lower() == "true",
-              "qwen3-5-397b-a17b-fp8-tp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8_TP4", "").lower() == "true",
-              "qwen3-5-397b-a17b-fp8": os.environ.get("ENABLE_QWEN3_5_397B_A17B_FP8", "").lower() == "true",
-              "qwen3-5-397b-a17b-mxfp4": os.environ.get("ENABLE_QWEN3_5_397B_A17B_MXFP4", "").lower() == "true",
               "qwen3-next-80b-a3b-instruct-fp8-tp1": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP1", "").lower() == "true",
               "qwen3-next-80b-a3b-instruct-fp8-tp2": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP2", "").lower() == "true",
               "qwen3-next-80b-a3b-instruct-fp8-tp4": os.environ.get("ENABLE_QWEN3_NEXT_80B_A3B_INSTRUCT_FP8_TP4", "").lower() == "true",
@@ -894,8 +840,6 @@ jobs:
           fi
 
           case "${{ matrix.model.prefix }}" in
-            deepseek-r1-fp8) echo "enabled=${{ inputs.deepseek-r1-fp8 }}" >> "$GITHUB_OUTPUT" ;;
-            deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-v3-2-fp8) echo "enabled=${{ inputs.deepseek-v3-2-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-v3-2-fp8-tp4) echo "enabled=${{ inputs.deepseek-v3-2-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> "$GITHUB_OUTPUT" ;;
@@ -910,17 +854,10 @@ jobs:
             MiniMax-M2.5-tp2) echo "enabled=${{ inputs.minimax-m2-5-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             MiniMax-M2.5-tp4) echo "enabled=${{ inputs.minimax-m2-5-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             MiniMax-M2.5-tp8) echo "enabled=${{ inputs.minimax-m2-5-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp1) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp1 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp2) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b) echo "enabled=${{ inputs.qwen3-5-397b-a17b }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8-tp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-fp8) echo "enabled=${{ inputs.qwen3-5-397b-a17b-fp8 }}" >> "$GITHUB_OUTPUT" ;;
-            qwen3-5-397b-a17b-mxfp4) echo "enabled=${{ inputs.qwen3-5-397b-a17b-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-next-80b-a3b-instruct-fp8-tp1) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp1 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-next-80b-a3b-instruct-fp8-tp2) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             qwen3-next-80b-a3b-instruct-fp8-tp4) echo "enabled=${{ inputs.qwen3-next-80b-a3b-instruct-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
