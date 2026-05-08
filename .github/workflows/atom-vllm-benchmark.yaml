@@ -438,9 +438,9 @@ jobs:
             CONCURRENCY="${PARAMS[2]}"
             RANDOM_RANGE_RATIO="${PARAMS[3]}"
             case "${CONCURRENCY}" in
-              4|8|16|32|64|128|256) ;;
+              4|8|16|32|64|128|256|512) ;;
               *)
-                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64,128,256"
+                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64,128,256,512"
                 exit 1
                 ;;
             esac
@@ -614,6 +614,7 @@ jobs:
         env:
           MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
           PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           BENCHMARK_MATRIX="$(python3 - <<'PY'
           import json
@@ -621,6 +622,7 @@ jobs:
 
           models = json.loads(os.environ["MODELS_JSON"])
           params = json.loads(os.environ["PARAMS_JSON"])
+          event = os.environ["GITHUB_EVENT_NAME"]
 
           include = []
           for model in models:
@@ -628,8 +630,9 @@ jobs:
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
               model_params = []
               seen = set()
-              # Run all benchmark cases at the two highest supported concurrency levels too.
-              extra_concurrency = (128, 256)
+              # Keep nightly runs broad, but let manual workflow_dispatch runs
+              # honor the user's param_lists exactly (e.g. 512-only sweeps).
+              extra_concurrency = (128, 256) if event == "schedule" else ()
 
               for param in params:
                   variants = [param]
