@@ -6,6 +6,12 @@ MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
 ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
 
+is_gpt_oss_model() {
+  local model_path_lc
+  model_path_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "${model_path_lc}" == *gpt-oss* ]]
+}
+
 
 if [ "$TYPE" == "launch" ]; then
   echo ""
