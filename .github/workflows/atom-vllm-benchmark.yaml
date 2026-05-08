@@ -39,6 +39,10 @@ on:
         description: "MiniMax-M2.5 TP2"
         type: boolean
         default: false
+      minimax-m2-5-tp4:
+        description: "MiniMax-M2.5 TP4"
+        type: boolean
+        default: false
       kimi-k2-thinking-mxfp4-tp4:
         description: "Kimi-K2-Thinking-MXFP4 TP4"
         type: boolean
@@ -468,6 +472,7 @@ jobs:
           ENABLE_GLM_4_7_FP8_TP8: ${{ inputs.glm-4-7-fp8-tp8 }}
           ENABLE_GLM_5_1_FP8_TP8: ${{ inputs.glm-5-1-fp8-tp8 }}
           ENABLE_MINIMAX_M25_TP2: ${{ inputs.minimax-m2-5-tp2 }}
+          ENABLE_MINIMAX_M25_TP4: ${{ inputs.minimax-m2-5-tp4 }}
           ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
           ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
           ENABLE_KIMI_K25_TP2: ${{ inputs.kimi-k2-5-mxfp4-tp2 }}
@@ -505,6 +510,7 @@ jobs:
               "glm-4-7-fp8-tp8": os.environ.get("ENABLE_GLM_4_7_FP8_TP8", "").lower() == "true",
               "glm-5-1-fp8-tp8": os.environ.get("ENABLE_GLM_5_1_FP8_TP8", "").lower() == "true",
               "MiniMax-M2.5-tp2": os.environ.get("ENABLE_MINIMAX_M25_TP2", "").lower() == "true",
+              "MiniMax-M2.5-tp4": os.environ.get("ENABLE_MINIMAX_M25_TP4", "").lower() == "true",
               "kimi-k2-thinking-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K2_TP4", "").lower() == "true",
               "kimi-k2-thinking-mxfp4-tp8": os.environ.get("ENABLE_KIMI_K2_TP8", "").lower() == "true",
               "kimi-k25-mxfp4-tp2": os.environ.get("ENABLE_KIMI_K25_TP2", "").lower() == "true",
@@ -835,6 +841,7 @@ jobs:
             glm-4-7-fp8-tp8) echo "enabled=${{ inputs.glm-4-7-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             glm-5-1-fp8-tp8) echo "enabled=${{ inputs.glm-5-1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             MiniMax-M2.5-tp2) echo "enabled=${{ inputs.minimax-m2-5-tp2 }}" >> "$GITHUB_OUTPUT" ;;
+            MiniMax-M2.5-tp4) echo "enabled=${{ inputs.minimax-m2-5-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp2) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp2 }}" >> "$GITHUB_OUTPUT" ;;

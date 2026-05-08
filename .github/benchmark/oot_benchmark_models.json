@@ -46,6 +46,18 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
   },
   {
+    "display": "MiniMax-M2.5 TP4",
+    "dashboard_model": "MiniMax-M2.5-tp4",
+    "source_path": "MiniMaxAI/MiniMax-M2.5",
+    "path": "MiniMaxAI/MiniMax-M2.5",
+    "prefix": "MiniMax-M2.5-tp4",
+    "nightly_group": "C",
+    "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+  },
+  {
     "display": "GLM-4.7-FP8 TP8",
     "dashboard_model": "GLM-4.7-FP8",
     "source_path": "zai-org/GLM-4.7-FP8",
