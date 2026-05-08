@@ -56,7 +56,7 @@ Keep benchmark methodology unchanged (smoke check, concurrency isolation, and fi
 
 - **Default (candidate):** plugin enabled
 - **Optional control (baseline):** plugin disabled (only when A/B comparison is requested)
-- **Default ATOM vLLM Plugin image:** `rocm/atom-dev:vllm-lastest`
+- **Default ATOM vLLM Plugin image:** `rocm/atom-dev:vllm-latest`
 
 If both conditions are run, only one variable is allowed to change between them.
 
