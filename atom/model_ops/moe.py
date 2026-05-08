@@ -902,10 +902,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
             return
         elif (
-            #get_gfx() == "gfx950"
+            get_gfx() == "gfx950"
             and self.quant_type == QuantType.per_1x32
             and self.quant_dtype == dtypes.fp4x2
-            # and not self.use_triton
+            and not self.use_triton
         ):
             layer.w13_weight.data = shuffle_weight_a16w4(
                 layer.w13_weight.contiguous(), 16, True
@@ -914,12 +914,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.contiguous(), 16, False
             )
             layer.w13_weight_scale.data = shuffle_scale_a16w4(
-                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]).contiguous(),
+                layer.w13_weight_scale.view(
+                    -1, layer.w13_weight_scale.shape[-1]
+                ).contiguous(),
                 self.num_experts,
                 True,
             )
             layer.w2_weight_scale.data = shuffle_scale_a16w4(
-                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]).contiguous(),
+                layer.w2_weight_scale.view(
+                    -1, layer.w2_weight_scale.shape[-1]
+                ).contiguous(),
                 self.num_experts,
                 False,
             )
@@ -1090,7 +1094,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
                 swiglu_limit=10.0,
-                gate_mode=GateMode.INTERLEAVE.value
+                gate_mode=GateMode.INTERLEAVE.value,
             )
         return self.fused_experts(
             hidden_states=x,
@@ -1117,7 +1121,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
 class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
@@ -1315,12 +1318,14 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         w2_input_scale = getattr(layer, "w2_input_scale", None)
 
         if self.need_normalize_e4m3fn_to_e4m3fnuz:
-            w13.data, w13_scale.data, w13_input_scale_data = (
-                normalize_e4m3fn_to_e4m3fnuz(
-                    w13.data,
-                    w13_scale.data,
-                    w13_input_scale.data if w13_input_scale is not None else None,
-                )
+            (
+                w13.data,
+                w13_scale.data,
+                w13_input_scale_data,
+            ) = normalize_e4m3fn_to_e4m3fnuz(
+                w13.data,
+                w13_scale.data,
+                w13_input_scale.data if w13_input_scale is not None else None,
             )
             if w13_input_scale is not None and w13_input_scale_data is not None:
                 w13_input_scale.data = w13_input_scale_data
@@ -1752,9 +1757,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w13_weight_scale[expert_id][shard_id],
                 )
                 quant_func = get_hip_quant(self.quant_type)
-                layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                    quant_func(dq_weight, max_w13_scales[expert_id])
-                )
+                (
+                    layer.w13_weight[expert_id][start : start + shard_size, :],
+                    _,
+                ) = quant_func(dq_weight, max_w13_scales[expert_id])
                 start += shard_size
 
         shuffle_weights(layer.w13_weight, layer.w2_weight)
@@ -1887,9 +1893,9 @@ def determine_expert_map(
     # Create a expert map for the local experts
     if ep_rank < (ep_size - 1):
         # Each non-last rank gets local_num_experts experts.
-        expert_map[ep_rank * local_num_experts : (ep_rank + 1) * local_num_experts] = (
-            torch.arange(0, local_num_experts, dtype=torch.int32)
-        )
+        expert_map[
+            ep_rank * local_num_experts : (ep_rank + 1) * local_num_experts
+        ] = torch.arange(0, local_num_experts, dtype=torch.int32)
     else:
         # All remaining experts are assigned to the last rank.
         local_num_experts = global_num_experts - ep_rank * local_num_experts

@@ -1739,7 +1739,9 @@ class MoE(nn.Module):
         )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
-            n_shared_experts=args.n_shared_experts if self._fuse_shared_into_routed else 0,
+            n_shared_experts=args.n_shared_experts
+            if self._fuse_shared_into_routed
+            else 0,
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -2045,10 +2047,12 @@ class Block(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
-        x, post, comb = (
-            self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-            )
+        (
+            x,
+            post,
+            comb,
+        ) = self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions)  # [num_tokens, dim]
