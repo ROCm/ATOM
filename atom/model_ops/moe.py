@@ -906,6 +906,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             and self.quant_type == QuantType.per_1x32
             and self.quant_dtype == dtypes.fp4x2
             and not self.use_triton
+            and getattr(layer, "gate_mode", None) == GateMode.INTERLEAVE.value
         ):
             layer.w13_weight.data = shuffle_weight_a16w4(
                 layer.w13_weight.contiguous(), 16, True
@@ -1093,8 +1094,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_pad=self.intermediate_pad,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
-                swiglu_limit=10.0,
-                gate_mode=GateMode.INTERLEAVE.value,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                gate_mode=getattr(layer, "gate_mode", GateMode.SEPARATED.value),
             )
         return self.fused_experts(
             hidden_states=x,
@@ -1893,9 +1894,9 @@ def determine_expert_map(
     # Create a expert map for the local experts
     if ep_rank < (ep_size - 1):
         # Each non-last rank gets local_num_experts experts.
-        expert_map[
-            ep_rank * local_num_experts : (ep_rank + 1) * local_num_experts
-        ] = torch.arange(0, local_num_experts, dtype=torch.int32)
+        expert_map[ep_rank * local_num_experts : (ep_rank + 1) * local_num_experts] = (
+            torch.arange(0, local_num_experts, dtype=torch.int32)
+        )
     else:
         # All remaining experts are assigned to the last rank.
         local_num_experts = global_num_experts - ep_rank * local_num_experts

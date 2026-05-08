@@ -39,6 +39,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.config import (
     Config,
@@ -1739,9 +1740,9 @@ class MoE(nn.Module):
         )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
-            n_shared_experts=args.n_shared_experts
-            if self._fuse_shared_into_routed
-            else 0,
+            n_shared_experts=(
+                args.n_shared_experts if self._fuse_shared_into_routed else 0
+            ),
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -1758,6 +1759,7 @@ class MoE(nn.Module):
             config=moe_cfg,
         )
         self.experts.swiglu_limit = args.swiglu_limit
+        self.experts.gate_mode = GateMode.INTERLEAVE.value
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
