@@ -15,14 +15,13 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 ### Qwen3-Next-80B-A3B-Instruct-FP8 (TP=1, MI355X)
 
 ```bash
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --host localhost \
     --port 8000 \
     --tensor-parallel-size 1 \
-    --attention-backend ROCM_AITER_FA \
     --kv-cache-dtype fp8 \
     --gpu_memory_utilization 0.9 \
     --async-scheduling \

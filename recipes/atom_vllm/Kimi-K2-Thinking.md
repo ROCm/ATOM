@@ -16,7 +16,7 @@ docker pull rocm/atom-dev:vllm-latest
 The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options and API usage, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
 ```bash
-# use quick allreduce to reduce TTFT (may impact accuracy)
+# use quick allreduce to reduce TTFT
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 
 vllm serve amd/Kimi-K2-Thinking-MXFP4 \
@@ -32,26 +32,19 @@ vllm serve amd/Kimi-K2-Thinking-MXFP4 \
 ```
 
 ## Step 3: Performance Benchmark
-Use the ATOM benchmark guide aligned command form (`vllm` backend + `/v1/completions` endpoint + `temperature=0.0`) for reproducible results.
+Users can use the default vllm bench command for performance benchmarking.
 ```bash
 vllm bench serve \
-    --backend vllm \
-    --base-url http://localhost:8000 \
-    --endpoint /v1/completions \
+    --host localhost \
+    --port 8000 \
     --model amd/Kimi-K2-Thinking-MXFP4 \
-    --trust-remote-code \
     --dataset-name random \
-    --random-input-len 1024 \
-    --random-output-len 1024 \
+    --random-input-len 8000 \
+    --random-output-len 1000 \
     --random-range-ratio 0.8 \
-    --temperature 0.0 \
-    --request-rate inf \
-    --ignore-eos \
     --max-concurrency 64 \
     --num-prompts 640 \
-    --num-warmups 128 \
-    --disable-tqdm \
-    --save-result \
+    --trust_remote_code \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
