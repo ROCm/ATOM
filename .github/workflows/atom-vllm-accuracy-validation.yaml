@@ -14,6 +14,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_qwen3_next_80b_tp1:
+        description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP1"
+        required: false
+        type: boolean
+        default: false
       run_qwen3_next_80b_tp4:
         description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
         required: false
@@ -64,6 +69,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_dsv32_fp8_tp8:
+        description: "DeepSeek-V3.2-FP8 TP8"
+        required: false
+        type: boolean
+        default: false
       run_gpt_oss_120b_tp1:
         description: "gpt-oss-120b TP1"
         required: false
@@ -79,6 +89,11 @@ on:
         required: false
         type: boolean
         default: false
+      oot_image:
+        description: "Optional atom-vLLM image override. Leave empty to keep the existing nightly/manual build behavior."
+        required: false
+        type: string
+        default: ""
       upload_accuracy_to_dashboard:
         description: "Optional: upload OOT accuracy results to dashboard after this manual run"
         required: false
@@ -120,6 +135,7 @@ jobs:
         id: meta
         env:
           RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
+          RUN_QWEN3_NEXT_80B_TP1: ${{ inputs.run_qwen3_next_80b_tp1 }}
           RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
           RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
           RUN_QWEN35_397B_TP8: ${{ inputs.run_qwen35_397b_tp8 }}
@@ -130,9 +146,11 @@ jobs:
           RUN_KIMI_K25_TP8: ${{ inputs.run_kimi_k25_tp8 }}
           RUN_DSR1_FP8_TP8: ${{ inputs.run_dsr1_fp8_tp8 }}
           RUN_DSR1_FP4_TP8: ${{ inputs.run_dsr1_fp4_tp8 }}
+          RUN_DSV32_FP8_TP8: ${{ inputs.run_dsv32_fp8_tp8 }}
           RUN_GPT_OSS_120B_TP1: ${{ inputs.run_gpt_oss_120b_tp1 }}
           RUN_GPT_OSS_120B_TP2: ${{ inputs.run_gpt_oss_120b_tp2 }}
           RUN_GLM5_1_FP8_TP8: ${{ inputs.run_glm5_1_fp8_tp8 }}
+          INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
         run: |
           set -euo pipefail
 
@@ -155,10 +173,19 @@ jobs:
                   "runner": "linux-atom-mi35x-8",
               },
               {
+                  "toggle_env": "RUN_QWEN3_NEXT_80B_TP1",
+                  "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
+                  "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+                  "extra_args": "--tensor-parallel-size 1",
+                  "accuracy_test_threshold": 0.83,
+                  "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1",
+                  "runner": "linux-atom-mi35x-1",
+              },
+              {
                   "toggle_env": "RUN_QWEN3_NEXT_80B_TP4",
                   "model_name": "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
                   "model_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-                  "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
+                  "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=1",
                   "runner": "linux-atom-mi35x-4",
@@ -167,7 +194,7 @@ jobs:
                   "toggle_env": "RUN_QWEN35_397B_FP8_TP8",
                   "model_name": "Qwen3.5-397B-A17B-FP8 TP8",
                   "model_path": "Qwen/Qwen3.5-397B-A17B-FP8",
-                  "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
+                  "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
@@ -176,7 +203,7 @@ jobs:
                   "toggle_env": "RUN_QWEN35_397B_TP8",
                   "model_name": "Qwen3.5-397B-A17B TP8",
                   "model_path": "Qwen/Qwen3.5-397B-A17B",
-                  "extra_args": "--tensor-parallel-size 8 --attention-backend ROCM_AITER_FA",
+                  "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-8",
@@ -185,7 +212,7 @@ jobs:
                   "toggle_env": "RUN_QWEN35_397B_FP4_TP4",
                   "model_name": "Qwen3.5-397B-A17B-MXFP4 TP4",
                   "model_path": "amd/Qwen3.5-397B-A17B-MXFP4",
-                  "extra_args": "--tensor-parallel-size 4 --attention-backend ROCM_AITER_FA",
+                  "extra_args": "--tensor-parallel-size 4",
                   "accuracy_test_threshold": 0.83,
                   "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0",
                   "runner": "linux-atom-mi35x-4",
@@ -211,7 +238,7 @@ jobs:
               {
                   "toggle_env": "RUN_KIMI_K2_TP8",
                   "model_name": "Kimi-K2-Thinking-MXFP4 TP8",
-                  "model_path": "amd/Kimi-K2-Thinking-MXFP4",
+                  "model_path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.90,
                   "env_vars": "",
@@ -220,7 +247,7 @@ jobs:
               {
                   "toggle_env": "RUN_KIMI_K25_TP8",
                   "model_name": "Kimi-K2.5-MXFP4 TP8",
-                  "model_path": "amd/Kimi-K2.5-MXFP4",
+                  "model_path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
                   "extra_args": "--tensor-parallel-size 8",
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
@@ -240,6 +267,16 @@ jobs:
                   "model_name": "DeepSeek-R1-0528-MXFP4 TP8",
                   "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
                   "extra_args": "--tensor-parallel-size 8",
+                  "accuracy_test_threshold": 0.93,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-8",
+              },
+              {
+                  "toggle_env": "RUN_DSV32_FP8_TP8",
+                  "model_name": "DeepSeek-V3.2-FP8 TP8",
+                  "model_path": "deepseek-ai/DeepSeek-V3.2",
+                  "extra_args": "--tensor-parallel-size 8 --block-size 1",
+                  "lm_eval_num_fewshot": 20,
                   "accuracy_test_threshold": 0.93,
                   "env_vars": "",
                   "runner": "linux-atom-mi35x-8",
@@ -308,6 +345,14 @@ jobs:
               RESOLVED_OOT_IMAGE="${NIGHTLY_OOT_IMAGE_TAG}"
             fi
             echo "oot_image_tag=${RESOLVED_OOT_IMAGE}" >> "$GITHUB_OUTPUT"
+            echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
+            echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "${INPUT_OOT_IMAGE}" ]; then
+            echo "Manual run will use user-provided atom-vLLM image: ${INPUT_OOT_IMAGE}"
+            echo "oot_image_tag=${INPUT_OOT_IMAGE}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -472,14 +517,7 @@ jobs:
 
       - name: Collect GPU info (inside container)
         id: gpu-info
-        run: |
-          GPU_NAME=$(docker exec "$CONTAINER_NAME" rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
-          GPU_VRAM_GB=$(docker exec "$CONTAINER_NAME" rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
-          ROCM_VERSION=$(docker exec "$CONTAINER_NAME" cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
-          echo "gpu_name=${GPU_NAME}" >> "$GITHUB_OUTPUT"
-          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> "$GITHUB_OUTPUT"
-          echo "rocm_version=${ROCM_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Download model if needed
         run: |

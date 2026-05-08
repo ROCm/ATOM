@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<title>DeepSeek V4 — Compressor State Cache Animation</title>
+<style>
+:root {
+  --bg-primary: #0b0c10; --bg-secondary: #141519; --bg-tertiary: #1c1d24;
+  --border: #303140; --border-light: #262733;
+  --text-primary: #eef0f6; --text-secondary: #bfc1d0; --text-tertiary: #7e8094;
+  --brand: #d86ecc; --brand-dim: rgba(216,110,204,0.12);
+  --ui: #8899b8; --ui-bright: #a4b3ce; --ui-dim: rgba(136,153,184,0.12);
+  --accent-green: #6dbf80; --accent-red: #f25c4e; --accent-orange: #eda06a;
+  --accent-purple: #c49af5; --accent-yellow: #ddb040;
+  --g0-border: #a6caec; --g0-bg: #5a9cd6; --g0-fg: #eef5fc;
+  --g1-border: hsl(30,55%,50%); --g1-bg: hsl(30,55%,35%); --g1-fg: hsl(30,55%,85%);
+  --radius: 8px;
+  --font-mono: "SF Mono","Fira Code",Consolas,monospace;
+}
+[data-theme="light"] {
+  --bg-primary: #f5f6fa; --bg-secondary: #ffffff; --bg-tertiary: #ebedf3;
+  --border: #d0d3dc; --border-light: #e2e4eb;
+  --text-primary: #1a1c24; --text-secondary: #4a4d5e; --text-tertiary: #7e8094;
+  --brand: #c054b4; --brand-dim: rgba(192,84,180,0.10);
+  --ui: #5a6d8a; --ui-bright: #3d5278; --ui-dim: rgba(90,109,138,0.10);
+  --accent-green: #2e8b47; --accent-red: #d63a2f; --accent-orange: #c47a30;
+  --accent-purple: #8b5ec0; --accent-yellow: #b08a20;
+  --g0-border: #a6caec; --g0-bg: #c8def2; --g0-fg: #1a3a5c;
+  --g1-border: hsl(30,50%,50%); --g1-bg: hsl(30,50%,80%); --g1-fg: hsl(30,50%,20%);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       background:var(--bg-primary); color:var(--text-primary); padding:24px 30px;
+       transition:background .3s,color .3s; }
+.page { max-width:1500px; margin:0 auto; }
+.header { text-align:center; margin-bottom:16px; }
+.header h1 { color:var(--brand); font-size:24px; margin-bottom:4px; }
+.header h2 { color:var(--text-tertiary); font-size:13px; font-weight:normal; font-family:var(--font-mono); }
+
+/* Selectors */
+.selectors { display:flex; justify-content:center; gap:24px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
+.sel-group { display:flex; align-items:center; gap:6px; }
+.sel-label { font-size:12px; color:var(--text-tertiary); font-weight:600; }
+.sel-btn { background:var(--bg-secondary); color:var(--text-secondary); border:1px solid var(--border);
+           padding:6px 14px; cursor:pointer; border-radius:var(--radius); font-size:12px;
+           font-family:inherit; transition:all .2s; }
+.sel-btn:hover { border-color:var(--ui); background:var(--bg-tertiary); }
+.sel-btn.active { background:var(--brand-dim); border-color:var(--brand); color:var(--brand); font-weight:600; }
+.sel-btn-variant.active { background:var(--ui-dim); border-color:var(--ui); color:var(--ui-bright); font-weight:600; }
+.sel-dropdown { background:var(--bg-secondary); color:var(--text-primary); border:1px solid var(--border);
+                padding:5px 10px; border-radius:var(--radius); font-size:12px; font-family:var(--font-mono);
+                cursor:pointer; transition:all .2s; }
+.sel-dropdown:hover { border-color:var(--ui); }
+
+/* Params line */
+.params-line { text-align:center; margin-bottom:16px; font-size:12px; font-family:var(--font-mono);
+               color:var(--text-tertiary); line-height:1.8; }
+.params-line .pv { color:var(--text-primary); font-weight:600; }
+.params-line .sep { color:var(--border); margin:0 6px; }
+
+/* Controls */
+.controls { display:flex; justify-content:center; gap:8px; align-items:center; margin-bottom:18px; flex-wrap:wrap; }
+button { background:var(--bg-secondary); color:var(--ui-bright); border:1px solid var(--border);
+         padding:7px 14px; cursor:pointer; border-radius:var(--radius); font-size:12px;
+         font-family:inherit; transition:all .2s; }
+button:hover { background:var(--bg-tertiary); border-color:var(--ui); }
+button.active { background:var(--ui-dim); border-color:var(--ui); color:var(--text-primary); }
+/* ATOM-style pill toggle */
+.theme-toggle { position:relative; display:inline-block; width:36px; height:18px;
+                background:var(--border); border:none; border-radius:9px; cursor:pointer;
+                transition:background .2s; padding:0; vertical-align:middle; }
+.theme-toggle::after { content:''; position:absolute; top:3px; left:3px; width:12px; height:12px;
+                       background:var(--text-primary); border-radius:50%; transition:transform .2s; }
+[data-theme="light"] .theme-toggle::after { transform:translateX(18px); }
+.theme-label { font-size:11px; color:var(--text-tertiary); margin-right:4px; vertical-align:middle; }
+.stage-badge { display:inline-block; padding:3px 0; border-radius:4px; font-size:11px; font-weight:600;
+               letter-spacing:.5px; width:80px; text-align:center; }
+.stage-prefill { background:rgba(196,154,245,.15); color:var(--accent-purple); border:1px solid rgba(196,154,245,.3); }
+.stage-decode { background:rgba(237,160,106,.15); color:var(--accent-orange); border:1px solid rgba(237,160,106,.3); }
+.stage-compress { background:rgba(109,191,128,.15); color:var(--accent-green); border:1px solid rgba(109,191,128,.3); }
+.stage-shift { background:rgba(221,176,64,.15); color:var(--accent-yellow); border:1px solid rgba(221,176,64,.3); }
+
+/* Content */
+.content { display:flex; gap:20px; }
+.main { flex:1; min-width:0; }
+.side { width:360px; flex-shrink:0; }
+.lbl { font-size:12px; color:var(--text-tertiary); margin-bottom:6px; text-align:center; letter-spacing:.3px; }
+
+/* Tokens */
+.tok-row { display:flex; gap:3px; flex-wrap:wrap; margin-bottom:16px; justify-content:flex-start; align-items:center; }
+.tok-phase-lbl { font-size:9px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
+                 padding:4px 0; border-radius:4px; margin-right:4px; font-family:var(--font-mono);
+                 width:58px; text-align:center; display:inline-block; }
+.tok-phase-prefill { background:rgba(196,154,245,.15); color:var(--accent-purple); border:1px solid rgba(196,154,245,.3); }
+.tok-phase-decode { background:rgba(237,160,106,.15); color:var(--accent-orange); border:1px solid rgba(237,160,106,.3); margin-left:6px; }
+.tok-break { width:100%; height:0; }
+.tok { display:inline-flex; align-items:center; justify-content:center; width:58px; height:30px;
+       border-radius:5px; font-size:11px; font-family:var(--font-mono); transition:all .3s; }
+.tok-p { background:var(--bg-secondary); color:var(--text-tertiary); border:1px dashed var(--border); }
+.tok-c { background:rgba(237,160,106,.2); color:var(--accent-orange); border:1px solid var(--accent-orange); box-shadow:0 0 8px rgba(237,160,106,.3); }
+.tok-w { background:rgba(196,154,245,.15); color:var(--accent-purple); border:1px solid rgba(196,154,245,.4); }
+.tok-d { background:var(--bg-secondary); color:var(--text-tertiary); border:1px solid var(--border-light); opacity:.5; }
+
+/* Projection */
+.proj { margin-bottom:16px; padding:12px; background:var(--bg-secondary); border-radius:var(--radius);
+        border:1px solid var(--border); text-align:center; transition:background .3s; }
+.proj-lbl { font-size:11px; color:var(--text-secondary); margin-bottom:6px; font-family:var(--font-mono); }
+.proj-bar { height:32px; display:flex; border-radius:5px; overflow:hidden; max-width:700px; margin:0 auto; }
+.proj-half { display:flex; align-items:center; justify-content:center; font-size:11px; font-family:var(--font-mono); }
+
+/* Cache grid (CSA) */
+.cache-wrap { margin-bottom:16px; text-align:center; }
+.cache-grid { display:inline-flex; gap:4px; justify-content:center; }
+.slot-col { width:115px; transition:transform .6s cubic-bezier(.4,0,.2,1); position:relative; }
+.slot-col.shift-l { transform:translateX(calc(-4 * (115px + 4px) - 6px)); }
+.slot-col.fade-out { opacity:0; transition:opacity .4s ease; }
+.slot-col.fade-in { animation:fi .4s ease; }
+.slot { border:1px solid var(--border); border-radius:var(--radius); padding:5px;
+        transition:border-color .3s,box-shadow .3s,background .3s; min-height:90px; background:var(--bg-secondary); }
+.slot-hdr { font-size:10px; color:var(--text-tertiary); margin-bottom:4px; text-align:center; font-family:var(--font-mono); font-weight:600; }
+.slot-body { display:flex; flex-direction:column; gap:2px; }
+.hlbl { font-size:8px; color:var(--text-tertiary); text-align:center; font-family:var(--font-mono); }
+.hf { height:20px; border-radius:3px; display:flex; align-items:center; justify-content:center;
+      font-size:9px; font-family:var(--font-mono); transition:all .3s; }
+.slot-prev { border-color:var(--g0-border); }
+.slot-curr { border-color:var(--g1-border); }
+.slot-act { border-color:var(--accent-green); box-shadow:0 0 10px rgba(109,191,128,.25); }
+.slot-cmp { border-color:var(--accent-green); box-shadow:0 0 14px rgba(109,191,128,.35); }
+.slot-sft { border-color:var(--accent-yellow); box-shadow:0 0 10px rgba(221,176,64,.3); }
+.hf-e { background:var(--bg-tertiary); color:var(--text-tertiary); }
+.hf-0 { background:var(--g0-bg); color:var(--g0-fg); }
+.hf-1 { background:var(--g1-bg); color:var(--g1-fg); }
+.hf-0v { background:color-mix(in srgb, var(--g0-bg) 40%, var(--bg-secondary)); color:var(--g0-fg); opacity:0.7; }
+.hf-1v { background:color-mix(in srgb, var(--g1-bg) 40%, var(--bg-secondary)); color:var(--g1-fg); opacity:0.7; }
+.hf-1-dead { background:color-mix(in srgb, var(--g1-bg) 55%, var(--bg-secondary)); color:var(--g1-fg); opacity:0.55; }
+.slot-virtual { border-style:dashed !important; border-width:2px !important; border-color:var(--accent-purple) !important;
+                background:color-mix(in srgb, var(--bg-secondary) 90%, var(--accent-purple)) !important; }
+.hf-r { box-shadow:0 0 6px rgba(109,191,128,.6); outline:2px solid var(--accent-green); }
+.hf-d { opacity:.12; }
+@keyframes fi { from{opacity:0;transform:scale(.95)} to{opacity:1;transform:scale(1)} }
+.slot-div { width:2px; background:var(--border); border-radius:1px; margin:0 2px; align-self:stretch; opacity:.5; }
+
+/* HCA progress bar */
+.hca-wrap { margin-bottom:16px; text-align:center; }
+.hca-bar-outer { max-width:800px; margin:0 auto; height:40px; background:var(--bg-secondary);
+                 border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; position:relative; }
+.hca-bar-fill { height:100%; transition:width .3s ease;
+                border-radius:var(--radius) 0 0 var(--radius); }
+.hca-bar-label { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+                 font-size:12px; font-family:var(--font-mono); color:var(--text-secondary); z-index:2;
+                 transition:color .3s, font-weight .3s; }
+.hca-bar-label.active { font-weight:700; }
+[data-theme="light"] .hca-bar-label.active { color:#ffffff; }
+[data-theme="dark"] .hca-bar-label.active { color:#000000; }
+.hca-bar-ticks { position:absolute; top:0; left:0; right:0; bottom:0; display:flex; pointer-events:none; }
+.hca-bar-tick { flex:1; border-right:1px dashed var(--border); opacity:.4; }
+.hca-bar-tick:last-child { border-right:none; }
+.hca-slots-info { margin-top:8px; font-size:11px; color:var(--text-tertiary); font-family:var(--font-mono); }
+
+/* Gather */
+.gather { margin-bottom:16px; padding:12px 18px; background:rgba(109,191,128,.05);
+          border-radius:var(--radius); border:1px solid rgba(109,191,128,.2);
+          text-align:left; max-width:900px; margin-left:auto; margin-right:auto;
+          min-height:60px; transition:opacity .3s; }
+.gather.inactive { opacity:0.15; }
+.gr { display:flex; align-items:center; gap:6px; margin:3px 0; font-size:11px; font-family:var(--font-mono); }
+.gv { min-width:100px; height:20px; border-radius:3px; display:flex; align-items:center;
+      justify-content:center; font-size:10px; }
+.gather-res { margin-top:8px; padding-top:8px; border-top:1px solid rgba(109,191,128,.2);
+              font-size:12px; color:var(--accent-green); text-align:center; }
+
+/* KV cache */
+.kv-sec { text-align:center; margin-bottom:16px; }
+.kv-row { display:inline-flex; gap:4px; flex-wrap:wrap; justify-content:center; }
+.kve { width:80px; height:34px; border:1px solid var(--border); border-radius:5px;
+       display:flex; align-items:center; justify-content:center; font-size:10px;
+       font-family:var(--font-mono); transition:all .4s; background:var(--bg-secondary); color:var(--text-tertiary); }
+.kve-f { background:rgba(109,191,128,.1); color:var(--accent-green); border-color:rgba(109,191,128,.3); }
+.kve-n { animation:ep .5s ease; box-shadow:0 0 12px rgba(109,191,128,.4); }
+@keyframes ep { 0%{transform:scale(.7);opacity:0} 100%{transform:scale(1);opacity:1} }
+
+/* Log */
+.log-w { position:sticky; top:20px; }
+.log { background:var(--bg-secondary); border:1px solid var(--border); border-radius:var(--radius);
+       padding:10px; height:580px; overflow-y:auto; overflow-x:hidden; font-size:11px; line-height:1.7;
+       font-family:var(--font-mono); transition:background .3s; word-wrap:break-word; }
+.log::-webkit-scrollbar { width:5px; }
+.log::-webkit-scrollbar-track { background:transparent; }
+.log::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+.le { border-bottom:1px solid var(--border-light); padding:3px 0; cursor:pointer; display:flex; gap:6px;
+      transition:background .15s, opacity .2s; }
+.le:hover { background:var(--bg-tertiary); }
+.le.le-future { opacity:0.25; }
+.le.le-future:hover { opacity:0.5; }
+.le-num { color:var(--text-tertiary); font-size:9px; min-width:20px; text-align:right; flex-shrink:0;
+          user-select:none; }
+.le-num:hover { color:var(--brand); }
+.le-content { flex:1; min-width:0; }
+.ls { color:var(--brand); font-weight:600; font-size:10px; }
+.la { color:var(--text-secondary); }
+.ld { color:var(--text-tertiary); font-size:10px; }
+.lc { color:var(--accent-green); font-weight:600; }
+.lh { color:var(--accent-yellow); }
+</style>
+</head>
+<body>
+<div class="page">
+<div class="header">
+  <h1>DeepSeek V4 — Compressor State Cache</h1>
+  <h2 id="subtitle"></h2>
+</div>
+
+<div class="selectors">
+  <div class="sel-group">
+    <span class="sel-label">Compressor:</span>
+    <button class="sel-btn active" onclick="pickComp('csa_attn')" id="sb-csa_attn">CSA Attention</button>
+    <button class="sel-btn" onclick="pickComp('csa_idx')" id="sb-csa_idx">CSA Indexer</button>
+    <button class="sel-btn" onclick="pickComp('hca')" id="sb-hca">HCA</button>
+  </div>
+  <div class="sel-group">
+    <span class="sel-label">Model:</span>
+    <button class="sel-btn sel-btn-variant" onclick="pickVar('flash')" id="sv-flash">V4-Flash</button>
+    <button class="sel-btn sel-btn-variant active" onclick="pickVar('pro')" id="sv-pro">V4-Pro</button>
+  </div>
+  <div class="sel-group">
+    <span class="sel-label">Prefill tokens:</span>
+    <select id="prefill-count" onchange="pickPrefill(this.value)" class="sel-dropdown"></select>
+  </div>
+  <span class="theme-label">Theme</span>
+  <button class="theme-toggle" onclick="toggleTheme()" id="btn-theme" title="Toggle light/dark mode"></button>
+</div>
+
+<div class="params-line" id="params"></div>
+
+<div class="controls">
+  <button onclick="doStepBack()" id="btn-back">◀ Back</button>
+  <button onclick="doStep()" id="btn-step">Step ▶</button>
+  <button onclick="togglePlay()" id="btn-play">Play ▶▶</button>
+  <button onclick="doReset()">Reset ↺</button>
+  <span style="color:var(--text-tertiary);font-size:11px;margin:0 4px">Speed:</span>
+  <button onclick="setSpd(1500)" id="sp-1500">Slow</button>
+  <button onclick="setSpd(800)" id="sp-800" class="active">Med</button>
+  <button onclick="setSpd(400)" id="sp-400">Fast</button>
+  <span id="phase-badge"><span class="stage-badge" style="opacity:0">READY</span></span>
+</div>
+
+<hr style="border:none;border-top:1px solid var(--border);margin-bottom:18px;">
+<div class="content">
+<div class="main">
+  <div class="lbl">Tokens</div>
+  <div class="tok-row" id="toks"></div>
+  <div class="proj" id="proj-sec">
+    <div class="proj-lbl" id="proj-lbl">Projection: waiting...</div>
+    <div class="proj-bar" id="proj-bar"></div>
+  </div>
+  <div class="cache-wrap" id="csa-cache" style="display:none">
+    <div class="lbl" id="cache-lbl"></div>
+    <div class="cache-grid" id="cache-grid"></div>
+  </div>
+  <div class="hca-wrap" id="hca-cache" style="display:none">
+    <div class="lbl" id="hca-lbl"></div>
+    <div class="hca-bar-outer"><div class="hca-bar-fill" id="hca-fill"></div><div class="hca-bar-ticks" id="hca-ticks"></div><div class="hca-bar-label" id="hca-blbl"></div></div>
+    <div class="hca-slots-info" id="hca-info"></div>
+  </div>
+  <div class="gather" id="gather-sec">
+    <div class="lbl" style="color:var(--accent-green);text-align:left" id="gather-lbl"></div>
+    <div id="gather-rows"></div>
+    <div class="gather-res" id="gather-res"></div>
+  </div>
+  <div class="kv-sec">
+    <div class="lbl" id="kv-lbl">Compressed KV Cache</div>
+    <div class="kv-row" id="kv-entries"></div>
+  </div>
+</div>
+<div class="side">
+  <div class="log-w"><div class="lbl" style="text-align:left">Event Log</div><div class="log" id="log"></div></div>
+</div>
+</div>
+</div>
+
+<script>
+const CONFIGS = {
+  csa_attn: {
+    label: 'CSA Attention Compressor',
+    ratio: 4, overlap: true, rotate: false, quant: 'FP8 (non-RoPE 448) + BF16 (RoPE 64)',
+    flash: { dim: 4096, head_dim: 512 }, pro: { dim: 7168, head_dim: 512 },
+  },
+  csa_idx: {
+    label: 'CSA Indexer Compressor',
+    ratio: 4, overlap: true, rotate: true, quant: 'FP4 full vector (after Hadamard)',
+    flash: { dim: 4096, head_dim: 128 }, pro: { dim: 7168, head_dim: 128 },
+  },
+  hca: {
+    label: 'HCA Compressor',
+    ratio: 128, overlap: false, rotate: false, quant: 'FP8 (non-RoPE 448) + BF16 (RoPE 64)',
+    flash: { dim: 4096, head_dim: 512 }, pro: { dim: 7168, head_dim: 512 },
+  },
+};
+
+let curComp = 'csa_attn', curVar = 'pro', prefillCount = 4;
+let C, coff, nSlots, projW, stateW, demoRatio, decodeToks;
+let S = {};
+
+function calcParams() {
+  C = CONFIGS[curComp];
+  coff = C.overlap ? 2 : 1;
+  nSlots = coff * C.ratio;
+  const v = C[curVar];
+  projW = coff * v.head_dim;
+  stateW = 2 * projW;
+  if (curComp === 'hca') { demoRatio = 8; }
+  else { demoRatio = C.ratio; }
+  decodeToks = demoRatio * 2; // always show 2 full decode windows
+}
+
+function updateSubtitle() {
+  const v = C[curVar];
+  document.getElementById('subtitle').textContent =
+    `${C.label} · ${curVar==='flash'?'V4-Flash (dim=4096)':'V4-Pro (dim=7168)'}`;
+}
+
+function updateParams() {
+  const v = C[curVar];
+  const s = '<span class="sep">·</span>';
+  const kv = (k,val) => `${k}=<span class="pv">${val}</span>`;
+  const nSlotsStr = curComp==='hca' ? `${C.ratio} (demo:${demoRatio})` : nSlots;
+  document.getElementById('params').innerHTML = [
+    kv('head_dim',v.head_dim), kv('ratio',C.ratio), kv('overlap',C.overlap), kv('coff',coff),
+    kv('proj',`[${projW}]`), kv('state/slot',`${stateW} fp32`), kv('slots',nSlotsStr),
+    kv('rotate',C.rotate), kv('wkv',`[${v.dim},${projW}]`), kv('ape',`[${C.ratio},${projW}]`),
+    kv('quant',C.quant),
+  ].join(s);
+}
+
+function toggleTheme() {
+  const h=document.documentElement, c=h.getAttribute('data-theme');
+  h.setAttribute('data-theme', c==='dark'?'light':'dark');
+}
+
+function pickComp(c) { curComp=c; document.querySelectorAll('.sel-btn:not(.sel-btn-variant)').forEach(b=>b.classList.remove('active'));
+  document.getElementById('sb-'+c).classList.add('active'); populateDropdown(); doReset(); }
+function pickVar(v) { curVar=v; document.querySelectorAll('.sel-btn-variant').forEach(b=>b.classList.remove('active'));
+  document.getElementById('sv-'+v).classList.add('active'); doReset(); }
+function pickPrefill(v) { prefillCount=parseInt(v); doReset(); }
+
+function populateDropdown() {
+  const sel=document.getElementById('prefill-count');
+  const r = curComp==='hca' ? 8 : 4;
+  sel.innerHTML='';
+  for(let i=1;i<=r*3;i++){
+    const opt=document.createElement('option');
+    opt.value=i; opt.textContent=`${i} token${i>1?'s':''}`;
+    if(i===r) opt.selected=true;
+    sel.appendChild(opt);
+  }
+  prefillCount=r;
+}
+
+// --- Steps ---
+function buildSteps() {
+  const st=[], r=demoRatio, isHCA=curComp==='hca', isCSA=!isHCA;
+  const currOff = isCSA ? r : 0;
+  const hd = C[curVar].head_dim;
+  const nWin = Math.floor(prefillCount / r);
+  const rem = prefillCount % r;
+
+  // --- PREFILL (bulk — state cache NOT used for compression, only for decode handoff) ---
+  st.push({t:'phase',p:'prefill',m:`PREFILL — ${prefillCount} token${prefillCount>1?'s':''} (tok 0-${prefillCount-1}) arrive simultaneously`});
+
+  // Bulk project all tokens at once
+  st.push({t:'bulk-project',count:prefillCount,m:`Bulk project all ${prefillCount} tokens: kv=wkv(x)→[${prefillCount},${projW}], score=wgate(x)+ape→[${prefillCount},${projW}]`});
+
+  // Visualize overlap_transform for each complete window
+  if(nWin>0 && isCSA){
+    st.push({t:'bulk-compress',nWin:nWin,r:r,m:`overlap_transform: unflatten [${nWin},${r},${projW}] → [${nWin},${2*r},${hd}] — bulk tensor op, state cache NOT touched`});
+
+    for(let w=0;w<nWin;w++){
+      const ws=w*r;
+      // Virtually fill slots to visualize the overlap positions
+      if(w===0){
+        st.push({t:'virtual-fill',window:w,ws:ws,hasPrev:false,
+          m:`Window ${w} (tok ${ws}-${ws+r-1}): slots 0-3 = fill (0/-inf, no prev), slots 4-7 = tok ${ws}-${ws+r-1} [${hd}:]`});
+      } else {
+        st.push({t:'virtual-fill',window:w,ws:ws,hasPrev:true,prevWS:(w-1)*r,
+          m:`Window ${w} (tok ${ws}-${ws+r-1}): slots 0-3 = tok ${(w-1)*r}-${ws-1} [:${hd}] (prev), slots 4-7 = tok ${ws}-${ws+r-1} [${hd}:] (curr)`});
+      }
+      st.push({t:'gather',entry:w,m:isCSA
+        ?`Gather: slots 0-${r-1}[:${hd}] ${w===0?'(fill)':'(prev)'} + slots ${r}-${2*r-1}[${hd}:] (curr) → softmax pool → [${hd}]`
+        :`Gather all → softmax pool`});
+      st.push({t:'compress',entry:w,toks:Array.from({length:r},(_,j)=>ws+j),m:`Entry ${w} ← tok ${ws}-${ws+r-1}`});
+      // Clear virtual slots after each window visualization
+      st.push({t:'virtual-clear',m:`(conceptual — state cache was never written)`});
+    }
+  } else if(nWin>0 && !isCSA){
+    st.push({t:'bulk-compress',nWin:nWin,r:r,m:`Bulk compress: unflatten [${nWin},${r},${projW}] → softmax pool → ${nWin} entries`});
+    for(let w=0;w<nWin;w++){
+      const ws=w*r;
+      st.push({t:'compress',entry:w,toks:Array.from({length:r},(_,j)=>ws+j),m:`Entry ${w} ← tok ${ws}-${ws+r-1}`});
+    }
+    st.push({t:'clear-hca',m:'HCA: state cache cleared.'});
+  }
+
+  // --- State cache priming for decode handoff ---
+  if(nWin>0 || rem>0){
+    st.push({t:'phase',p:'prefill',m:'State cache priming — ONLY time state cache is written during prefill'});
+  }
+
+  // Slots 0-3: last complete window (previous window for decode overlap)
+  if(nWin>0 && isCSA){
+    const lastWS=(nWin-1)*r;
+    for(let j=0;j<r;j++){
+      st.push({t:'store',tok:lastWS+j,slot:j,m:`Store tok ${lastWS+j} → slot ${j} (previous window for decode overlap)`});
+    }
+  }
+
+  // Remainder tokens into current window slots
+  if(rem>0){
+    const remStart=nWin*r;
+    if(nWin===0){
+      st.push({t:'phase',p:'prefill',m:`No complete window — ${rem} token${rem>1?'s':''} stored in state cache, awaiting decode`});
+    }
+    for(let j=0;j<rem;j++){
+      const pos=remStart+j;
+      st.push({t:'store',tok:pos,slot:currOff+(pos%r),m:`Store tok ${pos} → slot ${currOff+(pos%r)} (remainder, awaiting decode)`});
+    }
+  }
+
+  // --- DECODE ---
+  st.push({t:'phase',p:'decode',m:'DECODE — tokens arrive one at a time'});
+  for(let di=0;di<decodeToks;di++){
+    const pos=prefillCount+di;
+    st.push({t:'project',tok:pos,m:`Project tok ${di} (pos ${pos}): kv=wkv(h)→[${projW}], score+ape[${pos%C.ratio}]→[${projW}]`});
+    st.push({t:'store',tok:pos,slot:currOff+(pos%r),m:`Store tok ${di} → slot ${currOff+(pos%r)}`});
+    if((pos+1)%r===0){
+      const ws=pos-r+1, eidx=Math.floor(pos/r);
+      st.push({t:'phase',p:'compress',m:`COMPRESS — boundary at pos ${pos}, (${pos}+1)%${r}==0`});
+      st.push({t:'gather',entry:eidx,m:isCSA
+        ?`Gather: slots 0-${r-1}[:${hd}] + slots ${r}-${2*r-1}[${hd}:]`
+        :`Gather: all ${r} slots → softmax pool`});
+      st.push({t:'compress',entry:eidx,toks:Array.from({length:r},(_,j)=>ws+j),m:`Pool → entry ${eidx} written`});
+      if(isCSA){
+        st.push({t:'phase',p:'shift',m:'SHIFT — current → previous'});
+        st.push({t:'shift',m:`Slots ${r}-${2*r-1} → slots 0-${r-1}. Current cleared.`});
+      } else {
+        st.push({t:'clear-hca',m:'All slots cleared for next window.'});
+      }
+    } else {
+      st.push({t:'silent',tok:pos,m:`(${pos}+1)%${r}=${((pos+1)%r)} ≠ 0 — no compression`});
+    }
+  }
+  return st;
+}
+
+// --- UI ---
+function initUI(){
+  calcParams(); updateSubtitle(); updateParams();
+  const isCSA = curComp!=='hca';
+  const nS = isCSA ? coff*demoRatio : demoRatio;
+
+  // Tokens with prefill/decode labels
+  const totalPos = prefillCount + decodeToks;
+  const tEl=document.getElementById('toks');tEl.innerHTML='';
+  // Prefill row
+  const plbl=document.createElement('span');plbl.className='tok-phase-lbl tok-phase-prefill';plbl.textContent='prefill';tEl.appendChild(plbl);
+  for(let i=0;i<prefillCount;i++){
+    const d=document.createElement('span');d.className='tok tok-p';d.id=`tok-${i}`;d.textContent=`tok ${i}`;tEl.appendChild(d);
+  }
+  // Decode row
+  const br=document.createElement('div');br.className='tok-break';tEl.appendChild(br);
+  const dlbl=document.createElement('span');dlbl.className='tok-phase-lbl tok-phase-decode';dlbl.textContent='decode';dlbl.style.marginLeft='0';tEl.appendChild(dlbl);
+  for(let i=0;i<decodeToks;i++){
+    const pos=prefillCount+i;
+    const d=document.createElement('span');d.className='tok tok-p';d.id=`tok-${pos}`;d.textContent=`tok ${i}`;tEl.appendChild(d);
+  }
+
+  // Cache
+  document.getElementById('csa-cache').style.display=isCSA?'':'none';
+  document.getElementById('hca-cache').style.display=isCSA?'none':'';
+
+  if(isCSA){
+    document.getElementById('cache-lbl').innerHTML=
+      `State Cache — ${nS} slots &nbsp;<span style="color:var(--g0-border)">●</span> prev (0-${demoRatio-1}) &nbsp;<span style="color:var(--g1-border)">●</span> curr (${demoRatio}-${nS-1})`;
+    const g=document.getElementById('cache-grid');g.innerHTML='';
+    for(let i=0;i<nS;i++){
+      if(i===demoRatio){const dv=document.createElement('div');dv.className='slot-div';g.appendChild(dv);}
+      const col=document.createElement('div');col.className='slot-col';col.id=`col-${i}`;
+      const role=i<demoRatio?'prev':'curr',cls=i<demoRatio?'slot-prev':'slot-curr';
+      const hd=C[curVar].head_dim;
+      if(C.overlap){
+        col.innerHTML=`<div class="slot ${cls}" id="slot-${i}"><div class="slot-hdr">slot ${i} · ${role}</div><div class="slot-body">
+          <div class="hlbl">kv [:${hd}] g0</div><div class="hf hf-e" id="s${i}-kv0">—</div>
+          <div class="hlbl">kv [${hd}:] g1</div><div class="hf hf-e" id="s${i}-kv1">—</div>
+          <div class="hlbl">sc [:${hd}] g0</div><div class="hf hf-e" id="s${i}-sc0">—</div>
+          <div class="hlbl">sc [${hd}:] g1</div><div class="hf hf-e" id="s${i}-sc1">—</div>
+        </div></div>`;
+      } else {
+        col.innerHTML=`<div class="slot ${cls}" id="slot-${i}"><div class="slot-hdr">slot ${i}</div><div class="slot-body">
+          <div class="hlbl">kv [${hd}]</div><div class="hf hf-e" id="s${i}-kv0">—</div>
+          <div class="hlbl">sc [${hd}]</div><div class="hf hf-e" id="s${i}-sc0">—</div>
+        </div></div>`;
+      }
+      g.appendChild(col);
+    }
+  } else {
+    document.getElementById('hca-lbl').textContent=`State Cache — ${C.ratio} slots (demo: ${demoRatio} slots, actual ratio=${C.ratio})`;
+    document.getElementById('hca-fill').style.width='0%';
+    document.getElementById('hca-fill').style.background='var(--g1-bg)';
+    document.getElementById('hca-blbl').textContent=`0 / ${demoRatio} slots filled`;
+    // Generate tick marks
+    const ticks=document.getElementById('hca-ticks');ticks.innerHTML='';
+    for(let i=0;i<demoRatio;i++){const t=document.createElement('div');t.className='hca-bar-tick';ticks.appendChild(t);}
+    document.getElementById('hca-info').textContent=`Each slot: kv[${C[curVar].head_dim}] + score[${C[curVar].head_dim}] = ${stateW} fp32 | No overlap (coff=1)`;
+  }
+
+  // KV entries
+  const nEntries = Math.ceil(totalPos/demoRatio);
+  const kv=document.getElementById('kv-entries');kv.innerHTML='';
+  for(let i=0;i<nEntries;i++){const e=document.createElement('div');e.className='kve';e.id=`kv-${i}`;e.textContent=`entry ${i}`;kv.appendChild(e);}
+  document.getElementById('kv-lbl').textContent=`Compressed KV Cache (each [${C[curVar].head_dim}])`;
+
+  // Reset others
+  document.getElementById('proj-bar').innerHTML='';
+  document.getElementById('proj-lbl').textContent='Projection: waiting...';
+  const gs=document.getElementById('gather-sec');
+  gs.classList.add('inactive');
+  gs.querySelector('#gather-rows').innerHTML='';
+  gs.querySelector('#gather-lbl').textContent='Gather: waiting for compression boundary...';
+  gs.querySelector('#gather-res').innerHTML='';
+  if(!_instant){
+    document.getElementById('log').innerHTML='';
+    _logCount=0;
+  }
+  document.getElementById('phase-badge').innerHTML='<span class="stage-badge" style="opacity:0">READY</span>';
+
+  // Ensure dropdown is populated
+  const sel=document.getElementById('prefill-count');
+  if(sel.options.length===0) populateDropdown();
+  else sel.value=prefillCount;
+
+  S = {step:0, slots:Array(nS).fill(null), hcaFilled:0, playing:false, speed:S.speed||800, steps:buildSteps()};
+}
+
+let _logCount=0;
+function lg(h){
+  if(_instant) return; // don't create entries during silent replay
+  const l=document.getElementById('log');
+  const stepIdx=S.step;
+
+  // Check if there's already a greyed entry for this step — un-grey it
+  const existing=l.querySelector(`.le-future[data-step="${stepIdx}"]`);
+  if(existing){
+    existing.classList.remove('le-future');
+    l.scrollTop=l.scrollHeight;
+    return;
+  }
+
+  _logCount++;
+  const d=document.createElement('div');
+  d.className='le';
+  d.setAttribute('data-step', stepIdx);
+  d.innerHTML=`<span class="le-num" title="Click to jump to step ${_logCount}">${_logCount}</span><span class="le-content">${h}</span>`;
+  d.onclick=function(){ rewindTo(stepIdx); };
+  l.appendChild(d);l.scrollTop=l.scrollHeight;
+}
+function setPhase(p){const b=document.getElementById('phase-badge');
+  const c={prefill:'stage-prefill',decode:'stage-decode',compress:'stage-compress',shift:'stage-shift'};
+  const l={prefill:'PREFILL',decode:'DECODE',compress:'COMPRESS',shift:'SHIFT'};
+  b.innerHTML=`<span class="stage-badge ${c[p]}">${l[p]}</span>`;}
+function showProj(tok){
+  const hd=C[curVar].head_dim;
+  document.getElementById('proj-lbl').textContent=`Token ${tok}: wkv(hidden)→[${projW}]  ·  wgate(hidden)+ape[${tok%C.ratio}]→[${projW}]`;
+  if(C.overlap){
+    document.getElementById('proj-bar').innerHTML=
+    `<div class="proj-half" style="flex:1;background:var(--g0-bg);color:var(--g0-fg)">[:${hd}] overlap half → next window</div>
+     <div class="proj-half" style="flex:1;background:var(--g1-bg);color:var(--g1-fg)">[${hd}:] normal half → this window</div>`;
+  } else {
+    document.getElementById('proj-bar').innerHTML=
+    `<div class="proj-half" style="flex:1;background:var(--g1-bg);color:var(--g1-fg)">[${hd}] single projection (no overlap)</div>`;
+  }
+}
+
+function clearHL(){const nS=S.slots.length;for(let i=0;i<nS;i++){
+  const sl=document.getElementById(`slot-${i}`);if(!sl)continue;
+  sl.classList.remove('slot-act','slot-cmp','slot-sft');
+  ['kv0','kv1','sc0','sc1'].forEach(x=>{const e=document.getElementById(`s${i}-${x}`);if(e)e.classList.remove('hf-r','hf-d');});
+}}
+
+function fillSlot(si,tok){
+  S.slots[si]=tok;
+  const isCSA=curComp!=='hca';
+  if(!isCSA){
+    S.hcaFilled=Math.max(S.hcaFilled,(si%demoRatio)+1);
+    const pct=Math.round(S.hcaFilled/demoRatio*100);
+    const bar=document.getElementById('hca-fill');
+    bar.style.width=pct+'%'; bar.style.background='var(--g1-bg)';
+    document.getElementById('hca-blbl').textContent=`${S.hcaFilled} / ${demoRatio} slots filled`;
+    return;
+  }
+  const sl=document.getElementById(`slot-${si}`);
+  sl.className=`slot ${si<demoRatio?'slot-prev':'slot-curr'} slot-act`;
+  const hd=C[curVar].head_dim;
+  const tl=`t${tok}`, isPrev=si<demoRatio;
+  const set=(id,cls,t)=>{const e=document.getElementById(id);if(e){e.className=`hf ${cls}`;e.textContent=t;}};
+  set(`s${si}-kv0`,'hf-0',`${tl}[:${hd}]`);
+  if(C.overlap) set(`s${si}-kv1`, isPrev?'hf-1-dead':'hf-1', `${tl}[${hd}:]`);
+  set(`s${si}-sc0`,'hf-0',`${tl}[:${hd}]`);
+  if(C.overlap) set(`s${si}-sc1`, isPrev?'hf-1-dead':'hf-1', `${tl}[${hd}:]`);
+}
+
+function clearSlot(si){
+  S.slots[si]=null;
+  const sl=document.getElementById(`slot-${si}`);if(!sl)return;
+  sl.className=`slot ${si<demoRatio?'slot-prev':'slot-curr'}`;
+  ['kv0','kv1','sc0','sc1'].forEach(x=>{const e=document.getElementById(`s${si}-${x}`);if(e){e.className='hf hf-e';e.textContent='—';}});
+}
+
+function hideGather(){
+  const gs=document.getElementById('gather-sec');
+  gs.classList.add('inactive');
+}
+function showGather(eidx){
+  const gs=document.getElementById('gather-sec');gs.classList.remove('inactive');
+  const rows=document.getElementById('gather-rows');rows.innerHTML='';
+  const hd=C[curVar].head_dim;
+  const isCSA=curComp!=='hca';
+
+  if(isCSA){
+    document.getElementById('gather-lbl').textContent=`Gather — fixed pattern: slots 0-${demoRatio-1} [:${hd}] + slots ${demoRatio}-${2*demoRatio-1} [${hd}:]`;
+    for(let i=0;i<S.slots.length;i++){
+      const sl=document.getElementById(`slot-${i}`);if(sl)sl.classList.add('slot-cmp');
+      const tok=S.slots[i],isPrev=i<demoRatio;
+      const row=document.createElement('div');row.className='gr';
+      if(tok!==null){
+        const readH=isPrev?`[:${hd}]`:`[${hd}:]`;
+        const ignH=isPrev?`[${hd}:]`:`[:${hd}]`;
+        row.innerHTML=`<span style="width:95px;color:var(--text-tertiary)">slot ${i} (${isPrev?'prev':'curr'}):</span>
+          <div class="gv" style="background:${isPrev?'var(--g0-bg)':'var(--g1-bg)'};color:${isPrev?'var(--g0-fg)':'var(--g1-fg)'}">t${tok} ${readH}</div>
+          <span style="color:var(--accent-green);font-weight:600">← READ</span>
+          <span style="color:var(--text-tertiary);font-size:9px">${ignH} ignored</span>`;
+        if(isPrev){const a=document.getElementById(`s${i}-kv0`);if(a)a.classList.add('hf-r');
+                   const b=document.getElementById(`s${i}-sc0`);if(b)b.classList.add('hf-r');
+                   const c=document.getElementById(`s${i}-kv1`);if(c)c.classList.add('hf-d');
+                   const d=document.getElementById(`s${i}-sc1`);if(d)d.classList.add('hf-d');}
+        else{const a=document.getElementById(`s${i}-kv1`);if(a)a.classList.add('hf-r');
+             const b=document.getElementById(`s${i}-sc1`);if(b)b.classList.add('hf-r');
+             const c=document.getElementById(`s${i}-kv0`);if(c)c.classList.add('hf-d');
+             const d=document.getElementById(`s${i}-sc0`);if(d)d.classList.add('hf-d');}
+      } else {
+        row.innerHTML=`<span style="width:95px;color:var(--text-tertiary)">slot ${i} (prev):</span>
+          <div class="gv" style="background:var(--bg-tertiary);color:var(--text-tertiary)">fill: 0/-inf</div>
+          <span style="color:var(--text-tertiary)">← no data</span>`;
+      }
+      rows.appendChild(row);
+    }
+  } else {
+    document.getElementById('gather-lbl').textContent=`Gather — all ${demoRatio} slots, softmax over ${demoRatio} positions`;
+    const filled=S.hcaFilled;
+    rows.innerHTML=`<div class="gr"><span style="color:var(--text-secondary)">${filled} slots filled → softmax(scores, dim=0) over ${filled} positions → weighted sum → [${hd}]</span></div>
+      <div class="gr"><span style="color:var(--text-tertiary)">No overlap, no half-selection — full [${hd}] from each slot</span></div>`;
+    document.getElementById('hca-fill').style.background='var(--accent-green)';
+    document.getElementById('hca-blbl').classList.add('active');
+  }
+  const postPipeline = C.rotate ? 'RMSNorm → RoPE → Hadamard → FP4 quant' : 'RMSNorm → RoPE → FP8 quant';
+  document.getElementById('gather-res').innerHTML=`→ softmax → weighted_sum → <b>[${hd}]</b> → ${postPipeline}`;
+}
+
+function writeKV(eidx){const e=document.getElementById(`kv-${eidx}`);
+  e.className='kve kve-f kve-n';e.textContent=`entry ${eidx} ✓`;
+  setTimeout(()=>e.classList.remove('kve-n'),600);}
+
+function doShiftCSA(){
+  const r=demoRatio;
+  function applyShift(){
+    for(let i=0;i<r;i++){if(S.slots[r+i]!==null)fillSlot(i,S.slots[r+i]);else clearSlot(i);clearSlot(r+i);}
+    for(let i=0;i<2*r;i++){const c=document.getElementById(`col-${i}`);if(c)c.classList.remove('shift-l','fade-out','fade-in');}
+    for(let i=0;i<r;i++){const c=document.getElementById(`col-${i}`);if(c&&!_instant)c.classList.add('fade-in');
+      const sl=document.getElementById(`slot-${i}`);if(sl)sl.className='slot slot-prev';}
+    hideGather();clearHL();
+  }
+  if(_instant){ applyShift(); return; }
+  for(let i=r;i<2*r;i++){const c=document.getElementById(`col-${i}`);if(c){c.classList.add('shift-l');document.getElementById(`slot-${i}`).classList.add('slot-sft');}}
+  for(let i=0;i<r;i++){const c=document.getElementById(`col-${i}`);if(c)c.classList.add('fade-out');}
+  setTimeout(applyShift,650);
+}
+
+function doClearHCA(){
+  S.hcaFilled=0;
+  document.getElementById('hca-fill').style.width='0%';
+  document.getElementById('hca-fill').style.background='var(--g1-bg)';
+  const blbl=document.getElementById('hca-blbl');
+  blbl.textContent=`0 / ${demoRatio} slots filled`;
+  blbl.classList.remove('active');
+  hideGather();
+  S.slots.fill(null);
+}
+
+function doStep(){
+  if(S.step>=S.steps.length)return;
+  const s=S.steps[S.step]; clearHL();
+  switch(s.t){
+    case 'phase': setPhase(s.p); lg(`<span class="ls">━━ ${s.m} ━━</span>`); break;
+    case 'project': document.getElementById(`tok-${s.tok}`).className='tok tok-c'; showProj(s.tok);
+      lg(`<span class="la">→ ${s.m}</span>`); break;
+    case 'bulk-project':
+      for(let i=0;i<s.count;i++){const te=document.getElementById(`tok-${i}`);if(te)te.className='tok tok-w';}
+      document.getElementById('proj-lbl').textContent=s.m;
+      document.getElementById('proj-bar').innerHTML=
+        `<div class="proj-half" style="flex:1;background:var(--accent-purple);color:white;opacity:0.7;font-size:10px">All ${s.count} tokens projected in bulk (no state cache involved)</div>`;
+      lg(`<span class="la">→ ${s.m}</span>`); break;
+    case 'bulk-compress':
+      lg(`<span class="lc">→ ${s.m}</span>`);
+      break;
+    case 'virtual-fill': {
+      // Show overlap positions with dashed purple borders + lighter colors — conceptual only
+      const ws=s.ws, hd=C[curVar].head_dim;
+      const set=(id,cls,t)=>{const e=document.getElementById(id);if(e){e.className=`hf ${cls}`;e.textContent=t;}};
+      // Current window (slots 4-7): only group 1 [hd:] is used (lighter colors)
+      for(let j=0;j<demoRatio;j++){
+        const si=demoRatio+j, tok=ws+j;
+        S.slots[si]=tok;
+        const sl=document.getElementById(`slot-${si}`);
+        if(sl) sl.className='slot slot-virtual';
+        set(`s${si}-kv0`,'hf-e','—');
+        if(C.overlap) set(`s${si}-kv1`,'hf-1v',`t${tok}[${hd}:]`);
+        set(`s${si}-sc0`,'hf-e','—');
+        if(C.overlap) set(`s${si}-sc1`,'hf-1v',`t${tok}[${hd}:]`);
+      }
+      // Previous window (slots 0-3): only group 0 [:hd] is used (lighter colors)
+      if(s.hasPrev){
+        for(let j=0;j<demoRatio;j++){
+          const si=j, tok=s.prevWS+j;
+          S.slots[si]=tok;
+          const sl=document.getElementById(`slot-${si}`);
+          if(sl) sl.className='slot slot-virtual';
+          set(`s${si}-kv0`,'hf-0v',`t${tok}[:${hd}]`);
+          if(C.overlap) set(`s${si}-kv1`,'hf-e','—');
+          set(`s${si}-sc0`,'hf-0v',`t${tok}[:${hd}]`);
+          if(C.overlap) set(`s${si}-sc1`,'hf-e','—');
+        }
+      }
+      lg(`<span class="la">→ ${s.m}</span><br><span class="ld">&nbsp;&nbsp;(dashed purple border = conceptual view via overlap_transform, state cache not touched)</span>`);
+      } break;
+    case 'virtual-clear':
+      for(let i=0;i<S.slots.length;i++){
+        clearSlot(i);
+        const sl=document.getElementById(`slot-${i}`);
+        if(sl) sl.classList.remove('slot-virtual');
+      }
+      hideGather();
+      lg(`<span class="ld">→ ${s.m}</span>`);
+      break;
+    case 'store': fillSlot(s.slot,s.tok); document.getElementById(`tok-${s.tok}`).className='tok tok-w';
+      lg(`<span class="la">→ ${s.m}</span><br><span class="ld">&nbsp;&nbsp;[${projW}] kv + [${projW}] score = ${stateW} fp32</span>`); break;
+    case 'gather': showGather(s.entry);
+      lg(`<span class="lc">→ ${s.m}</span>`); break;
+    case 'compress': writeKV(s.entry); s.toks.forEach(t=>{document.getElementById(`tok-${t}`).className='tok tok-d';});
+      lg(`<span class="lc">→ ${s.m}</span>`); break;
+    case 'shift': doShiftCSA(); lg(`<span class="lh">→ ${s.m}</span>`); break;
+    case 'clear-hca': doClearHCA(); lg(`<span class="lh">→ ${s.m}</span>`); break;
+    case 'silent': document.getElementById(`tok-${s.tok}`).className='tok tok-d';
+      hideGather();
+      document.getElementById('proj-bar').innerHTML='';
+      document.getElementById('proj-lbl').textContent='No projection — compressor returns None';
+      lg(`<span class="ld">→ ${s.m}</span>`); break;
+  }
+  S.step++;
+  if(S.step>=S.steps.length){lg('<span class="ls">━━ COMPLETE ━━</span>');stopPlay();}
+}
+
+let pInt=null;
+function togglePlay(){if(S.playing){stopPlay();}else{S.playing=true;
+  document.getElementById('btn-play').textContent='Pause ⏸';document.getElementById('btn-play').classList.add('active');
+  pInt=setInterval(()=>{if(S.step>=S.steps.length){stopPlay();return;}doStep();},S.speed);}}
+function stopPlay(){S.playing=false;if(pInt)clearInterval(pInt);pInt=null;
+  document.getElementById('btn-play').textContent='Play ▶▶';document.getElementById('btn-play').classList.remove('active');}
+function setSpd(ms){S.speed=ms;document.querySelectorAll('[id^="sp-"]').forEach(b=>b.classList.remove('active'));
+  document.getElementById('sp-'+ms).classList.add('active');if(S.playing){stopPlay();togglePlay();}}
+function doReset(){stopPlay();initUI();}
+
+let _instant = false;
+
+function rewindTo(targetStep){
+  stopPlay();
+  const savedSpeed=S.speed;
+
+  // Save log content before initUI clears it
+  const logEl=document.getElementById('log');
+  const savedLog=logEl.innerHTML;
+  const savedLogCount=_logCount;
+
+  _instant=true;
+  initUI();
+
+  // Restore log and replay animation state silently
+  logEl.innerHTML=savedLog;
+  _logCount=savedLogCount;
+
+  // Replay animation state to targetStep (lg() is suppressed by _instant)
+  for(let i=0;i<targetStep;i++) doStep();
+  _instant=false;
+  S.speed=savedSpeed;
+
+  // Grey out entries after targetStep, un-grey entries up to it
+  logEl.querySelectorAll('.le').forEach(el=>{
+    const s=parseInt(el.getAttribute('data-step'));
+    if(s>=targetStep) el.classList.add('le-future');
+    else el.classList.remove('le-future');
+  });
+}
+
+function doStepBack(){
+  if(S.step<=0)return;
+  rewindTo(S.step-1);
+}
+
+populateDropdown();
+initUI();
+</script>
+</body>
+</html>
