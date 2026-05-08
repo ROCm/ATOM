@@ -762,6 +762,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 np.cumsum(n_committed_per_seq, dtype=np.int64),
             ]
         )
+        # Empty-batch guard: when no seq has committed K yet
+        # (`cu_committed_cpu[-1] == 0`, e.g. fresh prefill with prompt
+        # shorter than the CSA `ratio`), `cp_gather_indexer_k_quant_cache`
+        # would launch with grid.x = 0 and fail with HIP "invalid
+        # configuration argument". Bump the last cumsum by one so the
+        # kernel sees a single dummy row to gather (charged to the last
+        # seq's first cache block). Downstream readers
+        # (`fp8_mqa_logits` + `top_k_per_row_prefill`) honor per-token
+        # `cu_starts`/`cu_ends` derived from `cu_committed_gpu[:-1]` and
+        # `n_committed_per_seq`, both of which remain 0 — so the dummy
+        # row is never read and the output is `-1` sentinels everywhere,
+        # matching the all-empty semantics. Pure host-side scalar
+        # arithmetic on a value already host-synced two lines up; no new
+        # CG/torch.compile graph branch is introduced.
+        cu_committed_cpu[-1] = max(int(cu_committed_cpu[-1]), 1)
         total_committed = int(cu_committed_cpu[-1])
 
         # FP8 write-side slot_mapping (independent of `total_committed` —
@@ -771,15 +786,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         compress_slot_mapping_gpu = self._build_indexer_compress_slot_mapping(
             csa_compress_plan_cpu, scheduled_bs, k_per_block, ratio
         )
-
-        # All-empty batch: forward_batched short-circuits on
-        # `total_committed == 0` and returns -1; the FP8 read side is unused.
-        if total_committed == 0:
-            return {
-                "total_committed": 0,
-                "cu_committed_gpu": None,
-                "compress_slot_mapping_gpu": compress_slot_mapping_gpu,
-            }
 
         # batch_id_per_token + n_committed_csa: reuse the shared GPU
         # tensors set in `_attach_v4_per_fwd_meta` (which MUST run before

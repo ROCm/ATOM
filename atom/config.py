@@ -421,6 +421,13 @@ class QuantizationConfig:
             new_excludes.append(name)
         self.exclude_layers = list(dict.fromkeys(new_excludes))
 
+    def apply_default_exclude_layers(self, excludes: list[str]):
+        if not excludes:
+            return
+        for exclude in excludes:
+            if exclude not in self.exclude_layers:
+                self.exclude_layers.append(exclude)
+
     def remap_layer_name(
         self,
         hf_config: PretrainedConfig,

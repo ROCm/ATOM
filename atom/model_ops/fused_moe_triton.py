@@ -18,7 +18,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import torch
+from contextlib import contextmanager
 from typing import Any
 import logging
 from math import prod
@@ -39,6 +41,45 @@ if has_triton_kernels():
             "version is compatible. Error: %s",
             e,
         )
+
+
+@contextmanager
+def _amd_smem_safe_tile():
+    """Cap matmul_ogs tile size on AMD CDNA4 to fit MI355X's 160 KiB LDS.
+
+    triton_kernels' AMD opt_flags has a special-case
+    `if cdna4 and block_m == 128: block_n = 512`, which makes BLOCK_M*BLOCK_N
+    = 64K FP32 entries — large enough that triton 3.6+/3.7+ spills the
+    accumulator into LDS and overflows the 160 KiB budget (observed 269 KiB
+    on V4-Pro FP8 MoE). triton 3.5 happened to keep more of the acc in
+    registers and slipped under the limit, hence the version-dependent OOM.
+
+    Pin block_n ≤ ATOM_TRITON_MOE_MAX_BLOCK_N (default 256) so BLOCK_M*BLOCK_N
+    stays at 32K. Default block_n in compute_block_nk is already capped at
+    256 except for that single cdna4 branch, so this only sidesteps the bad
+    path on gfx950.
+    """
+    if get_gfx() != "gfx950" or not has_triton_kernels():
+        yield
+        return
+    try:
+        from triton_kernels.matmul_ogs_details.opt_flags import (
+            update_opt_flags_constraints,
+            reset_opt_flags_constraints,
+        )
+    except ImportError:
+        yield
+        return
+    # Defaults chosen so BLOCK_M*BLOCK_N stays ≤ 16384 entries (64 KiB FP32
+    # acc), comfortably fitting MI355X's register file. Override via env if
+    # a future compiler/kernel update relaxes the budget.
+    block_m = int(os.getenv("ATOM_TRITON_MOE_BLOCK_M", "64"))
+    block_n = int(os.getenv("ATOM_TRITON_MOE_BLOCK_N", "256"))
+    update_opt_flags_constraints({"block_m": block_m, "block_n": block_n})
+    try:
+        yield
+    finally:
+        reset_opt_flags_constraints()
 
 
 def _swizzle_mxfp4(quant_tensor, scale):
@@ -241,16 +282,17 @@ def triton_kernel_fused_experts(
         dtype=hidden_states.dtype,
     )
 
-    matmul_ogs(
-        hidden_states,
-        w1,
-        w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
-        precision_config=w13_precision_config,
-        gammas=gammas if apply_router_weight_on_input else None,
-        y=raw_intermediate,
-    )
+    with _amd_smem_safe_tile():
+        matmul_ogs(
+            hidden_states,
+            w1,
+            w1_bias,
+            routing_data,
+            gather_indx=gather_indx,
+            precision_config=w13_precision_config,
+            gammas=gammas if apply_router_weight_on_input else None,
+            y=raw_intermediate,
+        )
 
     # Standard SiLU/SwiGLU activation: silu(gate) * up
     # With optional swiglu_limit clamping (V4: limit=10.0)
@@ -262,16 +304,17 @@ def triton_kernel_fused_experts(
         up = up.clamp(-swiglu_limit, swiglu_limit)
     intermediate_cache[0] = torch.nn.functional.silu(gate) * up
 
-    matmul_ogs(
-        intermediate_cache.view(M * topk, half_N),
-        w2,
-        w2_bias,
-        routing_data,
-        scatter_indx=scatter_indx,
-        precision_config=w2_precision_config,
-        gammas=None if apply_router_weight_on_input else gammas,
-        y=output_tensor,
-    )
+    with _amd_smem_safe_tile():
+        matmul_ogs(
+            intermediate_cache.view(M * topk, half_N),
+            w2,
+            w2_bias,
+            routing_data,
+            scatter_indx=scatter_indx,
+            precision_config=w2_precision_config,
+            gammas=None if apply_router_weight_on_input else gammas,
+            y=output_tensor,
+        )
 
     output_tensor = output_tensor.view(M, K)
     return output_tensor

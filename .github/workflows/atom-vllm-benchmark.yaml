@@ -19,6 +19,10 @@ on:
         description: "DeepSeek-R1 MXFP4 TP8"
         type: boolean
         default: false
+      deepseek-v3-2-fp8:
+        description: "DeepSeek-V3.2 FP8 TP8"
+        type: boolean
+        default: false
       gpt-oss-120b:
         description: "gpt-oss-120b TP1"
         type: boolean
@@ -451,6 +455,7 @@ jobs:
         env:
           ENABLE_DEEPSEEK_R1_FP8: ${{ inputs.deepseek-r1-fp8 }}
           ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4 }}
+          ENABLE_DEEPSEEK_V3_2_FP8: ${{ inputs.deepseek-v3-2-fp8 }}
           ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b }}
           ENABLE_GLM_5_1_FP8_TP8: ${{ inputs.glm-5-1-fp8-tp8 }}
           ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
@@ -485,6 +490,7 @@ jobs:
           manual_toggles = {
               "deepseek-r1-fp8": os.environ.get("ENABLE_DEEPSEEK_R1_FP8", "").lower() == "true",
               "deepseek-r1-mxfp4": os.environ.get("ENABLE_DEEPSEEK_R1_MXFP4", "").lower() == "true",
+              "deepseek-v3-2-fp8": os.environ.get("ENABLE_DEEPSEEK_V3_2_FP8", "").lower() == "true",
               "gpt-oss-120b": os.environ.get("ENABLE_GPT_OSS_120B", "").lower() == "true",
               "glm-5-1-fp8-tp8": os.environ.get("ENABLE_GLM_5_1_FP8_TP8", "").lower() == "true",
               "kimi-k2-thinking-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K2_TP4", "").lower() == "true",
@@ -812,6 +818,7 @@ jobs:
           case "${{ matrix.model.prefix }}" in
             deepseek-r1-fp8) echo "enabled=${{ inputs.deepseek-r1-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-v3-2-fp8) echo "enabled=${{ inputs.deepseek-v3-2-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> "$GITHUB_OUTPUT" ;;
             glm-5-1-fp8-tp8) echo "enabled=${{ inputs.glm-5-1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
