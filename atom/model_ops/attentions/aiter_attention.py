@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_generate_triton,
@@ -498,19 +498,50 @@ class AiterAttentionMetadataBuilder:
             )
         else:
             x = 16 // runner.kv_cache.element_size()
-            k_cache = runner.kv_cache[0, attn_idx].view(
-                runner.num_physical_kvcache_blocks,
-                runner.num_kv_heads,
-                hf_config.head_dim // x,
-                runner.physical_block_size,
-                x,
+            # unified_attention consumes flash layout directly; the ASM path
+            # keeps the legacy shuffled K layout.
+            impl = getattr(module, "impl", None)
+            use_triton_attn = impl is not None and (
+                getattr(impl, "sliding_window", -1) != -1
+                or getattr(impl, "head_dim", 128) != 128
             )
-            v_cache = runner.kv_cache[1, attn_idx].view(
-                runner.num_physical_kvcache_blocks,
-                runner.num_kv_heads,
-                hf_config.head_dim,
-                runner.physical_block_size,
+            fused_shuffle_path = impl is not None and (
+                getattr(impl, "rotary_emb", None) is not None
+                and getattr(impl, "q_norm", None) is not None
+                and getattr(impl, "k_norm", None) is not None
             )
+            use_flash_layout = (
+                use_triton_attn
+                and not fused_shuffle_path
+                and envs.ATOM_USE_UNIFIED_ATTN
+            )
+            if use_flash_layout:
+                k_cache = runner.kv_cache[0, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    runner.physical_block_size,
+                    runner.num_kv_heads,
+                    hf_config.head_dim,
+                )
+                v_cache = runner.kv_cache[1, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    runner.physical_block_size,
+                    runner.num_kv_heads,
+                    hf_config.head_dim,
+                )
+            else:
+                k_cache = runner.kv_cache[0, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    runner.num_kv_heads,
+                    hf_config.head_dim // x,
+                    runner.physical_block_size,
+                    x,
+                )
+                v_cache = runner.kv_cache[1, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    runner.num_kv_heads,
+                    hf_config.head_dim,
+                    runner.physical_block_size,
+                )
             if config.kv_cache_dtype == "fp8":
                 module.k_scale = runner.kv_scale[0, attn_idx]
                 module.v_scale = runner.kv_scale[1, attn_idx]
