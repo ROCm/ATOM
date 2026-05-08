@@ -31,7 +31,7 @@ from aiter import (
     QuantType,
     cp_gather_indexer_k_quant_cache,
     dtypes,
-    fused_qk_rmsnorm_maybe_quant,
+    fused_qk_rmsnorm,
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
@@ -181,8 +181,14 @@ def _fused_rms_fp8_quant_fake(
     torch.Tensor,
 ]:
     m, n1 = x1.shape
-    out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
-    if quant_type == QuantType.per_Token.value:
+    disable_quant = quant_type is None or quant_type == QuantType.No.value
+    if not disable_quant:
+        out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
+    else:
+        out1_quantized = torch.empty_like(x1)
+    if disable_quant:
+        out1_bs = None
+    elif quant_type == QuantType.per_Token.value:
         out1_bs = torch.empty((m, 1), dtype=torch.float32, device=x1.device)
     else:
         num_bs_cols = (n1 + group_size - 1) // group_size
@@ -286,7 +292,7 @@ def _fused_rms_fp8_quant(
     else:
         quant_type = QuantType(quant_type)
 
-    fused_qk_rmsnorm_maybe_quant(
+    fused_qk_rmsnorm(
         q_out_quantized=out1_quantized,
         q_out_scale=out1_bs,
         q=x1,
@@ -716,36 +722,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
 
     # logger.info(f"{q_c.shape=}, {q_c_scale.shape=}, {kv_c_normed.shape=}, {k_pe.shape=}, {q_c.stride()=}, {q_c_scale.stride()=}, {kv_c_normed.stride()=}, {k_pe.stride()=}")
     return q_c, q_c_scale, kv_c_normed, k_pe
-
-
-def _fused_qk_rmsnorm_fake(
-    q_c: torch.Tensor,
-    q_a_layernorm_weight: torch.Tensor,
-    q_a_layernorm_variance_epsilon: float,
-    kv_c: torch.Tensor,
-    kv_a_layernorm_weight: torch.Tensor,
-    kv_a_layernorm_variance_epsilon: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(q_c), torch.empty_like(kv_c)
-
-
-@torch_compile_guard(gen_fake=_fused_qk_rmsnorm_fake)
-def _fused_qk_rmsnorm(
-    q_c: torch.Tensor,
-    q_a_layernorm_weight: torch.Tensor,
-    q_a_layernorm_variance_epsilon: float,
-    kv_c: torch.Tensor,
-    kv_a_layernorm_weight: torch.Tensor,
-    kv_a_layernorm_variance_epsilon: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return fused_qk_rmsnorm_maybe_quant(
-        q=q_c,
-        q_weight=q_a_layernorm_weight,
-        q_epsilon=q_a_layernorm_variance_epsilon,
-        k=kv_c,
-        k_weight=kv_a_layernorm_weight,
-        k_epsilon=kv_a_layernorm_variance_epsilon,
-    )
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1543,7 +1519,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     dim=-1,
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
-                if self.fuse_qknorm_quant:
+                if self.fuse_qknorm_quant or self.fuse_qknorm:
                     (
                         (hidden_states_or_q_c, hidden_states_or_q_c_scale),
                         _,
@@ -1565,16 +1541,6 @@ class DeepseekV2MLAAttention(nn.Module):
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
-                elif self.fuse_qknorm:
-                    hidden_states_or_q_c, kv_c_normed = _fused_qk_rmsnorm(
-                        q_c,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.eps,
-                        kv_c,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.eps,
-                    )
-                    hidden_states_or_q_c_scale = None
                 else:
                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
