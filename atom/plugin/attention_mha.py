@@ -245,9 +245,10 @@ class PagedAttentionImplPluginModeMethods:
         assert num_q_heads_total % num_kv_heads == 0
         context_partition_size = 256
 
-        use_ps = self.adopt_persistent_kernel(
-            head_size, num_kv_heads, num_q_heads_total
-        )
+        # use_ps = self.adopt_persistent_kernel(
+        #     head_size, num_kv_heads, num_q_heads_total
+        # )
+        use_ps = True
         if use_ps:
             max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
         else:
