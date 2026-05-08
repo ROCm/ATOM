@@ -21,6 +21,7 @@ from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.decorators import mark_trace
+from atom.utils import envs
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
@@ -347,8 +348,9 @@ class RMSNormGated(nn.Module):
                 # Extract group size from quant type
                 if quant_type == QuantType.per_1x128:
                     self.group_size_quant = 128
-                    # per_1x128 blockscale GEMM requires transposed scale layout
-                    self.transpose_scale = True
+                    # preshuffle GEMM expects column-major x_scale;
+                    # non-preshuffle GEMM expects row-major x_scale
+                    self.transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
                 elif quant_type == QuantType.per_1x32:
                     self.group_size_quant = 32
                     self.transpose_scale = False
@@ -557,15 +559,23 @@ class GemmaRMSNorm(nn.Module):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
         from aiter.utility.dtypes import fp8
 
+        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         group_size = 128
         M = x.shape[0]
         N = x.shape[1]
         num_groups = N // group_size
 
         out_fp8 = torch.empty((M, N), dtype=fp8, device=x.device)
-        out_scale = torch.empty(
-            (num_groups, M), dtype=torch.float32, device=x.device
-        ).view(M, num_groups)
+        if transpose_scale:
+            # column-major: allocate (num_groups, M) then view as (M, num_groups)
+            out_scale = torch.empty(
+                (num_groups, M), dtype=torch.float32, device=x.device
+            ).view(M, num_groups)
+        else:
+            # row-major: allocate (M, num_groups) directly
+            out_scale = torch.empty(
+                (M, num_groups), dtype=torch.float32, device=x.device
+            )
         out_bf16 = (
             torch.empty((M, N), dtype=x.dtype, device=x.device)
             if self.write_bf16
@@ -583,7 +593,7 @@ class GemmaRMSNorm(nn.Module):
             q_res_out=res_out,
             q_residual=residual,
             group_size=group_size,
-            transpose_scale=True,
+            transpose_scale=transpose_scale,
             gemma_norm=True,
         )
         if residual is not None:
