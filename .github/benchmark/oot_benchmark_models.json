@@ -34,6 +34,18 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
+    "display": "DeepSeek-V3.2 FP8 TP4",
+    "dashboard_model": "DeepSeek-V3.2-FP8-tp4",
+    "source_path": "deepseek-ai/DeepSeek-V3.2",
+    "path": "deepseek-ai/DeepSeek-V3.2",
+    "prefix": "deepseek-v3-2-fp8-tp4",
+    "nightly_group": "B",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 4 --block-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+  },
+  {
     "display": "MiniMax-M2.5 TP2",
     "dashboard_model": "MiniMax-M2.5",
     "source_path": "MiniMaxAI/MiniMax-M2.5",
