@@ -73,7 +73,7 @@ def _amd_smem_safe_tile():
     # Defaults chosen so BLOCK_M*BLOCK_N stays ≤ 16384 entries (64 KiB FP32
     # acc), comfortably fitting MI355X's register file. Override via env if
     # a future compiler/kernel update relaxes the budget.
-    block_m = int(os.getenv("ATOM_TRITON_MOE_BLOCK_M", "64"))
+    block_m = int(os.getenv("ATOM_TRITON_MOE_BLOCK_M", "32"))
     block_n = int(os.getenv("ATOM_TRITON_MOE_BLOCK_N", "256"))
     update_opt_flags_constraints({"block_m": block_m, "block_n": block_n})
     try:
