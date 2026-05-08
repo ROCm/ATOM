@@ -22,6 +22,28 @@
     "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
   },
   {
+    "display": "DeepSeek-V3.2 FP8 TP8",
+    "dashboard_model": "DeepSeek-V3.2-FP8",
+    "source_path": "deepseek-ai/DeepSeek-V3.2",
+    "path": "deepseek-ai/DeepSeek-V3.2",
+    "prefix": "deepseek-v3-2-fp8",
+    "extra_args": "--trust-remote-code --tensor-parallel-size 8 --block-size 1 --max-num-batched-tokens 16384 --max-model-len 16384",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+  },
+  {
+    "display": "MiniMax-M2.5 TP2",
+    "dashboard_model": "MiniMax-M2.5",
+    "source_path": "MiniMaxAI/MiniMax-M2.5",
+    "path": "MiniMaxAI/MiniMax-M2.5",
+    "prefix": "MiniMax-M2.5-tp2",
+    "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2",
+    "bench_args": "",
+    "runner": "atom-mi355-8gpu-oot-benchmark",
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+  },
+  {
     "display": "gpt-oss-120b TP1",
     "source_path": "openai/gpt-oss-120b",
     "path": "openai/gpt-oss-120b",

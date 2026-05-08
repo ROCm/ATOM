@@ -43,9 +43,9 @@ on:
       runner:
         description: "Runner label to use"
         type: choice
-        default: "linux-atom-mi355-1"
+        default: "linux-atom-mi35x-1"
         options:
-          - linux-atom-mi355-1
+          - linux-atom-mi35x-1
           - build-only-atom
           - atom-mi355-8gpu.predownload
       skip_tests:
