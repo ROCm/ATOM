@@ -31,7 +31,7 @@ from aiter import (
     QuantType,
     cp_gather_indexer_k_quant_cache,
     dtypes,
-    fused_qk_rmsnorm,
+    fused_qk_rmsnorm_maybe_quant,
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
@@ -286,7 +286,7 @@ def _fused_rms_fp8_quant(
     else:
         quant_type = QuantType(quant_type)
 
-    fused_qk_rmsnorm(
+    fused_qk_rmsnorm_maybe_quant(
         q_out_quantized=out1_quantized,
         q_out_scale=out1_bs,
         q=x1,
@@ -738,13 +738,13 @@ def _fused_qk_rmsnorm(
     kv_a_layernorm_weight: torch.Tensor,
     kv_a_layernorm_variance_epsilon: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return fused_qk_rmsnorm(
-        q_c,
-        q_a_layernorm_weight,
-        q_a_layernorm_variance_epsilon,
-        kv_c,
-        kv_a_layernorm_weight,
-        kv_a_layernorm_variance_epsilon,
+    return fused_qk_rmsnorm_maybe_quant(
+        q=q_c,
+        q_weight=q_a_layernorm_weight,
+        q_epsilon=q_a_layernorm_variance_epsilon,
+        k=kv_c,
+        k_weight=kv_a_layernorm_weight,
+        k_epsilon=kv_a_layernorm_variance_epsilon,
     )
 
 
