@@ -8,6 +8,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.models.utils import IntermediateTensors
@@ -40,7 +41,13 @@ class SharedHead(nn.Module):
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
-    def __init__(self, atom_config: Config, prefix: str, layer_idx: int) -> None:
+    def __init__(
+        self,
+        atom_config: Config,
+        prefix: str,
+        layer_idx: int,
+        topk_indices_buffer: Optional[torch.Tensor] = None,
+    ) -> None:
         super().__init__()
 
         config = atom_config.hf_config
@@ -48,7 +55,13 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.eh_proj = ReplicatedLinear(
+            config.hidden_size * 2,
+            config.hidden_size,
+            bias=False,
+            quant_config=atom_config.quant_config,
+            prefix=maybe_prefix(prefix, "eh_proj"),
+        )
 
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
@@ -63,6 +76,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
+            topk_indices_buffer=topk_indices_buffer,
         )
 
     def forward(
@@ -95,7 +109,13 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):
-    def __init__(self, *, atom_config: Config, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        atom_config: Config,
+        prefix: str = "",
+        topk_indices_buffer: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
         config = atom_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
@@ -104,7 +124,10 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         self.layers = torch.nn.ModuleDict(
             {
                 str(idx): DeepSeekMultiTokenPredictorLayer(
-                    atom_config, f"{prefix}.layers.{idx}", layer_idx=idx
+                    atom_config,
+                    f"{prefix}.layers.{idx}",
+                    layer_idx=idx,
+                    topk_indices_buffer=topk_indices_buffer,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -167,8 +190,20 @@ class DeepSeekMTP(nn.Module):
                 "up_proj": ("gate_up_proj", 1),
             }
 
+        if hasattr(self.config, "index_topk"):
+            topk_indices_buffer = torch.empty(
+                atom_config.max_num_batched_tokens,
+                self.config.index_topk,
+                dtype=torch.int32,
+                device="cuda",
+            )
+        else:
+            topk_indices_buffer = None
+
         self.model = DeepSeekMultiTokenPredictor(
-            atom_config=atom_config, prefix=maybe_prefix(prefix, "model")
+            atom_config=atom_config,
+            prefix=maybe_prefix(prefix, "model"),
+            topk_indices_buffer=topk_indices_buffer,
         )
 
     def remap_mtp_weight_name(self, name: str) -> str | None:

@@ -580,18 +580,34 @@ function parseRunConfigs(run) {
 // All parsed configs from all runs, keyed by configKey, each holding array of values over time.
 // When multiple runs share the same commit, keep only the newest run per (configKey, commit)
 // so that all consumers (table, trend chart, tooltip, detail panel) see consistent data.
+function localDay(ts) { const d = new Date(ts); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+
 const historyMap = {}; // key -> [{date, commit, throughput, ...}, ...]
-const _seenCommits = {}; // key -> Set of 7-char commit prefixes already added
+const _seenDayCommit = {}; // key -> { "day|cid7": { cfg, benchCount } }
+const _benchCounts = new WeakMap(); // cfg -> run.benches.length (avoids polluting cfg objects)
 // Use 7-char prefix for dedup: data.js may store the same commit as abbreviated
 // (e.g. "450f14b7") or full hash — both must be treated as the same commit.
 for (const run of allRuns) {
   const configs = parseRunConfigs(run);
   for (const [key, cfg] of Object.entries(configs)) {
-    if (!historyMap[key]) { historyMap[key] = []; _seenCommits[key] = new Set(); }
+    if (!historyMap[key]) { historyMap[key] = []; _seenDayCommit[key] = {}; }
     const cid7 = cfg.commit.id.slice(0, 7);
-    // allRuns is sorted desc by date, so first entry for a commit is the newest — skip duplicates
-    if (_seenCommits[key].has(cid7)) continue;
-    _seenCommits[key].add(cid7);
+    // Dedup by day+commit — keep the entry from the run with most benches
+    const day = localDay(cfg.date);
+    const dedupKey = day + '|' + cid7;
+    const prev = _seenDayCommit[key][dedupKey];
+    if (prev) {
+      // Replace if this run is from a larger batch (more complete nightly)
+      const prevIdx = historyMap[key].indexOf(prev.cfg);
+      if (prevIdx >= 0 && run.benches.length > prev.benchCount) {
+        _benchCounts.set(cfg, run.benches.length);
+        historyMap[key][prevIdx] = cfg;
+        _seenDayCommit[key][dedupKey] = { cfg, benchCount: run.benches.length };
+      }
+      continue;
+    }
+    _benchCounts.set(cfg, run.benches.length);
+    _seenDayCommit[key][dedupKey] = { cfg, benchCount: run.benches.length };
     historyMap[key].push(cfg);
   }
 }
@@ -615,7 +631,7 @@ for (const history of Object.values(historyMap)) {
   for (const cfg of history) {
     const meta = _commitMeta[cfg.backend + '|' + cfg.commit.id.slice(0, 7)];
     if (!meta) continue;
-    cfg.date = meta.date;
+    // Don't overwrite cfg.date — each nightly run's date must stay distinct for trends
     if (meta.runUrl) cfg.runUrl = meta.runUrl;
     if (meta._oot_image_tag) cfg._oot_image_tag = meta._oot_image_tag;
     if (meta._gpu_name) cfg._gpu_name = meta._gpu_name;
@@ -2001,25 +2017,23 @@ function renderTrendsTab() {
   if (!state.trendModelKey) return;
   const [trendBackend, trendModel] = state.trendModelKey.split('|');
 
-  // Build ordered x-axis: use date as primary key (not commit ID)
-  // Each run gets a unique index; x-axis shows short date labels.
-  // Use _commitMeta date when available (unified across configKeys) to stay
-  // consistent with popover/detail dates; fall back to run date for accuracy-only commits.
-  const seen = new Set();
-  const orderedRuns = []; // [{cid, date, label}]
+  // Build ordered x-axis: group by day+commit, keep the run with most benches
+  // (nightly > individual reruns). Same commit can appear on multiple days.
+  const dayRunMap = {}; // "YYYY-MM-DD|cid" -> best run
   for (const r of allRuns) {
     const cid = r.commit.id.slice(0, 7);
-    if (!seen.has(cid)) {
-      seen.add(cid);
-      // _commitMeta is keyed by "backend|cid7"; find newest date across all backends
-      let metaDate = null;
-      for (const mk of Object.keys(_commitMeta)) { if (mk.endsWith('|' + cid)) { const d = _commitMeta[mk].date; if (!metaDate || d > metaDate) metaDate = d; } }
-      const useDate = metaDate || r.date;
-      const d = new Date(useDate);
-      orderedRuns.push({ cid, date: useDate, label: (d.getMonth()+1) + '/' + d.getDate() + ' ' + cid });
+    const dayKey = localDay(r.date) + '|' + cid;
+    if (!dayRunMap[dayKey] || r.benches.length > dayRunMap[dayKey].benches.length) {
+      dayRunMap[dayKey] = r;
     }
   }
-  orderedRuns.reverse(); // chronological order for x-axis
+  const orderedRuns = Object.values(dayRunMap)
+    .sort((a, b) => a.date - b.date)
+    .map(r => {
+      const cid = r.commit.id.slice(0, 7);
+      const d = new Date(r.date);
+      return { cid, date: r.date, day: localDay(r.date), label: (d.getMonth()+1) + '/' + d.getDate() + ' ' + cid };
+    });
   const orderedLabels = orderedRuns.map(r => r.label);
   const commitDateMap = {}; const labelToCid = {};
   orderedRuns.forEach(r => { commitDateMap[r.label] = r.date; labelToCid[r.label] = r.cid; });
@@ -2058,8 +2072,9 @@ function renderTrendsTab() {
       const pointMap = {};
       for (const pt of history) {
         const cid = pt.commit.id.slice(0, 7);
-        // Map to the label that contains this commit ID
-        const matchLabel = orderedRuns.find(r => r.cid === cid)?.label;
+        const day = localDay(pt.date);
+        // Match by day+commit (same granularity as orderedRuns dedup)
+        const matchLabel = orderedRuns.find(r => r.cid === cid && r.day === day)?.label;
         if (matchLabel && pt[met.key] != null) {
           let val = pt[met.key];
           // Normalize Total Tput to per-GPU for cross-config comparability
@@ -2164,8 +2179,9 @@ function renderTrendsTab() {
           if (!key) return;
           const lbl = orderedLabels[elems[0].index];
           const cid = labelToCid[lbl];
+          const clickedDay = commitDateMap[lbl] ? localDay(commitDateMap[lbl]) : null;
           const hist = historyMap[key];
-          const histCfg = cid && hist ? hist.find(h => h.commit.id.slice(0, 7) === cid) : null;
+          const histCfg = cid && hist ? hist.find(h => h.commit.id.slice(0, 7) === cid && (!clickedDay || localDay(h.date) === clickedDay)) : null;
           showPopover(key, histCfg || latestConfigs[key]);
         }
       }

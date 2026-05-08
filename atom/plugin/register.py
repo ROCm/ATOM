@@ -4,6 +4,7 @@ from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
+from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
 from atom.config import Config
 from atom.plugin.prepare import is_vllm, is_sglang
 
@@ -14,7 +15,23 @@ _ATOM_SUPPORTED_MODELS = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
+    "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
 }
+
+if is_sglang():
+    from atom.models.qwen3_next import Qwen3NextForCausalLM
+    from atom.models.qwen3_5 import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5MoeForCausalLM,
+    )
+
+    _ATOM_SUPPORTED_MODELS.update(
+        {
+            "Qwen3NextForCausalLM": Qwen3NextForCausalLM,
+            "Qwen3_5ForConditionalGeneration": Qwen3_5ForCausalLM,
+            "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForCausalLM,
+        }
+    )
 
 
 def _register_custom_attention_to_sglang() -> None:

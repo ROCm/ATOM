@@ -223,11 +223,13 @@ class GenericParser(QuantConfigParser):
         is_dynamic = hf_quant_config.get("is_dynamic", True)
         # Each quantizer uses a different key for excluded layers:
         # Quark -> "exclude", compressed-tensors -> "ignore",
-        # gpt-oss/HF transformers -> "modules_to_not_convert"
+        # gpt-oss/HF transformers -> "modules_to_not_convert",
+        # MiMo-V2-Flash/HF transformers -> "ignored_layers"
         exclude = list(
             hf_quant_config.get("ignore")
             or hf_quant_config.get("modules_to_not_convert")
             or hf_quant_config.get("exclude")
+            or hf_quant_config.get("ignored_layers")
             or []
         )
 

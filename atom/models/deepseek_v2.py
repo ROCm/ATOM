@@ -75,6 +75,11 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
+# shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
+# `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.plugin.attention_mla_sparse import (
@@ -769,42 +774,6 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
-def maybe_dual_stream_forward(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    """Dual-stream MoE forward: shared experts on alt stream, routed on main."""
-    atom_config = get_current_atom_config()
-    self = atom_config.compilation_config.static_forward_context[layer_name]
-    DUAL_STREAM_TOKEN_THRESHOLD = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    num_tokens, hidden_dim = hidden_states.shape
-    if (
-        self._use_dual_stream
-        and num_tokens > 0
-        and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
-        # and not get_forward_context().context.is_prefill
-    ):
-        return self.dual_stream_moe_forward(hidden_states)
-    else:
-        return self.single_stream_moe_forward(hidden_states)
-
-
-def maybe_dual_stream_forward_fake(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="maybe_dual_stream_forward",
-    op_func=maybe_dual_stream_forward,
-    mutates_args=["hidden_states"],
-    fake_impl=maybe_dual_stream_forward_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
-
-
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -1011,13 +980,19 @@ def sparse_attn_indexer(
     if forward_context.context.is_dummy_run:
         # dummy runner
         return weights
-    num_decode_tokens = context.batch_size if not context.is_prefill else 0
+    # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
+    num_decode_tokens = (
+        context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
+    )
+    runner_block_size = get_current_atom_config().kv_cache_block_size
+    kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     indexer_k_quant_and_cache(
         k,
         kv_cache,
         slot_mapping,
         quant_block_size,
         scale_fmt,
+        preshuffle=True,
     )
     if context.is_prefill:
         if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
@@ -1049,6 +1024,7 @@ def sparse_attn_indexer(
                 if prefill_metadata.has_cached
                 else prefill_metadata.cu_seqlens_q
             ),
+            preshuffle=True,
         )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
@@ -1100,6 +1076,8 @@ def sparse_attn_indexer(
             decode_metadata.context_lens,
             attn_metadata.block_tables,
             max_model_len,
+            KVBlockSize=runner_block_size,
+            Preshuffle=True,
         )
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
@@ -1192,7 +1170,7 @@ class Indexer(nn.Module):
         self.weights_proj = ReplicatedLinear(
             hidden_size,
             self.n_head,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
@@ -2007,7 +1985,9 @@ class DeepseekV2ForCausalLM(nn.Module):
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
-    pass
+    # DeepSeek-V3.2's indexer weights_proj are not quantized, but they are not listed in
+    # model's quant exclude mapping. So we add it to quant_default_exclude_layers.
+    quant_default_exclude_layers: list[str] = ["*.indexer.weights_proj"]
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):

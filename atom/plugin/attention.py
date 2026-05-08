@@ -11,7 +11,6 @@ from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.config import get_current_atom_config
-
 from atom.utils.forward_context import Context, AttentionMetaData
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
@@ -123,17 +122,34 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        from vllm.v1.attention.backend import (
-            MultipleOf,
-        )  # pyright: ignore[reportMissingImports]
 
-        return [MultipleOf(16)]
+        return [16]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
         if block_size is None:
             return True
         return block_size % 16 == 0
+
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        """Discover which tensor dim is the block index, since different
+        backends lay out dims differently."""
+        _S = 1234567
+        shape = cls.get_kv_cache_shape(
+            _S,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(_S)
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -345,17 +361,18 @@ class vllmAttentionMetadataBuilderMethods:
         )
 
         if mixed:
-            prefill_max_query_len = (
-                query_lens_cpu[num_decodes + num_extends :].max().item()
-            )
-            prefill_max_seq_len = seq_lens[num_decodes + num_extends :].max().item()
-            prefill_query_start_loc = (
-                prefill_query_start_loc[num_decodes + num_extends :]
-                - prefill_query_start_loc[num_decodes + num_extends]
-            )
-            decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
-            decode_max_seq_len = seq_lens[:num_decodes].max().item()
-            decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
+            prefill_start = num_decodes + num_extends
+            if num_prefills > 0:
+                prefill_max_query_len = query_lens_cpu[prefill_start:].max().item()
+                prefill_max_seq_len = seq_lens[prefill_start:].max().item()
+                prefill_query_start_loc = (
+                    prefill_query_start_loc[prefill_start:]
+                    - prefill_query_start_loc[prefill_start]
+                )
+            if num_decodes > 0:
+                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_seq_len = seq_lens[:num_decodes].max().item()
+                decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
         prefill_metadata = None
         decode_metadata = None
@@ -611,8 +628,15 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
                     if callable(method):
                         class_dict[method_name] = method
         elif is_sglang_mode:
-            raise NotImplementedError(
-                "AttentionMetadataBuilder for sglang is not implemented yet"
+            # SGLang uses ATOM's ScheduledBatch + CommonAttentionBuilder pipeline (same as
+            # native ATOM server). Do not swap in vLLM's AttentionMetadataBuilder or
+            # vllmAttentionMetadataBuilderMethods(build(common_attn_metadata=...)).
+            base_class = default_base_class
+            generic_base = default_base_class
+            needs_generic = True
+            logger.info(
+                "AiterAttentionMetadataBuilder: SGLang plugin mode keeps %s + original methods",
+                getattr(default_base_class, "__name__", default_base_class),
             )
 
         # create the new class
@@ -626,8 +650,10 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
         )
         if needs_generic and is_generic_builder_base:
             new_class.__orig_bases__ = (generic_base[AttentionMetaData],)
-        else:
+        elif generic_base is not None:
             new_class.__orig_bases__ = (generic_base,)
+        else:
+            new_class.__orig_bases__ = (base_class,)
 
         return new_class
 
@@ -1339,8 +1365,12 @@ def AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
                     if callable(method):
                         class_dict[method_name] = method
         elif is_sglang_mode:
-            raise NotImplementedError(
-                "AttentionMetadataBuilder for sglang is not implemented yet"
+            base_class = default_base_class
+            generic_base = default_base_class
+            needs_generic = True
+            logger.info(
+                "AiterMLAMetadataBuilder: SGLang plugin mode keeps %s + original methods",
+                getattr(default_base_class, "__name__", default_base_class),
             )
 
         # create the new class
@@ -1423,6 +1453,7 @@ def AiterBackendDecoratorForPluginMode(cls):
     """
     is_vllm_mode = is_vllm()
     if is_vllm_mode:
+        is_sparse_mla = False
         if not issubclass(cls.get_impl_cls(), MLAAttention):
             methods_cls = vllmAiterAttentionBackendMethods
         else:
@@ -1434,7 +1465,16 @@ def AiterBackendDecoratorForPluginMode(cls):
         for name in dir(methods_cls):
             if name.startswith("_"):
                 continue
-            setattr(cls, name, getattr(methods_cls, name))
+            raw = methods_cls.__dict__.get(name)
+            if is_sparse_mla and isinstance(raw, classmethod):
+                # Re-wrap so cls binds to the target class, not methods_cls.
+                # For backends like sparse MLA where more than one attention
+                # backends are registered through this decorator exist, the
+                # different backends need to return distinct identities
+                # through full_cls_name().
+                setattr(cls, name, classmethod(raw.__func__))
+            else:
+                setattr(cls, name, getattr(methods_cls, name))
     return cls
 
 
@@ -1711,9 +1751,6 @@ class AiterMLASparseMetadataForPluginMode:
 
     block_size: int = 1
     topk_tokens: int = 2048
-
-    # Flag to run ragged layout conversion only once per forward (shared across MLA layers)
-    ragged_layout_built: bool = False
 
 
 class vllmMLASparseAttentionMetadataBuilderMethods:
@@ -2285,13 +2322,16 @@ def unified_attention_with_output_base_for_plugin_mode(
         return self.o_proj(output)
     else:
         self = atom_config.compilation_config.static_forward_context[layer_name]
+
         # here is the standard vllm attention impl interface
         # when using fusion, we need to pass the qkv and positions through the q,k,v
         # [watch out] accept_output_buffer must be False for plugin mode
         # because we don't want vllm to manipulate the q k v and output buffer
         # ATOM needs to handle all of the buffer here
+        # Positions for compiled unified_attention are provided via vLLM ForwardContext
+        # (atom_positions) in ATOMModelBase.forward, not via this Python arg.
         if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            output = self.attn(q, positions, qkv)
+            output = self.attn(q, k, v)
         else:
             # calculate the q and k with rotary embedding
             if self.rotary_emb is not None:

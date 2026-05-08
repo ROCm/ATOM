@@ -164,7 +164,6 @@ def load_fused_expert_weights(
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
-
     def create_qkvz_proj(
         self,
         hidden_size: int,
@@ -244,15 +243,14 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        x_fp8=None,
+        x_scale=None,
     ):
         """
         Forward pass with three parts:
         1. Input projection
         2. Core attention (custom op)
-        3. Output projection
         """
-        num_tokens = hidden_states.size(0)
 
         # ============================================================
         # Part 1: Input Projection
@@ -269,7 +267,10 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                 self.head_v_dim,
             )
         else:
-            mixed_qkvz = self.in_proj_qkvz(hidden_states)
+            if x_fp8 is not None:
+                mixed_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
+            else:
+                mixed_qkvz = self.in_proj_qkvz(hidden_states)
             ba = self.in_proj_ba(hidden_states)
 
             qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
@@ -289,7 +290,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # Part 3: Output Projection
         # ============================================================
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
-        output[:num_tokens] = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        output = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        return output
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -414,7 +416,6 @@ class Qwen3_5Model(Qwen3NextModel):
 
 
 class Qwen3_5ForCausalLMBase(nn.Module):
-
     def __init__(self, atom_config: Config, prefix: str = ""):
         config: Qwen3_5MoeTextConfig = get_qwen3_5_text_config(atom_config)
         self.atom_config = atom_config
@@ -877,7 +878,6 @@ if is_vllm():
         dummy_inputs=Qwen3VLDummyInputsBuilder,
     )
     class Qwen3_5ForConditionalGeneration(ATOMForConditionalGeneration, IsHybrid):
-
         packed_modules_mapping = {
             "q_proj": ("qkv_proj", "q"),
             "k_proj": ("qkv_proj", "k"),
@@ -964,6 +964,5 @@ if is_vllm():
         dummy_inputs=Qwen3VLDummyInputsBuilder,
     )
     class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration, IsHybrid):
-
         def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
             return self.model.get_expert_mapping()

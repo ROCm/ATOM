@@ -13,6 +13,7 @@ from aiter import (
     gemm_a8w8,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
+    gemm_a8w8_blockscale,
     get_hip_quant,
 )
 
@@ -372,14 +373,23 @@ class LinearBase(nn.Module):
             )
             self.weight.data = w_q
             self.weight_scale = atom_parameter(w_s)
-            shuffle_weights(self.weight)
+            # Only quantized 2D GEMM weights use aiter's preshuffle layout.
+            # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
+            # quantized models must keep that tensor unshuffled here.
+            if self.weight.dim() == 2:
+                shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
-            if (
+            need_shuffle = (
                 self.quant_type == QuantType.per_Token
                 and self.params_dtype == dtypes.fp8
-            ) or (self.quant_type in [QuantType.per_1x32, QuantType.per_1x128]):
-                shuffle_weights(self.weight)
+            ) or self.quant_type == QuantType.per_1x32
+            # per_1x128 only needs shuffle when using the preshuffle GEMM path
+            if not need_shuffle and self.quant_type == QuantType.per_1x128:
+                need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+            if need_shuffle:
+                if self.weight.dim() == 2:
+                    shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32:
@@ -400,8 +410,11 @@ class LinearBase(nn.Module):
             if x_scale is None:
                 quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:
+                    # preshuffle GEMM expects column-major x_scale;
+                    # non-preshuffle GEMM expects row-major x_scale
                     quant_func = functools_partial(
-                        self.quant_func, transpose_scale=True
+                        self.quant_func,
+                        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(
@@ -439,14 +452,23 @@ class LinearBase(nn.Module):
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
-                y = gemm_a8w8_blockscale_preshuffle_impl(
-                    x,
-                    self.weight,
-                    x_scale,
-                    self.weight_scale,
-                    dtype=otype,
-                    prefix=self.prefix,
-                )
+                if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+                    y = gemm_a8w8_blockscale_preshuffle_impl(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        dtype=otype,
+                        prefix=self.prefix,
+                    )
+                else:
+                    y = gemm_a8w8_blockscale(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        dtype=otype,
+                    )
                 if self.bias is not None:
                     y += self.bias
             elif self.quant_type.value == QuantType.per_1x32.value:
@@ -617,8 +639,8 @@ class MergedColumnParallelLinear(LinearBase):
             self, "input_scale", None
         ):
             if self.quant_type == QuantType.per_1x128:
-                shard_offset //= 128
-                shard_size //= 128
+                shard_offset = (shard_offset + 127) // 128
+                shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = loaded_shard_id
@@ -717,8 +739,8 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
             self, "input_scale", None
         ):
             if self.quant_type == QuantType.per_1x128:
-                shard_offset //= 128
-                shard_size //= 128
+                shard_offset = (shard_offset + 127) // 128
+                shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = ["qkvz", "ba"].index(loaded_shard_id)
@@ -887,9 +909,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        v_head_size: int | None = None,
         **kwargs,
     ):
         self.head_size = head_size
+        self.v_head_size = v_head_size if v_head_size is not None else head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
         tp_size = get_tp_group().world_size
@@ -909,7 +933,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         output_sizes = [
             self.num_heads * self.head_size * tp_size,
             self.num_kv_heads * self.head_size * tp_size,
-            self.num_kv_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.v_head_size * tp_size,
         ]
 
         super().__init__(
@@ -935,7 +959,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_offset = self.num_heads * self.head_size
             shard_rank = self.tp_rank // self.num_kv_head_replicas
         else:
-            shard_size = self.num_kv_heads * self.head_size
+            shard_size = self.num_kv_heads * self.v_head_size
             shard_offset = (
                 self.num_heads * self.head_size + self.num_kv_heads * self.head_size
             )
@@ -944,8 +968,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             self, "input_scale", None
         ):
             if self.quant_type == QuantType.per_1x128:
-                shard_offset //= 128
-                shard_size //= 128
+                shard_offset = (shard_offset + 127) // 128
+                shard_size = (shard_size + 127) // 128
             elif self.quant_type == QuantType.per_Tensor:
                 loaded_weight = loaded_weight.view(1, 1).repeat(self.tp_size, 1)
                 shard_offset = ["q", "k", "v"].index(loaded_shard_id)

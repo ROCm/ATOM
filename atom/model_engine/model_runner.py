@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
-from aiter import destroy_dist_env, dtypes, init_dist_env
+from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
     get_pp_group,
@@ -20,7 +20,7 @@ from aiter.dist.parallel_state import (
     graph_capture,
 )
 from aiter.dist.utils import get_distributed_init_method
-from atom.config import Config, KVCacheTensor, set_current_atom_config
+from atom.config import Config, set_current_atom_config
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
@@ -46,7 +46,6 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.selector import get_attn_backend
-from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
 from torch.profiler import record_function
 
 logger = logging.getLogger("atom")
@@ -58,6 +57,7 @@ support_model_arch_dict = {
     "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
+    "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
@@ -66,6 +66,7 @@ support_model_arch_dict = {
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeForConditionalGenerationTextOnly",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
+    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2_flash.MiMoV2FlashForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -492,6 +493,7 @@ class ModelRunner:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
+        self.use_v4 = self.is_deepseek_v4()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -551,6 +553,7 @@ class ModelRunner:
             self.block_size,
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
+            use_v4=self.use_v4,
         )
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
@@ -596,6 +599,18 @@ class ModelRunner:
         )
         logger.info(f"Model load done: {config.model}")
 
+        # Optional debug instrumentation; no-op when env vars unset.
+        # See atom/utils/debug_helper/.
+        from atom.utils.debug_helper import (
+            install_block_forward_hooks,
+            maybe_dump_weights_and_exit,
+        )
+
+        _n_fwd_hooks = install_block_forward_hooks(self.model)
+        if _n_fwd_hooks > 0:
+            logger.info(f"[ATOM_FWD_DUMP] {_n_fwd_hooks} Block forward hooks installed")
+        maybe_dump_weights_and_exit(self.model)
+
         if self.config.speculative_config and get_pp_group().is_last_rank:
             from atom.utils.backends import set_model_tag
 
@@ -613,6 +628,27 @@ class ModelRunner:
             model_runner=self
         )
         self.physical_block_size = self.attn_metadata_builder.block_size
+        # Sanity-check: any builder that allocates a per-request cache must
+        # have its model_type listed in `InputOutputProcessor`'s
+        # `per_req_cache_model_types` set; otherwise sequences will be
+        # constructed with `has_per_req_cache=False`, the BlockManager will
+        # never assign them a slot, and the builder will silently read
+        # tensor[-1] on first decode. Catch the misconfiguration up front
+        # rather than producing wrong outputs at inference time.
+        if self.attn_metadata_builder.compute_per_req_cache_bytes() > 0:
+            from atom.model_engine.llm_engine import (
+                InputOutputProcessor as _IOProc,
+            )
+
+            mt = self.config.hf_config.model_type
+            known = _IOProc._per_req_cache_model_types()  # noqa: SLF001
+            assert mt in known, (
+                f"Attention builder {type(self.attn_metadata_builder).__name__} "
+                f"reports per_req_cache_bytes>0 but model_type={mt!r} is not in "
+                f"InputOutputProcessor.per_req_cache_model_types ({sorted(known)}). "
+                "Add it to the set or sequences will not be assigned slots "
+                "(silent corruption)."
+            )
         if config.enable_tbo:
             dp_gather_scatter = (
                 config.enable_dp_attention and not config.enable_expert_parallel
@@ -667,6 +703,18 @@ class ModelRunner:
             "qwen3_5_text",
             "qwen3_5_moe_text",
         ):
+            return True
+        return False
+
+    def is_deepseek_v4(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        return self.hf_text_config.model_type == "deepseek_v4"
+
+    def is_mimo_v2(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        elif self.hf_text_config.model_type in ("mimo_v2_flash"):
             return True
         return False
 
@@ -1035,107 +1083,16 @@ class ModelRunner:
         return total
 
     def _compute_block_bytes(self):
-        """Compute the TRUE per-block memory cost including all tensors.
+        """Per-block bytes for the unified KV pool budget.
 
-        This must match exactly what allocate_kv_cache() allocates.
-        Includes: kv_cache tensor + kv_scale tensor + draft model layers.
+        Delegates to the attention builder, which knows its own tensor
+        layout (MLA 576-dim packed, GDN-hybrid full-attn-only, MiMo-V2
+        per-layer-type, standard MHA split-K/V). Mirror of
+        `attn_metadata_builder.allocate_kv_cache_tensors()` so the budget
+        math matches what's actually allocated. Per-request cache bytes
+        are accounted for separately via `compute_per_req_cache_bytes()`.
         """
-        config = self.config
-        hf_config = config.hf_config
-        num_kv_heads = self._get_num_kv_heads()
-        total_num_layers = self._get_total_num_layers()
-        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-
-        if self.use_mla:
-            # MLA: shape [total_layers, blocks, block_size, 576]
-            # No kv_scale for MLA
-            block_bytes = total_num_layers * self.block_size * 576 * kv_dtype_size
-            if self.is_deepseek_v32:
-                index_dim = hf_config.index_head_dim + 4
-                aligned_index_dim = ((index_dim + 15) // 16) * 16
-                block_bytes += (
-                    hf_config.num_hidden_layers
-                    * self.block_size
-                    * aligned_index_dim
-                    * dtypes.fp8.itemsize
-                )
-        elif self.is_qwen_next():
-            self.full_attention_interval = hf_config.full_attention_interval
-            self.num_full_attn = (
-                hf_config.num_hidden_layers // self.full_attention_interval
-            )
-            self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
-            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
-            full_attn_layers = self.num_full_attn + num_draft_layers
-
-            # full attention kv_cache bytes
-            block_bytes = (
-                2
-                * full_attn_layers
-                * self.physical_block_size
-                * num_kv_heads
-                * hf_config.head_dim
-                * kv_dtype_size
-            )
-
-            # kv_scale for full attention: [2, full_attn_layers, blocks, kv_heads, phys_block_size] float32
-            block_bytes += (
-                2
-                * full_attn_layers
-                * num_kv_heads
-                * self.physical_block_size
-                * 4  # float32
-            )
-
-            # GDN recurrent state is per-request (not per-block).
-            # It is accounted for separately via _compute_mamba_per_slot_bytes().
-            # Do NOT add it to block_bytes.
-        else:
-            # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
-            # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
-            # the standard path (draft layers use separate binding).
-            block_bytes = (
-                2
-                * hf_config.num_hidden_layers
-                * self.block_size
-                * num_kv_heads
-                * hf_config.head_dim
-                * kv_dtype_size
-            )
-            # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
-            block_bytes += (
-                2
-                * hf_config.num_hidden_layers
-                * num_kv_heads
-                * self.physical_block_size
-                * 4  # float32
-            )
-        return block_bytes
-
-    def _compute_mamba_per_slot_bytes(self) -> int:
-        """Compute per-slot recurrent state bytes (all GDN layers, one slot).
-
-        A slot holds one request's state (or one spec token's state).
-        Returns 0 for non-GDN models.
-        """
-        if not self.is_qwen_next():
-            return 0
-        hf_config = self.config.hf_config
-        mamba_shape = self.gated_delta_net_state_shape(
-            get_tp_group().world_size,
-            hf_config.linear_num_key_heads,
-            hf_config.linear_num_value_heads,
-            hf_config.linear_key_head_dim,
-            hf_config.linear_value_head_dim,
-            hf_config.linear_conv_kernel_dim,
-            self.num_spec_tokens,
-        )
-        mamba_dtypes = self.gated_delta_net_state_dtypes()
-        one_layer_byte = (
-            math.prod(mamba_shape[0]) * mamba_dtypes[0].itemsize
-            + math.prod(mamba_shape[1]) * mamba_dtypes[1].itemsize
-        )
-        return self.num_gdn_attn_state * one_layer_byte
+        return self.attn_metadata_builder.compute_block_bytes()
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -1191,30 +1148,45 @@ class ModelRunner:
 
         block_bytes = self._compute_block_bytes()
 
-        # GDN recurrent state: deduct mamba tensor memory from pool budget
-        mamba_per_slot = self._compute_mamba_per_slot_bytes()
-        slots_per_req = 1 + self.num_spec_tokens
-        max_mamba_slots = (
-            config.max_num_seqs * slots_per_req if mamba_per_slot > 0 else 0
+        # Per-request cache (e.g. GDN recurrent state, future DeepseekV4 ring
+        # buffer + compressor state): deduct its tensor memory from the KV
+        # pool budget. The actual layout / shape is owned by the attention
+        # builder; ModelRunner only does sizing math.
+        per_req_cache_bytes = self.attn_metadata_builder.compute_per_req_cache_bytes()
+        slots_per_req = self.attn_metadata_builder.slots_per_req()
+        max_per_req_cache_slots = (
+            config.max_num_seqs * slots_per_req if per_req_cache_bytes > 0 else 0
         )
-        mamba_tensor_bytes = max_mamba_slots * mamba_per_slot
-        available_for_pool = available_for_kv - mamba_tensor_bytes
+        per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
+        available_for_pool = available_for_kv - per_req_cache_tensor_bytes
         if available_for_pool <= 0:
             raise RuntimeError(
-                f"GDN mamba tensor ({mamba_tensor_bytes / (1 << 30):.2f}GB for "
-                f"{max_mamba_slots} slots) exceeds available KV budget "
+                f"Per-request cache tensor "
+                f"({per_req_cache_tensor_bytes / (1 << 30):.2f}GB for "
+                f"{max_per_req_cache_slots} slots) exceeds available KV budget "
                 f"({available_for_kv / (1 << 30):.2f}GB). "
                 f"Reduce --max-num-seqs or increase gpu_memory_utilization."
             )
-        mamba_equiv = (
-            math.ceil(mamba_per_slot / block_bytes) if mamba_per_slot > 0 else 0
+        per_req_cache_equiv_blocks = (
+            math.ceil(per_req_cache_bytes / block_bytes)
+            if per_req_cache_bytes > 0
+            else 0
         )
 
-        # Store for BlockManager and allocate_kv_cache
-        config.mamba_equiv_per_req = mamba_equiv
-        config.max_mamba_slots = max_mamba_slots
-        config.num_mamba_groups = config.max_num_seqs if mamba_per_slot > 0 else 0
-        self.max_mamba_slots = max_mamba_slots
+        # Store for BlockManager and allocate_kv_cache.
+        # Note the distinction:
+        #   - per_req_cache_equiv_blocks: block-equivalents charged to the
+        #     unified pool per request (memory accounting)
+        #   - num_per_req_cache_groups: BlockManager free-list size; one
+        #     group == one request occupies `slots_per_req` contiguous
+        #     tensor slots
+        #   - max_per_req_cache_slots (runner-only): TENSOR slot dimension
+        #     == groups × slots_per_req (groups != slots in general)
+        config.per_req_cache_equiv_blocks = per_req_cache_equiv_blocks
+        config.num_per_req_cache_groups = (
+            config.max_num_seqs if per_req_cache_bytes > 0 else 0
+        )
+        self.max_per_req_cache_slots = max_per_req_cache_slots
 
         num_kvcache_blocks = available_for_pool // block_bytes
 
@@ -1230,12 +1202,13 @@ class ModelRunner:
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
         )
-        if mamba_per_slot > 0:
+        if per_req_cache_bytes > 0:
             logger.info(
-                f"GDN state pool: mamba_per_slot={mamba_per_slot / (1 << 20):.2f}MB, "
-                f"max_mamba_slots={max_mamba_slots}, "
-                f"mamba_tensor={mamba_tensor_bytes / (1 << 30):.2f}GB, "
-                f"mamba_equiv_blocks_per_req={mamba_equiv}, "
+                f"Per-req cache pool: bytes_per_slot="
+                f"{per_req_cache_bytes / (1 << 20):.2f}MB, "
+                f"max_slots={max_per_req_cache_slots}, "
+                f"tensor_total={per_req_cache_tensor_bytes / (1 << 30):.2f}GB, "
+                f"equiv_blocks_per_req={per_req_cache_equiv_blocks}, "
                 f"pool_blocks={num_kvcache_blocks}"
             )
 
@@ -1251,8 +1224,10 @@ class ModelRunner:
         )
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
-            "mamba_equiv_per_req": mamba_equiv,
-            "num_mamba_groups": config.max_num_seqs if mamba_per_slot > 0 else 0,
+            "per_req_cache_equiv_blocks": per_req_cache_equiv_blocks,
+            "num_per_req_cache_groups": (
+                config.max_num_seqs if per_req_cache_bytes > 0 else 0
+            ),
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
@@ -1270,6 +1245,10 @@ class ModelRunner:
         else:
             assert self.world_size % hf_config.num_key_value_heads == 0
             num_kv_heads = 1
+        # Promote to self so attention builders' build_kv_cache_tensor()
+        # hooks can access it without re-deriving from hf_config.
+        self.num_kv_heads = num_kv_heads
+        self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
         # Calculate total number of layers (target + draft)
         total_num_layers = hf_config.num_hidden_layers
@@ -1284,92 +1263,32 @@ class ModelRunner:
                 f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
             )
 
-        if self.use_mla:
-            self.kv_cache = torch.zeros(
-                total_num_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                576,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
-            if self.is_deepseek_v32:
-                # Align last dimension to 16 bytes for fp8 (1 byte per element)
-                # to avoid unaligned memory access in torch inductor
-                index_dim = hf_config.index_head_dim + 4
-                aligned_index_dim = ((index_dim + 15) // 16) * 16
-                self.index_cache = torch.zeros(
-                    hf_config.num_hidden_layers,
-                    self.num_physical_kvcache_blocks,
-                    self.physical_block_size,
-                    aligned_index_dim,
-                    dtype=dtypes.fp8,
-                    device="cuda",
-                )
-        elif self.is_qwen_next():
+        # Primary KV cache allocation (model-agnostic, delegated to the
+        # attention builder). Each builder owns its tensor layout: MLA →
+        # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
+        # MiMo-V2 → defer per-module; standard MHA → split-K/V `[2, L, ...]`.
+        # Returned tensors are setattr'd on `self` under their conventional
+        # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
+        # _kv_layer_cache_store) so binding code and downstream consumers
+        # find them where they expect.
+        main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
+            num_kv_heads, num_draft_layers
+        )
+        for name, value in main_kv.items():
+            setattr(self, name, value)
 
-            self.kv_cache = torch.zeros(
-                2,
-                self.num_full_attn + num_draft_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
+        # Per-request cache allocation (model-agnostic, delegated to the
+        # attention metadata builder). For GDN this returns
+        # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
+        # attentions it returns an empty dict (no-op). Tensors are setattr'd
+        # on `self` so model layers can access them as `model_runner.<name>`.
+        if self.max_per_req_cache_slots > 0:
+            per_req_tensors = self.attn_metadata_builder.allocate_per_req_cache(
+                self.max_per_req_cache_slots
             )
+            for name, tensor in per_req_tensors.items():
+                setattr(self, name, tensor)
 
-            self.kv_scale = torch.zeros(
-                2,
-                self.num_full_attn + num_draft_layers,
-                self.num_physical_kvcache_blocks,
-                num_kv_heads,
-                self.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            )
-
-            mamba_shape = self.gated_delta_net_state_shape(
-                get_tp_group().world_size,
-                hf_config.linear_num_key_heads,
-                hf_config.linear_num_value_heads,
-                hf_config.linear_key_head_dim,
-                hf_config.linear_value_head_dim,
-                hf_config.linear_conv_kernel_dim,
-                self.num_spec_tokens,  # self.num_spec,
-            )
-            mamba_dtypes = self.gated_delta_net_state_dtypes()
-            self.mamba_k_cache = torch.zeros(
-                (self.num_gdn_attn_state, self.max_mamba_slots) + mamba_shape[0],
-                dtype=mamba_dtypes[0],
-                device="cuda",
-            )
-            self.mamba_v_cache = torch.zeros(
-                (self.num_gdn_attn_state, self.max_mamba_slots) + mamba_shape[1],
-                dtype=mamba_dtypes[1],
-                device="cuda",
-            )
-        else:
-            self.kv_cache = torch.zeros(
-                2,
-                hf_config.num_hidden_layers,
-                self.num_physical_kvcache_blocks,
-                self.physical_block_size,
-                num_kv_heads,
-                hf_config.head_dim,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            )
-
-            self.kv_scale = torch.zeros(
-                2,
-                hf_config.num_hidden_layers,
-                self.num_physical_kvcache_blocks,
-                num_kv_heads,
-                self.physical_block_size,
-                dtype=dtypes.fp32,
-                device="cuda",
-            )
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
         # models with only one type of attention, but not support multi-type of attention models.
@@ -1382,8 +1301,9 @@ class ModelRunner:
 
         kv_cache_tensors = []
         layer_id = 0
-        x = 16 // self.kv_cache.element_size()
-        mtp_start_layer_idx = (
+        # Promote to self so the attention builder's build_kv_cache_tensor()
+        # can access it without recomputing from drafter state.
+        self.mtp_start_layer_idx = (
             self.drafter.model.model.mtp_start_layer_idx
             if hasattr(self, "drafter")
             else hf_config.num_hidden_layers
@@ -1394,104 +1314,17 @@ class ModelRunner:
             )
 
             for module in model.modules():
-                # Since use attention base and there are child in attention, add base condition
-                if hasattr(module, "base_attention"):
-                    if hasattr(module, "use_mla") and not module.use_mla:
-                        # Non-MLA attention: hybrid models interleave full
-                        # attention and linear attention, so attn_idx must
-                        # skip linear-attention layers for target, and use
-                        # consecutive slots after num_full_attn for draft.
-                        if self.is_qwen_next():
-                            if layer_id < mtp_start_layer_idx:
-                                attn_idx = layer_id // self.full_attention_interval
-                            else:
-                                attn_idx = self.num_full_attn + (
-                                    layer_id - mtp_start_layer_idx
-                                )
-                        else:
-                            attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
-
-                        k_scale = module.k_scale
-                        v_scale = module.v_scale
-
-                        # Store in KVCacheTensor
-                        kv_cache_tensor = KVCacheTensor(
-                            layer_num=layer_id,
-                            k_cache=k_cache,
-                            v_cache=v_cache,
-                            k_scale=k_scale,
-                            v_scale=v_scale,
-                        )
-                        kv_cache_tensors.append(kv_cache_tensor)
-
-                        module.k_cache = k_cache
-                        module.v_cache = v_cache
-
-                        layer_id += 1
-                    elif hasattr(module, "use_mla") and module.use_mla:
-                        # MLA attention
-                        kv_cache = self.kv_cache[layer_id].view(
-                            self.num_physical_kvcache_blocks * self.physical_block_size,
-                            1,
-                            576,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if self.is_deepseek_v32 and module.indexer is not None:
-                            # Use aligned dimension to avoid memory copy in torch inductor
-                            module.indexer.k_cache.kv_cache[0] = self.index_cache[
-                                layer_id
-                            ].view(
-                                self.num_physical_kvcache_blocks
-                                * self.physical_block_size,
-                                1,
-                                aligned_index_dim,
-                            )
-                        # Store in KVCacheTensor
-                        kv_cache_tensor = KVCacheTensor(
-                            layer_num=layer_id,
-                            k_cache=kv_cache,
-                            v_cache=None,
-                            k_scale=None,
-                            v_scale=None,
-                        )
-                        kv_cache_tensors.append(kv_cache_tensor)
-
-                        module.kv_cache = kv_cache
-                        module.max_model_len = self.config.max_model_len
-                        layer_id += 1
-                elif hasattr(module, "base_linear_attention"):
-                    gdn_idx = (
-                        layer_id
-                        // self.full_attention_interval
-                        * (self.full_attention_interval - 1)
-                        + layer_id % self.full_attention_interval
-                    )
-                    mamba_k_cache = self.mamba_k_cache[gdn_idx]
-                    mamba_v_cache = self.mamba_v_cache[gdn_idx]
-                    kv_cache_tensor = KVCacheTensor(
-                        layer_num=layer_id,
-                        k_cache=mamba_k_cache,
-                        v_cache=mamba_v_cache,
-                        k_scale=None,
-                        v_scale=None,
-                    )
+                # Per-attention-type binding is owned by the attention
+                # metadata builder; ModelRunner only walks modules and
+                # collects the resulting KVCacheTensor entries. The builder
+                # returns None for modules it does not recognize (so a
+                # sibling module like nn.LayerNorm is silently skipped),
+                # and increments through MHA / MLA / GDN / V3.2-indexer
+                # internally.
+                kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
+                    layer_id, module
+                )
+                if kv_cache_tensor is not None:
                     kv_cache_tensors.append(kv_cache_tensor)
                     layer_id += 1
 
@@ -1503,13 +1336,28 @@ class ModelRunner:
         # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
         set_kv_cache_data(kv_cache_data, config)
 
-        # Cross-validate: compare estimated vs actual KV cache allocation
+        # Cross-validate: compare estimated vs actual KV cache allocation.
+        # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
+        # `block_bytes × num_blocks`) AND the per-request cache tensors (state
+        # buffers + SWA window prefix embedded in unified_kv). The budget
+        # math in `get_num_blocks()` reserves both separately, so the cross-
+        # check must mirror that — otherwise it spuriously fires for any
+        # backend with non-zero `compute_per_req_cache_bytes()` (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
-        expected_kv_bytes = self._compute_block_bytes() * num_kvcache_blocks
+        expected_kv_bytes = (
+            self._compute_block_bytes() * num_kvcache_blocks
+            + self.attn_metadata_builder.compute_per_req_cache_bytes()
+            * self.max_per_req_cache_slots
+        )
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
-            if diff_pct > 0.01:
+            # 3% threshold: budget formula matches allocation exactly, but the
+            # measured `post_alloc - pre_alloc` includes allocator alignment
+            # (round to 256 B / 16 MiB segments) and ephemeral init buffers
+            # from `_zero_state` / `_neg_inf_state` views, accounting for ~2%
+            # noise on multi-GiB pools. Lower thresholds spuriously fire.
+            if diff_pct > 0.03:
                 logger.warning(
                     f"KV cache allocation mismatch: "
                     f"expected={expected_kv_bytes / (1 << 30):.3f}GB, "
@@ -1520,34 +1368,6 @@ class ModelRunner:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return True
-
-    def gated_delta_net_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
-        return self.config.torch_dtype, self.config.torch_dtype
-
-    def gated_delta_net_state_shape(
-        self,
-        tp_world_size: int,
-        num_k_heads: int,
-        num_v_heads: int,
-        head_k_dim: int,
-        head_v_dim: int,
-        conv_kernel_size: int,
-        num_spec: int = 0,
-    ):
-        conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
-        conv_state_shape = (
-            conv_dim // tp_world_size,
-            conv_kernel_size - 1 + num_spec,
-        )
-
-        conv_state_shape = conv_state_shape[1], conv_state_shape[0]
-
-        temporal_state_shape = (
-            num_v_heads // tp_world_size,
-            head_v_dim,
-            head_k_dim,
-        )
-        return conv_state_shape, temporal_state_shape
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
         dp_size = self.config.parallel_config.data_parallel_size
@@ -1716,11 +1536,17 @@ class ModelRunner:
 
     def prepare_sample(
         self, batch: ScheduledBatch
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, bool]:
         bs = batch.total_seqs_num
 
         # Check on CPU whether all requests are greedy (temperature=0)
         all_greedy = (batch.temperatures == 0).all()
+
+        # Check on CPU whether any fan-out sibling needs per-row random noise.
+        # Missing attribute (e.g. dummy runs, older callers) -> False.
+        needs_independent_noise = bool(
+            getattr(batch, "needs_independent_noise", np.zeros(0, dtype=bool)).any()
+        )
 
         temp_buffer = self.forward_vars["temperatures"]
         # Clamp temperatures on CPU to avoid division by zero in sampler
@@ -1754,13 +1580,15 @@ class ModelRunner:
         else:
             top_ps = None
 
-        return temperatures, top_ks, top_ps, all_greedy
+        return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
     def prepare_model(self, batch: ScheduledBatch):
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
-        temperatures, top_ks, top_ps, all_greedy = self.prepare_sample(batch)
+        temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
+            self.prepare_sample(batch)
+        )
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         self.prepare_inputs(batch, input_ids)
         return (
@@ -1769,6 +1597,7 @@ class ModelRunner:
             top_ks,
             top_ps,
             all_greedy,
+            needs_independent_noise,
         )
 
     def run_model(
@@ -1833,12 +1662,18 @@ class ModelRunner:
         all_greedy: bool,
         # following for draft
         hidden_states: torch.Tensor,
+        needs_independent_noise: bool = False,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
             sampled_tokens = self.sampler(
-                logits, temperatures, top_ks, top_ps, all_greedy
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise=needs_independent_noise,
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
@@ -1855,6 +1690,7 @@ class ModelRunner:
                 top_ks=top_ks,
                 top_ps=top_ps,
                 all_greedy=all_greedy,
+                needs_independent_noise=needs_independent_noise,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
@@ -1930,7 +1766,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
+        (
+            input_ids,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            needs_independent_noise,
+        ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
         fwd_output = self.postprocess(
             batch,
@@ -1940,6 +1783,7 @@ class ModelRunner:
             top_ps,
             all_greedy,
             hidden_states,
+            needs_independent_noise=needs_independent_noise,
         )
         reset_forward_context()
         return fwd_output
@@ -2008,14 +1852,33 @@ class ModelRunner:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
 
-        assert (
-            self.graph_bs[0] <= self.config.max_num_seqs
-        ), "cudagraph capture sizes must be less than max_num_seqs."
+        # Drop any capture size that exceeds max_num_seqs — those graphs would
+        # never be replayed since the scheduler can't produce a batch larger
+        # than max_num_seqs. Warn so the user notices a misconfig (default
+        # cuda_graph_sizes=[512] vs e.g. max_num_seqs=16) without crashing.
+        max_bs = self.config.max_num_seqs
+        oversized = [s for s in self.graph_bs if s > max_bs]
+        if oversized:
+            self.graph_bs = [s for s in self.graph_bs if s <= max_bs]
+            logger.warning(
+                "cudagraph capture sizes %s exceed max_num_seqs=%d; dropping. "
+                "Remaining: %s",
+                oversized,
+                max_bs,
+                self.graph_bs,
+            )
+        assert self.graph_bs, (
+            f"no cudagraph capture sizes left after filtering by "
+            f"max_num_seqs={max_bs}; pass --cudagraph-capture-sizes or raise "
+            f"--max-num-seqs."
+        )
 
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
         self.forward_vars["kv_indptr"].gpu.zero_()
+        if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
+            self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()

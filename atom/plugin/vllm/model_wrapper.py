@@ -27,6 +27,7 @@ from vllm.forward_context import (
 
 import atom  # noqa: F401
 from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.plugin.prepare import _set_framework_backbone
 
 import logging
 
@@ -39,12 +40,14 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss:GptOssForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
+    "DeepseekV32ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
+    "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
 }
 
 
@@ -76,6 +79,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        _set_framework_backbone("vllm")
 
         self.config = vllm_config.model_config.hf_config
         self.text_config = self.config.get_text_config()
@@ -113,6 +118,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         exclude_mapping = getattr(model_cls, "quant_exclude_name_mapping", {})
         if exclude_mapping and self.atom_config.quant_config is not None:
             self.atom_config.quant_config.apply_exclude_name_mapping(exclude_mapping)
+
+        default_excludes = getattr(model_cls, "quant_default_exclude_layers", [])
+        if default_excludes and self.atom_config.quant_config is not None:
+            self.atom_config.quant_config.apply_default_exclude_layers(default_excludes)
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
         self.model = model_cls(self.atom_config)

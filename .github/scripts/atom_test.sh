@@ -41,8 +41,8 @@ if [ "$TYPE" == "launch" ]; then
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
-  # Phase 1: Wait for HTTP server to be up via /health endpoint
-  max_retries=30
+  # Phase 1: Wait for HTTP server to be up via /health endpoint (45 min max)
+  max_retries=45
   retry_interval=60
   server_up=false
   for ((i=1; i<=max_retries; i++)); do

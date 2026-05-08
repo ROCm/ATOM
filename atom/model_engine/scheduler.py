@@ -249,13 +249,20 @@ class ScheduledBatch:
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
-        self.mamba_state_slots = [
-            seq.mamba_state_slot
+        self.per_req_cache_groups = [
+            seq.per_req_cache_group
             for seq in seqs.values()
-            if seq.mamba_enabled and seq.mamba_state_slot >= 0
+            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
+        # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
+        # and therefore requires fresh per-row random noise at the sampler
+        # rather than the cached shared exponential tensor.
+        self.needs_independent_noise = np.asarray(
+            [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
+            dtype=bool,
+        )
 
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
@@ -401,10 +408,71 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
+        for seq in seqs:
+            self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
+
+    def _warn_if_unschedulable(self, seq: Sequence) -> None:
+        """Detect requests that exceed static scheduler/KV-pool capacity.
+
+        These requests would otherwise sit in `waiting` forever (head-of-line
+        blocking the prefill loop, which `break`s on the first oversized seq)
+        with no log output. Surface a single warning at submit time so the
+        caller knows the request will never be picked up.
+
+        Three permanent failure modes:
+          - prompt longer than `max_num_batched_tokens` → no single prefill
+            forward can ever fit it
+          - prompt's KV blocks (+ per-req cache reservation) exceed the total
+            pool size → never fits even on a fully empty pool
+          - request needs a per-req cache slot but the model was started with
+            zero slots (e.g. GDN/V4 with `max_num_seqs=0`)
+        """
+        num_tokens = seq.num_tokens
+        if num_tokens > self.max_num_batched_tokens:
+            logger.warning(
+                "Request %s will never be scheduled: input tokens=%d > "
+                "max_num_batched_tokens=%d. Increase --max-num-batched-tokens "
+                "or shorten the prompt.",
+                seq.id,
+                num_tokens,
+                self.max_num_batched_tokens,
+            )
+            return
+
+        bm = self.block_manager
+        per_req_cost = bm.per_req_cache_equiv_blocks if seq.has_per_req_cache else 0
+        total_blocks = len(bm.blocks)
+        if seq.num_blocks + per_req_cost > total_blocks:
+            logger.warning(
+                "Request %s will never be scheduled: needs %d KV blocks "
+                "(%d for %d input tokens + %d for per-req cache) > "
+                "total pool blocks=%d. Reduce prompt length, lower "
+                "--max-num-seqs, or raise --gpu-memory-utilization.",
+                seq.id,
+                seq.num_blocks + per_req_cost,
+                seq.num_blocks,
+                num_tokens,
+                per_req_cost,
+                total_blocks,
+            )
+            return
+
+        if (
+            seq.has_per_req_cache
+            and not bm.free_per_req_cache_groups
+            and not bm.per_req_cache_accounting
+        ):
+            logger.warning(
+                "Request %s will never be scheduled: needs per-req cache slot "
+                "but no slots were allocated (max_num_seqs=0 for this model "
+                "type).",
+                seq.id,
+            )
 
     def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
         """Select the next batch of sequences for a forward pass.
