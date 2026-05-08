@@ -1723,10 +1723,23 @@ class MoE(nn.Module):
             # (set by ModelRunner). torch.compile silently drops NNModule
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
-
+        assert args.n_shared_experts == 1
+        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
+        # when shared and routed have the same quant dtype.
+        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
+        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
+        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
+        # True for V4 because shared matches global, missing the routed-shared
+        # mismatch. Direct comparison: get routed and shared specs and compare.
+        routed_dtype = qc.get_layer_quant_config(f"{prefix}.experts").quant_dtype
+        shared_dtype = qc.get_layer_quant_config(f"{prefix}.shared_experts").quant_dtype
+        self._fuse_shared_into_routed = (
+            routed_dtype == shared_dtype
+            and is_rocm_aiter_fusion_shared_expert_enabled()
+        )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
-            n_shared_experts=args.n_shared_experts,
+            n_shared_experts=args.n_shared_experts if self._fuse_shared_into_routed else 0,
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -1743,21 +1756,9 @@ class MoE(nn.Module):
             config=moe_cfg,
         )
         self.experts.swiglu_limit = args.swiglu_limit
-        assert args.n_shared_experts == 1
-        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
-        # when shared and routed have the same quant dtype.
-        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
-        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
-        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
-        # True for V4 because shared matches global, missing the routed-shared
-        # mismatch. Direct comparison: get routed and shared specs and compare.
-        routed_dtype = qc.get_layer_quant_config(f"{prefix}.experts").quant_dtype
-        shared_dtype = qc.get_layer_quant_config(f"{prefix}.shared_experts").quant_dtype
-        self._fuse_shared_into_routed = (
-            routed_dtype == shared_dtype
-            and is_rocm_aiter_fusion_shared_expert_enabled()
-        )
+
         if not self._fuse_shared_into_routed:
+            # self.experts.num_fused_shared_experts = 0
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
