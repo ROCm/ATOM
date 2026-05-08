@@ -21,6 +21,7 @@ from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.decorators import mark_trace
+from atom.utils import envs
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
@@ -347,8 +348,9 @@ class RMSNormGated(nn.Module):
                 # Extract group size from quant type
                 if quant_type == QuantType.per_1x128:
                     self.group_size_quant = 128
-                    # per_1x128 blockscale GEMM requires transposed scale layout
-                    self.transpose_scale = True
+                    # preshuffle GEMM expects column-major x_scale;
+                    # non-preshuffle GEMM expects row-major x_scale
+                    self.transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
                 elif quant_type == QuantType.per_1x32:
                     self.group_size_quant = 32
                     self.transpose_scale = False
@@ -557,15 +559,23 @@ class GemmaRMSNorm(nn.Module):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
         from aiter.utility.dtypes import fp8
 
+        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         group_size = 128
         M = x.shape[0]
         N = x.shape[1]
         num_groups = N // group_size
 
         out_fp8 = torch.empty((M, N), dtype=fp8, device=x.device)
-        out_scale = torch.empty(
-            (num_groups, M), dtype=torch.float32, device=x.device
-        ).view(M, num_groups)
+        if transpose_scale:
+            # column-major: allocate (num_groups, M) then view as (M, num_groups)
+            out_scale = torch.empty(
+                (num_groups, M), dtype=torch.float32, device=x.device
+            ).view(M, num_groups)
+        else:
+            # row-major: allocate (M, num_groups) directly
+            out_scale = torch.empty(
+                (M, num_groups), dtype=torch.float32, device=x.device
+            )
         out_bf16 = (
             torch.empty((M, N), dtype=x.dtype, device=x.device)
             if self.write_bf16
@@ -583,7 +593,7 @@ class GemmaRMSNorm(nn.Module):
             q_res_out=res_out,
             q_residual=residual,
             group_size=group_size,
-            transpose_scale=True,
+            transpose_scale=transpose_scale,
             gemma_norm=True,
         )
         if residual is not None:
@@ -625,6 +635,7 @@ def _fused_qk_norm_single_kernel(
     num_q_heads,
     num_k_heads,
     ADD_UNIT_OFFSET: tl.constexpr,
+    Q_HAS_WEIGHT: tl.constexpr,
     RBLOCK: tl.constexpr,
     XBLOCK: tl.constexpr,
 ):
@@ -654,15 +665,22 @@ def _fused_qk_norm_single_kernel(
 
     mask = xmask & col_mask
 
-    # Weight: load both, select via is_q
-    qw = tl.load(
-        q_weight_ptr + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
-    ).to(tl.float32)
+    # Weight: load both (or use ones for Q when Q_HAS_WEIGHT=False), select via is_q.
+    # Q_HAS_WEIGHT=False is for callers whose Q-side norm has implicit identity
+    # weight (e.g. V4's per-head Q normalization, equivalent to the prior
+    # `_rmsnorm_nw` helper) — saves a load + register row.
+    if Q_HAS_WEIGHT:
+        qw = tl.load(
+            q_weight_ptr + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
+        ).to(tl.float32)
+        if ADD_UNIT_OFFSET:
+            qw = qw + 1.0
+    else:
+        qw = tl.full((RBLOCK,), 1.0, tl.float32)
     kw = tl.load(
         k_weight_ptr + cols, mask=col_mask, other=0.0, eviction_policy="evict_last"
     ).to(tl.float32)
     if ADD_UNIT_OFFSET:
-        qw = qw + 1.0
         kw = kw + 1.0
     w = tl.where(is_q, qw, kw)
 
@@ -704,7 +722,7 @@ def _fused_qk_norm_single_kernel(
 def fused_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_weight: torch.Tensor,
+    q_weight: Optional[torch.Tensor],
     k_weight: torch.Tensor,
     eps: float,
     add_unit_offset: bool = False,
@@ -714,11 +732,18 @@ def fused_qk_norm(
     Args:
         q: [num_tokens, num_heads, head_dim]
         k: [num_tokens, num_kv_heads, head_dim]
-        q_weight, k_weight: [head_dim] norm weights
+        q_weight: [head_dim] norm weight, or None for an implicit ones weight
+                  (skips the Q-side weight load — for callers whose Q norm
+                  is the identity, e.g. V4's per-head Q normalization).
+        k_weight: [head_dim] norm weight (always required)
         eps: epsilon for numerical stability
         add_unit_offset: True for GemmaRMSNorm (w+1), False for standard
     """
-    head_dim = q_weight.shape[0]
+    head_dim = k_weight.shape[0]
+    if q_weight is not None:
+        assert (
+            q_weight.shape[0] == head_dim
+        ), f"q_weight head_dim {q_weight.shape[0]} != k_weight {head_dim}"
     num_tokens = q.shape[0]
     num_q_heads = q.shape[1]
     num_k_heads = k.shape[1]
@@ -735,12 +760,15 @@ def fused_qk_norm(
     # num_warps=1 is universally optimal for head_dim=256 workloads on MI355X.
     XBLOCK = 2 if total_rows > 8192 else 1
     NUM_WARPS = 1
+    # When q_weight is None pass k_weight as a placeholder pointer (the
+    # kernel won't load from it — Q_HAS_WEIGHT=False gates the load).
+    q_weight_arg = q_weight if q_weight is not None else k_weight
     _fused_qk_norm_single_kernel[((total_rows + XBLOCK - 1) // XBLOCK,)](
         q,
         k,
         q_out,
         k_out,
-        q_weight,
+        q_weight_arg,
         k_weight,
         eps,
         num_tokens,
@@ -752,6 +780,7 @@ def fused_qk_norm(
         num_q_heads,
         num_k_heads,
         ADD_UNIT_OFFSET=add_unit_offset,
+        Q_HAS_WEIGHT=q_weight is not None,
         RBLOCK=RBLOCK,
         XBLOCK=XBLOCK,
         num_warps=NUM_WARPS,
@@ -763,6 +792,12 @@ class DualRMSNorm:
     """Fused Q/K RMSNorm — single Triton kernel launch.
 
     Not an nn.Module. References existing q_norm/k_norm for weights.
+
+    Q-side weightless mode: when `q_norm.weight is None`, the Q-side norm
+    is treated as the identity (implicit ones weight). The kernel skips
+    the q_weight load entirely (Q_HAS_WEIGHT=False). Use this when the
+    checkpoint does not ship a Q weight (e.g. V4's per-head Q normalization,
+    equivalent to the prior `_rmsnorm_nw` helper).
     """
 
     def __init__(
@@ -779,7 +814,22 @@ class DualRMSNorm:
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.add_unit_offset = isinstance(q_norm, GemmaRMSNorm)
+        # add_unit_offset only applies when q has a real weight; the kernel's
+        # weightless path (q_norm.weight is None) emits qw=1.0 directly with
+        # no offset, so the GemmaRMSNorm test is gated on weight existence.
+        self.add_unit_offset = getattr(
+            q_norm, "weight", None
+        ) is not None and isinstance(q_norm, GemmaRMSNorm)
+        # Resolve eps once. Different RMSNorm implementations name the
+        # attribute differently — `variance_epsilon` (HF/Gemma style) or
+        # `eps` (ATOM RMSNorm). Cache to avoid the lookup per forward call.
+        self._eps = getattr(q_norm, "variance_epsilon", None) or getattr(
+            q_norm, "eps", None
+        )
+        assert self._eps is not None, (
+            f"q_norm {type(q_norm).__name__} must expose `eps` or "
+            f"`variance_epsilon`"
+        )
         self.prefix = prefix
 
     @mark_trace
@@ -793,12 +843,15 @@ class DualRMSNorm:
         Returns:
             (q_normed, k_normed) same shapes as input
         """
+        # `self.q_norm.weight` is None for weightless q_norm (e.g. V4
+        # `q_norm2`); fused_qk_norm forwards that None to the kernel which
+        # takes the Q_HAS_WEIGHT=False fast path.
         q, k = fused_qk_norm(
             q.view(-1, self.num_q_heads, self.head_dim),
             k.view(-1, self.num_kv_heads, self.head_dim),
             self.q_norm.weight,
             self.k_norm.weight,
-            self.q_norm.variance_epsilon,
+            self._eps,
             add_unit_offset=self.add_unit_offset,
         )
         return (
