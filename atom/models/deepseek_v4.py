@@ -150,52 +150,6 @@ def _hc_head_reduce(
     return y.to(x.dtype)
 
 
-def _mhc_pre_fake(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    m = residual.size(0)
-    hc_mult = residual.size(1)
-    hidden_size = residual.size(2)
-    return (
-        torch.empty(m, hc_mult, 1, dtype=torch.float32, device=residual.device),
-        torch.empty(m, hc_mult, hc_mult, dtype=torch.float32, device=residual.device),
-        torch.empty(m, hidden_size, dtype=torch.bfloat16, device=residual.device),
-    )
-
-
-@torch_compile_guard(gen_fake=_mhc_pre_fake, mutates_args=[])
-def _mhc_pre_guarded(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return aiter.mhc_pre(
-        residual,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-    )
-
-
 def _v4_attention_fake(
     x: torch.Tensor,
     positions: torch.Tensor,
@@ -2081,7 +2035,7 @@ class Block(nn.Module):
         if self._mhc_pre is not None:
             # aiter mhc_pre wants [M, hc, dim] and returns
             # (post [M, hc, 1], comb [M, hc, hc], y [M, dim]).
-            post, comb, y = _mhc_pre_guarded(
+            post, comb, y = self._mhc_pre(
                 residual,
                 hc_fn,
                 hc_scale,
