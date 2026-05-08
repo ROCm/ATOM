@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -11,8 +12,19 @@ from rtp_llm.ops import ParallelismConfig
 from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
-from atom.plugin.rtpllm.model_ops.attention_gdn import apply_attention_gdn_rtpllm_patch
+from atom.model_loader.loader import WeightsMapper
+from atom.models.qwen3_5 import (
+    detect_fused_expert_format,
+    get_fused_expert_mapping,
+    load_fused_expert_weights,
+)
+from atom.plugin.rtpllm.model_ops import (
+    apply_attention_gdn_rtpllm_patch,
+    apply_attention_mha_rtpllm_patch,
+)
 from atom.plugin.rtpllm.models.qwen3_next import apply_qwen3_next_rtpllm_patch
+from atom.plugin.rtpllm.utils import RTPForwardContext
+from atom.plugin.rtpllm.utils.tensor_dump import dump_tensor as dump_atom_tensor
 
 logger = logging.getLogger("atom.plugin.rtpllm.models")
 
@@ -60,7 +72,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             device_resource_config=device_resource_config,
         )
         self.model = atom_model
-        self._warned_once_keys: set[str] = set()
 
     def load_weights(self):
         # ATOM weights should be loaded exactly once from ATOMQwen35Moe._create_python_model.
@@ -78,16 +89,16 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             return torch.bfloat16
         return first_param.dtype
 
-    def _warn_once(self, key: str, msg: str, *args: Any) -> None:
-        if key in self._warned_once_keys:
-            return
-        self._warned_once_keys.add(key)
-        logger.warning(msg, *args)
+    def _get_token_num(self, inputs: PyModelInputs, input_ids: torch.Tensor | None) -> int:
+        if input_ids is not None and input_ids.numel() > 0:
+            return int(input_ids.numel())
+        if inputs.input_hiddens is not None and inputs.input_hiddens.numel() > 0:
+            return int(inputs.input_hiddens.shape[0])
+        return 0
 
-    def _build_positions_fallback(
-        self, inputs: PyModelInputs, model_device: torch.device
+    def _build_positions_from_attention_inputs(
+        self, attn_inputs: Any, model_device: torch.device
     ) -> torch.Tensor | None:
-        attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
             return None
 
@@ -95,84 +106,20 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         if input_lengths is None or input_lengths.numel() == 0:
             return None
 
-        prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
-        sequence_lengths = getattr(attn_inputs, "sequence_lengths", None)
-
-        context_batch = (
-            int(prefix_lengths.numel())
-            if prefix_lengths is not None and prefix_lengths.numel() > 0
-            else 0
-        )
-        decode_batch = (
-            int(sequence_lengths.numel())
-            if sequence_lengths is not None and sequence_lengths.numel() > 0
-            else 0
-        )
-
-        parts: list[torch.Tensor] = []
-
-        for i in range(context_batch):
-            token_num = int(input_lengths[i].item())
-            prefix = int(prefix_lengths[i].item())
-            if token_num > 0:
-                parts.append(
-                    torch.arange(
-                        prefix,
-                        prefix + token_num,
-                        dtype=torch.int32,
-                        device=model_device,
-                    )
-                )
-
-        for j in range(decode_batch):
-            idx = context_batch + j
-            token_num = int(input_lengths[idx].item()) if idx < input_lengths.numel() else 1
-            seq_len = int(sequence_lengths[j].item())
-            if token_num <= 0:
-                continue
-            if token_num == 1:
-                parts.append(torch.tensor([seq_len], dtype=torch.int32, device=model_device))
-            else:
-                parts.append(
-                    torch.arange(
-                        seq_len - token_num + 1,
-                        seq_len + 1,
-                        dtype=torch.int32,
-                        device=model_device,
-                    )
-                )
-
-        if not parts:
-            return None
-        return torch.cat(parts, dim=0)
-
-    def _build_positions_from_attention_inputs(
-        self, attn_inputs: Any, model_device: torch.device
-    ) -> torch.Tensor | None:
-        if attn_inputs is None:
-            return None
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-        input_lengths = getattr(attn_inputs, "input_lengths", None)
-        prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
-        sequence_lengths = getattr(attn_inputs, "sequence_lengths", None)
+        if is_prefill:
+            prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
+            if prefix_lengths is None or prefix_lengths.numel() == 0:
+                return None
 
-        if is_prefill and input_lengths is not None and input_lengths.numel() > 0:
             parts: list[torch.Tensor] = []
             input_lengths_cpu = input_lengths.detach().to(device="cpu")
-            prefix_lengths_cpu = (
-                prefix_lengths.detach().to(device="cpu")
-                if prefix_lengths is not None and prefix_lengths.numel() > 0
-                else None
-            )
+            prefix_lengths_cpu = prefix_lengths.detach().to(device="cpu")
             for i, token_num in enumerate(input_lengths_cpu.tolist()):
                 token_num = int(token_num)
                 if token_num <= 0:
                     continue
-                prefix = (
-                    int(prefix_lengths_cpu[i].item())
-                    if prefix_lengths_cpu is not None and i < int(prefix_lengths_cpu.numel())
-                    else 0
-                )
+                prefix = int(prefix_lengths_cpu[i].item())
                 parts.append(
                     torch.arange(
                         prefix,
@@ -181,83 +128,134 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                         device=model_device,
                     )
                 )
-            if parts:
-                return torch.cat(parts, dim=0)
+            if not parts:
+                return None
+            return torch.cat(parts, dim=0)
 
-        if sequence_lengths is not None and sequence_lengths.numel() > 0:
-            return sequence_lengths.to(
-                device=model_device, dtype=torch.int32, non_blocking=True
-            ).contiguous()
-        return None
+        sequence_lengths = getattr(attn_inputs, "sequence_lengths", None)
+        if sequence_lengths is None or sequence_lengths.numel() == 0:
+            return None
+
+        parts: list[torch.Tensor] = []
+        input_lengths_cpu = input_lengths.detach().to(device="cpu")
+        sequence_lengths_cpu = sequence_lengths.detach().to(device="cpu")
+        for i, token_num in enumerate(input_lengths_cpu.tolist()):
+            token_num = int(token_num)
+            if token_num <= 0:
+                continue
+            if i >= int(sequence_lengths_cpu.numel()):
+                return None
+            seq_idx = int(sequence_lengths_cpu[i].item())
+            if token_num == 1:
+                parts.append(
+                    torch.tensor([seq_idx], dtype=torch.int32, device=model_device)
+                )
+            else:
+                parts.append(
+                    torch.arange(
+                        seq_idx - token_num + 1,
+                        seq_idx + 1,
+                        dtype=torch.int32,
+                        device=model_device,
+                    )
+                )
+        if not parts:
+            return None
+        return torch.cat(parts, dim=0)
+
+    def _extract_combo_positions(
+        self, inputs: PyModelInputs, model_device: torch.device
+    ) -> torch.Tensor | None:
+        bert_inputs = getattr(inputs, "bert_embedding_inputs", None)
+        if bert_inputs is None:
+            return None
+        combo_position_ids = getattr(bert_inputs, "combo_position_ids", None)
+        if combo_position_ids is None or combo_position_ids.numel() == 0:
+            return None
+        return combo_position_ids.to(
+            device=model_device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+
+    def _extract_positions(
+        self, inputs: PyModelInputs, model_device: torch.device, token_num: int
+    ) -> torch.Tensor:
+        attn_inputs = getattr(inputs, "attention_inputs", None)
+        if attn_inputs is None:
+            raise ValueError(
+                "RTP plugin requires inputs.attention_inputs to provide position_ids."
+            )
+        # Keep plugin semantics aligned with RTP native path:
+        # first use attention_inputs.position_ids, then fallback to combo_position_ids.
+        positions = getattr(attn_inputs, "position_ids", None)
+        if positions is None or positions.numel() == 0:
+            positions = self._extract_combo_positions(inputs=inputs, model_device=model_device)
+        if positions is None or positions.numel() == 0:
+            positions = self._build_positions_from_attention_inputs(
+                attn_inputs=attn_inputs,
+                model_device=model_device,
+            )
+        if positions is None or positions.numel() == 0:
+            raise ValueError(
+                "RTP plugin requires real position metadata from attention_inputs "
+                "(position_ids or input/prefix/sequence lengths); fallback positions are disabled."
+            )
+        positions = positions.to(
+            device=model_device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        pos_tokens = int(positions.shape[-1]) if positions.dim() > 0 else int(positions.numel())
+        if token_num > 0 and pos_tokens != token_num:
+            rebuilt_positions = self._build_positions_from_attention_inputs(
+                attn_inputs=attn_inputs,
+                model_device=model_device,
+            )
+            rebuilt_tokens = (
+                int(rebuilt_positions.shape[-1])
+                if rebuilt_positions is not None and rebuilt_positions.dim() > 0
+                else (int(rebuilt_positions.numel()) if rebuilt_positions is not None else -1)
+            )
+            if rebuilt_positions is not None and rebuilt_tokens == token_num:
+                positions = rebuilt_positions.to(
+                    device=model_device, dtype=torch.int32, non_blocking=True
+                ).contiguous()
+            elif pos_tokens > token_num:
+                # Keep using RTP-provided real positions, but align to current token window.
+                positions = positions[..., -token_num:].contiguous()
+            else:
+                raise ValueError(
+                    "RTP plugin position_ids/token_num mismatch "
+                    f"(position_ids_tokens={pos_tokens}, token_num={token_num})."
+                )
+        return positions
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         model_device = self._get_model_device()
         model_dtype = self._get_model_dtype()
         input_ids = inputs.input_ids
-        attn_inputs = getattr(inputs, "attention_inputs", None)
-        positions = getattr(attn_inputs, "position_ids", None)
-        if positions is None:
-            positions = self._build_positions_from_attention_inputs(attn_inputs, model_device)
-        if positions is None:
-            # In some RTP plugin paths, position ids are populated in
-            # bert_embedding_inputs instead of attention_inputs.
-            positions = getattr(inputs.bert_embedding_inputs, "combo_position_ids", None)
-        if positions is None:
-            # Fallback for plugin paths that don't populate either field.
-            positions = self._build_positions_fallback(inputs, model_device)
         inputs_embeds = None
 
         if input_ids is not None and input_ids.numel() > 0 and input_ids.device != model_device:
             input_ids = input_ids.to(device=model_device, non_blocking=True)
-        if positions is not None and positions.numel() > 0 and positions.device != model_device:
-            positions = positions.to(device=model_device, non_blocking=True)
-        if positions is None and input_ids is not None and input_ids.numel() > 0:
-            # Last resort: keep generation alive for simple text-only cases.
-            positions = torch.arange(
-                input_ids.numel(), dtype=torch.int32, device=model_device
-            )
-            self._warn_once(
-                "positions_missing_local_arange",
-                "RTP plugin did not provide position ids; using local arange fallback."
-            )
-        # Rotary embedding requires `positions.numel() == token_num`.
-        # In some plugin paths RTP passes full-context positions while input_ids contains only decode tokens.
-        token_num = 0
+        token_num = self._get_token_num(inputs=inputs, input_ids=input_ids)
+        positions = self._extract_positions(
+            inputs=inputs, model_device=model_device, token_num=token_num
+        )
+        model_inputs_embeds = None
         if input_ids is not None and input_ids.numel() > 0:
-            token_num = int(input_ids.numel())
-        if token_num == 0 and inputs.input_hiddens is not None and inputs.input_hiddens.numel() > 0:
-            token_num = int(inputs.input_hiddens.shape[0])
-        if positions is not None and positions.numel() > 0 and token_num > 0:
-            pos_num = int(positions.shape[-1])
-            if pos_num != token_num:
-                attn_inputs = getattr(inputs, "attention_inputs", None)
-                sequence_lengths = (
-                    getattr(attn_inputs, "sequence_lengths", None) if attn_inputs is not None else None
-                )
-                if sequence_lengths is not None and int(sequence_lengths.numel()) == token_num:
-                    positions = sequence_lengths.to(device=model_device, dtype=torch.int32, non_blocking=True)
-                    self._warn_once(
-                        "position_token_mismatch_sequence_lengths",
-                        "Position/token mismatch fixed via sequence_lengths: pos=%d token=%d",
-                        pos_num,
-                        token_num,
-                    )
-                elif pos_num > token_num:
-                    positions = positions[..., -token_num:].contiguous()
-                    self._warn_once(
-                        "position_token_mismatch_tail_slice",
-                        "Position/token mismatch fixed via tail slice: pos=%d token=%d",
-                        pos_num,
-                        token_num,
-                    )
-                else:
-                    positions = torch.arange(token_num, dtype=torch.int32, device=model_device)
-                    self._warn_once(
-                        "position_token_mismatch_local_arange",
-                        "Position/token mismatch fixed via local arange: pos=%d token=%d",
-                        pos_num,
-                        token_num,
-                    )
+            try:
+                # Dump-only tensor to align with RTP runtime/inputs_embeds comparison point.
+                model_inputs_embeds = self.model.embed_input_ids(input_ids)
+            except Exception:  # noqa: BLE001
+                model_inputs_embeds = None
+        dump_atom_tensor(
+            tag="runtime/input_ids",
+            tensor=input_ids,
+            meta={"token_num": token_num},
+        )
+        dump_atom_tensor(
+            tag="runtime/positions",
+            tensor=positions,
+            meta={"token_num": token_num},
+        )
         if input_ids is None or input_ids.numel() == 0:
             inputs_embeds = inputs.input_hiddens
             if (
@@ -272,12 +270,25 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 and inputs_embeds.dtype != model_dtype
             ):
                 inputs_embeds = inputs_embeds.to(dtype=model_dtype)
+        dump_atom_tensor(
+            tag="runtime/inputs_embeds",
+            tensor=model_inputs_embeds if model_inputs_embeds is not None else inputs_embeds,
+            meta={"token_num": token_num},
+        )
 
-        hidden_states = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=None,
-            inputs_embeds=inputs_embeds,
+        with RTPForwardContext.bind(
+            model=self.model, runtime=self, inputs=inputs, positions=positions
+        ):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=inputs_embeds,
+            )
+        dump_atom_tensor(
+            tag="runtime/hidden_states",
+            tensor=hidden_states,
+            meta={"token_num": token_num},
         )
         return PyModelOutputs(hidden_states)
 
@@ -289,6 +300,40 @@ class ATOMQwen35Moe(Qwen35Moe):
     def _is_external_plugin_mode() -> bool:
         modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
         return "atom.plugin.rtpllm.models" in modules
+
+    @staticmethod
+    def _make_qwen35_hf_mapper() -> WeightsMapper:
+        # Keep loading on outer text-only wrapper so packed_modules_mapping works.
+        # Normalize checkpoint prefixes to match wrapper's weights_mapping rules.
+        return WeightsMapper(
+            orig_to_new_substr={"attn.qkv.": "attn.qkv_proj."},
+            orig_to_new_prefix={
+                # model.language_model.model.* -> model.language_model.*
+                # then wrapper mapping turns it into language_model.model.*
+                "model.language_model.model.": "model.language_model.",
+                # model.language_model.lm_head.* -> lm_head.* -> language_model.lm_head.*
+                "model.language_model.lm_head.": "lm_head.",
+            },
+        )
+
+    @staticmethod
+    @contextmanager
+    def _maybe_disable_shared_expert_fusion_for_load(atom_model: Any):
+        has_standalone_shared_expert = any(
+            ".shared_expert." in name for name, _ in atom_model.named_parameters()
+        )
+        if not has_standalone_shared_expert:
+            yield
+            return
+
+        import atom.model_loader.loader as atom_loader
+
+        origin_fn = atom_loader.is_rocm_aiter_fusion_shared_expert_enabled
+        atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = lambda: False
+        try:
+            yield
+        finally:
+            atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = origin_fn
 
     def load(self):
         # External plugin mode: bypass rtp-llm native weight loading path and
@@ -371,9 +416,54 @@ class ATOMQwen35Moe(Qwen35Moe):
                 self.weight.set_global_weight(W.final_ln_gamma, final_ln.detach())
                 logger.info("Injected runtime final_ln_gamma for RTP: %s", tuple(final_ln.shape))
 
+        def _assert_norm_weights_loaded(atom_model_obj: Any) -> None:
+            # Guard against silently using default-initialized GemmaRMSNorm weights.
+            candidates = [
+                "language_model.model.layers.0.input_layernorm.weight",
+                "model.layers.0.input_layernorm.weight",
+            ]
+            norm_w = None
+            for name in candidates:
+                norm_w = _get_first_param_tensor(atom_model_obj, name)
+                if norm_w is not None:
+                    break
+            if norm_w is None:
+                raise ValueError(
+                    "Cannot locate layer-0 input_layernorm.weight after ATOM load in RTP plugin mode."
+                )
+            norm_w_cpu = norm_w.detach().float().reshape(-1).cpu()
+            if norm_w_cpu.numel() == 0 or bool(torch.all(norm_w_cpu == 0)):
+                raise ValueError(
+                    "Loaded layer-0 input_layernorm.weight is all zeros. "
+                    "This indicates checkpoint mapping/load mismatch, refusing to run with default values."
+                )
+
+        def _load_fused_expert_weights_for_qwen35(
+            original_name: str,
+            name: str,
+            params_dict: dict,
+            loaded_weight: torch.Tensor,
+            shard_id: str,
+            num_experts: int,
+        ) -> bool:
+            if not detect_fused_expert_format(original_name):
+                return False
+            mapping = get_fused_expert_mapping()
+            if not any(weight_name in original_name for _, weight_name, _ in mapping):
+                return False
+            return load_fused_expert_weights(
+                original_name=original_name,
+                name=name,
+                params_dict=params_dict,
+                loaded_weight=loaded_weight,
+                shard_id=shard_id,
+                num_experts=num_experts,
+            )
+
         try:
             # Keep RTP-specific behavior in plugin path only.
             apply_attention_gdn_rtpllm_patch()
+            apply_attention_mha_rtpllm_patch()
             apply_qwen3_next_rtpllm_patch()
             atom_model = atom.prepare_model(config=self, engine="rtpllm")
             if atom_model is None:
@@ -395,11 +485,16 @@ class ATOMQwen35Moe(Qwen35Moe):
                 )
 
             # External plugin mode: load checkpoint once through ATOM loader.
-            load_model_in_plugin_mode(
-                model=atom_model,
-                config=atom_config,
-                prefix="model.",
-            )
+            # Keep Qwen3.5 MoE weight semantics aligned with #532 plugin path.
+            with self._maybe_disable_shared_expert_fusion_for_load(atom_model):
+                load_model_in_plugin_mode(
+                    model=atom_model,
+                    config=atom_config,
+                    prefix="model.",
+                    weights_mapper=self._make_qwen35_hf_mapper(),
+                    load_fused_expert_weights_fn=_load_fused_expert_weights_for_qwen35,
+                )
+            _assert_norm_weights_loaded(atom_model)
             _inject_rtp_projection_weights(atom_model)
         finally:
             torch.set_default_dtype(old_default_dtype)
