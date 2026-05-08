@@ -57,6 +57,7 @@ support_model_arch_dict = {
     "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
     "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
+    "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
     "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
@@ -492,6 +493,7 @@ class ModelRunner:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
+        self.use_v4 = self.is_deepseek_v4()
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
@@ -551,6 +553,7 @@ class ModelRunner:
             self.block_size,
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
+            use_v4=self.use_v4,
         )
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
@@ -595,6 +598,18 @@ class ModelRunner:
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
         logger.info(f"Model load done: {config.model}")
+
+        # Optional debug instrumentation; no-op when env vars unset.
+        # See atom/utils/debug_helper/.
+        from atom.utils.debug_helper import (
+            install_block_forward_hooks,
+            maybe_dump_weights_and_exit,
+        )
+
+        _n_fwd_hooks = install_block_forward_hooks(self.model)
+        if _n_fwd_hooks > 0:
+            logger.info(f"[ATOM_FWD_DUMP] {_n_fwd_hooks} Block forward hooks installed")
+        maybe_dump_weights_and_exit(self.model)
 
         if self.config.speculative_config and get_pp_group().is_last_rank:
             from atom.utils.backends import set_model_tag
@@ -690,6 +705,11 @@ class ModelRunner:
         ):
             return True
         return False
+
+    def is_deepseek_v4(self) -> bool:
+        if not hasattr(self.hf_text_config, "model_type"):
+            return False
+        return self.hf_text_config.model_type == "deepseek_v4"
 
     def is_mimo_v2(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
@@ -1316,13 +1336,28 @@ class ModelRunner:
         # vllm use register_kv_caches to register kv_cache_data. We just set it to global here
         set_kv_cache_data(kv_cache_data, config)
 
-        # Cross-validate: compare estimated vs actual KV cache allocation
+        # Cross-validate: compare estimated vs actual KV cache allocation.
+        # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
+        # `block_bytes × num_blocks`) AND the per-request cache tensors (state
+        # buffers + SWA window prefix embedded in unified_kv). The budget
+        # math in `get_num_blocks()` reserves both separately, so the cross-
+        # check must mirror that — otherwise it spuriously fires for any
+        # backend with non-zero `compute_per_req_cache_bytes()` (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
-        expected_kv_bytes = self._compute_block_bytes() * num_kvcache_blocks
+        expected_kv_bytes = (
+            self._compute_block_bytes() * num_kvcache_blocks
+            + self.attn_metadata_builder.compute_per_req_cache_bytes()
+            * self.max_per_req_cache_slots
+        )
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
-            if diff_pct > 0.01:
+            # 3% threshold: budget formula matches allocation exactly, but the
+            # measured `post_alloc - pre_alloc` includes allocator alignment
+            # (round to 256 B / 16 MiB segments) and ephemeral init buffers
+            # from `_zero_state` / `_neg_inf_state` views, accounting for ~2%
+            # noise on multi-GiB pools. Lower thresholds spuriously fire.
+            if diff_pct > 0.03:
                 logger.warning(
                     f"KV cache allocation mismatch: "
                     f"expected={expected_kv_bytes / (1 << 30):.3f}GB, "
@@ -1817,9 +1852,26 @@ class ModelRunner:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
 
-        assert (
-            self.graph_bs[0] <= self.config.max_num_seqs
-        ), "cudagraph capture sizes must be less than max_num_seqs."
+        # Drop any capture size that exceeds max_num_seqs — those graphs would
+        # never be replayed since the scheduler can't produce a batch larger
+        # than max_num_seqs. Warn so the user notices a misconfig (default
+        # cuda_graph_sizes=[512] vs e.g. max_num_seqs=16) without crashing.
+        max_bs = self.config.max_num_seqs
+        oversized = [s for s in self.graph_bs if s > max_bs]
+        if oversized:
+            self.graph_bs = [s for s in self.graph_bs if s <= max_bs]
+            logger.warning(
+                "cudagraph capture sizes %s exceed max_num_seqs=%d; dropping. "
+                "Remaining: %s",
+                oversized,
+                max_bs,
+                self.graph_bs,
+            )
+        assert self.graph_bs, (
+            f"no cudagraph capture sizes left after filtering by "
+            f"max_num_seqs={max_bs}; pass --cudagraph-capture-sizes or raise "
+            f"--max-num-seqs."
+        )
 
         input_ids = self.forward_vars["input_ids"].gpu
         positions = self.forward_vars["positions"].gpu

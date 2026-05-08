@@ -24,6 +24,18 @@
     "_baseline_note": "CI measured FP8 baseline (GSM8K 3-shot flexible-extract)"
   },
   {
+    "model_name": "DeepSeek-V4-Pro",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+    "env_vars": "ATOM_USE_TRITON_MOE=1",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "pr",
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": 0.96,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "Local 4-run average GSM8K-100 3-shot flexible-extract = 0.96 (runs: 0.96/0.98/0.96/0.94, stderr ~0.024). ATOM_USE_TRITON_MOE=1 is required — without it accuracy drops to ~0.6. Threshold set 4pp below local baseline to absorb full-eval (1319 samples) noise; refresh after first CI measurement."
+  },
+  {
     "model_name": "DeepSeek-R1-0528 MTP",
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8 --method mtp --num-speculative-tokens 3",

@@ -722,7 +722,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        num_tokens = hidden_states.size(0)
 
         # ============================================================
         # Part 1: Input Projection

@@ -216,7 +216,6 @@ class PagedAttentionImpl(nn.Module):
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
-
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
@@ -521,7 +520,6 @@ class PagedAttentionImpl(nn.Module):
             window_size=sliding_window,
             sink_ptr=self.sinks,
         )
-
         return o
 
     def prefill_attention_triton(

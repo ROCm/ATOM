@@ -23,6 +23,10 @@ on:
         description: "DeepSeek-R1-0528-MXFP4 FP4 TP4"
         type: boolean
         default: false
+      deepseek-r1-fp4-tp8-ep8:
+        description: "DeepSeek-R1-0528-MXFP4 FP4 TP8 EP8"
+        type: boolean
+        default: false
       sglang_image:
         description: "Optional SGLang benchmark image override. Leave empty to use sglang-latest on main or rebuild from the selected non-main branch."
         type: string
@@ -212,6 +216,7 @@ jobs:
           ENABLE_DEEPSEEK_R1_FP8_TP4: ${{ inputs.deepseek-r1-fp8-tp4 }}
           ENABLE_DEEPSEEK_R1_FP4_TP8: ${{ inputs.deepseek-r1-fp4-tp8 }}
           ENABLE_DEEPSEEK_R1_FP4_TP4: ${{ inputs.deepseek-r1-fp4-tp4 }}
+          ENABLE_DEEPSEEK_R1_FP4_TP8_EP8: ${{ inputs.deepseek-r1-fp4-tp8-ep8 }}
         run: |
           MODELS_JSON="$(jq -c '
             map(select(
@@ -219,6 +224,7 @@ jobs:
               or (.prefix == "deepseek-r1-fp8-tp4" and env.ENABLE_DEEPSEEK_R1_FP8_TP4 == "true")
               or (.prefix == "deepseek-r1-fp4-tp8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8 == "true")
               or (.prefix == "deepseek-r1-fp4-tp4" and env.ENABLE_DEEPSEEK_R1_FP4_TP4 == "true")
+              or (.prefix == "deepseek-r1-fp4-tp8-ep8" and env.ENABLE_DEEPSEEK_R1_FP4_TP8_EP8 == "true")
             ))
           ' .github/benchmark/sglang_benchmark_models.json)"
           echo "models_json=${MODELS_JSON}" >> "$GITHUB_OUTPUT"
@@ -468,6 +474,7 @@ jobs:
             deepseek-r1-fp8-tp4) echo "enabled=${{ inputs.deepseek-r1-fp8-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-r1-fp4-tp4) echo "enabled=${{ inputs.deepseek-r1-fp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
+            deepseek-r1-fp4-tp8-ep8) echo "enabled=${{ inputs.deepseek-r1-fp4-tp8-ep8 }}" >> "$GITHUB_OUTPUT" ;;
             *) echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
           esac
 
