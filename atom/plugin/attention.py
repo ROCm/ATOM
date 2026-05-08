@@ -2382,7 +2382,14 @@ def unified_attention_with_output_base_for_plugin_mode(
         # ATOM needs to handle all of the buffer here
         # Positions for compiled unified_attention are provided via vLLM ForwardContext
         # (atom_positions) in ATOMModelBase.forward, not via this Python arg.
-        if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        #
+        # RoPE single-source-of-truth in plugin mode: when ATOM's
+        # PagedAttentionImpl is active, it applies RoPE inside
+        # rope_cache_plugin_mode. Applying RoPE here too would double apply
+        # it for any model hitting the "else" branch in rope_cache_plugin_mode when
+        # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION is not set.
+        # if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if current_atom_config.plugin_config.vllm_use_atom_attention:
             output = self.attn(q, k, v)
         else:
             # calculate the q and k with rotary embedding
