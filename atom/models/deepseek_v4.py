@@ -35,6 +35,7 @@ from aiter import (
     get_hip_quant,
     indexer_k_quant_and_cache,
 )
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
@@ -66,7 +67,7 @@ from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
 from atom.model_ops.utils import atom_parameter
-from atom.utils import envs
+from atom.utils import envs, mark_spliting_op
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
 # (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
@@ -86,6 +87,7 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils.forward_context import get_forward_context
+from atom.utils.decorators import support_torch_compile
 
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
@@ -118,6 +120,53 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
         return rmsnorm_nw(x, eps)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
+
+
+def _hc_head_reduce_fake(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    return torch.empty(x.shape[0], x.shape[-1], dtype=x.dtype, device=x.device)
+
+
+@torch_compile_guard(gen_fake=_hc_head_reduce_fake, mutates_args=[])
+def _hc_head_reduce(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    x_flat = x.flatten(-2)
+    x_normed = _rmsnorm_nw(x_flat, norm_eps, x_flat.shape[-1])
+    mixes = F.linear(x_normed.float(), hc_fn)
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)
+    return y.to(x.dtype)
+
+
+def _v4_attention_fake(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
+def v4_attention_with_output(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    return self.forward_impl(x, positions)
 
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1340,10 @@ class DeepseekV4Attention(nn.Module):
             self.indexer.rotary_emb = self.rotary_emb
             self.indexer.compressor.rotary_emb = self.rotary_emb
 
+        self.layer_name = prefix
+        atom_config = get_current_atom_config()
+        atom_config.compilation_config.static_forward_context[self.layer_name] = self
+
     def process_weights_after_loading(self) -> None:
         """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
 
@@ -1342,6 +1395,13 @@ class DeepseekV4Attention(nn.Module):
         self.wo_a.quant_type = QuantType.No
 
     def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops.aiter.v4_attention_with_output(x, positions, self.layer_name)
+
+    def forward_impl(
         self,
         x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
@@ -2128,10 +2188,14 @@ class ParallelHead(nn.Module):
         """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
-        _, _, y = aiter.mhc_pre(
-            x, hc_fn, hc_scale, hc_base, self.norm_eps, self.hc_eps, sinkhorn_repeat=0
+        return _hc_head_reduce(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.norm_eps,
+            self.hc_eps,
         )
-        return y
 
     def forward(
         self,
@@ -2219,6 +2283,7 @@ class MTPBlock(Block):
         )
 
 
+@support_torch_compile
 class DeepseekV4Model(nn.Module):
     """Full model: embed -> expand to hc_mult copies -> N blocks -> hc_head -> logits.
 
@@ -2234,6 +2299,7 @@ class DeepseekV4Model(nn.Module):
     def __init__(
         self,
         *,
+        atom_config: Config,
         args: DeepseekV4Args,
     ):
         super().__init__()
@@ -2285,7 +2351,6 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
-    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,  # [num_tokens] int  flat ragged-batch token ids
@@ -2382,7 +2447,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # config lacks `quantization_config` (e.g. dummy / toy validation),
         # this still works — base spec is QuantType.No.
         self.args.quant_config = make_v4_quant_config(self.hf_config)
-        self.model = DeepseekV4Model(args=self.args)
+        self.model = DeepseekV4Model(atom_config=config, args=self.args)
 
     def forward(
         self,

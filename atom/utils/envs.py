@@ -93,6 +93,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.
     "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
+    # --- Bpreshuffle for weight ---
+    # Preshuffle weight.  Default "1" (enabled)
+    "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE": lambda: os.getenv(
+        "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1"
+    )
+    == "1",
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with

@@ -1351,13 +1351,22 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             # Update scale to single max scale per expert [E]
             layer.w13_weight_scale = atom_parameter(max_w13_scales)
 
-        # Shuffle weights for asm moe (moved from inference to load time for better performance)
-        if w13.dtype in [
-            torch.int8,
-            torch.uint8,
-            torch.float8_e4m3fnuz,
-            torch.float8_e4m3fn,
-        ]:
+        # Shuffle weights for asm moe (moved from inference to load time for better performance).
+        # For per_1x128 blockscale (block_quant), only shuffle when the preshuffle GEMM
+        # path is enabled — the non-preshuffle kernel expects the un-shuffled layout.
+        skip_shuffle_for_block = (
+            self.block_quant and not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+        if (
+            w13.dtype
+            in [
+                torch.int8,
+                torch.uint8,
+                torch.float8_e4m3fnuz,
+                torch.float8_e4m3fn,
+            ]
+            and not skip_shuffle_for_block
+        ):
             from aiter.ops.shuffle import shuffle_weight
 
             w13.data = shuffle_weight(w13.data)
@@ -1667,7 +1676,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = atom_parameter(layer.w2_weight.data)
             layer.w2_weight_scale = atom_parameter(layer.w2_weight_scale.data)
 
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        # per_1x128 blockscale MoE only needs weight bpreshuffle when the
+        # preshuffle GEMM path is enabled. Skip it to match the non-preshuffle
+        # kernel's expected weight layout.
+        if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
         """PTPTC"""
