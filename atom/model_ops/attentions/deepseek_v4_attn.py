@@ -265,7 +265,7 @@ def _build_window_topk_batched(
     )
     pos_col = positions.view(total, 1)
     sp_col = start_pos_per_token.view(total, 1)
-    neg1 = torch.tensor(-1, device=device, dtype=positions.dtype)
+    neg1 = positions.new_full((), -1)
 
     # Case A: sp == 0 (fresh prefill) — abs positions [pos-win+1, pos] clamped.
     case_a = (pos_col - window_size + 1).clamp(min=0) + arange_w
