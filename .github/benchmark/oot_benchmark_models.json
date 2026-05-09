@@ -6,7 +6,7 @@
       "path": "deepseek-ai/DeepSeek-R1-0528",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
-      "nightly_group": "B",
+      "nightly_group": "C",
       "variants": [
         {
           "tp_size": 8,
@@ -23,7 +23,7 @@
       "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
-      "nightly_group": "B",
+      "nightly_group": "D",
       "variants": [
         {
           "tp_size": 8,
@@ -40,7 +40,7 @@
       "path": "deepseek-ai/DeepSeek-V3.2",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
-      "nightly_group": "B",
+      "nightly_group": "D",
       "variants": [
         {
           "tp_size": 4,
@@ -69,11 +69,19 @@
       "nightly_group": "B",
       "variants": [
         {
+          "tp_size": 1,
+          "display": "MiniMax-M2.5 TP1",
+          "dashboard_model": "MiniMax-M2.5-tp1",
+          "prefix": "MiniMax-M2.5-tp1",
+          "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 1",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
+        },
+        {
           "tp_size": 2,
           "display": "MiniMax-M2.5 TP2",
           "dashboard_model": "MiniMax-M2.5",
           "prefix": "MiniMax-M2.5-tp2",
-          "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 2",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         },
         {
@@ -81,7 +89,7 @@
           "display": "MiniMax-M2.5 TP4",
           "dashboard_model": "MiniMax-M2.5-tp4",
           "prefix": "MiniMax-M2.5-tp4",
-          "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 4",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         },
         {
@@ -89,7 +97,7 @@
           "display": "MiniMax-M2.5 TP8",
           "dashboard_model": "MiniMax-M2.5-tp8",
           "prefix": "MiniMax-M2.5-tp8",
-          "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "extra_args": "--trust-remote-code --kv-cache-dtype fp8 --tensor-parallel-size 8",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
         }
       ]
@@ -100,7 +108,7 @@
       "path": "openai/gpt-oss-120b",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
-      "nightly_group": "C",
+      "nightly_group": "B",
       "variants": [
         {
           "tp_size": 1,
@@ -112,15 +120,20 @@
         {
           "tp_size": 2,
           "display": "gpt-oss-120b TP2",
-          "dashboard_model": "gpt-oss-120b-tp2",
           "prefix": "gpt-oss-120b-tp2",
           "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
         },
         {
+          "tp_size": 4,
+          "display": "gpt-oss-120b TP4",
+          "prefix": "gpt-oss-120b-tp4",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
+        },
+        {
           "tp_size": 8,
           "display": "gpt-oss-120b TP8",
-          "dashboard_model": "gpt-oss-120b-tp8",
           "prefix": "gpt-oss-120b-tp8",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nGPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT=1\nOOT_GPU_MEMORY_UTILIZATION=0.5"
@@ -133,8 +146,16 @@
       "path": "zai-org/GLM-4.7-FP8",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
-      "nightly_group": "B",
+      "nightly_group": "D",
       "variants": [
+        {
+          "tp_size": 2,
+          "display": "GLM-4.7-FP8 TP2",
+          "dashboard_model": "GLM-4.7-FP8-tp2",
+          "prefix": "glm-4-7-fp8-tp2",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+        },
         {
           "tp_size": 4,
           "display": "GLM-4.7-FP8 TP4",
@@ -146,7 +167,7 @@
         {
           "tp_size": 8,
           "display": "GLM-4.7-FP8 TP8",
-          "dashboard_model": "GLM-4.7-FP8-tp8",
+          "dashboard_model": "GLM-4.7-FP8",
           "prefix": "glm-4-7-fp8-tp8",
           "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 16384 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
@@ -159,7 +180,7 @@
       "path": "zai-org/GLM-5.1-FP8",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
-      "nightly_group": "C",
+      "nightly_group": "D",
       "variants": [
         {
           "tp_size": 8,
@@ -180,7 +201,7 @@
       "path": "amd/Kimi-K2-Thinking-MXFP4-AttnFP8",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
-      "nightly_group": "B",
+      "nightly_group": "C",
       "variants": [
         {
           "tp_size": 4,
@@ -206,8 +227,16 @@
       "path": "amd/Kimi-K2.5-MXFP4-AttnFP8",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
-      "nightly_group": "B",
+      "nightly_group": "C",
       "variants": [
+        {
+          "tp_size": 1,
+          "display": "Kimi-K2.5-MXFP4 TP1",
+          "dashboard_model": "Kimi-K2.5-MXFP4-tp1",
+          "prefix": "kimi-k25-mxfp4-tp1",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 1",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+        },
         {
           "tp_size": 2,
           "display": "Kimi-K2.5-MXFP4 TP2",
@@ -330,7 +359,7 @@
           "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-tp1",
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp1",
           "extra_args": "--trust-remote-code --tensor-parallel-size 1 --max-num-batched-tokens 32768 --max-model-len 16384",
-          "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0"
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0"
         },
         {
           "tp_size": 2,
@@ -346,6 +375,14 @@
           "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-tp4",
           "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp4",
           "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 32768 --max-model-len 16384",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0"
+        },
+        {
+          "tp_size": 8,
+          "display": "Qwen3-Next-80B-A3B-Instruct-FP8 TP8",
+          "dashboard_model": "Qwen3-Next-80B-A3B-Instruct-FP8-tp8",
+          "prefix": "qwen3-next-80b-a3b-instruct-fp8-tp8",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 8 --max-num-batched-tokens 32768 --max-model-len 16384",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_USE_FLYDSL_GDR=0"
         }
       ]

@@ -28,17 +28,21 @@ on:
           - DeepSeek-R1 MXFP4 TP8
           - DeepSeek-V3.2 FP8 TP4
           - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP1
           - MiniMax-M2.5 TP2
           - MiniMax-M2.5 TP4
           - MiniMax-M2.5 TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
+          - gpt-oss-120b TP4
           - gpt-oss-120b TP8
+          - GLM-4.7-FP8 TP2
           - GLM-4.7-FP8 TP4
           - GLM-4.7-FP8 TP8
           - GLM-5.1-FP8 TP8
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP1
           - Kimi-K2.5-MXFP4 TP2
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
@@ -50,6 +54,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP8
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
@@ -60,17 +65,21 @@ on:
           - DeepSeek-R1 MXFP4 TP8
           - DeepSeek-V3.2 FP8 TP4
           - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP1
           - MiniMax-M2.5 TP2
           - MiniMax-M2.5 TP4
           - MiniMax-M2.5 TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
+          - gpt-oss-120b TP4
           - gpt-oss-120b TP8
+          - GLM-4.7-FP8 TP2
           - GLM-4.7-FP8 TP4
           - GLM-4.7-FP8 TP8
           - GLM-5.1-FP8 TP8
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP1
           - Kimi-K2.5-MXFP4 TP2
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
@@ -82,6 +91,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP8
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
@@ -92,17 +102,21 @@ on:
           - DeepSeek-R1 MXFP4 TP8
           - DeepSeek-V3.2 FP8 TP4
           - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP1
           - MiniMax-M2.5 TP2
           - MiniMax-M2.5 TP4
           - MiniMax-M2.5 TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
+          - gpt-oss-120b TP4
           - gpt-oss-120b TP8
+          - GLM-4.7-FP8 TP2
           - GLM-4.7-FP8 TP4
           - GLM-4.7-FP8 TP8
           - GLM-5.1-FP8 TP8
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP1
           - Kimi-K2.5-MXFP4 TP2
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
@@ -114,6 +128,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP8
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
@@ -124,17 +139,21 @@ on:
           - DeepSeek-R1 MXFP4 TP8
           - DeepSeek-V3.2 FP8 TP4
           - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP1
           - MiniMax-M2.5 TP2
           - MiniMax-M2.5 TP4
           - MiniMax-M2.5 TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
+          - gpt-oss-120b TP4
           - gpt-oss-120b TP8
+          - GLM-4.7-FP8 TP2
           - GLM-4.7-FP8 TP4
           - GLM-4.7-FP8 TP8
           - GLM-5.1-FP8 TP8
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP1
           - Kimi-K2.5-MXFP4 TP2
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
@@ -146,6 +165,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP8
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
@@ -156,17 +176,21 @@ on:
           - DeepSeek-R1 MXFP4 TP8
           - DeepSeek-V3.2 FP8 TP4
           - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP1
           - MiniMax-M2.5 TP2
           - MiniMax-M2.5 TP4
           - MiniMax-M2.5 TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
+          - gpt-oss-120b TP4
           - gpt-oss-120b TP8
+          - GLM-4.7-FP8 TP2
           - GLM-4.7-FP8 TP4
           - GLM-4.7-FP8 TP8
           - GLM-5.1-FP8 TP8
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP1
           - Kimi-K2.5-MXFP4 TP2
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
@@ -178,6 +202,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP8
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
@@ -188,17 +213,21 @@ on:
           - DeepSeek-R1 MXFP4 TP8
           - DeepSeek-V3.2 FP8 TP4
           - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP1
           - MiniMax-M2.5 TP2
           - MiniMax-M2.5 TP4
           - MiniMax-M2.5 TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
+          - gpt-oss-120b TP4
           - gpt-oss-120b TP8
+          - GLM-4.7-FP8 TP2
           - GLM-4.7-FP8 TP4
           - GLM-4.7-FP8 TP8
           - GLM-5.1-FP8 TP8
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP1
           - Kimi-K2.5-MXFP4 TP2
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
@@ -210,6 +239,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP8
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
@@ -220,17 +250,21 @@ on:
           - DeepSeek-R1 MXFP4 TP8
           - DeepSeek-V3.2 FP8 TP4
           - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP1
           - MiniMax-M2.5 TP2
           - MiniMax-M2.5 TP4
           - MiniMax-M2.5 TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
+          - gpt-oss-120b TP4
           - gpt-oss-120b TP8
+          - GLM-4.7-FP8 TP2
           - GLM-4.7-FP8 TP4
           - GLM-4.7-FP8 TP8
           - GLM-5.1-FP8 TP8
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP1
           - Kimi-K2.5-MXFP4 TP2
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
@@ -242,6 +276,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP8
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
@@ -252,17 +287,21 @@ on:
           - DeepSeek-R1 MXFP4 TP8
           - DeepSeek-V3.2 FP8 TP4
           - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP1
           - MiniMax-M2.5 TP2
           - MiniMax-M2.5 TP4
           - MiniMax-M2.5 TP8
           - gpt-oss-120b TP1
           - gpt-oss-120b TP2
+          - gpt-oss-120b TP4
           - gpt-oss-120b TP8
+          - GLM-4.7-FP8 TP2
           - GLM-4.7-FP8 TP4
           - GLM-4.7-FP8 TP8
           - GLM-5.1-FP8 TP8
           - Kimi-K2-Thinking-MXFP4 TP4
           - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP1
           - Kimi-K2.5-MXFP4 TP2
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
@@ -274,6 +313,7 @@ on:
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP8
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -299,7 +339,7 @@ on:
         type: boolean
         default: false
       upload_to_custom_dashboard:
-        description: "Upload benchmark results to the custom dashboard integration payload"
+        description: "Upload benchmark results to the custom dashboard"
         type: boolean
         default: true
 
@@ -816,7 +856,7 @@ jobs:
           from pathlib import Path
 
           anchor_date = date(2026, 5, 6)
-          nightly_rotation = ("A", "B", "C")
+          nightly_rotation = ("A", "B", "C", "D")
           none_choice = "none"
 
           catalog = json.loads(
