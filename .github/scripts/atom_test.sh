@@ -6,12 +6,6 @@ MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
 ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
 
-is_gpt_oss_model() {
-  local model_path_lc
-  model_path_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  [[ "${model_path_lc}" == *gpt-oss* ]]
-}
-
 
 if [ "$TYPE" == "launch" ]; then
   echo ""
@@ -127,18 +121,58 @@ if [ "$TYPE" == "accuracy" ]; then
   RUN_TAG=$(date +%Y%m%d%H%M%S)
   OUTPUT_PATH=accuracy_test_results/${RUN_TAG}
   FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
-  if is_gpt_oss_model "$MODEL_PATH"; then
-    echo "Using chat completions + apply_chat_template for gpt-oss accuracy."
-    lm_eval --model local-chat-completions \
-            --apply_chat_template \
-            --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True \
-            --tasks gsm8k \
-            --num_fewshot 3 \
-            --output_path "${OUTPUT_PATH}" \
-            2>&1 | tee "$ATOM_CLIENT_LOG"
+  CLIENT_COMMAND="${CLIENT_COMMAND:-}"
+  if [[ "${CLIENT_COMMAND}" == "null" ]]; then
+    CLIENT_COMMAND=""
+  fi
+
+  if [[ -n "${CLIENT_COMMAND}" ]]; then
+    CLIENT_COMMAND_ARGS=()
+    while IFS= read -r -d '' token; do
+      CLIENT_COMMAND_ARGS+=("${token}")
+    done < <(
+      CLIENT_COMMAND="${CLIENT_COMMAND}" \
+      MODEL_PATH_VALUE="${MODEL_PATH}" \
+      OUTPUT_PATH_VALUE="${OUTPUT_PATH}" \
+      python3 - <<'PY'
+import os
+import shlex
+import sys
+
+client_command = os.environ["CLIENT_COMMAND"]
+replacements = {
+    "${MODEL_PATH}": os.environ["MODEL_PATH_VALUE"],
+    "$MODEL_PATH": os.environ["MODEL_PATH_VALUE"],
+    "${OUTPUT_PATH}": os.environ["OUTPUT_PATH_VALUE"],
+    "$OUTPUT_PATH": os.environ["OUTPUT_PATH_VALUE"],
+}
+for src, dst in replacements.items():
+    client_command = client_command.replace(src, dst)
+
+for token in shlex.split(client_command):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
+
+    if [[ ${#CLIENT_COMMAND_ARGS[@]} -eq 0 ]]; then
+      echo "ERROR: CLIENT_COMMAND is set but empty after parsing."
+      exit 2
+    fi
+
+    for arg in "${CLIENT_COMMAND_ARGS[@]}"; do
+      if [[ "${arg}" =~ \$\{[A-Z0-9_]+\} ]] || [[ "${arg}" =~ \$[A-Z_][A-Z0-9_]* ]]; then
+        echo "ERROR: CLIENT_COMMAND contains unresolved placeholder after expansion: ${arg}"
+        exit 2
+      fi
+    done
+
+    echo "Using custom lm-eval command from client_command: ${CLIENT_COMMAND}"
+    "${CLIENT_COMMAND_ARGS[@]}" 2>&1 | tee "$ATOM_CLIENT_LOG"
   else
+    echo "Using default lm-eval command."
     lm_eval --model local-completions \
-            --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
+            --model_args "model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
             --tasks gsm8k \
             --num_fewshot 3 \
             --output_path "${OUTPUT_PATH}" \
