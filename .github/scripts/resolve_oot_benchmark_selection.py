@@ -66,94 +66,39 @@ def _flatten_variant(family: dict, variant: dict) -> dict:
     return flattened
 
 
-def _supported_tp_sizes(family: dict) -> list[int]:
-    return [int(variant["tp_size"]) for variant in family["variants"]]
+def manual_variant_choices(catalog: dict) -> list[str]:
+    choices = []
+    for family in catalog["families"]:
+        for variant in family["variants"]:
+            choices.append(str(variant["display"]))
+    return choices
 
 
-def _normalize_tp_token(token: str) -> int:
-    value = token.strip().lower()
-    if value.startswith("tp"):
-        value = value[2:]
-    if not value.isdigit():
-        raise ValueError(f"Invalid TP size token {token!r}. Use values like 4,8 or all.")
-    return int(value)
-
-
-def parse_requested_tp_sizes(tp_sizes_text: str, family: dict) -> list[int]:
-    supported = _supported_tp_sizes(family)
-    normalized = tp_sizes_text.strip()
-    if not normalized:
-        if len(supported) == 1:
-            return supported
-        raise ValueError(
-            f"TP sizes are required when selecting {family['choice_label']}. Use values like 4,8 or all."
-        )
-
-    if normalized.lower() == "all":
-        return supported
-
-    requested: list[int] = []
-    unsupported: list[int] = []
-    for raw_token in normalized.split(","):
-        token = raw_token.strip()
-        if not token:
-            continue
-        tp_size = _normalize_tp_token(token)
-        if tp_size not in supported:
-            unsupported.append(tp_size)
-            continue
-        if tp_size not in requested:
-            requested.append(tp_size)
-
-    if unsupported:
-        unsupported_text = ",".join(str(value) for value in unsupported)
-        supported_text = ",".join(str(value) for value in supported)
-        raise ValueError(
-            f"{family['choice_label']} does not support TP sizes {unsupported_text}; "
-            f"supported TP sizes: {supported_text}"
-        )
-
-    if not requested:
-        raise ValueError(
-            f"TP sizes are required when selecting {family['choice_label']}. Use values like 4,8 or all."
-        )
-
-    return requested
-
-
-def resolve_manual_variants(catalog: dict, slot_inputs: list[tuple[str, str]]) -> list[dict]:
-    families = catalog["families"]
-    family_map = {family["choice_label"]: family for family in families}
+def resolve_manual_variants(catalog: dict, slot_inputs: list[str]) -> list[dict]:
     selected: list[dict] = []
     seen_prefixes: set[str] = set()
+    variant_map: dict[str, dict] = {}
+    for family in catalog["families"]:
+        for variant in family["variants"]:
+            label = str(variant["display"])
+            variant_map[label] = _flatten_variant(family, variant)
 
-    for choice_label, tp_sizes_text in slot_inputs:
-        label = (choice_label or "").strip()
-        tp_sizes = (tp_sizes_text or "").strip()
-
+    for raw_label in slot_inputs:
+        label = (raw_label or "").strip()
         if not label or label == NONE_CHOICE:
-            if tp_sizes:
-                raise ValueError(
-                    f"TP sizes were provided for an empty model slot: {tp_sizes!r}."
-                )
             continue
 
-        family = family_map.get(label)
-        if family is None:
-            available = ", ".join(sorted(family_map))
+        selected_variant = variant_map.get(label)
+        if selected_variant is None:
+            available = ", ".join(sorted(variant_map))
             raise ValueError(
-                f"Unknown model family {label!r}. Available families: {available}"
+                f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
             )
-
-        requested_tps = set(parse_requested_tp_sizes(tp_sizes, family))
-        for variant in family["variants"]:
-            if int(variant["tp_size"]) not in requested_tps:
-                continue
-            prefix = variant["prefix"]
-            if prefix in seen_prefixes:
-                continue
-            selected.append(_flatten_variant(family, variant))
-            seen_prefixes.add(prefix)
+        prefix = str(selected_variant["prefix"])
+        if prefix in seen_prefixes:
+            continue
+        selected.append(selected_variant)
+        seen_prefixes.add(prefix)
 
     return selected
 
@@ -178,15 +123,10 @@ def resolve_scheduled_variants(catalog: dict, selected_group: str) -> list[dict]
     return selected
 
 
-def collect_manual_slot_inputs(max_slots: int) -> list[tuple[str, str]]:
-    slots: list[tuple[str, str]] = []
+def collect_manual_slot_inputs(max_slots: int) -> list[str]:
+    slots: list[str] = []
     for slot_idx in range(1, max_slots + 1):
-        slots.append(
-            (
-                os.environ.get(f"MODEL_SLOT_{slot_idx}", ""),
-                os.environ.get(f"TP_SIZES_SLOT_{slot_idx}", ""),
-            )
-        )
+        slots.append(os.environ.get(f"MODEL_SLOT_{slot_idx}", ""))
     return slots
 
 
@@ -234,7 +174,7 @@ def main() -> int:
         "--max-slots",
         type=int,
         default=8,
-        help="Maximum number of MODEL_SLOT_N / TP_SIZES_SLOT_N pairs to read",
+        help="Maximum number of MODEL_SLOT_N inputs to read",
     )
     args = parser.parse_args()
 

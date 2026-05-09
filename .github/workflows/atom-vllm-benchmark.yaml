@@ -11,26 +11,6 @@ on:
     - cron: '0 15 * * *'
   workflow_dispatch:
     inputs:
-      manual_selection_guide:
-        description: "Reference only. Open this dropdown to view one model family per line with its supported TP sizes. Leave it unchanged."
-        type: choice
-        default: "Reference only - open dropdown for model -> TP sizes"
-        options:
-          - Reference only - open dropdown for model -> TP sizes
-          - DeepSeek-R1 FP8 -> TP 8
-          - DeepSeek-R1 MXFP4 -> TP 8
-          - DeepSeek-V3.2 FP8 -> TP 8
-          - MiniMax-M2.5 -> TP 2
-          - gpt-oss-120b -> TP 1
-          - GLM-5.1-FP8 -> TP 8
-          - Kimi-K2-Thinking-MXFP4 -> TP 4,8
-          - Kimi-K2.5-MXFP4 -> TP 2,4,8
-          - Qwen3.5-397B-A17B-FP8 -> TP 4,8
-          - Qwen3.5-397B-A17B-MXFP4 -> TP 4
-          - Qwen3.5-397B-A17B -> TP 4,8
-          - Qwen3-Next-80B-A3B-Instruct-FP8 -> TP 1,2,4
-          - TP input examples -> 4,8 or all
-          - Blank TP input -> auto-uses the only TP when a family supports exactly one TP size
       benchmark_client:
         description: "Benchmark client command. `InferenceMax bench` uses the repo benchmark script. `vLLM bench` uses the vLLM CLI benchmark command."
         type: choice
@@ -39,181 +19,205 @@ on:
           - InferenceMax bench
           - vLLM bench
       model_slot_1:
-        description: "Manual selection slot 1: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
+        description: "Manual selection slot 1: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_1:
-        description: "TP sizes for slot 1. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family."
-        type: string
-        default: ""
+          - DeepSeek-R1 FP8 TP8
+          - DeepSeek-R1 MXFP4 TP8
+          - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP2
+          - gpt-oss-120b TP1
+          - GLM-5.1-FP8 TP8
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP2
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Qwen3.5-397B-A17B TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
       model_slot_2:
-        description: "Manual selection slot 2: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
+        description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_2:
-        description: "TP sizes for slot 2. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
-        type: string
-        default: ""
+          - DeepSeek-R1 FP8 TP8
+          - DeepSeek-R1 MXFP4 TP8
+          - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP2
+          - gpt-oss-120b TP1
+          - GLM-5.1-FP8 TP8
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP2
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Qwen3.5-397B-A17B TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
       model_slot_3:
-        description: "Manual selection slot 3: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
+        description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_3:
-        description: "TP sizes for slot 3. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
-        type: string
-        default: ""
+          - DeepSeek-R1 FP8 TP8
+          - DeepSeek-R1 MXFP4 TP8
+          - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP2
+          - gpt-oss-120b TP1
+          - GLM-5.1-FP8 TP8
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP2
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Qwen3.5-397B-A17B TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
       model_slot_4:
-        description: "Manual selection slot 4: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
+        description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_4:
-        description: "TP sizes for slot 4. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
-        type: string
-        default: ""
+          - DeepSeek-R1 FP8 TP8
+          - DeepSeek-R1 MXFP4 TP8
+          - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP2
+          - gpt-oss-120b TP1
+          - GLM-5.1-FP8 TP8
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP2
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Qwen3.5-397B-A17B TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
       model_slot_5:
-        description: "Manual selection slot 5: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
+        description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_5:
-        description: "TP sizes for slot 5. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
-        type: string
-        default: ""
+          - DeepSeek-R1 FP8 TP8
+          - DeepSeek-R1 MXFP4 TP8
+          - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP2
+          - gpt-oss-120b TP1
+          - GLM-5.1-FP8 TP8
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP2
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Qwen3.5-397B-A17B TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
       model_slot_6:
-        description: "Manual selection slot 6: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
+        description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_6:
-        description: "TP sizes for slot 6. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
-        type: string
-        default: ""
+          - DeepSeek-R1 FP8 TP8
+          - DeepSeek-R1 MXFP4 TP8
+          - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP2
+          - gpt-oss-120b TP1
+          - GLM-5.1-FP8 TP8
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP2
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Qwen3.5-397B-A17B TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
       model_slot_7:
-        description: "Manual selection slot 7: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
+        description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_7:
-        description: "TP sizes for slot 7. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
-        type: string
-        default: ""
+          - DeepSeek-R1 FP8 TP8
+          - DeepSeek-R1 MXFP4 TP8
+          - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP2
+          - gpt-oss-120b TP1
+          - GLM-5.1-FP8 TP8
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP2
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Qwen3.5-397B-A17B TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
       model_slot_8:
-        description: "Manual selection slot 8: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
+        description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_8:
-        description: "TP sizes for slot 8. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
-        type: string
-        default: ""
+          - DeepSeek-R1 FP8 TP8
+          - DeepSeek-R1 MXFP4 TP8
+          - DeepSeek-V3.2 FP8 TP8
+          - MiniMax-M2.5 TP2
+          - gpt-oss-120b TP1
+          - GLM-5.1-FP8 TP8
+          - Kimi-K2-Thinking-MXFP4 TP4
+          - Kimi-K2-Thinking-MXFP4 TP8
+          - Kimi-K2.5-MXFP4 TP2
+          - Kimi-K2.5-MXFP4 TP4
+          - Kimi-K2.5-MXFP4 TP8
+          - Qwen3.5-397B-A17B-FP8 TP4
+          - Qwen3.5-397B-A17B-FP8 TP8
+          - Qwen3.5-397B-A17B-MXFP4 TP4
+          - Qwen3.5-397B-A17B TP4
+          - Qwen3.5-397B-A17B TP8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
+          - Qwen3-Next-80B-A3B-Instruct-FP8 TP4
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -606,21 +610,13 @@ jobs:
       - id: load
         env:
           MODEL_SLOT_1: ${{ inputs.model_slot_1 || 'none' }}
-          TP_SIZES_SLOT_1: ${{ inputs.tp_sizes_slot_1 || '' }}
           MODEL_SLOT_2: ${{ inputs.model_slot_2 || 'none' }}
-          TP_SIZES_SLOT_2: ${{ inputs.tp_sizes_slot_2 || '' }}
           MODEL_SLOT_3: ${{ inputs.model_slot_3 || 'none' }}
-          TP_SIZES_SLOT_3: ${{ inputs.tp_sizes_slot_3 || '' }}
           MODEL_SLOT_4: ${{ inputs.model_slot_4 || 'none' }}
-          TP_SIZES_SLOT_4: ${{ inputs.tp_sizes_slot_4 || '' }}
           MODEL_SLOT_5: ${{ inputs.model_slot_5 || 'none' }}
-          TP_SIZES_SLOT_5: ${{ inputs.tp_sizes_slot_5 || '' }}
           MODEL_SLOT_6: ${{ inputs.model_slot_6 || 'none' }}
-          TP_SIZES_SLOT_6: ${{ inputs.tp_sizes_slot_6 || '' }}
           MODEL_SLOT_7: ${{ inputs.model_slot_7 || 'none' }}
-          TP_SIZES_SLOT_7: ${{ inputs.tp_sizes_slot_7 || '' }}
           MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
-          TP_SIZES_SLOT_8: ${{ inputs.tp_sizes_slot_8 || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
