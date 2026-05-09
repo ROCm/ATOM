@@ -293,6 +293,18 @@ class GenericParser(QuantConfigParser):
                         mapped = _QSCHEME_TO_QUANT_TYPE.get(f"per_{strategy}")
                     if mapped is not None:
                         return mapped
+        # Honor weight_block_size explicitly: a present-but-null value (Mistral
+        # FP8 native checkpoints) means per-tensor, not blockwise.
+        if "weight_block_size" in cfg:
+            wbs = cfg.get("weight_block_size")
+            if wbs is None:
+                return QuantType.per_Tensor
+            if isinstance(wbs, (list, tuple)) and len(wbs) >= 2:
+                m, n = int(wbs[0]), int(wbs[1])
+                if (m, n) == (1, 128): return QuantType.per_1x128
+                if (m, n) == (128, 128): return QuantType.per_128x128
+                if (m, n) == (1, 32): return QuantType.per_1x32
+                return QuantType.per_1x128
         # Fall back to regex heuristics on full config string
         for pattern, qtype in self._QTYPE_PATTERNS.items():
             if re.search(pattern, config_str):
