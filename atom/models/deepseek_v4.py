@@ -1919,11 +1919,14 @@ class Expert(nn.Module):
         x: torch.Tensor,  # [num_tokens, dim]
         weights: Optional[torch.Tensor] = None,  # [num_tokens, 1]  optional gate
     ) -> torch.Tensor:  # [num_tokens, dim]
+        from aiter import silu_and_mul as aiter_silu_and_mul
+
         dtype = x.dtype
-        # Single fused GEMM, then chunk(2) along last dim so TP-sharded per-rank
-        # output (inter_dim_per_tp * 2) is split correctly regardless of tp_size.
-        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp] BF16
-        
+        # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
+        # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
+        # silu/clamp/mul in fp32 internally regardless of input dtype, so we
+        # feed the bf16 GEMM output directly.
+        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul_quant:
             x_fp8, x_scale = fused_clamp_act_mul_fp8_group_quant(
                 combined,
@@ -1934,16 +1937,17 @@ class Expert(nn.Module):
                 transpose_scale=True,
             )
             return self.w2(x_fp8, x_scale=x_scale)
-
-        combined = combined.float()
-        gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, inter_dim_per_tp]
-        if self.swiglu_limit > 0:
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-        x = F.silu(gate) * up  # [num_tokens, inter_dim_per_tp]
+        out = torch.empty(
+            (combined.shape[0], combined.shape[-1] // 2),
+            dtype=dtype,
+            device=combined.device,
+        )
+        # limit > 0 enables in-kernel clamp (gate≤limit, up∈[-limit,limit]) via
+        # ROCm v_med3_f32 — same semantics as the prior torch.clamp pair.
+        aiter_silu_and_mul(out, combined, self.swiglu_limit)
         if weights is not None:
-            x = weights * x
-        return self.w2(x.to(dtype))  # [num_tokens, dim]
+            out = weights.to(dtype) * out
+        return self.w2(out)  # [num_tokens, dim]
 
 
 class MoE(nn.Module):
@@ -2010,10 +2014,25 @@ class MoE(nn.Module):
             # (set by ModelRunner). torch.compile silently drops NNModule
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
-
+        assert args.n_shared_experts == 1
+        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
+        # when shared and routed have the same quant dtype.
+        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
+        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
+        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
+        # True for V4 because shared matches global, missing the routed-shared
+        # mismatch. Direct comparison: get routed and shared specs and compare.
+        routed_dtype = qc.get_layer_quant_config(f"{prefix}.experts").quant_dtype
+        shared_dtype = qc.get_layer_quant_config(f"{prefix}.shared_experts").quant_dtype
+        self._fuse_shared_into_routed = (
+            routed_dtype == shared_dtype
+            and is_rocm_aiter_fusion_shared_expert_enabled()
+        )
         moe_cfg = SimpleNamespace(
             routed_scaling_factor=self.routed_scaling_factor,
-            n_shared_experts=args.n_shared_experts,
+            n_shared_experts=(
+                args.n_shared_experts if self._fuse_shared_into_routed else 0
+            ),
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -2030,21 +2049,9 @@ class MoE(nn.Module):
             config=moe_cfg,
         )
         self.experts.swiglu_limit = args.swiglu_limit
-        assert args.n_shared_experts == 1
-        # aiter can fuse shared expert into the routed FusedMoE kernel ONLY
-        # when shared and routed have the same quant dtype.
-        # `is_rocm_aiter_fusion_shared_expert_enabled` compares shared vs
-        # GLOBAL (=base dtype), but V4-Pro has routed=FP4 (per-layer override
-        # for `.ffn.experts`) and shared=FP8 (=global). The function returns
-        # True for V4 because shared matches global, missing the routed-shared
-        # mismatch. Direct comparison: get routed and shared specs and compare.
-        routed_dtype = qc.get_layer_quant_config(f"{prefix}.experts").quant_dtype
-        shared_dtype = qc.get_layer_quant_config(f"{prefix}.shared_experts").quant_dtype
-        self._fuse_shared_into_routed = (
-            routed_dtype == shared_dtype
-            and is_rocm_aiter_fusion_shared_expert_enabled()
-        )
+
         if not self._fuse_shared_into_routed:
+            # self.experts.num_fused_shared_experts = 0
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
@@ -2331,10 +2338,12 @@ class Block(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
-        x, post, comb = (
-            self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-            )
+        (
+            x,
+            post,
+            comb,
+        ) = self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions)  # [num_tokens, dim]
