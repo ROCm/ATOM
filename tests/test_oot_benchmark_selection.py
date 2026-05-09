@@ -47,15 +47,16 @@ def test_catalog_groups_variants_by_family():
     ]
 
 
-def test_manual_selection_expands_requested_tp_variants():
+def test_manual_selection_resolves_selected_variant_labels():
     catalog = _load_catalog()
     resolver = _load_selection_module()
 
     selected = resolver.resolve_manual_variants(
         catalog,
         [
-            ("DeepSeek-R1 FP8", "8"),
-            ("Qwen3.5-397B-A17B-FP8", "4,8"),
+            "DeepSeek-R1 FP8 TP8",
+            "Qwen3.5-397B-A17B-FP8 TP4",
+            "Qwen3.5-397B-A17B-FP8 TP8",
         ],
     )
 
@@ -66,15 +67,17 @@ def test_manual_selection_expands_requested_tp_variants():
     ]
 
 
-def test_manual_selection_accepts_all_and_deduplicates_overlapping_slots():
+def test_manual_selection_deduplicates_repeated_variant_labels():
     catalog = _load_catalog()
     resolver = _load_selection_module()
 
     selected = resolver.resolve_manual_variants(
         catalog,
         [
-            ("Qwen3-Next-80B-A3B-Instruct-FP8", "all"),
-            ("Qwen3-Next-80B-A3B-Instruct-FP8", "2,4"),
+            "Qwen3-Next-80B-A3B-Instruct-FP8 TP1",
+            "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
+            "Qwen3-Next-80B-A3B-Instruct-FP8 TP2",
+            "Qwen3-Next-80B-A3B-Instruct-FP8 TP4",
         ],
     )
 
@@ -85,34 +88,14 @@ def test_manual_selection_accepts_all_and_deduplicates_overlapping_slots():
     ]
 
 
-def test_manual_selection_rejects_unsupported_tp_size():
+def test_manual_selection_rejects_unknown_variant_label():
     catalog = _load_catalog()
     resolver = _load_selection_module()
 
     with pytest.raises(
-        ValueError, match="does not support TP sizes 4; supported TP sizes: 8"
+        ValueError, match="Unknown benchmark model variant choice"
     ):
-        resolver.resolve_manual_variants(catalog, [("DeepSeek-R1 FP8", "4")])
-
-
-def test_manual_selection_defaults_single_variant_family_when_tp_is_blank():
-    catalog = _load_catalog()
-    resolver = _load_selection_module()
-
-    selected = resolver.resolve_manual_variants(catalog, [("MiniMax-M2.5", "")])
-
-    assert [model["prefix"] for model in selected] == ["MiniMax-M2.5-tp2"]
-
-
-def test_manual_selection_requires_tp_sizes_for_multi_variant_family():
-    catalog = _load_catalog()
-    resolver = _load_selection_module()
-
-    with pytest.raises(
-        ValueError,
-        match="TP sizes are required when selecting Qwen3.5-397B-A17B-FP8",
-    ):
-        resolver.resolve_manual_variants(catalog, [("Qwen3.5-397B-A17B-FP8", "")])
+        resolver.resolve_manual_variants(catalog, ["DeepSeek-R1 FP8 TP4"])
 
 
 def test_scheduled_selection_expands_all_variants_in_selected_group():
