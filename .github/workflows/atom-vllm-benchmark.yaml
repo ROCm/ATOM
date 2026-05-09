@@ -339,7 +339,7 @@ on:
         type: boolean
         default: false
       upload_to_custom_dashboard:
-        description: "Upload benchmark results to the custom dashboard"
+        description: "Upload benchmark results to the LLM-Booster dashboard"
         type: boolean
         default: true
 
@@ -507,7 +507,7 @@ jobs:
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             PUBLISH_TO_DASHBOARD=true
-            UPLOAD_TO_CUSTOM_DASHBOARD=true
+            UPLOAD_TO_CUSTOM_DASHBOARD=false
           else
             PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-false}"
             UPLOAD_TO_CUSTOM_DASHBOARD="${INPUT_UPLOAD_TO_CUSTOM_DASHBOARD:-true}"
@@ -1749,10 +1749,10 @@ jobs:
           fi
 
           if [[ "${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}" == "true" ]]; then
-            printf 'Custom dashboard payload artifact upload is enabled for this run.\n' \
+            printf 'LLM-Booster dashboard publish is enabled for this run.\n' \
               >> "$GITHUB_STEP_SUMMARY"
           else
-            printf 'Custom dashboard payload artifact upload is disabled for this run.\n' \
+            printf 'LLM-Booster dashboard publish is disabled for this run.\n' \
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -1784,30 +1784,107 @@ jobs:
           name: oot-benchmark-summary
           path: oot_benchmark_summary.json
 
-      - name: Note skipped custom dashboard processing
+      - name: Note skipped LLM-Booster dashboard publish
         if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases == '0'
         run: |
-          printf '\nNo successful benchmark result JSONs were produced, so custom dashboard payload upload was skipped.\n' \
+          printf '\nNo successful benchmark result JSONs were produced, so LLM-Booster dashboard publish was skipped.\n' \
             >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build custom dashboard payload
+      - name: Check LLM-Booster deploy key
+        id: llmbooster-key
         if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         env:
+          LLM_BOOSTER_DEPLOY_KEY: ${{ secrets.LLM_BOOSTER_DEPLOY_KEY }}
+        run: |
+          if [[ -n "${LLM_BOOSTER_DEPLOY_KEY}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::LLM_BOOSTER_DEPLOY_KEY is not configured; skipping LLM-Booster dashboard publish."
+            printf '\nLLM-Booster dashboard publish skipped because secret `LLM_BOOSTER_DEPLOY_KEY` is not configured.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkout LLM-Booster dashboard repo
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ROCm/LLM-Booster
+          ref: main
+          path: llm-booster-repo
+          ssh-key: ${{ secrets.LLM_BOOSTER_DEPLOY_KEY }}
+          fetch-depth: 1
+
+      - name: Build LLM-Booster dashboard files
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        env:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
+          ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
+          OOT_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.oot_image_source }}
+          BENCHMARK_CLIENT: ${{ needs.resolve-atom-source.outputs.benchmark_client }}
         run: |
           python3 - <<'PY'
           import json
           import os
+          import re
+          import sys
+          import time
+          from collections import defaultdict
           from datetime import datetime, timezone
           from pathlib import Path
 
-          results = []
-          for path in sorted(Path(".").glob("*.json")):
-              if path.name in {
-                  "oot_benchmark_summary.json",
-                  "regression_report.json",
-                  "oot_custom_dashboard_payload.json",
-              }:
+          root = Path(".")
+          llm_booster_dashboard = root / "llm-booster-repo" / "dashboard"
+          llm_booster_data_dir = llm_booster_dashboard / "data" / "vllm-atom"
+          llm_booster_data_dir.mkdir(parents=True, exist_ok=True)
+
+          sys.path.insert(0, str(llm_booster_dashboard))
+          from update_data import index_root_for, rebuild_index  # noqa: E402
+
+          catalog = json.loads(
+              (root / ".github" / "benchmark" / "oot_benchmark_models.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          def slugify(text: str) -> str:
+              return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "unknown"
+
+          def precision_from_model(model: str):
+              upper = model.upper()
+              if "MXFP4" in upper or "FP4" in upper:
+                  return "fp4"
+              if "FP8" in upper:
+                  return "fp8"
+              return None
+
+          def model_name_for_variant(variant: dict) -> str:
+              if variant.get("dashboard_model"):
+                  return str(variant["dashboard_model"])
+              display = str(variant["display"])
+              return display.replace(" TP", "-tp").replace(" ", "-")
+
+          prefix_map = {}
+          for family in catalog["families"]:
+              base = {k: v for k, v in family.items() if k not in {"choice_label", "variants"}}
+              for variant in family["variants"]:
+                  item = dict(base)
+                  item.update(variant)
+                  prefix_map[str(variant["prefix"])] = item
+
+          def parse_result_filename(path: Path):
+              stem = path.stem
+              prefix, isl, osl, concurrency, ratio = stem.rsplit("-", 4)
+              return prefix, int(isl), int(osl), int(concurrency), float(ratio)
+
+          benchmark_client = os.environ["BENCHMARK_CLIENT"]
+          client_slug = "vllmbench" if benchmark_client == "vLLM bench" else "inferencemax"
+          client_label = "vllm bench" if benchmark_client == "vLLM bench" else "inferencemax"
+
+          grouped = defaultdict(list)
+          for path in sorted(root.glob("*.json")):
+              if path.name in {"oot_benchmark_summary.json", "regression_report.json"}:
                   continue
               try:
                   payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1820,32 +1897,145 @@ jobs:
               ).strip().lower()
               if custom_dashboard_flag in {"0", "false", "no"}:
                   continue
-              results.append(payload)
 
-          payload = {
-              "generated_at": datetime.now(timezone.utc).isoformat(),
-              "repository": os.environ["GITHUB_REPOSITORY"],
-              "run_id": os.environ["GITHUB_RUN_ID"],
-              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-              "run_url": os.environ["RUN_URL"],
-              "atom_source_repository": "${{ needs.resolve-atom-source.outputs.atom_repository }}",
-              "atom_source_ref": "${{ needs.resolve-atom-source.outputs.atom_ref }}",
-              "oot_image_source": "${{ needs.resolve-atom-source.outputs.oot_image_source }}",
-              "benchmark_client": "${{ needs.resolve-atom-source.outputs.benchmark_client }}",
-              "results": results,
-          }
-          Path("oot_custom_dashboard_payload.json").write_text(
-              json.dumps(payload, indent=2), encoding="utf-8"
-          )
-          print(f"Wrote custom dashboard payload with {len(results)} results.")
+              prefix, isl, osl, concurrency, ratio = parse_result_filename(path)
+              variant = prefix_map.get(prefix)
+              if variant is None:
+                  raise SystemExit(f"Unknown benchmark prefix in result file {path.name}: {prefix}")
+
+              model = model_name_for_variant(variant)
+              precision = precision_from_model(model)
+              atom_source_sha = str(payload.get("atom_source_sha", "")) or "unknown"
+              sha7 = atom_source_sha[:7] if atom_source_sha else "unknown"
+              day = time.strftime("%Y-%m-%d", time.gmtime())
+              grouped[(day, sha7, model, isl, osl, client_slug)].append((path, payload, precision, concurrency, ratio))
+
+          written_files = set()
+          for (day, sha7, model, isl, osl, client_slug), entries in sorted(grouped.items()):
+              entries.sort(key=lambda item: (item[3], item[4]))
+              timestamp_ms = int(time.time() * 1000)
+              precision = entries[0][2]
+              first_payload = entries[0][1]
+              tp = first_payload.get("tensor_parallel_size")
+              tp_label = f"_tp{int(tp)}" if tp not in (None, "", 0) else ""
+              model_slug = slugify(model)
+              run_id = (
+                  f"atom_vllm_{day.replace('-', '')}_{model_slug}_isl{isl}_osl{osl}_"
+                  f"{sha7}_{os.environ['GITHUB_RUN_ID']}_{client_slug}"
+              )
+              config_label = f"atom-vllm_{model_slug}"
+              if precision:
+                  config_label += f"_{precision}"
+              if tp not in (None, "", 0):
+                  config_label += tp_label
+              if client_slug == "inferencemax":
+                  config_label += "_inferencemax"
+
+              points = []
+              for _, payload, precision, concurrency, ratio in entries:
+                  output_tput = payload.get("output_throughput")
+                  total_tput = payload.get("total_token_throughput")
+                  total_gpu = payload.get("tensor_parallel_size")
+                  try:
+                      total_gpu = int(total_gpu) if total_gpu is not None else None
+                  except (TypeError, ValueError):
+                      total_gpu = None
+                  points.append(
+                      {
+                          "isl": isl,
+                          "osl": osl,
+                          "concurrency": concurrency,
+                          "ratio": ratio,
+                          "client_bench": client_label,
+                          "ttft_ms": payload.get("mean_ttft_ms"),
+                          "ttft_p99": payload.get("p99_ttft_ms"),
+                          "tpot_ms": payload.get("mean_tpot_ms"),
+                          "tpot_p99": payload.get("p99_tpot_ms"),
+                          "itl_ms": payload.get("mean_itl_ms"),
+                          "e2el_ms": payload.get("mean_e2el_ms"),
+                          "interactivity": (output_tput / concurrency) if output_tput and concurrency else None,
+                          "tput_per_gpu": (total_tput / total_gpu) if total_tput and total_gpu else None,
+                          "output_tput_per_gpu": (output_tput / total_gpu) if output_tput and total_gpu else None,
+                          "input_tput_per_gpu": None,
+                          "output_tput": output_tput,
+                          "total_tput": total_tput,
+                          "req_tput": payload.get("request_throughput"),
+                          "completed": payload.get("completed"),
+                          "duration": payload.get("duration"),
+                          "num_prompts": payload.get("num_prompts"),
+                          "prefill_tp": None,
+                          "decode_tp": None,
+                          "tensor_parallel_size": total_gpu,
+                          "num_prefill_gpu": None,
+                          "num_decode_gpu": None,
+                          "total_gpu": total_gpu,
+                          "gpu_name": payload.get("gpu_name"),
+                          "image": payload.get("oot_image_tag") or payload.get("docker_image"),
+                          "rocm": payload.get("rocm_version"),
+                          "run_url": os.environ["RUN_URL"],
+                          "model_path": payload.get("model_id"),
+                          "point_date": day,
+                          "precision": precision,
+                          "hardware": "mi355x",
+                      }
+                  )
+
+              run = {
+                  "run_id": run_id,
+                  "date": day,
+                  "timestamp": timestamp_ms,
+                  "model": model,
+                  "backend": "vLLM-ATOM",
+                  "config_label": config_label,
+                  "precision": precision,
+                  "source": "ATOM Dashboard",
+                  "client_bench": client_label,
+                  "hardware": "mi355x",
+                  "commit": {
+                      "id": first_payload.get("atom_source_sha"),
+                      "message": f"ATOM benchmark run {os.environ['GITHUB_RUN_ID']}",
+                      "timestamp": datetime.now(timezone.utc).isoformat(),
+                      "url": f"https://github.com/{os.environ['ATOM_SOURCE_REPOSITORY']}/commit/{first_payload.get('atom_source_sha', '')}",
+                      "author": {},
+                      "committer": {},
+                  },
+                  "points": points,
+                  "gsm8k": None,
+              }
+
+              run_file = llm_booster_data_dir / f"{run_id}.json"
+              run_file.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+              written_files.add(run_file)
+
+          rebuild_index(index_root_for(llm_booster_data_dir))
+          print(f"Wrote {len(written_files)} LLM-Booster ATOM vLLM run files.")
           PY
 
-      - name: Upload custom dashboard payload
-        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+      - name: Upload LLM-Booster dashboard preview artifact
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: oot-benchmark-custom-dashboard-input
-          path: oot_custom_dashboard_payload.json
+          name: oot-benchmark-llm-booster-preview
+          path: |
+            llm-booster-repo/dashboard/data/index.json
+            llm-booster-repo/dashboard/data/vllm-atom/*.json
+
+      - name: Push LLM-Booster dashboard data
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
+        working-directory: llm-booster-repo
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          git add dashboard/data/index.json dashboard/data/vllm-atom
+          if git diff --cached --quiet; then
+            echo "No LLM-Booster dashboard data changes to push."
+            exit 0
+          fi
+          git commit -m "Update ATOM vLLM benchmark dashboard data"
+          git push origin HEAD:main
 
       - name: Download baseline from previous successful main run
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
