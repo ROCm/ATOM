@@ -484,6 +484,7 @@ class MLAAttention(nn.Module):
                 attn_metadata.block_tables,
                 attn_metadata.cu_seqlens_k,
                 NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                PAGE_SIZE=get_current_atom_config().kv_cache_block_size,
             )
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
@@ -547,35 +548,65 @@ class MLAAttention(nn.Module):
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
+        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
+        paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
+        max_q_len = attn_metadata.max_seqlen_q
         if self.topk_indices_buffer is not None:
-            paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = triton_convert_req_index_to_global_index(
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.kv_indptr,
-                paged_kv_indptr,
-                attn_metadata.kv_indices,
-                self.topk_indices_buffer[:B],
-                NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-            )
-
-        # q_scale = kv_scale = None
-        # if self.kv_cache_dtype.startswith("fp8"):
-        #     q = q.to(dtypes.fp8)
-        #     q_scale = kv_scale = self.one_scale
+            if attn_metadata.max_seqlen_q > 1:
+                # MTP verify: per-token layout with max_q_len=1.
+                # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
+                paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
+                paged_kv_indptr = attn_metadata.sparse_kv_indptr
+                paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+                # Gather physical page indices from kv_indices using topk positions.
+                # block_tables contains large-block IDs (block_ratio > 1) that
+                # need expansion; kv_indices already has per-token page indices.
+                paged_kv_indices = triton_gather_kv_indices_sparse(
+                    paged_kv_indptr,
+                    attn_metadata.token_to_seq_idxs,
+                    self.topk_indices_buffer[:B],
+                    attn_metadata.kv_indices,
+                    attn_metadata.kv_indptr,
+                    NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                )
+                max_q_len = 1
+            else:
+                paged_kv_indptr = attn_metadata.sparse_kv_indptr
+                paged_kv_indices = triton_convert_req_index_to_global_index(
+                    attn_metadata.cu_seqlens_q,
+                    attn_metadata.kv_indptr,
+                    paged_kv_indptr,
+                    attn_metadata.kv_indices,
+                    self.topk_indices_buffer[:B],
+                    NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                )
 
         dp_size = get_dp_group().world_size
         use_persistent_mode = not (dp_size > 1)
 
+        # Sparse layers in MTP verify use separate persistent metadata
+        # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
+        # (max_seqlen_qo=2).
+        is_sparse_mtp = (
+            self.topk_indices_buffer is not None and attn_metadata.max_seqlen_q > 1
+        )
+
         if not use_persistent_mode:
-            # DP : disable persistent mode to avoid overflow
             work_meta_data = None
             work_indptr = None
             work_info_set = None
             reduce_indptr = None
             reduce_final_map = None
             reduce_partial_map = None
+        elif is_sparse_mtp:
+            work_meta_data = attn_metadata.sparse_mtp_work_meta_data
+            work_indptr = attn_metadata.sparse_mtp_work_indptr
+            work_info_set = attn_metadata.sparse_mtp_work_info_set
+            reduce_indptr = attn_metadata.sparse_mtp_reduce_indptr
+            reduce_final_map = attn_metadata.sparse_mtp_reduce_final_map
+            reduce_partial_map = attn_metadata.sparse_mtp_reduce_partial_map
         else:
             work_meta_data = attn_metadata.work_meta_data
             work_indptr = attn_metadata.work_indptr
@@ -588,11 +619,11 @@ class MLAAttention(nn.Module):
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
-            attn_metadata.cu_seqlens_q,
+            paged_cu_seqlens_q,
             paged_kv_indptr,
             paged_kv_indices,
-            attn_metadata.kv_last_page_lens,
-            attn_metadata.max_seqlen_q,
+            paged_kv_last_page_lens,
+            max_q_len,
             num_kv_splits=16,
             sm_scale=self.scale,
             work_meta_data=work_meta_data,
@@ -878,7 +909,7 @@ def triton_convert_req_index_to_global_index(
     kv_indices_c = kv_indices.contiguous()
     token_indices_c = token_indices.contiguous()
     page_kv_indptr_c = page_kv_indptr.contiguous()
-    # TODO: not support mtp
+    # NOTE: MTP (max_seqlen_q > 1) uses triton_convert_req_index_to_global_index_dsa_prefill instead
     new_kv_indices = torch.empty_like(kv_indices)
 
     # Strides in elements
@@ -916,7 +947,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
@@ -941,14 +972,19 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     )  # int32
     pre_seqlens_q = tl.load(cu_seqlens_q + req_id)
 
+    seq_token_idx = indice - pre_seqlens_q
+    block_id = seq_token_idx // PAGE_SIZE
+    inblock_offset = seq_token_idx % PAGE_SIZE
+
     # Guard block_table access
     store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
     valid_mask = store_mask & (indice >= 0)
-    out_val = tl.load(
-        block_table + req_id * bt_stride0 + (indice - pre_seqlens_q) * bt_stride1,
+    physical_block = tl.load(
+        block_table + req_id * bt_stride0 + block_id * bt_stride1,
         mask=valid_mask,
         other=-1,
     )
+    out_val = tl.where(valid_mask, physical_block * PAGE_SIZE + inblock_offset, -1)
 
     # Store results
     out_ptr_ij = out_kv_indices + kv_start + col_id
@@ -967,7 +1003,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
     cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
     # dsa_kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]           -->>>     output for this kernel
-    PAGE_SIZE: int = 1,  # page_block_size = 1 for now
+    PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
 ):
@@ -1010,3 +1046,85 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         bt_stride1,
     )
     return new_kv_indices
+
+
+@triton.jit
+def _gather_kv_indices_sparse_kernel(
+    sparse_kv_indptr,
+    token_to_seq_idxs,
+    topk_indices,
+    kv_indices,
+    kv_indptr,
+    out_kv_indices,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    req_id = tl.load(token_to_seq_idxs + token_id)
+
+    out_start = tl.load(sparse_kv_indptr + token_id)
+    out_end = tl.load(sparse_kv_indptr + token_id + 1)
+    kv_len = out_end - out_start
+
+    pos = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
+
+    kv_base = tl.load(kv_indptr + req_id)
+    kv_end = tl.load(kv_indptr + req_id + 1)
+    req_kv_len = kv_end - kv_base
+
+    store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
+    valid_mask = store_mask & (pos >= 0) & (pos < req_kv_len)
+
+    out_val = tl.load(
+        kv_indices + kv_base + pos,
+        mask=valid_mask,
+        other=0,
+    )
+
+    tl.store(
+        out_kv_indices + out_start + col_id,
+        out_val,
+        mask=store_mask,
+    )
+
+
+def triton_gather_kv_indices_sparse(
+    sparse_kv_indptr: torch.Tensor,
+    token_to_seq_idxs: torch.Tensor,
+    topk_indices: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 1024,
+):
+    assert topk_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0
+
+    num_tokens = token_to_seq_idxs.shape[0]
+    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+
+    out = torch.empty(
+        num_tokens * NUM_TOPK_TOKENS, dtype=torch.int32, device=topk_indices.device
+    )
+
+    ti_stride0, ti_stride1 = topk_indices.stride()
+    grid = (num_tokens, tiles_per_row)
+
+    _gather_kv_indices_sparse_kernel[grid](
+        sparse_kv_indptr,
+        token_to_seq_idxs,
+        topk_indices,
+        kv_indices,
+        kv_indptr,
+        out,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+    )
+    return out
