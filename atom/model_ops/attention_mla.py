@@ -547,94 +547,124 @@ class MLAAttention(nn.Module):
             device=q.device,
         )
 
-        kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
-        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
-        paged_kv_indptr = attn_metadata.kv_indptr
-        paged_kv_indices = attn_metadata.kv_indices
-        paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
-        max_q_len = attn_metadata.max_seqlen_q
-        if self.topk_indices_buffer is not None:
-            if attn_metadata.max_seqlen_q > 1:
-                # MTP verify: per-token layout with max_q_len=1.
-                # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
-                paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
-                paged_kv_indptr = attn_metadata.sparse_kv_indptr
-                paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-                # Gather physical page indices from kv_indices using topk positions.
-                # block_tables contains large-block IDs (block_ratio > 1) that
-                # need expansion; kv_indices already has per-token page indices.
-                paged_kv_indices = triton_gather_kv_indices_sparse(
-                    paged_kv_indptr,
-                    attn_metadata.token_to_seq_idxs,
-                    self.topk_indices_buffer[:B],
-                    attn_metadata.kv_indices,
-                    attn_metadata.kv_indptr,
-                    NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-                )
-                max_q_len = 1
-            else:
-                paged_kv_indptr = attn_metadata.sparse_kv_indptr
-                paged_kv_indices = triton_convert_req_index_to_global_index(
-                    attn_metadata.cu_seqlens_q,
-                    attn_metadata.kv_indptr,
-                    paged_kv_indptr,
-                    attn_metadata.kv_indices,
-                    self.topk_indices_buffer[:B],
-                    NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-                )
+        if hasattr(attn_metadata, "triton_block_table"):
+            from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
 
-        dp_size = get_dp_group().world_size
-        use_persistent_mode = not (dp_size > 1)
+            k_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
+            v_buffer = k_buffer[..., : self.kv_lora_rank]
+            page_size = k_buffer.shape[1]
 
-        # Sparse layers in MTP verify use separate persistent metadata
-        # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
-        # (max_seqlen_qo=2).
-        is_sparse_mtp = (
-            self.topk_indices_buffer is not None and attn_metadata.max_seqlen_q > 1
-        )
+            q_for_triton = (
+                q.to(torch.bfloat16)
+                if q.dtype.is_floating_point and q.element_size() == 1
+                else q
+            )
 
-        if not use_persistent_mode:
-            work_meta_data = None
-            work_indptr = None
-            work_info_set = None
-            reduce_indptr = None
-            reduce_final_map = None
-            reduce_partial_map = None
-        elif is_sparse_mtp:
-            work_meta_data = attn_metadata.sparse_mtp_work_meta_data
-            work_indptr = attn_metadata.sparse_mtp_work_indptr
-            work_info_set = attn_metadata.sparse_mtp_work_info_set
-            reduce_indptr = attn_metadata.sparse_mtp_reduce_indptr
-            reduce_final_map = attn_metadata.sparse_mtp_reduce_final_map
-            reduce_partial_map = attn_metadata.sparse_mtp_reduce_partial_map
+            # Use pre-built dense block_table from prepare_decode()
+            decode_attention_fwd(
+                q_for_triton,
+                k_buffer,
+                v_buffer,
+                o,
+                attn_metadata.triton_lse,
+                attn_metadata.triton_block_table,
+                attn_metadata.context_lens,
+                attn_metadata.triton_attn_logits,
+                4,  # num_kv_splits
+                self.scale,
+                page_size,
+                k_scale=self._k_scale,
+                v_scale=self._k_scale,
+            )
         else:
-            work_meta_data = attn_metadata.work_meta_data
-            work_indptr = attn_metadata.work_indptr
-            work_info_set = attn_metadata.work_info_set
-            reduce_indptr = attn_metadata.reduce_indptr
-            reduce_final_map = attn_metadata.reduce_final_map
-            reduce_partial_map = attn_metadata.reduce_partial_map
+            kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
+            paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
+            paged_kv_indptr = attn_metadata.kv_indptr
+            paged_kv_indices = attn_metadata.kv_indices
+            paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
+            max_q_len = attn_metadata.max_seqlen_q
+            if self.topk_indices_buffer is not None:
+                if attn_metadata.max_seqlen_q > 1:
+                    # MTP verify: per-token layout with max_q_len=1.
+                    # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
+                    paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
+                    paged_kv_indptr = attn_metadata.sparse_kv_indptr
+                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+                    # Gather physical page indices from kv_indices using topk positions.
+                    # block_tables contains large-block IDs (block_ratio > 1) that
+                    # need expansion; kv_indices already has per-token page indices.
+                    paged_kv_indices = triton_gather_kv_indices_sparse(
+                        paged_kv_indptr,
+                        attn_metadata.token_to_seq_idxs,
+                        self.topk_indices_buffer[:B],
+                        attn_metadata.kv_indices,
+                        attn_metadata.kv_indptr,
+                        NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                    )
+                    max_q_len = 1
+                else:
+                    paged_kv_indptr = attn_metadata.sparse_kv_indptr
+                    paged_kv_indices = triton_convert_req_index_to_global_index(
+                        attn_metadata.cu_seqlens_q,
+                        attn_metadata.kv_indptr,
+                        paged_kv_indptr,
+                        attn_metadata.kv_indices,
+                        self.topk_indices_buffer[:B],
+                        NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                    )
 
-        mla_decode_fwd(
-            q,
-            kv_buffer.view(-1, 1, 1, q.shape[-1]),
-            o,
-            paged_cu_seqlens_q,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_lens,
-            max_q_len,
-            num_kv_splits=16,
-            sm_scale=self.scale,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            q_scale=self._q_scale,
-            kv_scale=self._k_scale,
-        )
+            dp_size = get_dp_group().world_size
+            use_persistent_mode = not (dp_size > 1)
+
+            # Sparse layers in MTP verify use separate persistent metadata
+            # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
+            # (max_seqlen_qo=2).
+            is_sparse_mtp = (
+                self.topk_indices_buffer is not None and attn_metadata.max_seqlen_q > 1
+            )
+
+            if not use_persistent_mode:
+                work_meta_data = None
+                work_indptr = None
+                work_info_set = None
+                reduce_indptr = None
+                reduce_final_map = None
+                reduce_partial_map = None
+            elif is_sparse_mtp:
+                work_meta_data = attn_metadata.sparse_mtp_work_meta_data
+                work_indptr = attn_metadata.sparse_mtp_work_indptr
+                work_info_set = attn_metadata.sparse_mtp_work_info_set
+                reduce_indptr = attn_metadata.sparse_mtp_reduce_indptr
+                reduce_final_map = attn_metadata.sparse_mtp_reduce_final_map
+                reduce_partial_map = attn_metadata.sparse_mtp_reduce_partial_map
+            else:
+                work_meta_data = attn_metadata.work_meta_data
+                work_indptr = attn_metadata.work_indptr
+                work_info_set = attn_metadata.work_info_set
+                reduce_indptr = attn_metadata.reduce_indptr
+                reduce_final_map = attn_metadata.reduce_final_map
+                reduce_partial_map = attn_metadata.reduce_partial_map
+
+            mla_decode_fwd(
+                q,
+                kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                o,
+                paged_cu_seqlens_q,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_lens,
+                max_q_len,
+                num_kv_splits=16,
+                sm_scale=self.scale,
+                work_meta_data=work_meta_data,
+                work_indptr=work_indptr,
+                work_info_set=work_info_set,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                q_scale=self._q_scale,
+                kv_scale=self._k_scale,
+            )
 
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :].contiguous()

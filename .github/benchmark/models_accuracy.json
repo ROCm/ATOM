@@ -50,12 +50,13 @@
   {
     "model_name": "gpt-oss-120b",
     "model_path": "openai/gpt-oss-120b",
-    "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
+    "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",
+    "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
     "env_vars": "",
     "runner": "linux-atom-mi35x-1",
     "test_level": "pr",
-    "accuracy_threshold": 0.39,
-    "accuracy_baseline": 0.41,
+    "accuracy_threshold": 0.88,
+    "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
   },
@@ -122,12 +123,13 @@
   {
     "model_name": "gpt-oss-120b (2 GPUs)",
     "model_path": "openai/gpt-oss-120b",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --enable-tbo all --gpu-memory-utilization 0.3",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --enable-tbo all --gpu-memory-utilization 0.5",
+    "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
     "env_vars": "",
     "runner": "linux-atom-mi35x-4",
     "test_level": "main",
-    "accuracy_threshold": 0.39,
-    "accuracy_baseline": 0.41,
+    "accuracy_threshold": 0.88,
+    "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
   },

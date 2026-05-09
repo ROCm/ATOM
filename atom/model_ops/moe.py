@@ -686,11 +686,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or self.quant_type == QuantType.per_1x32
         )
         gfx = get_gfx()
-        self.use_triton = (
-            gfx.startswith("gfx94")
-            or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
-            or os.environ.get("ATOM_USE_TRITON_MOE") == "1"
-        )
+        if envs.is_set("ATOM_USE_TRITON_MOE"):
+            self.use_triton = envs.ATOM_USE_TRITON_MOE
+        else:
+            self.use_triton = (
+                gfx.startswith("gfx94")
+                or gfx.startswith("gfx12")
+                or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
+            )
         if self.use_triton:
             from atom.model_ops.utils import has_triton_kernels
 
@@ -975,11 +978,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_fused_shared_experts=layer.num_fused_shared_experts,
                     routed_scaling_factor=layer.routed_scaling_factor,
                 )
+                n_expts_act = topk_weights.shape[1]
 
                 # Convert to triton routing data structures
                 n_expts_tot = router_logits.shape[-1]
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
+                n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
                 routing_data, gather_idx, scatter_idx = routing_from_topk(
                     topk_weights, topk_ids, n_expts_tot
@@ -994,7 +999,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     routing_data,
                     gather_idx,
                     scatter_idx,
-                    topk=top_k,
+                    topk=n_expts_act,
                     activation=activation,
                     w13_precision_config=self.w13_precision_config,
                     w2_precision_config=self.w2_precision_config,
@@ -1002,7 +1007,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w2_bias=layer.w2_bias,
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                    global_num_experts=global_num_experts,
+                    global_num_experts=n_expts_tot,
                     expert_map=expert_map,
                 )
                 return _moe_result

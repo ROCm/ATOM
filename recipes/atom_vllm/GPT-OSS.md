@@ -21,7 +21,7 @@ vllm serve openai/gpt-oss-120b \
     --host localhost \
     --port 8000 \
     --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
+    --gpu_memory_utilization 0.5 \
     --async-scheduling \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --no-enable-prefix-caching

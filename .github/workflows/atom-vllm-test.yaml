@@ -212,9 +212,9 @@ jobs:
           - display_name: "gpt-oss-120b TP1"
             model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
-            extra_args: "--tensor-parallel-size 1"
+            extra_args: "--tensor-parallel-size 1 --gpu-memory-utilization 0.5"
             env_vars: "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1"
-            accuracy_test_threshold: 0.38
+            accuracy_test_threshold: 0.88
             runner: linux-atom-mi35x-1
           - display_name: "Kimi-K2-Thinking-MXFP4 TP4"
             model_name: "Kimi-K2-Thinking-MXFP4"
