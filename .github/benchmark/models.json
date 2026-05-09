@@ -73,7 +73,7 @@
     "display": "gpt-oss-120b",
     "path": "openai/gpt-oss-120b",
     "prefix": "gpt-oss-120b",
-    "args": "--kv_cache_dtype fp8",
+    "args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",
     "bench_args": "",
     "suffix": "",
     "runner": "atom-mi355-8gpu.predownload",

@@ -33,6 +33,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
+    "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.
@@ -69,6 +71,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
+    # Use a thread pool for weight loading instead of main-process sequential I/O.
+    # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
+    "ATOM_LOADER_USE_THREADPOOL": lambda: os.getenv("ATOM_LOADER_USE_THREADPOOL", "1")
+    == "1",
+    # --- Attention Backend ---
+    # Use unified_attention (flash-style) for MHA paged/prefill attention instead
+    # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
+    "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"

@@ -727,6 +727,7 @@ class SpeculativeConfig:
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
         "deepseek_v3": "deepseek_mtp",
+        "deepseek_v32": "deepseek_mtp",
         "glm_moe_dsa": "deepseek_mtp",
         "qwen3_next": "qwen3_next_mtp",
         "qwen3_5": "qwen3_5_mtp",
@@ -745,7 +746,7 @@ class SpeculativeConfig:
 
     def __post_init__(self):
         if self.draft_model_hf_config is None:
-            self.draft_model_hf_config = AutoConfig.from_pretrained(
+            self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
             )
         # For multimodal models, extract text_config

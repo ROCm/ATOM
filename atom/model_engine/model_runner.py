@@ -1877,6 +1877,8 @@ class ModelRunner:
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
         self.forward_vars["kv_indptr"].gpu.zero_()
+        if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
+            self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
