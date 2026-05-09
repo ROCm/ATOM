@@ -321,6 +321,9 @@ def triton_kernel_fused_experts(
             raw_2d = raw_intermediate.view(M * topk, N)
             gate = raw_2d[:, :half_N]
             up = raw_2d[:, half_N:]
+            if swiglu_limit > 0:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(-swiglu_limit, swiglu_limit)
             intermediate_cache = intermediate_cache.view(M * topk, half_N)
             intermediate_cache.copy_(torch.nn.functional.silu(gate) * up)
             intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
