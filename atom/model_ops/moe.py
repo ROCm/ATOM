@@ -682,6 +682,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
+        self.is_guinterleave = os.environ.get("AITER_MOE_GU_ITLV", "0") == "1"
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -869,17 +870,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
             return
         else:
-            is_guinterleave = os.environ.get("AITER_MOE_GU_ITLV", "0") == "1"
-            # suffle weight
+            # shuffle weight
             layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight, is_guinterleave=is_guinterleave, gate_up=True
+                layer.w13_weight,
+                is_guinterleave=self.is_guinterleave,
+                gate_up=True,
             )
             layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight, is_guinterleave=is_guinterleave, gate_up=False
+                layer.w2_weight,
+                is_guinterleave=self.is_guinterleave,
+                gate_up=False,
             )
 
             # shuffle scale
-            if is_guinterleave:
+            if self.is_guinterleave:
                 w13_scale_2d = layer.w13_weight_scale.view(
                     -1, layer.w13_weight_scale.shape[-1]
                 )
@@ -891,10 +895,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_scale_2d = layer.w2_weight_scale.view(self.num_experts, -1)
 
             shuffled_w13_scale = shuffle_scale(
-                w13_scale_2d, self.num_experts, is_guinterleave, True
+                w13_scale_2d, self.num_experts, self.is_guinterleave, True
             )
             shuffled_w2_scale = shuffle_scale(
-                w2_scale_2d, self.num_experts, is_guinterleave, False
+                w2_scale_2d, self.num_experts, self.is_guinterleave, False
             )
 
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
@@ -1054,7 +1058,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
                 swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
-                gate_mode=getattr(layer, "gate_mode", GateMode.SEPARATED.value),
+                gate_mode=(
+                    GateMode.INTERLEAVE.value
+                    if self.is_guinterleave
+                    else GateMode.SEPARATED.value
+                ),
             )
         return self.fused_experts(
             hidden_states=x,
