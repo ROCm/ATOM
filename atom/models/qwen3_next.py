@@ -645,6 +645,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         3. Output projection
         """
 
+        num_tokens = hidden_states.shape[0]
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
