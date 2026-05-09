@@ -25,7 +25,7 @@ from typing import Any
 import logging
 from math import prod
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.fused_routing_from_topk import (
+from aiter.ops.triton.fusions.fused_routing_from_topk import (
     fused_routing_from_topk as _aiter_fused_routing_from_topk,
 )
 from atom.model_ops.utils import has_triton_kernels
