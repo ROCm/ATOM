@@ -518,9 +518,6 @@ class AiterAttentionMetadataBuilder:
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
-        impl = getattr(module, "impl", None)
-        if impl is not None:
-            impl.use_flash_layout = False
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=k_cache,

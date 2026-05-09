@@ -638,7 +638,7 @@ class PagedAttentionImpl(nn.Module):
                 return self.prefill_attention_triton
             return self.prefill_attention
         else:
-            if self.use_triton_attn:
+            if self.use_triton_attn or self.use_flash_layout:
                 return self.paged_attention_triton
             else:
                 # Only use pa persistent when block_size == 1024
