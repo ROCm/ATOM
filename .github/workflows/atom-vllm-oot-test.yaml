@@ -35,7 +35,7 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
-      - name: Download and check pre-checkin signal
+      - name: Wait for Pre Checkin workflow
         run: bash ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

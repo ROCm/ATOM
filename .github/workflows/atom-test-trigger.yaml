@@ -1,0 +1,46 @@
+name: ATOM Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      aiter_branch:
+        description: 'ROCm/aiter branch to build inside the CI image'
+        required: false
+        default: 'main'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  atom-test:
+    uses: ./.github/workflows/atom-test.yaml
+    with:
+      checkout_repository: ${{ github.repository }}
+      checkout_ref: ${{ github.sha }}
+      source_repo_url: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
+      source_commit_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+      aiter_branch: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.aiter_branch || 'main' }}
+      model_scope: ${{ github.event_name == 'schedule' && 'nightly' || github.event_name == 'workflow_dispatch' && 'nightly' || github.event_name == 'push' && 'main' || 'pr' }}
+      run_precheck: ${{ github.event_name != 'workflow_dispatch' }}
+      is_draft_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft || false }}
+      is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork || false }}
+      publish_dashboard: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+    secrets:
+      github_token: ${{ secrets.GITHUB_TOKEN }}
+      docker_username: ${{ secrets.DOCKER_USERNAME }}
+      docker_password: ${{ secrets.DOCKER_PASSWORD }}
+      amd_hf_token: ${{ secrets.AMD_HF_TOKEN }}
