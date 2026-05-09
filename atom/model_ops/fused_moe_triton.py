@@ -40,10 +40,6 @@ if has_triton_kernels():
             PrecisionConfig,
             matmul_ogs,
         )
-        from triton_kernels.matmul_ogs_details.opt_flags import (
-            update_opt_flags_constraints,
-            reset_opt_flags_constraints,
-        )
         from triton_kernels.routing import routing
     except (AttributeError, ImportError) as e:
         logger.error(
