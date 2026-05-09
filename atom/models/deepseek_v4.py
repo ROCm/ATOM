@@ -1720,18 +1720,25 @@ class Expert(nn.Module):
         x: torch.Tensor,  # [num_tokens, dim]
         weights: Optional[torch.Tensor] = None,  # [num_tokens, 1]  optional gate
     ) -> torch.Tensor:  # [num_tokens, dim]
+        from aiter import silu_and_mul as aiter_silu_and_mul
+
         dtype = x.dtype
-        # Single fused GEMM, then chunk(2) along last dim so TP-sharded per-rank
-        # output (inter_dim_per_tp * 2) is split correctly regardless of tp_size.
-        combined = self.gate_up_proj(x).float()  # [num_tokens, 2*inter_dim_per_tp]
-        gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, inter_dim_per_tp]
-        if self.swiglu_limit > 0:
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-        x = F.silu(gate) * up  # [num_tokens, inter_dim_per_tp]
+        # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
+        # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
+        # silu/clamp/mul in fp32 internally regardless of input dtype, so we
+        # feed the bf16 GEMM output directly.
+        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        out = torch.empty(
+            (combined.shape[0], combined.shape[-1] // 2),
+            dtype=dtype,
+            device=combined.device,
+        )
+        # limit > 0 enables in-kernel clamp (gate≤limit, up∈[-limit,limit]) via
+        # ROCm v_med3_f32 — same semantics as the prior torch.clamp pair.
+        aiter_silu_and_mul(out, combined, self.swiglu_limit)
         if weights is not None:
-            x = weights * x
-        return self.w2(x.to(dtype))  # [num_tokens, dim]
+            out = weights.to(dtype) * out
+        return self.w2(out)  # [num_tokens, dim]
 
 
 class MoE(nn.Module):
