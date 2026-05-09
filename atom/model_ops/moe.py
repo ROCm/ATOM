@@ -947,6 +947,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 triton_kernel_moe_forward,
                 triton_kernel_fused_experts,
                 routing_from_topk,
+                fused_routing_from_topk_triton,
             )
 
             # Check if the model needs custom routing that triton routing()
@@ -981,7 +982,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
 
-                routing_data, gather_idx, scatter_idx = routing_from_topk(
+                routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
                     topk_weights, topk_ids, n_expts_tot
                 )
 
