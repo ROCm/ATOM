@@ -233,7 +233,7 @@ def main() -> int:
     parser.add_argument(
         "--max-slots",
         type=int,
-        default=11,
+        default=8,
         help="Maximum number of MODEL_SLOT_N / TP_SIZES_SLOT_N pairs to read",
     )
     args = parser.parse_args()
