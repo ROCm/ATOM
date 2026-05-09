@@ -181,12 +181,12 @@ def _fused_rms_fp8_quant_fake(
     torch.Tensor,
 ]:
     m, n1 = x1.shape
-    disable_quant = quant_type is None or quant_type == QuantType.No.value
-    if not disable_quant:
+    no_quant = quant_type is None or quant_type == QuantType.No.value
+    if not no_quant:
         out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
     else:
         out1_quantized = torch.empty_like(x1)
-    if disable_quant:
+    if no_quant:
         out1_bs = None
     elif quant_type == QuantType.per_Token.value:
         out1_bs = torch.empty((m, 1), dtype=torch.float32, device=x1.device)
@@ -285,10 +285,7 @@ def _fused_rms_fp8_quant(
     )
 
     if quant_type is None:
-        if group_size == 32:
-            quant_type = QuantType.per_1x32
-        else:
-            quant_type = QuantType.per_1x128
+        quant_type = QuantType.No
     else:
         quant_type = QuantType(quant_type)
 
@@ -344,7 +341,7 @@ def _fuse_rmsnorm_quant(
                 output_unquantized_inp1,
             )
         )
-    elif dtype_quant == dtypes.fp8:
+    elif dtype_quant == dtypes.fp8 or dtype_quant == torch.bfloat16:
         out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
             _fused_rms_fp8_quant(
                 x1,
@@ -1472,8 +1469,8 @@ class DeepseekV2MLAAttention(nn.Module):
 
         # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if FP8 or (use_triton_gemm() and FP4),
         self.prefix = prefix
-        self.quant_dtype = None
-        self.qknorm_quant_type = None
+        self.quant_dtype = layer_quant_dtype
+        self.qknorm_quant_type = layer_quant_type_value
         self.fuse_qknorm_quant = False
         # always fuse qknorm
         self.fuse_qknorm = ENABLE_DS_QKNORM_FUSION
@@ -1481,8 +1478,6 @@ class DeepseekV2MLAAttention(nn.Module):
             if layer_quant_dtype == dtypes.fp8 or (
                 layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
             ):
-                self.quant_dtype = layer_quant_dtype
-                self.qknorm_quant_type = layer_quant_type_value
                 self.fuse_qknorm_quant = True
 
     def forward(
