@@ -10,7 +10,6 @@ from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
 from atom.config import get_current_atom_config
-from atom.utils import envs
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 
@@ -78,6 +77,10 @@ class PagedAttentionImpl(nn.Module):
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
+        # Set by the attention backend's build_kv_cache_tensor when KV cache is
+        # allocated in flash layout [num_blocks, block_size, num_kv_heads, head_dim]
+        # for aiter triton unified_attention. AiterBackend keeps this False.
+        self.use_flash_layout = False
 
         # for plugin mode(vllm), the query quant is disabled for now
         if is_vllm():
@@ -230,7 +233,7 @@ class PagedAttentionImpl(nn.Module):
                 k_scale,
                 v_scale,
                 self.rotary_emb.is_neox_style,
-                flash_layout=envs.ATOM_USE_UNIFIED_ATTN,
+                flash_layout=self.use_flash_layout,
                 apply_scale=self.kv_cache_dtype.startswith("fp8"),
                 offs=None,
                 q_out=q,
@@ -374,13 +377,13 @@ class PagedAttentionImpl(nn.Module):
         o = torch.empty_like(q)
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        if envs.ATOM_USE_UNIFIED_ATTN:
+        if self.use_flash_layout:
             sliding_window = (
                 (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
             )
 
-            # KV cache is already in flash layout (4D) when
-            # ATOM_USE_UNIFIED_ATTN is set, allocated by model_runner.
+            # KV cache is already in flash layout (4D), allocated by
+            # TritonMHAMetadataBuilder.build_kv_cache_tensor.
             nkv = k_cache.shape[2]
             descale_shape = (num_seqs, nkv)
 
@@ -631,7 +634,7 @@ class PagedAttentionImpl(nn.Module):
         ctx = fwd_ctx.context
 
         if ctx.is_prefill:
-            if envs.ATOM_USE_UNIFIED_ATTN and self.use_triton_attn:
+            if self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention
         else:

@@ -63,4 +63,6 @@ def get_attn_backend_cls(
                 "atom.plugin.sglang.attention_backend.attention_gdn.GDNAttentionBackend"
             )
         return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
+    if envs.ATOM_USE_UNIFIED_ATTN:
+        return "atom.model_ops.attentions.triton_mha.TritonMHABackend"
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501
