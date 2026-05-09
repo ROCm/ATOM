@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
 #SBATCH --time=04:00:00
-#SBATCH --nodelist=mia1-p02-g42
+#SBATCH --nodelist=mia1-p02-g44
 #SBATCH --output=/it-share/yajizhan/slurm_logs/ds_fp4_standalone_tp8_vllm-%j.out
 #SBATCH --error=/it-share/yajizhan/slurm_logs/ds_fp4_standalone_tp8_vllm-%j.err
 #
@@ -38,8 +38,8 @@ PORT="${PORT:-8000}"
 
 MEM_FRACTION="${MEM_FRACTION:-0.9}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-}"
 CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
@@ -48,7 +48,7 @@ CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-256}"
 # Workload: comma-separated ISL:OSL pairs.
 ISL_OSL_LIST="${ISL_OSL_LIST:-8192:1,1:1024,8192:1024}"
 CONC_LIST="${CONC_LIST:-1,2,4,8,16}"
-RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1}"
+RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.8}"
 
 LOAD_DUMMY="${LOAD_DUMMY:-}"
 WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-1800}"
@@ -114,9 +114,9 @@ fi
 CUDAGRAPH_SIZES=$(seq -s, "${CUDA_GRAPH_BS_START}" "${CUDA_GRAPH_BS_END}")
 
 if [[ -n "${ENFORCE_EAGER}" ]]; then
-    COMPILE_ARGS="--no-async-scheduling --enforce-eager"
+    COMPILE_ARGS="--enforce-eager"
 else
-    COMPILE_ARGS="--no-async-scheduling --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": [${CUDAGRAPH_SIZES}]}'"
+    COMPILE_ARGS="--async-scheduling --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": [${CUDAGRAPH_SIZES}]}'"
 fi
 
 cat <<INFO
@@ -162,9 +162,8 @@ vllm serve "${MODEL_PATH}" \
     --tensor-parallel-size "${TP}" \
     --kv-cache-dtype "${KV_CACHE_DTYPE}" \
     --gpu-memory-utilization "${MEM_FRACTION}" \
-    --max-num-seqs "${MAX_NUM_SEQS}" \
-    --enable-chunked-prefill \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
     --no-enable-prefix-caching \
     ${COMPILE_ARGS} \
     ${LOAD_FORMAT_ARG} \
@@ -245,11 +244,15 @@ IFS=',' read -ra CONCS <<< "${CONC_LIST}"
 for PAIR in "${PAIRS[@]}"; do
     ISL="${PAIR%%:*}"
     OSL="${PAIR##*:}"
+    EFFECTIVE_RATIO="${RANDOM_RANGE_RATIO}"
+    if [[ "${ISL}" -le 1 || "${OSL}" -le 1 ]]; then
+        EFFECTIVE_RATIO=1
+    fi
     for CONC in "${CONCS[@]}"; do
-        RESULT_FILENAME="standalone-vllm-${ISL}-${OSL}-${CONC}-${RANDOM_RANGE_RATIO}"
+        RESULT_FILENAME="standalone-vllm-${ISL}-${OSL}-${CONC}-${EFFECTIVE_RATIO}"
         echo ""
         echo "========================================="
-        echo "[bench] ISL=${ISL} OSL=${OSL} CONC=${CONC}"
+        echo "[bench] ISL=${ISL} OSL=${OSL} CONC=${CONC} RATIO=${EFFECTIVE_RATIO}"
         echo "========================================="
 
         PYTHONDONTWRITEBYTECODE=1 python /tmp/sglang-benchmark/bench_serving/benchmark_serving.py \
@@ -259,7 +262,7 @@ for PAIR in "${PAIRS[@]}"; do
             --dataset-name=random \
             --random-input-len="${ISL}" \
             --random-output-len="${OSL}" \
-            --random-range-ratio "${RANDOM_RANGE_RATIO}" \
+            --random-range-ratio "${EFFECTIVE_RATIO}" \
             --num-prompts=$(( CONC * 10 )) \
             --max-concurrency="${CONC}" \
             --trust-remote-code \
@@ -314,8 +317,8 @@ for script in "${LOG_ROOT}"/scripts/*.sh; do
         -e "s|\${MODEL_PATH}|${MODEL_PATH}|g" \
         -e "s|\${MEM_FRACTION}|${MEM_FRACTION}|g" \
         -e "s|\${KV_CACHE_DTYPE}|${KV_CACHE_DTYPE}|g" \
-        -e "s|\${MAX_NUM_SEQS}|${MAX_NUM_SEQS}|g" \
         -e "s|\${MAX_NUM_BATCHED_TOKENS}|${MAX_NUM_BATCHED_TOKENS}|g" \
+        -e "s|\${MAX_MODEL_LEN}|${MAX_MODEL_LEN}|g" \
         -e "s|\${GPU_IDS}|${GPU_IDS}|g" \
         -e "s|\${LOAD_FORMAT_ARG}|${LOAD_FORMAT_ARG}|g" \
         -e "s|\${COMPILE_ARGS}|${COMPILE_ARGS}|g" \

@@ -40,8 +40,8 @@ BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 
 MEM_FRACTION="${MEM_FRACTION:-0.9}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
 IB_DEVICE="${IB_DEVICE:-rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7}"
 MESH_BIN="${MESH_BIN:-/usr/local/bin/atom-mesh}"
@@ -124,9 +124,9 @@ fi
 CUDAGRAPH_SIZES=$(seq -s, "${CUDA_GRAPH_BS_START}" "${CUDA_GRAPH_BS_END}")
 
 if [[ -n "${ENFORCE_EAGER}" ]]; then
-    COMPILE_ARGS="--no-async-scheduling --enforce-eager"
+    COMPILE_ARGS="--enforce-eager"
 else
-    COMPILE_ARGS="--no-async-scheduling --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": [${CUDAGRAPH_SIZES}]}'"
+    COMPILE_ARGS="--async-scheduling --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"cudagraph_capture_sizes\": [${CUDAGRAPH_SIZES}]}'"
 fi
 
 cat <<INFO
@@ -175,9 +175,8 @@ vllm serve "${MODEL_PATH}" \
     --tensor-parallel-size "${PREFILL_TP}" \
     --kv-cache-dtype "${KV_CACHE_DTYPE}" \
     --gpu-memory-utilization "${MEM_FRACTION}" \
-    --max-num-seqs "${MAX_NUM_SEQS}" \
-    --enable-chunked-prefill \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
     --no-enable-prefix-caching \
     --kv-transfer-config '{"kv_connector": "MooncakeConnector", "kv_role": "kv_producer"}' \
     ${COMPILE_ARGS} \
@@ -209,7 +208,8 @@ vllm serve "${MODEL_PATH}" \
     --tensor-parallel-size "${DECODE_TP}" \
     --kv-cache-dtype "${KV_CACHE_DTYPE}" \
     --gpu-memory-utilization "${MEM_FRACTION}" \
-    --max-num-seqs "${MAX_NUM_SEQS}" \
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
     --no-enable-prefix-caching \
     --kv-transfer-config '{"kv_connector": "MooncakeConnector", "kv_role": "kv_consumer"}' \
     ${COMPILE_ARGS} \
@@ -387,8 +387,8 @@ for script in "${LOG_ROOT}"/scripts/*.sh; do
         -e "s|\${MODEL_PATH}|${MODEL_PATH}|g" \
         -e "s|\${MEM_FRACTION}|${MEM_FRACTION}|g" \
         -e "s|\${KV_CACHE_DTYPE}|${KV_CACHE_DTYPE}|g" \
-        -e "s|\${MAX_NUM_SEQS}|${MAX_NUM_SEQS}|g" \
         -e "s|\${MAX_NUM_BATCHED_TOKENS}|${MAX_NUM_BATCHED_TOKENS}|g" \
+        -e "s|\${MAX_MODEL_LEN}|${MAX_MODEL_LEN}|g" \
         -e "s|\${IB_DEVICE}|${IB_DEVICE}|g" \
         -e "s|\${MESH_BIN}|${MESH_BIN}|g" \
         -e "s|\${PREFILL_GPU_IDS}|${PREFILL_GPU_IDS}|g" \
