@@ -682,7 +682,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
-        self.is_guinterleave = os.environ.get("AITER_MOE_GU_ITLV", "0") == "1"
+        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
