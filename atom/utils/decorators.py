@@ -1,7 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Callable, Optional, TypeVar, Union
+from typing import (
+    Callable,
+    Optional,
+    ParamSpec,
+    TypeVar,
+    Union,
+    overload as _overload,
+)
 import inspect
 import os
 import sys
@@ -23,6 +30,8 @@ from atom.utils.graph_marker import graph_marker
 # from atom.utils import start_monitoring_torch_compile
 
 _T = TypeVar("_T", bound=type[nn.Module])
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 context_manager = None
 torch_compile_start_time: float = 0.0
@@ -167,6 +176,18 @@ def _decorate_mark_trace_torch_compile(func: Callable, prefix: Optional[str] = N
     return wrapped
 
 
+# Overloads preserve the decorated callable's signature for pyright.
+# Without them, `@mark_trace` instances were inferred as plain `Callable`,
+# and class instances whose `__call__` was wrapped (DualRMSNorm, LinearBase,
+# ...) were flagged as "not callable" at the call site.
+@_overload
+def mark_trace(func: Callable[_P, _R], /) -> Callable[_P, _R]: ...
+@_overload
+def mark_trace(
+    *,
+    torch_compile: bool = ...,
+    prefix: Optional[str] = ...,
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
 def mark_trace(
     func: Optional[Callable] = None,
     *,

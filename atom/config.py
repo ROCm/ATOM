@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
 import torch
 from aiter import QuantType
@@ -302,7 +302,9 @@ class QuantizationConfig:
         """Alias for ``global_spec``."""
         return self.global_spec
 
-    def get_layer_quant_config(self, layer_name: str) -> LayerQuantConfig:
+    def get_layer_quant_config(
+        self, layer_name: str, *, check_children: bool = False
+    ) -> LayerQuantConfig:
         """Return the :class:`LayerQuantConfig` for *layer_name*.
 
         Resolution order:
@@ -311,7 +313,7 @@ class QuantizationConfig:
         3. Fall back to ``global_spec``.
         """
         # 1. Exclude list
-        if self._is_excluded(layer_name):
+        if self._is_excluded(layer_name, check_children=check_children):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
@@ -366,13 +368,21 @@ class QuantizationConfig:
 
     # -- internal helpers ---------------------------------------------------
 
-    def _is_excluded(self, layer_name: str) -> bool:
+    def _is_excluded(self, layer_name: str, *, check_children: bool = False) -> bool:
         if layer_name is None or not self.exclude_layers:
             return False
-        return any(
-            self._matches_exclude(layer_name, ignore_str)
-            for ignore_str in self.exclude_layers
-        )
+        prefix = layer_name + "."
+        for ignore_str in self.exclude_layers:
+            if self._matches_exclude(layer_name, ignore_str):
+                return True
+            # When check_children is True, also match if any exclude entry
+            # is a child of layer_name.  This is needed by container modules
+            # like FusedMoE whose prefix (e.g. "mtp.layers.60.mlp.experts")
+            # is a parent of the leaf-level exclude entries (e.g.
+            # "mtp.layers.60.mlp.experts.0.gate_up_proj").
+            if check_children and ignore_str.startswith(prefix):
+                return True
+        return False
 
     @staticmethod
     def _matches_exclude(
@@ -401,15 +411,36 @@ class QuantizationConfig:
                 return True
         return False
 
+    def apply_exclude_name_mapping(self, mapping: dict[str, str]):
+        if not mapping or not self.exclude_layers:
+            return
+        new_excludes = []
+        for name in self.exclude_layers:
+            for old, new in mapping.items():
+                name = name.replace(old, new)
+            new_excludes.append(name)
+        self.exclude_layers = list(dict.fromkeys(new_excludes))
+
+    def apply_default_exclude_layers(self, excludes: list[str]):
+        if not excludes:
+            return
+        for exclude in excludes:
+            if exclude not in self.exclude_layers:
+                self.exclude_layers.append(exclude)
+
     def remap_layer_name(
-        self, hf_config: PretrainedConfig, packed_modules_mapping: dict | None = None
+        self,
+        hf_config: PretrainedConfig,
+        packed_modules_mapping: dict | None = None,
+        weights_mapper={},
+        quant_exclude_name_mapping: dict[str, str] | None = None,
     ):
         model_type = hf_config.model_type
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
         # for special models
-        if model_type in ("deepseek_mtp", "deepseek_v3", "kimi_k2"):
+        if model_type in ("deepseek_mtp", "deepseek_v3", "kimi_k2", "glm_moe_dsa"):
             if hasattr(hf_config, "q_lora_rank") and hf_config.q_lora_rank is not None:
                 self.packed_modules_mapping = {
                     "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -425,6 +456,11 @@ class QuantizationConfig:
         elif model_type == "qwen3_moe" or model_type == "qwen3_next":
             if getattr(hf_config, "mlp_only_layers", []):
                 self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+
+        if weights_mapper:
+            self.exclude_layers = [
+                weights_mapper._map_name(name) for name in self.exclude_layers
+            ]
 
         # remap
         def _remap_layer_name(name: str) -> list[str]:
@@ -454,9 +490,18 @@ class QuantizationConfig:
             new_exclude.extend(_remap_layer_name(name))
         self.exclude_layers = list(dict.fromkeys(new_exclude))
 
+        # Apply model-declared HF-name to ATOM-path translations for exclude entries.
+        # Models that have a mismatch between their HF quant config names and ATOM
+        # module paths declare `quant_exclude_name_mapping` as a class attribute.
+        if quant_exclude_name_mapping:
+            self.apply_exclude_name_mapping(quant_exclude_name_mapping)
+
 
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
+    "deepseek_v4": "deepseek_v3",  # V4 reuses V3 schema; V4-specific fields
+    # (compress_ratios, num_hash_layers, hc_mult, swiglu_limit, ...) flow
+    # through as extra config attrs and are read in DeepseekV4Args.from_hf_config.
     "glm_moe_dsa": "deepseek_v3",  # GLM 5.0 MoE, structure similar to DeepSeek v3.2
     "kimi_k2": "deepseek_v3",
 }
@@ -465,6 +510,15 @@ _CONFIG_REGISTRY: dict[str, str] = {
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k25": "text_config",
+    "qwen3_5": "text_config",
+    "qwen3_5_moe": "text_config",
+}
+
+# multimodal models fully supported by plugin mode
+_PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
+    "kimi_k25",
+    "qwen3_5",
+    "qwen3_5_moe",
 }
 
 
@@ -480,10 +534,18 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             return token
         return None
 
+    multimodal_model_types = _MULTIMODAL_MODEL_TYPES
+    if is_vllm():
+        # Avoid mutating module-level state
+        multimodal_model_types = {
+            name: text_key
+            for name, text_key in _MULTIMODAL_MODEL_TYPES.items()
+            if name not in _PLUGIN_SUPPORTED_MULTIMODAL_MODELS
+        }
     # For multimodal models, extract the text sub-config so the rest of ATOM
     # (which is text-only today) works transparently.
-    if model_type in _MULTIMODAL_MODEL_TYPES:
-        text_config_key = _MULTIMODAL_MODEL_TYPES[model_type]
+    if model_type in multimodal_model_types:
+        text_config_key = multimodal_model_types[model_type]
         text_config_dict = config_dict.get(text_config_key, {}).copy()
         # Remove auto_map to avoid trust_remote_code issues
         text_config_dict.pop("auto_map", None)
@@ -511,13 +573,22 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
 
     if model_type in _CONFIG_REGISTRY:
         config_class = AutoConfig.for_model(_CONFIG_REGISTRY[model_type])
-        return config_class.from_pretrained(
+        hf_config = config_class.from_pretrained(
             model,
             # revision=revision,
             # code_revision=code_revision,
             token=_get_hf_token(),
             trust_remote_code=trust_remote_code,
         )
+        # transformers' from_pretrained strips fields that aren't in the target
+        # config schema. For mapped types (e.g. deepseek_v4 → deepseek_v3) the
+        # source-specific fields would be dropped. Re-inject them so V4-only
+        # attrs (compress_ratios, num_hash_layers, hc_mult, swiglu_limit, ...)
+        # remain accessible via getattr(hf_config, field) downstream.
+        for field, value in config_dict.items():
+            if not hasattr(hf_config, field):
+                setattr(hf_config, field, value)
+        return hf_config
     try:
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code
@@ -653,46 +724,79 @@ class SpeculativeConfig:
     num_speculative_tokens: Optional[int] = None
     draft_model_hf_config: Optional[PretrainedConfig] = None
 
+    # model_type → mtp_model_type mapping
+    _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
+        "deepseek_v3": "deepseek_mtp",
+        "deepseek_v32": "deepseek_mtp",
+        "glm_moe_dsa": "deepseek_mtp",
+        "qwen3_next": "qwen3_next_mtp",
+        "qwen3_5": "qwen3_5_mtp",
+        "qwen3_5_moe": "qwen3_5_mtp",
+        "qwen3_5_text": "qwen3_5_mtp",
+        "qwen3_5_moe_text": "qwen3_5_mtp",
+        "mimo_v2_flash": "mimo_v2_flash_mtp",
+    }
+
+    # mtp_model_type → (n_predict_attr, architecture)
+    _MTP_CONFIG: ClassVar[dict[str, tuple[str, str]]] = {
+        "deepseek_mtp": ("num_nextn_predict_layers", "DeepSeekMTPModel"),
+        "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
+        "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
+    }
+
     def __post_init__(self):
         if self.draft_model_hf_config is None:
-            self.draft_model_hf_config = AutoConfig.from_pretrained(self.model)
+            self.draft_model_hf_config = get_hf_config(
+                self.model, trust_remote_code=True
+            )
+        # For multimodal models, extract text_config
+        if hasattr(self.draft_model_hf_config, "text_config"):
+            self.draft_model_hf_config = self.draft_model_hf_config.text_config
         self.hf_config_override(self.draft_model_hf_config)
 
     @staticmethod
-    def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type == "deepseek_v3":
-            hf_config.model_type = "deepseek_mtp"
-        if hf_config.model_type == "qwen3_next":
-            hf_config.model_type = "qwen3_next_mtp"
+    def hf_config_override(hf_config: PretrainedConfig) -> None:
+        # Step 1: resolve model_type → mtp model_type
+        mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
+        if mtp_type is not None:
+            hf_config.model_type = mtp_type
 
-        if hf_config.model_type == "deepseek_mtp":
-            # DeepSeek MTP typically uses only 1 layer that gets reused
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
-            # Override to use only 1 layer if config says otherwise
+        # Step 2: apply MTP-specific config overrides
+        entry = SpeculativeConfig._MTP_CONFIG.get(hf_config.model_type)
+        if entry is not None:
+            n_predict_attr, arch = entry
+            n_predict = getattr(hf_config, n_predict_attr, 1)
             if n_predict != 1:
                 logger.warning(
-                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
+                    f"Overriding {n_predict_attr} from {n_predict} to 1 "
                     "(MTP typically uses 1 layer that gets reused)"
                 )
                 n_predict = 1
+
+            updates: dict[str, Any] = {
+                "n_predict": n_predict,
+                "num_nextn_predict_layers": n_predict,
+                "architectures": [arch],
+            }
+            # Qwen3.5 MTP needs expert counts for MoE layer construction
+            if hf_config.model_type == "qwen3_5_mtp":
+                updates["n_shared_experts"] = 1
+                updates["n_routed_experts"] = getattr(hf_config, "num_experts", 0)
+
+            hf_config.update(updates)
+
+        # MiMo-V2 has not MTP related information in HF config.json,
+        # override n_predict with the actual layer count (default 3).
+        if hf_config.model_type == "mimo_v2_flash_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 3)
             hf_config.update(
                 {
                     "n_predict": n_predict,
                     "num_nextn_predict_layers": n_predict,
-                    "architectures": ["DeepSeekMTPModel"],
+                    "architectures": ["MiMoV2FlashMTPModel"],
                 }
             )
-        if hf_config.model_type == "qwen3_next_mtp":
-            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
-            if n_predict != 1:
-                logger.warning(
-                    f"Overriding num_nextn_predict_layers from {n_predict} to 1 "
-                    "(MTP typically uses 1 layer that gets reused)"
-                )
-                n_predict = 1
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["Qwen3NextMTPModel"]}
-            )
+
         logger.info(f"hf config is: {hf_config}")
 
     def __repr__(self) -> str:
@@ -737,6 +841,11 @@ class Config:
     enable_dp_attention: bool = False
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: Optional[SpeculativeConfig] = None
+    kv_transfer_config: dict = field(default_factory=dict)
+
+    enable_tbo: bool = False
+    enable_tbo_decode: bool = False
+    enable_low_latency: bool = False
 
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
@@ -760,13 +869,22 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
-        if not hasattr(self.hf_config, "rope_parameters"):
-            # Compatible with both transformers < 5
-            rope_params = getattr(self.hf_config, "rope_scaling", {})
-            if rope_params is None:
-                rope_params = {}
+        # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
+        # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
+        if getattr(self.hf_config, "rope_parameters", None) is None:
+            # Compatible with transformers < 5
+            rope_params = getattr(self.hf_config, "rope_scaling", None) or {}
+            rope_params = dict(rope_params)
+            # rope_theta: GPT-OSS / LLaMA-style configs keep it on the root in <5
             rope_params["rope_theta"] = getattr(self.hf_config, "rope_theta", None)
-            rope_params["rope_type"] = getattr(self.hf_config, "rope_type", "default")
+            # rope_type: must NOT overwrite rope_scaling["rope_type"] (e.g. GPT-OSS YaRN).
+            # transformers 4.x has no top-level rope_type; getattr(..., "default") was wrong.
+            if "rope_type" not in rope_params and "type" in rope_params:
+                rope_params["rope_type"] = rope_params["type"]
+            if "rope_type" not in rope_params:
+                rope_params["rope_type"] = getattr(
+                    self.hf_config, "rope_type", "default"
+                )
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
@@ -822,11 +940,34 @@ class Config:
             else torch.bfloat16
         )
 
+        if hasattr(self, "kv_transfer_config") and isinstance(
+            self.kv_transfer_config, str
+        ):
+            import json
+
+            try:
+                self.kv_transfer_config = json.loads(self.kv_transfer_config)
+            except json.JSONDecodeError:
+                import ast
+
+                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+
         if self.speculative_config is not None:
-            if self.speculative_config.num_speculative_tokens > 4:
+            num_spec = self.speculative_config.num_speculative_tokens
+            if num_spec is None or num_spec < 1 or num_spec > 4:
                 raise ValueError(
-                    f"num_speculative_tokens must be between 1 and 4,, got {self.speculative_config.num_speculative_tokens}. "
+                    f"num_speculative_tokens must be between 1 and 4, got {num_spec}."
                 )
+
+        # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
+        # lcm(m, m'). For V4-Pro / V4-Flash this is lcm(4, 128) = 128 original
+        # tokens. ATOM's BlockManager + slot_mapping math assume one global
+        # block_size, so we override `kv_cache_block_size` here when V4 is
+        # detected; the V4 attention builder enforces the same value.
+        if getattr(self.hf_config, "model_type", None) == "deepseek_v4":
+            v4_block_size = 128
+            if self.kv_cache_block_size != v4_block_size:
+                self.kv_cache_block_size = v4_block_size
 
     def compute_hash(self) -> str:
         """

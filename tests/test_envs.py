@@ -25,6 +25,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION",
     "ATOM_USE_CUSTOM_ALL_GATHER",
+    "ATOM_ENABLE_RELAXED_MTP",
 ]
 
 
@@ -84,6 +85,9 @@ class TestEnvsDefaults:
     def test_disable_vllm_plugin_attention_default(self):
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN_ATTENTION is False
 
+    def test_atom_enable_relaxed_mtp_default(self):
+        assert _get_envs().ATOM_ENABLE_RELAXED_MTP is False
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -131,6 +135,10 @@ class TestEnvsOverrides:
     def test_disable_vllm_plugin_attention_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "1")
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN_ATTENTION is True
+
+    def test_atom_enable_relaxed_mtp_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "1")
+        assert _get_envs().ATOM_ENABLE_RELAXED_MTP is True
 
 
 class TestIsSet:

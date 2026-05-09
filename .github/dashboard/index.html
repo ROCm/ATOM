@@ -4,7 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ATOM Benchmark Dashboard</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='4' fill='%23f5f0eb'/><rect x='0' y='0' width='8' height='8' fill='%23f2cfee'/><rect x='8' y='8' width='8' height='8' fill='%23f2cfee'/><rect x='0' y='16' width='8' height='8' fill='%23f2cfee'/><rect x='16' y='16' width='8' height='8' fill='%23f2cfee'/><rect x='0' y='24' width='8' height='8' fill='%23f2cfee'/><rect x='8' y='24' width='8' height='8' fill='%23f2cfee'/><rect x='24' y='24' width='8' height='8' fill='%23f2cfee'/></svg>" />
+  <link rel="icon" type="image/png" href="atom_logo_mini.png" />
+  <script>if(localStorage.getItem('atom-dash-theme')==='light')document.documentElement.setAttribute('data-theme','light');</script>
   <style>
     /* ============================================================
        CSS VARIABLES & RESET
@@ -20,15 +21,30 @@
       /* UI accent — slightly brighter slate blue */
       --ui: #8899b8; --ui-bright: #a4b3ce; --ui-dim: rgba(136,153,184,0.12);
       /* Semantic — slightly more vivid */
-      --accent-green: #56d472; --accent-red: #f25c4e;
+      --accent-green: #6dbf80; --accent-red: #f25c4e;
       --accent-orange: #eda06a; --accent-purple: #c49af5; --accent-yellow: #ddb040;
       /* Spacing */
       --gap-sm: 8px; --gap-md: 16px; --gap-lg: 24px; --radius: 8px;
     }
+    [data-theme="light"] {
+      --bg-primary: #f5f6fa; --bg-secondary: #ffffff; --bg-tertiary: #ebedf3;
+      --border: #d0d3dc; --border-light: #e2e4eb;
+      --text-primary: #1a1c24; --text-secondary: #4a4d5e; --text-tertiary: #7e8094;
+      --brand: #c054b4; --brand-dim: rgba(192,84,180,0.10);
+      --ui: #5a6d8a; --ui-bright: #3d5278; --ui-dim: rgba(90,109,138,0.10);
+      --accent-green: #2e8b47; --accent-red: #d63a2f;
+      --accent-orange: #c47a30; --accent-purple: #8b5ec0; --accent-yellow: #b08a20;
+      --table-stripe: rgba(0,0,0,0.03);
+    }
+    .header-left > div { position: relative; }
+    h1 { line-height: 24px; }
+    .theme-toggle { position: absolute; right: 0; top: 5px; display: block; width: 28px; height: 14px; background: var(--border); border: none; border-radius: 7px; cursor: pointer; transition: background 0.2s; }
+    .theme-toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 10px; height: 10px; background: var(--text-primary); border-radius: 50%; transition: transform 0.2s; }
+    [data-theme="light"] .theme-toggle { background: var(--border); }
+    [data-theme="light"] .theme-toggle::after { transform: translateX(14px); }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { overflow-x: hidden; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg-primary); color: var(--text-secondary); }
-    body::after { content: ''; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: url('atom_logo.png') no-repeat center/240px 60px; opacity: 0.04; pointer-events: none; z-index: 0; }
     .container { max-width: 1440px; margin: 0 auto; padding: var(--gap-lg); }
     a { color: var(--ui-bright); text-decoration: none; }
     a:hover { text-decoration: underline; }
@@ -37,11 +53,11 @@
     /* ============================================================
        HEADER & FILTER BAR
        ============================================================ */
-    header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: var(--gap-md); padding: var(--gap-md) var(--gap-lg); border-bottom: 2px solid var(--brand); position: fixed; top: 0; left: 0; right: 0; z-index: 50; background: var(--bg-primary); }
+    header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: var(--gap-md); padding: var(--gap-md) var(--gap-lg); border-bottom: 2px solid var(--brand); position: fixed; top: 0; left: 0; right: 0; z-index: 50; background: var(--bg-primary); max-width: 1440px; margin: 0 auto; }
     .header-spacer { margin-bottom: var(--gap-lg); }
     .fixed-thead { position: fixed; z-index: 40; background: var(--bg-secondary); display: none; overflow: hidden; }
     .header-left { display: flex; align-items: center; gap: 12px; }
-    .header-logo { height: 28px; opacity: 0.9; }
+    .header-logo { height: 36px; opacity: 0.9; display: block; }
     h1 { font-size: 20px; color: var(--text-primary); font-weight: 600; }
     h1 .h1-sep { color: var(--text-tertiary); font-weight: 300; margin: 0 2px; }
     h1 .h1-sub { color: var(--text-secondary); font-weight: 400; }
@@ -65,7 +81,9 @@
     /* ============================================================
        KPI CARDS (Level 1 — Overview)
        ============================================================ */
-    .kpi-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: var(--gap-md); margin-bottom: var(--gap-lg); }
+    .kpi-row { display: flex; gap: var(--gap-lg); margin-bottom: var(--gap-lg); }
+    .kpi-group { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--gap-md); flex: 1; }
+    .kpi-group + .kpi-group { border-left: 1px solid var(--border); padding-left: var(--gap-lg); }
     .kpi-card { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--gap-md); }
     .kpi-card .kpi-label { font-size: 11px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
     .kpi-card .kpi-value { font-size: 28px; font-weight: 700; color: var(--text-primary); font-family: "SF Mono", "Fira Code", monospace; }
@@ -74,12 +92,15 @@
     .kpi-card .kpi-trend { font-size: 12px; font-weight: 600; margin-top: 2px; }
     .kpi-card.alert { border-color: var(--accent-red); animation: pulse-border 2s infinite; }
     .kpi-card.alert-warning { border-color: var(--accent-orange); }
-    .kpi-card.ok { border-color: var(--accent-green); }
-    @keyframes pulse-border { 0%, 100% { border-color: var(--accent-red); } 50% { border-color: rgba(248,81,73,0.3); } }
+    .kpi-card.ok { border-color: var(--border); }
+    .kpi-card.ok .kpi-label { color: var(--accent-green); }
+    @keyframes pulse-border { 0%, 100% { border-color: var(--accent-red); } 50% { border-color: rgba(242,92,78,0.3); } }
     .kpi-card.clickable { cursor: pointer; }
     .kpi-card.clickable:hover { background: var(--bg-tertiary); }
     .perf-table tbody tr.flash { animation: flash-row 1.5s ease-out; }
-    @keyframes flash-row { 0% { background: rgba(240,85,69,0.3); } 100% { background: transparent; } }
+    @keyframes flash-row { 0% { background: rgba(242,92,78,0.3); } 100% { background: transparent; } }
+    .trend-jump { background: none; color: var(--text-tertiary); border: none; padding: 0; font-size: 11px; cursor: pointer; margin-left: 4px; }
+    .trend-jump:hover { color: var(--text-secondary); }
     .trend-up { color: var(--accent-green); }
     .trend-down { color: var(--accent-red); }
     .trend-neutral { color: var(--text-tertiary); }
@@ -89,18 +110,25 @@
        TABS (Level 2 — Diagnostic)
        ============================================================ */
     .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: var(--gap-lg); }
-    .tab { padding: 8px 16px; font-size: 13px; color: var(--text-tertiary); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; user-select: none; }
+    .tab { padding: 8px 16px; font-size: 13px; font-weight: 600; color: var(--text-tertiary); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; user-select: none; }
     .tab:hover { color: var(--text-secondary); }
     .tab.active { color: var(--text-primary); border-bottom-color: var(--ui); }
+    .tab .tab-badge { display: inline-block; margin-left: 4px; vertical-align: middle; font-size: 10px; font-weight: 600; min-width: 16px; height: 16px; line-height: 16px; text-align: center; border-radius: 8px; padding: 0 4px; }
+    .tab .tab-badge.warn { background: rgba(237,160,106,0.2); color: var(--accent-orange); }
+    .tab .tab-badge.alert { background: rgba(242,92,78,0.2); color: var(--accent-red); }
+    .tab .tab-badge.hidden { display: none; }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
 
     /* ============================================================
        CHART CARDS
        ============================================================ */
+    .section-container { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--gap-md); margin-bottom: var(--gap-lg); }
+    .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--gap-md); padding-bottom: var(--gap-sm); border-bottom: 1px solid var(--border-light); }
+    .section-title { font-size: 13px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500; }
     .chart-grid { display: grid; grid-template-columns: 1fr; gap: var(--gap-lg); }
     .chart-card { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--gap-md); }
-    .chart-card h3 { font-size: 13px; color: var(--text-tertiary); margin-bottom: var(--gap-sm); font-weight: 500; letter-spacing: 0.3px; }
+    .chart-card h3 { font-size: 14px; color: var(--text-secondary); margin-bottom: var(--gap-sm); font-weight: 500; letter-spacing: 0.3px; }
     .chart-card canvas { width: 100% !important; }
     .chart-card .chart-wrap { position: relative; width: 100%; }
     .chart-card.hero .chart-wrap { height: 380px; }
@@ -124,11 +152,12 @@
        TABLES — Conditional Formatting
        ============================================================ */
     .perf-table { width: 100%; min-width: 1100px; border-collapse: collapse; font-size: 12px; }
-    .table-watermark { position: relative; overflow-x: scroll; }
-    .table-watermark::-webkit-scrollbar { height: 8px; }
-    .table-watermark::-webkit-scrollbar-track { background: var(--bg-tertiary); border-radius: 4px; }
-    .table-watermark::-webkit-scrollbar-thumb { background: var(--text-tertiary); border-radius: 4px; }
-    .table-watermark::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+    .table-watermark { position: relative; }
+    .table-watermark-scroll { overflow-x: scroll; background: url('data:image/png;base64,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') no-repeat center/400px auto fixed; }
+    .table-watermark-scroll::-webkit-scrollbar { height: 8px; }
+    .table-watermark-scroll::-webkit-scrollbar-track { background: var(--bg-tertiary); border-radius: 4px; }
+    .table-watermark-scroll::-webkit-scrollbar-thumb { background: var(--text-tertiary); border-radius: 4px; }
+    .table-watermark-scroll::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
     .perf-table th { text-align: left; padding: 8px 10px; border-bottom: 2px solid var(--border); color: var(--text-tertiary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; background: var(--bg-secondary); }
     .perf-table th.num { text-align: right; }
     .perf-table td { padding: 7px 10px; border-bottom: 1px solid var(--border-light); }
@@ -143,20 +172,20 @@
     #tab-data .perf-table tbody tr[data-key] td:first-child::before { content: '▸ '; color: var(--text-tertiary); font-size: 10px; }
     #tab-performance .perf-table tbody tr[data-key].row-open td:first-child::before,
     #tab-data .perf-table tbody tr[data-key].row-open td:first-child::before { content: '▾ '; }
-    .perf-table tbody tr:nth-child(4n+1), .perf-table tbody tr:nth-child(4n+2) { background: rgba(22,27,34,0.5); }
+    .perf-table tbody tr:nth-child(4n+1), .perf-table tbody tr:nth-child(4n+2) { background: var(--table-stripe, rgba(22,27,34,0.5)); }
     .perf-table tbody tr:hover { background: var(--bg-tertiary); }
-    .perf-table tbody tr.regression { background: rgba(248,81,73,0.08) !important; }
-    .perf-table tbody tr.regression:hover { background: rgba(248,81,73,0.14) !important; }
-    .perf-table tbody tr.regression-warning { background: rgba(237,160,106,0.08) !important; }
-    .perf-table tbody tr.regression-warning:hover { background: rgba(237,160,106,0.14) !important; }
+    .perf-table tbody tr.regression { background: rgba(242,92,78,0.06) !important; }
+    .perf-table tbody tr.regression td:first-child { border-left: 3px solid var(--accent-red); }
+    .perf-table tbody tr.regression:hover { background: rgba(242,92,78,0.12) !important; }
+    .perf-table tbody tr.regression-warning { background: rgba(237,160,106,0.06) !important; }
+    .perf-table tbody tr.regression-warning td:first-child { border-left: 3px solid var(--accent-orange); }
+    .perf-table tbody tr.regression-warning:hover { background: rgba(237,160,106,0.12) !important; }
     .perf-table .warn { color: var(--accent-red); }
     /* Data bar for throughput */
     .data-bar { position: relative; }
     .data-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; pointer-events: none; }
     .data-bar-text { position: relative; z-index: 1; }
 
-    .trend-jump { background: none; color: var(--ui-bright); border: none; padding: 0; font-size: 11px; cursor: pointer; white-space: nowrap; margin-left: 6px; }
-    .trend-jump:hover { color: var(--text-primary); text-decoration: underline; }
 
     /* Detail row (expandable) */
     .detail-row { display: none; }
@@ -187,7 +216,7 @@
     .tl-header .commit-id { font-family: "SF Mono", monospace; font-weight: 600; color: var(--text-primary); }
     .tl-header .date { color: var(--text-tertiary); font-size: 12px; }
     .tl-header .badge { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--bg-tertiary); color: var(--text-secondary); border: 1px solid var(--border); }
-    .tl-header .badge.warn { background: rgba(248,81,73,0.15); color: var(--accent-red); border-color: var(--accent-red); }
+    .tl-header .badge.warn { background: rgba(242,92,78,0.15); color: var(--accent-red); border-color: var(--accent-red); }
     .tl-msg { color: var(--text-tertiary); font-size: 12px; margin-top: 4px; max-width: 600px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .tl-details { margin-top: var(--gap-sm); display: none; }
     .tl-details.expanded { display: block; }
@@ -207,6 +236,15 @@
     .popover .pop-section { margin-top: var(--gap-md); padding-top: var(--gap-sm); border-top: 1px solid var(--border); }
     /* pop-actions uses shared action-row + action-btn */
     .pop-close { position: absolute; top: 12px; right: 12px; background: none; border: none; color: var(--text-tertiary); font-size: 18px; cursor: pointer; }
+    .hover-tooltip { display: none; position: fixed; z-index: 210; min-width: 220px; max-width: 320px; padding: 10px 12px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 12px 32px rgba(0,0,0,0.35); pointer-events: none; }
+    .hover-tooltip.open { display: block; }
+    .hover-tooltip .hover-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; font-size: 12px; }
+    .hover-tooltip .hover-key { color: var(--text-tertiary); white-space: nowrap; }
+    .hover-tooltip .hover-val { color: var(--text-primary); text-align: right; overflow-wrap: anywhere; }
+    .hover-tooltip .hover-val.num { font-family: "SF Mono", monospace; }
+    .accuracy-score-cell { padding-top: 4px; padding-bottom: 4px; }
+    .accuracy-score-trigger { background: none; border: none; padding: 0; font: inherit; font-weight: 700; color: var(--text-primary); cursor: pointer; text-decoration: underline dotted transparent; text-underline-offset: 3px; }
+    .accuracy-score-trigger:hover, .accuracy-score-trigger:focus-visible { text-decoration-color: var(--text-tertiary); }
 
     /* ============================================================
        FOOTER
@@ -219,7 +257,8 @@
        RESPONSIVE
        ============================================================ */
     @media (max-width: 768px) {
-      .kpi-row { grid-template-columns: repeat(2, 1fr); }
+      .kpi-row { flex-direction: column; gap: var(--gap-md); }
+      .kpi-group + .kpi-group { border-left: none; padding-left: 0; border-top: 1px solid var(--border); padding-top: var(--gap-md); }
       .kpi-card .kpi-value { font-size: 22px; }
       .kpi-card .kpi-sub { font-size: 10px; }
       .filter-bar { width: 100%; }
@@ -234,7 +273,7 @@
       .popover { max-width: 95vw; padding: var(--gap-md); padding-top: 36px; }
     }
     @media (max-width: 480px) {
-      .kpi-row { grid-template-columns: 1fr; }
+      .kpi-group { grid-template-columns: 1fr; }
       .container { padding: var(--gap-sm); }
       header { padding: var(--gap-sm); }
       .filter-bar { gap: 4px; }
@@ -261,10 +300,11 @@
 <body>
 <header>
   <div class="header-left">
-    <img class="header-logo" src="atom_logo.png" alt="ATOM" onerror="this.style.display='none'">
+    <a href="https://github.com/rocm/atom" target="_blank" rel="noopener noreferrer"><img class="header-logo" src="atom_logo.png" alt="ATOM" onerror="this.style.display='none'"></a>
     <div>
       <h1>Benchmark Dashboard</h1>
       <div class="meta"><span id="last-update"></span> · <a id="repo-link" target="_blank" rel="noopener noreferrer"></a></div>
+      <button class="theme-toggle" id="theme-toggle" title="Toggle light/dark mode"></button>
     </div>
   </div>
   <div class="filter-bar" id="filter-bar"></div>
@@ -277,11 +317,11 @@
 
   <!-- Level 2-3: Tabs -->
   <div class="tabs" id="tabs-nav">
-    <div class="tab active" data-tab="performance">Performance</div>
+    <div class="tab active" data-tab="performance">Performance<span class="tab-badge hidden" id="tab-badge-perf"></span></div>
     <div class="tab" data-tab="tradeoff">Throughput vs Latency</div>
     <div class="tab" data-tab="trends">Trends</div>
     <div class="tab" data-tab="data">Data &amp; Trace</div>
-    <div class="tab" data-tab="accuracy">Accuracy</div>
+    <div class="tab" data-tab="accuracy">Accuracy<span class="tab-badge hidden" id="tab-badge-acc"></span></div>
   </div>
 
   <div class="tab-content active" id="tab-performance"></div>
@@ -300,17 +340,20 @@
 
 <!-- Popover -->
 <div class="popover-overlay" id="popover-overlay"><div class="popover" id="popover"></div></div>
+<div class="hover-tooltip" id="accuracy-hover-tooltip" aria-hidden="true"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js" integrity="sha384-y49Zu59jZHJL/PLKgZPv3k2WI9c0Yp3pWB76V8OBVCb0QBKS8l4Ff3YslzHVX76Y" crossorigin="anonymous"></script>
 <script src="data.js"></script>
+<script src="models_map.js"></script>
 <script>
 'use strict';
 (function() {
 /* ================================================================
    1. CONSTANTS & COLOR PALETTE
    ================================================================ */
-// HSL-based palette: each model gets a distinct hue, bar alpha varies by concurrency
+// HSL-based palette: each model gets a distinct base hue; backend offsets keep
+// ATOM, ATOM-vLLM, and ATOM-SGLang visually related but not identical.
 const MODEL_HUES = {
   'DeepSeek-R1-0528':      210,   // blue
   'DeepSeek-R1-0528-mtp3': 175,   // cyan/teal — distinct from base DeepSeek
@@ -321,23 +364,35 @@ const MODEL_HUES = {
   'Meta-Llama-3-8B-Instruct': 270, // purple
   'Qwen3-235B-A22B-Instruct-2507-FP8': 50, // gold
 };
+const BACKEND_HUE_OFFSETS = {
+  'ATOM': 0,
+  'ATOM-vLLM': 28,
+  'ATOM-SGLang': -30,
+};
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
 function getModelHue(backend, model) {
-  const backendModelKey = backend ? `${backend}::${model}` : model;
+  const normalizedBackend = backend === 'OOT' ? 'ATOM-vLLM' : backend;
+  const backendModelKey = normalizedBackend ? `${normalizedBackend}::${model}` : model;
   if (MODEL_HUES[backendModelKey] != null) return MODEL_HUES[backendModelKey];
-  if (MODEL_HUES[model] != null) return MODEL_HUES[model];
-  const h = FALLBACK_HUES[fallbackHueIdx % FALLBACK_HUES.length];
-  MODEL_HUES[backendModelKey] = h;
-  fallbackHueIdx++;
-  return h;
+  let baseHue = MODEL_HUES[model];
+  if (baseHue == null) {
+    baseHue = FALLBACK_HUES[fallbackHueIdx % FALLBACK_HUES.length];
+    MODEL_HUES[model] = baseHue;
+    fallbackHueIdx++;
+  }
+  const offset = BACKEND_HUE_OFFSETS[normalizedBackend] ?? 0;
+  const derivedHue = normalizedBackend ? (baseHue + offset) % 360 : baseHue;
+  if (normalizedBackend) MODEL_HUES[backendModelKey] = derivedHue;
+  return derivedHue;
 }
 function getModelColor(backend, model) {
   const h = getModelHue(backend, model);
+  const light = _theme === 'light';
   return {
-    border: `hsl(${h}, 55%, 65%)`,
-    bg:     `hsla(${h}, 55%, 65%, 0.12)`,
-    text:   `hsl(${h}, 35%, 75%)`,
+    border: `hsl(${h}, ${light ? '50%' : '55%'}, ${light ? '45%' : '65%'})`,
+    bg:     `hsla(${h}, ${light ? '50%' : '55%'}, ${light ? '45%' : '65%'}, ${light ? '0.08' : '0.12'})`,
+    text:   `hsl(${h}, ${light ? '40%' : '35%'}, ${light ? '40%' : '75%'})`,
   };
 }
 // Bar color: lower saturation, higher lightness for a soft pastel look
@@ -346,17 +401,44 @@ function getBarColor(backend, model, conc, concList) {
   const sorted = [...concList].sort((a, b) => a - b);
   const rank = sorted.indexOf(conc);
   const alpha = concList.length <= 1 ? 0.55 : 0.3 + (rank / (sorted.length - 1)) * 0.35;
-  return `hsla(${h}, 50%, 72%, ${alpha.toFixed(2)})`;
+  return `hsla(${h}, ${_theme === 'light' ? '45%' : '50%'}, ${_theme === 'light' ? '55%' : '72%'}, ${alpha.toFixed(2)})`;
 }
 
-// Chart color constants (match CSS --text-tertiary / --text-secondary)
-const C_TICK = '#8a8da0';    // axis ticks, labels
-const C_LEGEND = '#9ea0b2';  // legend text, datalabels
-const C_TOOLTIP_BG = '#141519';
-const C_TOOLTIP_BD = '#303140';
-const C_TOOLTIP_TITLE = '#eef0f6';
-const C_TOOLTIP_BODY = '#bfc1d0';
+// Chart color constants (match CSS variables, updated on theme toggle)
+const THEME_COLORS = {
+  dark:  { tick: '#8a8da0', legend: '#b0b2c4', tooltipBg: '#141519', tooltipBd: '#303140', tooltipTitle: '#eef0f6', tooltipBody: '#bfc1d0', grid: 'rgba(65,67,85,0.4)' },
+  light: { tick: '#5a5d70', legend: '#4a4d5e', tooltipBg: '#ffffff', tooltipBd: '#d0d3dc', tooltipTitle: '#1a1c24', tooltipBody: '#4a4d5e', grid: 'rgba(0,0,0,0.10)' }
+};
+let _theme = localStorage.getItem('atom-dash-theme') || 'dark';
+let C_TICK = THEME_COLORS[_theme].tick;
+let C_LEGEND = THEME_COLORS[_theme].legend;
+let C_TOOLTIP_BG = THEME_COLORS[_theme].tooltipBg;
+let C_TOOLTIP_BD = THEME_COLORS[_theme].tooltipBd;
+let C_TOOLTIP_TITLE = THEME_COLORS[_theme].tooltipTitle;
+let C_TOOLTIP_BODY = THEME_COLORS[_theme].tooltipBody;
+let C_GRID = THEME_COLORS[_theme].grid;
 
+// Apply saved theme on load
+if (_theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
+
+function applyTheme(theme) {
+  _theme = theme;
+  localStorage.setItem('atom-dash-theme', theme);
+  if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  else document.documentElement.removeAttribute('data-theme');
+  const tc = THEME_COLORS[theme];
+  C_TICK = tc.tick; C_LEGEND = tc.legend; C_TOOLTIP_BG = tc.tooltipBg;
+  C_TOOLTIP_BD = tc.tooltipBd; C_TOOLTIP_TITLE = tc.tooltipTitle; C_TOOLTIP_BODY = tc.tooltipBody;
+  C_GRID = tc.grid;
+  Chart.defaults.color = C_TICK;
+  // Re-render dashboard
+  if (typeof renderAll === 'function') renderAll();
+}
+document.addEventListener('click', function(e) {
+  if (e.target.id === 'theme-toggle') {
+    applyTheme(_theme === 'dark' ? 'light' : 'dark');
+  }
+});
 // Register datalabels globally but disable by default
 if (typeof ChartDataLabels !== 'undefined') Chart.register(ChartDataLabels);
 Chart.defaults.plugins.datalabels = { display: false };
@@ -422,6 +504,25 @@ const REGRESSION_CRITICAL = 0.10;  // 10% → critical
    ================================================================ */
 const rawData = window.BENCHMARK_DATA;
 
+// Normalize legacy model names using HF-path->display mapping from models_map.js
+const _displayMap = window.MODELS_DISPLAY_MAP || {};
+const _displayEntries = Object.entries(_displayMap).sort((a, b) => b[0].length - a[0].length);
+// Accuracy model name renames: unify legacy "MTP3" suffix to "MTP"
+// TODO: Remove after old "MTP3" data ages out of dashboard history (~90 runs)
+const _accuracyRenames = {
+  'Qwen3.5-397B-A17B-FP8 MTP3': 'Qwen3.5-397B-A17B-FP8 MTP',
+  'DeepSeek-R1-0528 MTP3': 'DeepSeek-R1-0528 MTP',
+  'DeepSeek-R1-0528-MXFP4 MTP3': 'DeepSeek-R1-0528-MXFP4 MTP',
+};
+function normalizeModelName(name, accRename = false) {
+  if (accRename && _accuracyRenames[name]) return _accuracyRenames[name];
+  const lc = name.toLowerCase();
+  for (const [key, display] of _displayEntries) {
+    if (lc === key) return display;
+  }
+  return name;
+}
+
 function parseBenchName(name) {
   let backend = 'ATOM';
   let rawName = name;
@@ -433,11 +534,17 @@ function parseBenchName(name) {
   if (backend === 'OOT') backend = 'ATOM-vLLM';
   // Accuracy entries: "ModelName accuracy (GSM8K)" — (.+?) for multi-word model names
   let m = rawName.match(/^(.+?)\s+accuracy\s+\((\w+)\)$/);
-  if (m) return { backend, model: m[1], metric: 'accuracy', unit: m[2], isAccuracy: true };
-  m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
-  if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
-  m = rawName.match(/^(\S+)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count)$/);
-  if (m) return { backend, model: m[1], islOsl: m[2], conc: +m[3], metric: '_gpu_count', unit: '' };
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'accuracy', unit: m[2], isAccuracy: true };
+  // MTP acceptance: "ModelName MTP acceptance (%)"
+  m = rawName.match(/^(.+?)\s+MTP acceptance\s+\((%)\)$/);
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'MTP acceptance', unit: m[2] };
+  // avg toks/fwd: "ModelName avg toks/fwd (tok/fwd)"
+  m = rawName.match(/^(.+?)\s+avg toks\/fwd\s+\((.+)\)$/);
+  if (m) return { backend, model: normalizeModelName(m[1], true), metric: 'avg toks/fwd', unit: m[2] };
+  m = rawName.match(/^(.+?)\s+(\d+\/\d+)\s+c=(\d+)\s+(.+?)\s*\((.+)\)$/);
+  if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: m[4].trim(), unit: m[5] };
+  m = rawName.match(/^(.+?)\s+(\d+\/\d+)\s+c=(\d+)\s+(_gpu_count|_tp)$/);
+  if (m) return { backend, model: normalizeModelName(m[1]), islOsl: m[2], conc: +m[3], metric: m[4], unit: '' };
   return null;
 }
 
@@ -449,7 +556,7 @@ function parseRunConfigs(run) {
   const configs = {}; // key: "backend|model|isl/osl|conc"
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
-    if (!p || p.isAccuracy || p.islOsl === '0/0') continue;
+    if (!p || p.isAccuracy || !p.islOsl || p.islOsl === '0/0') continue;
     const key = `${p.backend}|${p.model}|${p.islOsl}|${p.conc}`;
     if (!configs[key]) configs[key] = { backend: p.backend, model: p.model, islOsl: p.islOsl, conc: p.conc, commit: run.commit, date: run.date, runUrl: '' };
     configs[key][p.metric] = b.value;
@@ -458,23 +565,78 @@ function parseRunConfigs(run) {
       const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/);
       if (rm) configs[key].runUrl = rm[1];
       const gm = b.extra.match(/GPU:\s*([^|]+)/);
-      if (gm) configs[key]._gpu_name = gm[1].trim();
+      if (gm) configs[key]._gpu_name = gm[1].trim().replace(/\bAMD\b/gi, '').replace(/\bInstinct\b/gi, '').replace(/\s+/g, ' ').trim();
       const vm = b.extra.match(/VRAM:\s*(\d+)GB/);
       if (vm) configs[key]._gpu_vram_gb = +vm[1];
       const rcm = b.extra.match(/ROCm:\s*([\d.]+)/);
       if (rcm) configs[key]._rocm_version = rcm[1];
+      const dm = b.extra.match(/Docker:\s*([^|]+)/);
+      if (dm) configs[key]._oot_image_tag = dm[1].trim();
     }
   }
   return configs;
 }
 
-// All parsed configs from all runs, keyed by configKey, each holding array of values over time
+// All parsed configs from all runs, keyed by configKey, each holding array of values over time.
+// When multiple runs share the same commit, keep only the newest run per (configKey, commit)
+// so that all consumers (table, trend chart, tooltip, detail panel) see consistent data.
+function localDay(ts) { const d = new Date(ts); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+
 const historyMap = {}; // key -> [{date, commit, throughput, ...}, ...]
+const _seenDayCommit = {}; // key -> { "day|cid7": { cfg, benchCount } }
+const _benchCounts = new WeakMap(); // cfg -> run.benches.length (avoids polluting cfg objects)
+// Use 7-char prefix for dedup: data.js may store the same commit as abbreviated
+// (e.g. "450f14b7") or full hash — both must be treated as the same commit.
 for (const run of allRuns) {
   const configs = parseRunConfigs(run);
   for (const [key, cfg] of Object.entries(configs)) {
-    if (!historyMap[key]) historyMap[key] = [];
+    if (!historyMap[key]) { historyMap[key] = []; _seenDayCommit[key] = {}; }
+    const cid7 = cfg.commit.id.slice(0, 7);
+    // Dedup by day+commit — keep the entry from the run with most benches
+    const day = localDay(cfg.date);
+    const dedupKey = day + '|' + cid7;
+    const prev = _seenDayCommit[key][dedupKey];
+    if (prev) {
+      // Replace if this run is from a larger batch (more complete nightly)
+      const prevIdx = historyMap[key].indexOf(prev.cfg);
+      if (prevIdx >= 0 && run.benches.length > prev.benchCount) {
+        _benchCounts.set(cfg, run.benches.length);
+        historyMap[key][prevIdx] = cfg;
+        _seenDayCommit[key][dedupKey] = { cfg, benchCount: run.benches.length };
+      }
+      continue;
+    }
+    _benchCounts.set(cfg, run.benches.length);
+    _seenDayCommit[key][dedupKey] = { cfg, benchCount: run.benches.length };
     historyMap[key].push(cfg);
+  }
+}
+
+// Unify metadata across configKeys that share the same commit.
+// Different benchmark runs for the same commit may have different Docker tags,
+// dates, and run URLs; pick the newest run's metadata so all configKeys are consistent.
+// Note: _gpu_count/_tp are NOT unified — they are real per-config values tied to throughput data.
+// Key by (backend, cid7): different backends (ATOM, ATOM-vLLM, ATOM-sglang)
+// legitimately use different Docker images on the same commit.
+const _commitMeta = {}; // "backend|cid7" -> metadata from newest run
+for (const history of Object.values(historyMap)) {
+  for (const cfg of history) {
+    const mk = cfg.backend + '|' + cfg.commit.id.slice(0, 7);
+    if (!_commitMeta[mk] || cfg.date > _commitMeta[mk].date) {
+      _commitMeta[mk] = { date: cfg.date, runUrl: cfg.runUrl, _oot_image_tag: cfg._oot_image_tag, _gpu_name: cfg._gpu_name, _gpu_vram_gb: cfg._gpu_vram_gb, _rocm_version: cfg._rocm_version };
+    }
+  }
+}
+for (const history of Object.values(historyMap)) {
+  for (const cfg of history) {
+    const meta = _commitMeta[cfg.backend + '|' + cfg.commit.id.slice(0, 7)];
+    if (!meta) continue;
+    // Don't overwrite cfg.date — each nightly run's date must stay distinct for trends
+    if (meta.runUrl) cfg.runUrl = meta.runUrl;
+    if (meta._oot_image_tag) cfg._oot_image_tag = meta._oot_image_tag;
+    if (meta._gpu_name) cfg._gpu_name = meta._gpu_name;
+    if (meta._gpu_vram_gb) cfg._gpu_vram_gb = meta._gpu_vram_gb;
+    if (meta._rocm_version) cfg._rocm_version = meta._rocm_version;
   }
 }
 
@@ -493,9 +655,12 @@ function detectRegressions() {
     const history = historyMap[key];
     if (!history || history.length < 2) continue;
     const prev = history[1]; // second entry is previous (sorted desc)
-    if (!prev || !prev.throughput || !cfg.throughput) continue;
-    const tputChange = (cfg.throughput - prev.throughput) / prev.throughput;
+    if (!prev || !prev['Total Tput'] || !cfg['Total Tput']) continue;
+    const tputChange = (cfg['Total Tput'] - prev['Total Tput']) / prev['Total Tput'];
     const tpotChange = (prev.TPOT && cfg.TPOT) ? (cfg.TPOT - prev.TPOT) / prev.TPOT : 0;
+    // Skip regression check when throughput improved significantly —
+    // TPOT increase alongside throughput gain is a normal batching tradeoff, not a regression.
+    if (tputChange >= REGRESSION_WARNING) continue;
     const worstDelta = Math.max(-tputChange, tpotChange);
     if (worstDelta >= REGRESSION_WARNING) {
       const severity = worstDelta >= REGRESSION_CRITICAL ? 'critical' : 'warning';
@@ -508,28 +673,44 @@ const regressions = detectRegressions();
 
 /* ---- Accuracy data ---- */
 const accuracyMap = {}; // "backend|model" -> [{date, commit, score, runUrl, threshold}, ...]
+const mtpAcceptanceMap = {}; // "backend|model" -> [{date, commit, rate, avgToks, runUrl}, ...]
 for (const run of allRuns) {
   for (const b of run.benches) {
     const p = parseBenchName(b.name);
-    if (!p || !p.isAccuracy) continue;
+    if (!p) continue;
+    // MTP acceptance entries from perf benchmark
+    if (p.metric === 'MTP acceptance') {
+      const mkey = `${p.backend}|${p.model}`;
+      if (!mtpAcceptanceMap[mkey]) mtpAcceptanceMap[mkey] = [];
+      const mEntry = { date: run.date, commit: run.commit, rate: b.value, runUrl: '' };
+      if (b.extra) { const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/); if (rm) mEntry.runUrl = rm[1]; }
+      mtpAcceptanceMap[mkey].push(mEntry);
+      continue;
+    }
+    if (p.metric === 'avg toks/fwd') {
+      const mkey = `${p.backend}|${p.model}`;
+      const arr = mtpAcceptanceMap[mkey];
+      if (arr && arr.length > 0) { const last = arr[arr.length - 1]; if (last.date === run.date) last.avgToks = b.value; }
+      continue;
+    }
+    if (!p.isAccuracy) continue;
     const key = `${p.backend}|${p.model}`;
     if (!accuracyMap[key]) accuracyMap[key] = [];
     const entry = { date: run.date, commit: run.commit, score: b.value, runUrl: '' };
     if (b.extra) {
-      const rm = b.extra.match(/Run:\s*(https:\/\/\S+)/);
-      if (rm) entry.runUrl = rm[1];
-      const tm = b.extra.match(/Threshold:\s*([\d.]+)/);
-      if (tm) entry.threshold = +tm[1];
-      const sm = b.extra.match(/strict-match:\s*([\d.]+)/);
-      if (sm) entry.strictMatch = +sm[1];
-      const fm = b.extra.match(/fewshot:\s*(\d+)/);
-      if (fm) entry.fewshot = +fm[1];
-      const bl = b.extra.match(/Baseline:\s*([\d.]+)/);
-      if (bl) entry.baseline = +bl[1];
-      const bm = b.extra.match(/BaselineModel:\s*(\S+)/);
-      if (bm) entry.baselineModel = bm[1];
-      const bn = b.extra.match(/BaselineNote:\s*([^|]+)/);
-      if (bn) entry.baselineNote = bn[1].trim();
+      const meta = parseAccuracyExtra(b.extra);
+      if (meta.runUrl) entry.runUrl = meta.runUrl;
+      if (meta.dockerImage) entry.dockerImage = meta.dockerImage;
+      if (meta.gpuName) entry._gpu_name = meta.gpuName;
+      if (meta.gpuVramGb != null) entry._gpu_vram_gb = meta.gpuVramGb;
+      if (meta.rocmVersion) entry._rocm_version = meta.rocmVersion;
+      if (meta.threshold != null) entry.threshold = meta.threshold;
+      if (meta.strictMatch != null) entry.strictMatch = meta.strictMatch;
+      if (meta.fewshot != null) entry.fewshot = meta.fewshot;
+      if (meta.baseline != null) entry.baseline = meta.baseline;
+      if (meta.baselineModel) entry.baselineModel = meta.baselineModel;
+      if (meta.baselineNote) entry.baselineNote = meta.baselineNote;
+      if (meta.modelId) entry.modelId = meta.modelId;
     }
     accuracyMap[key].push(entry);
   }
@@ -538,6 +719,7 @@ for (const run of allRuns) {
 for (const history of Object.values(accuracyMap)) {
   history.sort((a, b) => b.date - a.date);
 }
+for (const h of Object.values(mtpAcceptanceMap)) h.sort((a, b) => b.date - a.date);
 const latestAccuracy = {};
 for (const [key, history] of Object.entries(accuracyMap)) {
   if (!history.length) continue;
@@ -566,6 +748,38 @@ const hasAccuracyData = Object.keys(accuracyMap).length > 0;
 // HTML escape & safe URL helpers
 function escHTML(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function safeHref(url) { return typeof url === 'string' && url.startsWith('https://') ? url : null; }
+function parseMaybeNumber(value) {
+  if (value == null || value === '') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+function parseAccuracyExtra(extra) {
+  const parsed = {};
+  if (typeof extra !== 'string' || !extra) return parsed;
+  for (const part of extra.split(' | ')) {
+    if (part.startsWith('Run: ')) parsed.runUrl = part.slice(5).trim();
+    else if (part.startsWith('Threshold: ')) parsed.threshold = parseMaybeNumber(part.slice(11).trim());
+    else if (part.startsWith('Baseline: ')) parsed.baseline = parseMaybeNumber(part.slice(10).trim());
+    else if (part.startsWith('BaselineModel: ')) parsed.baselineModel = part.slice(15).trim();
+    else if (part.startsWith('BaselineNote: ')) parsed.baselineNote = part.slice(14).trim();
+    else if (part.startsWith('Docker: ')) parsed.dockerImage = part.slice(8).trim();
+    else if (part.startsWith('GPU: ')) parsed.gpuName = part.slice(5).trim();
+    else if (part.startsWith('VRAM: ')) parsed.gpuVramGb = parseMaybeNumber(part.slice(6).trim().replace(/GB$/i, ''));
+    else if (part.startsWith('ROCm: ')) parsed.rocmVersion = part.slice(6).trim();
+    else if (part.startsWith('strict-match: ')) parsed.strictMatch = parseMaybeNumber(part.slice(14).trim());
+    else if (part.startsWith('fewshot: ')) parsed.fewshot = parseMaybeNumber(part.slice(9).trim());
+    else if (part.startsWith('Model: ')) parsed.modelId = part.slice(7).trim();
+  }
+  return parsed;
+}
+function buildAccuracyPreviewRows(preview) {
+  const scoreText = Number.isFinite(preview?.score) ? preview.score.toFixed(4) : '—';
+  return [
+    { label: 'Model', value: preview?.model || '—' },
+    { label: 'Date', value: preview?.dateText || '—' },
+    { label: 'Accuracy', value: scoreText },
+  ];
+}
 
 // Extract unique filter values from ALL runs (not just latest) so historical models are always visible
 const _lc = (a, b) => { const la = a.toLowerCase(), lb = b.toLowerCase(); return la < lb ? -1 : la > lb ? 1 : 0; };
@@ -613,12 +827,38 @@ function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+
 
 // Model family grouping: "DeepSeek-R1-0528-mtp3" → family "DeepSeek-R1-0528", variant "mtp3"
 function modelFamily(name) {
-  const m = name.match(/^([A-Za-z][\w]*(?:-[A-Za-z0-9]+){1,3}?)(?:[-_](?:mtp|MTP|moe|MoE|MXFP|mxfp).*)?$/);
-  return m ? m[1] : name;
+  // Strip space-separated quant/MTP suffixes (e.g. "DeepSeek-R1-0528 MXFP4 MTP3" -> "DeepSeek-R1-0528")
+  const base = name.replace(/(\s+(?:MTP|MXFP|FP)\d*)+$/i, '');
+  const m = base.match(/^([A-Za-z][\w.]*(?:-[A-Za-z0-9.]+){1,6}?)(?:[-_](?:mtp|MTP|moe|MoE|MXFP|mxfp|FP|fp)\d*.*)?$/);
+  return m ? m[1] : base;
 }
 function modelVariant(name) {
   const fam = modelFamily(name);
-  return name === fam ? 'base' : name.slice(fam.length).replace(/^[-_]+/, '');
+  return name === fam ? 'base' : name.slice(fam.length).replace(/^[-_\s]+/, '');
+}
+const MERGED_KIMI_TRADEOFF_FAMILY = 'Kimi-K2&K2.5-MXFP4';
+function tradeoffFamilyInfo(name) {
+  if (name === 'Kimi-K2.5-MXFP4') {
+    return { family: MERGED_KIMI_TRADEOFF_FAMILY, label: MERGED_KIMI_TRADEOFF_FAMILY, variant: 'K2.5' };
+  }
+  if (name.startsWith('Kimi-K2-Thinking-MXFP4')) {
+    const tpMatch = name.match(/-tp(\d+)$/i);
+    return {
+      family: MERGED_KIMI_TRADEOFF_FAMILY,
+      label: MERGED_KIMI_TRADEOFF_FAMILY,
+      variant: tpMatch ? `K2 TP${tpMatch[1]}` : 'K2',
+    };
+  }
+  const family = modelFamily(name);
+  return {
+    family,
+    label: family,
+    variant: modelVariant(name),
+  };
+}
+function tradeoffFamilyLabel(family, models) {
+  if (family === MERGED_KIMI_TRADEOFF_FAMILY) return MERGED_KIMI_TRADEOFF_FAMILY;
+  return models.size > 1 ? family + ' family' : family;
 }
 
 function fmtNum(v, dec) { return v != null ? v.toLocaleString(undefined, { minimumFractionDigits: dec, maximumFractionDigits: dec }) : '—'; }
@@ -648,11 +888,33 @@ function trendHTML(current, previous, inverse) {
   return `<span class="${cls}">${arrow} ${abs}%</span>`;
 }
 
-// Heat color: ratio 0 (best) → 1 (worst)
+// Non-regression trend: positive ≥5% gets green, negative stays muted
+function neutralTrendHTML(current, previous) {
+  if (previous == null || current == null) return '<span class="trend-neutral">—</span>';
+  const pct = ((current - previous) / previous * 100);
+  const abs = Math.abs(pct).toFixed(1);
+  if (Math.abs(pct) < 1) return `<span class="trend-neutral">${pct >= 0 ? '+' : ''}${abs}%</span>`;
+  const arrow = pct > 0 ? '▲' : '▼';
+  if (pct >= 5) return `<span class="trend-up">${arrow} ${abs}%</span>`;
+  return `<span class="trend-neutral">${arrow} ${abs}%</span>`;
+}
+
+// Regression-aware trend: color matches severity (orange for warning, red for critical)
+function regTrendHTML(current, previous, severity) {
+  if (previous == null || current == null) return '<span class="trend-neutral">—</span>';
+  const pct = ((current - previous) / previous * 100);
+  const abs = Math.abs(pct).toFixed(1);
+  const arrow = pct > 0 ? '▲' : '▼';
+  const color = severity === 'critical' ? 'var(--accent-red)' : 'var(--accent-orange)';
+  return `<span style="color:${color}">${arrow} ${abs}%</span>`;
+}
+
+// Heat color: ratio 0 (best) → 1 (worst), 3-color gradient: green → yellow → red
 function heatBg(ratio) {
   const r = Math.min(1, Math.max(0, ratio));
-  if (r < 0.5) return `rgba(63,185,80,${0.12 + r * 0.16})`;
-  return `rgba(248,81,73,${(r - 0.5) * 0.24 + 0.04})`;
+  if (r < 0.33) return `rgba(86, 212, 114, ${(0.08 + r * 0.2).toFixed(2)})`;
+  if (r < 0.67) return `rgba(221, 176, 64, ${(0.08 + (r - 0.33) * 0.2).toFixed(2)})`;
+  return `rgba(242, 92, 78, ${(0.08 + (r - 0.67) * 0.3).toFixed(2)})`;
 }
 
 function destroyChartsIn(container) {
@@ -673,7 +935,7 @@ function syncHeaderH() {
 function bindFixedThead(container) {
   const table = container.querySelector('.perf-table');
   _ftTable = table;
-  _ftWrapper = table ? table.closest('.table-watermark') : null;
+  _ftWrapper = table ? table.closest('.table-watermark-scroll') : null;
   if (!table) { _ftHead.style.display = 'none'; return; }
 
   // Clone table structure with only thead for pixel-perfect alignment
@@ -728,7 +990,7 @@ window.addEventListener('resize', () => {
 }, { passive: true });
 
 function chartGridOpts() {
-  return { color: 'rgba(65,67,85,0.4)', drawBorder: false };
+  return { color: C_GRID, drawBorder: false };
 }
 
 // Reference line plugin — draws a dashed horizontal line with label
@@ -760,6 +1022,45 @@ function avgLinePlugin(avgValue, label, color) {
 }
 function chartTooltipOpts() {
   return { backgroundColor: C_TOOLTIP_BG, borderColor: C_TOOLTIP_BD, borderWidth: 1, titleColor: C_TOOLTIP_TITLE, bodyColor: C_TOOLTIP_BODY, cornerRadius: 6, padding: 12 };
+}
+const _accuracyHoverTooltip = document.getElementById('accuracy-hover-tooltip');
+function renderAccuracyHover(preview) {
+  if (!_accuracyHoverTooltip) return;
+  const rows = buildAccuracyPreviewRows(preview);
+  _accuracyHoverTooltip.innerHTML = rows.map(r => `<div class="hover-row"><span class="hover-key">${escHTML(r.label)}</span><span class="hover-val ${r.label === 'Accuracy' ? 'num' : ''}">${escHTML(String(r.value))}</span></div>`).join('');
+}
+function positionAccuracyHoverTooltip(anchor) {
+  if (!_accuracyHoverTooltip) return;
+  const pad = 12;
+  const rect = _accuracyHoverTooltip.getBoundingClientRect();
+  let x = pad;
+  let y = pad;
+  if (anchor && typeof anchor.clientX === 'number' && typeof anchor.clientY === 'number') {
+    x = anchor.clientX;
+    y = anchor.clientY;
+  } else if (anchor && anchor.getBoundingClientRect) {
+    const targetRect = anchor.getBoundingClientRect();
+    x = targetRect.left + targetRect.width / 2;
+    y = targetRect.bottom;
+  }
+  let left = x + 14;
+  let top = y + 14;
+  if (left + rect.width + pad > window.innerWidth) left = x - rect.width - 14;
+  if (top + rect.height + pad > window.innerHeight) top = y - rect.height - 14;
+  _accuracyHoverTooltip.style.left = Math.max(pad, left) + 'px';
+  _accuracyHoverTooltip.style.top = Math.max(pad, top) + 'px';
+}
+function showAccuracyHover(anchor, preview) {
+  if (!_accuracyHoverTooltip) return;
+  renderAccuracyHover(preview);
+  _accuracyHoverTooltip.classList.add('open');
+  _accuracyHoverTooltip.setAttribute('aria-hidden', 'false');
+  positionAccuracyHoverTooltip(anchor);
+}
+function hideAccuracyHover() {
+  if (!_accuracyHoverTooltip) return;
+  _accuracyHoverTooltip.classList.remove('open');
+  _accuracyHoverTooltip.setAttribute('aria-hidden', 'true');
 }
 
 /* ================================================================
@@ -826,6 +1127,19 @@ function renderFilters() {
       </div>`;
     bar.appendChild(group);
   }
+  // Filter summary
+  const allSelected = filterDefs.every(d => getFilterState(d.id).length === d.options.length);
+  const summaryEl = document.createElement('span');
+  summaryEl.style.cssText = 'font-size:11px;color:var(--text-tertiary);margin-left:4px';
+  if (allSelected) {
+    summaryEl.textContent = 'Showing all';
+  } else {
+    const fc = filteredConfigs();
+    const count = Object.keys(fc).length;
+    summaryEl.textContent = `${count} configs`;
+  }
+  bar.appendChild(summaryEl);
+
   // Reset button
   const resetBtn = document.createElement('button');
   resetBtn.className = 'filter-reset';
@@ -928,7 +1242,7 @@ function renderKPICards() {
 
   const models = new Set(entries.map(([, c]) => c.model));
   const backends = new Set(entries.map(([, c]) => c.backend));
-  const gpuCounts = [...new Set(entries.map(([, c]) => c._gpu_count).filter(Boolean))].sort((a, b) => a - b);
+  const gpuCounts = [...new Set(entries.map(([, c]) => c._gpu_count || c._tp).filter(Boolean))].sort((a, b) => a - b);
   const gpuLabel = gpuCounts.length === 1 ? gpuCounts[0] + '× GPU' : gpuCounts.length > 1 ? gpuCounts[0] + '-' + gpuCounts[gpuCounts.length - 1] + '× GPU' : '';
 
   // GPU platform info from latest configs
@@ -970,44 +1284,57 @@ function renderKPICards() {
     regSub = `${warningCount} warning`;
   }
 
-  // Accuracy KPI (not filtered by model/backend — accuracy models may differ from perf models)
-  const accEntries = Object.entries(latestAccuracy);
-  const passCount = accEntries.filter(([, a]) => a.threshold && a.score >= a.threshold).length;
-  const failCount = accEntries.filter(([, a]) => a.threshold && a.score < a.threshold).length;
-  const accRegCount = Object.keys(accuracyRegressions).length;
-  const accCardClass = failCount > 0 ? 'alert clickable' : accRegCount > 0 ? 'alert-warning clickable' : (accEntries.length > 0 ? 'ok clickable' : 'clickable');
+  // Accuracy KPI — health-based status (not regression-based); respect backend/model filters
+  const accEntries = filteredAccuracyEntries();
+  const failCount = accEntries.filter(([, a]) => a.threshold && (a.score < 0.1 || a.score < a.threshold)).length;
+  const atRiskCount = accEntries.filter(([, a]) => a.threshold && a.score >= 0.1 && a.score >= a.threshold && (a.score - a.threshold) < 0.005).length;
+  const healthyCount = accEntries.filter(([, a]) => a.threshold && a.score >= 0.1 && a.score >= a.threshold && (a.score - a.threshold) >= 0.005).length;
+  const accCardClass = failCount > 0 ? 'alert clickable' : atRiskCount > 0 ? 'alert-warning clickable' : (accEntries.length > 0 ? 'ok clickable' : 'clickable');
   const accSub = accEntries.length === 0 ? 'No accuracy data'
-    : failCount > 0 ? `${failCount} failed` + (accRegCount > 0 ? ` · ${accRegCount} regression` : '')
-    : accRegCount > 0 ? `All passing · ${accRegCount} regression`
-    : 'All passing · stable';
+    : failCount > 0 ? `${failCount} failed` + (atRiskCount > 0 ? ` · ${atRiskCount} at risk` : '')
+    : atRiskCount > 0 ? `${healthyCount} healthy · ${atRiskCount} at risk`
+    : 'All healthy';
+
+  // Find worst regression model name for story annotation
+  let worstRegModel = '';
+  if (criticalCount > 0) {
+    const worstKey = filteredRegKeys.find(k => regressions[k].severity === 'critical');
+    if (worstKey) worstRegModel = latestConfigs[worstKey]?.model || '';
+  } else if (warningCount > 0) {
+    worstRegModel = latestConfigs[filteredRegKeys[0]]?.model || '';
+  }
 
   row.innerHTML = `
-    <div class="kpi-card">
-      <div class="kpi-label">Peak Total Throughput</div>
-      <div class="kpi-value">${peakTput != null ? fmtCompact(peakTput, 0) : '—'} <span class="kpi-unit">tok/s</span></div>
-      <div class="kpi-trend">${trendHTML(peakTput, peakTputPrev, false)}</div>
-      <div class="kpi-sub">${peakTputCfg ? peakTputCfg.model + ' ' + fmtIslOsl(peakTputCfg.islOsl) + ' c=' + peakTputCfg.conc : ''}</div>
+    <div class="kpi-group">
+      <div class="kpi-card">
+        <div class="kpi-label">Peak Total Throughput</div>
+        <div class="kpi-value">${peakTput != null ? fmtCompact(peakTput, 0) : '—'} <span class="kpi-unit">tok/s</span></div>
+        <div class="kpi-trend">${trendHTML(peakTput, peakTputPrev, false)}</div>
+        <div class="kpi-sub">${peakTputCfg ? peakTputCfg.model + ' ' + fmtIslOsl(peakTputCfg.islOsl) + ' c=' + peakTputCfg.conc : ''}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Best TPOT (Lowest)</div>
+        <div class="kpi-value">${bestTpot != null ? fmtNum(bestTpot, 2) : '—'} <span class="kpi-unit">ms</span></div>
+        <div class="kpi-trend">${trendHTML(bestTpot, bestTpotPrev, true)}</div>
+        <div class="kpi-sub">${bestTpotCfg ? bestTpotCfg.model + ' ' + fmtIslOsl(bestTpotCfg.islOsl) + ' c=' + bestTpotCfg.conc : ''}</div>
+      </div>
     </div>
-    <div class="kpi-card">
-      <div class="kpi-label">Best TPOT (Lowest)</div>
-      <div class="kpi-value">${bestTpot != null ? fmtNum(bestTpot, 2) : '—'} <span class="kpi-unit">ms</span></div>
-      <div class="kpi-trend">${trendHTML(bestTpot, bestTpotPrev, true)}</div>
-      <div class="kpi-sub">${bestTpotCfg ? bestTpotCfg.model + ' ' + fmtIslOsl(bestTpotCfg.islOsl) + ' c=' + bestTpotCfg.conc : ''}</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-label">Test Matrix</div>
-      <div class="kpi-value">${models.size} <span class="kpi-unit">models</span></div>
-      <div class="kpi-sub">${gpuParts.join(' · ')}</div>
-    </div>
-    <div class="kpi-card ${regCardClass}" id="kpi-reg" ${regCount > 0 ? 'title="Click to view regressions"' : ''}>
-      <div class="kpi-label">Regressions</div>
-      <div class="kpi-value">${regCount > 0 ? regCount : '0'} <span class="kpi-unit">${regCount > 0 ? '⚠' : '✓'}</span></div>
-      <div class="kpi-sub">${regSub}</div>
-    </div>
-    <div class="kpi-card ${accCardClass}" id="kpi-acc" title="Click to view accuracy">
-      <div class="kpi-label">Accuracy</div>
-      <div class="kpi-value">${accEntries.length > 0 ? passCount + '/' + accEntries.length : '—'} <span class="kpi-unit">${failCount > 0 ? '⚠' : accEntries.length > 0 ? '✓' : ''}</span></div>
-      <div class="kpi-sub">${accSub}</div>
+    <div class="kpi-group">
+      <div class="kpi-card">
+        <div class="kpi-label">Test Matrix</div>
+        <div class="kpi-value">${models.size} <span class="kpi-unit">models</span></div>
+        <div class="kpi-sub">${gpuParts.join(' · ')}</div>
+      </div>
+      <div class="kpi-card ${regCardClass}" id="kpi-reg" ${regCount > 0 ? 'title="Click to view regressions"' : ''}>
+        <div class="kpi-label">Regressions</div>
+        <div class="kpi-value">${regCount > 0 ? regCount : '0'} <span class="kpi-unit">${regCount > 0 ? '⚠' : '✓'}</span></div>
+        <div class="kpi-sub">${regSub}${worstRegModel ? ' · ' + worstRegModel : ''}</div>
+      </div>
+      <div class="kpi-card ${accCardClass}" id="kpi-acc" title="Click to view accuracy">
+        <div class="kpi-label">Accuracy</div>
+        <div class="kpi-value">${accEntries.length > 0 ? healthyCount + '/' + accEntries.length : '—'} <span class="kpi-unit">${failCount > 0 ? '⚠' : accEntries.length > 0 ? '✓' : ''}</span></div>
+        <div class="kpi-sub">${accSub}</div>
+      </div>
     </div>`;
 
   // Regression card click → switch to Performance tab, scroll to first regression, flash highlight
@@ -1043,6 +1370,28 @@ function renderKPICards() {
         syncToHash();
       }
     });
+  }
+
+  // Tab badges — show count + tooltip
+  const perfBadge = document.getElementById('tab-badge-perf');
+  if (perfBadge) {
+    if (regCount > 0) {
+      perfBadge.className = 'tab-badge ' + (criticalCount > 0 ? 'alert' : 'warn');
+      perfBadge.textContent = regCount;
+      perfBadge.title = regSub;
+    } else {
+      perfBadge.className = 'tab-badge hidden';
+    }
+  }
+  const accBadge = document.getElementById('tab-badge-acc');
+  if (accBadge) {
+    if (failCount > 0) {
+      accBadge.className = 'tab-badge alert';
+      accBadge.textContent = failCount;
+      accBadge.title = failCount + ' model(s) below threshold';
+    } else {
+      accBadge.className = 'tab-badge hidden';
+    }
   }
 }
 
@@ -1089,7 +1438,7 @@ function renderPerformanceTab() {
   });
 
   if (entries.length === 0) {
-    container.innerHTML = '<div class="chart-empty">No data matches the current filters.</div>';
+    container.innerHTML = '<div class="chart-empty">No data matches the current filters.<br><span style="font-size:12px;color:var(--text-tertiary)">Try adjusting filters above or click Reset to show all data.</span></div>';
     return;
   }
 
@@ -1112,8 +1461,8 @@ function renderPerformanceTab() {
     byModel[groupKey].push([key, cfg]);
   }
 
-  let html = `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:var(--gap-md)">
-    <h3 style="margin:0;font-size:13px;color:var(--text-tertiary)">${pm.label} — Model Comparison</h3>
+  let html = `<div class="section-container"><div class="section-header">
+    <span class="section-title">${pm.label} — Model Comparison</span>
     <div class="model-selector" style="margin:0">${metricBtns}</div>
   </div><div class="chart-grid">`;
 
@@ -1127,7 +1476,7 @@ function renderPerformanceTab() {
     const mLabels = sortedEntries.map(([, c]) => `${fmtIslOsl(c.islOsl)} c=${c.conc}`);
     const mValues = sortedEntries.map(([, c]) => c[pm.key] || 0);
     const mBgColors = sortedEntries.map(([, c]) => getBarColor(backend, model, c.conc, concList));
-    const mBdColors = sortedEntries.map(([k]) => regressions[k] ? 'rgba(240,85,69,0.8)' : color.border);
+    const mBdColors = sortedEntries.map(([k]) => regressions[k] ? 'rgba(242,92,78,0.8)' : color.border);
     const mBdWidths = sortedEntries.map(([k]) => regressions[k] ? 2.5 : 1.5);
     const avgVal = mValues.length ? mValues.reduce((a, b) => a + b, 0) / mValues.length : null;
 
@@ -1139,12 +1488,13 @@ function renderPerformanceTab() {
     byModel[groupKey]._chartData = { id: `perf-bar-${chartIdx}`, labels: mLabels, values: mValues, bgColors: mBgColors, bdColors: mBdColors, bdWidths: mBdWidths, avgVal, sortedEntries };
     chartIdx++;
   }
-  html += '</div>';
+  html += '</div></div>';
 
   // --- Table ---
-  html += `<div class="table-watermark"><table class="perf-table"><thead><tr>
-    <th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th><th>GPU</th>
-    <th class="num">Total Tput (tok/s)</th><th class="num">Output Tput (tok/s)</th>
+  html += `<div class="section-container"><div class="section-header"><span class="section-title">Detail Table</span></div>
+  <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
+    <th>Backend</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th><th>GPU</th>
+    <th class="num">Total tok/s</th><th class="num">Output tok/s</th>
     <th class="num">Interac.</th>
     <th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th>
     <th class="num">Trend</th><th>Commit</th><th>Run</th>
@@ -1172,25 +1522,25 @@ function renderPerformanceTab() {
     const dataAge = Date.now() - cfg.date;
     const staleClass = dataAge > 3 * 86400000 ? ' stale-data' : '';
     html += `<tr class="${regClass}${staleClass}" data-key="${key}">
-      <td>${escHTML(cfg.backend)}</td>
+      <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td>
       <td class="model-name" style="color:${modelTextColor}">${reg ? '⚠ ' : ''}${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
-      <td class="num">${cfg._gpu_count || '—'}</td>
+      <td class="num">${cfg._tp || cfg._gpu_count || 1}</td>
       <td style="white-space:nowrap;font-size:11px">${cfg._gpu_name ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_name : '—'}</td>
-      <td class="num data-bar"><div class="data-bar-fill" style="width:${totalTputPct}%;background:rgba(63,185,80,0.12)"></div><span class="data-bar-text">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</span></td>
+      <td class="num data-bar"><div class="data-bar-fill" style="width:${totalTputPct}%;background:rgba(109,191,128,0.12)"></div><span class="data-bar-text">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</span></td>
       <td class="num data-bar"><div class="data-bar-fill" style="width:${outTputPct}%;background:rgba(126,143,174,0.10)"></div><span class="data-bar-text">${fmtNum(cfg.throughput, 1)}</span></td>
       <td class="num">${cfg.TPOT != null && cfg.TPOT > 0 ? fmtNum(1000 / cfg.TPOT, 1) : '—'}</td>
       <td class="num" style="background:${heatBg(tpotRatio)}">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
       <td class="num" style="background:${heatBg(ttftRatio)}">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
-      <td class="num">${trendHTML(cfg.throughput, prev ? prev.throughput : null, false)} <button class="trend-jump" data-trend-key="${cfg.backend}|${cfg.model}" title="View trends">trend →</button></td>
+      <td class="num" style="white-space:nowrap">${reg ? regTrendHTML(cfg['Total Tput'], prev ? prev['Total Tput'] : null, reg.severity) : neutralTrendHTML(cfg['Total Tput'], prev ? prev['Total Tput'] : null)} <button class="trend-jump" data-trend-key="${cfg.backend}|${cfg.model}" title="View trends">↗</button></td>
       <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
       <td>${safeHref(cfg.runUrl) ? `<a href="${escHTML(safeHref(cfg.runUrl))}" target="_blank" rel="noopener noreferrer">view</a>` : '—'}</td>
     </tr>`;
     // Detail row
     html += `<tr class="detail-row" data-detail="${key}"><td colspan="14">${buildDetailHTML(key, cfg)}</td></tr>`;
   }
-  html += '</tbody></table></div>';
+  html += '</tbody></table></div></div></div>';
 
   container.innerHTML = html;
 
@@ -1309,7 +1659,7 @@ function renderTradeoffTab() {
   destroyChartsIn(container);
   const fc = filteredConfigs();
   const entries = Object.entries(fc);
-  if (entries.length === 0) { container.innerHTML = '<div class="chart-empty">No data matches the current filters.</div>'; return; }
+  if (entries.length === 0) { container.innerHTML = '<div class="chart-empty">No data matches the current filters.<br><span style="font-size:12px;color:var(--text-tertiary)">Try adjusting filters above or click Reset to show all data.</span></div>'; return; }
 
   // Group by backend+model+ISL/OSL for scatter series
   const seriesMap = {};
@@ -1318,7 +1668,7 @@ function renderTradeoffTab() {
     if (!seriesMap[sKey]) seriesMap[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, points: [], concLabels: [], configKeys: [] };
     const tpot = cfg.TPOT;
     const totalTput = cfg['Total Tput'];
-    const gpuCount = cfg._gpu_count || 8;
+    const gpuCount = cfg._gpu_count || cfg._tp || 1;
     if (tpot && tpot > 0 && totalTput) {
       seriesMap[sKey].points.push({ x: 1000 / tpot, y: totalTput / gpuCount });
       seriesMap[sKey].concLabels.push(cfg.conc);
@@ -1329,23 +1679,25 @@ function renderTradeoffTab() {
   // Group models into families
   const familyMap = {};
   for (const [, cfg] of entries) {
-    const fam = modelFamily(cfg.model);
+    const fam = tradeoffFamilyInfo(cfg.model).family;
     if (!familyMap[fam]) familyMap[fam] = new Set();
     familyMap[fam].add(cfg.model);
   }
   const tradeoffFamilies = Object.keys(familyMap).sort();
 
-  let html = '<div class="chart-grid">';
+  let html = '<div class="section-container"><div class="section-header"><span class="section-title">Tradeoff Charts</span></div><div class="chart-grid">';
   for (let fi = 0; fi < tradeoffFamilies.length; fi++) {
     const fam = tradeoffFamilies[fi];
     const safeId = fi + '-' + fam.replace(/[^a-zA-Z0-9]/g, '');
-    const famLabel = familyMap[fam].size > 1 ? fam + ' family' : fam;
+    const famLabel = tradeoffFamilyLabel(fam, familyMap[fam]);
     html += `<div class="chart-card half"><h3>${famLabel} — Interactive vs Total Throughput</h3><div class="chart-wrap"><canvas id="hero-${safeId}"></canvas></div></div>`;
     html += `<div class="chart-card half"><h3>${famLabel} — Concurrency Scaling</h3><div class="chart-wrap"><canvas id="scaling-${safeId}"></canvas></div></div>`;
   }
-  html += '</div>';
+  html += '</div></div>';
 
   // Heatmap: Concurrency × ISL/OSL, one per model
+  html += '<div class="section-container"><div class="section-header"><span class="section-title">Throughput Matrix</span></div>';
+  let hasHeatmaps = false;
   const heatModels = {};
   for (const [, cfg] of entries) {
     const mk = `${cfg.backend} · ${cfg.model}`;
@@ -1360,6 +1712,7 @@ function renderTradeoffTab() {
     if (rowKeys.length < 1 || heatConcs.length < 2) continue;
     const allVals = rowKeys.flatMap(rk => heatConcs.map(c => hm.data[rk]?.[c]).filter(v => v != null));
     if (allVals.length < 3) continue;
+    hasHeatmaps = true;
     const minV = Math.min(...allVals), maxV = Math.max(...allVals), rangeV = maxV - minV || 1;
     html += `<div class="chart-card"><h3>${mk} — Throughput Heatmap (tok/s)</h3>`;
     html += '<table class="heatmap-table"><thead><tr><th>ISL/OSL</th>';
@@ -1381,6 +1734,8 @@ function renderTradeoffTab() {
     }
     html += '</tbody></table></div>';
   }
+  if (!hasHeatmaps) html += '<div class="chart-empty">Not enough data points for heatmap (need 2+ concurrency levels and 3+ data points).</div>';
+  html += '</div>';
 
   container.innerHTML = html;
 
@@ -1400,8 +1755,9 @@ function renderTradeoffTab() {
       if (!famModels.includes(s.model) || s.points.length === 0) continue;
       const indices = s.points.map((_, i) => i).sort((a, b) => s.points[a].x - s.points[b].x);
       const color = getModelColor(s.backend, s.model);
+      const tradeoffInfo = tradeoffFamilyInfo(s.model);
       heroDS.push({
-        label: `${s.backend} · ${modelVariant(s.model)} ${fmtIslOsl(s.islOsl)}`, data: indices.map(i => s.points[i]),
+        label: `${s.backend} · ${tradeoffInfo.variant} ${fmtIslOsl(s.islOsl)}`, data: indices.map(i => s.points[i]),
         borderColor: color.border, backgroundColor: color.bg,
         borderWidth: 2, pointRadius: 5, pointHoverRadius: 7, showLine: true, fill: false,
         _concLabels: indices.map(i => s.concLabels[i]), _configKeys: indices.map(i => s.configKeys[i])
@@ -1525,7 +1881,7 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
   for (const [key, cfg] of Object.entries(configs)) {
     const sKey = `${cfg.backend}|${cfg.model}|${cfg.islOsl}`;
     if (!byKey[sKey]) byKey[sKey] = { backend: cfg.backend, model: cfg.model, islOsl: cfg.islOsl, tputPoints: [], tpotPoints: [], tputKeys: [], tpotKeys: [] };
-    const gpuCount = cfg._gpu_count || 8;
+    const gpuCount = cfg._gpu_count || cfg._tp || 1;
     if (cfg['Total Tput'] != null) { byKey[sKey].tputPoints.push({ x: cfg.conc, y: cfg['Total Tput'] / gpuCount }); byKey[sKey].tputKeys.push(key); }
     if (cfg.TPOT != null) { byKey[sKey].tpotPoints.push({ x: cfg.conc, y: cfg.TPOT }); byKey[sKey].tpotKeys.push(key); }
   }
@@ -1538,8 +1894,9 @@ function buildConcurrencyScaling(canvasId, configs, familyName, famModels) {
     const s = byKey[seriesKeys[i]];
     const dash = dashPatterns[i % dashPatterns.length];
     const h = getModelHue(s.backend, s.model);
+    const tradeoffInfo = tradeoffFamilyInfo(s.model);
     const variantBits = [s.backend];
-    if (famModels.length > 1) variantBits.push(modelVariant(s.model));
+    if (famModels.length > 1) variantBits.push(tradeoffInfo.variant);
     variantBits.push(fmtIslOsl(s.islOsl));
     const variantLabel = variantBits.join(' ');
     // Throughput: use model color
@@ -1635,10 +1992,10 @@ function renderTrendsTab() {
     .sort((a, b) => _lc(a.split('|')[1], b.split('|')[1]));
   if (!trendOptions.includes(state.trendModelKey)) state.trendModelKey = trendOptions[0] || '';
 
-  let html = '';
+  let html = '<div class="section-container"><div class="section-header"><span class="section-title">Historical Trends</span>';
   // Only show selector when there are multiple mode/model pairs to choose from
   if (trendOptions.length > 1) {
-    html += '<div class="model-selector"><span class="sel-label">Model:</span>';
+    html += '<div class="model-selector" style="margin:0"><span class="sel-label">Model:</span>';
     for (const trendKey of trendOptions) {
       const [backend, model] = trendKey.split('|');
       const _tc = getModelColor(backend, model);
@@ -1647,7 +2004,7 @@ function renderTrendsTab() {
     }
     html += '</div>';
   }
-  html += '<div class="chart-grid" id="trend-charts"></div>';
+  html += '</div><div class="chart-grid" id="trend-charts"></div></div>';
   container.innerHTML = html;
 
   container.querySelectorAll('.sel-btn').forEach(btn => {
@@ -1660,25 +2017,29 @@ function renderTrendsTab() {
   if (!state.trendModelKey) return;
   const [trendBackend, trendModel] = state.trendModelKey.split('|');
 
-  // Build ordered x-axis: use date as primary key (not commit ID)
-  // Each run gets a unique index; x-axis shows short date labels
-  const runsAsc = [...allRuns].reverse();
-  const seen = new Set();
-  const orderedRuns = []; // [{cid, date, label}]
-  for (const r of runsAsc) {
+  // Build ordered x-axis: group by day+commit, keep the run with most benches
+  // (nightly > individual reruns). Same commit can appear on multiple days.
+  const dayRunMap = {}; // "YYYY-MM-DD|cid" -> best run
+  for (const r of allRuns) {
     const cid = r.commit.id.slice(0, 7);
-    if (!seen.has(cid)) {
-      seen.add(cid);
-      const d = new Date(r.date);
-      orderedRuns.push({ cid, date: r.date, label: (d.getMonth()+1) + '/' + d.getDate() + ' ' + cid });
+    const dayKey = localDay(r.date) + '|' + cid;
+    if (!dayRunMap[dayKey] || r.benches.length > dayRunMap[dayKey].benches.length) {
+      dayRunMap[dayKey] = r;
     }
   }
+  const orderedRuns = Object.values(dayRunMap)
+    .sort((a, b) => a.date - b.date)
+    .map(r => {
+      const cid = r.commit.id.slice(0, 7);
+      const d = new Date(r.date);
+      return { cid, date: r.date, day: localDay(r.date), label: (d.getMonth()+1) + '/' + d.getDate() + ' ' + cid };
+    });
   const orderedLabels = orderedRuns.map(r => r.label);
   const commitDateMap = {}; const labelToCid = {};
   orderedRuns.forEach(r => { commitDateMap[r.label] = r.date; labelToCid[r.label] = r.cid; });
 
   const metrics = [
-    { key: 'Total Tput', title: 'Total Throughput', unit: 'tok/s' },
+    { key: 'Total Tput', title: 'Total Tput (per GPU)', unit: 'tok/s/gpu' },
     { key: 'throughput', title: 'Output Throughput', unit: 'tok/s' },
     { key: 'TPOT', title: 'Time Per Output Token', unit: 'ms' },
     { key: 'TTFT', title: 'Time To First Token', unit: 'ms' },
@@ -1711,9 +2072,19 @@ function renderTrendsTab() {
       const pointMap = {};
       for (const pt of history) {
         const cid = pt.commit.id.slice(0, 7);
-        // Map to the label that contains this commit ID
-        const matchLabel = orderedRuns.find(r => r.cid === cid)?.label;
-        if (matchLabel && pt[met.key] != null) pointMap[matchLabel] = pt[met.key];
+        const day = localDay(pt.date);
+        // Match by day+commit (same granularity as orderedRuns dedup)
+        const matchLabel = orderedRuns.find(r => r.cid === cid && r.day === day)?.label;
+        if (matchLabel && pt[met.key] != null) {
+          let val = pt[met.key];
+          // Normalize Total Tput to per-GPU for cross-config comparability
+          if (met.key === 'Total Tput') {
+            const gpuCount = pt._gpu_count || pt._tp;
+            if (!gpuCount) continue;
+            val = val / gpuCount;
+          }
+          pointMap[matchLabel] = val;
+        }
       }
       const data = orderedLabels.map(lbl => pointMap[lbl] != null ? pointMap[lbl] : null);
       if (data.every(v => v === null)) continue;
@@ -1733,7 +2104,7 @@ function renderTrendsTab() {
     });
 
     if (datasets.length === 0) {
-      card.innerHTML += '<div class="chart-empty">No historical data for this mode/model and metric.</div>';
+      card.innerHTML += '<div class="chart-empty">No historical data for this backend/model and metric.</div>';
       continue;
     }
     if (datasets.length > 8) {
@@ -1793,7 +2164,7 @@ function renderTrendsTab() {
                 ` Date:  ${fmtDate(commitDateMap[lbl])}`
               ];
             },
-            afterBody: () => '\nClick to trace'
+            afterBody: () => '\nClick for details'
           }},
           datalabels: { display: false }
         },
@@ -1804,10 +2175,14 @@ function renderTrendsTab() {
         onClick: (_e, elems) => {
           if (!elems.length) return;
           const ds = datasets[elems[0].datasetIndex];
+          const key = ds._configKey;
+          if (!key) return;
           const lbl = orderedLabels[elems[0].index];
           const cid = labelToCid[lbl];
-          const run = cid ? allRuns.find(r => r.commit.id.slice(0, 7) === cid) : null;
-          if (run && ds._configKey) switchToTrace(ds._configKey, run.date);
+          const clickedDay = commitDateMap[lbl] ? localDay(commitDateMap[lbl]) : null;
+          const hist = historyMap[key];
+          const histCfg = cid && hist ? hist.find(h => h.commit.id.slice(0, 7) === cid && (!clickedDay || localDay(h.date) === clickedDay)) : null;
+          showPopover(key, histCfg || latestConfigs[key]);
         }
       }
     });
@@ -1846,7 +2221,7 @@ function renderDataTab() {
   const csvBtn = document.getElementById('copy-csv-btn');
   if (csvBtn) {
     csvBtn.addEventListener('click', () => {
-      const header = 'Date,Commit,Mode,Model,ISL/OSL,Concurrency,TP,Total Throughput (tok/s),TPOT (ms),TTFT (ms),Run URL';
+      const header = 'Date,Commit,Backend,Model,ISL/OSL,Concurrency,TP,Total Throughput (tok/s),TPOT (ms),TTFT (ms),Run URL';
       const rows = [];
       for (const run of allRuns) {
         const configs = parseRunConfigs(run);
@@ -1856,7 +2231,7 @@ function renderDataTab() {
           if (!state.filters.islOsl.includes(cfg.islOsl)) continue;
           if (!state.filters.conc.includes(cfg.conc)) continue;
           rows.push([fmtDate(cfg.date), cfg.commit.id?.slice(0,7), cfg.backend, cfg.model, cfg.islOsl, cfg.conc,
-            cfg._gpu_count ?? '', cfg['Total Tput'] ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
+            cfg._tp ?? cfg._gpu_count ?? '', cfg['Total Tput'] ?? '', cfg.TPOT ?? '', cfg.TTFT ?? '', cfg.runUrl].join(','));
         }
       }
       navigator.clipboard.writeText(header + '\n' + rows.join('\n'));
@@ -1924,7 +2299,7 @@ function renderDataTable() {
       case 'model': return dir * a.cfg.model.localeCompare(b.cfg.model);
       case 'islOsl': return dir * a.cfg.islOsl.localeCompare(b.cfg.islOsl);
       case 'conc': return dir * (a.cfg.conc - b.cfg.conc);
-      case 'tp': return dir * ((a.cfg._gpu_count || 0) - (b.cfg._gpu_count || 0));
+      case 'tp': return dir * ((a.cfg._tp || a.cfg._gpu_count || 0) - (b.cfg._tp || b.cfg._gpu_count || 0));
       case 'gpu': return dir * (a.cfg._gpu_name || '').localeCompare(b.cfg._gpu_name || '');
       case 'totalTput': return dir * ((a.cfg['Total Tput'] || 0) - (b.cfg['Total Tput'] || 0));
       case 'tpot': return dir * ((a.cfg.TPOT || 0) - (b.cfg.TPOT || 0));
@@ -1934,10 +2309,11 @@ function renderDataTable() {
   });
   const sCls = (col) => 'sortable' + (state.dataSort.column === col ? ' sort-' + state.dataSort.direction : '');
   const sIco = (col) => '<span class="sort-icon">' + (state.dataSort.column === col ? (state.dataSort.direction === 'asc' ? '▲' : '▼') : '⇕') + '</span>';
-  let html = `<div class="table-watermark"><table class="perf-table"><thead><tr>
+  let html = `<div class="section-container"><div class="section-header"><span class="section-title">Historical Data</span></div>
+  <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
     <th class="${sCls('date')}" data-sort="date">Date ${sIco('date')}</th>
     <th class="${sCls('commit')}" data-sort="commit">Commit ${sIco('commit')}</th>
-    <th class="${sCls('mode')}" data-sort="mode">Mode ${sIco('mode')}</th>
+    <th class="${sCls('mode')}" data-sort="mode">Backend ${sIco('mode')}</th>
     <th class="${sCls('model')}" data-sort="model">Model ${sIco('model')}</th>
     <th class="${sCls('islOsl')}" data-sort="islOsl">ISL/OSL ${sIco('islOsl')}</th>
     <th class="num ${sCls('conc')}" data-sort="conc">Conc ${sIco('conc')}</th>
@@ -1951,13 +2327,13 @@ function renderDataTable() {
   for (const { key, cfg, runDate } of rows) {
     const commitId = cfg.commit.id ? cfg.commit.id.slice(0, 7) : '';
     html += `<tr data-key="data-${key}-${runDate}">
-      <td>${fmtDate(cfg.date)}</td>
+      <td title="${fmtDate(cfg.date)}">${relTime(cfg.date)}</td>
       <td>${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${commitId}</a>` : commitId}</td>
-      <td>${escHTML(cfg.backend)}</td>
+      <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td>
       <td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td>
       <td>${fmtIslOsl(cfg.islOsl)}</td>
       <td class="num">${cfg.conc}</td>
-      <td class="num">${cfg._gpu_count || '—'}</td>
+      <td class="num">${cfg._tp || cfg._gpu_count || 1}</td>
       <td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
       <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
       <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
@@ -1966,12 +2342,12 @@ function renderDataTable() {
     </tr>`;
     html += `<tr class="detail-row" data-detail="data-${key}-${runDate}"><td colspan="12">${buildDetailHTML(key, cfg)}</td></tr>`;
   }
-  html += '</tbody></table></div>';
+  html += '</tbody></table></div></div></div>';
   return html;
 }
 
 function renderTimeline() {
-  let html = '<div class="timeline">';
+  let html = '<div class="section-container"><div class="section-header"><span class="section-title">Commit Timeline</span></div><div class="timeline">';
   for (const run of allRuns) {
     const configs = parseRunConfigs(run);
     // Apply global filters to timeline entries
@@ -2002,20 +2378,20 @@ function renderTimeline() {
       <button class="tl-toggle">Show Details</button>
       <div class="tl-details">
         <table class="perf-table" style="margin-top:8px"><thead><tr>
-          <th>Mode</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th><th>GPU</th>
+          <th>Backend</th><th>Model</th><th>ISL/OSL</th><th class="num">Conc</th><th class="num">TP</th><th>GPU</th>
           <th class="num">Total Throughput (tok/s)</th><th class="num">TPOT (ms)</th><th class="num">TTFT (ms)</th>
         </tr></thead><tbody>`;
     for (const [, cfg] of entries) {
       html += `<tr>
-        <td>${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._gpu_count || '—'}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
+        <td style="white-space:nowrap;font-weight:600">${escHTML(cfg.backend)}</td><td class="model-name" style="color:${getModelColor(cfg.backend, cfg.model).text}">${escHTML(cfg.model)}</td><td>${fmtIslOsl(cfg.islOsl)}</td><td class="num">${cfg.conc}</td><td class="num">${cfg._tp || cfg._gpu_count || 1}</td><td style="white-space:nowrap;font-size:11px">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</td>
         <td class="num">${cfg['Total Tput'] != null ? fmtNum(cfg['Total Tput'], 1) : '—'}</td>
         <td class="num">${cfg.TPOT != null ? fmtNum(cfg.TPOT, 2) : '—'}</td>
         <td class="num">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) : '—'}</td>
       </tr>`;
     }
-    html += '</tbody></table></div></div></div>';
+    html += '</tbody></table></div></div>';
   }
-  html += '</div>';
+  html += '</div></div>';
   return html;
 }
 
@@ -2024,7 +2400,8 @@ function renderTimeline() {
    ================================================================ */
 function buildDetailHTML(key, cfg) {
   const hist = historyMap[key];
-  const prev = (hist && hist.length > 1) ? hist[1] : null;
+  const idx = hist ? hist.indexOf(cfg) : -1;
+  const prev = hist && idx >= 0 && idx + 1 < hist.length ? hist[idx + 1] : (hist && hist.length > 1 ? hist[1] : null);
   const reg = regressions[key];
 
   const interactive = cfg.TPOT && cfg.TPOT > 0 ? 1000 / cfg.TPOT : null;
@@ -2035,6 +2412,7 @@ function buildDetailHTML(key, cfg) {
     ['Interactive', interactive, 'tok/s/user', prevInteractive, false],
     ['TPOT', cfg.TPOT, 'ms', prev?.TPOT, true],
     ['TTFT', cfg.TTFT, 'ms', prev?.TTFT, true],
+    ['TP', cfg._tp || cfg._gpu_count, '', null, false],
     ['GPU Count', cfg._gpu_count, '', null, false],
   ].map(([label, val, unit, prevVal, inv]) =>
     `<div class="detail-item"><span class="detail-key">${label}</span><span class="detail-val">${val != null ? fmtNum(val, 2) + ' ' + unit : '—'} ${prevVal != null ? trendHTML(val, prevVal, inv) : ''}</span></div>`
@@ -2047,10 +2425,11 @@ function buildDetailHTML(key, cfg) {
     </div>
     <div class="detail-section">
       <h4>Environment</h4>
-      <div class="detail-item"><span class="detail-key">Mode</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.backend)}</span></div>
+      <div class="detail-item"><span class="detail-key">Backend</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.backend)}</span></div>
       <div class="detail-item"><span class="detail-key">GPU</span><span class="detail-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">VRAM</span><span class="detail-val">${cfg._gpu_vram_gb ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_vram_gb + ' GB' : '—'}</span></div>
       <div class="detail-item"><span class="detail-key">ROCm</span><span class="detail-val">${escHTML(cfg._rocm_version || '—')}</span></div>
+      <div class="detail-item"><span class="detail-key">Docker</span><span class="detail-val" style="max-width:250px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_tag || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Commit</span><span class="detail-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Message</span><span class="detail-val" style="font-family:inherit;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHTML(cfg.commit.message || '')}">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Author</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>
@@ -2068,7 +2447,8 @@ function buildDetailHTML(key, cfg) {
    ================================================================ */
 function showPopover(key, cfg) {
   const hist = historyMap[key];
-  const prev = (hist && hist.length > 1) ? hist[1] : null;
+  const idx = hist ? hist.indexOf(cfg) : -1;
+  const prev = hist && idx >= 0 && idx + 1 < hist.length ? hist[idx + 1] : (hist && hist.length > 1 ? hist[1] : null);
   const reg = regressions[key];
 
   const pop = document.getElementById('popover');
@@ -2080,9 +2460,10 @@ function showPopover(key, cfg) {
     <div class="pop-row"><span class="pop-key">TTFT</span><span class="pop-val">${cfg.TTFT != null ? fmtNum(cfg.TTFT, 1) + ' ms' : '—'}</span></div>
     ${reg ? `<div style="margin-top:8px;color:${reg.severity === 'critical' ? 'var(--accent-red)' : 'var(--accent-orange)'};font-size:13px">⚠ ${reg.severity.toUpperCase()}: throughput ${reg.tputPct.toFixed(1)}%, TPOT ${reg.tpotPct.toFixed(1)}%</div>` : ''}
     <div class="pop-section">
-      <div class="pop-row"><span class="pop-key">Mode</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.backend)}</span></div>
+      <div class="pop-row"><span class="pop-key">Backend</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.backend)}</span></div>
       <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}${cfg._gpu_vram_gb ? ' · ' + cfg._gpu_vram_gb + 'GB' : ''}</span></div>
       <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(cfg._rocm_version || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_tag || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>
@@ -2103,6 +2484,51 @@ function showPopover(key, cfg) {
     switchToTrace(key, cfg.date);
   });
 }
+function showAccuracyPopover(key, acc, prevOverride) {
+  const history = accuracyMap[key] || [];
+  const prev = prevOverride !== undefined ? prevOverride : (history.length > 1 ? history[1] : null);
+  const [backend, model] = key.split('|');
+  const hasThreshold = acc.threshold != null;
+  const margin = hasThreshold ? acc.score - acc.threshold : null;
+  const recoveryPct = acc.baseline > 0 ? acc.score / acc.baseline * 100 : null;
+  const gpuParts = [];
+  if (acc._gpu_name) gpuParts.push(acc._gpu_name);
+  if (acc._gpu_vram_gb) gpuParts.push(acc._gpu_vram_gb + 'GB');
+  const gpuLabel = gpuParts.length ? gpuParts.join(' · ') : '—';
+  const commitHref = safeHref(acc.commit?.url);
+  const runHref = safeHref(acc.runUrl);
+
+  const pop = document.getElementById('popover');
+  pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
+    <h3>${escHTML(model)} Accuracy</h3>
+    <div class="pop-row"><span class="pop-key">Accuracy</span><span class="pop-val">${fmtNum(acc.score, 4)} ${trendHTML(acc.score, prev?.score, false)}</span></div>
+    <div class="pop-row"><span class="pop-key">Strict Match</span><span class="pop-val">${acc.strictMatch != null ? fmtNum(acc.strictMatch, 4) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Threshold</span><span class="pop-val">${hasThreshold ? fmtNum(acc.threshold, 4) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Margin</span><span class="pop-val">${hasThreshold ? (margin >= 0 ? '+' : '') + fmtNum(margin, 4) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Fewshot</span><span class="pop-val">${acc.fewshot != null ? acc.fewshot : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Baseline</span><span class="pop-val">${acc.baseline > 0 ? fmtNum(acc.baseline, 4) : '—'}</span></div>
+    <div class="pop-row"><span class="pop-key">Recovery</span><span class="pop-val">${recoveryPct != null ? recoveryPct.toFixed(1) + '%' : '—'}</span></div>
+    <div class="pop-section">
+      <div class="pop-row"><span class="pop-key">Model</span><span class="pop-val" style="font-family:inherit">${escHTML(model)}</span></div>
+      <div class="pop-row"><span class="pop-key">Backend</span><span class="pop-val" style="font-family:inherit">${escHTML(backend)}</span></div>
+      <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${escHTML(gpuLabel)}</span></div>
+      <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(acc._rocm_version || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(acc.dockerImage || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${commitHref ? `<a href="${escHTML(commitHref)}" target="_blank" rel="noopener noreferrer">${acc.commit?.id?.slice(0, 7) || '—'}</a>` : (acc.commit?.id?.slice(0, 7) || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(acc.commit?.message?.split('\n')[0] || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(acc.commit?.author?.name || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${fmtDate(acc.date)}</span></div>
+    </div>
+    <div class="action-row">
+      ${runHref ? `<a class="action-btn" href="${escHTML(runHref)}" target="_blank" rel="noopener noreferrer">Open Run ↗</a>` : ''}
+      ${commitHref ? `<a class="action-btn" href="${escHTML(commitHref)}" target="_blank" rel="noopener noreferrer">View Commit ↗</a>` : ''}
+    </div>`;
+  document.getElementById('popover-overlay').classList.add('open');
+  document.getElementById('pop-close-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    hidePopover();
+  });
+}
 function hidePopover() { document.getElementById('popover-overlay').classList.remove('open'); }
 document.getElementById('popover-overlay').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) hidePopover();
@@ -2111,6 +2537,7 @@ document.getElementById('popover-overlay').addEventListener('click', (e) => {
 // Escape key: close popover or dropdowns
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
+    hideAccuracyHover();
     const overlay = document.getElementById('popover-overlay');
     if (overlay.classList.contains('open')) { hidePopover(); return; }
     closeAllDropdowns();
@@ -2153,26 +2580,38 @@ function readFromHash() {
 /* ================================================================
    16. ACCURACY TAB
    ================================================================ */
+/** Accuracy keys are "backend|model"; ISL/conc do not apply to GSM8K rows. */
+function filteredAccuracyEntries() {
+  return Object.entries(latestAccuracy).filter(([key]) => {
+    const [backend] = key.split('|');
+    return state.filters.backends.includes(backend);
+  });
+}
+
 function renderAccuracyTab() {
   const container = document.getElementById('tab-accuracy');
   if (!hasAccuracyData) {
     container.innerHTML = '<p style="color:var(--text-tertiary);padding:var(--gap-lg)">No accuracy data available yet. Accuracy data will appear after CI accuracy tests run on the main branch.</p>';
     return;
   }
-  // Not filtered by model/backend — accuracy tab always shows all models
-  const models = Object.entries(latestAccuracy)
+  const models = filteredAccuracyEntries()
     .sort((a, b) => _lc(a[0].split('|')[1], b[0].split('|')[1]));
 
+  if (models.length === 0) {
+    container.innerHTML = '<div class="chart-empty">No accuracy rows match the current Backend / Model filters.<br><span style="font-size:12px;color:var(--text-tertiary)">Widen filters above or click Reset. (Concurrency / ISL filters do not apply to accuracy.)</span></div>';
+    return;
+  }
+
   let html = `
-    <h3 style="color:var(--text-primary);margin-bottom:var(--gap-md)">Model Accuracy (GSM8K)</h3>
-    <div class="table-watermark">
+    <div class="section-container"><div class="section-header"><span class="section-title">Model Accuracy (GSM8K)</span></div>
+    <div class="table-watermark"><div class="table-watermark-scroll">
       <table class="perf-table">
         <thead><tr>
-          <th>Mode</th><th>Model</th>
+          <th>Backend</th><th>Model</th>
           <th class="num">flexible-extract</th><th class="num">strict-match</th>
           <th class="num">Baseline</th><th class="num">Recovery</th>
-          <th class="num">Threshold</th><th class="num">Margin</th><th>Status</th>
-          <th>Trend</th><th>Fewshot</th><th>Last Tested</th><th>Run</th>
+          <th class="num">Threshold</th><th class="num">Margin</th>
+          <th>Trend</th><th>Fewshot</th><th class="num">MTP Accept%</th><th class="num">toks/fwd</th><th>Last Tested</th><th>Run</th>
         </tr></thead>
         <tbody>`;
 
@@ -2184,35 +2623,59 @@ function renderAccuracyTab() {
     const hasThreshold = !!acc.threshold;
     const margin = acc.score - threshold;
     const marginClass = !hasThreshold ? 'trend-neutral' : margin >= 0.05 ? 'trend-up' : margin >= 0 ? 'trend-neutral' : 'trend-down';
-    const status = hasThreshold ? (margin >= 0 ? '✓ Pass' : '✗ Fail') : '—';
-    const statusClass = !hasThreshold ? 'trend-neutral' : margin >= 0 ? 'trend-up' : 'trend-down';
-    const reg = accuracyRegressions[key];
-    const regClass = reg ? (reg.severity === 'critical' ? 'regression' : 'regression-warning') : '';
+
+    // Health status: based on threshold pass/fail + margin + anomaly detection
+    let healthLevel, healthLabel, healthColor, rowClass;
+    if (!hasThreshold) {
+      healthLevel = 'unknown'; healthLabel = '—'; healthColor = 'var(--text-tertiary)'; rowClass = '';
+    } else if (acc.score < 0.1) {
+      // Anomaly: score suspiciously low (likely broken test) — check before threshold
+      healthLevel = 'anomaly'; healthLabel = '● Anomaly'; healthColor = 'var(--accent-red)'; rowClass = 'regression';
+    } else if (acc.score < threshold) {
+      healthLevel = 'fail'; healthLabel = '● Fail'; healthColor = 'var(--accent-red)'; rowClass = 'regression';
+    } else if (margin < 0.005) {
+      healthLevel = 'warn'; healthLabel = '● At Risk'; healthColor = 'var(--accent-orange)'; rowClass = 'regression-warning';
+    } else {
+      healthLevel = 'healthy'; healthLabel = '● Healthy'; healthColor = 'var(--accent-green)'; rowClass = '';
+    }
+
     const dateStr = fmtDate(acc.date);
     const href = safeHref(acc.runUrl);
 
+    // MTP acceptance lookup — exact key match
+    let mtpRate = null, mtpToks = null, mtpHistory = null;
+    const mh = mtpAcceptanceMap[key];
+    if (mh && mh.length > 0) { mtpRate = mh[0].rate; mtpToks = mh[0].avgToks; mtpHistory = mh; }
+
     html += `
-      <tr class="${regClass}" data-acc-key="${escHTML(key)}">
-        <td>${escHTML(backend)}</td>
+      <tr class="${rowClass}" data-acc-key="${escHTML(key)}">
+        <td style="white-space:nowrap;font-weight:600">${escHTML(backend)}</td>
         <td style="font-weight:600;color:var(--text-primary)">${escHTML(model)}</td>
-        <td class="num" style="font-weight:700;color:var(--text-primary)">${fmtNum(acc.score, 4)}</td>
+        <td class="num accuracy-score-cell"><button type="button" class="accuracy-score-trigger" data-acc-open="${escHTML(key)}">${fmtNum(acc.score, 4)}</button></td>
         <td class="num">${acc.strictMatch != null ? fmtNum(acc.strictMatch, 4) : '—'}</td>
         <td class="num">${acc.baseline > 0 ? fmtNum(acc.baseline, 4) : '—'}</td>
         <td class="num">${acc.baseline > 0 ? '<span class="' + (acc.score / acc.baseline >= 0.98 ? 'trend-up' : acc.score / acc.baseline >= 0.95 ? 'trend-neutral' : 'trend-down') + '">' + (acc.score / acc.baseline * 100).toFixed(1) + '%</span>' : '—'}</td>
         <td class="num">${hasThreshold ? fmtNum(threshold, 4) : '—'}</td>
         <td class="num"><span class="${marginClass}">${hasThreshold ? (margin >= 0 ? '+' : '') + fmtNum(margin, 4) : '—'}</span></td>
-        <td><span class="${statusClass}">${status}</span></td>
         <td>${trendHTML(acc.score, prev?.score, false)}</td>
         <td class="num">${acc.fewshot != null ? acc.fewshot : '—'}</td>
+        <td class="num">${mtpRate != null ? '<span style="color:var(--accent-green)">' + fmtNum(mtpRate, 1) + '%</span>' : '—'}</td>
+        <td class="num">${mtpToks != null ? fmtNum(mtpToks, 2) : '—'}</td>
         <td>${dateStr}</td>
         <td>${href ? `<a href="${escHTML(href)}" target="_blank" rel="noopener noreferrer">→</a>` : '—'}</td>
       </tr>`;
 
     // Detail row with inline trend chart
     const canvasId = 'acc-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
-    html += `<tr class="detail-row" data-detail-acc="${escHTML(key)}"><td colspan="13"><div class="detail-inner" style="display:flex;gap:var(--gap-lg);flex-wrap:wrap;align-items:flex-start">`;
-    // Left: trend chart
-    html += `<div style="flex:1;min-width:280px"><canvas id="${canvasId}" style="height:180px"></canvas></div>`;
+    html += `<tr class="detail-row" data-detail-acc="${escHTML(key)}"><td colspan="14"><div class="detail-inner" style="display:flex;gap:var(--gap-lg);flex-wrap:wrap;align-items:flex-start">`;
+    // Left: charts stacked vertically (accuracy trend + MTP acceptance)
+    const mtpCanvasId = 'mtp-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+    html += `<div style="flex:1;min-width:280px;display:flex;flex-direction:column;gap:var(--gap-md)">`;
+    html += `<div><canvas id="${canvasId}" style="height:180px"></canvas></div>`;
+    if (mtpHistory && mtpHistory.length > 0) {
+      html += `<div><canvas id="${mtpCanvasId}" style="height:180px"></canvas></div>`;
+    }
+    html += `</div>`;
     // Right: info
     html += `<div style="flex:0 0 auto;min-width:200px">`;
     if (acc.baselineModel || acc.baselineNote) {
@@ -2221,15 +2684,22 @@ function renderAccuracyTab() {
       if (acc.baselineNote) html += `<p style="color:var(--text-tertiary);font-size:11px;margin-top:4px;font-style:italic">${escHTML(acc.baselineNote)}</p>`;
       html += `</div>`;
     }
-    if (reg) {
-      html += `<div class="detail-section"><h4>Regression</h4><p>flexible-extract dropped by ${fmtNum(reg.dropAbs, 4)} (${fmtNum(reg.dropPct, 1)}%) from ${fmtNum(reg.prev.score, 4)}</p></div>`;
+    if (acc.dockerImage) {
+      html += `<div class="detail-section"><h4>Docker</h4><p style="color:var(--text-secondary);font-size:11px;overflow-wrap:anywhere">${escHTML(acc.dockerImage)}</p></div>`;
+    }
+    if (healthLevel !== 'healthy' && healthLevel !== 'unknown') {
+      html += `<div class="detail-section"><h4>Status: ${healthLabel.replace('● ','')}</h4><p style="color:${healthColor}">${healthLevel === 'anomaly' ? 'Score suspiciously low — possible test failure' : healthLevel === 'fail' ? 'Below threshold by ' + fmtNum(Math.abs(margin), 4) : 'Margin to threshold only ' + fmtNum(margin, 4)}</p></div>`;
     }
     html += `</div></div></td></tr>`;
   }
 
-  html += '</tbody></table></div>';
+  html += '</tbody></table></div></div></div>';
 
   container.innerHTML = html;
+
+  // Fixed table header for accuracy tab
+  syncHeaderH();
+  bindFixedThead(container);
 
   // Track per-row chart instances to avoid duplicates
   const accCharts = {};
@@ -2237,7 +2707,8 @@ function renderAccuracyTab() {
   // Row expand/collapse — render chart on first expand
   container.querySelectorAll('tr[data-acc-key]').forEach(row => {
     row.style.cursor = 'pointer';
-    row.addEventListener('click', () => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.accuracy-score-trigger')) return;
       const key = row.dataset.accKey;
       const detail = container.querySelector(`tr[data-detail-acc="${key}"]`);
       if (!detail) return;
@@ -2245,9 +2716,51 @@ function renderAccuracyTab() {
       detail.classList.toggle('expanded');
       row.classList.toggle('row-open');
       if (expanding && !accCharts[key]) {
-        requestAnimationFrame(() => renderAccuracyMiniChart(key, accCharts));
+        requestAnimationFrame(() => {
+          renderAccuracyMiniChart(key, accCharts);
+          renderMtpAcceptanceMiniChart(key);
+        });
       }
     });
+  });
+  function getAccuracyTriggerContext(target) {
+    const btn = target?.closest ? target.closest('.accuracy-score-trigger') : null;
+    if (!btn || !container.contains(btn)) return null;
+    const key = btn.dataset.accOpen;
+    const acc = latestAccuracy[key];
+    if (!acc) return null;
+    return { btn, key, acc, preview: { model: key.split('|')[1], dateText: fmtDate(acc.date), score: acc.score } };
+  }
+  container.addEventListener('click', (e) => {
+    const hit = getAccuracyTriggerContext(e.target);
+    if (!hit) return;
+    e.preventDefault();
+    hideAccuracyHover();
+    showAccuracyPopover(hit.key, hit.acc);
+  });
+  container.addEventListener('mouseover', (e) => {
+    const hit = getAccuracyTriggerContext(e.target);
+    if (!hit) return;
+    showAccuracyHover(e, hit.preview);
+  });
+  container.addEventListener('mousemove', (e) => {
+    if (!getAccuracyTriggerContext(e.target)) return;
+    positionAccuracyHoverTooltip(e);
+  });
+  container.addEventListener('mouseout', (e) => {
+    const hit = getAccuracyTriggerContext(e.target);
+    if (!hit) return;
+    const related = e.relatedTarget;
+    if (related && related.closest && related.closest('.accuracy-score-trigger') === hit.btn) return;
+    hideAccuracyHover();
+  });
+  container.addEventListener('focusin', (e) => {
+    const hit = getAccuracyTriggerContext(e.target);
+    if (!hit) return;
+    showAccuracyHover(hit.btn, hit.preview);
+  });
+  container.addEventListener('focusout', (e) => {
+    if (getAccuracyTriggerContext(e.target)) hideAccuracyHover();
   });
 }
 
@@ -2341,6 +2854,10 @@ function renderAccuracyMiniChart(key, chartCache) {
         tooltip: { ...chartTooltipOpts(), callbacks: {
           title: (items) => model + ' · ' + labels[items[0].dataIndex],
           label: (item) => ` ${item.dataset.label}: ${fmtNum(item.raw, 4)}  (${(item.raw * 100).toFixed(1)}%)`,
+          afterBody: (items) => {
+            const dockerImage = sorted[items[0].dataIndex]?.dockerImage;
+            return dockerImage ? ['', `Docker: ${dockerImage}`] : [];
+          },
         }},
         datalabels: { display: false },
       },
@@ -2352,8 +2869,102 @@ function renderAccuracyMiniChart(key, chartCache) {
           ticks: { color: C_TICK, callback: v => (v * 100).toFixed(0) + '%' },
         },
       },
+      onClick: (_e, elems) => {
+        if (!elems.length) return;
+        const pointIdx = elems[0].index;
+        const accEntry = sorted[pointIdx];
+        if (!accEntry) return;
+        const prevEntry = pointIdx > 0 ? sorted[pointIdx - 1] : null;
+        hideAccuracyHover();
+        showAccuracyPopover(key, accEntry, prevEntry);
+      },
     },
   });
+}
+
+function renderMtpAcceptanceMiniChart(key) {
+  const mtpCanvasId = 'mtp-trend-' + key.replace(/[^a-zA-Z0-9]/g, '_');
+  const canvas = document.getElementById(mtpCanvasId);
+  if (!canvas) return;
+  const history = mtpAcceptanceMap[key];
+  if (!history || !history.length) return;
+  const sorted = [...history].sort((a, b) => a.date - b.date);
+  const labels = sorted.map(h => { const dt = new Date(h.date); return `${dt.getMonth()+1}/${dt.getDate()}`; });
+  const datasets = [{
+    label: 'Acceptance %', data: sorted.map(h => h.rate),
+    borderColor: 'hsl(145,63%,49%)', backgroundColor: 'hsla(145,63%,49%,0.15)',
+    borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, tension: 0.3, fill: true, yAxisID: 'y',
+  }];
+  const hasAvgToks = sorted.some(h => h.avgToks != null);
+  if (hasAvgToks) {
+    datasets.push({
+      label: 'avg toks/fwd', data: sorted.map(h => h.avgToks ?? null),
+      borderColor: 'hsl(210,80%,60%)', backgroundColor: 'hsla(210,80%,60%,0.1)',
+      borderWidth: 1.5, borderDash: [4,3], pointRadius: 3, tension: 0.3, fill: false, yAxisID: 'y2',
+    });
+  }
+  new Chart(canvas, {
+    type: 'line', data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
+        title: { display: true, text: 'MTP Acceptance Rate', color: C_LEGEND, font: { size: 12 } },
+        tooltip: { ...chartTooltipOpts() },
+        datalabels: { display: false },
+      },
+      scales: {
+        x: { grid: chartGridOpts(), ticks: { color: C_TICK, font: { size: 10 } } },
+        y: { position: 'left', grid: chartGridOpts(),
+          title: { display: true, text: 'Acceptance %', color: C_TICK, font: { size: 10 } },
+          ticks: { color: C_TICK } },
+        ...(hasAvgToks ? { y2: { position: 'right', grid: { display: false },
+          title: { display: true, text: 'toks/fwd', color: C_TICK, font: { size: 10 } },
+          ticks: { color: C_TICK } } } : {}),
+      },
+      onClick: (_e, elems) => {
+        if (!elems.length) return;
+        const h = sorted[elems[0].index];
+        if (!h) return;
+        const [backend, model] = key.split('|');
+        const acc = latestAccuracy[key] || {};
+        const gpuParts = [];
+        if (acc._gpu_name) gpuParts.push(acc._gpu_name);
+        if (acc._gpu_vram_gb) gpuParts.push(acc._gpu_vram_gb + 'GB');
+        const gpuLabel = gpuParts.length ? gpuParts.join(' · ') : '—';
+        const commitHref = safeHref(h.commit?.url);
+        const runHref = safeHref(h.runUrl);
+        const pop = document.getElementById('popover');
+        pop.innerHTML = `<button class="pop-close" id="pop-close-btn">&times;</button>
+          <h3>${escHTML(model)} MTP Acceptance</h3>
+          <div class="pop-row"><span class="pop-key">Acceptance Rate</span><span class="pop-val" style="color:var(--accent-green)">${fmtNum(h.rate, 2)}%</span></div>
+          ${h.avgToks != null ? `<div class="pop-row"><span class="pop-key">Avg toks/fwd</span><span class="pop-val">${fmtNum(h.avgToks, 2)}</span></div>` : ''}
+          <div class="pop-section">
+            <div class="pop-row"><span class="pop-key">Model</span><span class="pop-val" style="font-family:inherit">${escHTML(model)}</span></div>
+            <div class="pop-row"><span class="pop-key">Backend</span><span class="pop-val" style="font-family:inherit">${escHTML(backend)}</span></div>
+            <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${escHTML(gpuLabel)}</span></div>
+            <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(acc._rocm_version || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(acc.dockerImage || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${commitHref ? '<a href="' + escHTML(commitHref) + '" target="_blank" rel="noopener noreferrer">' + (h.commit?.id?.slice(0,7) || '—') + '</a>' : (h.commit?.id?.slice(0,7) || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(h.commit?.message?.split('\\n')[0] || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(h.commit?.author?.name || '—')}</span></div>
+            <div class="pop-row"><span class="pop-key">Date</span><span class="pop-val">${fmtDate(h.date)}</span></div>
+          </div>
+          <div class="action-row">
+            ${runHref ? '<a class="action-btn" href="' + escHTML(runHref) + '" target="_blank" rel="noopener noreferrer">Open Run ↗</a>' : ''}
+            ${commitHref ? '<a class="action-btn" href="' + escHTML(commitHref) + '" target="_blank" rel="noopener noreferrer">View Commit ↗</a>' : ''}
+          </div>`;
+        document.getElementById('popover-overlay').classList.add('open');
+        document.getElementById('pop-close-btn').addEventListener('click', (e) => { e.stopPropagation(); hidePopover(); });
+      },
+    },
+  });
+}
+
+// Re-render everything (used by theme toggle)
+function renderAll() {
+  renderKPICards();
+  renderActiveTab();
 }
 
 /* ================================================================

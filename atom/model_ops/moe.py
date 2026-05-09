@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from aiter import ActivationType, QuantType, dtypes, get_hip_quant
+from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_softplus
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
@@ -43,6 +44,7 @@ from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
 from atom.model_ops.utils import (
     _has_module,
+    atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
     shuffle_weights,
@@ -177,8 +179,12 @@ def naive_multicast(
     return buffer
 
 
-def all_gather_with_padding(x: torch.Tensor):
-    max_batch_size = get_forward_context().context.graph_bs
+def pad_for_all_gather(x: torch.Tensor):
+    ctx = get_forward_context()
+    max_batch_size = ctx.context.graph_bs
+    if not ctx.context.is_prefill and ctx.attn_metadata is not None:
+        # For MTP > 1
+        max_batch_size *= ctx.attn_metadata.max_seqlen_q
     dim = 0
     original_batch_size = x.shape[dim]
     padded_x = x
@@ -189,10 +195,15 @@ def all_gather_with_padding(x: torch.Tensor):
         padding_shape[dim] = padding_size
 
         padding = torch.empty(padding_shape, dtype=x.dtype, device=x.device)
-        padding.zero_()
+        # padding.zero_()
         padded_x = torch.cat([x, padding], dim=dim)
 
-    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=dim)
+    return padded_x, original_batch_size
+
+
+def all_gather_with_padding(x: torch.Tensor):
+    padded_x, original_batch_size = pad_for_all_gather(x)
+    gathered_hidden_states = get_dp_group().all_gather(padded_x, dim=0)
     return gathered_hidden_states, original_batch_size
 
 
@@ -332,18 +343,57 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
             )
+            from atom.utils.tbo.ubatching import tbo_enabled
+            from atom.config import get_current_atom_config
+
             handle = all2all_manager.get_handle(all_to_all_args)
+            is_async = tbo_enabled()
+            atom_config = get_current_atom_config()
+            low_latency = getattr(atom_config, "enable_low_latency", False)
 
             # We not use quant for mori now
             use_fp8_dispatch = False
             quant_type = None
 
+            common_args = dict(
+                rank=all2all_manager.rank,
+                world_size=all2all_manager.world_size,
+                hidden_dim=moe.hidden_dim,
+                scale_dim=scale_dim,
+                max_num_inp_token_per_rank=16384,
+                num_local_experts=moe.num_experts // all2all_manager.world_size,
+                num_experts_per_token=moe.experts_per_token,
+                gpu_per_node=moe.moe_parallel_config.local_ep_size,
+                data_type_itemsize=moe.in_dtype.itemsize,
+                max_token_type_size=moe.in_dtype.itemsize,
+            )
+
+            tbo_mori_ops = None
+            sync_handle = handle  # IntraNode handle for prefill (sync path)
+            if is_async:
+                from atom.model_ops.fused_moe.mori_prepare_finalize import (
+                    init_mori_op,
+                    _NUM_TBO_UBATCHES,
+                )
+
+                tbo_mori_ops = [
+                    init_mori_op(
+                        **common_args,
+                        low_latency=low_latency,
+                        instance_id=i,
+                    )
+                    for i in range(_NUM_TBO_UBATCHES)
+                ]
+
             prepare_finalize = MoriPrepareAndFinalize(
-                handle,
+                sync_handle,
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
                 quant_type=quant_type,
+                is_async=is_async,
+                tbo_mori_ops=tbo_mori_ops,
+                low_latency=low_latency,
             )
 
         return prepare_finalize
@@ -405,27 +455,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(
+        w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(
+        w2_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
@@ -436,12 +484,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
 
-        layer.w13_weight = torch.nn.Parameter(
-            self._maybe_pad_weight(layer.w13_weight.data), requires_grad=False
-        )
-        layer.w2_weight = torch.nn.Parameter(
-            self._maybe_pad_weight(layer.w2_weight.data), requires_grad=False
-        )
+        layer.w13_weight = atom_parameter(self._maybe_pad_weight(layer.w13_weight.data))
+        layer.w2_weight = atom_parameter(self._maybe_pad_weight(layer.w2_weight.data))
         # reshaping weights is required for aiter moe kernel.
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
@@ -636,13 +680,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_type = quant_config.quant_type
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
+        self.static_input_scales = not quant_config.is_dynamic
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
         gfx = get_gfx()
-        self.use_triton = gfx.startswith("gfx94") or (
-            gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
+        self.use_triton = (
+            gfx.startswith("gfx94")
+            or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
+            or os.environ.get("ATOM_USE_TRITON_MOE") == "1"
         )
         if self.use_triton:
             from atom.model_ops.utils import has_triton_kernels
@@ -678,14 +725,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.intermediate_size - layer.intermediate_size_per_partition
         )
         # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(
+        w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition_after_pad,
                 hidden_size // 2,
                 dtype=weight_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w13_weight", w13_weight)
         # Zero-fill padding region: FP4 dtype doesn't support torch.zeros,
@@ -693,26 +739,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w13_weight_scale = torch.nn.Parameter(
+        w13_weight_scale = atom_parameter(
             torch.zeros(
                 num_experts,
                 2 * intermediate_size_per_partition_after_pad,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         if layer.has_bias:
-            w13_bias = torch.nn.Parameter(
+            w13_bias = atom_parameter(
                 torch.empty(
                     num_experts,
                     2 * intermediate_size_per_partition_after_pad,
                     dtype=torch.bfloat16,
-                ),
-                requires_grad=False,
+                )
             )
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
@@ -720,50 +764,66 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_bias", None)
 
         # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(
+        w2_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition_after_pad // 2,
                 dtype=weight_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w2_weight", w2_weight)
         w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        w2_weight_scale = torch.nn.Parameter(
+        w2_weight_scale = atom_parameter(
             torch.zeros(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition_after_pad // mxfp4_block,
                 dtype=scale_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         if layer.has_bias:
-            w2_bias = torch.nn.Parameter(
+            w2_bias = atom_parameter(
                 torch.empty(
                     num_experts,
                     hidden_size,
                     dtype=torch.bfloat16,
-                ),
-                requires_grad=False,
+                )
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
         else:
             layer.register_parameter("w2_bias", None)
 
+        if self.static_input_scales:
+            w13_input_scale = atom_parameter(
+                torch.ones(num_experts, dtype=torch.float32)
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+            w2_input_scale = atom_parameter(
+                torch.ones(num_experts, dtype=torch.float32)
+            )
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
     def process_weights_after_loading(self, layer):
         if layer.w13_bias is not None:
             layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
+
+        if os.environ.get("ATOM_V4_TORCH_MOE"):
+            return
 
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
@@ -849,12 +909,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale.view(self.num_experts, -1)
             )
 
-        layer.w13_weight_scale = torch.nn.Parameter(
-            shuffled_w13_scale, requires_grad=False
-        )
-        layer.w2_weight_scale = torch.nn.Parameter(
-            shuffled_w2_scale, requires_grad=False
-        )
+        layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
+        layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -944,6 +1000,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w2_precision_config=self.w2_precision_config,
                     w1_bias=layer.w13_bias,
                     w2_bias=layer.w2_bias,
+                    swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=global_num_experts,
                     expert_map=expert_map,
@@ -987,6 +1044,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+        a1_scale = getattr(layer, "w13_input_scale", None)
+        a2_scale = getattr(layer, "w2_input_scale", None)
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -999,6 +1058,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 quant_type=self.quant_type,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
                 doweight_stage1=apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
@@ -1019,8 +1080,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             expert_map=expert_map,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            a1_scale=None,
-            a2_scale=None,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
             bias1=layer.w13_bias,
             bias2=layer.w2_bias,
             hidden_pad=self.hidden_pad,
@@ -1096,26 +1157,24 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 )
 
         # WEIGHTS
-        w13_weight = torch.nn.Parameter(
+        w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w2_weight = torch.nn.Parameter(
+        w2_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
@@ -1124,25 +1183,23 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         if self.per_channel:
             # Per-channel quantization: shape [E, N, 1]
             # This is the key difference for compressed-tensors
-            w13_weight_scale = torch.nn.Parameter(
+            w13_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
                     2 * intermediate_size_per_partition,
                     1,  # Important: dimension is 1, not omitted
                     dtype=torch.float32,
-                ),
-                requires_grad=False,
+                )
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-            w2_weight_scale = torch.nn.Parameter(
+            w2_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
                     hidden_size,
                     1,  # Important: dimension is 1, not omitted
                     dtype=torch.float32,
-                ),
-                requires_grad=False,
+                )
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
@@ -1155,7 +1212,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
         elif self.block_quant:
             # Block quantization
-            w13_weight_scale = torch.nn.Parameter(
+            w13_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
                     2
@@ -1165,20 +1222,18 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                     ),
                     (hidden_size + self.block_k - 1) // self.block_k,
                     dtype=torch.float32,
-                ),
-                requires_grad=False,
+                )
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-            w2_weight_scale = torch.nn.Parameter(
+            w2_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
                     (hidden_size + self.block_n - 1) // self.block_n,
                     (intermediate_size_per_partition + self.block_k - 1)
                     // self.block_k,
                     dtype=torch.float32,
-                ),
-                requires_grad=False,
+                )
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
@@ -1190,15 +1245,13 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
         else:
             # Per-tensor quantization: shape [E, 2] for w13, [E] for w2
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32),
-                requires_grad=False,
+            w13_weight_scale = atom_parameter(
+                torch.ones(num_experts, 2, dtype=torch.float32)
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32),
-                requires_grad=False,
+            w2_weight_scale = atom_parameter(
+                torch.ones(num_experts, dtype=torch.float32)
             )
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
@@ -1210,16 +1263,14 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
         # INPUT_SCALES (activation scales)
         if self.static_input_scales:
-            w13_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32),
-                requires_grad=False,
+            w13_input_scale = atom_parameter(
+                torch.ones(num_experts, dtype=torch.float32)
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
-            w2_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32),
-                requires_grad=False,
+            w2_input_scale = atom_parameter(
+                torch.ones(num_experts, dtype=torch.float32)
             )
             layer.register_parameter("w2_input_scale", w2_input_scale)
             set_weight_attrs(w2_input_scale, extra_weight_attrs)
@@ -1298,17 +1349,24 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                     w13.data[expert_id, shard_size:, :] = w3_q.to(w13.dtype)
 
             # Update scale to single max scale per expert [E]
-            layer.w13_weight_scale = torch.nn.Parameter(
-                max_w13_scales, requires_grad=False
-            )
+            layer.w13_weight_scale = atom_parameter(max_w13_scales)
 
-        # Shuffle weights for asm moe (moved from inference to load time for better performance)
-        if w13.dtype in [
-            torch.int8,
-            torch.uint8,
-            torch.float8_e4m3fnuz,
-            torch.float8_e4m3fn,
-        ]:
+        # Shuffle weights for asm moe (moved from inference to load time for better performance).
+        # For per_1x128 blockscale (block_quant), only shuffle when the preshuffle GEMM
+        # path is enabled — the non-preshuffle kernel expects the un-shuffled layout.
+        skip_shuffle_for_block = (
+            self.block_quant and not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+        if (
+            w13.dtype
+            in [
+                torch.int8,
+                torch.uint8,
+                torch.float8_e4m3fnuz,
+                torch.float8_e4m3fn,
+            ]
+            and not skip_shuffle_for_block
+        ):
             from aiter.ops.shuffle import shuffle_weight
 
             w13.data = shuffle_weight(w13.data)
@@ -1493,26 +1551,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
         # WEIGHTS
-        w13_weight = torch.nn.Parameter(
+        w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w2_weight = torch.nn.Parameter(
+        w2_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
-            ),
-            requires_grad=False,
+            )
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
@@ -1521,49 +1577,45 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.channel_quant:
             # Per-channel (PTPTC): one scale per output channel per expert.
             # w13: [E, 2*N], w2: [E, hidden_size]
-            w13_weight_scale = torch.nn.Parameter(
+            w13_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
                     2 * intermediate_size_per_partition,
                     dtype=torch.float32,
-                ),
-                requires_grad=False,
+                )
             )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, hidden_size, dtype=torch.float32),
-                requires_grad=False,
+            w2_weight_scale = atom_parameter(
+                torch.ones(num_experts, hidden_size, dtype=torch.float32)
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
         elif self.block_quant:
-            w13_weight_scale = torch.nn.Parameter(
+            w13_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
                     2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
                     dtype=torch.float32,
-                ),
-                requires_grad=False,
+                )
             )
-            w2_weight_scale = torch.nn.Parameter(
+            w2_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
                     (hidden_size + block_n - 1) // block_n,
                     (intermediate_size_per_partition + block_k - 1) // block_k,
                     dtype=torch.float32,
-                ),
-                requires_grad=False,
+                )
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
             assert self.quant_config.is_dynamic
         else:
             # Per-tensor
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+            w13_weight_scale = atom_parameter(
+                torch.ones(num_experts, 2, dtype=torch.float32)
             )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            w2_weight_scale = atom_parameter(
+                torch.ones(num_experts, dtype=torch.float32)
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -1577,13 +1629,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
         else:
-            w13_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            w13_input_scale = atom_parameter(
+                torch.ones(num_experts, dtype=torch.float32)
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
-            w2_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            w2_input_scale = atom_parameter(
+                torch.ones(num_experts, dtype=torch.float32)
             )
             layer.register_parameter("w2_input_scale", w2_input_scale)
             set_weight_attrs(w2_input_scale, extra_weight_attrs)
@@ -1597,14 +1649,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w2_weight, w2_weight_scale, w2_input_scale = normalize_e4m3fn_to_e4m3fnuz(
             layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
         )
-        layer.w13_weight = nn.Parameter(w13_weight, requires_grad=False)
-        layer.w13_weight_scale = nn.Parameter(w13_weight_scale, requires_grad=False)
-        layer.w2_weight = nn.Parameter(w2_weight, requires_grad=False)
-        layer.w2_weight_scale = nn.Parameter(w2_weight_scale, requires_grad=False)
+        layer.w13_weight = atom_parameter(w13_weight)
+        layer.w13_weight_scale = atom_parameter(w13_weight_scale)
+        layer.w2_weight = atom_parameter(w2_weight)
+        layer.w2_weight_scale = atom_parameter(w2_weight_scale)
         if w13_input_scale is not None:
-            layer.w13_input_scale = nn.Parameter(w13_input_scale, requires_grad=False)
+            layer.w13_input_scale = atom_parameter(w13_input_scale)
         if w2_input_scale is not None:
-            layer.w2_input_scale = nn.Parameter(w2_input_scale, requires_grad=False)
+            layer.w2_input_scale = atom_parameter(w2_input_scale)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if self.block_quant:
@@ -1619,16 +1671,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self._normalize_weights_and_scales(layer)
 
         if not self.need_normalize_e4m3fn_to_e4m3fnuz:
-            layer.w13_weight = nn.Parameter(layer.w13_weight.data, requires_grad=False)
-            layer.w13_weight_scale = nn.Parameter(
-                layer.w13_weight_scale.data, requires_grad=False
-            )
-            layer.w2_weight = nn.Parameter(layer.w2_weight.data, requires_grad=False)
-            layer.w2_weight_scale = nn.Parameter(
-                layer.w2_weight_scale.data, requires_grad=False
-            )
+            layer.w13_weight = atom_parameter(layer.w13_weight.data)
+            layer.w13_weight_scale = atom_parameter(layer.w13_weight_scale.data)
+            layer.w2_weight = atom_parameter(layer.w2_weight.data)
+            layer.w2_weight_scale = atom_parameter(layer.w2_weight_scale.data)
 
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        # per_1x128 blockscale MoE only needs weight bpreshuffle when the
+        # preshuffle GEMM path is enabled. Skip it to match the non-preshuffle
+        # kernel's expected weight layout.
+        if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
         """PTPTC"""
@@ -1658,12 +1710,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     "QuantConfig has static quantization, but found "
                     "activation scales are None."
                 )
-            layer.w13_input_scale = torch.nn.Parameter(
-                layer.w13_input_scale.max(), requires_grad=False
-            )
-            layer.w2_input_scale = torch.nn.Parameter(
-                layer.w2_input_scale.max(), requires_grad=False
-            )
+            layer.w13_input_scale = atom_parameter(layer.w13_input_scale.max())
+            layer.w2_input_scale = atom_parameter(layer.w2_input_scale.max())
 
         self._normalize_weights_and_scales(layer)
 
@@ -1685,7 +1733,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
-        layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
+        layer.w13_weight_scale = atom_parameter(max_w13_scales)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1904,7 +1952,9 @@ class FusedMoE(torch.nn.Module):
         super().__init__()
         self.prefix = prefix
         layer_quant_config = (
-            quant_config.get_layer_quant_config(prefix) if quant_config else None
+            quant_config.get_layer_quant_config(prefix, check_children=True)
+            if quant_config
+            else None
         )
         self.params_dtype = (
             layer_quant_config.quant_dtype
@@ -2198,6 +2248,15 @@ class FusedMoE(torch.nn.Module):
         if load_shard_size != expert_shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         if expert_data.dtype != dtypes.fp4x2:
+            # Dtype glue: V4 stores per-1x32 weight scales as float8_e8m0fnu but
+            # FusedMoE allocates them as uint8 (raw byte storage). PyTorch's
+            # copy_() between mismatched float8/uint8 dtypes silently writes
+            # zeros — must reinterpret the source as uint8 first.
+            if expert_data.dtype == torch.uint8 and loaded_weight.dtype in (
+                torch.float8_e8m0fnu,
+                torch.float8_e4m3fn,
+            ):
+                loaded_weight = loaded_weight.view(torch.uint8)
             expert_data.copy_(loaded_weight)
         else:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
@@ -2228,6 +2287,12 @@ class FusedMoE(torch.nn.Module):
         if expert_data.dtype == dtypes.fp4x2:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
         else:
+            # Dtype glue: see _load_w13 for the same uint8/float8 reinterpret.
+            if expert_data.dtype == torch.uint8 and loaded_weight.dtype in (
+                torch.float8_e8m0fnu,
+                torch.float8_e4m3fn,
+            ):
+                loaded_weight = loaded_weight.view(torch.uint8)
             expert_data.copy_(loaded_weight)
 
     def _load_single_value(
@@ -2267,7 +2332,20 @@ class FusedMoE(torch.nn.Module):
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
+        expert_id: Optional[int] = None,
     ):
+        target_param = param
+        # single_expert means gate_up_proj.shape=[2880*2, 1440] from quark
+        maybe_single_expert_input = loaded_weight.dim() == param.dim() - 1
+        if expert_id is not None and maybe_single_expert_input:
+            local_expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+            if local_expert_id == -1:
+                return
+            # Support loading a split/single expert tensor while reusing the
+            # original merged loading logic.
+            if loaded_weight.dim() == param.dim() - 1:
+                loaded_weight = loaded_weight.unsqueeze(0)
+                target_param = param[local_expert_id : local_expert_id + 1]
         # (FIXME) for gpt-oss all experts are combined
         mxfp4_block = 32
         ep_rank_start = self.ep_rank * self.local_num_experts
@@ -2276,62 +2354,91 @@ class FusedMoE(torch.nn.Module):
         tp_rank_end = tp_rank_start + self.intermediate_size_per_partition
         if param is getattr(self, "w13_bias", None):
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
             dim1 = narrow_weight.shape[1]
-            param[:, :dim1].copy_(narrow_weight)
+            target_param[:, :dim1].copy_(narrow_weight)
         elif param is getattr(self, "w2_bias", None):
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight
                 if self.tp_rank != 0:
                     narrow_weight.zero_()
             dim1 = narrow_weight.shape[1]
-            param[:, :dim1].copy_(narrow_weight)
+            target_param[:, :dim1].copy_(narrow_weight)
         elif param is getattr(self, "w13_weight", None):
             loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[
                     :, 2 * tp_rank_start : 2 * tp_rank_end, ...
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
-            param.view(torch.uint8)[:, :dim1, :dim2].copy_(
+            target_param.view(torch.uint8)[:, :dim1, :dim2].copy_(
                 narrow_weight.view(torch.uint8)
             )
         elif param is getattr(self, "w2_weight", None):
             loaded_weight = loaded_weight.view(*loaded_weight.shape[:2], -1)
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[
                     ..., tp_rank_start // 2 : tp_rank_end // 2
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
-            param.view(torch.uint8)[:, :dim1, :dim2].copy_(
+            target_param.view(torch.uint8)[:, :dim1, :dim2].copy_(
                 narrow_weight.view(torch.uint8)
             )
         elif param is getattr(self, "w13_weight_scale", None):
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[
                     :, 2 * tp_rank_start : 2 * tp_rank_end, ...
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
-            param[:, :dim1, :dim2].copy_(narrow_weight)
+            target_param[:, :dim1, :dim2].copy_(narrow_weight)
         elif param is getattr(self, "w2_weight_scale", None):
             if self.use_ep:
-                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+                if loaded_weight.shape[0] == target_param.shape[0]:
+                    narrow_weight = loaded_weight
+                else:
+                    narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
             else:
                 narrow_weight = loaded_weight[
                     ..., tp_rank_start // mxfp4_block : tp_rank_end // mxfp4_block
                 ]
             dim1, dim2 = narrow_weight.shape[1:]
-            param[:, :dim1, :dim2].copy_(narrow_weight)
+            target_param[:, :dim1, :dim2].copy_(narrow_weight)
+        elif param is getattr(self, "w13_input_scale", None) or param is getattr(
+            self, "w2_input_scale", None
+        ):
+            # input_scale is scalar per expert.
+            if loaded_weight.dim() == 0:
+                loaded_weight = loaded_weight.unsqueeze(0)
+            if self.use_ep and loaded_weight.shape[0] != target_param.shape[0]:
+                narrow_weight = loaded_weight[ep_rank_start:ep_rank_end, ...]
+            else:
+                narrow_weight = loaded_weight
+            target_param[: narrow_weight.shape[0]].copy_(narrow_weight)
 
     def weight_loader(
         self,
@@ -2342,7 +2449,7 @@ class FusedMoE(torch.nn.Module):
         expert_id: int = 0,
     ) -> None:
         if self.layer_quant_config.quant_dtype == dtypes.fp4x2 and weight_name == "":
-            self.mxf4_merged_weight_loader(param, loaded_weight)
+            self.mxf4_merged_weight_loader(param, loaded_weight, expert_id)
             return
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
@@ -2486,6 +2593,18 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: float = 1.0,
     ):
 
+        # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
+        # in the first 3 layers, where topk_ids are looked up from a per-token
+        # hash table instead of computed from gate logits).
+        if custom_routing_function is not None:
+            topk_weights, topk_ids = custom_routing_function(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+            )
+            return topk_weights, topk_ids
+
         # DeekSeekv2 uses grouped_top_k
         if use_grouped_topk:
             assert topk_group is not None
@@ -2530,6 +2649,24 @@ class FusedMoE(torch.nn.Module):
                     ).clamp_min(1e-20)
 
                 topk_ids = topk_ids.to(torch.int32)
+            elif scoring_func == "sqrtsoftplus":
+                # # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
+                # # weights gathered from the unbiased sqrt(softplus(.)) values.
+                tokens_num = router_logits.shape[0]
+                topk_ids = torch.empty(
+                    tokens_num, top_k, dtype=torch.int32, device=router_logits.device
+                )
+                topk_weights = torch.empty(
+                    tokens_num, top_k, dtype=torch.float32, device=router_logits.device
+                )
+                topk_softplus(
+                    topk_weights,
+                    topk_ids,
+                    router_logits,
+                    e_score_correction_bias,
+                    renormalize,
+                    routed_scaling_factor,
+                )
             else:
                 raise ValueError(
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"
@@ -2551,13 +2688,27 @@ class FusedMoE(torch.nn.Module):
         # 3. DP attention + TP All_gahter/reduce Moe
         original_hidden_size = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
-        if (
+        use_dp_gather_scatter = (
             self.dp_size > 1
             and not self.moe_parallel_config.use_all2all_kernels
             and get_current_atom_config().enable_dp_attention
-        ):
+        )
+        if use_dp_gather_scatter:
+            from atom.utils.tbo.ubatching import tbo_active
+
+            _tbo = tbo_active()
+            if _tbo:
+                from atom.utils.tbo.ubatching import (
+                    tbo_switch_to_compute_sync,
+                    tbo_yield_and_switch_from_compute_to_comm,
+                    tbo_yield_and_switch_from_comm_to_compute,
+                )
+
+                tbo_yield_and_switch_from_compute_to_comm()
             hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
             router_logits, _ = all_gather_with_padding(router_logits)
+            if _tbo:
+                tbo_switch_to_compute_sync()
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -2580,14 +2731,14 @@ class FusedMoE(torch.nn.Module):
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
-        if (
-            self.dp_size > 1
-            and not self.moe_parallel_config.use_all2all_kernels
-            and get_current_atom_config().enable_dp_attention
-        ):
+        if use_dp_gather_scatter:
+            if _tbo:
+                tbo_yield_and_switch_from_compute_to_comm()
             final_hidden_states = reduce_scatter_with_unpadding(
                 final_hidden_states, original_hidden_size
             )
+            if _tbo:
+                tbo_yield_and_switch_from_comm_to_compute()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

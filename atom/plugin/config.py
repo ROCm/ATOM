@@ -1,5 +1,3 @@
-import sys
-
 from typing import Any, Optional
 from dataclasses import dataclass
 
@@ -35,6 +33,42 @@ class PluginConfig:
     sglang_enable_dp_attention: bool = False
     sglang_dist_init_addr: Optional[str] = None
     sglang_port_args: Any = None
+
+
+def _normalize_sglang_parallel_config(
+    tp_size: int,
+    dp_size: int,
+    tp_rank: int,
+    enable_dp_attention: bool,
+) -> tuple[int, int, int, int]:
+    """Translate SGLang parallel args into the runtime layout ATOM expects.
+
+    SGLang's ``tp_size`` is the whole world used by the model runner, while
+    ``dp_size`` under dp-attention is only an attention-layout factor inside
+    that world. For pure-DP, SGLang launches multiple independent TP workers,
+    so ATOM should treat that DP dimension as external scheduling rather than
+    a model-internal communication group.
+    """
+
+    if enable_dp_attention:
+        if dp_size < 1:
+            raise ValueError(f"SGLang dp_size must be >= 1, got {dp_size}")
+        if tp_size % dp_size != 0:
+            raise ValueError(
+                "SGLang tp_size must be divisible by dp_size when "
+                f"enable_dp_attention=True, got tp_size={tp_size}, dp_size={dp_size}"
+            )
+
+        runtime_tp_size = 1
+        runtime_dp_size = tp_size
+        runtime_dp_rank = tp_rank
+        aiter_rank_id = 0
+        return runtime_tp_size, runtime_dp_size, runtime_dp_rank, aiter_rank_id
+
+    # Without dp-attention, SGLang's DP workers are external replicas. Keep
+    # ATOM/aiter on the per-worker TP world and do not create an internal DP
+    # communication group.
+    return tp_size, 1, 0, tp_rank
 
 
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
@@ -85,6 +119,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     return Config(
         model=vllm_model_config.model,
+        trust_remote_code=getattr(vllm_model_config, "trust_remote_code", False),
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=vllm_scheduler_config.max_num_seqs,
         max_model_len=max_model_len,
@@ -109,9 +144,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
 
 def _generate_atom_config_from_sglang_config(config: Any):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
     from sglang.srt.server_args import (
-        ServerArgs,
-        prepare_server_args,
+        get_global_server_args,
         PortArgs,
     )
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
@@ -119,10 +154,23 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.load_config import LoadConfig
     from atom.config import Config, ParallelConfig, CompilationConfig
 
-    # sglang has no global config variable like vllm,
-    # so here construct the server args from sys.argv passed by users
-    # this is the only way to get full arguments
-    server_args: ServerArgs = prepare_server_args(sys.argv[1:])
+    # sglang's ModelRunner already parsed and stored ServerArgs globally
+    # before OOT model loading, so we can retrieve it directly.
+    try:
+        server_args = get_global_server_args()
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to retrieve SGLang global ServerArgs. Ensure this "
+            "function is called after SGLang has initialized its server "
+            "arguments."
+        ) from exc
+
+    if server_args is None:
+        raise RuntimeError(
+            "SGLang global ServerArgs are not initialized. Ensure this "
+            "function is called after SGLang has parsed and set its "
+            "server arguments."
+        )
 
     sgl_model_config = SglangModelConfig.from_server_args(server_args)
     sgl_model_opt_config = ModelOptConfig(
@@ -148,9 +196,23 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # get rank number through the torch.distributed.get_rank()
     rank = torch.distributed.get_rank()
 
+    tp_rank = get_tensor_model_parallel_rank()
+    (
+        atom_tensor_parallel_size,
+        atom_data_parallel_size,
+        atom_data_parallel_rank,
+        sglang_aiter_rank_id,
+    ) = _normalize_sglang_parallel_config(
+        tp_size=server_args.tp_size,
+        dp_size=server_args.dp_size,
+        tp_rank=tp_rank,
+        enable_dp_attention=server_args.enable_dp_attention,
+    )
+
     # sglang uses the atom parallel config
     sgl_parallel_config = ParallelConfig(
-        data_parallel_size=server_args.dp_size,
+        data_parallel_size=atom_data_parallel_size,
+        data_parallel_rank=atom_data_parallel_rank,
     )
 
     # use sglang torch compile policy and cuda graph policy
@@ -182,13 +244,17 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # force max num batched tokens to 16K because sgl doesn't have
     # concept for max num batched tokens
     return Config(
-        model=None,
+        model=server_args.model_path,
         max_num_batched_tokens=16384,
         max_num_seqs=server_args.max_running_requests,
         max_model_len=server_args.context_length,
         gpu_memory_utilization=server_args.mem_fraction_static,
-        tensor_parallel_size=server_args.tp_size,
-        enforce_eager=True,  # disable using atom cuda graph
+        tensor_parallel_size=atom_tensor_parallel_size,
+        # Disable ATOM's own torch.compile and CUDA graph capture —
+        # sglang manages its own compilation/graph strategy, and the
+        # @support_torch_compile decorator checks enforce_eager to skip,
+        # preventing double-compile.
+        enforce_eager=True,
         parallel_config=sgl_parallel_config,
         kv_cache_dtype=server_args.kv_cache_dtype,
         enable_prefix_caching=False,
@@ -214,7 +280,6 @@ def generate_atom_config_for_plugin_mode(config: Any = None):
     """
 
     logger.info("Generate atom config for plugin mode from passed config")
-
     atom_config = None
     from atom.plugin import is_vllm, is_sglang
     from atom.config import set_current_atom_config

@@ -187,6 +187,7 @@ def fused_sigmoid_gating_delta_rule_update(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    o: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
     scale: float = None,
@@ -223,7 +224,10 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    if o is None:
+        o = q.new_empty(NK, *v.shape)
+    else:
+        o = o.unsqueeze(0)
     if inplace_final_state:
         final_state = initial_state
     else:
