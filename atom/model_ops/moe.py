@@ -946,7 +946,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_moe_forward,
                 triton_kernel_fused_experts,
-                routing_from_topk,
                 fused_routing_from_topk_triton,
             )
 
