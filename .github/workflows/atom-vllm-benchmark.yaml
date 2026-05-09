@@ -578,17 +578,104 @@ jobs:
           CONCURRENCY_VALUES: ${{ inputs.concurrency_values || '4,8,16,32,64,128,256,512' }}
           RANDOM_RANGE_RATIOS: ${{ inputs.random_range_ratios || '0.8' }}
         run: |
+          set -euo pipefail
           echo "Using isl_osl_pairs: ${ISL_OSL_PAIRS}"
           echo "Using concurrency_values: ${CONCURRENCY_VALUES}"
           echo "Using random_range_ratios: ${RANDOM_RANGE_RATIOS:-<default 0.8>}"
           printf 'isl_osl_pairs=%s\n' "${ISL_OSL_PAIRS}" >> "$GITHUB_OUTPUT"
           printf 'concurrency_values=%s\n' "${CONCURRENCY_VALUES}" >> "$GITHUB_OUTPUT"
           printf 'random_range_ratios=%s\n' "${RANDOM_RANGE_RATIOS}" >> "$GITHUB_OUTPUT"
-          python3 .github/scripts/build_oot_benchmark_param_matrix.py \
-            --isl-osl-pairs "${ISL_OSL_PAIRS}" \
-            --concurrency-values "${CONCURRENCY_VALUES}" \
-            --random-range-ratios "${RANDOM_RANGE_RATIOS}" \
-            >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          allowed_concurrencies = {4, 8, 16, 32, 64, 128, 256, 512}
+
+          def dedupe_preserve_order(values):
+              deduped = []
+              seen = set()
+              for value in values:
+                  marker = (
+                      json.dumps(value, sort_keys=True) if isinstance(value, dict) else value
+                  )
+                  if marker in seen:
+                      continue
+                  seen.add(marker)
+                  deduped.append(value)
+              return deduped
+
+          pairs = []
+          for raw_pair in os.environ["ISL_OSL_PAIRS"].split(";"):
+              pair = raw_pair.strip()
+              if not pair:
+                  continue
+              parts = [part.strip() for part in pair.split(",")]
+              if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                  raise SystemExit(
+                      f"Invalid ISL/OSL pair {pair!r}. Use semicolon-separated pairs like 1024,1024;2048,1024."
+                  )
+              pairs.append(
+                  {
+                      "input_length": int(parts[0]),
+                      "output_length": int(parts[1]),
+                  }
+              )
+          if not pairs:
+              raise SystemExit("At least one ISL/OSL pair is required.")
+          pairs = dedupe_preserve_order(pairs)
+
+          concurrencies = []
+          for raw_value in os.environ["CONCURRENCY_VALUES"].split(","):
+              value = raw_value.strip()
+              if not value:
+                  continue
+              if not value.isdigit():
+                  raise SystemExit(
+                      f"Invalid concurrency {value!r}. Allowed values: 4,8,16,32,64,128,256,512"
+                  )
+              parsed = int(value)
+              if parsed not in allowed_concurrencies:
+                  raise SystemExit(
+                      f"Unsupported concurrency: {parsed}. Allowed values: 4,8,16,32,64,128,256,512"
+                  )
+              concurrencies.append(parsed)
+          if not concurrencies:
+              raise SystemExit("At least one concurrency value is required.")
+          concurrencies = dedupe_preserve_order(concurrencies)
+
+          ratio_text = os.environ["RANDOM_RANGE_RATIOS"].strip()
+          if not ratio_text:
+              ratios = ["0.8"]
+          else:
+              ratios = []
+              for raw_ratio in ratio_text.split(","):
+                  ratio = raw_ratio.strip()
+                  if not ratio:
+                      continue
+                  try:
+                      float(ratio)
+                  except ValueError as exc:
+                      raise SystemExit(
+                          f"Invalid random range ratio {ratio!r}. Use values like 0.8 or 1.0."
+                      ) from exc
+                  ratios.append(ratio)
+              ratios = dedupe_preserve_order(ratios) or ["0.8"]
+
+          matrix = []
+          for pair in pairs:
+              for concurrency in concurrencies:
+                  for ratio in ratios:
+                      matrix.append(
+                          {
+                              "input_length": pair["input_length"],
+                              "output_length": pair["output_length"],
+                              "concurrency": concurrency,
+                              "random_range_ratio": ratio,
+                          }
+                      )
+
+          print(f"matrix_json={json.dumps(matrix, separators=(',', ':'))}")
+          PY
 
       - name: Print benchmark parameter matrix JSON
         run: |
@@ -665,9 +752,109 @@ jobs:
             export SCHEDULE_CREATED_AT=""
           fi
 
-          python3 .github/scripts/resolve_oot_benchmark_selection.py \
-            --event "${GITHUB_EVENT_NAME}" \
-            >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+
+          anchor_date = date(2026, 5, 6)
+          nightly_rotation = ("A", "B", "C")
+          none_choice = "none"
+
+          catalog = json.loads(
+              Path(".github/benchmark/oot_benchmark_models.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          families = catalog.get("families")
+          if not isinstance(families, list):
+              raise SystemExit("Benchmark catalog must define a 'families' list.")
+
+          def flatten_variant(family, variant):
+              flattened = {
+                  key: value
+                  for key, value in family.items()
+                  if key not in {"choice_label", "variants"}
+              }
+              flattened.update(variant)
+              return flattened
+
+          selected_group = ""
+          event = os.environ["GITHUB_EVENT_NAME"]
+          selected = []
+
+          if event == "schedule":
+              created_at = os.environ.get("SCHEDULE_CREATED_AT", "")
+              if not created_at:
+                  raise SystemExit(
+                      "Scheduled selection requires a run creation timestamp."
+                  )
+              beijing_tz = timezone(timedelta(hours=8))
+              run_date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+              beijing_date = run_date.astimezone(beijing_tz).date()
+              rotation_index = (beijing_date - anchor_date).days % len(nightly_rotation)
+              selected_group = nightly_rotation[rotation_index]
+
+              for family in families:
+                  family_group = str(family.get("nightly_group", "")).upper()
+                  for variant in family["variants"]:
+                      variant_group = str(
+                          variant.get("nightly_group", family_group)
+                      ).upper()
+                      if variant_group != selected_group:
+                          continue
+                      selected.append(flatten_variant(family, variant))
+
+              if not selected:
+                  raise SystemExit(
+                      f"No models configured for nightly benchmark group {selected_group}."
+                  )
+          else:
+              variant_map = {}
+              for family in families:
+                  for variant in family["variants"]:
+                      variant_map[str(variant["display"])] = flatten_variant(
+                          family, variant
+                      )
+
+              seen_prefixes = set()
+              for slot_idx in range(1, 9):
+                  label = os.environ.get(f"MODEL_SLOT_{slot_idx}", "").strip()
+                  if not label or label == none_choice:
+                      continue
+                  selected_variant = variant_map.get(label)
+                  if selected_variant is None:
+                      available = ", ".join(sorted(variant_map))
+                      raise SystemExit(
+                          f"Unknown benchmark model variant choice {label!r}. Available choices: {available}"
+                      )
+                  prefix = str(selected_variant["prefix"])
+                  if prefix in seen_prefixes:
+                      continue
+                  selected.append(selected_variant)
+                  seen_prefixes.add(prefix)
+
+          if selected_group:
+              print(
+                  f"Scheduled nightly benchmark group: {selected_group}",
+                  file=sys.stderr,
+              )
+          if not selected:
+              print("No benchmark model variants were selected.", file=sys.stderr)
+          else:
+              print("Selected benchmark model variants:", file=sys.stderr)
+              for model in selected:
+                  print(
+                      f" - {model['display']} ({model['prefix']})",
+                      file=sys.stderr,
+                  )
+
+          print(f"models_json={json.dumps(selected, separators=(',', ':'))}")
+          print(f"selected_group={selected_group}")
+          print(f"has_enabled_models={'true' if selected else 'false'}")
+          PY
 
       - name: Print selected models
         run: |
