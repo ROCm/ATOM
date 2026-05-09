@@ -42,7 +42,6 @@ BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
 CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
 CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-256}"
@@ -186,10 +185,8 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --tp-size "${PREFILL_TP}" \
     --kv-cache-dtype "${KV_CACHE_DTYPE}" \
-    --attention-backend aiter \
     --mem-fraction-static "${MEM_FRACTION}" \
     --page-size 1 \
-    --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
     --max-running-requests "${MAX_RUNNING_REQUESTS}" \
     --disable-radix-cache \
     --log-level info \
@@ -433,7 +430,6 @@ for script in "${LOG_ROOT}"/scripts/*.sh; do
         -e "s|\${MODEL_PATH}|${MODEL_PATH}|g" \
         -e "s|\${MEM_FRACTION}|${MEM_FRACTION}|g" \
         -e "s|\${KV_CACHE_DTYPE}|${KV_CACHE_DTYPE}|g" \
-        -e "s|\${CHUNKED_PREFILL_SIZE}|${CHUNKED_PREFILL_SIZE}|g" \
         -e "s|\${MAX_RUNNING_REQUESTS}|${MAX_RUNNING_REQUESTS}|g" \
         -e "s|\${CUDA_GRAPH_BS_START}|${CUDA_GRAPH_BS_START}|g" \
         -e "s|\${CUDA_GRAPH_BS_END}|${CUDA_GRAPH_BS_END}|g" \
