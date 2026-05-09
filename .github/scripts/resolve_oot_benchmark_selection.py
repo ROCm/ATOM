@@ -83,6 +83,8 @@ def parse_requested_tp_sizes(tp_sizes_text: str, family: dict) -> list[int]:
     supported = _supported_tp_sizes(family)
     normalized = tp_sizes_text.strip()
     if not normalized:
+        if len(supported) == 1:
+            return supported
         raise ValueError(
             f"TP sizes are required when selecting {family['choice_label']}. Use values like 4,8 or all."
         )
@@ -231,7 +233,7 @@ def main() -> int:
     parser.add_argument(
         "--max-slots",
         type=int,
-        default=8,
+        default=11,
         help="Maximum number of MODEL_SLOT_N / TP_SIZES_SLOT_N pairs to read",
     )
     args = parser.parse_args()
