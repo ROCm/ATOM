@@ -12,25 +12,25 @@ on:
   workflow_dispatch:
     inputs:
       manual_selection_guide:
-        description: |
-          Manual selection guide. Leave this field empty.
-          Model family -> supported TP sizes
-          - DeepSeek-R1 FP8 -> 8
-          - DeepSeek-R1 MXFP4 -> 8
-          - DeepSeek-V3.2 FP8 -> 8
-          - MiniMax-M2.5 -> 2
-          - gpt-oss-120b -> 1
-          - GLM-5.1-FP8 -> 8
-          - Kimi-K2-Thinking-MXFP4 -> 4,8
-          - Kimi-K2.5-MXFP4 -> 2,4,8
-          - Qwen3.5-397B-A17B-FP8 -> 4,8
-          - Qwen3.5-397B-A17B-MXFP4 -> 4
-          - Qwen3.5-397B-A17B -> 4,8
-          - Qwen3-Next-80B-A3B-Instruct-FP8 -> 1,2,4
-          TP input examples: `4,8`, `all`
-          If a family supports only one TP size, leaving `tp_sizes_slot_N` empty uses that only TP size.
-        type: string
-        default: ""
+        description: "Reference only. Open this dropdown to view one model family per line with its supported TP sizes. Leave it unchanged."
+        type: choice
+        default: "Reference only - open dropdown for model -> TP sizes"
+        options:
+          - Reference only - open dropdown for model -> TP sizes
+          - DeepSeek-R1 FP8 -> TP 8
+          - DeepSeek-R1 MXFP4 -> TP 8
+          - DeepSeek-V3.2 FP8 -> TP 8
+          - MiniMax-M2.5 -> TP 2
+          - gpt-oss-120b -> TP 1
+          - GLM-5.1-FP8 -> TP 8
+          - Kimi-K2-Thinking-MXFP4 -> TP 4,8
+          - Kimi-K2.5-MXFP4 -> TP 2,4,8
+          - Qwen3.5-397B-A17B-FP8 -> TP 4,8
+          - Qwen3.5-397B-A17B-MXFP4 -> TP 4
+          - Qwen3.5-397B-A17B -> TP 4,8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 -> TP 1,2,4
+          - TP input examples -> 4,8 or all
+          - Blank TP input -> auto-uses the only TP when a family supports exactly one TP size
       benchmark_client:
         description: "Benchmark client command. `python_benchmark_serving` uses the repo benchmark script. `vllm_bench_serve` uses the vLLM CLI benchmark command."
         type: choice
@@ -39,7 +39,7 @@ on:
           - python_benchmark_serving
           - vllm_bench_serve
       model_slot_1:
-        description: "Manual selection slot 1: choose a model family. See `manual_selection_guide` above for supported TP sizes."
+        description: "Manual selection slot 1: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -61,7 +61,7 @@ on:
         type: string
         default: ""
       model_slot_2:
-        description: "Manual selection slot 2: choose a model family. See `manual_selection_guide` above for supported TP sizes."
+        description: "Manual selection slot 2: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -83,7 +83,7 @@ on:
         type: string
         default: ""
       model_slot_3:
-        description: "Manual selection slot 3: choose a model family. See `manual_selection_guide` above for supported TP sizes."
+        description: "Manual selection slot 3: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -105,7 +105,7 @@ on:
         type: string
         default: ""
       model_slot_4:
-        description: "Manual selection slot 4: choose a model family. See `manual_selection_guide` above for supported TP sizes."
+        description: "Manual selection slot 4: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -127,7 +127,7 @@ on:
         type: string
         default: ""
       model_slot_5:
-        description: "Manual selection slot 5: choose a model family. See `manual_selection_guide` above for supported TP sizes."
+        description: "Manual selection slot 5: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -149,7 +149,7 @@ on:
         type: string
         default: ""
       model_slot_6:
-        description: "Manual selection slot 6: choose a model family. See `manual_selection_guide` above for supported TP sizes."
+        description: "Manual selection slot 6: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -171,7 +171,7 @@ on:
         type: string
         default: ""
       model_slot_7:
-        description: "Manual selection slot 7: choose a model family. See `manual_selection_guide` above for supported TP sizes."
+        description: "Manual selection slot 7: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -193,7 +193,7 @@ on:
         type: string
         default: ""
       model_slot_8:
-        description: "Manual selection slot 8: choose a model family. See `manual_selection_guide` above for supported TP sizes."
+        description: "Manual selection slot 8: choose a model family. See the `manual_selection_guide` dropdown above for supported TP sizes."
         type: choice
         default: none
         options:
