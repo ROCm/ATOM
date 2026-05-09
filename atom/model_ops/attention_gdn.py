@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib
 
 import torch
 import triton
@@ -19,6 +20,13 @@ from atom.model_ops.fla_ops import (
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 from aiter.dist.parallel_state import get_tp_group
+
+try:
+    sglang_fused_sigmoid_gating_delta_rule_update = importlib.import_module(
+        "sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent"
+    ).fused_sigmoid_gating_delta_rule_update
+except ImportError:
+    sglang_fused_sigmoid_gating_delta_rule_update = None
 
 
 @triton.jit
@@ -157,8 +165,9 @@ class GatedDeltaNet(nn.Module):
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 
         fwd_ctx: ForwardContext = get_forward_context()
-        gdn_metadata: GDNAttentionMetadata = fwd_ctx.attn_metadata.gdn_metadata
-
+        gdn_metadata: GDNAttentionMetadata = getattr(
+            fwd_ctx.attn_metadata, "gdn_metadata", None
+        )
         if gdn_metadata is None:
             return core_attn_out
 
@@ -177,7 +186,13 @@ class GatedDeltaNet(nn.Module):
             gdn_metadata.non_spec_state_indices_tensor
         )  # noqa: E501
 
-        conv_state = conv_state.transpose(-1, -2)
+        # `causal_conv1d_*` expects the logical shape [slot, conv_dim, state_len].
+        # ModelRunner stores [slot, state_len, conv_dim], so it needs the
+        # transpose below. SGLang already provides [slot, conv_dim, state_len],
+        # and the Triton kernel consumes the original conv_state strides directly.
+        if conv_state.size(1) != self.conv1d.weight.size(0):
+            # transpose for ModelRunner
+            conv_state = conv_state.transpose(-1, -2)
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         num_accepted_tokens = gdn_metadata.num_accepted_tokens
@@ -270,24 +285,41 @@ class GatedDeltaNet(nn.Module):
                 1, num_tokens_nonspec, -1, self.head_v_dim
             )
 
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        use_sglang_fused_decode = (
+            gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes > 0
+            and spec_sequence_masks is None
+            and sglang_fused_sigmoid_gating_delta_rule_update is not None
+        )
+        needs_materialized_gates = (
+            gdn_metadata.num_prefills > 0
+            or spec_sequence_masks is not None
+            or (gdn_metadata.num_decodes > 0 and not use_sglang_fused_decode)
+        )
 
-        if spec_sequence_masks is not None:
-            if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
-                g_spec = g
-                beta_spec = beta
-                g_non_spec = None
-                beta_non_spec = None
+        if needs_materialized_gates:
+            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+            if spec_sequence_masks is not None:
+                if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
+                    g_spec = g
+                    beta_spec = beta
+                    g_non_spec = None
+                    beta_non_spec = None
+                else:
+                    g_spec = g.index_select(1, spec_token_indx)
+                    beta_spec = beta.index_select(1, spec_token_indx)
+                    g_non_spec = g.index_select(1, non_spec_token_indx)
+                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
             else:
-                g_spec = g.index_select(1, spec_token_indx)
-                beta_spec = beta.index_select(1, spec_token_indx)
-                g_non_spec = g.index_select(1, non_spec_token_indx)
-                beta_non_spec = beta.index_select(1, non_spec_token_indx)
+                g_spec = None
+                beta_spec = None
+                g_non_spec = g
+                beta_non_spec = beta
         else:
             g_spec = None
             beta_spec = None
-            g_non_spec = g
-            beta_non_spec = beta
+            g_non_spec = None
+            beta_non_spec = None
 
         # 2. Recurrent attention
 
@@ -333,20 +365,40 @@ class GatedDeltaNet(nn.Module):
                 ssm_state.dtype
             )
         elif gdn_metadata.num_decodes > 0:
-            core_attn_out_non_spec, last_recurrent_state = (
-                fused_recurrent_gated_delta_rule(
+            if use_sglang_fused_decode:
+                core_attn_out_non_spec = sglang_fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=a,
+                    dt_bias=self.dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
+                    b=b,
+                    initial_state_source=ssm_state,
+                    initial_state_indices=non_spec_state_indices_tensor,
                     cu_seqlens=non_spec_query_start_loc[: gdn_metadata.num_decodes + 1],
-                    ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
                 )
-            )
+                last_recurrent_state = None
+            else:
+                core_attn_out_non_spec, last_recurrent_state = (
+                    fused_recurrent_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc[
+                            : gdn_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
