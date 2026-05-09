@@ -11,25 +11,35 @@ on:
     - cron: '0 15 * * *'
   workflow_dispatch:
     inputs:
-      model_slot_1:
+      manual_selection_guide:
         description: |
-          Manual selection slot 1: choose a model family.
-          TP guide:
-          - DeepSeek-R1 FP8: 8
-          - DeepSeek-R1 MXFP4: 8
-          - DeepSeek-V3.2 FP8: 8
-          - MiniMax-M2.5: 2
-          - gpt-oss-120b: 1
-          - GLM-5.1-FP8: 8
-          - Kimi-K2-Thinking-MXFP4: 4,8
-          - Kimi-K2.5-MXFP4: 2,4,8
-          - Qwen3.5-397B-A17B-FP8: 4,8
-          - Qwen3.5-397B-A17B-MXFP4: 4
-          - Qwen3.5-397B-A17B: 4,8
-          - Qwen3-Next-80B-A3B-Instruct-FP8: 1,2,4
-          In `tp_sizes_slot_N`, use comma-separated TP sizes like `4,8`.
-          Use `all` to benchmark all TP sizes supported by the selected model family.
-          If a family supports only one TP size, leaving `tp_sizes_slot_N` empty will use that only TP size.
+          Manual selection guide. Leave this field empty.
+          Model family -> supported TP sizes
+          - DeepSeek-R1 FP8 -> 8
+          - DeepSeek-R1 MXFP4 -> 8
+          - DeepSeek-V3.2 FP8 -> 8
+          - MiniMax-M2.5 -> 2
+          - gpt-oss-120b -> 1
+          - GLM-5.1-FP8 -> 8
+          - Kimi-K2-Thinking-MXFP4 -> 4,8
+          - Kimi-K2.5-MXFP4 -> 2,4,8
+          - Qwen3.5-397B-A17B-FP8 -> 4,8
+          - Qwen3.5-397B-A17B-MXFP4 -> 4
+          - Qwen3.5-397B-A17B -> 4,8
+          - Qwen3-Next-80B-A3B-Instruct-FP8 -> 1,2,4
+          TP input examples: `4,8`, `all`
+          If a family supports only one TP size, leaving `tp_sizes_slot_N` empty uses that only TP size.
+        type: string
+        default: ""
+      benchmark_client:
+        description: "Benchmark client command. `python_benchmark_serving` uses the repo benchmark script. `vllm_bench_serve` uses the vLLM CLI benchmark command."
+        type: choice
+        default: python_benchmark_serving
+        options:
+          - python_benchmark_serving
+          - vllm_bench_serve
+      model_slot_1:
+        description: "Manual selection slot 1: choose a model family. See `manual_selection_guide` above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -47,11 +57,11 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_1:
-        description: "TP sizes for slot 1. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family."
+        description: "TP sizes for slot 1. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family."
         type: string
         default: ""
       model_slot_2:
-        description: "Manual selection slot 2: choose a model family"
+        description: "Manual selection slot 2: choose a model family. See `manual_selection_guide` above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -69,11 +79,11 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_2:
-        description: "TP sizes for slot 2. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
+        description: "TP sizes for slot 2. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
         type: string
         default: ""
       model_slot_3:
-        description: "Manual selection slot 3: choose a model family"
+        description: "Manual selection slot 3: choose a model family. See `manual_selection_guide` above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -91,11 +101,11 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_3:
-        description: "TP sizes for slot 3. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
+        description: "TP sizes for slot 3. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
         type: string
         default: ""
       model_slot_4:
-        description: "Manual selection slot 4: choose a model family"
+        description: "Manual selection slot 4: choose a model family. See `manual_selection_guide` above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -113,11 +123,11 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_4:
-        description: "TP sizes for slot 4. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
+        description: "TP sizes for slot 4. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
         type: string
         default: ""
       model_slot_5:
-        description: "Manual selection slot 5: choose a model family"
+        description: "Manual selection slot 5: choose a model family. See `manual_selection_guide` above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -135,11 +145,11 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_5:
-        description: "TP sizes for slot 5. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
+        description: "TP sizes for slot 5. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
         type: string
         default: ""
       model_slot_6:
-        description: "Manual selection slot 6: choose a model family"
+        description: "Manual selection slot 6: choose a model family. See `manual_selection_guide` above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -157,11 +167,11 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_6:
-        description: "TP sizes for slot 6. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
+        description: "TP sizes for slot 6. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
         type: string
         default: ""
       model_slot_7:
-        description: "Manual selection slot 7: choose a model family"
+        description: "Manual selection slot 7: choose a model family. See `manual_selection_guide` above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -179,11 +189,11 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_7:
-        description: "TP sizes for slot 7. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
+        description: "TP sizes for slot 7. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
         type: string
         default: ""
       model_slot_8:
-        description: "Manual selection slot 8: choose a model family"
+        description: "Manual selection slot 8: choose a model family. See `manual_selection_guide` above for supported TP sizes."
         type: choice
         default: none
         options:
@@ -201,7 +211,7 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_8:
-        description: "TP sizes for slot 8. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
+        description: "TP sizes for slot 8. Use comma-separated values like 4,8. Use `all` to benchmark every TP size supported by the selected model family. See `manual_selection_guide` above."
         type: string
         default: ""
       isl_osl_pairs:
@@ -209,6 +219,7 @@ on:
           Benchmark ISL/OSL pairs.
           Input as semicolon-separated `input_length,output_length` pairs.
           Example: 1024,1024;1024,8192;8192,1024
+          Additional copy-ready example: 1000,100;5000,500;10000,1000
         type: string
         default: "1024,1024;1024,8192;8192,1024"
       concurrency_values:
@@ -225,6 +236,10 @@ on:
         default: ""
       publish_to_dashboard:
         description: "Upload benchmark results to the dashboard"
+        type: boolean
+        default: false
+      upload_to_custom_dashboard:
+        description: "Upload benchmark results to the custom dashboard integration payload"
         type: boolean
         default: true
 
@@ -358,6 +373,8 @@ jobs:
       oot_base_image: ${{ steps.resolve.outputs.oot_base_image }}
       oot_image_source: ${{ steps.resolve.outputs.oot_image_source }}
       publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
+      upload_to_custom_dashboard: ${{ steps.resolve.outputs.upload_to_custom_dashboard }}
+      benchmark_client: ${{ steps.resolve.outputs.benchmark_client }}
     steps:
       - name: Checkout selected branch
         uses: actions/checkout@v6
@@ -367,6 +384,8 @@ jobs:
         env:
           INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
+          INPUT_UPLOAD_TO_CUSTOM_DASHBOARD: ${{ inputs.upload_to_custom_dashboard }}
+          INPUT_BENCHMARK_CLIENT: ${{ inputs.benchmark_client || 'python_benchmark_serving' }}
         run: |
           set -euo pipefail
 
@@ -388,9 +407,13 @@ jobs:
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             PUBLISH_TO_DASHBOARD=true
+            UPLOAD_TO_CUSTOM_DASHBOARD=true
           else
-            PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
+            PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-false}"
+            UPLOAD_TO_CUSTOM_DASHBOARD="${INPUT_UPLOAD_TO_CUSTOM_DASHBOARD:-true}"
           fi
+
+          BENCHMARK_CLIENT="${INPUT_BENCHMARK_CLIENT:-python_benchmark_serving}"
 
           mapfile -t VLLM_META < <(python3 - <<'PY'
           import re
@@ -463,6 +486,8 @@ jobs:
             echo "oot_base_image=${OOT_BASE_IMAGE}"
             echo "oot_image_source=${OOT_IMAGE_SOURCE}"
             echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
+            echo "upload_to_custom_dashboard=${UPLOAD_TO_CUSTOM_DASHBOARD}"
+            echo "benchmark_client=${BENCHMARK_CLIENT}"
           } >> "$GITHUB_OUTPUT"
 
           printf '### OOT benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
@@ -517,11 +542,18 @@ jobs:
             esac
           fi
 
-          printf -- '- Upload to dashboard: `%s`\n' \
-            "${PUBLISH_TO_DASHBOARD}" >> "$GITHUB_STEP_SUMMARY"
+          printf -- '- Benchmark client: `%s`\n- Upload to dashboard: `%s`\n- Upload to custom dashboard: `%s`\n' \
+            "${BENCHMARK_CLIENT}" \
+            "${PUBLISH_TO_DASHBOARD}" \
+            "${UPLOAD_TO_CUSTOM_DASHBOARD}" >> "$GITHUB_STEP_SUMMARY"
 
           if [[ "${PUBLISH_TO_DASHBOARD}" != "true" ]]; then
             printf '\nDashboard upload is disabled by workflow input, so results are kept in artifacts and run summaries only.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "${UPLOAD_TO_CUSTOM_DASHBOARD}" != "true" ]]; then
+            printf 'Custom dashboard payload upload is disabled by workflow input.\n' \
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -859,6 +891,8 @@ jobs:
       VLLM_COMMIT_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_commit }}
       VLLM_VERSION_USED: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
       PUBLISH_TO_DASHBOARD: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
+      UPLOAD_TO_CUSTOM_DASHBOARD: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      BENCHMARK_CLIENT: ${{ needs.resolve-atom-source.outputs.benchmark_client }}
     steps:
       - name: Detect container engine
         run: |
@@ -1031,15 +1065,22 @@ jobs:
             echo "Using model id: ${MODEL_SOURCE_PATH}"
           fi
 
-      - name: Prepare OOT benchmark runner in container
+      - name: Prepare benchmark client in container
         run: |
-          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
-            set -euo pipefail
-            rm -rf \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
-            mkdir -p \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
-            git clone --depth 1 \"${BENCH_SERVING_REPO_URL}\" \"${CONTAINER_BENCH_SERVING_DIR}\"
-            test -f \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\"
-          "
+          if [[ "${BENCHMARK_CLIENT}" == "python_benchmark_serving" ]]; then
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              rm -rf \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
+              mkdir -p \"${CONTAINER_BENCH_SERVING_DIR%/bench_serving}\"
+              git clone --depth 1 \"${BENCH_SERVING_REPO_URL}\" \"${CONTAINER_BENCH_SERVING_DIR}\"
+              test -f \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\"
+            "
+          else
+            $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              command -v vllm
+            "
+          fi
 
       - name: Launch OOT benchmark server
         env:
@@ -1067,42 +1108,83 @@ jobs:
           set -euo pipefail
           TRUST_REMOTE_CODE_ARG=""
           if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
-            TRUST_REMOTE_CODE_ARG="--trust-remote-code"
+            if [[ "${BENCHMARK_CLIENT}" == "vllm_bench_serve" ]]; then
+              TRUST_REMOTE_CODE_ARG="--trust_remote_code"
+            else
+              TRUST_REMOTE_CODE_ARG="--trust-remote-code"
+            fi
           fi
 
           {
-            echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
-            $CONTAINER_ENGINE exec \
-              -e ISL="${ISL}" \
-              -e OSL="${OSL}" \
-              -e CONC="${CONC}" \
-              -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
-              -e RESULT_FILENAME="${RESULT_FILENAME}" \
-              -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
-              "$CONTAINER_NAME" bash -lc "
-                set -euo pipefail
-                rm -rf \"${CONTAINER_RESULT_DIR}\"
-                mkdir -p \"${CONTAINER_RESULT_DIR}\"
-                PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
-                  --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
-                  --backend=vllm \
-                  --base-url=http://127.0.0.1:8000 \
-                  --dataset-name=random \
-                  --random-input-len=\"${ISL}\" \
-                  --random-output-len=\"${OSL}\" \
-                  --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
-                  --num-prompts=\"$(( CONC * 10 ))\" \
-                  --max-concurrency=\"${CONC}\" \
-                  ${TRUST_REMOTE_CODE_ARG} \
-                  --num-warmups=\"$(( 2 * CONC ))\" \
-                  --request-rate=inf \
-                  --ignore-eos \
-                  --save-result \
-                  --percentile-metrics=\"ttft,tpot,itl,e2el\" \
-                  --result-dir=\"${CONTAINER_RESULT_DIR}\" \
-                  --result-filename=\"${RESULT_FILENAME}.json\" \
-                  ${BENCH_EXTRA_ARGS:-}
-              "
+            echo "=== Benchmark config: ${MODEL_NAME} CLIENT=${BENCHMARK_CLIENT} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} ==="
+            if [[ "${BENCHMARK_CLIENT}" == "python_benchmark_serving" ]]; then
+              $CONTAINER_ENGINE exec \
+                -e ISL="${ISL}" \
+                -e OSL="${OSL}" \
+                -e CONC="${CONC}" \
+                -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+                -e RESULT_FILENAME="${RESULT_FILENAME}" \
+                -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                "$CONTAINER_NAME" bash -lc "
+                  set -euo pipefail
+                  rm -rf \"${CONTAINER_RESULT_DIR}\"
+                  mkdir -p \"${CONTAINER_RESULT_DIR}\"
+                  PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
+                    --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                    --backend=vllm \
+                    --base-url=http://127.0.0.1:8000 \
+                    --dataset-name=random \
+                    --random-input-len=\"${ISL}\" \
+                    --random-output-len=\"${OSL}\" \
+                    --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                    --num-prompts=\"$(( CONC * 10 ))\" \
+                    --max-concurrency=\"${CONC}\" \
+                    ${TRUST_REMOTE_CODE_ARG} \
+                    --num-warmups=\"$(( 2 * CONC ))\" \
+                    --request-rate=inf \
+                    --ignore-eos \
+                    --save-result \
+                    --percentile-metrics=\"ttft,tpot,itl,e2el\" \
+                    --result-dir=\"${CONTAINER_RESULT_DIR}\" \
+                    --result-filename=\"${RESULT_FILENAME}.json\" \
+                    ${BENCH_EXTRA_ARGS:-}
+                "
+            else
+              $CONTAINER_ENGINE exec \
+                -e ISL="${ISL}" \
+                -e OSL="${OSL}" \
+                -e CONC="${CONC}" \
+                -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
+                -e RESULT_FILENAME="${RESULT_FILENAME}" \
+                -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                "$CONTAINER_NAME" bash -lc "
+                  set -euo pipefail
+                  rm -rf \"${CONTAINER_RESULT_DIR}\"
+                  mkdir -p \"${CONTAINER_RESULT_DIR}\"
+                  vllm bench serve \
+                    --backend vllm \
+                    --base-url http://127.0.0.1:8000 \
+                    --endpoint /v1/completions \
+                    --model \"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                    --dataset-name random \
+                    --random-input-len \"${ISL}\" \
+                    --random-output-len \"${OSL}\" \
+                    --random-range-ratio \"${RANDOM_RANGE_RATIO}\" \
+                    --temperature 0.0 \
+                    --num-prompts \"$(( CONC * 10 ))\" \
+                    --max-concurrency \"${CONC}\" \
+                    ${TRUST_REMOTE_CODE_ARG} \
+                    --num-warmups \"$(( 2 * CONC ))\" \
+                    --request-rate inf \
+                    --ignore-eos \
+                    --disable-tqdm \
+                    --save-result \
+                    --percentile-metrics ttft,tpot,itl,e2el \
+                    --result-dir \"${CONTAINER_RESULT_DIR}\" \
+                    --result-filename \"${RESULT_FILENAME}.json\" \
+                    ${BENCH_EXTRA_ARGS:-}
+                "
+            fi
           } > "./${RESULT_FILENAME}.client.log" 2>&1
 
       - name: Copy OOT benchmark outputs
@@ -1137,6 +1219,8 @@ jobs:
           OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
           OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
           PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
+          UPLOAD_TO_CUSTOM_DASHBOARD="${UPLOAD_TO_CUSTOM_DASHBOARD}" \
+          BENCHMARK_CLIENT="${BENCHMARK_CLIENT}" \
           python3 - <<'PY'
           import json
           import os
@@ -1168,8 +1252,12 @@ jobs:
           data["vllm_version"] = os.environ.get("VLLM_VERSION_USED", "")
           data["oot_image_source"] = os.environ.get("OOT_IMAGE_SOURCE", "")
           data["oot_image_tag"] = os.environ.get("OOT_IMAGE_TAG_USED", "")
+          data["benchmark_client"] = os.environ.get("BENCHMARK_CLIENT", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
+          )
+          data["custom_dashboard_publish_allowed"] = (
+              os.environ.get("UPLOAD_TO_CUSTOM_DASHBOARD", "false").lower() == "true"
           )
 
           with open(result_path, "w", encoding="utf-8") as f:
@@ -1365,16 +1453,28 @@ jobs:
 
       - name: Note summary behavior
         run: |
+          printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table.\n- Benchmark client: `%s`\n- Upload to dashboard: `%s`\n- Upload to custom dashboard: `%s`\n' \
+            "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
+            "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
+            "${{ needs.resolve-atom-source.outputs.oot_image_source }}" \
+            "${{ needs.resolve-atom-source.outputs.benchmark_client }}" \
+            "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" \
+            "${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}" >> "$GITHUB_STEP_SUMMARY"
+
           if [[ "${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}" == "true" ]]; then
-            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
-              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
-              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+            printf '\nDashboard upload is enabled for this run, so this final Ubuntu summary job also reconciles the completed run for regression comparison and publishes dashboard data.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
           else
-            printf '### Summary mode\nResults from `%s@%s` using `%s` OOT image mode are shown below as a workflow summary table only. Dashboard upload is disabled for this run.\n' \
-              "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
-              "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+            printf '\nDashboard upload is disabled for this run.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}" == "true" ]]; then
+            printf 'Custom dashboard payload artifact upload is enabled for this run.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Custom dashboard payload artifact upload is disabled for this run.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Generate OOT benchmark summary table
@@ -1405,6 +1505,69 @@ jobs:
           name: oot-benchmark-summary
           path: oot_benchmark_summary.json
 
+      - name: Note skipped custom dashboard processing
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases == '0'
+        run: |
+          printf '\nNo successful benchmark result JSONs were produced, so custom dashboard payload upload was skipped.\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build custom dashboard payload
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          results = []
+          for path in sorted(Path(".").glob("*.json")):
+              if path.name in {
+                  "oot_benchmark_summary.json",
+                  "regression_report.json",
+                  "oot_custom_dashboard_payload.json",
+              }:
+                  continue
+              try:
+                  payload = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                  continue
+              if "output_throughput" not in payload:
+                  continue
+              custom_dashboard_flag = str(
+                  payload.get("custom_dashboard_publish_allowed", True)
+              ).strip().lower()
+              if custom_dashboard_flag in {"0", "false", "no"}:
+                  continue
+              results.append(payload)
+
+          payload = {
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "run_url": os.environ["RUN_URL"],
+              "atom_source_repository": "${{ needs.resolve-atom-source.outputs.atom_repository }}",
+              "atom_source_ref": "${{ needs.resolve-atom-source.outputs.atom_ref }}",
+              "oot_image_source": "${{ needs.resolve-atom-source.outputs.oot_image_source }}",
+              "benchmark_client": "${{ needs.resolve-atom-source.outputs.benchmark_client }}",
+              "results": results,
+          }
+          Path("oot_custom_dashboard_payload.json").write_text(
+              json.dumps(payload, indent=2), encoding="utf-8"
+          )
+          print(f"Wrote custom dashboard payload with {len(results)} results.")
+          PY
+
+      - name: Upload custom dashboard payload
+        if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        uses: actions/upload-artifact@v7
+        with:
+          name: oot-benchmark-custom-dashboard-input
+          path: oot_custom_dashboard_payload.json
+
       - name: Download baseline from previous successful main run
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
         id: baseline
@@ -1414,7 +1577,7 @@ jobs:
           mapfile -t CANDIDATE_RUN_IDS < <(
             {
               gh run list \
-                --workflow="ATOM vLLM OOT Benchmark" \
+                --workflow="ATOM vLLM Benchmark" \
                 --branch=main \
                 --event=workflow_dispatch \
                 --status=success \
