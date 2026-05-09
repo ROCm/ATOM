@@ -870,7 +870,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
         else:
             is_guinterleave = os.environ.get("AITER_MOE_GU_ITLV", "0") == "1"
-            print(111, is_guinterleave)
             # suffle weight
             layer.w13_weight.data = shuffle_weight(
                 layer.w13_weight, is_guinterleave=is_guinterleave, gate_up=True
