@@ -38,7 +38,6 @@ PORT="${PORT:-8000}"
 
 MEM_FRACTION="${MEM_FRACTION:-0.85}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-128}"
 CUDA_GRAPH_BS_START="${CUDA_GRAPH_BS_START:-1}"
 CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-256}"
@@ -46,7 +45,7 @@ CUDA_GRAPH_BS_END="${CUDA_GRAPH_BS_END:-256}"
 # Workload: comma-separated ISL:OSL pairs.
 ISL_OSL_LIST="${ISL_OSL_LIST:-8192:1,1:1024,8192:1024}"
 CONC_LIST="${CONC_LIST:-1,2,4,8,16}"
-RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1}"
+RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.8}"
 BACKEND="${BACKEND:-sglang}"
 
 LOAD_DUMMY="${LOAD_DUMMY:-}"
@@ -148,10 +147,8 @@ TORCHINDUCTOR_COMPILE_THREADS=128 python3 -m sglang.launch_server \
     --trust-remote-code \
     --tp-size "${TP}" \
     --kv-cache-dtype "${KV_CACHE_DTYPE}" \
-    --attention-backend aiter \
     --mem-fraction-static "${MEM_FRACTION}" \
     --page-size 1 \
-    --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
     --max-running-requests "${MAX_RUNNING_REQUESTS}" \
     --cuda-graph-bs $(seq ${CUDA_GRAPH_BS_START} ${CUDA_GRAPH_BS_END}) \
     --disable-radix-cache \
@@ -235,11 +232,15 @@ IFS=',' read -ra CONCS <<< "${CONC_LIST}"
 for PAIR in "${PAIRS[@]}"; do
     ISL="${PAIR%%:*}"
     OSL="${PAIR##*:}"
+    EFFECTIVE_RATIO="${RANDOM_RANGE_RATIO}"
+    if [[ "${ISL}" -le 1 || "${OSL}" -le 1 ]]; then
+        EFFECTIVE_RATIO=1
+    fi
     for CONC in "${CONCS[@]}"; do
-        RESULT_FILENAME="standalone-sglang-${ISL}-${OSL}-${CONC}-${RANDOM_RANGE_RATIO}"
+        RESULT_FILENAME="standalone-sglang-${ISL}-${OSL}-${CONC}-${EFFECTIVE_RATIO}"
         echo ""
         echo "========================================="
-        echo "[bench] ISL=${ISL} OSL=${OSL} CONC=${CONC}"
+        echo "[bench] ISL=${ISL} OSL=${OSL} CONC=${CONC} RATIO=${EFFECTIVE_RATIO}"
         echo "========================================="
 
         PYTHONDONTWRITEBYTECODE=1 python /tmp/sglang-benchmark/bench_serving/benchmark_serving.py \
@@ -249,7 +250,7 @@ for PAIR in "${PAIRS[@]}"; do
             --dataset-name=random \
             --random-input-len="${ISL}" \
             --random-output-len="${OSL}" \
-            --random-range-ratio "${RANDOM_RANGE_RATIO}" \
+            --random-range-ratio "${EFFECTIVE_RATIO}" \
             --num-prompts=$(( CONC * 10 )) \
             --max-concurrency="${CONC}" \
             --trust-remote-code \
@@ -305,7 +306,6 @@ for script in "${LOG_ROOT}"/scripts/*.sh; do
         -e "s|\${MODEL_PATH}|${MODEL_PATH}|g" \
         -e "s|\${MEM_FRACTION}|${MEM_FRACTION}|g" \
         -e "s|\${KV_CACHE_DTYPE}|${KV_CACHE_DTYPE}|g" \
-        -e "s|\${CHUNKED_PREFILL_SIZE}|${CHUNKED_PREFILL_SIZE}|g" \
         -e "s|\${MAX_RUNNING_REQUESTS}|${MAX_RUNNING_REQUESTS}|g" \
         -e "s|\${CUDA_GRAPH_BS_START}|${CUDA_GRAPH_BS_START}|g" \
         -e "s|\${CUDA_GRAPH_BS_END}|${CUDA_GRAPH_BS_END}|g" \
