@@ -155,7 +155,9 @@ RUN echo "========== [OOT] Restore base image triton ==========" && \
     rm -f /tmp/triton_pip_show.txt && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')"
 
-# unisntall existing triton (acc issue) and install known good version    
+# Qwen3-next encounter accuracy issue with the triton from base image
+# we install verified good version triton==3.6.0 here as a temporary fix
+# this should be removed after the triton issue is resolved  
 RUN echo "========== [OOT] Reinstall known good triton ==========" && \
     pip uninstall -y triton amd-triton && \
     pip install triton==3.6.0
@@ -396,8 +398,10 @@ RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
 RUN pip install rocm-trace-lite && \
     rtl --version || true
 
-# unisntall existing triton (acc issue) and install known good version    
-RUN pip uninstall -y triton && \
+# Qwen3-next encounter accuracy issue with the triton from base image
+# we install verified good version triton==3.6.0 here as a temporary fix
+# this should be removed after the triton issue is resolved
+RUN pip uninstall -y triton amd-triton && \
     pip install triton==3.6.0
 RUN pip show triton || true
 
