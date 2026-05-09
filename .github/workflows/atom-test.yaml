@@ -47,7 +47,7 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: actions/checkout@v6
 
-      - name: Download and check pre-checkin signal
+      - name: Wait for Pre Checkin workflow
         if: ${{ github.event_name != 'workflow_dispatch' }}
         run: bash ./.github/scripts/check_signal.sh
         env:
@@ -545,6 +545,7 @@ jobs:
         timeout-minutes: 30
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
+          CLIENT_COMMAND: ${{ matrix.client_command || '' }}
         run: |
           set -euo pipefail
           echo ""
@@ -561,6 +562,7 @@ jobs:
           echo ""
           echo "========== Running accuracy test =========="
           docker exec \
+            -e CLIENT_COMMAND="${CLIENT_COMMAND}" \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \

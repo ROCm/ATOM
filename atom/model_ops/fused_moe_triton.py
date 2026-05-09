@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from typing import Any
 import logging
 from math import prod
+from aiter import ActivationType
 from aiter.jit.utils.chip_info import get_gfx
 from atom.model_ops.utils import has_triton_kernels
 
@@ -32,9 +33,14 @@ logger = logging.getLogger("atom")
 
 if has_triton_kernels():
     try:
-        from triton_kernels.matmul_ogs import matmul_ogs
+        import triton_kernels.swiglu
+        from triton_kernels.matmul_ogs import (
+            FnSpecs,
+            FusedActivation,
+            PrecisionConfig,
+            matmul_ogs,
+        )
         from triton_kernels.routing import routing
-        from triton_kernels.matmul_ogs import PrecisionConfig
     except (AttributeError, ImportError) as e:
         logger.error(
             "Failed to import Triton kernels. Please make sure your triton "
@@ -283,28 +289,45 @@ def triton_kernel_fused_experts(
     )
 
     with _amd_smem_safe_tile():
-        matmul_ogs(
-            hidden_states,
-            w1,
-            w1_bias,
-            routing_data,
-            gather_indx=gather_indx,
-            precision_config=w13_precision_config,
-            gammas=gammas if apply_router_weight_on_input else None,
-            y=raw_intermediate,
-        )
+        if activation == ActivationType.Swiglu:
+            # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
+            act = FusedActivation(
+                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
+                (swiglu_alpha, swiglu_limit),
+                2,
+            )
+            matmul_ogs(
+                hidden_states,
+                w1,
+                w1_bias,
+                routing_data,
+                gather_indx=gather_indx,
+                precision_config=w13_precision_config,
+                gammas=gammas if apply_router_weight_on_input else None,
+                fused_activation=act,
+                y=intermediate_cache,
+            )
+        else:
+            # SiLU (DeepSeek): concatenated [gate | up] layout, manual activation
+            raw_intermediate = matmul_ogs(
+                hidden_states,
+                w1,
+                w1_bias,
+                routing_data,
+                gather_indx=gather_indx,
+                precision_config=w13_precision_config,
+                gammas=gammas if apply_router_weight_on_input else None,
+            )
+            raw_2d = raw_intermediate.view(M * topk, N)
+            gate = raw_2d[:, :half_N]
+            up = raw_2d[:, half_N:]
+            if swiglu_limit > 0:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(-swiglu_limit, swiglu_limit)
+            intermediate_cache = intermediate_cache.view(M * topk, half_N)
+            intermediate_cache.copy_(torch.nn.functional.silu(gate) * up)
+            intermediate_cache = intermediate_cache.view(batch_dim, M * topk, half_N)
 
-    # Standard SiLU/SwiGLU activation: silu(gate) * up
-    # With optional swiglu_limit clamping (V4: limit=10.0)
-    raw_2d = raw_intermediate.view(M * topk, N)
-    gate = raw_2d[:, :half_N]
-    up = raw_2d[:, half_N:]
-    if swiglu_limit > 0:
-        gate = gate.clamp(max=swiglu_limit)
-        up = up.clamp(-swiglu_limit, swiglu_limit)
-    intermediate_cache[0] = torch.nn.functional.silu(gate) * up
-
-    with _amd_smem_safe_tile():
         matmul_ogs(
             intermediate_cache.view(M * topk, half_N),
             w2,

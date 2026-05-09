@@ -77,6 +77,10 @@ class PagedAttentionImpl(nn.Module):
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
+        # Set by the attention backend's build_kv_cache_tensor when KV cache is
+        # allocated in flash layout [num_blocks, block_size, num_kv_heads, head_dim]
+        # for aiter triton unified_attention. AiterBackend keeps this False.
+        self.use_flash_layout = False
 
         # for plugin mode(vllm), the query quant is disabled for now
         if is_vllm():
@@ -229,7 +233,7 @@ class PagedAttentionImpl(nn.Module):
                 k_scale,
                 v_scale,
                 self.rotary_emb.is_neox_style,
-                flash_layout=False,
+                flash_layout=self.use_flash_layout,
                 apply_scale=self.kv_cache_dtype.startswith("fp8"),
                 offs=None,
                 q_out=q,
@@ -372,71 +376,101 @@ class PagedAttentionImpl(nn.Module):
 
         o = torch.empty_like(q)
         num_seqs = attn_metadata.context_lens.shape[0]
-        _, num_q_heads_total, head_size = q.shape
-        num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
-        # assume all query have same length
-        query_group_size = attn_metadata.max_seqlen_q * (
-            num_q_heads_total // num_kv_heads
-        )
-        assert num_q_heads_total % num_kv_heads == 0
 
-        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        if self.use_flash_layout:
+            sliding_window = (
+                (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
+            )
 
-        context_partition_size = 256
-        if self.sliding_window > 0:
-            max_context_partition_num = 1
-            context_partition_size = 128
+            # KV cache is already in flash layout (4D), allocated by
+            # TritonMHAMetadataBuilder.build_kv_cache_tensor.
+            nkv = k_cache.shape[2]
+            descale_shape = (num_seqs, nkv)
 
-        # Output buffers (same as Triton)
-        intermediate_shape = (
-            num_seqs,
-            num_kv_heads,
-            max_context_partition_num,
-            query_group_size,
-        )
-        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-        max_logits = torch.empty(
-            intermediate_shape, dtype=torch.float32, device=q.device
-        )
-        temporary_output = torch.empty(
-            *intermediate_shape,
-            head_size,
-            dtype=q.dtype,
-            device=q.device,
-        )
+            unified_attention(
+                q,
+                k_cache,
+                v_cache,
+                o,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                seqused_k=attn_metadata.context_lens,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=None,
+                window_size=sliding_window,
+                block_table=attn_metadata.block_tables,
+                softcap=0,
+                q_descale=None,
+                k_descale=self.kv_scale.expand(descale_shape),
+                v_descale=self.kv_scale.expand(descale_shape),
+                sinks=self.sinks,
+            )
+        else:
+            _, num_q_heads_total, head_size = q.shape
+            num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
+            query_group_size = attn_metadata.max_seqlen_q * (
+                num_q_heads_total // num_kv_heads
+            )
+            assert num_q_heads_total % num_kv_heads == 0
 
-        if k_scale is not None and k_scale.numel() > 1:
-            k_scale = k_scale.unsqueeze(-1)
-            v_scale = v_scale.unsqueeze(-1)
+            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
 
-        compute_type = (
-            torch.bfloat16
-            if self.kv_cache_dtype == "bf16"  # or per_tensor
-            else aiter.dtypes.fp8
-        )
-        torch.ops.aiter.pa_decode_gluon(
-            o,
-            q,
-            k_cache,
-            v_cache,
-            attn_metadata.context_lens,
-            attn_metadata.block_tables,
-            self.scale,
-            attn_metadata.max_seqlen_q,
-            max_context_partition_num,
-            context_partition_size,
-            compute_type,
-            None,  # q_scale
-            None if self.kv_cache_dtype == "bf16" else k_scale,
-            None if self.kv_cache_dtype == "bf16" else v_scale,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=temporary_output,
-            alibi_slopes=None,
-            sinks=self.sinks,
-            sliding_window=self.sliding_window,
-            ps=True,
-        )
+            context_partition_size = 256
+            if self.sliding_window > 0:
+                max_context_partition_num = 1
+                context_partition_size = 128
+
+            intermediate_shape = (
+                num_seqs,
+                num_kv_heads,
+                max_context_partition_num,
+                query_group_size,
+            )
+            exp_sums = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            max_logits = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            temporary_output = torch.empty(
+                *intermediate_shape,
+                head_size,
+                dtype=q.dtype,
+                device=q.device,
+            )
+
+            if k_scale is not None and k_scale.numel() > 1:
+                k_scale = k_scale.unsqueeze(-1)
+                v_scale = v_scale.unsqueeze(-1)
+
+            compute_type = (
+                torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
+            )
+            torch.ops.aiter.pa_decode_gluon(
+                o,
+                q,
+                k_cache,
+                v_cache,
+                attn_metadata.context_lens,
+                attn_metadata.block_tables,
+                self.scale,
+                attn_metadata.max_seqlen_q,
+                max_context_partition_num,
+                context_partition_size,
+                compute_type,
+                None,  # q_scale
+                None if self.kv_cache_dtype == "bf16" else k_scale,
+                None if self.kv_cache_dtype == "bf16" else v_scale,
+                exp_sums=exp_sums,
+                max_logits=max_logits,
+                temporary_output=temporary_output,
+                alibi_slopes=None,
+                sinks=self.sinks,
+                sliding_window=self.sliding_window,
+                ps=True,
+            )
 
         return o
 
@@ -540,19 +574,34 @@ class PagedAttentionImpl(nn.Module):
         # value:  [num_blocks, 1, num_kv_heads, head_size]
 
         attn_metadata = fwd_ctx.attn_metadata
-        block_tables = attn_metadata.block_tables
 
         o = torch.empty_like(q)
-        descale_shape = (attn_metadata.cu_seqlens_q.shape[0] - 1, k.shape[1])
+        num_seqs = attn_metadata.cu_seqlens_q.shape[0] - 1
+        descale_shape = (num_seqs, k.shape[1])
         sliding_window = (
             (self.sliding_window - 1, 0)
             if self.sliding_window is not None
             else (-1, -1)
         )
+
+        # `block_tables` is always populated by TritonMHAMetadataBuilder.
+        # For pure prefill (no cached tokens) it is the fake table built in
+        # prepare_prefill that maps seq i to token indices
+        # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
+        # treated as kv_cache with block_size=1.
+        if attn_metadata.has_cached:
+            k_for_attn = k_cache
+            v_for_attn = v_cache
+        else:
+            #   k: [total_tokens, num_kv_heads, head_size]
+            #     -> [total_tokens, 1, num_kv_heads, head_size]
+            k_for_attn = k.unsqueeze(1)
+            v_for_attn = v.unsqueeze(1)
+
         unified_attention(
             q,
-            k_cache,
-            v_cache,
+            k_for_attn,
+            v_for_attn,
             o,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
             seqused_k=attn_metadata.context_lens,
@@ -562,7 +611,7 @@ class PagedAttentionImpl(nn.Module):
             causal=True,
             alibi_slopes=None,
             window_size=sliding_window,
-            block_table=block_tables,
+            block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
             k_descale=self.kv_scale.expand(descale_shape),
@@ -577,9 +626,11 @@ class PagedAttentionImpl(nn.Module):
         ctx = fwd_ctx.context
 
         if ctx.is_prefill:
+            if self.use_flash_layout:
+                return self.prefill_attention_triton
             return self.prefill_attention
         else:
-            if self.use_triton_attn:
+            if self.use_triton_attn or self.use_flash_layout:
                 return self.paged_attention_triton
             else:
                 # Only use pa persistent when block_size == 1024
