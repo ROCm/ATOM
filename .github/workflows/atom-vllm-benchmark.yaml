@@ -12,7 +12,24 @@ on:
   workflow_dispatch:
     inputs:
       model_slot_1:
-        description: "Manual selection slot 1: choose a model family"
+        description: |
+          Manual selection slot 1: choose a model family.
+          TP guide:
+          - DeepSeek-R1 FP8: 8
+          - DeepSeek-R1 MXFP4: 8
+          - DeepSeek-V3.2 FP8: 8
+          - MiniMax-M2.5: 2
+          - gpt-oss-120b: 1
+          - GLM-5.1-FP8: 8
+          - Kimi-K2-Thinking-MXFP4: 4,8
+          - Kimi-K2.5-MXFP4: 2,4,8
+          - Qwen3.5-397B-A17B-FP8: 4,8
+          - Qwen3.5-397B-A17B-MXFP4: 4
+          - Qwen3.5-397B-A17B: 4,8
+          - Qwen3-Next-80B-A3B-Instruct-FP8: 1,2,4
+          In `tp_sizes_slot_N`, use comma-separated TP sizes like `4,8`.
+          Use `all` to benchmark all TP sizes supported by the selected model family.
+          If a family supports only one TP size, leaving `tp_sizes_slot_N` empty will use that only TP size.
         type: choice
         default: none
         options:
@@ -30,7 +47,7 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_1:
-        description: "TP sizes for slot 1 (for example: 4,8 or all)"
+        description: "TP sizes for slot 1. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family."
         type: string
         default: ""
       model_slot_2:
@@ -52,7 +69,7 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_2:
-        description: "TP sizes for slot 2 (for example: 4,8 or all)"
+        description: "TP sizes for slot 2. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
         type: string
         default: ""
       model_slot_3:
@@ -74,7 +91,7 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_3:
-        description: "TP sizes for slot 3 (for example: 4,8 or all)"
+        description: "TP sizes for slot 3. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
         type: string
         default: ""
       model_slot_4:
@@ -96,7 +113,7 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_4:
-        description: "TP sizes for slot 4 (for example: 4,8 or all)"
+        description: "TP sizes for slot 4. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
         type: string
         default: ""
       model_slot_5:
@@ -118,7 +135,7 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_5:
-        description: "TP sizes for slot 5 (for example: 4,8 or all)"
+        description: "TP sizes for slot 5. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
         type: string
         default: ""
       model_slot_6:
@@ -140,7 +157,7 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_6:
-        description: "TP sizes for slot 6 (for example: 4,8 or all)"
+        description: "TP sizes for slot 6. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
         type: string
         default: ""
       model_slot_7:
@@ -162,7 +179,7 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_7:
-        description: "TP sizes for slot 7 (for example: 4,8 or all)"
+        description: "TP sizes for slot 7. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
         type: string
         default: ""
       model_slot_8:
@@ -184,73 +201,22 @@ on:
           - Qwen3.5-397B-A17B
           - Qwen3-Next-80B-A3B-Instruct-FP8
       tp_sizes_slot_8:
-        description: "TP sizes for slot 8 (for example: 4,8 or all)"
+        description: "TP sizes for slot 8. Use comma-separated values like 4,8. Use all to benchmark every TP size supported by the selected model family. See slot 1 guide above."
         type: string
         default: ""
-      model_slot_9:
-        description: "Manual selection slot 9: choose a model family"
-        type: choice
-        default: none
-        options:
-          - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_9:
-        description: "TP sizes for slot 9 (for example: 4,8 or all)"
+      isl_osl_pairs:
+        description: |
+          Benchmark ISL/OSL pairs.
+          Input as semicolon-separated `input_length,output_length` pairs.
+          Example: 1024,1024;1024,8192;8192,1024
         type: string
-        default: ""
-      model_slot_10:
-        description: "Manual selection slot 10: choose a model family"
-        type: choice
-        default: none
-        options:
-          - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_10:
-        description: "TP sizes for slot 10 (for example: 4,8 or all)"
+        default: "1024,1024;1024,8192;8192,1024"
+      concurrency_values:
+        description: "Benchmark concurrency values. Use comma-separated values from 4,8,16,32,64,128,256,512. The workflow will benchmark exactly the values you provide."
         type: string
-        default: ""
-      model_slot_11:
-        description: "Manual selection slot 11: choose a model family"
-        type: choice
-        default: none
-        options:
-          - none
-          - DeepSeek-R1 FP8
-          - DeepSeek-R1 MXFP4
-          - DeepSeek-V3.2 FP8
-          - MiniMax-M2.5
-          - gpt-oss-120b
-          - GLM-5.1-FP8
-          - Kimi-K2-Thinking-MXFP4
-          - Kimi-K2.5-MXFP4
-          - Qwen3.5-397B-A17B-FP8
-          - Qwen3.5-397B-A17B-MXFP4
-          - Qwen3.5-397B-A17B
-          - Qwen3-Next-80B-A3B-Instruct-FP8
-      tp_sizes_slot_11:
-        description: "TP sizes for slot 11 (for example: 4,8 or all)"
+        default: "4,8,16,32,64,128,256,512"
+      random_range_ratios:
+        description: "Benchmark random range ratios. Use comma-separated values like 0.8,1.0. Leave empty to default to 0.8."
         type: string
         default: ""
       oot_image:
@@ -261,15 +227,6 @@ on:
         description: "Upload benchmark results to the dashboard"
         type: boolean
         default: true
-      param_lists:
-        description: |
-          "Benchmark parameter lists.
-          Input as a single or multiple sets (comma-separated, semicolon between sets),
-          format: input_length,output_length,concurrency,random_range_ratio.
-          Example (single set): 1024,1024,64,0.8
-          Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
-        type: string
-        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,1024,256,0.8;1024,1024,512,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;1024,8192,128,0.8;1024,8192,256,0.8;1024,8192,512,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8;8192,1024,256,0.8;8192,1024,512,0.8"
 
 jobs:
   wait-for-older-manual-runs:
@@ -569,44 +526,37 @@ jobs:
           fi
 
   parse-param-lists:
-    name: Parse parameter lists
+    name: Parse benchmark parameter inputs
     needs: [wait-for-older-manual-runs]
     runs-on: ubuntu-latest
     outputs:
-      matrix_json: ${{ steps.parse-param-lists.outputs.matrix_json }}
-      param_lists: ${{ steps.parse-param-lists.outputs.param_lists }}
+      matrix_json: ${{ steps.parse-benchmark-params.outputs.matrix_json }}
+      isl_osl_pairs: ${{ steps.parse-benchmark-params.outputs.isl_osl_pairs }}
+      concurrency_values: ${{ steps.parse-benchmark-params.outputs.concurrency_values }}
+      random_range_ratios: ${{ steps.parse-benchmark-params.outputs.random_range_ratios }}
     steps:
-      - name: Parse parameter lists
-        id: parse-param-lists
+      - name: Parse benchmark parameter inputs
+        id: parse-benchmark-params
+        env:
+          ISL_OSL_PAIRS: ${{ inputs.isl_osl_pairs || '1024,1024;1024,8192;8192,1024' }}
+          CONCURRENCY_VALUES: ${{ inputs.concurrency_values || '4,8,16,32,64,128,256,512' }}
+          RANDOM_RANGE_RATIOS: ${{ inputs.random_range_ratios || '' }}
         run: |
-          PARAM_LISTS="${{ inputs.param_lists || '1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8' }}"
-          echo "Using param_lists: ${PARAM_LISTS}"
-          printf 'param_lists=%s\n' "${PARAM_LISTS}" >> "$GITHUB_OUTPUT"
-          IFS=';' read -ra SETS <<< "${PARAM_LISTS}"
-          MATRIX_JSON="["
-          SEP=""
-          for SET in "${SETS[@]}"; do
-            IFS=',' read -ra PARAMS <<< "$SET"
-            INPUT_LEN="${PARAMS[0]}"
-            OUTPUT_LEN="${PARAMS[1]}"
-            CONCURRENCY="${PARAMS[2]}"
-            RANDOM_RANGE_RATIO="${PARAMS[3]}"
-            case "${CONCURRENCY}" in
-              4|8|16|32|64|128|256|512) ;;
-              *)
-                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64,128,256,512"
-                exit 1
-                ;;
-            esac
-            MATRIX_JSON="${MATRIX_JSON}${SEP}{\"input_length\":${INPUT_LEN},\"output_length\":${OUTPUT_LEN},\"concurrency\":${CONCURRENCY},\"random_range_ratio\":${RANDOM_RANGE_RATIO}}"
-            SEP=","
-          done
-          MATRIX_JSON="${MATRIX_JSON}]"
-          echo "matrix_json=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+          echo "Using isl_osl_pairs: ${ISL_OSL_PAIRS}"
+          echo "Using concurrency_values: ${CONCURRENCY_VALUES}"
+          echo "Using random_range_ratios: ${RANDOM_RANGE_RATIOS:-<default 0.8>}"
+          printf 'isl_osl_pairs=%s\n' "${ISL_OSL_PAIRS}" >> "$GITHUB_OUTPUT"
+          printf 'concurrency_values=%s\n' "${CONCURRENCY_VALUES}" >> "$GITHUB_OUTPUT"
+          printf 'random_range_ratios=%s\n' "${RANDOM_RANGE_RATIOS}" >> "$GITHUB_OUTPUT"
+          python3 .github/scripts/build_oot_benchmark_param_matrix.py \
+            --isl-osl-pairs "${ISL_OSL_PAIRS}" \
+            --concurrency-values "${CONCURRENCY_VALUES}" \
+            --random-range-ratios "${RANDOM_RANGE_RATIOS}" \
+            >> "$GITHUB_OUTPUT"
 
-      - name: Print matrix JSON
+      - name: Print benchmark parameter matrix JSON
         run: |
-          echo "Matrix JSON: ${{ steps.parse-param-lists.outputs.matrix_json }}"
+          echo "Matrix JSON: ${{ steps.parse-benchmark-params.outputs.matrix_json }}"
 
   load-models:
     name: Load OOT model configs
@@ -639,12 +589,6 @@ jobs:
           TP_SIZES_SLOT_7: ${{ inputs.tp_sizes_slot_7 || '' }}
           MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
           TP_SIZES_SLOT_8: ${{ inputs.tp_sizes_slot_8 || '' }}
-          MODEL_SLOT_9: ${{ inputs.model_slot_9 || 'none' }}
-          TP_SIZES_SLOT_9: ${{ inputs.tp_sizes_slot_9 || '' }}
-          MODEL_SLOT_10: ${{ inputs.model_slot_10 || 'none' }}
-          TP_SIZES_SLOT_10: ${{ inputs.tp_sizes_slot_10 || '' }}
-          MODEL_SLOT_11: ${{ inputs.model_slot_11 || 'none' }}
-          TP_SIZES_SLOT_11: ${{ inputs.tp_sizes_slot_11 || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
