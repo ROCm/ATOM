@@ -187,6 +187,72 @@ on:
         description: "TP sizes for slot 8 (for example: 4,8 or all)"
         type: string
         default: ""
+      model_slot_9:
+        description: "Manual selection slot 9: choose a model family"
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8
+          - DeepSeek-R1 MXFP4
+          - DeepSeek-V3.2 FP8
+          - MiniMax-M2.5
+          - gpt-oss-120b
+          - GLM-5.1-FP8
+          - Kimi-K2-Thinking-MXFP4
+          - Kimi-K2.5-MXFP4
+          - Qwen3.5-397B-A17B-FP8
+          - Qwen3.5-397B-A17B-MXFP4
+          - Qwen3.5-397B-A17B
+          - Qwen3-Next-80B-A3B-Instruct-FP8
+      tp_sizes_slot_9:
+        description: "TP sizes for slot 9 (for example: 4,8 or all)"
+        type: string
+        default: ""
+      model_slot_10:
+        description: "Manual selection slot 10: choose a model family"
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8
+          - DeepSeek-R1 MXFP4
+          - DeepSeek-V3.2 FP8
+          - MiniMax-M2.5
+          - gpt-oss-120b
+          - GLM-5.1-FP8
+          - Kimi-K2-Thinking-MXFP4
+          - Kimi-K2.5-MXFP4
+          - Qwen3.5-397B-A17B-FP8
+          - Qwen3.5-397B-A17B-MXFP4
+          - Qwen3.5-397B-A17B
+          - Qwen3-Next-80B-A3B-Instruct-FP8
+      tp_sizes_slot_10:
+        description: "TP sizes for slot 10 (for example: 4,8 or all)"
+        type: string
+        default: ""
+      model_slot_11:
+        description: "Manual selection slot 11: choose a model family"
+        type: choice
+        default: none
+        options:
+          - none
+          - DeepSeek-R1 FP8
+          - DeepSeek-R1 MXFP4
+          - DeepSeek-V3.2 FP8
+          - MiniMax-M2.5
+          - gpt-oss-120b
+          - GLM-5.1-FP8
+          - Kimi-K2-Thinking-MXFP4
+          - Kimi-K2.5-MXFP4
+          - Qwen3.5-397B-A17B-FP8
+          - Qwen3.5-397B-A17B-MXFP4
+          - Qwen3.5-397B-A17B
+          - Qwen3-Next-80B-A3B-Instruct-FP8
+      tp_sizes_slot_11:
+        description: "TP sizes for slot 11 (for example: 4,8 or all)"
+        type: string
+        default: ""
       oot_image:
         description: "Optional OOT benchmark image override. Leave empty to resolve main to the same-digest published nightly tag behind vllm-latest, or rebuild from the selected non-main branch."
         type: string
@@ -203,7 +269,7 @@ on:
           Example (single set): 1024,1024,64,0.8
           Example (multiple sets): 1024,1024,64,0.8;2048,1024,32,0.7"
         type: string
-        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8"
+        default: "1024,1024,4,0.8;1024,1024,8,0.8;1024,1024,16,0.8;1024,1024,32,0.8;1024,1024,64,0.8;1024,1024,128,0.8;1024,1024,256,0.8;1024,1024,512,0.8;1024,8192,4,0.8;1024,8192,8,0.8;1024,8192,16,0.8;1024,8192,32,0.8;1024,8192,64,0.8;1024,8192,128,0.8;1024,8192,256,0.8;1024,8192,512,0.8;8192,1024,4,0.8;8192,1024,8,0.8;8192,1024,16,0.8;8192,1024,32,0.8;8192,1024,64,0.8;8192,1024,128,0.8;8192,1024,256,0.8;8192,1024,512,0.8"
 
 jobs:
   wait-for-older-manual-runs:
@@ -526,9 +592,9 @@ jobs:
             CONCURRENCY="${PARAMS[2]}"
             RANDOM_RANGE_RATIO="${PARAMS[3]}"
             case "${CONCURRENCY}" in
-              4|8|16|32|64|128|256) ;;
+              4|8|16|32|64|128|256|512) ;;
               *)
-                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64,128,256"
+                echo "Unsupported concurrency: ${CONCURRENCY}. Allowed values: 4,8,16,32,64,128,256,512"
                 exit 1
                 ;;
             esac
@@ -573,6 +639,12 @@ jobs:
           TP_SIZES_SLOT_7: ${{ inputs.tp_sizes_slot_7 || '' }}
           MODEL_SLOT_8: ${{ inputs.model_slot_8 || 'none' }}
           TP_SIZES_SLOT_8: ${{ inputs.tp_sizes_slot_8 || '' }}
+          MODEL_SLOT_9: ${{ inputs.model_slot_9 || 'none' }}
+          TP_SIZES_SLOT_9: ${{ inputs.tp_sizes_slot_9 || '' }}
+          MODEL_SLOT_10: ${{ inputs.model_slot_10 || 'none' }}
+          TP_SIZES_SLOT_10: ${{ inputs.tp_sizes_slot_10 || '' }}
+          MODEL_SLOT_11: ${{ inputs.model_slot_11 || 'none' }}
+          TP_SIZES_SLOT_11: ${{ inputs.tp_sizes_slot_11 || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -663,27 +735,18 @@ jobs:
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
               model_params = []
               seen = set()
-              # Run all benchmark cases at the two highest supported concurrency levels too.
-              extra_concurrency = (128, 256)
 
               for param in params:
-                  variants = [param]
-                  for concurrency in extra_concurrency:
-                      variant = dict(param)
-                      variant["concurrency"] = concurrency
-                      variants.append(variant)
-
-                  for variant in variants:
-                      key = (
-                          int(variant["input_length"]),
-                          int(variant["output_length"]),
-                          int(variant["concurrency"]),
-                          str(variant["random_range_ratio"]),
-                      )
-                      if key in seen:
-                          continue
-                      seen.add(key)
-                      model_params.append(variant)
+                  key = (
+                      int(param["input_length"]),
+                      int(param["output_length"]),
+                      int(param["concurrency"]),
+                      str(param["random_range_ratio"]),
+                  )
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  model_params.append(param)
 
               for param in model_params:
                   pair = f'{param["input_length"]}x{param["output_length"]}'

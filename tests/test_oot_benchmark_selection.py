@@ -95,6 +95,26 @@ def test_manual_selection_rejects_unsupported_tp_size():
         resolver.resolve_manual_variants(catalog, [("DeepSeek-R1 FP8", "4")])
 
 
+def test_manual_selection_defaults_single_variant_family_when_tp_is_blank():
+    catalog = _load_catalog()
+    resolver = _load_selection_module()
+
+    selected = resolver.resolve_manual_variants(catalog, [("MiniMax-M2.5", "")])
+
+    assert [model["prefix"] for model in selected] == ["MiniMax-M2.5-tp2"]
+
+
+def test_manual_selection_requires_tp_sizes_for_multi_variant_family():
+    catalog = _load_catalog()
+    resolver = _load_selection_module()
+
+    with pytest.raises(
+        ValueError,
+        match="TP sizes are required when selecting Qwen3.5-397B-A17B-FP8",
+    ):
+        resolver.resolve_manual_variants(catalog, [("Qwen3.5-397B-A17B-FP8", "")])
+
+
 def test_scheduled_selection_expands_all_variants_in_selected_group():
     catalog = _load_catalog()
     resolver = _load_selection_module()
