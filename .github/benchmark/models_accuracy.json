@@ -27,7 +27,7 @@
     "model_name": "DeepSeek-V4-Pro",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8",
-    "env_vars": "ATOM_USE_TRITON_MOE=1",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
     "accuracy_threshold": 0.92,
