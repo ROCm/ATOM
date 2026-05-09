@@ -40,6 +40,10 @@ class KimiK25ForCausalLM(nn.Module):
         "vision_tower.",
         "mm_projector.",
     ]
+    quant_exclude_name_mapping = {
+        "language_model.model.": "model.",
+        "language_model.lm_head": "lm_head",
+    }
 
     def __init__(
         self,
