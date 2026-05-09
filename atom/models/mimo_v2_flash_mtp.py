@@ -10,6 +10,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.linear import ReplicatedLinear
 from atom.models.utils import IntermediateTensors, maybe_prefix
 from atom.utils.decorators import support_torch_compile
 
@@ -113,7 +114,13 @@ class MiMoV2FlashMTPPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.eh_proj = ReplicatedLinear(
+            config.hidden_size * 2,
+            config.hidden_size,
+            bias=False,
+            quant_config=atom_config.quant_config,
+            prefix=maybe_prefix(prefix, "eh_proj"),
+        )
 
         self.mtp_block = MiMoV2FlashMTPLayer(
             atom_config=atom_config,

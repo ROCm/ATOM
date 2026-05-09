@@ -980,13 +980,19 @@ def sparse_attn_indexer(
     if forward_context.context.is_dummy_run:
         # dummy runner
         return weights
-    num_decode_tokens = context.batch_size if not context.is_prefill else 0
+    # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
+    num_decode_tokens = (
+        context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
+    )
+    runner_block_size = get_current_atom_config().kv_cache_block_size
+    kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     indexer_k_quant_and_cache(
         k,
         kv_cache,
         slot_mapping,
         quant_block_size,
         scale_fmt,
+        preshuffle=True,
     )
     if context.is_prefill:
         if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
@@ -1018,6 +1024,7 @@ def sparse_attn_indexer(
                 if prefill_metadata.has_cached
                 else prefill_metadata.cu_seqlens_q
             ),
+            preshuffle=True,
         )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
@@ -1069,6 +1076,8 @@ def sparse_attn_indexer(
             decode_metadata.context_lens,
             attn_metadata.block_tables,
             max_model_len,
+            KVBlockSize=runner_block_size,
+            Preshuffle=True,
         )
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
@@ -1161,7 +1170,7 @@ class Indexer(nn.Module):
         self.weights_proj = ReplicatedLinear(
             hidden_size,
             self.n_head,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5

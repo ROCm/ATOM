@@ -62,6 +62,7 @@ def make_compress_plans(
     device: torch.device,
     *,
     plan_buffers: dict | None = None,
+    decode_capacity_per_ratio: dict[int, int] | None = None,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
 
@@ -80,6 +81,18 @@ def make_compress_plans(
                     the returned `compress_plan_gpu` / `write_plan_gpu` views
                     have stable data pointers across calls. When None, the
                     legacy fresh-allocation path is used (eager only).
+      decode_capacity_per_ratio: optional dict[ratio] -> int. Slice length
+                    for the returned `compress_plan_gpu`. When PROVIDED:
+                    the slice is exactly that fixed value (independent of
+                    `n_compress`) — required by the decode CUDAGraph path
+                    so capture and replay produce kernel calls with
+                    identical tensor shapes. Caller must size this to the
+                    decode worst case (`max_decode_tokens // ratio + bs`).
+                    When NONE: the slice is exactly `n_compress` (tight,
+                    eager-only) — gives the smallest possible kernel grid.
+                    The slice is contiguous-from-base so the data pointer
+                    is stable; only `shape[0]` shrinks. The underlying
+                    buffer is always sized to the prefill worst case.
 
     Returns:
       dict[ratio] -> CompressPlan. Empty dict if `extend_lens_cpu.sum() == 0`
@@ -96,15 +109,27 @@ def make_compress_plans(
     if total == 0 or bs == 0:
         if plan_buffers is None:
             return out
-        # Capture path with empty fwd: fully sentinel-fill the buffers and
-        # return CompressPlans so addresses are stable. Skipped via num_*=0.
+        # Empty fwd: produce CompressPlans pointing at the pre-allocated
+        # buffers so capture-time addresses match replay-time addresses
+        # even on a zero-token fwd. Skipped via num_*=0.
+        #
+        # CG path (decode_capacity_per_ratio provided): slice = fixed cap.
+        # Eager path (None): slice = 0 — kernel grid is empty, no work
+        # dispatched, no sentinel fill required.
         for ratio, _ in unique_ratios_overlap:
             cbuf = plan_buffers[ratio]["compress"]
             wbuf = plan_buffers[ratio]["write"]
-            cbuf.np[:].fill(-1)
+            cap = (
+                decode_capacity_per_ratio.get(ratio)
+                if decode_capacity_per_ratio is not None
+                else 0
+            )
+            if cap > 0:
+                cbuf.np[:cap].fill(-1)
+            compress_plan_gpu = cbuf.copy_to_gpu(cap if cap > 0 else 0)
             wbuf.np[:].fill(-1)
             out[ratio] = CompressPlan(
-                compress_plan_gpu=cbuf.copy_to_gpu(),
+                compress_plan_gpu=compress_plan_gpu,
                 write_plan_gpu=wbuf.copy_to_gpu(),
                 num_compress=0,
                 num_write=0,
@@ -163,9 +188,19 @@ def make_compress_plans(
         if plan_buffers is not None:
             cbuf = plan_buffers[ratio]["compress"]
             wbuf = plan_buffers[ratio]["write"]
-            assert n_compress <= cbuf.np.shape[0], (
-                f"ratio={ratio} num_compress={n_compress} exceeds buffer "
-                f"capacity {cbuf.np.shape[0]}; bump in builder __init__."
+            full_cap = cbuf.np.shape[0]
+            # CG path: fixed slice (capture / replay must match). Eager
+            # path: slice = n_compress (smallest possible kernel grid).
+            cap = (
+                decode_capacity_per_ratio.get(ratio)
+                if decode_capacity_per_ratio is not None
+                else None
+            )
+            slice_cap = n_compress if cap is None else cap
+            assert n_compress <= slice_cap <= full_cap, (
+                f"ratio={ratio} num_compress={n_compress}, slice={slice_cap}, "
+                f"buffer={full_cap}: invariant violated. CG path requires "
+                f"n_compress ≤ decode_cap; eager path uses n_compress as slice."
             )
             assert n_write <= wbuf.np.shape[0], (
                 f"ratio={ratio} num_write={n_write} exceeds buffer "
@@ -173,11 +208,14 @@ def make_compress_plans(
             )
             if n_compress > 0:
                 cbuf.np[:n_compress] = compress_plan
-            cbuf.np[n_compress:].fill(-1)  # sentinel
+            # Sentinel only within the slice we hand to the kernel; rows
+            # beyond `slice_cap` are unreachable from this launch.
+            if slice_cap > n_compress:
+                cbuf.np[n_compress:slice_cap].fill(-1)
             if n_write > 0:
                 wbuf.np[:n_write] = write_plan
             wbuf.np[n_write:].fill(-1)  # sentinel
-            compress_plan_gpu = cbuf.copy_to_gpu()
+            compress_plan_gpu = cbuf.copy_to_gpu(slice_cap)
             write_plan_gpu = wbuf.copy_to_gpu()
         else:
             compress_plan_gpu = torch.from_numpy(
