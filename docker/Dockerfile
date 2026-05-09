@@ -390,6 +390,11 @@ RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
 RUN pip install rocm-trace-lite && \
     rtl --version || true
 
+# unisntall existing triton (acc issue) and install known good version    
+RUN pip uninstall -y triton && \
+    pip install triton==3.6.0
+RUN pip show triton || true
+
 # ATOM: lightweight install (no compilation needed)
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
