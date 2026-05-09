@@ -4,8 +4,11 @@
 import logging
 from typing import Type
 
+import torch
+
 import atom.model_ops as ops
 from atom.config import KVCacheTensor
+from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.model_ops.paged_attention import PagedAttention
 
@@ -40,6 +43,25 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
     Flash layout: K/V both [num_blocks, block_size, num_kv_heads, head_dim].
     Consumed directly by aiter triton `unified_attention` for prefill+decode.
     """
+
+    def prepare_prefill(self, batch: ScheduledBatch):
+        attn_metadata, positions = super().prepare_prefill(batch)
+
+        # When there are no cached tokens, the base builder leaves
+        # `block_tables=None` because AiterBackend's prefill consumes raw q/k/v
+        # via flash_attn_varlen_func. The unified_attention path used by
+        # TritonMHABackend instead requires a block_table even for pure prefill,
+        # so build a fake one here that treats raw K/V as a kv_cache with
+        # block_size=1: row i = [cu_seqlens_k[i], ..., cu_seqlens_k[i]+max-1].
+        if attn_metadata.block_tables is None:
+            cu_k = attn_metadata.cu_seqlens_k
+            num_seqs = cu_k.shape[0] - 1
+            offsets = cu_k[:num_seqs]
+            attn_metadata.block_tables = offsets.unsqueeze(1) + torch.arange(
+                attn_metadata.max_seqlen_k, dtype=torch.int32, device=cu_k.device
+            )
+
+        return attn_metadata, positions
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         if not (

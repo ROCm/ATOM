@@ -574,7 +574,6 @@ class PagedAttentionImpl(nn.Module):
         # value:  [num_blocks, 1, num_kv_heads, head_size]
 
         attn_metadata = fwd_ctx.attn_metadata
-        block_tables = attn_metadata.block_tables
 
         o = torch.empty_like(q)
         num_seqs = attn_metadata.cu_seqlens_q.shape[0] - 1
@@ -585,26 +584,19 @@ class PagedAttentionImpl(nn.Module):
             else (-1, -1)
         )
 
-        if block_tables is None:
-            # Prefill has no block_table. Use k/v directly as kv_cache with
-            # block_size=1 and a fake block_table (see comments above).
+        # `block_tables` is always populated by TritonMHAMetadataBuilder.
+        # For pure prefill (no cached tokens) it is the fake table built in
+        # prepare_prefill that maps seq i to token indices
+        # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
+        # treated as kv_cache with block_size=1.
+        if attn_metadata.has_cached:
+            k_for_attn = k_cache
+            v_for_attn = v_cache
+        else:
             #   k: [total_tokens, num_kv_heads, head_size]
             #     -> [total_tokens, 1, num_kv_heads, head_size]
             k_for_attn = k.unsqueeze(1)
             v_for_attn = v.unsqueeze(1)
-            # Build per-seq block tables: seq i maps to token indices
-            # [cu_seqlens_k[i], cu_seqlens_k[i]+1, ..., cu_seqlens_k[i+1]-1]
-            max_seqlen_k = attn_metadata.max_seqlen_k
-            cu_k = attn_metadata.cu_seqlens_k
-            offsets = cu_k[:num_seqs]  # [num_seqs]
-            block_tables = offsets.unsqueeze(1) + torch.arange(
-                max_seqlen_k, dtype=torch.int32, device=q.device
-            )
-            seqused_k = cu_k[1:] - cu_k[:num_seqs]
-        else:
-            k_for_attn = k_cache
-            v_for_attn = v_cache
-            seqused_k = attn_metadata.context_lens
 
         unified_attention(
             q,
@@ -612,14 +604,14 @@ class PagedAttentionImpl(nn.Module):
             v_for_attn,
             o,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
-            seqused_k=seqused_k,
+            seqused_k=attn_metadata.context_lens,
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             softmax_scale=self.scale,
             causal=True,
             alibi_slopes=None,
             window_size=sliding_window,
-            block_table=block_tables,
+            block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
             k_descale=self.kv_scale.expand(descale_shape),
