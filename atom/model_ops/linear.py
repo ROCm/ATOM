@@ -61,16 +61,48 @@ def _fp8_per_tensor_linear_torch(
     bias,
     x_scale,
     otype,
+    output_partition_sizes=None,
 ) -> torch.Tensor:
     """Pure-torch per-tensor FP8 linear: dequant weight (and x if FP8) to a
-    floating dtype, then F.linear. Used as a gfx1201 fallback for tgemm.mm."""
+    floating dtype, then F.linear. Used as a gfx1201 fallback for tgemm.mm.
+
+    For fused linear layers (QKV, gate_up), `weight_scale` has shape (P, 1)
+    where P is the number of output partitions; each partition's rows are
+    scaled by its own scalar. Pass `output_partition_sizes` to apply the
+    scales correctly.
+    """
     import torch.nn.functional as _F
 
-    # Dequantize weight from FP8 to fp32 then cast to otype
-    w_scale = weight_scale.to(torch.float32) if weight_scale is not None else None
-    w = weight.to(torch.float32)
-    if w_scale is not None:
-        w = w * w_scale
+    # AITER stores FP8 weights as raw torch.uint8 bytes. Reinterpret-cast
+    # to torch.float8_e4m3fn (Mistral / transformers FP8 convention) before
+    # converting to fp32 so we recover the actual encoded floats. Already-fp8
+    # tensors pass through as-is.
+    if weight.dtype == torch.uint8:
+        w_fp8 = weight.view(torch.float8_e4m3fn)
+        w = w_fp8.to(torch.float32)
+    else:
+        w = weight.to(torch.float32)
+    if weight_scale is not None:
+        ws = weight_scale.to(torch.float32)
+        if ws.dim() <= 1 or ws.numel() == 1:
+            # scalar / per-tensor scale
+            w = w * ws.reshape(()).item() if ws.numel() == 1 else w * ws
+        elif (
+            ws.dim() == 2
+            and ws.shape[1] == 1
+            and output_partition_sizes is not None
+            and ws.shape[0] == len(output_partition_sizes)
+        ):
+            # per-partition scale: shape (P, 1), one scalar per output sub-block
+            offset = 0
+            for i, p_size in enumerate(output_partition_sizes):
+                w[offset : offset + p_size] = (
+                    w[offset : offset + p_size] * ws[i].item()
+                )
+                offset += p_size
+        else:
+            # generic per-output-row broadcast
+            w = w * ws
     w = w.to(otype)
 
     # Dequantize x if it came in as FP8
@@ -480,7 +512,8 @@ class LinearBase(nn.Module):
                     # gfx1201: skip aiter tgemm.mm (no gfx1201 HIP code object),
                     # dequant FP8 weight + run F.linear in BF16.
                     y = _fp8_per_tensor_linear_torch(
-                        x, self.weight, self.weight_scale, self.bias, x_scale, otype
+                        x, self.weight, self.weight_scale, self.bias, x_scale, otype,
+                        output_partition_sizes=getattr(self, "output_partition_sizes", None),
                     )
                 else:
                     y = tgemm.mm(
