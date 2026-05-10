@@ -54,19 +54,27 @@ export ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0
 
 ## Required CLI flags
 
-* `--enforce-eager --level 0` — CUDAGraph capture is not yet supported
-  by the torch-native backend.
+* `--level 0` — torch.compile (`--level 3`) is not supported; ATOM's
+  `VllmBackend` is single-use for this backend.
 * `--kv_cache_dtype bf16` — FP8 KV is a TODO; only BF16 is wired up.
 * `-tp 1` — multi-GPU TP not exercised against this backend yet.
+
+CUDAGraph capture is supported for **decode at bs ≤ 2 only**. Pass
+`--cudagraph-capture-sizes "[1,2]"` to opt in. Larger captured batches
+(bs ≥ 4) currently corrupt logits at replay (see Known caveats); the
+engine falls back to eager for any decode batch outside the captured
+set, so concurrency above 2 still works — it just doesn't get the
+graph speedup. Use `--enforce-eager` to disable cudagraph entirely.
 
 ## Smoke test
 
 ```bash
 python3 -m atom.examples.simple_inference \
   --model /path/to/Ministral-3-8B-Instruct-2512 \
-  --enforce-eager --level 0 -tp 1 --kv_cache_dtype bf16 \
+  --level 0 -tp 1 --kv_cache_dtype bf16 \
   --max-model-len 4096 --max-tokens 32 \
-  --gpu-memory-utilization 0.85
+  --gpu-memory-utilization 0.85 \
+  --cudagraph-capture-sizes "[1,2]"
 ```
 
 ## OpenAI-compatible server
@@ -74,9 +82,10 @@ python3 -m atom.examples.simple_inference \
 ```bash
 python3 -m atom.entrypoints.openai_server \
   --model /path/to/Ministral-3-8B-Instruct-2512 \
-  --enforce-eager --level 0 --kv_cache_dtype bf16 \
+  --level 0 --kv_cache_dtype bf16 \
   --max-model-len 4096 \
-  --server-port 30000
+  --server-port 30000 \
+  --cudagraph-capture-sizes "[1,2]"
 ```
 
 ## gsm8k via lm_eval (5-shot, generate-until)
@@ -125,12 +134,25 @@ SDPA at gsm8k context lengths (500–1500 tokens).
 Full gsm8k (1319 problems) extrapolates to ~30 min wall time at
 `num_concurrent=4`.
 
+**CUDAGraph at bs ≤ 2** (single-prompt latency, single-token bench):
+
+| Mode | TPOT | TTFT |
+|---|---:|---:|
+| Eager (`--enforce-eager`) | 0.033 s/tok | 0.21 s |
+| CUDAGraph (`--cudagraph-capture-sizes "[1,2]"`) | 0.025 s/tok | 0.06 s |
+
+24% TPOT reduction and 3.3× TTFT reduction at bs=1.
+
+gsm8k accuracy is preserved with cudagraph at bs ≤ 2:
+`0.765 strict / 0.765 flex on n=200, num_concurrent=2` (matches eager
+0.785 within ±0.030 stderr).
+
 Remaining perf headroom worth pursuing:
 
-- **CUDAGraph capture** is still disabled (`--enforce-eager --level 0`).
-  The torch-native backend doesn't yet implement
-  `build_for_cudagraph_capture`; wiring it would shave Python launch
-  overhead from each step.
+- **CUDAGraph at bs ≥ 4**: captured graphs at decode bs ≥ 4 corrupt
+  the first decode-step logits (see Known caveats); root cause is
+  unknown. Concurrency above 2 still works (engine falls back to
+  eager), but loses the graph speedup.
 - **FP8 KV cache**: BF16 KV today; would halve KV memory and shave
   some bandwidth on long-context decode.
 
@@ -145,3 +167,12 @@ Remaining perf headroom worth pursuing:
   boot. Cosmetic — KV writes/reads work end-to-end.
 * `--max-model-len` must accommodate the chat-templated prompt (the
   Mistral system prompt is ~540 tokens).
+* **CUDAGraph at decode bs ≥ 4 is broken**: captured graphs at bs=4 (and
+  presumably larger captured sizes) emit a wrong logit at the first
+  decode step after prefill, almost always sampling EOS / a stop token.
+  Eager mode at bs=4 is correct (e.g., gsm8k 5-shot 0.785). bs=1 and
+  bs=2 captured graphs are correct. Root cause is open: confirmed it is
+  *not* the v2 vs v1 dispatch (v1-only is also broken), *not* the
+  prewarm helper (capture works without it), and *not* a JIT-during-
+  capture failure (capture succeeds and per-call kernels work in
+  eager). Workaround: limit capture to `[1,2]`.
