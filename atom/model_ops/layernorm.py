@@ -64,8 +64,80 @@ def _is_gfx1201_layernorm() -> bool:
     return _is_gfx1201_layernorm._cached
 
 
+import triton as _triton
+import triton.language as _tl
+
+
+@_triton.jit
+def _rmsnorm_kernel(
+    X_PTR, W_PTR, OUT_PTR,
+    stride_x_row, stride_out_row,
+    EPS: _tl.constexpr,
+    D: _tl.constexpr,
+):
+    """One program per row. Computes y = (x / sqrt(mean(x^2) + eps)) * weight."""
+    row = _tl.program_id(0)
+    cols = _tl.arange(0, D)
+    x = _tl.load(X_PTR + row * stride_x_row + cols).to(_tl.float32)
+    var = _tl.sum(x * x, axis=0) / D
+    rstd = 1.0 / _tl.sqrt(var + EPS)
+    w = _tl.load(W_PTR + cols).to(_tl.float32)
+    y = (x * rstd) * w
+    _tl.store(OUT_PTR + row * stride_out_row + cols, y.to(OUT_PTR.dtype.element_ty))
+
+
+@_triton.jit
+def _rmsnorm_add_kernel(
+    X_PTR, RES_PTR, W_PTR, OUT_PTR, RES_OUT_PTR,
+    stride_x_row, stride_res_row, stride_out_row, stride_res_out_row,
+    EPS: _tl.constexpr,
+    D: _tl.constexpr,
+):
+    """One program per row. residual_out = x + residual; y = rmsnorm(residual_out) * weight."""
+    row = _tl.program_id(0)
+    cols = _tl.arange(0, D)
+    x = _tl.load(X_PTR + row * stride_x_row + cols).to(_tl.float32)
+    r = _tl.load(RES_PTR + row * stride_res_row + cols).to(_tl.float32)
+    s = x + r
+    var = _tl.sum(s * s, axis=0) / D
+    rstd = 1.0 / _tl.sqrt(var + EPS)
+    w = _tl.load(W_PTR + cols).to(_tl.float32)
+    y = (s * rstd) * w
+    _tl.store(RES_OUT_PTR + row * stride_res_out_row + cols, s.to(RES_OUT_PTR.dtype.element_ty))
+    _tl.store(OUT_PTR + row * stride_out_row + cols, y.to(OUT_PTR.dtype.element_ty))
+
+
+def _rmsnorm_triton(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Triton RMSNorm. x: [N, D]; weight: [D]. D must be a power of two for now
+    (Mistral-3 hidden=4096 satisfies)."""
+    out = torch.empty_like(x)
+    N, D = x.shape
+    _rmsnorm_kernel[(N,)](
+        x, weight, out,
+        x.stride(0), out.stride(0),
+        EPS=eps, D=D,
+    )
+    return out
+
+
+def _rmsnorm_add_triton(
+    x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float
+):
+    """Triton fused (x + residual) -> RMSNorm. Returns (out, residual_out)."""
+    out = torch.empty_like(x)
+    res_out = torch.empty_like(residual)
+    N, D = x.shape
+    _rmsnorm_add_kernel[(N,)](
+        x, residual, weight, out, res_out,
+        x.stride(0), residual.stride(0), out.stride(0), res_out.stride(0),
+        EPS=eps, D=D,
+    )
+    return out, res_out
+
+
 def _rmsnorm_torch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Pure-torch RMSNorm. x: [..., D]; weight: [D]."""
+    """Pure-torch RMSNorm fallback. Used only if D is not a power of two,
+    which is not a case we hit for Mistral-3 (hidden=4096)."""
     orig_dtype = x.dtype
     x32 = x.to(torch.float32)
     var = x32.pow(2).mean(-1, keepdim=True)
@@ -80,6 +152,9 @@ def rmsnorm2d_fwd_(
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     if _is_gfx1201_layernorm():
+        # Triton path requires power-of-two trailing dim; Mistral-3 has D=4096.
+        if (dim & (dim - 1)) == 0 and dim <= 16384:
+            return _rmsnorm_triton(x, weight, eps).view(ori_shape)
         return _rmsnorm_torch(x, weight, eps).view(ori_shape)
     return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
@@ -91,6 +166,10 @@ def rmsnorm2d_fwd_with_add_(
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     if _is_gfx1201_layernorm():
+        if (dim & (dim - 1)) == 0 and dim <= 16384:
+            res_in = residual.reshape(-1, dim)
+            out, res_out = _rmsnorm_add_triton(x, weight, res_in, eps)
+            return out.view(ori_shape), res_out.view(ori_shape)
         residual_out = (x + residual.reshape(-1, dim)).to(residual.dtype)
         out = _rmsnorm_torch(residual_out, weight, eps)
         return out.view(ori_shape), residual_out.view(ori_shape)

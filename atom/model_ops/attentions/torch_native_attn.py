@@ -52,7 +52,7 @@ from atom.model_ops.attentions.backends import (
     AttentionImpl,
     CommonAttentionBuilder,
 )
-from atom.utils.forward_context import AttentionMetaData, get_forward_context
+from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
 
 logger = logging.getLogger("atom")
 
@@ -230,6 +230,16 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
     ):
         self.block_size = 16 if model_runner.block_size != 1024 else 1024
         CommonAttentionBuilder.__init__(self, model_runner)
+        # ModelRunner.capture_cudagraph() unconditionally calls
+        # forward_vars["kv_indptr"].gpu.zero_() — that buffer is allocated by
+        # AiterAttentionMetadataBuilder. Add a tiny stub here so cudagraph
+        # capture does not KeyError on our backend (we don't actually use it
+        # because pa_decode is paged-block-table-based).
+        from atom.utils import CpuGpuBuffer
+        if "kv_indptr" not in self.model_runner.forward_vars:
+            self.model_runner.forward_vars["kv_indptr"] = CpuGpuBuffer(
+                self.max_bs + 1, dtype=torch.int32, device=self.device
+            )
         logger.info(
             "TorchNativeMetadataBuilder: initialized (no aiter HIP allocations)"
         )
@@ -362,10 +372,94 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
         return attn_metadata, positions_gpu
 
     def build_for_cudagraph_capture(self, bs: int):
-        raise NotImplementedError(
-            "build_for_cudagraph_capture: run with --enforce-eager --level 0 "
-            "(CUDAGraph capture not yet supported by torch-native backend)."
+        """Return a (AttentionMetaData, Context) for cudagraph capture at a
+        fixed decode batch size `bs`. Slices the pre-allocated forward_vars
+        buffers so the captured graph re-uses the same GPU memory across
+        replays. is_prefill=False -> graphs only the decode path.
+
+        Also pre-warms aiter triton paged_attention_decode for `bs` on a
+        non-capturing stream. The JIT compile (hipModuleLoad) is not
+        capturable; doing it before capture_cudagraph enters its capture
+        context lets the captured graph just replay the precompiled kernel.
+        """
+        self._prewarm_pa_decode_for_bs(bs)
+
+        var = self.model_runner.forward_vars
+        attn_metadata = AttentionMetaData(
+            slot_mapping=var["slot_mapping"].gpu[:bs],
+            context_lens=var["context_lens"].gpu[:bs],
+            block_tables=var["block_tables"].gpu[:bs],
+            cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
+            max_seqlen_q=1,
+            min_seqlen_q=0,
+            max_seqlen_k=self.model_runner.config.max_model_len,
+            dropout_p=0.0,
         )
+        positions = var["positions"].gpu[:bs]
+        context = Context(
+            positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
+        )
+        return attn_metadata, context
+
+    # ------------------------------------------------------------------ #
+    # Pre-warm helpers                                                   #
+    # ------------------------------------------------------------------ #
+    _prewarm_done_bs: set = None
+
+    def _prewarm_pa_decode_for_bs(self, bs: int) -> None:
+        """JIT-compile the pa_decode kernel for this bs by running a dummy
+        decode call on a separate (non-capturing) stream. Collects every
+        TorchNativeAttentionImpl bound to the model to warm them all
+        (different layers may end up with different specialization)."""
+        if TorchNativeMetadataBuilder._prewarm_done_bs is None:
+            TorchNativeMetadataBuilder._prewarm_done_bs = set()
+        if bs in TorchNativeMetadataBuilder._prewarm_done_bs:
+            return
+
+        pa_decode, tl_bf16 = _get_triton_pa_decode()
+        if pa_decode is None:
+            return
+
+        # Find every TorchNativeAttentionImpl in the model.
+        impls = [
+            m for m in self.model_runner.model.modules()
+            if isinstance(m, TorchNativeAttentionImpl) and m.k_cache.numel() > 0
+        ]
+        if not impls:
+            return
+
+        device = impls[0].k_cache.device
+        # Build dummy decode inputs at this bs on a non-capturing stream.
+        warmup_stream = torch.cuda.Stream(device=device)
+        torch.cuda.current_stream(device).synchronize()
+        with torch.cuda.stream(warmup_stream):
+            for impl in impls:
+                num_blocks_per_seq = self.max_num_blocks_per_seq // self.block_ratio
+                seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+                # Block tables: each request points at a single block index 0.
+                block_tables = torch.zeros(
+                    (bs, num_blocks_per_seq), dtype=torch.int32, device=device
+                )
+                q = torch.zeros(
+                    bs, impl.num_heads, impl.head_dim,
+                    dtype=impl.k_cache.dtype, device=device,
+                )
+                out = torch.empty_like(q)
+                try:
+                    pa_decode(
+                        out, q,
+                        impl.k_cache, impl.v_cache,
+                        seq_lens, block_tables,
+                        float(impl.scale), 1,
+                        tl_bf16, impl._pa_k_scale, impl._pa_v_scale,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "pa_decode pre-warm bs=%d raised %s; cudagraph may fail", bs, e
+                    )
+        warmup_stream.synchronize()
+        TorchNativeMetadataBuilder._prewarm_done_bs.add(bs)
+        logger.info("pa_decode pre-warmed for cudagraph bs=%d", bs)
 
 
 # ---------------------------------------------------------------------------
@@ -412,9 +506,11 @@ class TorchNativeAttentionImpl(AttentionImpl):
         self.k_cache = torch.tensor([])
         self.v_cache = torch.tensor([])
         # Reusable scale tensors for the triton paged-attention kernel
-        # (BF16 KV path -> identity scales).
-        self._pa_k_scale = None
-        self._pa_v_scale = None
+        # (BF16 KV path -> identity scales). Pre-created here so that
+        # CUDAGraph capture does not see a torch.tensor() allocation on the
+        # first decode call.
+        self._pa_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+        self._pa_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
         if kv_cache_dtype != "bf16":
             logger.warning(
                 f"TorchNativeAttentionImpl: kv_cache_dtype={kv_cache_dtype} "
@@ -608,14 +704,12 @@ class TorchNativeAttentionImpl(AttentionImpl):
         if pa_decode is not None and not sw_active and self.k_cache.numel() > 0:
             try:
                 out = torch.empty_like(q)
-                if self._pa_k_scale is None or self._pa_k_scale.device != q.device:
-                    self._pa_k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
-                    self._pa_v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
-                # block_tables to int32 (kernel expects int32)
-                block_tables = attn_md.block_tables[:bs].to(torch.int32)
-                seq_lens = attn_md.context_lens[:bs].to(torch.int32)
+                # context_lens / block_tables are already int32 from prepare_decode
+                # and build_for_cudagraph_capture; pass directly.
+                block_tables = attn_md.block_tables[:bs]
+                seq_lens = attn_md.context_lens[:bs]
                 pa_decode(
-                    out, q.contiguous(),
+                    out, q,
                     self.k_cache, self.v_cache,
                     seq_lens, block_tables,
                     float(self.scale), int(attn_md.max_seqlen_k),

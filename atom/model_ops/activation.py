@@ -10,6 +10,59 @@ from atom.config import QuantizationConfig
 from atom.quant_spec import LayerQuantConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+# --- gfx1201 fallback: triton SiLU + Mul (replaces forward_native) ---------
+import triton as _triton
+import triton.language as _tl
+
+
+@_triton.jit
+def _silu_mul_kernel(
+    X_PTR, OUT_PTR,
+    stride_x_row, stride_out_row,
+    HALF_D: _tl.int32,
+    BLOCK_D: _tl.constexpr,
+):
+    """For each row: out = silu(x[..., :HALF_D]) * x[..., HALF_D:]. Iterates
+    over D in BLOCK_D chunks so HALF_D need not be a power of two."""
+    row = _tl.program_id(0)
+    block_start = _tl.program_id(1) * BLOCK_D
+    cols = block_start + _tl.arange(0, BLOCK_D)
+    mask = cols < HALF_D
+    a = _tl.load(X_PTR + row * stride_x_row + cols, mask=mask, other=0.0).to(_tl.float32)
+    b = _tl.load(X_PTR + row * stride_x_row + HALF_D + cols, mask=mask, other=0.0).to(_tl.float32)
+    silu_a = a * (1.0 / (1.0 + _tl.exp(-a)))
+    out = (silu_a * b).to(OUT_PTR.dtype.element_ty)
+    _tl.store(OUT_PTR + row * stride_out_row + cols, out, mask=mask)
+
+
+def _silu_mul_triton(x: torch.Tensor) -> torch.Tensor:
+    """Triton SiLU+Mul. x: [N, 2*HALF_D]; output: [N, HALF_D]. HALF_D can be
+    arbitrary (kernel uses masked block iteration)."""
+    N, full_d = x.shape
+    half = full_d // 2
+    out = torch.empty((N, half), dtype=x.dtype, device=x.device)
+    BLOCK_D = 1024
+    grid = (N, _triton.cdiv(half, BLOCK_D))
+    _silu_mul_kernel[grid](
+        x, out,
+        x.stride(0), out.stride(0),
+        HALF_D=half,
+        BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
+def _is_gfx1201_act() -> bool:
+    if not hasattr(_is_gfx1201_act, "_cached"):
+        try:
+            _is_gfx1201_act._cached = (
+                torch.cuda.get_device_properties(0).gcnArchName or ""
+            ).startswith("gfx1201")
+        except Exception:
+            _is_gfx1201_act._cached = False
+    return _is_gfx1201_act._cached
+
+
 from aiter import (
     QuantType,
 )
@@ -84,18 +137,11 @@ class SiluAndMul(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # gfx1201 (RDNA4): aiter prebuilt silu_and_mul HIP kernel has no
-        # gfx1201 code object and SIGSEGVs on load. Use the existing
-        # forward_native (pure torch SiLU * Mul) instead.
-        if not hasattr(self, "_is_gfx1201_cached"):
-            try:
-                self._is_gfx1201_cached = (
-                    torch.cuda.get_device_properties(0).gcnArchName or ""
-                ).startswith("gfx1201")
-            except Exception:
-                self._is_gfx1201_cached = False
-        if self._is_gfx1201_cached:
-            return self.forward_native(x, x_scale)
+        # gfx1201 (RDNA4): aiter prebuilt silu_and_mul HIP kernel has no gfx1201
+        # code object. Prefer the triton kernel; fall back to torch forward_native
+        # if the input HALF_D is not a power of two (triton kernel limitation).
+        if _is_gfx1201_act():
+            return _silu_mul_triton(x)
         # fp8 quantization
         if x_scale is not None and self.fused_quant:
             from aiter.ops.triton.fused_fp8_quant import (
