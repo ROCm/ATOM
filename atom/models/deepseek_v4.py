@@ -1471,10 +1471,12 @@ class DeepseekV4Attention(nn.Module):
         self.use_fused_q_norm_qk_rope_swa_write = _V4_USE_TRITON_FUSION
         self.fuse_qknorm_quant = False
         self.quant_dtype = None
-        quant_dtype = qc.get_layer_quant_config(
-            f"{p}.wq_b"
-        ).quant_dtype
-        if qc is not None and ENABLE_DS_QKNORM_QUANT_FUSION and not _V4_FORCE_UE8M0_QUANT:
+        quant_dtype = qc.get_layer_quant_config(f"{p}.wq_b").quant_dtype
+        if (
+            qc is not None
+            and ENABLE_DS_QKNORM_QUANT_FUSION
+            and not _V4_FORCE_UE8M0_QUANT
+        ):
             self.quant_dtype = dtypes.fp8
             if quant_dtype == dtypes.fp8 or quant_dtype == dtypes.fp4x2:
                 self.quant_dtype = quant_dtype
@@ -1591,7 +1593,7 @@ class DeepseekV4Attention(nn.Module):
         v4_batch_id_per_token = attn_md.batch_id_per_token
         block_tables_gpu = attn_md.block_tables
         state_slot_mapping = attn_md.state_slot_mapping
-        
+
         # ----- Batched ops on full flat tensors -----
         # `_V4_FORCE_UE8M0_QUANT` (module-level): round-trip x/qr to ue8m0-FP8
         # to mirror the reference's `act_quant(scale_fmt="ue8m0")` Linear-input
@@ -1631,7 +1633,7 @@ class DeepseekV4Attention(nn.Module):
                 qr = qr.clone()
                 act_quant_inplace(qr, 128, "ue8m0")
             q = self.wq_b(qr)
-            
+
         if attn_md.is_pure_decode and self.use_fused_q_norm_qk_rope_swa_write:
             # Fused: wq_b GEMM (a8w8 1x128 blockscale) + per-head RMSNorm-nw
             # + RoPE on q tail + RoPE on kv tail (+ SWA write) in one triton
