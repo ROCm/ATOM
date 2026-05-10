@@ -11,7 +11,6 @@ from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.config import get_current_atom_config
-
 from atom.utils.forward_context import Context, AttentionMetaData
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.model_ops.attention_mla import MLAAttention, _MLA_MIN_HEADS
@@ -1454,6 +1453,7 @@ def AiterBackendDecoratorForPluginMode(cls):
     """
     is_vllm_mode = is_vllm()
     if is_vllm_mode:
+        is_sparse_mla = False
         if not issubclass(cls.get_impl_cls(), MLAAttention):
             methods_cls = vllmAiterAttentionBackendMethods
         else:
@@ -1465,7 +1465,16 @@ def AiterBackendDecoratorForPluginMode(cls):
         for name in dir(methods_cls):
             if name.startswith("_"):
                 continue
-            setattr(cls, name, getattr(methods_cls, name))
+            raw = methods_cls.__dict__.get(name)
+            if is_sparse_mla and isinstance(raw, classmethod):
+                # Re-wrap so cls binds to the target class, not methods_cls.
+                # For backends like sparse MLA where more than one attention
+                # backends are registered through this decorator exist, the
+                # different backends need to return distinct identities
+                # through full_cls_name().
+                setattr(cls, name, classmethod(raw.__func__))
+            else:
+                setattr(cls, name, getattr(methods_cls, name))
     return cls
 
 
@@ -1742,9 +1751,6 @@ class AiterMLASparseMetadataForPluginMode:
 
     block_size: int = 1
     topk_tokens: int = 2048
-
-    # Flag to run ragged layout conversion only once per forward (shared across MLA layers)
-    ragged_layout_built: bool = False
 
 
 class vllmMLASparseAttentionMetadataBuilderMethods:
@@ -2316,13 +2322,16 @@ def unified_attention_with_output_base_for_plugin_mode(
         return self.o_proj(output)
     else:
         self = atom_config.compilation_config.static_forward_context[layer_name]
+
         # here is the standard vllm attention impl interface
         # when using fusion, we need to pass the qkv and positions through the q,k,v
         # [watch out] accept_output_buffer must be False for plugin mode
         # because we don't want vllm to manipulate the q k v and output buffer
         # ATOM needs to handle all of the buffer here
+        # Positions for compiled unified_attention are provided via vLLM ForwardContext
+        # (atom_positions) in ATOMModelBase.forward, not via this Python arg.
         if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            output = self.attn(q, positions, qkv)
+            output = self.attn(q, k, v)
         else:
             # calculate the q and k with rotary embedding
             if self.rotary_emb is not None:

@@ -1,4 +1,5 @@
 import functools
+from dataclasses import replace
 
 import torch
 from atom.plugin.vllm.platform import disable_vllm_plugin_attention
@@ -122,11 +123,48 @@ def _patch_vllm_mla_attention_forward_impl(mla_attention_cls) -> None:
     mla_attention_cls.forward_impl = _forward_impl
 
 
+def _patch_vllm_mla_attention_get_kv_cache_spec(mla_attention_cls) -> None:
+    """
+    vLLM's MLAAttention may set the kv cache dtype to fp8_ds_mla, which uses
+    656 bytes per block and is not compatible with ATOM's standard 576-per-block
+    fp8 layout. Therefore, we patch it so that in vLLM plugin mode, the layout
+    of the kv cache is not in the fp8_ds_mla format.
+    """
+
+    orig_get_kv_cache_spec = mla_attention_cls.get_kv_cache_spec
+    if getattr(orig_get_kv_cache_spec, "_atom_mla_get_kv_cache_spec_patched", False):
+        return
+
+    @functools.wraps(orig_get_kv_cache_spec)
+    def _patched_get_kv_cache_spec(self, vllm_config):
+        if disable_vllm_plugin_attention:
+            return orig_get_kv_cache_spec(self, vllm_config)
+
+        spec = orig_get_kv_cache_spec(self, vllm_config)
+
+        if (
+            hasattr(spec, "cache_dtype_str")
+            and spec.cache_dtype_str == "fp8_ds_mla"
+            and getattr(self, "use_sparse", False)
+        ):
+            spec = replace(spec, cache_dtype_str=None)
+
+        return spec
+
+    mla_attention_cls.get_kv_cache_spec = _patched_get_kv_cache_spec
+    setattr(
+        _patched_get_kv_cache_spec,
+        "_atom_mla_get_kv_cache_spec_patched",
+        True,
+    )
+
+
 def patch_vllm_mla_attention() -> None:
     try:
         from vllm.attention.layer import MLAAttention
     except ImportError:
         from vllm.model_executor.layers.attention import MLAAttention
 
+    _patch_vllm_mla_attention_get_kv_cache_spec(MLAAttention)
     _patch_vllm_mla_attention_process_weights_after_loading(MLAAttention)
     _patch_vllm_mla_attention_forward_impl(MLAAttention)

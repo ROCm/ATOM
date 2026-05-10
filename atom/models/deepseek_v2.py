@@ -75,6 +75,11 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
+# shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
+# `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.plugin.attention_mla_sparse import (
@@ -155,7 +160,7 @@ def _fuse_rmsnorm_fp4_quant_fake(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
-def _fused_rms_fp8_group_quant_fake(
+def _fused_rms_fp8_quant_fake(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
@@ -165,6 +170,7 @@ def _fused_rms_fp8_group_quant_fake(
     res1: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     group_size: int = 128,
+    quant_type: Optional[int] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ) -> Tuple[
@@ -175,9 +181,18 @@ def _fused_rms_fp8_group_quant_fake(
     torch.Tensor,
 ]:
     m, n1 = x1.shape
-    out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
-    num_bs_cols = (n1 + group_size - 1) // group_size
-    out1_bs = torch.empty((m, num_bs_cols), dtype=torch.float32, device=x1.device)
+    no_quant = quant_type is None or quant_type == QuantType.No.value
+    if not no_quant:
+        out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
+    else:
+        out1_quantized = torch.empty_like(x1)
+    if no_quant:
+        out1_bs = None
+    elif quant_type == QuantType.per_Token.value:
+        out1_bs = torch.empty((m, 1), dtype=torch.float32, device=x1.device)
+    else:
+        num_bs_cols = (n1 + group_size - 1) // group_size
+        out1_bs = torch.empty((m, num_bs_cols), dtype=torch.float32, device=x1.device)
     out1_unquantized = torch.empty_like(x1) if output_unquantized_inp1 else None
     out2 = None
     if x2 is not None:
@@ -231,8 +246,8 @@ def _fuse_rmsnorm_fp4_quant(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
-@torch_compile_guard(gen_fake=_fused_rms_fp8_group_quant_fake)
-def _fused_rms_fp8_group_quant(
+@torch_compile_guard(gen_fake=_fused_rms_fp8_quant_fake)
+def _fused_rms_fp8_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
@@ -242,6 +257,7 @@ def _fused_rms_fp8_group_quant(
     res1: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype = dtypes.fp8,
     group_size: int = 128,
+    quant_type: Optional[int] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ) -> Tuple[
@@ -252,7 +268,7 @@ def _fused_rms_fp8_group_quant(
     torch.Tensor,
 ]:
     out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
-        _fused_rms_fp8_group_quant_fake(
+        _fused_rms_fp8_quant_fake(
             x1,
             x1_weight,
             x1_epsilon,
@@ -262,14 +278,18 @@ def _fused_rms_fp8_group_quant(
             res1,
             dtype_quant,
             group_size,
+            quant_type,
             output_unquantized_inp1,
             transpose_scale,
         )
     )
 
-    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+    if quant_type is None:
+        quant_type = QuantType.No
+    else:
+        quant_type = QuantType(quant_type)
 
-    fused_qk_rmsnorm_group_quant(
+    fused_qk_rmsnorm(
         q_out_quantized=out1_quantized,
         q_out_scale=out1_bs,
         q=x1,
@@ -282,6 +302,7 @@ def _fused_rms_fp8_group_quant(
         k_weight=x2_weight,
         k_epsilon=x2_epsilon,
         q_residual=res1,
+        quant_type=quant_type,
         group_size=group_size,
         transpose_scale=transpose_scale,
     )
@@ -301,6 +322,7 @@ def _fuse_rmsnorm_quant(
     shuffle: bool = True,
     scale_shuffle_padding: bool = False,
     group_size: int = 128,
+    quant_type: Optional[int] = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
 ):
@@ -319,9 +341,9 @@ def _fuse_rmsnorm_quant(
                 output_unquantized_inp1,
             )
         )
-    elif dtype_quant == dtypes.fp8:
+    elif dtype_quant == dtypes.fp8 or dtype_quant == torch.bfloat16:
         out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
-            _fused_rms_fp8_group_quant(
+            _fused_rms_fp8_quant(
                 x1,
                 x1_weight,
                 x1_epsilon,
@@ -329,10 +351,11 @@ def _fuse_rmsnorm_quant(
                 x2_weight,
                 x2_epsilon,
                 res1,
-                dtype_quant,
-                group_size,
-                output_unquantized_inp1,
-                transpose_scale,
+                dtype_quant=dtype_quant,
+                group_size=group_size,
+                quant_type=quant_type,
+                output_unquantized_inp1=output_unquantized_inp1,
+                transpose_scale=transpose_scale,
             )
         )
     else:
@@ -698,36 +721,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
-def _fused_qk_rmsnorm_fake(
-    q_c: torch.Tensor,
-    q_a_layernorm_weight: torch.Tensor,
-    q_a_layernorm_variance_epsilon: float,
-    kv_c: torch.Tensor,
-    kv_a_layernorm_weight: torch.Tensor,
-    kv_a_layernorm_variance_epsilon: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(q_c), torch.empty_like(kv_c)
-
-
-@torch_compile_guard(gen_fake=_fused_qk_rmsnorm_fake)
-def _fused_qk_rmsnorm(
-    q_c: torch.Tensor,
-    q_a_layernorm_weight: torch.Tensor,
-    q_a_layernorm_variance_epsilon: float,
-    kv_c: torch.Tensor,
-    kv_a_layernorm_weight: torch.Tensor,
-    kv_a_layernorm_variance_epsilon: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return fused_qk_rmsnorm(
-        q_c,
-        q_a_layernorm_weight,
-        q_a_layernorm_variance_epsilon,
-        kv_c,
-        kv_a_layernorm_weight,
-        kv_a_layernorm_variance_epsilon,
-    )
-
-
 class DeepseekV2MLP(nn.Module):
 
     def __init__(
@@ -767,42 +760,6 @@ class DeepseekV2MLP(nn.Module):
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
-
-
-def maybe_dual_stream_forward(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    """Dual-stream MoE forward: shared experts on alt stream, routed on main."""
-    atom_config = get_current_atom_config()
-    self = atom_config.compilation_config.static_forward_context[layer_name]
-    DUAL_STREAM_TOKEN_THRESHOLD = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    num_tokens, hidden_dim = hidden_states.shape
-    if (
-        self._use_dual_stream
-        and num_tokens > 0
-        and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
-        # and not get_forward_context().context.is_prefill
-    ):
-        return self.dual_stream_moe_forward(hidden_states)
-    else:
-        return self.single_stream_moe_forward(hidden_states)
-
-
-def maybe_dual_stream_forward_fake(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="maybe_dual_stream_forward",
-    op_func=maybe_dual_stream_forward,
-    mutates_args=["hidden_states"],
-    fake_impl=maybe_dual_stream_forward_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
 
 
 class DeepseekV2MoE(nn.Module):
@@ -1011,7 +968,10 @@ def sparse_attn_indexer(
     if forward_context.context.is_dummy_run:
         # dummy runner
         return weights
-    num_decode_tokens = context.batch_size if not context.is_prefill else 0
+    # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
+    num_decode_tokens = (
+        context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
+    )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     indexer_k_quant_and_cache(
@@ -1326,6 +1286,14 @@ class DeepseekV2MLAAttention(nn.Module):
         layer_quant_dtype = quant_config.get_layer_quant_config(
             f"{prefix}.{q_a_proj_name}"
         ).quant_dtype
+        layer_quant_type = quant_config.get_layer_quant_config(
+            f"{prefix}.{q_a_proj_name}"
+        ).quant_type
+        # Keep a plain int on the module so Dynamo does not guard on a
+        # QuantType enum attribute.
+        layer_quant_type_value = (
+            None if layer_quant_type is None else layer_quant_type.value
+        )
         if layer_quant_dtype == dtypes.fp4x2:
             if not use_triton_gemm():
                 source_quant_dtype = None
@@ -1501,7 +1469,8 @@ class DeepseekV2MLAAttention(nn.Module):
 
         # When ATOM_ENABLE_DS_QKNORM_QUANT_FUSION is turned on, self.fuse_qknorm_quant is turned on only if FP8 or (use_triton_gemm() and FP4),
         self.prefix = prefix
-        self.quant_dtype = None
+        self.quant_dtype = layer_quant_dtype
+        self.qknorm_quant_type = layer_quant_type_value
         self.fuse_qknorm_quant = False
         # always fuse qknorm
         self.fuse_qknorm = ENABLE_DS_QKNORM_FUSION
@@ -1509,7 +1478,6 @@ class DeepseekV2MLAAttention(nn.Module):
             if layer_quant_dtype == dtypes.fp8 or (
                 layer_quant_dtype == dtypes.fp4x2 and use_triton_gemm()
             ):
-                self.quant_dtype = layer_quant_dtype
                 self.fuse_qknorm_quant = True
 
     def forward(
@@ -1555,7 +1523,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     dim=-1,
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
-                if self.fuse_qknorm_quant:
+                if self.fuse_qknorm_quant or self.fuse_qknorm:
                     (
                         (hidden_states_or_q_c, hidden_states_or_q_c_scale),
                         _,
@@ -1573,19 +1541,10 @@ class DeepseekV2MLAAttention(nn.Module):
                         shuffle=False,
                         scale_shuffle_padding=False,
                         group_size=128,
+                        quant_type=self.qknorm_quant_type,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
-                elif self.fuse_qknorm:
-                    hidden_states_or_q_c, kv_c_normed = _fused_qk_rmsnorm(
-                        q_c,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.eps,
-                        kv_c,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.eps,
-                    )
-                    hidden_states_or_q_c_scale = None
                 else:
                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
         else:
@@ -1663,6 +1622,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             None
             if quant_config is None
             else quant_config.get_layer_quant_config(prefix).quant_dtype
+        )
+        self.input_norm_quant_type = (
+            None
+            if quant_config is None
+            else quant_config.get_layer_quant_config(prefix).quant_type.value
         )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
@@ -1747,6 +1711,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                         shuffle=True,
                         scale_shuffle_padding=True,
                         group_size=128,
+                        quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
@@ -1765,6 +1730,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                         shuffle=True,
                         scale_shuffle_padding=True,
                         group_size=128,
+                        quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
                     )
@@ -1874,6 +1840,8 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
+        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -1887,7 +1855,9 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> Union[
+        torch.Tensor, IntermediateTensors, Tuple[torch.Tensor, list[torch.Tensor]]
+    ]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1899,7 +1869,13 @@ class DeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        aux_hidden_states = []
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
@@ -1908,6 +1884,9 @@ class DeepseekV2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -2008,12 +1987,25 @@ class DeepseekV2ForCausalLM(nn.Module):
             }
         )
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default Eagle3 aux hidden-state layer ids: early / middle / late
+        of the target model. Aligned with vLLM's default (see
+        vllm/model_executor/models/deepseek_v2.py).
+        """
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
-    pass
+    # DeepSeek-V3.2's indexer weights_proj are not quantized, but they are not listed in
+    # model's quant exclude mapping. So we add it to quant_default_exclude_layers.
+    quant_default_exclude_layers: list[str] = ["*.indexer.weights_proj"]
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):

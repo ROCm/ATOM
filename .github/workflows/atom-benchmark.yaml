@@ -14,6 +14,10 @@ on:
         description: "Benchmark DeepSeek-R1-0528 (+ MTP3)"
         type: boolean
         default: true
+      deepseek-v4-pro:
+        description: "Benchmark DeepSeek-V4-Pro"
+        type: boolean
+        default: true
       glm-5-fp8:
         description: "Benchmark GLM-5-FP8"
         type: boolean
@@ -186,13 +190,11 @@ jobs:
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
 
-          # Build env var flags from model config
-          ENV_FLAGS=""
-          if [ -n "${{ matrix.model.env_vars }}" ]; then
-            for ev in ${{ matrix.model.env_vars }}; do
-              ENV_FLAGS="$ENV_FLAGS -e $ev"
-            done
-          fi
+          # Write env_vars via env block (avoids expression injection — newlines
+          # in `matrix.model.env_vars` would otherwise break the host bash).
+          # Empty file when MODEL_ENV_VARS unset is fine — docker --env-file
+          # accepts it.
+          printenv MODEL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_benchmark_env.txt || true
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
@@ -206,22 +208,18 @@ jobs:
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
-            $ENV_FLAGS \
+            --env-file /tmp/atom_benchmark_env.txt \
             --name atom-benchmark \
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          MODEL_ENV_VARS: ${{ matrix.model.env_vars }}
 
       - name: Collect GPU info (inside container)
         id: gpu-info
         run: |
-          # Run rocm-smi inside the container for consistent output across runners
-          GPU_NAME=$(docker exec atom-benchmark rocm-smi --showproductname 2>/dev/null | grep -i "Card Series" | head -1 | sed 's/.*:\s*//' || echo "")
-          if [ -z "$GPU_NAME" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; then
-            GPU_NAME=$(docker exec atom-benchmark rocminfo 2>/dev/null | grep -A1 "Uuid:.*GPU-" | grep "Marketing Name" | head -1 | sed 's/.*:\s*//' | xargs || echo "")
-          fi
-          GPU_VRAM_GB=$(docker exec atom-benchmark rocm-smi --showmeminfo vram 2>/dev/null | grep -i "VRAM Total Memory" | head -1 | awk -F: '{printf "%.0f", $NF/(1024*1024*1024)}' || echo "0")
-          ROCM_VERSION=$(docker exec atom-benchmark cat /opt/rocm/.info/version 2>/dev/null || echo "unknown")
+          RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.model.runner }}"
+          bash .github/scripts/collect_gpu_info.sh atom-benchmark docker "$RUNNER_HINT"
           # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
           DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
           if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
@@ -231,11 +229,8 @@ jobs:
             fi
             DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
           fi
-          echo "gpu_name=${GPU_NAME}" >> $GITHUB_OUTPUT
-          echo "gpu_vram_gb=${GPU_VRAM_GB}" >> $GITHUB_OUTPUT
-          echo "rocm_version=${ROCM_VERSION}" >> $GITHUB_OUTPUT
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
-          echo "GPU: ${GPU_NAME}, VRAM: ${GPU_VRAM_GB}GB, ROCm: ${ROCM_VERSION}, Docker: ${DOCKER_IMAGE}"
+          echo "Docker: ${DOCKER_IMAGE}"
 
       - name: Download models
         run: |
@@ -563,13 +558,9 @@ jobs:
           MODEL_MOUNT=""
           [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
 
-          # Build env var flags from model config
-          ENV_FLAGS=""
-          if [ -n "${{ matrix.cell.env_vars }}" ]; then
-            for ev in ${{ matrix.cell.env_vars }}; do
-              ENV_FLAGS="$ENV_FLAGS -e $ev"
-            done
-          fi
+          # Write env_vars via env block (avoids expression injection — newlines
+          # in `matrix.cell.env_vars` would otherwise break the host bash).
+          printenv CELL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_regression_env.txt || true
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
             -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
@@ -579,11 +570,12 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
             -e ATOM_DISABLE_MMAP=true \
-            $ENV_FLAGS \
+            --env-file /tmp/atom_regression_env.txt \
             --name atom-regression \
             ${{ inputs.image || 'rocm/atom-dev:latest' }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          CELL_ENV_VARS: ${{ matrix.cell.env_vars }}
 
       - name: Download model
         run: |
@@ -599,8 +591,12 @@ jobs:
           if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
           else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
 
+          # cell.env_vars are already injected into the container env via
+          # --env-file in "Start CI container" — `docker exec` inherits them,
+          # so no need to re-prefix them on the command line (the previous
+          # inline form silently dropped the first var when env_vars contained
+          # a literal newline).
           docker exec atom-regression bash -lc "set -euo pipefail
-            ${{ matrix.cell.env_vars }} \
             ENABLE_TORCH_PROFILER=1 \
             .github/scripts/atom_test.sh launch $MODEL_DIR ${{ matrix.cell.server_args }}"
 

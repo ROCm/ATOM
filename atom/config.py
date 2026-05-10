@@ -421,6 +421,13 @@ class QuantizationConfig:
             new_excludes.append(name)
         self.exclude_layers = list(dict.fromkeys(new_excludes))
 
+    def apply_default_exclude_layers(self, excludes: list[str]):
+        if not excludes:
+            return
+        for exclude in excludes:
+            if exclude not in self.exclude_layers:
+                self.exclude_layers.append(exclude)
+
     def remap_layer_name(
         self,
         hf_config: PretrainedConfig,
@@ -492,6 +499,9 @@ class QuantizationConfig:
 
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
+    "deepseek_v4": "deepseek_v3",  # V4 reuses V3 schema; V4-specific fields
+    # (compress_ratios, num_hash_layers, hc_mult, swiglu_limit, ...) flow
+    # through as extra config attrs and are read in DeepseekV4Args.from_hf_config.
     "glm_moe_dsa": "deepseek_v3",  # GLM 5.0 MoE, structure similar to DeepSeek v3.2
     "kimi_k2": "deepseek_v3",
 }
@@ -563,13 +573,22 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
 
     if model_type in _CONFIG_REGISTRY:
         config_class = AutoConfig.for_model(_CONFIG_REGISTRY[model_type])
-        return config_class.from_pretrained(
+        hf_config = config_class.from_pretrained(
             model,
             # revision=revision,
             # code_revision=code_revision,
             token=_get_hf_token(),
             trust_remote_code=trust_remote_code,
         )
+        # transformers' from_pretrained strips fields that aren't in the target
+        # config schema. For mapped types (e.g. deepseek_v4 → deepseek_v3) the
+        # source-specific fields would be dropped. Re-inject them so V4-only
+        # attrs (compress_ratios, num_hash_layers, hc_mult, swiglu_limit, ...)
+        # remain accessible via getattr(hf_config, field) downstream.
+        for field, value in config_dict.items():
+            if not hasattr(hf_config, field):
+                setattr(hf_config, field, value)
+        return hf_config
     try:
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code
@@ -704,10 +723,13 @@ class SpeculativeConfig:
     model: Optional[str] = None
     num_speculative_tokens: Optional[int] = None
     draft_model_hf_config: Optional[PretrainedConfig] = None
+    use_aux_hidden_state: bool = False
+    eagle3_aux_layer_ids: list[int] = field(default_factory=list)
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
         "deepseek_v3": "deepseek_mtp",
+        "deepseek_v32": "deepseek_mtp",
         "glm_moe_dsa": "deepseek_mtp",
         "qwen3_next": "qwen3_next_mtp",
         "qwen3_5": "qwen3_5_mtp",
@@ -726,7 +748,7 @@ class SpeculativeConfig:
 
     def __post_init__(self):
         if self.draft_model_hf_config is None:
-            self.draft_model_hf_config = AutoConfig.from_pretrained(
+            self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
             )
         # For multimodal models, extract text_config
@@ -734,8 +756,34 @@ class SpeculativeConfig:
             self.draft_model_hf_config = self.draft_model_hf_config.text_config
         self.hf_config_override(self.draft_model_hf_config)
 
+        if self.method == "eagle3":
+            if getattr(self.draft_model_hf_config, "kv_lora_rank", None):
+                raise NotImplementedError(
+                    "Eagle3 draft model with MLA attention is not supported"
+                )
+            # Aux hidden state layers: prefer the draft checkpoint's
+            # eagle_config; if absent or the list is empty, ModelRunner
+            # falls back to model.get_eagle3_aux_hidden_state_layers(),
+            # which defaults to 3 layers — early / middle / late
+            # (see DeepseekV2ForCausalLM.get_eagle3_aux_hidden_state_layers,
+            # returns `(2, num_layers // 2, num_layers - 3)`, aligned with vLLM).
+            eagle_cfg = getattr(self.draft_model_hf_config, "eagle_config", None)
+            if eagle_cfg:
+                self.use_aux_hidden_state = eagle_cfg.get("use_aux_hidden_state", False)
+                if self.use_aux_hidden_state and not self.eagle3_aux_layer_ids:
+                    self.eagle3_aux_layer_ids = eagle_cfg.get(
+                        "eagle_aux_hidden_state_layer_ids", []
+                    )
+            else:
+                self.use_aux_hidden_state = True
+
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> None:
+        # Eagle3 architecture mapping (architecture-level, not model_type)
+        arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if arch == "LlamaForCausalLMEagle3":
+            hf_config.architectures = ["Eagle3LlamaModel"]
+
         # Step 1: resolve model_type → mtp model_type
         mtp_type = SpeculativeConfig._MTP_TYPE_MAP.get(hf_config.model_type)
         if mtp_type is not None:
@@ -938,6 +986,16 @@ class Config:
                 raise ValueError(
                     f"num_speculative_tokens must be between 1 and 4, got {num_spec}."
                 )
+
+        # DeepSeek V4: paper §3.6.1 mandates classical KV cache block_size =
+        # lcm(m, m'). For V4-Pro / V4-Flash this is lcm(4, 128) = 128 original
+        # tokens. ATOM's BlockManager + slot_mapping math assume one global
+        # block_size, so we override `kv_cache_block_size` here when V4 is
+        # detected; the V4 attention builder enforces the same value.
+        if getattr(self.hf_config, "model_type", None) == "deepseek_v4":
+            v4_block_size = 128
+            if self.kv_cache_block_size != v4_block_size:
+                self.kv_cache_block_size = v4_block_size
 
     def compute_hash(self) -> str:
         """
