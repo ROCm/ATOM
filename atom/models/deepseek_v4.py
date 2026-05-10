@@ -33,10 +33,15 @@ from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
     get_hip_quant,
+    silu_and_mul as aiter_silu_and_mul,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+)
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -48,7 +53,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.model_loader.loader import WeightsMapper
-from atom.model_ops.embed_head import VocabParallelEmbedding
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
@@ -1739,7 +1744,6 @@ class Expert(nn.Module):
         x: torch.Tensor,  # [num_tokens, dim]
         weights: Optional[torch.Tensor] = None,  # [num_tokens, 1]  optional gate
     ) -> torch.Tensor:  # [num_tokens, dim]
-        from aiter import silu_and_mul as aiter_silu_and_mul
 
         dtype = x.dtype
         # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
@@ -2171,58 +2175,43 @@ class Block(nn.Module):
         return x
 
 
-class ParallelHead(nn.Module):
-    """LM head with mHC reduction.
+class ParallelHead(ParallelLMHead):
+    """V4 LM head with mHC reduction; vocab-parallel sharded across TP ranks.
 
-    Port of inference/model.py:704-736. Unlike `Block.hc_pre` (which uses
-    Sinkhorn projection on the combination matrix), `hc_head` uses simple
-    `Sigmoid(mix*scale + base) + eps` weights to reduce the [num_tokens, hc, dim]
-    residual to [num_tokens, dim] before applying the LM head linear projection.
+    Port of inference/model.py:704-736. Inherits from `ParallelLMHead` so the
+    vocab-axis sharding, `weight_loader`, last-token slicing, bf16 a16w16 GEMM
+    (`tgemm.mm`), and TP all-gather come for free. V4 only adds:
 
-    `get_logits` projects only the last token of each sequence (decode mode);
-    for prefill the caller should slice the desired positions before passing
-    through.
+    - `forward(...)` taking the mHC residual + hc_head params + final norm
+    - `get_logits(...)` so `compute_logits` can call it directly on the
+      hidden-state output of `model.forward` (CUDAGraph contract)
+    - `hc_head(...)` Sigmoid-gated mHC reduction (vs `Block.hc_pre`'s Sinkhorn)
+
+    Note on weight dtype: the V4 reference (model.py:713-714) keeps the LM head
+    in fp32 because the disk weight is bf16; on AMD CDNA3/CDNA4 the bf16 MFMA
+    instruction accumulates in fp32 natively, so a bf16 GEMM with the
+    bf16-on-disk weight has the same effective precision as the reference's
+    fp32 path while halving VRAM and using the faster a16w16 kernel.
     """
 
     def __init__(
         self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6
     ):
-        super().__init__()
-        self.vocab_size = vocab_size
+        super().__init__(vocab_size, dim, bias=False)
         self.dim = dim
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
-        # PR1 single-rank: full vocab on this rank.
-        self.weight = atom_parameter(
-            torch.empty(self.vocab_size, self.dim, dtype=torch.float32)
-        )
 
     def get_logits(
         self, x: torch.Tensor  # [num_tokens, dim]
     ) -> torch.Tensor:  # [bs, vocab]
-        """Project the last-token-per-seq slice of `x` to vocab logits.
-
-        Picks the last token of each sequence using `cu_seqlens_q` from the
-        forward_context. Falls back to `x[-1:]` (single-seq) when no
-        forward_context is set (warmup / standalone).
+        """Project to vocab logits via the inherited `ParallelLMHead.forward`,
+        which handles last-token slicing (prefill) + tgemm.mm + all-gather.
         """
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"get_logits expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        ctx = get_forward_context()
-        cu_seqlens_q = (
-            ctx.attn_metadata.cu_seqlens_q
-            if ctx is not None and ctx.attn_metadata is not None
-            else None
-        )
-        if cu_seqlens_q is not None and cu_seqlens_q.numel() >= 2:
-            # Last-token positions per seq: cu_seqlens_q[1:bs+1] - 1.
-            # block_tables tells us the actual scheduled bs (cu_seqlens_q
-            # may have trailing zeros from the CpuGpuBuffer pool).
-            bs = ctx.attn_metadata.block_tables.size(0)
-            last_idx = cu_seqlens_q[1 : bs + 1] - 1
-            return F.linear(x.index_select(0, last_idx.long()).float(), self.weight)
-        return F.linear(x[-1:].float(), self.weight)
+        return super().forward(x)
 
     def hc_head(
         self,
@@ -2252,9 +2241,8 @@ class ParallelHead(nn.Module):
         norm: nn.Module,
     ) -> torch.Tensor:  # [bs, vocab]
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)  # [num_tokens, dim]
-        logits = self.get_logits(norm(x))  # [bs, vocab]
-        # PR1 single-rank: skip all_gather
-        return logits
+        # get_logits handles the per-rank vocab shard + all-gather internally.
+        return self.get_logits(norm(x))  # [bs, vocab]
 
 
 class MTPBlock(Block):
